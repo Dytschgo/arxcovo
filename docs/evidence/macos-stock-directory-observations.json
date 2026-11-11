@@ -5,7 +5,9 @@
     "runId": 43041133895,
     "jobId": 130592903303,
     "head": "69c1a6c2d498e8d2089d3588c3f9039364b1515b",
-    "runner": "macos-latest"
+    "runner": "macos-latest",
+    "image": "macos-26-arm64",
+    "imageVersion": "20261102.0473.1"
   },
   "observations": [
     {
