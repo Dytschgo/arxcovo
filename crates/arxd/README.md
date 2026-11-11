@@ -92,15 +92,45 @@ hosts require fresh state. This is local application identity for future routing
 not a future Raft numeric node ID or certificate identity; no Raft design changes.
 Using the existing transactional store avoids another private file or write path.
 
-The activity table stores only principal, fixed tool classification, numeric ID and outcome.
-A durable transaction records `started` before inventory collection; storage
-failure prevents dispatch/results. Completion failure withholds inventory and
-leaves the durable started row. Restart marks unfinished rows `interrupted`.
-A file lock prevents concurrent instances sharing state. Retention is 1000 rows;
-database page size/count are capped at 4096/1024 (4 MiB, plus bounded rollback
-journal). Older rows are pruned transactionally. Rejected calls use the fixed
-inventory classification and `rejected`; attacker tool names/arguments are never
-stored. There is no activity-reading tool or HTTP configuration authority.
+Activity schema v2 is durable M2 groundwork, not M2 acceptance. Version 0
+identity initialization and version 1 migration, preservation of host ID/events,
+and restart reconciliation commit atomically. Legacy rows become agent/read rows
+with NULL timestamps and execution metadata. Unsupported versions and malformed
+columns fail closed. Timestamps are nullable bounded UTC milliseconds
+(0..=253402300799999), informational rather than ordering keys.
+
+`list_activity` accepts only `limit` (integer 1–50, default 20), `before_id`
+(positive i64) and `include_reads` (boolean, default false). It returns
+`{activities, next_before_id}` in descending ID order. Only the transport's
+immutable principal's agent rows are visible; principal and daemon rows are
+omitted. Its own committed started row bounds the SQL query, together with the
+optional cursor. SQL reads at most limit+1 rows, with bounded text columns; all
+returned values are validated against typed vocabulary and numeric/identity
+bounds. The last returned ID becomes the next cursor only if an extra row exists.
+Completion commits before results are exposed. Invalid arguments are rejected
+before querying, but still audited. Unknown calls persist only `unknown_tool`.
+
+Start commits before dispatch. `finish_typed(id, Outcome, &Metadata)` updates
+exactly one started row in a transaction; missing, duplicate or already completed
+rows refuse and roll back. Future execution metadata is nullable and typed, with
+fixed reason/program/rights/observation/stop/tree vocabulary. No argv, environment,
+workspace, executable path, output, caller tool name or arbitrary error is stored.
+`Program::Path` records only the literal `path`. An observed identity is optional;
+when present its SID/decimal syntax and 184-byte maximum are validated.
+
+Cancellation, timeout and shutdown map to **Outcome::Failed plus
+StopReason::Cancelled / Timeout / Shutdown**, respectively. They are not outcome
+strings; `finish` rejects them. Stop reason and outcome persist in the same update.
+A clean service lifecycle event may finish succeeded. `start_lifecycle(Start|Stop)`
+creates only daemon/arxd lifecycle records; service Host integration belongs to the
+service builder. No executor, command tool or discovery route is added here.
+
+Restart marks unfinished rows interrupted. Retention independently keeps the
+newest 200 reads and 1000 actions+lifecycle rows, pruned transactionally. Rejected
+calls become reads, so read floods cannot evict action history. A file lock prevents
+concurrent instances. Page size/count stay capped at 4096/1024 (4 MiB, plus bounded
+rollback journal); checks run after the whole migration/start/finish transaction's
+work and before commit. Completion storage failure withholds results.
 
 Verification: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
 --locked -- -D warnings`, `cargo nextest run --workspace --locked`. Tests use the
@@ -115,9 +145,151 @@ real hardware**. Windows junction rejection is **unverified on real hardware**.
 
 Still required for M2: architecture/security review; real dedicated-account
 command backend and identity evidence; rights enforcement; per-OS services;
-stdio bridge with endpoint identity checks; tool discovery as that account;
+reviewed local transport and privileged identity evidence; tool discovery as that account;
 Claude Code acceptance listing the host and running `cargo --version` with
 persisted principal, observed execution identity and outcome. S4U, root service,
 CA keys and owner setup were not implemented or performed. The coordinator must
 integrate only after M1 and obtain the required different-provider review and
 required checks. No CI gates are changed by this slice.
+
+## Opt-in local stdio bridge
+
+The inventory daemon now also accepts an optional `local` object in its private
+configuration. Omit it (or set null) to disable local IPC. HTTP remains optional;
+`arxd --config <absolute-private-config.json>` can serve either or both transports.
+No configured listeners exits without listening. Unknown fields, including inside
+`local`, are rejected. Existing configuration still works.
+
+Windows configuration addition:
+
+```json
+"local": {
+  "address": "\\\\.\\pipe\\arxcovo-development",
+  "client_identity": "<explicit allowed client SID>"
+}
+```
+
+Unix configuration addition (under an existing private 0700 directory):
+
+```json
+"local": {
+  "address": "/absolute/private-directory/mcp.sock",
+  "client_identity": "<decimal client UID>"
+}
+```
+
+The client command is `arxd mcp-stdio --client-config <absolute-private-file>`.
+The private client JSON contains exactly:
+
+```json
+{
+  "address": "<same local endpoint>",
+  "expected_server_identity": "<explicit foreground server SID or decimal UID>",
+  "token": "<64 lowercase hex token characters>"
+}
+```
+
+Provision this file outside the repository with the private permissions described
+above. On Windows explicitly set **both file and parent owner to the bridge's
+TokenUser SID**, alongside the private protected DACL. Do not use TokenOwner or
+infer identity from a newly created directory: a full administrator token commonly
+creates BUILTIN\Administrators-owned objects. Provision using the client account
+(or its installer), setting OWNER_SECURITY_INFORMATION to that account's user SID.
+A group-owned file is rejected even if its ACL is otherwise private. Standard and
+filtered users usually default to their TokenUser; elevated/full admin users need
+explicit ownership; SYSTEM needs S-1-5-18 ownership for its own client files. These
+are provisioning requirements, not instructions for agents to elevate. Set
+expected_server_identity independently to the daemon TokenUser (pipe owner), never
+to a config directory's owner. Elevated/SYSTEM runtime remains unverified here. Its parent must also be private; file and parent must belong to the bridge
+user. It is limited to 16 KiB. The raw credential resides only in this private
+client configuration; the daemon retains only the hash. Never put it in argv,
+environment, MCP arguments or shell output. Configure MCP clients to invoke this
+binary with the three arguments above and an absolute client config path. The
+bridge does not start the daemon, invoke an endpoint command or access state.
+
+Before sending **any** authentication bytes, Windows opens the exact pipe and
+queries its kernel-held owner SID using GetSecurityInfo on that connected handle.
+It requires the configured expected SID; inability to inspect it fails closed.
+There is no OpenProcessToken-on-SYSTEM fallback. The daemon explicitly sets its
+own SID as pipe owner. Pipes use first-instance reservation, remote-client
+rejection, a NETWORK deny ACE, and a protected DACL. The server owner gets full
+rights; the configured client SID gets specific read/write/synchronize/READ_CONTROL
+rights without FILE_CREATE_PIPE_INSTANCE. This permits a future SYSTEM-owned
+pipe to grant a separate client SID connectivity without granting instance creation.
+The bridge uses anonymous SQOS, preventing server impersonation of the client.
+See Microsoft's [pipe security reference](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
+and [GetSecurityInfo reference](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo).
+
+Unix uses Tokio 1.48 peer_cred (kernel SO_PEERCRED on Linux; LOCAL_PEEREPID
+followed by getpeereid on macOS)
+to compare the connected server UID before sending credentials, and to restrict
+accepted client UIDs. The socket is 0600 under an owner-only parent. Bind refuses
+every existing object, including stale sockets and symlinks. Normal shutdown
+unlinks only the exact socket inode/device/owner created by this instance; a
+replacement is left alone. After a crash, inspect and remove a stale endpoint
+manually. No agent automatically steals or deletes it.
+
+Expected SYSTEM SID and UID 0 are valid identity values; privileged and cross-user
+cases remain **unverified on real hardware**. Unix's current owner-only filesystem
+policy intentionally requires same-user development fixtures; separate root-service
+and client filesystem provisioning remains a service-integration prerequisite.
+The current server is an **unprivileged foreground inventory development server**.
+Set expected identity explicitly to that foreground user. This authenticates an OS
+identity, not an executable binary. Another process of the same OS user can already
+read that user's client credentials. This is not production SYSTEM-service or
+account-isolation evidence.
+
+After identity verification, the bridge sends a fixed 70-byte `ARX1 <token>\n`
+preamble and waits for `OK\n`, each within five seconds. Only then does it pump
+newline-delimited MCP stdio frames unchanged. Official rmcp 3.9.0
+AsyncRwTransport::new_server owns MCP initialize/list/tool dispatch on the daemon,
+with an 8192-byte request line cap. The bridge forwards complete request frames up to 8192 bytes and response frames up to 65536 bytes
+and rejects oversized or incomplete frames without forwarding their partial data.
+The API and feature names were verified against the exact downloaded crate's
+`transport/async_rw.rs` and Cargo.toml, not inferred from another SDK version.
+There are at most eight admitted connections, a five-second authentication limit,
+a five-second initialization limit and a five-second write limit. Authenticated
+initialized sessions have no arbitrary total or between-frame idle deadline. Each
+may retain one of the eight slots while idle; this deliberately accepts same-user
+slot exhaustion to preserve long-lived Claude Code sessions. New excess clients
+are closed; busy/rejected accepts are paced at 25 ms (at most 40/s per listener).
+Once the first byte arrives, a frame must complete within five minutes. Both
+server and bridge enforce 8192-byte requests and 65536-byte responses, including newline:
+an oversized inventory response closes that connection without forwarding the
+partial frame. Activity pages contain at most 50 validated rows.
+Buffers are capped; no frame accumulation across idle periods is permitted.
+Unrecoverable accept/reset errors stop the listener. Windows replenishment keeps
+the reservation and attempts creation at most three times with 50 ms spacing;
+persistent failure stops the listener. Windows busy connects retry every 10 ms
+within the five-second connect deadline. Peer credential lookup failure always
+rejects that peer; it never substitutes an identity. The first rejected peer emits
+one fixed diagnostic per listener lifetime, preventing log flooding. Dropping the listener aborts admitted connection tasks. The
+binary emits only fixed client-config, peer-connect/identity, peer-authentication,
+server-config/state/bind/listener or transport failure categories (no source error
+chains, paths or tokens). HTTP Ctrl-C shutdown again drains gracefully, bounded to
+five seconds. The binary explicitly exits after bridge transport closure because Tokio stdin reads
+cannot be cancelled; holding stdin open cannot orphan the bridge.
+
+Each authenticated connection gets one immutable server-side principal. No
+client metadata or tool argument chooses that principal. HTTP retains stateless
+per-request principal binding. Both transports share the same Activity store and
+persistent host identity, including start-before-inventory and withholding results
+on activity/storage failure. `list_activity` shares those semantics. No configuration or
+execution tools are exposed.
+
+Local Windows evidence: real SDK client subprocess stdio initialize/list/call,
+local-only daemon binary, concurrent principals and persisted identity, missing
+daemon, wrong configured peer identity trap receiving zero bytes, malformed/missing
+credentials, oversized authentication and configuration, nested unknown keys,
+authentication deadline, storage-start failure, eight-connection capacity,
+listener shutdown, and bridge exit with stdin held open. HTTP regression tests
+remain green. Unix collision/replacement/symlink tests are compiled but **unverified
+on real hardware**. Linux/macOS Rust type checks are distinct from native C builds:
+normal cross-checks stop at unavailable SQLite C toolchains; a linked-SQLite
+build-script override permits Rust-only checking without claiming a native link.
+
+Still missing for M2 acceptance: independent review and hosted native checks,
+services and account isolation, dedicated-account execution and rights evidence,
+account-scoped tool discovery, and real Claude Code list-host plus cargo --version
+acceptance with persisted execution identity/outcome. No account, service,
+elevation or old Lab Manager operation was performed for this slice.

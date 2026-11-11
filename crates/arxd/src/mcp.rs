@@ -1,10 +1,11 @@
-use crate::store::Activity;
+use crate::store::{Activity, ListActivity};
 use rmcp::{ErrorData, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde_json::json;
 use std::sync::Arc;
 #[derive(Clone)]
 pub struct Inventory {
     pub activity: Arc<Activity>,
+    pub principal: Option<Principal>,
 }
 #[derive(Clone)]
 pub struct Principal(pub String);
@@ -23,16 +24,36 @@ impl ServerHandler for Inventory {
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: vec![Tool::new(
-                "list_hosts",
-                "Observed local facts; execution unavailable until dedicated account backend exists",
-                Arc::new(
-                    json!({"type":"object","properties":{},"additionalProperties":false})
+            tools: vec![
+                Tool::new(
+                    "list_hosts",
+                    "Observed local facts; execution unavailable until dedicated account backend exists",
+                    Arc::new(
+                        json!({"type":"object","properties":{},"additionalProperties":false})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                ),
+                Tool::new(
+                    "list_activity",
+                    "Durable activity visible to the authenticated agent",
+                    Arc::new(
+                        json!({
+                            "type":"object",
+                            "properties":{
+                                "limit":{"type":"integer","minimum":1,"maximum":50,"default":20},
+                                "before_id":{"type":"integer","minimum":1},
+                                "include_reads":{"type":"boolean","default":false}
+                            },
+                            "additionalProperties":false
+                        })
                         .as_object()
                         .unwrap()
                         .clone(),
+                    ),
                 ),
-            )],
+            ],
             ..Default::default()
         })
     }
@@ -41,18 +62,54 @@ impl ServerHandler for Inventory {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let principal = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|p| p.extensions.get::<Principal>())
+        let principal = self
+            .principal
+            .as_ref()
+            .or_else(|| {
+                context
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|p| p.extensions.get::<Principal>())
+            })
             .ok_or_else(|| ErrorData::internal_error("authentication context unavailable", None))?;
         // Never persist attacker-provided tool names or arguments.
+        let label = match request.name.as_ref() {
+            "list_hosts" => "list_hosts",
+            "list_activity" => "list_activity",
+            _ => "unknown_tool",
+        };
         let id = self
             .activity
-            .start(&principal.0, "list_hosts")
+            .start(&principal.0, label)
             .map_err(|_| unavailable())?;
-        if request.name != "list_hosts" || request.arguments.as_ref().is_some_and(|a| !a.is_empty())
-        {
+        let args = request.arguments.unwrap_or_default();
+        if label == "list_activity" {
+            let parsed = if args.values().any(serde_json::Value::is_null) {
+                None
+            } else {
+                serde_json::from_value::<ListActivity>(args.into()).ok()
+            }
+            .filter(|a| a.validate().is_ok());
+            let Some(args) = parsed else {
+                self.activity
+                    .finish(id, "rejected")
+                    .map_err(|_| unavailable())?;
+                return Err(ErrorData::invalid_params(
+                    "invalid activity arguments",
+                    None,
+                ));
+            };
+            let page = self
+                .activity
+                .list(&principal.0, id, &args)
+                .map_err(|_| unavailable())?;
+            self.activity
+                .finish(id, "succeeded")
+                .map_err(|_| unavailable())?;
+            let value = serde_json::to_string(&page).map_err(|_| unavailable())?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into());
+        }
+        if label != "list_hosts" || !args.is_empty() {
             self.activity
                 .finish(id, "rejected")
                 .map_err(|_| unavailable())?;

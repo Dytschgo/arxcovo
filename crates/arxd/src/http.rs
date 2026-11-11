@@ -78,6 +78,7 @@ pub fn router(
         move || {
             Ok(Inventory {
                 activity: activity.clone(),
+                principal: None,
             })
         },
         Arc::new(LocalSessionManager::default()),
