@@ -1095,3 +1095,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   its ACL absent/nonempty/unknown contracts. Final formatting, workspace/all-target
   Clippy, workspace test compilation and both Unix actual-source metadata Clippy
   checks passed again. Native runtime/ownership mutations remain outstanding.
+
+## Integrated Unix owner and macOS namespace checkpoint
+
+- Codex / gpt-6.1-sol, medium integrated the ADR0015 implementation candidate `546ca708` with retained-state/start-preflight head `7b346f1`. Only appended progress history conflicted; both histories were retained. The shared Fs code merged automatically and retains creation-only ownership plus StartPreflight/ProvisionState.
+- On the integrated Windows tree, formatting and workspace/all-target Clippy with warnings denied passed. Full nextest passed **133/133**, with two subprocess-only fixtures skipped directly and exercised through parents. No owner operation, manager, account, rights or elevation action was performed.
+- Hosted macOS positive controls and ordinary-user Unix fixtures remain required. Any failed stock-path positive control returns to architecture; no historical observation JSON was replaced. Native ownership mutations, macOS manager parsing, independent review and installed-service/dedicated-account acceptance remain outstanding and **unverified on real hardware**.
