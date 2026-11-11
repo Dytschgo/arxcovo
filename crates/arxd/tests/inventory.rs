@@ -98,11 +98,24 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     assert!(host["ram_bytes"].as_u64().unwrap() > 0);
     assert!(host["disk_total_bytes"].as_u64().unwrap() > 0);
     assert_eq!(host["execution_available"], false);
+    assert_eq!(host["execution"]["reason"], "not_configured");
+    assert!(host["execution"].get("mode").is_none());
     assert!(
         peer.call_tool(CallToolRequestParams::new("run_command"))
             .await
             .is_err()
     );
+    // Valid arguments without the private development key: refused, no fallback.
+    let valid = serde_json::json!({"tool":"cargo","args":["--version"]});
+    let refused = peer
+        .call_tool(
+            CallToolRequestParams::new("run_command")
+                .with_arguments(valid.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("execution unavailable"));
     let args = serde_json::json!({"secret_marker":token})
         .as_object()
         .unwrap()
@@ -173,7 +186,16 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     assert_eq!(
         db.query_row("SELECT count(*) FROM activity", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        4
+        5
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM activity WHERE tool='run_command' AND outcome='refused' AND reason='unavailable' AND identity_mode IS NULL",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
     );
     drop(db);
     let fresh = private_dir();
