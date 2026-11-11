@@ -763,3 +763,38 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Coordinator preparation checks passed: formatting, workspace/all-target
   Clippy with warnings denied, and all three portable owner_unix tests. Native
   Unix manager behavior was not exercised by these Windows checks.
+
+## ADR0014 implementation foundation — incomplete
+
+- Provider/effort: OpenAI / gpt-6.1-sol / medium. Prepared base verified as
+  `d1e2425e8b37c038b65076b799bcbddc332dc597`; initial worktree clean.
+- Outcome: added portable `service::owner_query` types, bounded systemd property
+  parser, fixed status tokens, expectation/gate predicates and the three fixed
+  lifecycle errors. These APIs are not wired into owner plans or the executor.
+  `launchd` deliberately returns Unknown for all inputs; even the positive-output
+  parser remains unfinished. No absence exit code or state vocabulary was invented.
+- Checks run: `cargo fmt --all -- --check`, workspace/all-target Clippy with
+  warnings denied, `cargo test --workspace --no-run`, and
+  `cargo test -p arxd service::owner_` (14 passed, including four new query tests).
+  Workspace test compilation preceded the fourth test; that test subsequently
+  compiled and passed in the focused run. `git diff --check` passed.
+- Native cross-target attempts: Linux and macOS `cargo check -p arxd --tests`
+  stopped in bundled SQLite's C build before checking arxd. Linux lacks
+  `x86_64-linux-gnu-gcc`; macOS lacks `cc`. No native metadata or runtime pass
+  is claimed. All systemd/launchd and installed paths remain
+  **unverified on real hardware**.
+- Remaining implementation: exact lifecycle plans and command/gate allowlist,
+  runner and fixture-Fs seam, bounded spawn/query/drain, explicit optional-parent
+  StartPreflight, stop postcheck, boot intent ordering, provision integration and
+  retained-state handling, UnitAbsent publication, macOS endpoint creation and
+  all ADR matrix/retry/failure/state-preservation/model tests. No guard mutations
+  were executed (0/7 required); mutation acceptance is outstanding.
+- Coordination: `configure_plan` retains this base's bool batch observation.
+  PR30's Option<BatchObservation> integration must adapt Unix callers when that
+  parent lands; no engine or Windows adapter changes were copied here.
+- Independent Opus review is still required. PR29's unloaded-job blocker is not
+  closed; CLI activation is not ready. Native launchd fixtures, stock ancestor
+  policy, installed-service acceptance and the full M2 dedicated-account goal
+  remain open. Last merged PR remains #28 as recorded above.
+- No manager, privileged harness, owner administration, dispatch, settings,
+  old Lab Manager or VM operation ran. No push, PR write, merge or watch ran.

@@ -5,6 +5,7 @@ pub mod config;
 pub mod layout;
 pub mod native;
 pub mod owner_plan;
+pub mod owner_query;
 pub mod owner_unix;
 
 pub mod preflight;
