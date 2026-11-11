@@ -7,7 +7,10 @@ pub const SYSTEMD_QUERY: &[&str] = &[
     "--property=LoadState,ActiveState,FragmentPath,DropInPaths",
     "arxd.service",
 ];
-pub const LAUNCHD_QUERY: &[&str] = &["print", "system/com.arxcovo.arxd"];
+pub const UNIT_PATH: &str = "/etc/systemd/system/arxd.service";
+pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.arxcovo.arxd.plist";
+pub const LAUNCHD_TARGET: &str = "system/com.arxcovo.arxd";
+pub const LAUNCHD_QUERY: &[&str] = &["print", LAUNCHD_TARGET];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Running,
@@ -177,7 +180,7 @@ pub fn systemd(success: bool, stdout: &[u8]) -> Query {
     if !matches!(load, "loaded" | "not-found") {
         return Query::Unknown;
     }
-    if (!fragment.is_empty() && fragment != "/etc/systemd/system/arxd.service")
+    if (!fragment.is_empty() && fragment != UNIT_PATH)
         || (!dropin.is_empty() && dropin != DROPIN_PATH)
     {
         return Query::Foreign;
@@ -186,7 +189,7 @@ pub fn systemd(success: bool, stdout: &[u8]) -> Query {
         "not-found" if fragment.is_empty() && dropin.is_empty() && state == State::Stopped => {
             Query::Absent
         }
-        "loaded" if fragment == "/etc/systemd/system/arxd.service" => Query::Ours(state),
+        "loaded" if fragment == UNIT_PATH => Query::Ours(state),
         _ => Query::Unknown,
     }
 }
@@ -207,7 +210,7 @@ mod tests {
     }
     #[test]
     fn bounded_queries_reject_ambiguous_or_foreign_output() {
-        let unit = "/etc/systemd/system/arxd.service";
+        let unit = UNIT_PATH;
         let good = output("loaded", "inactive", unit, DROPIN_PATH);
         assert_eq!(systemd(true, &good), Query::Ours(State::Stopped));
         assert_eq!(systemd(false, &good), Query::Unknown);

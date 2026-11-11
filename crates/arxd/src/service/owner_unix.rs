@@ -5,13 +5,10 @@ use super::{layout::Error, owner_plan::Plan};
 #[cfg(any(unix, test))]
 use super::{
     layout::{Layout, Platform, Policy},
-    owner_plan::{DROPIN, Operation, PLIST, UNIT},
+    owner_plan::{ConstantGate, DROPIN, DROPIN_PATH, Gate, Operation, PLIST, UNIT},
 };
 #[cfg(any(unix, test))]
 use std::path::Path;
-
-#[cfg(any(unix, test))]
-const DROPIN_PATH: &str = "/etc/systemd/system/arxd.service.d/50-arxcovo-standard-rights.conf";
 
 /// Execute an already validated plan, with fresh native authority checks. Installing
 /// artifacts never starts the daemon. Partial failures are retained, not rolled back.
@@ -21,6 +18,9 @@ pub fn execute(plan: &Plan) -> Result<(), Error> {
         let mut manager = imp::Manager::new()?;
         for op in plan.operations() {
             allowed(&manager.layout, op)?;
+        }
+        for op in plan.operations() {
+            executable(op)?;
         }
         plan.execute(&mut manager)
     }
@@ -57,24 +57,47 @@ fn artifact(l: &Layout, path: &Path, bytes: &[u8]) -> bool {
     }
 }
 #[cfg(any(unix, test))]
-fn command(platform: Platform, program: &str, args: &[&str]) -> bool {
+fn command(platform: Platform, program: &str, args: &[&str], when: Gate) -> bool {
     match platform {
         Platform::Linux => {
             program == "/usr/bin/systemctl"
-                && (args == ["daemon-reload"]
-                    || matches!(args, ["start" | "stop" | "is-active", "arxd.service"]))
+                && (((args == ["daemon-reload"]
+                    || args == ["enable", "arxd.service"]
+                    || args == ["start", "arxd.service"])
+                    && when == Gate::Always)
+                    || (args == ["disable", "arxd.service"]
+                        && matches!(when, Gate::Always | Gate::ArtifactPresent))
+                    || (args == ["stop", "arxd.service"]
+                        && matches!(when, Gate::Always | Gate::Loaded)))
         }
         Platform::Macos => {
             program == "/bin/launchctl"
-                && (args
-                    == [
-                        "bootstrap",
-                        "system",
-                        "/Library/LaunchDaemons/com.arxcovo.arxd.plist",
-                    ]
-                    || matches!(args, ["bootout" | "print", "system/com.arxcovo.arxd"]))
+                && ((args == ["bootstrap", "system", super::owner_query::PLIST_PATH]
+                    && when == Gate::NotLoaded)
+                    || (args == ["bootout", super::owner_query::LAUNCHD_TARGET]
+                        && when == Gate::Loaded)
+                    || (matches!(args, ["enable" | "disable", target] if *target == super::owner_query::LAUNCHD_TARGET)
+                        && when == Gate::Always))
         }
         _ => false,
+    }
+}
+/// Phase 3 must implement these semantics before native lifecycle execution.
+#[cfg(any(unix, test))]
+fn executable(op: &Operation) -> Result<(), Error> {
+    match op {
+        Operation::Expect(_)
+        | Operation::StartPreflight
+        | Operation::ProvisionState
+        | Operation::Constant {
+            when: ConstantGate::UnitAbsent,
+            ..
+        }
+        | Operation::Command {
+            when: Gate::Loaded | Gate::NotLoaded | Gate::ArtifactPresent,
+            ..
+        } => Err(Error::Manager),
+        _ => Ok(()),
     }
 }
 #[cfg(any(unix, test))]
@@ -88,10 +111,15 @@ fn allowed(l: &Layout, op: &Operation) -> Result<(), Error> {
         },
         Operation::EnsureDirectory { path, policy } => match policy {
             Policy::PrivateDirectory => l.private_dirs().contains(path),
-            Policy::EndpointDirectory => Some(path.as_path()) == l.endpoint().parent(),
+            Policy::EndpointDirectory => false,
             _ => false,
         },
-        Operation::Constant { path, bytes } => artifact(l, path, bytes),
+        Operation::Constant { path, bytes, when } => {
+            artifact(l, path, bytes)
+                && (*when == ConstantGate::Always
+                    || (l.platform() == Platform::Linux && path == Path::new(DROPIN_PATH)))
+        }
+        Operation::Expect(_) | Operation::StartPreflight | Operation::ProvisionState => true,
         Operation::RemoveConstant { path, expected } => artifact(l, path, expected),
         Operation::AtomicConfig {
             path,
@@ -104,7 +132,11 @@ fn allowed(l: &Layout, op: &Operation) -> Result<(), Error> {
                     .as_ref()
                     .is_none_or(|v| v.len() <= super::config::MAX_CONFIG_BYTES)
         }
-        Operation::Command { program, args } => command(l.platform(), program, args),
+        Operation::Command {
+            program,
+            args,
+            when,
+        } => command(l.platform(), program, args, *when),
         _ => false,
     };
     if valid { Ok(()) } else { Err(Error::Layout) }
@@ -476,6 +508,7 @@ mod imp {
         fn apply(&mut self, op: &Operation) -> Result<(), Error> {
             identity()?;
             allowed(&self.layout, op)?;
+            executable(op)?;
             match op {
                 Operation::Verify {
                     path,
@@ -490,24 +523,7 @@ mod imp {
                         0o755
                     },
                 ),
-                Operation::Constant { path, bytes } => {
-                    if self.layout.platform() == Platform::Macos {
-                        // A prior explicit start leaves a persistent enable
-                        // override. Reinstall must disable it before publication,
-                        // but first refuse any conflicting existing plist.
-                        let (p, n) = self.fs.parent(path)?.ok_or(Error::Layout)?;
-                        if let Some(mut f) = self.fs.open_at(&p, &n, false)?
-                            && self.fs.bytes(&mut f, 0o644, bytes.len())? != *bytes
-                        {
-                            return Err(Error::Config);
-                        }
-                        self.fs.verify(
-                            Path::new("/bin/launchctl"),
-                            Policy::BinaryIntegrity,
-                            true,
-                        )?;
-                        run("/bin/launchctl", &["disable", "system/com.arxcovo.arxd"])?;
-                    }
+                Operation::Constant { path, bytes, .. } => {
                     if path == Path::new(DROPIN_PATH) {
                         self.fs
                             .directory(path.parent().ok_or(Error::Layout)?, 0o755)?;
@@ -528,23 +544,9 @@ mod imp {
                     ServiceConfig::parse(bytes, &self.layout, &NativeResolver)?;
                     self.fs.config(path, bytes, expected)
                 }
-                Operation::Command { program, args } => {
-                    if args
-                        .first()
-                        .is_some_and(|a| matches!(*a, "start" | "bootstrap"))
-                    {
-                        native::read_config(&self.layout)?
-                            .revalidate(&self.layout, &NativeResolver)?;
-                        native::observe_layout(&self.layout)?;
-                        native::state_guard(&self.layout)?;
-                    }
+                Operation::Command { program, args, .. } => {
                     self.fs
                         .verify(Path::new(program), Policy::BinaryIntegrity, true)?;
-                    if self.layout.platform() == Platform::Macos
-                        && args.first() == Some(&"bootstrap")
-                    {
-                        run(program, &["enable", "system/com.arxcovo.arxd"])?;
-                    }
                     run(program, args)
                 }
                 _ => Err(Error::NativeAdapterMissing),
@@ -767,24 +769,77 @@ mod imp {
 mod tests {
     use super::*;
     #[test]
+    fn typed_lifecycle_is_fail_closed_and_gates_are_allowlisted() {
+        for os in [Platform::Linux, Platform::Macos] {
+            let l = Layout::for_test(os);
+            let c = super::super::owner_plan::OwnerContext {
+                admin: true,
+                running_binary: l.binary(),
+            };
+            for action in [
+                super::super::owner_plan::Action::Install,
+                super::super::owner_plan::Action::Start,
+                super::super::owner_plan::Action::Stop,
+                super::super::owner_plan::Action::Uninstall,
+            ] {
+                let plan = super::super::owner_plan::owner_plan(&l, &c, action).unwrap();
+                assert!(plan.operations().iter().all(|op| allowed(&l, op).is_ok()));
+                assert!(
+                    plan.operations()
+                        .iter()
+                        .any(|op| executable(op) == Err(Error::Manager))
+                );
+            }
+            assert_eq!(
+                allowed(
+                    &l,
+                    &Operation::EnsureDirectory {
+                        path: l.endpoint().parent().unwrap().into(),
+                        policy: Policy::EndpointDirectory
+                    }
+                ),
+                Err(Error::Layout)
+            );
+        }
+        assert!(!command(
+            Platform::Macos,
+            "/bin/launchctl",
+            &["bootstrap", "system", super::super::owner_query::PLIST_PATH],
+            Gate::Always
+        ));
+        assert!(!command(
+            Platform::Linux,
+            "/usr/bin/systemctl",
+            super::super::owner_query::SYSTEMD_QUERY,
+            Gate::Always
+        ));
+    }
+    #[test]
     fn fixed_vectors_and_artifacts_reject_injection() {
         let l = Layout::for_test(Platform::Linux);
         assert!(command(
             Platform::Linux,
             "/usr/bin/systemctl",
-            &["daemon-reload"]
+            &["daemon-reload"],
+            Gate::Always
         ));
         assert!(!command(
             Platform::Linux,
             "systemctl",
-            &["start", "arxd.service"]
+            &["start", "arxd.service"],
+            Gate::Always
         ));
         for args in [
             vec!["start", "other.service"],
-            vec!["enable", "arxd.service"],
+            vec!["enable", "--now", "arxd.service"],
             vec!["start", "arxd.service", "--root=/tmp"],
         ] {
-            assert!(!command(Platform::Linux, "/usr/bin/systemctl", &args));
+            assert!(!command(
+                Platform::Linux,
+                "/usr/bin/systemctl",
+                &args,
+                Gate::Always
+            ));
         }
         assert!(artifact(&l, l.artifact(), UNIT));
         assert!(!artifact(&l, l.artifact(), b"injected"));
@@ -792,7 +847,8 @@ mod tests {
         assert!(!command(
             Platform::Macos,
             "/bin/launchctl",
-            &["bootstrap", "user/501", "/tmp/job.plist"]
+            &["bootstrap", "user/501", "/tmp/job.plist"],
+            Gate::Always
         ));
         assert_eq!(
             allowed(
@@ -832,7 +888,6 @@ mod tests {
                 Action::Install,
                 Action::Start,
                 Action::Stop,
-                Action::Status,
                 Action::Uninstall,
             ] {
                 let p = owner_plan(&l, &c, action).unwrap();

@@ -92,7 +92,7 @@ impl Layout {
                 "/etc/arxcovo/arxd.json",
                 "/var/lib/arxcovo",
                 "/run/arxcovo/arxd.sock",
-                "/etc/systemd/system/arxd.service",
+                super::owner_query::UNIT_PATH,
                 vec!["/etc/arxcovo", "/var/lib/arxcovo"],
             ),
             _ => (
@@ -100,7 +100,7 @@ impl Layout {
                 "/Library/Application Support/Arxcovo/config/arxd.json",
                 "/Library/Application Support/Arxcovo/state",
                 "/private/var/run/arxcovo/arxd.sock",
-                "/Library/LaunchDaemons/com.arxcovo.arxd.plist",
+                super::owner_query::PLIST_PATH,
                 vec![
                     "/Library/Application Support/Arxcovo/config",
                     "/Library/Application Support/Arxcovo/state",
