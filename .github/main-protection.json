@@ -1,7 +1,6 @@
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": [],
     "checks": [
       { "context": "verify (ubuntu-latest)", "app_id": 15368 },
       { "context": "verify (windows-latest)", "app_id": 15368 },

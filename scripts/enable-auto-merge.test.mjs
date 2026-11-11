@@ -4,13 +4,13 @@ import { enableAutoMerge } from './enable-auto-merge.mjs';
 
 const head = 'a'.repeat(40);
 const input = { repository: 'example/arxcovo', number: 1, head, allowlist: ['agent'] };
-function fixture({ author = 'agent', source = 'example/arxcovo', sha = head, protectedBranch = true } = {}) {
+function fixture({ author = 'agent', source = 'example/arxcovo', sha = head, protectedBranch = true, state = 'open', draft = false, base = 'main', admins = true, strict = true, force = false, deletion = false, reviews = {} } = {}) {
   const calls = [];
   const run = args => {
     calls.push(args);
     if (args[0] === 'pr') return 'enabled';
-    if (args[1].endsWith('/pulls/1')) return JSON.stringify({ state: 'open', draft: false, user: { login: author }, author_association: 'OWNER', head: { sha, repo: { full_name: source } }, base: { ref: 'main' } });
-    return JSON.stringify({ required_status_checks: { strict: true, contexts: protectedBranch ? ['verify (ubuntu-latest)', 'verify (windows-latest)', 'verify (macos-latest)', 'ci-time-budget', 'agent-review'] : [] }, enforce_admins: { enabled: true }, required_pull_request_reviews: {} });
+    if (args[1].endsWith('/pulls/1')) return JSON.stringify({ state, draft, user: { login: author }, author_association: 'OWNER', head: { sha, repo: { full_name: source } }, base: { ref: base } });
+    return JSON.stringify({ required_status_checks: { strict, contexts: protectedBranch ? ['verify (ubuntu-latest)', 'verify (windows-latest)', 'verify (macos-latest)', 'ci-time-budget', 'agent-review'] : [] }, enforce_admins: { enabled: admins }, required_pull_request_reviews: reviews, allow_force_pushes: { enabled: force }, allow_deletions: { enabled: deletion } });
   };
   return { calls, run };
 }
@@ -28,4 +28,16 @@ test('outsiders, forks, stale heads and missing gates never invoke merge', () =>
 });
 test('empty allowlist fails before accessing GitHub', () => {
   assert.throws(() => enableAutoMerge({ ...input, allowlist: [] }, () => assert.fail('must not access GitHub')));
+});
+test('unready PRs and weakened protections never invoke merge', () => {
+  for (const options of [{ draft: true }, { state: 'closed' }, { base: 'release' }, { admins: false }, { strict: false }, { force: true }, { deletion: true }, { reviews: null }]) {
+    const { calls, run } = fixture(options);
+    assert.throws(() => enableAutoMerge(input, run));
+    assert.equal(calls.some(args => args[0] === 'pr'), false);
+  }
+});
+test('malformed repository, PR number and SHA fail before accessing GitHub', () => {
+  for (const override of [{ repository: 'https://example.invalid/' }, { number: 0 }, { head: 'main' }]) {
+    assert.throws(() => enableAutoMerge({ ...input, ...override }, () => assert.fail('must not access GitHub')));
+  }
 });
