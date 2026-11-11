@@ -58,3 +58,68 @@ macOS cross-account, set-ID policy, descriptor-inheritance probes, adversarial
 rename races, resource-limit exhaustion, crash/restart cleanup and ActivityStore
 audit-before-spawn integration still need platform evidence. Independent
 different-provider review and required hosted checks remain coordinator work.
+
+## Manual CI wiring candidate (base 989f1c6)
+
+The new `.github/workflows/unix-execution-experiment.yml` and
+`tools/unix-exec-validation/` prepare a future fresh GitHub-hosted Ubuntu 24.04
+experiment. They do not change the required three-OS CI, budget or policy gates.
+No core-library review, hosted privileged run or containment pass is claimed.
+The Windows experiment workflow is absent from this base; this wiring implements
+the requested equivalent manual actor/ref/reviewed-SHA fence directly.
+
+Only a manual dispatch by both actor and triggering actor `Dytschgo`, in
+`Dytschgo/arxcovo` on `refs/heads/main`, can run. Both `github.sha` and
+`github.workflow_sha` must equal the nonempty `UNIX_EXECUTION_REVIEWED_SHA`
+repository variable. The driver independently validates those values and decimal
+run identities. The workflow accepts no inputs, alternate commands, refs or SHAs.
+These checks and OS flags are guards, **not cryptographic attestation** of review
+or of a disposable host. No secrets or OIDC permission are requested.
+
+Future coordinator sequence (not performed by this implementation sub-agent):
+
+1. Obtain independent different-provider security review of both the Unix library
+   and this setup/cleanup code, including the systemd reference and Cargo runner
+   argument contract. Resolve blockers before any privileged execution.
+2. Merge only through the normal green required checks and independent
+   `agent-review`; preserve `ci-time-budget`. Select the resulting exact full
+   40-character main commit containing all reviewed code and this workflow.
+3. Have the authorized coordinator set repository variable
+   `UNIX_EXECUTION_REVIEWED_SHA` to that exact merged main SHA. A variable is a
+   selection mechanism, not a signed review record. Record the review evidence
+   and selected SHA separately. This implementation does not change settings.
+4. As `Dytschgo`, manually dispatch this workflow on main, while main still equals
+   that SHA. Re-runs require the same trusted triggering actor. A later main
+   commit requires new review and explicit variable reselection; never accept an
+   arbitrary SHA input. Never dispatch on self-hosted infrastructure.
+5. Inspect fixed preflight/test/cleanup evidence and the job conclusion. Failure
+   is failure, not a skipped acceptance. Quarantine cleanup failures; discard the
+   fresh host. No automatic retry, process-group fallback or security weakening.
+6. Clear `UNIX_EXECUTION_REVIEWED_SHA` immediately after the experiment, including
+   failure, and record run URL, exact code/workflow SHA and outcome here. This
+   sub-agent neither selects/clears the variable nor dispatches the experiment.
+
+Real proof requires successful read-only preflight, actual delegated controllers,
+the one exact ignored test reporting one pass within 120 seconds, its internal
+UID/environment/private-path/output/tree-kill assertions, and confirmed cleanup.
+The complete invocation remains `cargo test -p arxd --locked --lib
+exec::disposable::disposable_linux_cross_account -- --ignored --exact`, using the
+copied pinned Cargo and the exact reviewed checkout. Compilation is separate from
+the 120-second runtime bound. A zero-test success is rejected.
+
+Root is used only inside this future disposable Linux CI job; this does not
+authorize owner-PC administration, persistent accounts/services or VM operations.
+See `tools/unix-exec-validation/README.md` for resource ownership, quarantine and
+hard-cancellation limits. All privileged paths remain **unverified on real
+hardware**.
+
+Implementation evidence: Codex / gpt-6.1-sol, high effort. Ten safe Python tests
+passed on Windows, including executable gate deletion mutations and workflow
+guard removal mutations. YAML manual-only/read-only structure validated with
+PyYAML; no runtime containment is established. Base `989f1c6` includes the reported
+PR #14/root-MCP stable-ID merge; this task did not verify or change remote merge
+state. Progress is recorded here within the assigned validation-doc ownership;
+the coordinator must reconcile `docs/PROGRESS.md` and independent review status.
+Git Bash `bash -n` also passed on the workflow shell block and generated runner
+snippet. ShellCheck and actionlint were not available; neither was run. The
+required Cargo/three-OS suites were not run for this CI/docs-only change.
