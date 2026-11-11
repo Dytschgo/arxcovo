@@ -20,7 +20,7 @@ Current status (2026-11-11):
 
 - Main (`d7f3ebd`, #19) has inventory, host identity, the local IPC/stdio
   bridge and activity v2. The lifecycle plumbing in the PR20 candidate
-  passed 50 tests but is not installed anywhere.
+  passed 75 runnable Windows tests after integration with main 8fafbe7 but is not installed anywhere.
 - Owner commands and native application wiring do not exist yet. The
   configuration foundation (PR21) is separate and unmerged.
 - Windows S4U is **not established**. Both disposable experiments failed (runs
@@ -185,8 +185,9 @@ token into chat, an issue, a command line or a log.
    record your own login name or the client token.
 5. Negative checks, which are worth doing once:
    - Stop the service, rename the build account, and start the service again.
-     `list_hosts` must report `account_identity_changed`, and `run_command` must
-     be refused, never run as another identity.
+     `list_hosts` must report `account_missing`, and `run_command` must be
+     refused, never run as another identity. If the configured name instead
+     resolves to a different SID or UID, the reason is `account_identity_changed`.
    - Add the account to Administrators while `rights` is `standard`. The result
      must be `rights_mismatch`.
 

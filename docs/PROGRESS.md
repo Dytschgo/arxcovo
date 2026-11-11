@@ -3,8 +3,8 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#16](https://github.com/Dytschgo/arxcovo/pull/16), `b29f5317e94e03d033fcc1596a3e84c4d1d4d485`, 11:34:19 UTC (Windows rooted-path validation). Before it, [#19](https://github.com/Dytschgo/arxcovo/pull/19) merged as `d7f3ebd26e69438abb41ff5d671959e576832803` at 11:00:14 UTC; its exact-head independent Opus review passed on `9e7a603`, and all three hosted platforms and both status gates passed. Caller-scoped activity v2 is merged.
-- Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
+- Last merged PR: [#22](https://github.com/Dytschgo/arxcovo/pull/22), `8fafbe70451807cf419c8e47706259b24a49cf68`, 12:46:32 UTC. All required checks and fresh independent Sol review passed.
+- Main includes authenticated inventory/activity, persistent host identity and opt-in local Windows current-user development execution after PR22. Dedicated-account execution and installed services remain incomplete.
 - Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
 
 ## Accepted milestone 1 evidence
@@ -27,7 +27,7 @@
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
 - Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
-- Windows rooted-path fix #16 merged as `b29f531`. Activity-integrity #18 is closed as superseded by merged #19, including its completion and fixed unknown-tool-label regressions.
+- Windows rooted-path fix #16 is merged after fresh independent review; its bare-prefix correction passed 39 local tests. Activity-integrity #18 is closed as superseded by merged #19, including completion and fixed unknown-tool-label regressions.
 - Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
 - Constant systemd/launchd artifacts are committed on feat/service-install-artifacts. INI/plist syntax, fixed argv and absence of interpolation were checked; no manager or installation was invoked. Full ADR 0009 and the owner service guide remain on the service branch.
@@ -121,6 +121,9 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | PR20 scoped docs review | Codex / gpt-6.1-sol | high | Changes required on `9b02fe2`: P1 macOS admin cleanup false assurance, P2 audit vocabulary mismatch with merged activity v2, P2 stale status/development contract |
 | PR20 service architecture corrections | Claude / claude-opus-5-5 | high | ADR 0009 and the owner guide corrected for all three findings; docs only, fresh Sol review required; no acceptance claimed |
 
+| Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
+| Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
+
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
 ## PR20 architecture correction checkpoint
@@ -171,3 +174,163 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 ## macOS administrative execution refusal
 
 - Codex / gpt-6.1-sol, medium: integrating the reviewed-contract correction from PR20. A regression must reject macOS/admin before resolver observations and owner plan construction, while retaining Linux/Windows admin validation and refusing an admin account in macOS standard mode. The new regression failed before the guard (account lookups occurred) and passed after it. Its twelve cases cover all three platforms, both rights settings and both observed membership states, including zero account lookups and no configure plan for macOS/admin. Formatting, Clippy with warnings denied and all 63 runnable nextest tests passed; one direct-only fixture is exercised by its parent. Package checks passed three tests and skipped two native checks. No owner operation was performed.
+
+## Service guide negative-check correction
+
+- Scoped Sol high recheck of 302dbb5 resolved the original architecture findings but found one guide contradiction (https://github.com/Dytschgo/arxcovo/pull/20#issuecomment-6795284384). Codex / gpt-6.1-sol, medium corrected a renamed/missing account to account_missing; a configured name resolving to a different SID/UID remains account_identity_changed. UTF-8 and diff checks pass. No runtime or administrative action ran; full lifecycle implementation review remains pending.
+
+## PR20 lifecycle review corrections
+
+- Opus high full review failed d281c89 with two blockers (https://github.com/Dytschgo/arxcovo/pull/20#issuecomment-6795458828). Codex / gpt-6.1-sol, medium: the TokenOwner parent now checks the exact successful fixture row and one-pass count, and exercises an actual zero-test subprocess as a negative control. Renaming the fixture now fails the parent assertion; original bytes were restored and the parent passed.
+- Drain has a separate 10-second budget and stop audit a separate 5-second budget; a timed-out drain still produces no stop row, audit timeout is non-clean, and earlier errors are retained. The late-drain regression failed on the prior combined budget, then passed. Two advisory functional issues are also fixed: cooperative startup is bounded at 30 seconds despite heartbeats, and an unrequested successful serve return is endpoint failure. Both regressions failed before their fixes. ADR0009 records the exact contracts and remaining native blocking-call limitations.
+- Formatting, workspace Clippy with warnings denied and all 55 runnable Windows nextest tests passed; one direct-only fixture was exercised by its parent. No SCM/systemd/launchd installation or privileged action ran. Fresh exact-head independent review and hosted checks remain required. CI runtime PR23 is separately reviewed and awaiting its full hosted run; no budget or required check was weakened.
+
+
+## Historical development implementation records
+
+These task-time records retain the failed Sol handoff and later Opus resolution; the newest checkpoint below governs current status.
+
+## Current-user Windows implementation assignment
+
+- ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
+- Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
+
+## Windows development execution candidate — implementation handoff (2026-11-11)
+
+- Provider/effort: GPT-6.1 Sol, high. Outcome: incomplete candidate; stopped under
+  the task's three-different-failed-fixes rule. Independent other-provider review
+  and further implementation are required. No push, PR, dispatch, settings change,
+  account/rights/service/task change or positive owner acceptance was performed.
+- Base: `895324614e8ff5122ebaf5885004dfec05b8cc79` (activity schema v2 and ADRs
+  0010/0011 already present). Last merged PR is unchanged by this work.
+- Added: explicit private development config; Windows-only startup preflight;
+  current-token suspended CreateProcessW executor; three inherited handles;
+  unnamed Job memory/process/UI limits; token comparison before resume;
+  cancellation/shutdown/output/time bounds; cleanup confirmation and quarantine;
+  MCP execution/discovery/capability wiring; worker-owned audit completion;
+  transactional explicit v2→v3 identity_mode migration and development-row CHECKs.
+- Actual validation: `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed after final code
+  edits. The last full `cargo test --workspace --no-fail-fast` failed: 12/13
+  library tests passed, 32/32 inventory integration tests passed, 1/1 daemon
+  unit test passed, and both CLI integration tests (one per binary) passed.
+  The final edits to junction fixture construction were exercised only by its
+  focused test, which still failed. No final full-suite pass is claimed.
+- Native fixture mechanics passed: timeout kills Job tree, cancellation,
+  shutdown, overflow, explicit standard handles and non-inherited sentinel;
+  quoter roundtrip via CommandLineToArgvW; production token policy and independent
+  elevation query. These use only a cfg(test) policy fixture, not production
+  current-owner acceptance. Positive current-owner path, hosted OS checks,
+  dedicated-account and service paths remain **unverified on real hardware**.
+- Stop evidence: `cargo test -p arxd --lib junction_cwd -- --nocapture` fails at
+  junction fixture creation, before executor reparse checking or handle-count
+  assertions. Initial argv-form mklink failed with fixed OS text:
+  `The filename, directory name, or volume label syntax is incorrect.`
+  Three different subsequent fixes also failed: (1) explicit raw quoted cmd argv,
+  stripping verbatim prefixes; (2) normalizing forward slashes in fixture paths;
+  (3) relative literal `mklink /J junction outside` with fixture working directory.
+  Final test reports `junction fixture creation failed`. No more attempts were
+  made; coordinator must hand this evidence to the other provider. No delegates
+  were started because the implementation brief forbids them.
+- Remaining work: repair the junction fixture, verify actual executable-reparse
+  refusal and stable handle counts; add execution-specific real authenticated
+  local SDK/stdio tests with the unit-only policy fixture, including cancelled
+  request audit completion, start/completion storage faults, busy/quarantine,
+  principal isolation and mode/schema negatives; broaden exact child-identity
+  mismatch and configuration tests; review fixed-error/redaction edge cases and
+  resource cleanup. No mutation test suite was run. Do not claim the requested
+  complete execution acceptance from the existing inventory transport tests.
+- M2 dedicated-account/service criterion remains open. This candidate is only
+  the owner-authorized development deviation in ADR 0010. Instructions for the
+  coordinator's post-review private acceptance are in
+  `docs/windows-development-execution.md`.
+
+## Windows development execution — Opus continuation (2026-11-11)
+
+- Provider/effort: Anthropic claude-opus-5-5, high (other-provider continuation
+  under the three-failed-fixes rule). Outcome: candidate complete locally and
+  pending a fresh independent Sol review. Base `8953246`, Sol candidate
+  `68c6dbd`, head recorded by the coordinator at handoff. No push, PR,
+  dispatch, settings, account, rights, service or task change, elevation, S4U
+  probe or owner acceptance was performed. Last merged PR is unchanged by this
+  work.
+- Junction root cause (deterministic loop first): the failure reproduced, and
+  captured stderr was `md`'s own error. cmd.exe scans its whole command line for
+  switches, so the fixture's argv0 `...\System32/cmd.exe` was parsed as
+  `/c md.exe" ...`. All three earlier fixes kept that forward slash. A
+  backslash-only path alone made the focused test pass. This was a fixture bug:
+  no production code and no reparse guard was weakened. The candidate also had a
+  31 KB mojibake literal in the quoter test, now replaced by escapes.
+- PR16 dependency: the candidate needed PR16's bare-prefix skip (17b6bc9) for
+  canonical verbatim workspaces. On the coordinator's update it also carries the
+  root correction 8c3856a (physical `RootDir` required). A new unit test was red
+  on the prior code: it accepted bare `\\?\C:` and `\\?\Z:`. The lines are
+  identical to PR16.
+- Production fixes found in review: `redact` looped forever when a label
+  contained its needle (for example a user named `user` or `temp`), wedging the
+  single execution slot. The worker was spawned lazily, so a request cancelled
+  before first poll left its audit row `started`. It is now spawned on dispatch
+  and starts no process if already cancelled. Completion could relabel a row's
+  identity mode. The v3 CHECK now also pins development rows to elevation 0,
+  integrity 8192, `pre_exec` and `windows_job`. The environment block is now
+  sorted case-insensitively, as CreateProcessW requires. SIDs are redacted
+  anywhere in the text and the token profile directory is redacted. Results
+  carry dropped-byte counts; capability reports `shutdown`.
+- New coverage: development execution over the real local transport, with an SDK
+  client, the real stdio bridge code (`bridge_io`) and a real named pipe with
+  kernel identity checks. Requests reach the authenticated listener and SDK
+  server, then the policy-fixture executor. Covered paths: schema without
+  mode/identity/executable fields, honest `list_hosts`, a redacted success row
+  with fixed development facts, seven argument negatives after `started`, busy,
+  SDK cancellation completing the row once with confirmed cleanup, principal
+  isolation, start-failure runs nothing, completion-failure withholds the
+  result, and identity mismatch never resuming the child and then quarantining.
+  Also covered: a dispatch dropped before first poll, junctioned cwd and PATH
+  directory (executable reparse) with controls, stable handle counts, nonzero
+  exit, config classification and a valid `run_command` when not configured.
+- Actual validation at the final code commit: `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+  `cargo test --workspace --no-fail-fast` passed 58 tests (arxd lib 23,
+  inventory 32 including the activity suites, daemon unit 1, CLI 2), all on this
+  Windows host only. Hosted macOS/Linux/Windows runs were not performed.
+- Mutations (literal, one at a time, each file restored by git): 25 applied,
+  25 killed. Two (handle-level reparse check, pre-spawn cancellation check)
+  first survived; the tests were strengthened and both are now killed. Covered:
+  token policy, child TokenUser comparison, reparse/cwd/executable pins,
+  quarantine, Job termination and process limit, dropped counts, redaction loop
+  and SIDs, env ordering, busy set/release, eager spawn, env allowlist, HTTP
+  refusal, physical root, identity relabel, dev-row CHECKs, MCP argument
+  validation and shutdown capability.
+- Remaining limits: the positive production current-owner path is
+  **unverified on real hardware** until the coordinator's post-review run in
+  `docs/windows-development-execution.md`. The `admin_group_enabled` and
+  `elevated_identity` token refusals are tested on injected facts and an
+  independent elevation query only. ADR 0010's service-config rejection awaits a
+  service schema. Redaction stays best effort, and nothing here isolates the
+  owner. M2's dedicated-account criterion remains open.
+
+## Current-user development coordinator integration
+
+- Codex / gpt-6.1-sol, medium: integrated completed Opus candidate f1541ce with merged main b29f531. Main differed from the candidate activity base only in the already-carried checked_path correction, the committed Windows path regression and README encoding. The candidate source is retained, the main regression is added, and progress is reconciled. The Opus candidate passed 58 tests and 25 mutations. Integrated-revision formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows; executor, audit, MCP and bridge source remain byte-identical to that completed candidate. Fresh independent Sol review and hosted checks are required before any private acceptance run. No production owner execution or administrative operation has occurred.
+
+- Review ownership: Sol prepared the initial candidate and handed it off after three failed fixture fixes. Opus completed and took ownership of the executor, fixed production defects and strengthened tests. A new independent Sol review must cover the full integrated diff before merging or private production-path acceptance. Hosted checks are pending.
+
+## PR #22 hosted portability correction
+
+- Codex / gpt-6.1-sol, medium: first hosted run 43014149384 failed Linux/macOS Clippy because Windows production helpers and Windows-only fault hooks were compiled unused. Added cfg gates matching their callers, retaining portable redaction/bounds tests under cfg(test); warning enforcement is unchanged. Local formatting, Clippy and all 59 Windows nextest tests pass after the correction. Fresh hosted checks and independent Sol review remain pending. No positive owner MCP acceptance ran.
+
+## CI runtime correction after Windows timeout
+
+- Codex / gpt-6.1-sol, medium: PR22 run 43015177578 passed 59 Windows Rust tests and UI lint/test/build, then hit the unchanged 12-minute job limit during browser installation; browser/Electron smoke steps did not run. No merge or budget gate was bypassed. Hosted logs show activity_retention_and_interrupted_restart at 247.801 seconds and read_flood_preserves_actions_and_lifecycle at 318.726 seconds; the latter controlled the test phase.
+- The old restart test still exceeded the pre-v2 1000-row limit even though reads retain 200 rows. It now performs 205 real durable starts. The separate-bucket test still fills/overflows the 1000-action and 200-read buckets, then performs two real additional action starts instead of filling a second complete action bucket. New assertions verify action classification, oldest-action pruning and oldest-read preservation. Production store, workflow, timeout, policy and all checks are unchanged.
+- Local focused tests passed before and after. After the correction, formatting, Clippy with warnings denied and all 39 workspace nextest tests pass. Three temporary production mutations (read retention removed, buckets merged, restart recovery removed) each caused assertion failures; the exact original store bytes were restored and verified unchanged. These prove coverage of the retained behaviors, not hosted runtime. Independent Opus review and a fresh complete three-OS CI run remain required.
+- Current priority: unblock PR22 through real green gates, then perform private current-user Claude Code acceptance. PR20 service implementation review found two small blockers (owner-fixture false pass and drain/audit deadline mismatch); fixes remain pending. No dedicated-account/service or M2 acceptance is claimed.
+
+## PR22 CI-runtime integration checkpoint
+
+- Codex / gpt-6.1-sol, medium: integrated main 2be8268 into reviewed PR22 head72a5e5f. Only the two reviewed retention tests and progress changed; all arxd production source, Cargo manifests/lock and pinned toolchain are byte-identical to the successful independent Sol review. That review is https://github.com/Dytschgo/arxcovo/pull/22#issuecomment-6795099160. Integrated formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows. Fresh exact-head recheck and hosted checks are pending. No real cargo/Claude Code acceptance has run.
+- Service lifecycle review corrections are preserved on feat/service-lifecycle at b32ce16: TokenOwner execution proof, separate drain/audit budgets and bounded startup/unrequested serve failure, with 55 local tests. Configuration macOS-admin refusal is on PR21 at 8975520 with 63 local tests. Native macOS observation candidate b261457 has local type/policy tests but remains unmerged and unverified on native macOS. No service Application or owner installation adapter is activated.
+
+## Service lifecycle integration with Windows development execution
+
+- Codex / gpt-6.1-sol, medium: preserved PR20 review corrections while integrating main 8fafbe7, including the current-user executor and reviewed retention runtime correction. Combined formatting, workspace/all-target Clippy with warnings denied and all 75 runnable Windows nextest tests passed; one direct-only TokenOwner fixture is skipped and exercised by its passing parent. Fresh independent review and hosted checks remain pending. The real development acceptance record is independently reviewed in PR24; installed-service and dedicated-account M2 acceptance remain open.

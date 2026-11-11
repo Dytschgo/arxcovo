@@ -137,14 +137,28 @@ after ready.
 Stop order:
 1. Stop accepting connections.
 2. Signal `Shutdown`, which cancels runs.
-3. Wait up to 10 s for run threads to finish cleanup and persist the final outcome with stop reason `shutdown` (a failed run outcome,
-   rather than a separate storage outcome string).
-4. Write a daemon `service_stop` row.
-5. Release the lock and exit 0.
+3. Give drain its own 10 s budget for run cleanup and persistence of terminal
+   outcomes with stop reason `shutdown` (a failed run outcome, not a new stored
+   outcome). A late successful drain does not consume the audit budget.
+4. If drain returned, attempt the daemon `service_stop` row with a separate 5 s
+   budget. If drain timed out, do not pretend cleanup finished by writing a stop
+   row. Preserve any earlier failure; a drain or audit timeout otherwise exits 5.
+5. Release the lock. Exit 0 only when startup, serving and cleanup completed
+   without failure. The two shutdown budgets fit within the manager artifacts'
+   30 s stop limits.
 
-Every stop path keeps the store transaction rules: no row is left `started`
-except after a real crash, which restart reconciliation turns into
-`interrupted`.
+A clean stop leaves no row `started`. On a drain/audit deadline or a crash,
+uncompleted rows are reconciled to `interrupted` on restart; no completed audit
+row or clean outcome is fabricated. The host's deadlines require cancellation-
+safe asynchronous hooks and blocking work off the host task, as required by the
+Application contract. They cannot interrupt a synchronous native call.
+
+Startup has a cooperative 30 s deadline despite progress heartbeats. Expiry
+returns layout/integration code 7 and performs bounded partial-start cleanup;
+it never reports ready. An unexpected successful return from `serve()` without
+a stop request is endpoint failure 6, allowing configured manager recovery.
+Requested shutdown retains the clean-stop path. These lifecycle behaviors have
+unit evidence only; installed service-manager behavior remains unverified.
 
 Exit and service-specific codes, the same on all OSes: `0` clean, `2` usage,
 `3` config invalid, `4` config/state ownership or permissions, `5` store
