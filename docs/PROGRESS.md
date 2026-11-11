@@ -3,9 +3,9 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#23](https://github.com/Dytschgo/arxcovo/pull/23), `2be8268a656a754b03d560389f8486e5703eb98e`, 12:27:44 UTC. Exact-head independent Opus review passed on 0701079, all three hosted platforms and both gates passed, and normal gated squash auto-merge completed. Required CI and timeout policy are unchanged.
-- Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
-- Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
+- Last merged PR: [#22](https://github.com/Dytschgo/arxcovo/pull/22), `8fafbe70451807cf419c8e47706259b24a49cf68`, 12:46:32 UTC. Fresh independent Sol review passed on 59293a8, all three hosted platforms and both status gates passed, and normal gated squash auto-merge completed.
+- Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
+- Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
 
 ## Accepted milestone 1 evidence
 
@@ -273,3 +273,29 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Main CI duration history refresh
 
 - Codex / gpt-6.1-sol, medium: read all 17 completed main push CI runs through the GitHub API, fetched attempt 1 for each and cross-checked workflow completion against the latest job completion (within 30 seconds). The committed history now includes every completed run through PR22 main run43023260965. Existing five records were verified unchanged. JSON and whitespace validation passed; the history is evidence only and does not control the trusted budget gate. No workflow, policy or timeout changed. Independent review remains pending.
+
+## Real Claude Code development acceptance
+
+- Codex / gpt-6.1-sol, medium coordinated private acceptance after PR22 merged. Claude Code 2.1.322 was requested to use Opus 5.5 high through its existing login, with unrelated instructions, memory, hooks, connectors and built-in tools disabled; only the explicit arxcovo MCP server and named calls were allowed. Actual MCP events were inspected in memory, not a natural-language success report.
+- A non-test arxd binary built from independently reviewed source72a5e5f listed the host and executed literal cargo --version under the current unelevated Windows user. Production source equivalence to reviewed59293a8 was checked. SQLite and MCP confirmed the caller's successful row, development identity mode, current-user match, Medium integrity and null raw owner identity/rights. A daemon restart and fresh Claude Code session returned the same row.
+- The native executor reported confirmed Job cleanup. The harness stopped its owned processes, an independent native process query found zero remaining acceptance arxd instances, and temporary config/credential files were deleted. Only sanitized booleans, fixed labels, build/source hashes and outcomes are committed in docs/evidence/windows-development-acceptance.json. No raw CLI stream or private owner values were logged or committed.
+- This is a passed development acceptance under the owner's explicit alternative, not M2 completion: dedicated-account/service execution, rights enforcement, service Application and native owner adapters remain unfinished. S4U/service and VM paths remain unverified on real hardware. No account, right, task, service, elevation or old Lab Manager action occurred.
+
+## Windows CI handle-probe investigation
+
+- Opus PR20 exact-head recheck passed d8f034f but identified a Windows failure shared by main66c1b17 and PR25/PR20: actual_job_tree_timeout_cancel_shutdown_overflow_and_handles sees child exit101. Production source is unchanged from earlier green runs. Codex / gpt-6.1-sol, medium ran the focused existing test twice locally; both passed, so no cause is claimed. The parent assertion now includes bounded child stderr as well as stdout for diagnosis. Dedicated high-effort diagnosis is pending; no gate is bypassed and no rerun is claimed as a fix.
+
+- Scoped follow-up, Codex / gpt-6.1-sol / high: base 0de0b725ee976eaa0ac21a531fdd9ea6ab2131e9 (main66c1b173 plus diagnostic). Read the public PR20 addendum and all three exact failed Windows job logs. Locally the original cargo and nextest focused baselines passed once each. A temporary real-executor 64-slot sampler failed 1/64 children in each of two runs, surfacing GetHandleInformation return 1 versus 0 and child exit101. This proves the numeric-validity assumption is invalid locally; hosted logs still do not identify their child assertion.
+- Fixed only cfg(test) fixture code: randomly named sentinel, snapshot candidate before opening reference, compare kernel object identity. Child-local bounded native allocation makes reuse deterministic; standard handle type checks, production CreateProcess/three-handle list, Job cleanup and token checks remain unchanged. Restoring numeric-validity checking fails the regression (1/1); temporarily adding the sentinel to the actual production inheritance list also fails (1/1, explicit inherited-object assertion). Both mutations restored. Fixed controlled regression passed directly and under nextest (2/2). Final unforced named-event sampling passed 64/64, with zero spontaneous reuse markers in that run; do not interpret it as proof of a hosted fix.
+- Actual validation: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo nextest run --workspace --locked: **60/60 passed**, zero skipped, 7.369-second test phase. Original combined test also passed directly. Detailed loop, hypotheses, mutation results and limitations are in tools/windows-identity-probe/DEBUGGING.md. No architectural deviation. Last merged PR remains #24 / main66c1b173. Blockers: fresh hosted Windows result and independent other-provider review pending, coordinator integration required. No push/PR/merge/watch or privileged actions. Dedicated-account/service/VM paths remain **unverified on real hardware** by this fix.
+
+## Main CI history through merged handle correction
+
+- Codex / gpt-6.1-sol, medium reconciled this docs-only branch with main and
+  fetched the first-attempt API records for the two newer completed main runs.
+  Run 43027101934 at 66c1b17 failed after 219 seconds; run 43032105696 at
+  0ceb174 succeeded after 525 seconds. Both conclusions remain in the history,
+  so the short failed run cannot be mistaken for a speed improvement.
+- The history now contains all 19 completed main push CI runs visible in the
+  API through PR28. No policy, workflow, required check or timeout changed.
+  This evidence refresh still requires independent review and hosted checks.
