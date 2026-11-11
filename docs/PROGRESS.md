@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: authenticated MCP inventory/activity and the Windows execution feasibility probe. Electron and policy-test follow-ups remain open.
-- Last merged PR: [#8](https://github.com/Dytschgo/arxcovo/pull/8), merge `3148241287c48178fefc5e13f1396cbc7ae1a757`, 2026-11-11 08:22:47 UTC. All five required gates passed; GitHub completed auto-merge before a redundant coordinator command could act.
+- Current task: merge security-reviewed MCP inventory PR #11, review the manual Windows execution experiment, and build the Unix account backend. Policy-test PR #9 remains open.
+- Last merged PR: [#7](https://github.com/Dytschgo/arxcovo/pull/7), merge `9c623449f8341359283190f96d8222acfc7e5769`, 2026-11-11 08:29:43 UTC. All three platform checks, budget and fresh Opus review passed; Electron is covered on every hosted OS.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -19,7 +19,7 @@
 - The owner selected `Dytschgo` for the trusted agent-author allowlist. The guarded command rejects outsiders, forks, stale heads, unready PRs and weakened protection. Repository auto-merge is enabled. PR #3 proves the trivial-PR acceptance: auto-merge enabled at 03:00:12 UTC before review/CI completion, independent Opus review passed at 03:02:08, final Windows CI passed at 03:04:03, and GitHub merged at 03:06:17 without a subsequent coordinator merge command. Reviewed head was f432908; all five required gates passed.
 - Default Actions tokens are read-only, Actions PR approvals are disabled, and fork workflows require approval for all external contributors. Only the owner approves fork workflows and merges outsider PRs.
 - Policy uses trusted default-branch workflow_run code, a label-change signal and periodic retry. It reads candidate measurements through the API, measures attempt 1, deduplicates statuses and isolates failing heads. History is a record, not an additional gate. API unavailability and the 100-open-PR bound remain documented limitations.
-- Live slow-main rejection, measured ci-speed recovery, fast main baseline and resumed normal auto-merging all passed. The slow and recovered main durations are retained in this PR's history. Setup acceptance is proven; its final evidence PR still needs independent review and merge. The second main baseline, run 42949562343 at 861db0b, succeeded in 241 seconds and is also recorded in history.
+- Live slow-main rejection, measured ci-speed recovery, fast main baseline and resumed normal auto-merging all passed. Setup evidence and the slow/recovered durations were reviewed and merged in PR #8. The second main baseline, run 42949562343 at 861db0b, succeeded in 241 seconds and is also recorded in history.
 
 ## Slow-main acceptance experiment
 
@@ -35,8 +35,8 @@
 ### Milestone 2 delivery status
 
 - Inventory/activity: PR #11 contains the authenticated official-SDK HTTP tracer. Builder checks passed locally; current-head security review and three-OS CI are required before merge. It deliberately has no execution authority.
-- Hosted macOS first rejected the test fixture's symlinked temporary root. The fixture now resolves that trusted root only on macOS; production rejection and symlink-negative tests remain intact. An initial cross-platform fixture change failed Windows checks, was narrowed, and all ten Windows inventory tests passed again. Hosted results on 6abff15 remain pending.
-- Windows execution: the standalone 24d3c7e harness compiled/published and passed 21 unprivileged self-test assertions. A separate builder is preparing the reviewable disposable-CI setup/cleanup helper and manual workflow. No S4U/account-right/process-identity success is claimed.
+- Hosted macOS first rejected the test fixture's symlinked temporary root. Valid fixtures now resolve that root only on macOS, retaining production rejection. An initial cross-platform change failed Windows and was narrowed. PR #11 then fixed the review's inherited-ACL exposure; all 13 workspace tests passed locally and independently. Current head 181ddff has fresh review success; final hosted Windows CI remains to verify.
+- Windows execution: harness 24d3c7e and CI helper 852f6f0 are integrated for review. .NET 10 build/publish, 21 unprivileged harness assertions, 82 helper assertions and three validation mutations passed in the builder worktree. The manual-only workflow is gated to an explicitly reviewed main SHA; no S4U/account-right/process-identity success is claimed and no privileged experiment has run.
 - Still to implement and prove: stdio bridge and trusted local endpoint identity; per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
 - Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
 
@@ -93,6 +93,8 @@
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
 | PR #7 independent review | Claude / claude-opus-5-5 | high | Success on b8c2187; hosted Electron passed on three OSes, all five protection-removal mutations failed locally |
+| Windows CI experiment wiring | Codex / gpt-6.1-sol | high | Helper 852f6f0 integrated with harness; local unprivileged checks passed, independent review and disposable privileged run remain required |
+| Unix dedicated-account backend | Codex / gpt-6.1-sol | high | Isolated builder running; not connected to MCP, cross-account and cleanup acceptance still unverified |
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
