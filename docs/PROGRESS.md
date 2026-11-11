@@ -6,7 +6,7 @@
 - Last merged PR: [#37](https://github.com/Dytschgo/arxcovo/pull/37), `f06e9a2f906dcf52102bb2ee18f9f1d3265d1b93`, 18:59:00 UTC, through all five gates. This test-only CI correction changes no production code; installed/dedicated-account M2 acceptance remains open.
 - Main includes lifecycle, fixed configuration, native observation, Application, owner provenance and protected owner-store libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; M2 acceptance stays unchecked.
 - Queue priority: land strengthened SCM #35, then existing Unix owner/executor dependencies and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29; #37 was the narrow test-only CI exception.
-- Main push CI after #33 passed on its first attempt, run 43079116241 at `7c150f0`: **532 seconds**, below 15 minutes. The new #37 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Main push CI after #33 passed on its first attempt, run 43079116241 at `7c150f0`: **532 seconds**, below 15 minutes. Main push CI after #37 also passed on its first attempt, run 43082880556: **578 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -1428,3 +1428,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix owner integration with merged protected storage and CI fixture
 
 - Codex / gpt-6.1-sol / medium merged actual main `f06e9a2` into the local Unix owner candidate after recording the bounded diagnostic result. Preserved both typed Unix lifecycle modules and the Windows protected owner-store module; foundation and provider history retained. The merged PR37 test-only handle correction is included. No native authority or CLI activation is added. Combined checks and independent review remain required before publication; installed/dedicated M2 paths remain **unverified on real hardware**.
+
+- Combined-tree validation at `06e8f68` passed formatting, locked workspace/all-target Clippy, **165/165 normal nextest**, **26/26 CI helpers** and artifact checks (**3 passed, 2 native Unix skips**). Two subprocess-only fixtures were exercised through their parents. Nextest run `b33a8813-53b7-48ec-897f-feea93182ccd`, 10.474-second test phase. No recurrence is claimed repaired by this passing combination. Fresh independent exact-head review and hosted gates remain mandatory; no native owner, SCM/LSA or privileged acceptance ran.
