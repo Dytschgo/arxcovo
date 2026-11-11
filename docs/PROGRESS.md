@@ -1,5 +1,11 @@
 # Arxcovo progress
 
+## Read-only Unix manager evidence preparation
+
+- Codex / gpt-6.1-sol, medium prepared bounded fixed queries for the absent Arxcovo service on Linux/macOS and a read-only Apple system-service control. Numeric exit codes and fixed output-shape classifications will supply evidence for ADR0014's missing native launchd parser; no error code is guessed as absence and no production parser changes.
+- Each child uses a fixed environment, no shell, a six-second polling deadline after creation and combined 16 KiB pipe cap. Only fixed labels/booleans/classifications and numeric exit codes are emitted, at most 2048 bytes. No retries, manager mutations, package-source changes, owner values or gate exemptions. The one added Unix CI step leaves all existing checks/platforms/timeouts unchanged.
+- Eight pure tests passed locally; three ordinary-child Unix tests skipped on Windows and await hosted execution. Three actual-source mutations (shell enabled, JSON cap raised and raw stderr exposed) each failed assertions; original bytes were restored. YAML structural comparison confirms only the single diagnostic step was added. No manager query ran locally. Native observation, independent review and hosted checks remain pending. Installed lifecycle and M2 acceptance remain **unverified on real hardware**.
+
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
