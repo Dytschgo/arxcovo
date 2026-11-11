@@ -712,7 +712,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
 
-## Owner transaction coordinator integration
+## Superseded owner transaction coordinator integration
 
 - Codex / gpt-6.1-sol, medium preserved candidatea8628c6 on feat/windows-owner-transactions above the integrated service Application. Formatting and all-target Clippy with warnings denied passed; all nine focused owner-transaction tests passed. This delivers only a pure transaction prerequisite, not the requested native Windows installer adapter. Native ConfigurationIo, SCM/LSA operations and durable uninstall provenance remain absent. A crash between right grant and durable receipt remains RecoveryRequired; presence never proves ownership. Cross-provider architecture guidance is required before native activation. No owner or privileged operation occurred.
 
@@ -803,3 +803,43 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   with DNS resolution failures for Ubuntu mirrors, as attempt 1 did. Windows,
   macOS and independent review passed; the Ubuntu gate remains required. No second
   automatic retry or check bypass was performed.
+
+## Hosted hot-journal fixture owner correction
+
+- Codex / gpt-6.1-sol, medium inspected completed Windows job 130585845956
+  from PR30 run 43039115633. It failed at the initial fixture owner check,
+  before the crash/recovery path: 91 tests passed, one failed and 37 were not
+  run after fail-fast. This is not evidence of a SQLite recovery failure.
+- The parent Application fixture created private-DACL files without setting
+  their owner. It now assigns the current test user's owner SID explicitly on
+  its three newly created temporary files. The strict owner comparison and all
+  production code remain unchanged. No token default-owner change is made.
+- Formatting, workspace/all-target Clippy with warnings denied, and the focused
+  native hot-journal regression passed locally. Hosted full-admin-token evidence
+  is still pending; this correction does not establish installed SYSTEM/root
+  or physical-power-loss recovery. Those paths remain **unverified on real hardware**.
+
+## PR30 independent safety-guard coverage correction
+
+- Anthropic / claude-opus-5-5, high reviewed a9327cf and found the pure engine
+  correct but requested coverage for two backup safety guards. Codex /
+  gpt-6.1-sol, medium added fresh-observation/stale-plan extraction checks in
+  both presence directions, and direct unresolved-Intent uninstall refusals
+  with and without the right present. Neither test runs recovery first.
+- Both tests passed, then independently removing each production guard made
+  its corresponding test fail at an assertion. Mutations were restored.
+  Production engine bytes remain unchanged. The inherited parent hot-journal
+  owner-fixture correction was integrated without loosening any policy.
+- Corrected the guide: owner-record protection is checked by owner operations,
+  not service startup. The old Journal integration heading is now explicitly
+  superseded. Record-write errors after effect and the model's attribution
+  wording remain a tracked review advisory; existing bounded model counts do
+  not claim to cover every such write outcome.
+- Fresh exact-head independent review and hosted Windows/Ubuntu gates remain
+  required. No native store, LSA/SCM operation, owner activation or M2 acceptance
+  is supplied by these test corrections.
+
+- Combined correction validation: formatting and workspace/all-target Clippy
+  passed, followed by 131/131 Windows nextest tests. Two subprocess-only fixtures
+  were skipped directly and exercised by their parents. Both newly covered
+  guards and the restored-production hot-journal regression passed.

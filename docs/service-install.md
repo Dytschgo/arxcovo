@@ -104,8 +104,9 @@ token into chat, an issue, a command line or a log.
    and does not remove a right whose origin it cannot prove. The one exception
    follows a power failure or a Windows crash, and it is described under
    Uninstall. Do not edit
-   `arxd.json` or `owner-record.json` by hand: a changed owner stops the
-   service from starting (exit code 4).
+   `arxd.json` or `owner-record.json` by hand. Startup checks the config's
+   owner and refuses unsafe config protection (exit code 4). The owner record
+   is checked by owner operations; service startup does not read that record.
 
 ## Linux (systemd 254 or newer)
 

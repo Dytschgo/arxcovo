@@ -1016,3 +1016,68 @@ fn uninstall_uses_explicit_record_sid_without_resolving_it() {
     assert_eq!(rec.sid, OTHER);
     assert!(rec.state == RightState::None);
 }
+
+#[test]
+fn fresh_presence_cannot_relabel_a_plan_built_from_an_old_observation() {
+    use super::super::owner_plan::{OwnerContext, configure_plan};
+    for present in [false, true] {
+        let (layout, config) = windows_config(false);
+        let context = OwnerContext {
+            admin: true,
+            running_binary: layout.binary(),
+        };
+        let (mut store, mut right) = adapters(World {
+            present,
+            ..Default::default()
+        });
+        let original = observe_batch(SID, &mut store, &mut right).unwrap();
+        let plan = configure_plan(
+            &layout,
+            &context,
+            &config,
+            None,
+            Some(original),
+            &ResolverFixture,
+        )
+        .unwrap();
+        assert!(Configure::from_plan(&layout, &plan, &ResolverFixture, original).is_ok());
+        // An external assignment changes presence after the plan was built.
+        // Re-extraction must refuse, even with a freshly read observation.
+        store.0.borrow_mut().present = !present;
+        let fresh = observe_batch(SID, &mut store, &mut right).unwrap();
+        assert!(matches!(
+            Configure::from_plan(&layout, &plan, &ResolverFixture, fresh),
+            Err(Failure::InvalidPlan)
+        ));
+        let world = store.0.borrow();
+        assert_eq!(world.present, !present);
+        assert!(world.bytes.is_none());
+        assert!(
+            !world
+                .calls
+                .iter()
+                .any(|c| matches!(*c, "stage" | "grant" | "revoke"))
+        );
+    }
+}
+
+#[test]
+fn unresolved_intent_refuses_uninstall_before_any_right_observation() {
+    for present in [false, true] {
+        let mut world = World {
+            present,
+            ..Default::default()
+        };
+        world.set(RightState::Intent);
+        let before = world.bytes.clone();
+        let (mut store, mut right) = adapters(world);
+        assert_eq!(
+            uninstall_right(&mut store, &mut right),
+            Err(Failure::RecoveryRequired)
+        );
+        let world = store.0.borrow();
+        assert_eq!(world.bytes, before);
+        assert_eq!(world.present, present);
+        assert_eq!(world.calls, ["record"]);
+    }
+}
