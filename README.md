@@ -14,6 +14,7 @@ npm test
 npm run build
 npx playwright install chromium
 npm run smoke
+npm run test:desktop
 npm start -w desktop
 ```
 
