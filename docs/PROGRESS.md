@@ -938,3 +938,23 @@ later integration. No push, GitHub write, PR, merge, watch or delegation occurre
     retained-ancestor and delete-sharing mutations fail.
   - Evidence is in `docs/reviews/windows-owner-store-fixture-debug.md`. Sol
     applies the patch; no source changed in this handoff.
+
+## Windows owner-store fixture isolation resolved locally
+
+- Anthropic / claude-opus-5-5, high isolated the whole-suite interferer to the
+  development Windows child-process tests. Their intended read-only-sharing
+  pin on the shared temporary directory blocks renaming its direct children.
+  This is not an owner-store handle surviving session drop. See the retained
+  diagnostic report and test-only patch for the red pairings and control probes.
+- Codex / gpt-6.1-sol, medium reviewed and applied the patch: every renamed
+  fixture parent now sits one level below its own outer temporary directory.
+  All pinned rename/DELETE refusals and post-drop release assertions remain.
+  Production owner_windows.rs is unchanged from2604939. No pin or protection
+  was relaxed, and no sleep, retry, assertion skip or test-runner override was added.
+- Coordinator formatting and all-target Clippy passed. Full Windows nextest
+  passed144/144 with two subprocess fixtures skipped directly and exercised by
+  parents. Default cargo test --workspace --locked --no-fail-fast also passed.
+  These are current-user local tests, not hosted/SYSTEM/LSA/installed acceptance.
+- The native adapter candidate is now locally reviewable, but still needs full
+  independent security review and hosted checks. No CLI or owner activation
+  exists; privileged paths remain **unverified on real hardware**.

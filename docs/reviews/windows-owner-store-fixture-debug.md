@@ -125,3 +125,19 @@ unchanged.
   full runs across the two runners.
 - This is not a security review and not M2 acceptance. The installed SYSTEM
   path, LSA and production constructor are **unverified on real hardware**.
+
+## Sol review and application of the Opus-authored fixture patch
+
+Reviewer: OpenAI / gpt-6.1-sol / medium, 2026-11-11. Inspected the complete
+112-line patch against227afc0 before applying it. Standards: no findings.
+Spec: no findings. The owned outer directory changes which parent a rename
+opens for write; it does not change the pinned private parent's sharing or the
+production namespace policy. Both sibling fixtures share one owned outer
+parent, preserving the regression against retaining an ancestor in the fixture.
+The existing pinned rename/DELETE negatives and post-drop rename positive stay.
+
+After applying: fmt, all-target Clippy, full nextest144/144 (two subprocess-only
+fixtures exercised through parents), and default workspace cargo test passed.
+No production native constructor or LSA operation ran. This scoped test-patch
+review is separate from the still-required full security review of the Sol
+native owner-store implementation.
