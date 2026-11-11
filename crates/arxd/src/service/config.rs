@@ -52,6 +52,7 @@ struct Wire {
 pub struct ServiceConfig {
     wire: Wire,
     platform: Platform,
+    revisions: [Option<String>; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountKind {
@@ -66,6 +67,10 @@ pub struct Account {
     pub administrative: bool,
 }
 pub trait Resolver {
+    /// Internal point-in-time native incarnation evidence; never serialized.
+    fn revision(&self, _value: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
     fn account(&self, name_or_identity: &str) -> Result<Account, Error>;
     /// Metadata-only: existing directory, local disk, no symlinks/reparse ancestors.
     fn workspace_safe(&self, path: &str) -> Result<bool, Error>;
@@ -76,15 +81,29 @@ impl ServiceConfig {
             return Err(Error::Config);
         }
         let wire: Wire = serde_json::from_slice(bytes).map_err(|_| Error::Config)?;
+        let revisions = [
+            resolver.revision(&wire.build_account.name)?,
+            resolver.revision(&wire.client.identity)?,
+        ];
         let config = Self {
             wire,
             platform: layout.platform(),
+            revisions,
         };
-        config.validate(layout, resolver)?;
+        config.revalidate(layout, resolver)?;
         Ok(config)
     }
     pub fn revalidate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
-        self.validate(layout, resolver)
+        self.validate(layout, resolver)?;
+        if self.revisions
+            != [
+                resolver.revision(&self.wire.build_account.name)?,
+                resolver.revision(&self.wire.client.identity)?,
+            ]
+        {
+            return Err(Error::Identity);
+        }
+        Ok(())
     }
     fn validate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
         let w = &self.wire;
@@ -414,5 +433,37 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Observations {
+        revision: Cell<u8>,
+    }
+    impl Resolver for Observations {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            tests::FakeResolver::default().account(value)
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            Ok(true)
+        }
+        fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+            Ok(Some(self.revision.get().to_string()))
+        }
+    }
+    #[test]
+    fn revalidation_refuses_changed_incarnation_even_with_same_numeric_pins() {
+        let r = Observations {
+            revision: Cell::new(0),
+        };
+        let layout = Layout::for_test(Platform::Macos);
+        let c = ServiceConfig::parse(&serde_json::to_vec(&tests::fixture()).unwrap(), &layout, &r)
+            .unwrap();
+        assert!(c.revalidate(&layout, &r).is_ok());
+        r.revision.set(1);
+        assert!(c.revalidate(&layout, &r) == Err(Error::Identity));
     }
 }
