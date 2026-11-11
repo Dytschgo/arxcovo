@@ -567,3 +567,56 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Service Application ancestor integration
 
 - Codex / gpt-6.1-sol, medium integrated natived045cc4 into PR27, retaining Application FILE_READ_DATA ancestry pins and mutable-state write-sharing/no-delete-sharing behavior while adopting raw ACL masks and namespace authority checks. Formatting, workspace/all-target Clippy with warnings denied and all112 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Fresh security review and hosted checks remain pending. Privileged workspace metadata and detailed preflight-reason findings remain open, as do macOS ancestry and installed-service acceptance.
+
+## PR27 scoped preflight review corrections (2026-11-11)
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol / high, implementation child,
+  worked alone on `t3/service-preflight-review-fixes`, prepared base
+  `c7433438e2d618ca1e3fe010c88e68f03033d434`. Fixed the two assigned
+  preflight findings only. No architecture deviation; ADR 0009's identity-switch
+  boundary remains binding. Last merged PR is unchanged by this task (the latest
+  coordinator merge entry above records PR28); no push/PR/merge/watch performed.
+- Service inventory/startup/dynamic preflight never call workspace_safe; lexical
+  disjointness remains enforced. Only owner-local parse/revalidate/configure-plan
+  retains metadata validation. Poison/counting regression observes zero workspace
+  calls for repeated valid service preflights and failed identity/rights cases,
+  versus one on owner parse and another on configure-plan. Owner metadata refusal
+  is also retained. macOS legacy admin preflight refuses before any observation.
+- Added fixed response-only ExecutionUnavailable and exhaustive token/storedReason
+  matches. list_hosts carries the observed detail; absent-executor run_command
+  and discover_tools return execution_reason and finish refusal with the ADR's
+  coarse schema-3 Reason. Windows account lookup captures ERROR_NONE_MAPPED as
+  confirmed absence; access-denied, insufficient-buffer, no-domain and unknown
+  errors remain generic. Group-lookup failures and local SAM policy refusal do
+  not claim account absence. Unix/macOS resolver errors remain generic until
+  those adapters supply explicit absence evidence. No native error text or
+  private account/path values enter response details or stored metadata.
+- Evidence: synthetic codes run through the production native lookup classifier
+  with explicit absence and ambiguous-error controls; injected account models
+  separately exercise missing/changed/rights failures. SDK duplex MCP table covers
+  all 14 fixed reasons, both refusal tools, exact list_activity readback and SQL
+  completion checks, schema version 3, no detail/os_code columns, database-byte
+  absence of response-only tokens and private argument marker. This is not a
+  claim that native API failure injection or real account deletion was exercised.
+- Three deliberate mutations caught by assertion failures and restored: workspace
+  observation in service preflight; ambiguous Windows codes reported as missing;
+  account_missing persisted as unavailable instead of preflight_failed. The first
+  mapping mutation command hit a CRLF rewrite compile error (not evidence); its
+  byte-preserving rerun reached and failed the exact stored-reason assertion.
+- Actual checks: cargo fmt --all -- --check; cargo clippy --workspace --all-targets
+  --locked -- -D warnings; cargo nextest run --workspace --locked: **116/116 passed**,
+  preserving all 112 previous passing tests plus four regressions; one direct-only
+  fixture skipped by nextest and exercised by its subprocess parent. Test phase
+  7.665 seconds. Focused service tests also passed (53 passed, one fixture ignored).
+  Clippy initially caught a nested test if; collapsed it and Clippy passed.
+- Dedicated execution and tool discovery remain unavailable, with no foreground
+  fallback. Current service reason is a startup observation, not per-run execution
+  acceptance. Workspace access after identity switch, native failure paths on
+  installed hosts, SCM/LSA and Unix/macOS installed service behavior remain
+  **unverified on real hardware**. M2 acceptance is still open. No ignored
+  privileged harness, installation, account/right mutation, admin/elevation,
+  dispatch, service/settings operation, old Lab Manager or VM access occurred.
+  Existing normal-user fixture tests alone ran. Independent other-provider review
+  and hosted required checks remain coordinator work. Mac endpoint/ancestry and
+  SQLite crash-warning findings remain separate slices. ACL masks, namespace
+  policy, ancestry read-data pins and sharing fixes are retained unchanged.

@@ -239,9 +239,23 @@ protected handle and client identity, verifies the fixed binary location and
 protected layout, opens/reconciles the durable store, commits service_start,
 binds the local endpoint, and performs dynamic execution preflight before ready.
 Malformed static configuration or client identity is fatal. Missing/mismatched
-build accounts and unavailable workspace execution facts produce preflight_failed;
-a successful preflight still reports mechanism_unavailable. Neither outcome
-selects the development executor. No privileged PATH/tool discovery is performed.
+build accounts produce fixed response-only account_missing (only on native-confirmed
+absence), account_identity_changed or rights_mismatch as observed. Ambiguous native
+lookup/policy failures remain preflight_failed. Windows LookupAccountName/Sid's
+ERROR_NONE_MAPPED establishes absence; all other codes remain generic. Missing
+local SAM membership after a successful lookup, group lookup errors, and current
+Unix/macOS resolver failures remain generic rather than guessing their cause.
+A successful identity/rights preflight still reports mechanism_unavailable.
+Service inventory parsing and dynamic preflight perform only lexical workspace
+disjointness checks: they never open the build workspace or resolve its PATH.
+Workspace observation must run after switching identity in a future backend;
+only authorized owner-local configure retains metadata validation today.
+Neither outcome selects the development executor. No privileged PATH/tool
+discovery is performed. Startup preflight details are held only in memory; refused
+run_command/discover_tools responses carry execution_reason and complete with
+the exhaustive ADR 0009 stored-reason mapping. The backend remains absent (no
+per-run launch or workspace validation occurs), so these are startup observations,
+not proof that a future run would pass preflight. SQLite schema 3 is unchanged.
 macOS admin rights still refuse before any native account/revision observation.
 
 Store integration deliberately requires owner-provisioned, existing
