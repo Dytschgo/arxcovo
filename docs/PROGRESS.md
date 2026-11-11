@@ -3,9 +3,15 @@
 ## Current state
 
 - Milestone: 1 — Setup (in progress).
-- Current task: bootstrap public repository, workspace and CI/review gates.
+- Current task: correct review round 2 status-exhaustion finding, then request fresh Opus review; hosted CI and trusted-policy bootstrap activation pending.
+- Coordinator follow-up: guarded auto-merge, reviewed protection payload proposal, trusted workflow_run triggers and tested evaluator added. Twelve policy/auto-merge tests and UI lint pass. No configuration applied or auto-merge action performed.
 - Last merged PR: none.
 - Acceptance: no milestone acceptance checks have run yet.
+- Milestone 1 implementation: Rust workspace, React/Vite and Electron scaffolds, locked dependencies, pinned tools, three-OS CI and fail-closed budget policy prepared on feat/milestone-1. Bootstrap main is not acceptance.
+- Local evidence (Windows): cargo fmt --all --check, clippy workspace/all-targets with warnings denied, cargo test, cargo nextest (2 integration tests), npm lint, policy tests (3), UI production build and Playwright Chromium smoke (1) passed. Final rerun before PR: fmt, clippy, npm ci, lint, policy tests, build and Chromium smoke all passed.
+- Slow-main simulation: policy tests reject 901-second main for normal PRs, missing/unimproved/failed ci-speed measurements; successful measured reduction and 900-second boundary pass. Missing baseline rejects.
+- npm audit after pinned minimatch override: zero vulnerabilities. ESLint 9 remains pinned; major upgrade dependency resolution failed twice, so upgrade deferred rather than forced.
+- Coordinator WIP observation: nextest 0.9.151 installed and both scaffold tests passed; not independent final-head review.
 - Hardware: all hardware paths unverified on real hardware.
 - Repository started empty; local Rust 1.95.0 and Node 24.18.0 available.
 
@@ -26,13 +32,31 @@
 ## Blockers and owner actions
 
 - None confirmed yet. Administrative host configuration will require the owner before real VM acceptance; prepare the checklist first.
+- Main has no CI baseline/workflow yet. Coordinator must resolve trusted-policy bootstrap activation; no gate bypass was performed. Duration history remains honestly empty.
+- Pending: revised-head Opus review, hosted CI, reviewed installation merge, baseline history, protection/readback, trivial auto-merge and slow-main end-to-end acceptance. No new reviewer App is required.
+- Owner selected Dytschgo as the current allowlisted agent author; their own same-repository PRs under this login are eligible too. Recorded in .github/agent-authors.json.
+- Review round 1: Opus posted agent-review failure on 835d06c. Blocking findings: history became an unintended gate; untested evaluator paths; stale-success and label races; unnecessary approving-user/App requirements. Revised evaluator separates history, invalidates discovered heads before measurement, handles failures and reads live head/labels under workflow concurrency. Fresh review required.
+- Review round 2: Opus posted failure on 0218ba8 for repeated status exhaustion and cross-PR failure propagation. Follow-up publication is idempotent, only old successes with changed main measurements become pending, and capped heads are isolated. A 1,100-evaluation regression test emits only two statuses; another proves a capped head cannot strand a fresh PR. Fourteen policy/auto-merge tests plus one React component test, UI lint/build and Chromium smoke pass locally.
+- Owner setup checklist prepared locally as docs/dev-host-setup.md; no admin changes performed. It is a follow-up document outside the bootstrap review target.
+- Coordinator steering applied: budget policy uses trusted default-branch checkout on pull_request_target/workflow_run, with API-only candidate measurements and completion re-evaluation. Gate architecture remains proposed pending independent review.
 
 ## Provider usage
 
 | Task | Provider/model | Effort | Outcome |
 | --- | --- | --- | --- |
 | Bootstrap coordination | Codex / gpt-6.1-sol | medium | Empty workspace and local prerequisites inspected |
-| Oversight | Claude / claude-opus-5-5 | medium | Thread launched; schedule result pending |
+| Milestone 1 implementation | Codex / gpt-6.1-sol | medium | Scaffold and local checks prepared; hosted gates and independent review pending |
+| Oversight | Claude / claude-opus-5-5 | medium | Initial check-in completed on track; three-hour schedule active |
+| CI gate architecture | Claude / claude-opus-5-5 | high | Completed; app-free trusted workflow_run design and reviewed installation sequence proposed |
+| PR #1 independent review | Claude / claude-opus-5-5 | high | Completed on `835d06c`; changes requested, failure status posted |
+| Review corrections and merge command | Codex / gpt-6.1-sol | medium | Twelve local tests pass; revised-head review pending |
 
 Exact allowances and per-task cost are not exposed; do not invent usage percentages.
 
+
+## Implementation handoff
+
+- Public repository created; bootstrap base `176af7a` intentionally includes coordinator-authored AGENTS.md, KICKOFF.md and PROGRESS.md.
+- PR: https://github.com/Dytschgo/arxcovo/pull/1 (feat/milestone-1 to main). Nothing merged; last merged PR remains none.
+- Required next actions: independent Opus review, coordinator reconciliation of trusted-policy activation/baseline, branch protection and separately authenticated agent-review integration, then trivial PR through all gates.
+- Hosted CI pending at handoff. Electron runtime and VM/hypervisor paths **unverified on real hardware**. No Lab Manager, host admin, babysitter or schedule changes performed.
