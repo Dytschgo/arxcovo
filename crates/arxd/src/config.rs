@@ -12,6 +12,9 @@ use subtle::ConstantTimeEq;
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub execution: Option<std::sync::Arc<crate::development::Execution>>,
+    pub development_execution: Option<crate::development::Settings>,
     pub listen: Option<SocketAddr>,
     pub state_dir: PathBuf,
     pub agents: Vec<Agent>,
@@ -35,12 +38,30 @@ impl Config {
         if bytes.len() > 16384 {
             bail!("configuration too large");
         }
-        let value: Self =
+        let mut value: Self =
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
         value.validate()?;
+        if let Some(dev) = &value.development_execution {
+            dev.disjoint(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("invalid configuration"))?,
+            )?;
+        }
+        value.execution = value
+            .development_execution
+            .clone()
+            .map(crate::development::Execution::new)
+            .transpose()?;
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(dev) = &self.development_execution {
+            if !cfg!(windows) || self.listen.is_some() {
+                bail!("invalid development configuration");
+            }
+            dev.validate()?;
+            dev.disjoint(&self.state_dir)?;
+        }
         if let Some(endpoint) = &self.local {
             endpoint.validate()?;
         }
@@ -123,6 +144,10 @@ pub fn checked_path(path: &Path) -> Result<()> {
             }
         }
         prefix.push(part);
+        // A Windows drive prefix is not a filesystem root until RootDir follows.
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         let m = std::fs::symlink_metadata(&prefix)?;
         if m.file_type().is_symlink() {
             bail!("links forbidden");

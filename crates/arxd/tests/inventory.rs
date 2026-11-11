@@ -37,6 +37,8 @@ fn config(path: &Path) -> (Config, String) {
     let token = hex::encode(bytes);
     (
         Config {
+            execution: None,
+            development_execution: None,
             local: None,
             listen: Some("127.0.0.1:0".parse().unwrap()),
             state_dir: path.to_owned(),
@@ -76,7 +78,7 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     let peer = client(&url, &token).await;
     assert!(peer.peer_info().is_some());
     let tools = peer.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 2);
+    assert_eq!(tools.tools.len(), 4);
     assert_eq!(tools.tools[0].name, "list_hosts");
     let response = peer
         .call_tool(CallToolRequestParams::new("list_hosts"))
@@ -624,7 +626,7 @@ fn corrupt_identity_fails_closed_without_replacement() {
         "UPDATE local_host_identity SET host_id=printf('%0100000d',0)",
         "DELETE FROM local_host_identity",
         "DROP TABLE local_host_identity",
-        "PRAGMA user_version=3",
+        "PRAGMA user_version=4",
         "PRAGMA user_version=0",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,NULL)",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(2,printf('%064d',0))",

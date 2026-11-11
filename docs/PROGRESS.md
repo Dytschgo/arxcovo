@@ -125,3 +125,53 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
+
+## Windows development execution candidate — implementation handoff (2026-11-11)
+
+- Provider/effort: GPT-6.1 Sol, high. Outcome: incomplete candidate; stopped under
+  the task's three-different-failed-fixes rule. Independent other-provider review
+  and further implementation are required. No push, PR, dispatch, settings change,
+  account/rights/service/task change or positive owner acceptance was performed.
+- Base: `895324614e8ff5122ebaf5885004dfec05b8cc79` (activity schema v2 and ADRs
+  0010/0011 already present). Last merged PR is unchanged by this work.
+- Added: explicit private development config; Windows-only startup preflight;
+  current-token suspended CreateProcessW executor; three inherited handles;
+  unnamed Job memory/process/UI limits; token comparison before resume;
+  cancellation/shutdown/output/time bounds; cleanup confirmation and quarantine;
+  MCP execution/discovery/capability wiring; worker-owned audit completion;
+  transactional explicit v2→v3 identity_mode migration and development-row CHECKs.
+- Actual validation: `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed after final code
+  edits. The last full `cargo test --workspace --no-fail-fast` failed: 12/13
+  library tests passed, 32/32 inventory integration tests passed, 1/1 daemon
+  unit test passed, and both CLI integration tests (one per binary) passed.
+  The final edits to junction fixture construction were exercised only by its
+  focused test, which still failed. No final full-suite pass is claimed.
+- Native fixture mechanics passed: timeout kills Job tree, cancellation,
+  shutdown, overflow, explicit standard handles and non-inherited sentinel;
+  quoter roundtrip via CommandLineToArgvW; production token policy and independent
+  elevation query. These use only a cfg(test) policy fixture, not production
+  current-owner acceptance. Positive current-owner path, hosted OS checks,
+  dedicated-account and service paths remain **unverified on real hardware**.
+- Stop evidence: `cargo test -p arxd --lib junction_cwd -- --nocapture` fails at
+  junction fixture creation, before executor reparse checking or handle-count
+  assertions. Initial argv-form mklink failed with fixed OS text:
+  `The filename, directory name, or volume label syntax is incorrect.`
+  Three different subsequent fixes also failed: (1) explicit raw quoted cmd argv,
+  stripping verbatim prefixes; (2) normalizing forward slashes in fixture paths;
+  (3) relative literal `mklink /J junction outside` with fixture working directory.
+  Final test reports `junction fixture creation failed`. No more attempts were
+  made; coordinator must hand this evidence to the other provider. No delegates
+  were started because the implementation brief forbids them.
+- Remaining work: repair the junction fixture, verify actual executable-reparse
+  refusal and stable handle counts; add execution-specific real authenticated
+  local SDK/stdio tests with the unit-only policy fixture, including cancelled
+  request audit completion, start/completion storage faults, busy/quarantine,
+  principal isolation and mode/schema negatives; broaden exact child-identity
+  mismatch and configuration tests; review fixed-error/redaction edge cases and
+  resource cleanup. No mutation test suite was run. Do not claim the requested
+  complete execution acceptance from the existing inventory transport tests.
+- M2 dedicated-account/service criterion remains open. This candidate is only
+  the owner-authorized development deviation in ADR 0010. Instructions for the
+  coordinator's post-review private acceptance are in
+  `docs/windows-development-execution.md`.

@@ -164,6 +164,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tokio::time::timeout(AUTH_TIMEOUT, stream.write_all(b"OK\n")).await??;
     let (read, write) = tokio::io::split(stream);
     let handler = crate::mcp::Inventory {
+        execution: config.execution.clone(),
         activity,
         principal: Some(crate::mcp::Principal(principal)),
     };
@@ -345,6 +346,8 @@ mod tests {
         // kernel credential lookups; subsequent traffic uses the real SDK.
         let token = "a".repeat(64);
         let cfg = Arc::new(crate::config::Config {
+            execution: None,
+            development_execution: None,
             local: None,
             listen: None,
             state_dir: dir.path().into(),
