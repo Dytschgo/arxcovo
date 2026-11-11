@@ -1,5 +1,7 @@
 //! ADR0009 lifecycle plumbing. Production application integration is deliberately
 //! unavailable until fixed config, inventory and durable daemon audit are wired.
+pub mod config;
+pub mod layout;
 use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 
