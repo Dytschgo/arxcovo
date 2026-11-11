@@ -1,0 +1,28 @@
+# Windows development host: one-time owner checklist
+
+Status: preparation only. No administrator changes or real VM tests have been performed by agents. Complete the account steps before dedicated-account host acceptance, and the remaining steps before milestone 4 VM acceptance. Keep the existing Lab Manager installation, state and `agent-windows-test` VM untouched.
+
+## Owner actions
+
+- [ ] Create a dedicated local Windows account named `Arxcovo`, with account type **Standard user**. Keep its password out of chat, repository files and logs. ADR 0009 specifies S4U without collecting the account password; that mechanism remains unverified. A different mechanism requires a reviewed ADR, never an automatic password fallback. Do not add this account to Administrators or give it access to personal folders.
+- [ ] Keep the account out of Hyper-V Administrators too. Standard-account WHPX execution still requires a real probe; report failure rather than increasing its privileges. See docs/adr/0003-whpx-test-vm-spike.md.
+- [ ] Enable firmware virtualization if it is disabled. In Windows Features (`optionalfeatures.exe`), enable **Windows Hypervisor Platform**, then restart if requested. Do not disable host security features or change existing Hyper-V VMs. QEMU's WHPX backend requires this Windows feature; merely having QEMU installed is insufficient.
+- [ ] Install a Windows QEMU distribution reached through [QEMU's download page](https://www.qemu.org/download/#windows). Make `qemu-system-x86_64.exe` and `qemu-img.exe` readable/executable by the dedicated account. Record the chosen version and installation directory locally. Agents will verify its accelerator support; installation alone does not prove WHPX works.
+- [ ] Keep the pinned QEMU installation read/execute-only for the account. Designate private network probe targets locally. Any owner-installed firewall rules are defense in depth and must be tested; a program-path rule alone is not a complete sandbox.
+- [ ] Create a separate data folder, for example `D:\ArxcovoData`, with subfolders for templates, test VMs and evidence. Give the dedicated account modify rights there. Do not reuse Lab Manager paths, VM disks or state. Avoid granting broad access to the rest of the drive.
+- [ ] Configure a disk cap before real tests: start with **200 GiB aggregate** for Arxcovo data, maintaining **50 GiB free space** on the host volume. The application must account for templates, linked clones, snapshots and temporary install files together. Until that enforcement exists, do not launch unattended VM workloads. If an OS-enforced quota is added, have the owner configure and verify it; a qcow2 virtual capacity or folder name is not a physical-space cap.
+- [ ] Configure opportunistic-host reserves before real tests: initially reserve **16 GiB RAM** and **half the logical CPUs** for the owner. Start with at most one VM, **8 GiB RAM and 4 vCPUs**, and adjust downward if these reserves or current free memory cannot be maintained. These are initial limits, not measurements of workload safety. Arxcovo must enforce them and defer VM work while the user is active as specified in the kickoff.
+- [ ] Supply an official Windows 11 ISO and an official Ubuntu image/ISO through a local path accessible to the dedicated account. Do not commit installation media or license material. Windows-host Windows 11 guests are TEST VMs only; template installation uses the planned test-only TPM/Secure Boot bypass.
+- [ ] When a verified service installer is ready, the owner installs `arxd` with its protected service identity and configures the separate dedicated build account. The build account must not read or modify service configuration, agent credentials, private keys or the activity database. Grant only the specific logon rights required by the verified execution mechanism. Keep standard build rights selected by default. Agents must not silently fall back to the owner's login when dedicated-account execution fails. The platform identity-switching mechanism still needs implementation and verification; do not apply speculative privilege or service changes from research notes.
+
+## Agent verification after setup
+
+Run these checks as the dedicated account, recording bounded outputs without credentials:
+
+1. Confirm `whoami` identifies the dedicated account and an elevated/admin operation is refused. Confirm the configured folder permissions and resource limits.
+2. Check `qemu-system-x86_64 --version`, `qemu-system-x86_64 -accel help` and `qemu-img --version`. Then exercise an isolated disposable WHPX boot; an accelerator appearing in a help list does not establish that it runs.
+3. From Claude Code through MCP, list host capabilities and run `cargo --version` under the dedicated account. Confirm the activity feed records the caller identity, dedicated execution account and outcome. Install the Rust toolchain for that account if needed through the owner's setup path.
+4. Before guest workload execution, verify the TEST network cannot reach the home LAN or host management plane, while permitted guest-to-guest paths work. Verify the agent command and guest channels do not bypass these fences.
+5. Exercise real Windows/Ubuntu creation, guest commands, snapshot break/restore, expiry cleanup, disk-cap rejection and RAM/CPU reserve rejection. Observe actual process memory and disk allocation. Leave every unexercised path labelled **unverified on real hardware**.
+
+Sources: [QEMU WHPX prerequisites](https://www.qemu.org/docs/master/system/whpx.html), [Microsoft virtualization hardware requirements](https://learn.microsoft.com/windows-server/virtualization/hyper-v/host-hardware-requirements).
