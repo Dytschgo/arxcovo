@@ -1,0 +1,105 @@
+diff --git a/crates/arxd/src/development/windows.rs b/crates/arxd/src/development/windows.rs
+index 6ae1cf2..85f0c0e 100644
+--- a/crates/arxd/src/development/windows.rs
++++ b/crates/arxd/src/development/windows.rs
+@@ -659,10 +659,38 @@ pub(crate) mod tests {
+             "sleep" => std::thread::sleep(Duration::from_secs(30)),
+             "handles" => unsafe {
+                 use windows_sys::Win32::System::Console::*;
+-                let sentinel = std::env::var("ARX_UNIT_HANDLE")
++                let mut sentinel = std::env::var("ARX_UNIT_HANDLE")
+                     .unwrap()
+                     .parse::<usize>()
+                     .unwrap() as HANDLE;
++                // Deterministic seam for the intermittent case: Windows' own ETW
++                // registrations sit in valid slots yet refuse duplication, and the
++                // parent's sentinel value sometimes lands on one of them.
++                if std::env::var_os("ARX_UNIT_UNDUPLICABLE").is_some() {
++                    sentinel = (4..=0x4000usize)
++                        .step_by(4)
++                        .map(|v| v as HANDLE)
++                        .find(|&h| {
++                            let (mut flags, mut copy) = (0, null_mut());
++                            GetHandleInformation(h, &mut flags) != 0
++                                && if DuplicateHandle(
++                                    GetCurrentProcess(),
++                                    h,
++                                    GetCurrentProcess(),
++                                    &mut copy,
++                                    0,
++                                    0,
++                                    DUPLICATE_SAME_ACCESS,
++                                ) != 0
++                                {
++                                    drop(Handle(copy));
++                                    false
++                                } else {
++                                    GetLastError() == ERROR_NOT_SUPPORTED
++                                }
++                        })
++                        .expect("no valid unduplicable slot in child");
++                }
+                 // Model loader/runtime reuse of the parent's numeric slot, using
+                 // real child-local kernel objects rather than mocking Win32.
+                 let mut held = Vec::new();
+@@ -694,6 +722,12 @@ pub(crate) mod tests {
+                     0,
+                     DUPLICATE_SAME_ACCESS,
+                 ) != 0;
++                // A valid slot whose object refuses duplication (ERROR_NOT_SUPPORTED,
++                // e.g. an EtwRegistration) is still occupied: compare it in place.
++                // The sentinel is a duplicable event, so a leak takes the copy path.
++                let in_place = !present
++                    && GetLastError() == ERROR_NOT_SUPPORTED
++                    && GetHandleInformation(sentinel, &mut 0) != 0;
+                 let candidate = present.then(|| Handle(candidate));
+                 let name = std::env::var("ARX_UNIT_EVENT").unwrap();
+                 let reference = Handle(OpenEventW(
+@@ -702,9 +736,13 @@ pub(crate) mod tests {
+                     wide(std::ffi::OsStr::new(&name)).as_ptr(),
+                 ));
+                 assert!(!reference.0.is_null(), "sentinel reference unavailable");
+-                if let Some(candidate) = candidate {
++                if in_place {
++                    assert_ne!(reference.0, sentinel, "occupied slot vacated during check");
++                }
++                let slot = candidate.as_ref().map(|c| c.0);
++                if let Some(slot) = slot.or(in_place.then_some(sentinel)) {
+                     assert_eq!(
+-                        CompareObjectHandles(candidate.0, reference.0),
++                        CompareObjectHandles(slot, reference.0),
+                         0,
+                         "unintended inherited sentinel object"
+                     );
+@@ -771,7 +809,30 @@ pub(crate) mod tests {
+         assert!(result.cleanup_confirmed && result.matches_current_user);
+         assert_eq!(result.stop_reason, StopReason::Exited);
+         assert_eq!(result.exit_code, Some(0), "stderr={}", result.stderr);
+-        assert!(result.stdout.contains("ARX-HANDLE-REUSED-DISTINCT"));
++        assert!(
++            result.stdout.contains("ARX-HANDLE-REUSED-DISTINCT"),
++            "stdout={} stderr={}",
++            result.stdout,
++            result.stderr
++        );
++    }
++    #[test]
++    fn unduplicable_occupied_slot_is_compared_not_skipped() {
++        let (_dir, mut e, r) = fixture("handles");
++        let _sentinel = sentinel_event(&mut e);
++        e.settings
++            .environment
++            .insert("ARX_UNIT_UNDUPLICABLE".into(), "1".into());
++        let result = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
++        assert!(result.cleanup_confirmed && result.matches_current_user);
++        assert_eq!(result.stop_reason, StopReason::Exited);
++        assert_eq!(result.exit_code, Some(0), "stderr={}", result.stderr);
++        assert!(
++            result.stdout.contains("ARX-HANDLE-REUSED-DISTINCT"),
++            "stdout={} stderr={}",
++            result.stdout,
++            result.stderr
++        );
+     }
+     fn sentinel_event(e: &mut Execution) -> Handle {
+         let name = format!("Local\\Arxcovo-test-{:032x}", rand::random::<u128>());
