@@ -1,5 +1,10 @@
 # Arxcovo progress
 
+## Windows ETW handle-slot fixture correction
+
+- Anthropic / claude-opus-5-5 / requested high diagnosed the missing marker: valid child ETW-registration slots can reject duplication with error 50; the fixture treated that as absent. The deterministic new seam failed 50/50 without the correction and passed 100/100 with it. The author reports 1000 parallel plus 300 sequential original-test passes and real-leak mutation detection; records are retained in `docs/reviews/windows-handle-reuse-marker-failure.md`.
+- OpenAI / gpt-6.1-sol / medium independently reviewed and applied the test-only patch on main `0ceb174`. Personally reproduced the fallback-disabled failure and real handle-list-removal leak failure, restored all bytes, and passed formatting, locked all-target Clippy and **61/61 nextest tests** with zero skipped. See `docs/reviews/windows-unduplicable-slot-review.md`. Production behavior is unchanged; hosted checks and normal merge gates remain required. No installed-service or dedicated-account acceptance is claimed.
+
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
