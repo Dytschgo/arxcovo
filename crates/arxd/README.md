@@ -115,9 +115,124 @@ real hardware**. Windows junction rejection is **unverified on real hardware**.
 
 Still required for M2: architecture/security review; real dedicated-account
 command backend and identity evidence; rights enforcement; per-OS services;
-stdio bridge with endpoint identity checks; tool discovery as that account;
+reviewed local transport and privileged identity evidence; tool discovery as that account;
 Claude Code acceptance listing the host and running `cargo --version` with
 persisted principal, observed execution identity and outcome. S4U, root service,
 CA keys and owner setup were not implemented or performed. The coordinator must
 integrate only after M1 and obtain the required different-provider review and
 required checks. No CI gates are changed by this slice.
+
+## Opt-in local stdio bridge
+
+The inventory daemon now also accepts an optional `local` object in its private
+configuration. Omit it (or set null) to disable local IPC. HTTP remains optional;
+`arxd --config <absolute-private-config.json>` can serve either or both transports.
+No configured listeners exits without listening. Unknown fields, including inside
+`local`, are rejected. Existing configuration still works.
+
+Windows configuration addition:
+
+```json
+"local": {
+  "address": "\\\\.\\pipe\\arxcovo-development",
+  "client_identity": "<explicit allowed client SID>"
+}
+```
+
+Unix configuration addition (under an existing private 0700 directory):
+
+```json
+"local": {
+  "address": "/absolute/private-directory/mcp.sock",
+  "client_identity": "<decimal client UID>"
+}
+```
+
+The client command is `arxd mcp-stdio --client-config <absolute-private-file>`.
+The private client JSON contains exactly:
+
+```json
+{
+  "address": "<same local endpoint>",
+  "expected_server_identity": "<explicit foreground server SID or decimal UID>",
+  "token": "<64 lowercase hex token characters>"
+}
+```
+
+Provision this file outside the repository with the private permissions described
+above. Its parent must also be private; file and parent must belong to the bridge
+user. It is limited to 16 KiB. The raw credential resides only in this private
+client configuration; the daemon retains only the hash. Never put it in argv,
+environment, MCP arguments or shell output. Configure MCP clients to invoke this
+binary with the three arguments above and an absolute client config path. The
+bridge does not start the daemon, invoke an endpoint command or access state.
+
+Before sending **any** authentication bytes, Windows opens the exact pipe and
+queries its kernel-held owner SID using GetSecurityInfo on that connected handle.
+It requires the configured expected SID; inability to inspect it fails closed.
+There is no OpenProcessToken-on-SYSTEM fallback. The daemon explicitly sets its
+own SID as pipe owner. Pipes use first-instance reservation, remote-client
+rejection, a NETWORK deny ACE, and a protected DACL. The server owner gets full
+rights; the configured client SID gets specific read/write/synchronize/READ_CONTROL
+rights without FILE_CREATE_PIPE_INSTANCE. This permits a future SYSTEM-owned
+pipe to grant a separate client SID connectivity without granting instance creation.
+The bridge uses anonymous SQOS, preventing server impersonation of the client.
+See Microsoft's [pipe security reference](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
+and [GetSecurityInfo reference](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo).
+
+Unix uses Tokio peer_cred (kernel SO_PEERCRED on Linux and LOCAL_PEERCRED on macOS)
+to compare the connected server UID before sending credentials, and to restrict
+accepted client UIDs. The socket is 0600 under an owner-only parent. Bind refuses
+every existing object, including stale sockets and symlinks. Normal shutdown
+unlinks only the exact socket inode/device/owner created by this instance; a
+replacement is left alone. After a crash, inspect and remove a stale endpoint
+manually. No agent automatically steals or deletes it.
+
+Expected SYSTEM SID and UID 0 are valid identity values; privileged and cross-user
+cases remain **unverified on real hardware**. Unix's current owner-only filesystem
+policy intentionally requires same-user development fixtures; separate root-service
+and client filesystem provisioning remains a service-integration prerequisite.
+The current server is an **unprivileged foreground inventory development server**.
+Set expected identity explicitly to that foreground user. This authenticates an OS
+identity, not an executable binary. Another process of the same OS user can already
+read that user's client credentials. This is not production SYSTEM-service or
+account-isolation evidence.
+
+After identity verification, the bridge sends a fixed 70-byte `ARX1 <token>\n`
+preamble and waits for `OK\n`, each within five seconds. Only then does it pump
+newline-delimited MCP stdio frames unchanged. Official rmcp 3.9.0
+AsyncRwTransport::new_server owns MCP initialize/list/tool dispatch on the daemon,
+with an 8192-byte line cap. The bridge forwards complete frames up to 8192 bytes
+and rejects oversized or incomplete frames without forwarding their partial data.
+The API and feature names were verified against the exact downloaded crate's
+`transport/async_rw.rs` and Cargo.toml, not inferred from another SDK version.
+There are at most eight admitted connections, a five-second authentication limit,
+a five-second bridge write limit and a five-minute total daemon connection lease.
+The bridge also bounds each frame read to five minutes. Clients reconnect after
+the lease expires. Dropping the listener aborts admitted connection tasks. The
+binary explicitly exits after bridge transport closure because Tokio stdin reads
+cannot be cancelled; holding stdin open cannot orphan the bridge.
+
+Each authenticated connection gets one immutable server-side principal. No
+client metadata or tool argument chooses that principal. HTTP retains stateless
+per-request principal binding. Both transports share the same Activity store and
+persistent host identity, including start-before-inventory and withholding results
+on activity/storage failure. There are no configuration, activity-reading or
+execution tools.
+
+Local Windows evidence: real SDK client subprocess stdio initialize/list/call,
+local-only daemon binary, concurrent principals and persisted identity, missing
+daemon, wrong configured peer identity trap receiving zero bytes, malformed/missing
+credentials, oversized authentication and configuration, nested unknown keys,
+authentication deadline, storage-start failure, eight-connection capacity,
+listener shutdown, and bridge exit with stdin held open. HTTP regression tests
+remain green. Unix collision/replacement/symlink tests are compiled but **unverified
+on real hardware**. Linux/macOS Rust type checks are distinct from native C builds:
+normal cross-checks stop at unavailable SQLite C toolchains; a linked-SQLite
+build-script override permits Rust-only checking without claiming a native link.
+
+Still missing for M2 acceptance: independent review and hosted native checks,
+services and account isolation, dedicated-account execution and rights evidence,
+account-scoped tool discovery, and real Claude Code list-host plus cargo --version
+acceptance with persisted execution identity/outcome. No account, service,
+elevation or old Lab Manager operation was performed for this slice.

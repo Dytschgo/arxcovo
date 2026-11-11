@@ -101,3 +101,40 @@
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
+
+### Local transport implementation candidate (2026-11-11)
+
+- Provider/effort/outcome: GPT-6.1 Sol high; implemented in isolated branch
+  `t3/bounded-mcp-stdio-transport` from merged host identity/inventory base `90d3ce7`.
+  Root must independently review/integrate; no push, PR, merge or watch performed.
+- Opt-in Windows named-pipe / Unix socket endpoint, private client configuration,
+  expected kernel identity before token bytes, bounded authentication and official
+  rmcp 3.9.0 daemon AsyncRwTransport. Immutable connection principal shares existing
+  Activity/host ID; HTTP per-request principal behavior retained. No execution.
+- Windows checks run: fmt; workspace Clippy -D warnings; workspace nextest (24
+  passing tests). Real SDK subprocess stdio and local-only daemon binary exercised,
+  including two simultaneous principals, persisted identity, zero-byte wrong-peer
+  trap, missing daemon, malformed/missing credentials, config/auth/frame bounds,
+  real five-second auth deadline, capacity, storage-start failure and shutdown
+  while bridge stdin stays open. Existing HTTP regression/failure tests passed.
+- Ordinary Linux/macOS cross-checks blocked by missing native C compilers for
+  bundled SQLite. Rust-only all-target cross-checks pass with
+  LIBSQLITE3_SYS_USE_PKG_CONFIG=1 and SQLITE3_LIB_DIR pointing to the build directory;
+  these checks use generated bindings and do not link or exercise native SQLite.
+  Native CI and all Unix behavior remain **unverified on real hardware**.
+- SYSTEM/root and true cross-user identity cases remain **unverified on real
+  hardware**. Same-user Windows development is not production service/account
+  isolation; Unix cross-user socket provisioning remains a service prerequisite.
+- Architecture recorded in docs/adr/0003-local-inventory-mcp.md. Existing single
+  Cargo.lock unchanged: explicitly enabled SDK/Tokio/Windows features require no
+  additional resolved packages. No private permissions, Activity or executor rewrite.
+- Last merged base for this candidate: host identity/inventory #13 at `90d3ce7`.
+  Windows probe #12 remains under separate review; Unix backend #14 is separate.
+  M2 services, dedicated-account execution/tool discovery and Claude Code acceptance
+  are not done. No admin/account/service/old Lab Manager operations performed.
+- Final portable verification: Rust-only Clippy with -D warnings also passed for
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin with the same linked-SQLite
+  override. The first cross-Clippy run found a collapsible conditional in Unix
+  cleanup; it was corrected and both targets passed. No native Unix link/runtime
+  claim follows from these checks. Final Windows nextest: 24/24 passed, including
+  forged principal metadata and completion-failure withholding on the local path.
