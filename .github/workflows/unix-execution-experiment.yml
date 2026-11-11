@@ -1,0 +1,46 @@
+name: Unix execution experiment (manual, disposable)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  experiment:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'Dytschgo/arxcovo' &&
+      github.actor == 'Dytschgo' && github.triggering_actor == 'Dytschgo' &&
+      github.ref == 'refs/heads/main' &&
+      vars.UNIX_EXECUTION_REVIEWED_SHA != '' &&
+      github.sha == vars.UNIX_EXECUTION_REVIEWED_SHA &&
+      github.workflow_sha == vars.UNIX_EXECUTION_REVIEWED_SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ARX_REVIEWED_SHA: ${{ vars.UNIX_EXECUTION_REVIEWED_SHA }}
+      ARX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+      - name: Safe guard tests
+        run: python3 -m unittest discover -s tools/unix-exec-validation -p 'test_*.py'
+      - name: Fetch locked dependencies without privilege
+        run: cargo fetch --locked
+      - name: Guard, stage, run and finally clean (fresh hosted Linux only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/unix-exec-validation/driver.py guard
+          sudo -n /usr/bin/env -i \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            CI=true GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_ACTOR="$GITHUB_ACTOR" GITHUB_TRIGGERING_ACTOR="$GITHUB_TRIGGERING_ACTOR" \
+            GITHUB_REF="$GITHUB_REF" GITHUB_SHA="$GITHUB_SHA" \
+            ARX_REVIEWED_SHA="$ARX_REVIEWED_SHA" ARX_WORKFLOW_SHA="$ARX_WORKFLOW_SHA" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            /usr/bin/python3 -I tools/unix-exec-validation/driver.py run
