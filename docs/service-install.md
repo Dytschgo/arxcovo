@@ -1,8 +1,12 @@
 # Installing and verifying the arxd service (owner guide)
 
 Status: this is the **contract** for the owner-only install flow in ADR 0009.
-The `arxd service …` and `arxd client-config …` subcommands are not implemented
-yet. Do not run anything here until a merged release of `arxd` contains them.
+Only the exact `arxd service run` entry and lifecycle plumbing are implemented
+in the slices 1–2 candidate. Outside Windows SCM it exits 10; Unix exits 7
+because the real fixed-layout application integration is unavailable. It cannot
+report ready or serve inventory yet. Owner commands and `arxd client-config …`
+are not implemented. Do not run anything here until a merged release contains
+the complete installation and application integration.
 Every step is **unverified on real hardware** until someone performs it and
 records the result in docs/PROGRESS.md. Agents never perform these steps. Leave
 the old Lab Manager installation, its state and the `agent-windows-test` VM

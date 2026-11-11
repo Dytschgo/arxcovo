@@ -172,3 +172,72 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 ## Service implementation contract
 
 - Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18’s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.
+
+### M2 ADR0009 slices 1â€“2: lifecycle candidate (2026-11-11)
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol / high; implementation sub-agent,
+  working alone. Base `2aba6c3154201ca6e9afcd1ab53f984a002de600` includes corrected
+  PR15/ownership evidence `30f5c00`. Last merged PR remains unchanged; these local
+  commits have no independent review, hosted checks, push or PR.
+- Added `service::Host`, level-triggered `Shutdown`, fixed codes 0/2/3/4/5/6/7/10,
+  staged startup, post-readiness discovery hook, stop admission before cancelling
+  runs, ten-second cleanup deadline, durable audit hooks and lock-release hook.
+  Checkpoint errors do not discard cleanup; drain/audit/release errors cannot
+  report success. Stuck drain exits 5 and does not claim a persisted stop row.
+- Added Unix SIGTERM/SIGINT forwarding, ignored HUP/PIPE, and real UnixDatagram
+  sd_notify frames for filesystem and Linux abstract sockets. Added Windows SCM
+  dispatcher, handler, interrogate/status mapping, pending checkpoints, accepted
+  stop/preshutdown controls and a guard against RUNNING after STOP_PENDING.
+  ServiceMain constructs its runtime; it never waits on console Ctrl-C.
+- Exact `arxd service run` has no config/layout override. Windows outside SCM
+  exits 10 (real unprivileged binary test). Unix exits 7 without reading state;
+  both production entries deliberately lack the real application adapter. Under
+  SCM the current candidate reports integration failure, never RUNNING. Existing
+  foreground HTTP/local behavior and five-second HTTP graceful drain remain.
+- `SetTokenOwner = TokenUser` runs only in the service process before creating
+  objects, without privilege adjustment. An isolated ordinary child-process test
+  creates a real directory/file and independently compares their owners against
+  TokenUser; it passes locally. It never mutates the parent process token.
+- Private service config policy is explicitly required by `Application`:
+  root/SYSTEM exact ownership, protected Windows DACL restricted to SYSTEM and
+  Administrators (Unix root/private modes). The foreground DACL helper alone
+  does not verify that policy. Actual fixed config/owner validation belongs to
+  the later layout/config adapter and is **not implemented or accepted here**.
+- Local Windows checks: `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  `cargo nextest run --workspace --locked --no-fail-fast`: **40/40 passed**,
+  plus one ignored subprocess-only owner fixture which its passing parent test
+  explicitly invokes. All 28 baseline tests remain and pass. New coverage proves
+  ordered hooks/cancellation/audit, stop before/during startup, startup and cleanup
+  failure codes, pending checkpoints, bounded stuck drain, and reporting-failure
+  cleanup. Real binary tests reject extra service args and verify outside-SCM 10.
+- Rust metadata-only cross-target checks passed with
+  `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 cargo clippy -p arxd --tests --locked --target
+  x86_64-unknown-linux-gnu -- -D warnings` and the same command targeting
+  `aarch64-apple-darwin`. This avoids bundled SQLite's missing cross C compiler;
+  nothing was linked or run on Unix. An initial ordinary Linux cargo check failed
+  because `x86_64-linux-gnu-gcc` is absent; one Unix test-module ordering lint and
+  one initial fixture style lint were corrected before the successful checks.
+- Native Unix CI tests are source/type-checked only here: subprocess SIGTERM and
+  SIGINT each drive Host drain/audit; HUP/PIPE do not stop that subprocess; actual
+  filesystem and abstract UnixDatagram receivers verify READY/STOPPING frames.
+  No system daemon, privileged fixture, dispatch or workflow change is involved.
+  Windows SCM-hosted callbacks/status timing, SYSTEM/full-admin token behavior,
+  native Unix signals/notify, and all service installations remain
+  **unverified on real hardware**. Test doubles are `cfg(test)` only and provide
+  no inventory, real execution identity or milestone acceptance.
+- Next wiring interface: implement `Application::{load_config, verify_layout,
+  open_store, service_start, bind, preflight, start_discovery, serve,
+  stop_accepting, drain, service_stop, release}` with the real fixed Layout,
+  bounded service config, reconciled activity store and local inventory adapter.
+  `bind` receives run cancellation; `drain` must join tracked work and persist
+  terminal outcomes with a separate shutdown stop reason, **not** invent an
+  activity-v2 outcome enum. Host audit hooks must durably commit daemon rows.
+  Unix `run_application` owns signal forwarding and notify; Windows
+  `run_application` uses dispatcher context and must be called on ServiceMain's
+  runtime once the real adapter exists. Until then production remains fail-closed.
+- Coordinator steering applied: constant packaging artifacts stay on the separate
+  root branch; no duplication/integration here. Separate stop_reason alignment
+  stays with activity-v2 work. Store/MCP/local transport/inventory tests, execution
+  backends, owner commands, accounts, rights and old Lab Manager are untouched.
+  Root must integrate and obtain independent review before any installation.
