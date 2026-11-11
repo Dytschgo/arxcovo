@@ -1,5 +1,11 @@
 # Arxcovo progress
 
+## Mirror mitigation review correction
+
+- Independent Anthropic / claude-opus-5-5 / requested high review at `a97fd74` found B1: the actual Ubuntu image uses `mirror+file:/etc/apt/apt-mirrors.txt`, so the original direct-URI candidate would refuse unchanged. Its report is retained in `docs/reviews/ubuntu-mirror-mitigation-review.md`; nothing had been published or executed. Root cause of the DNS failure remains unknown.
+- Codex / gpt-6.1-sol, medium added guarded support for that one exact mirror-list path, validating all entries and optional priorities before source replacement. A regression failed first. The 144-byte observed entry format now passes through the complete owned-temp plan/recheck/publication loop; the mirror list and third-party sources remain unchanged. Tests cover stale identity/bytes, atomic staging cleanup, mode requests, all-plan refusal, parent/file-count guards and an empty plan.
+- The helper now refuses alternate insecure boolean spellings, tests the missing deb822 weak/downgrade options, recognizes lowercase URI fields, opens files nonblocking before type checks and prepares isolated root Python. Twenty portable tests pass locally. Eight restored source mutations now fail assertions: indirect-list validation, fresh bytes, fresh identity, mode preservation, file-count limit, parent policy, empty-plan refusal and rewritten-output bound. Root facts and fchmod are injected only in owned-temp tests; actual root APT publication/installation is still unrun. No owner-machine APT access or sudo ran. The revised candidate requires a fresh independent review before publication and does not establish a CI fix or M2 acceptance.
+
 ## Ubuntu signed-mirror mitigation candidate
 
 - Codex / gpt-6.1-sol, medium retained the PR32 observation: job 130635247058, source `b475bf1`, Ubuntu 26.04 image `20261101.186.1`, three Ubuntu-domain timeouts and resolved Kernel Archives/GitHub/Microsoft controls. The existing Playwright dependency install still failed; root cause is unknown.

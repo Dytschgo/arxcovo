@@ -13,7 +13,12 @@ mitigation candidate, not an established root cause or a verified CI fix.
 
 The [Kernel Archives Ubuntu mirror](https://mirrors.edge.kernel.org/ubuntu/dists/)
 lists resolute, updates, security and backports. The candidate rewrites only
-the exact URI values for the three observed hosts to its HTTPS endpoint. Suites,
+the exact URI values for the three observed hosts to its HTTPS endpoint. It
+also recognizes only `mirror+file:/etc/apt/apt-mirrors.txt`, after reading that
+exact file with the same native file guards and validating every entry as an
+allowed Ubuntu HTTP/HTTPS URI with at most one bounded `priority:N` tag. A
+foreign entry, malformed line, empty/oversized list or nested mirror URI refuses.
+The mirror list itself is never modified. Suites,
 components, architectures, signing-key selection, comments and unrelated
 repositories remain unchanged. Existing global key selection is retained when
 a source has no explicit Signed-By. No keys or insecure APT options are added.
@@ -23,7 +28,8 @@ continues to verify Release metadata and package checksums.
 Both legacy `.list` and deb822 `.sources` are supported conservatively. Unsafe
 trust options, foreign explicit keyrings, malformed target stanzas, unknown
 Ubuntu hosts and mixed target/foreign URI stanzas refuse. Every file is bounded
-to 64 KiB and at most 32 files are read. The whole plan is validated first.
+to 64 KiB and at most 32 source files are read, plus the optional mirror list
+bounded to 4 KiB and sixteen entries. The whole plan is validated first.
 Only root-owned, private-against-write, regular single-link files under the
 fixed APT directories are replaced through same-directory staging. Existing
 source identity and bytes are checked before replacement. A failure leaves CI
@@ -31,7 +37,7 @@ red; a partial successful rewrite is not rolled back. Noncooperating root
 writers are outside this ephemeral helper's guarantee.
 
 Activation, after review, would preserve only the four non-secret intent fields
-through sudo and run the helper in the disposable Ubuntu job before the
+through sudo and run isolated Python (`-I -B`) in the disposable Ubuntu job before the
 unchanged `npx playwright install --with-deps chromium`. APT update, signature
 verification, dependency installation and smoke tests must still pass. Do not
 change resolver configuration, hardcode IP addresses, disable checks, retry
@@ -41,3 +47,9 @@ Portable tests use synthetic native file facts for root ownership, regular-file,
 link-count, mode, read-size and no-follow guards. They do not open owner-machine
 APT files. Actual root publication and package installation have not run and
 remain unverified; no workflow has executed this candidate yet.
+
+The complete plan/recheck/publication loop is also tested against owned temporary
+trees using injected root facts and a recorded fchmod request. Real staging,
+byte replacement and cleanup run there; this provides no root-owner or Unix
+permission proof. Tests cover the observed 144-byte priority mirror list,
+preservation, all-plan refusal, stale bytes/identity and publication failure.

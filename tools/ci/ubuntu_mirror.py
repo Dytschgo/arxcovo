@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 MIRROR = "https://mirrors.edge.kernel.org/ubuntu"
 HOSTS = {"azure.archive.ubuntu.com", "archive.ubuntu.com", "security.ubuntu.com"}
 KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+MIRROR_LIST = "mirror+file:/etc/apt/apt-mirrors.txt"
 MAX_BYTES = 65536
 MAX_FILES = 32
 
@@ -18,7 +19,11 @@ class Refusal(Exception):
     pass
 
 
-def replacement(uri):
+def replacement(uri, indirect=False):
+    if uri == MIRROR_LIST:
+        if not indirect:
+            raise Refusal()
+        return MIRROR
     if uri.rstrip("/") == MIRROR:
         return MIRROR
     parts = urlsplit(uri)
@@ -33,15 +38,18 @@ def replacement(uri):
 
 
 def trust(options):
-    if re.search(r"(?:trusted|allow-insecure|allow-weak|allow-downgrade-to-insecure)\s*=\s*yes",
-                 options, re.I) or re.search(r"check-valid-until\s*=\s*no", options, re.I):
-        raise Refusal()
+    for key, value in re.findall(r"([a-z-]+)\s*=\s*([^\s\]]+)", options, re.I):
+        if key.lower() in ("trusted", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure"):
+            if value.lower() not in ("no", "false", "0"):
+                raise Refusal()
+        if key.lower() == "check-valid-until" and value.lower() not in ("yes", "true", "1"):
+            raise Refusal()
     keys = re.findall(r"signed-by\s*=\s*([^\s\]]+)", options, re.I)
     if keys and keys != [KEYRING]:
         raise Refusal()
 
 
-def rewrite_list(text):
+def rewrite_list(text, indirect=False):
     lines = []
     for line in text.splitlines(keepends=True):
         if not line.strip() or line.lstrip().startswith("#"):
@@ -50,7 +58,7 @@ def rewrite_list(text):
         match = re.match(r"[ \t]*deb(?:-src)?[ \t]+(?:\[[^\]\r\n]*\][ \t]+)?(?P<uri>[^ \t\r\n]+)", line)
         if not match:
             raise Refusal()
-        new = replacement(match["uri"])
+        new = replacement(match["uri"], indirect)
         if new is not None:
             trust(line[:match.start("uri")])
             if len(line[match.end("uri"):].split("#", 1)[0].split()) < 2:
@@ -60,15 +68,15 @@ def rewrite_list(text):
     return "".join(lines)
 
 
-def rewrite_sources(text):
+def rewrite_sources(text, indirect=False):
     blocks = re.split(r"(\n[ \t]*\n)", text)
     for index in range(0, len(blocks), 2):
         block = blocks[index]
-        matches = list(re.finditer(r"(?m)^URIs:[ \t]*(?P<uris>[^\r\n]*)", block))
+        matches = list(re.finditer(r"(?mi)^URIs:[ \t]*(?P<uris>[^\r\n]*)", block))
         if not matches:
             continue
         uris = matches[0]["uris"].split()
-        replacements = [replacement(uri) for uri in uris]
+        replacements = [replacement(uri, indirect) for uri in uris]
         if not any(value is not None for value in replacements):
             continue
         if len(matches) != 1 or not uris or any(value is None for value in replacements):
@@ -94,15 +102,15 @@ def rewrite_sources(text):
     return "".join(blocks)
 
 
-def rewrite(data, suffix):
+def rewrite(data, suffix, indirect=False):
     if len(data) > MAX_BYTES or b"\x00" in data:
         raise Refusal()
     try:
         text = data.decode("utf-8")
         if suffix == ".list":
-            result = rewrite_list(text)
+            result = rewrite_list(text, indirect)
         elif suffix == ".sources":
-            result = rewrite_sources(text)
+            result = rewrite_sources(text, indirect)
         else:
             raise Refusal()
     except (UnicodeError, ValueError):
@@ -114,7 +122,7 @@ def rewrite(data, suffix):
 
 
 def read_source(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
@@ -134,13 +142,36 @@ def runner_context():
             and os.environ.get("GITHUB_REPOSITORY") == "Dytschgo/arxcovo")
 
 
-def apply():
-    # Intent guard only, not provenance proof. Never run this on an owner host.
-    if not runner_context():
+def validate_mirror_list(data):
+    if len(data) > 4096 or b"\x00" in data:
         raise Refusal()
-    roots = (Path("/etc/apt"), Path("/etc/apt/sources.list.d"))
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeError:
+        raise Refusal() from None
+    count = 0
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        tokens = line.split()
+        if (len(tokens) not in (1, 2)
+                or (len(tokens) == 2 and not re.fullmatch(r"priority:[0-9]{1,6}", tokens[1]))):
+            raise Refusal()
+        try:
+            if urlsplit(tokens[0]).hostname not in HOSTS or replacement(tokens[0]) != MIRROR:
+                raise Refusal()
+        except ValueError:
+            raise Refusal() from None
+        count += 1
+    if not 1 <= count <= 16:
+        raise Refusal()
+
+
+def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
+    # Private injection seam for owned-temp tests, never a CLI/config selector.
+    roots = (apt_root, apt_root / "sources.list.d")
     for root in roots:
-        info = root.lstat()
+        info = inspect_dir(root)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             raise Refusal()
     paths = sorted(p for p in roots[1].iterdir() if p.suffix in (".list", ".sources"))
@@ -149,10 +180,14 @@ def apply():
         paths.append(legacy)
     if not paths or len(paths) > MAX_FILES:
         raise Refusal()
+    records = [(path, *read(path)) for path in paths]
+    indirect = any(MIRROR_LIST.encode() in data for _, data, _ in records)
+    if indirect:
+        data, _ = read(apt_root / "apt-mirrors.txt")
+        validate_mirror_list(data)
     plan = []
-    for path in paths:
-        before, info = read_source(path)
-        after = rewrite(before, path.suffix)
+    for path, before, info in records:
+        after = rewrite(before, path.suffix, indirect)
         if before != after:
             plan.append((path, before, after, info))
     if not plan:
@@ -160,7 +195,7 @@ def apply():
     # Validate the complete plan before the first change. Only root can modify
     # these parents; noncooperating root writers remain outside this CI helper.
     for path, before, after, old in plan:
-        current, info = read_source(path)
+        current, info = read(path)
         if current != before or (info.st_dev, info.st_ino) != (old.st_dev, old.st_ino):
             raise Refusal()
         fd, staged = tempfile.mkstemp(prefix=".arxcovo-mirror-", dir=path.parent)
@@ -175,6 +210,13 @@ def apply():
             if os.path.exists(staged):
                 os.unlink(staged)
     return len(plan)
+
+
+def apply():
+    # Intent guard only, not provenance proof. Never run this on an owner host.
+    if not runner_context():
+        raise Refusal()
+    return _apply(Path("/etc/apt"))
 
 
 def main():

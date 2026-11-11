@@ -1,14 +1,176 @@
 import contextlib
 import io
 import stat
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import ubuntu_mirror as mirror
 
+MIRRORS = (b"http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+           b"https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+           b"https://security.ubuntu.com/ubuntu/\tpriority:3\n")
+INDIRECT_SOURCE = (b"Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
+                   b"Suites: resolute resolute-updates resolute-backports resolute-security\n"
+                   b"Components: main restricted universe multiverse\n"
+                   b"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+
+
+def fixture_reader(path):
+    info = path.stat()
+    # Model root policy facts on owned temporary files; no root file is opened.
+    facts = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1,
+                            st_dev=info.st_dev, st_ino=info.st_ino)
+    return path.read_bytes(), facts
+
+
+def fixture_directory(_):
+    return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+
+def make_tree(directory):
+    root = Path(directory) / "apt"
+    sources = root / "sources.list.d"
+    sources.mkdir(parents=True)
+    source = sources / "ubuntu.sources"
+    source.write_bytes(INDIRECT_SOURCE)
+    (root / "apt-mirrors.txt").write_bytes(MIRRORS)
+    return root, source
+
 
 class UbuntuMirrorTests(unittest.TestCase):
+    def setUp(self):
+        # Windows lacks fchmod. Record the publication request on owned temp
+        # files without claiming a real Unix permission change was exercised.
+        chmod = patch.object(mirror.os, "fchmod", create=True)
+        self.addCleanup(chmod.stop)
+        chmod.start()
+
+    def test_complete_indirect_runner_plan_rechecks_and_publishes(self):
+        self.assertEqual(len(MIRRORS), 144)
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = make_tree(directory)
+            legacy = root / "sources.list"
+            legacy.write_bytes(b"deb https://security.ubuntu.com/ubuntu resolute-security main\n")
+            unrelated = root / "sources.list.d" / "vendor.list"
+            unrelated.write_bytes(b"deb https://packages.microsoft.com/repos/code stable main\n")
+            reads = []
+
+            def read(path):
+                reads.append(path.name)
+                return fixture_reader(path)
+
+            with patch.object(mirror.os, "fchmod", create=True) as mode:
+                self.assertEqual(mirror._apply(root, read, fixture_directory), 2)
+            self.assertEqual(source.read_bytes(), INDIRECT_SOURCE.replace(mirror.MIRROR_LIST.encode(),
+                                                                          mirror.MIRROR.encode()))
+            self.assertEqual((root / "apt-mirrors.txt").read_bytes(), MIRRORS)
+            self.assertEqual(unrelated.read_bytes(), b"deb https://packages.microsoft.com/repos/code stable main\n")
+            self.assertEqual(reads.count("ubuntu.sources"), 2)
+            self.assertEqual(reads.count("sources.list"), 2)
+            self.assertEqual(reads.count("apt-mirrors.txt"), 1)
+            self.assertEqual([call.args[1] for call in mode.call_args_list], [0o644, 0o644])
+            self.assertFalse(any(root.rglob(".arxcovo-mirror-*")))
+
+    def test_entire_plan_validation_precedes_any_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = make_tree(directory)
+            bad = root / "sources.list.d" / "z.sources"
+            bad.write_bytes(INDIRECT_SOURCE.replace(b"Signed-By:", b"Trusted: yes\nSigned-By:"))
+            with patch.object(mirror.os, "replace") as publish:
+                with self.assertRaises(mirror.Refusal):
+                    mirror._apply(root, fixture_reader, fixture_directory)
+            publish.assert_not_called()
+            self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+
+    def test_invalid_indirect_mirror_list_never_changes_sources(self):
+        for data in (b"", b"https://foreign.invalid/ubuntu priority:1\n",
+                     b"http://archive.ubuntu.com/ubuntu priority:1 extra\n",
+                     b"mirror+file:/private priority:1\n", b"https://[bad/\n",
+                     b"http://archive.ubuntu.com/ubuntu priority:-1\n", b"x" * 4097):
+            with self.subTest(data_size=len(data)), tempfile.TemporaryDirectory() as directory:
+                root, source = make_tree(directory)
+                (root / "apt-mirrors.txt").write_bytes(data)
+                with self.assertRaises(mirror.Refusal):
+                    mirror._apply(root, fixture_reader, fixture_directory)
+                self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+
+    def test_fresh_bytes_and_identity_each_refuse_stale_publication(self):
+        for change in ("bytes", "identity"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root, source = make_tree(directory)
+                calls = 0
+
+                def read(path):
+                    nonlocal calls
+                    data, facts = fixture_reader(path)
+                    if path == source:
+                        calls += 1
+                        if calls == 2:
+                            if change == "bytes":
+                                data += b"# changed\n"
+                            else:
+                                facts.st_ino += 1
+                    return data, facts
+
+                with patch.object(mirror.os, "replace") as publish:
+                    with self.assertRaises(mirror.Refusal):
+                        mirror._apply(root, read, fixture_directory)
+                publish.assert_not_called()
+                self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+
+    def test_publication_error_cleans_only_its_stage_and_preserves_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = make_tree(directory)
+            with patch.object(mirror.os, "replace", side_effect=OSError("injected")), \
+                 patch.object(mirror.os, "fchmod", create=True):
+                with self.assertRaises(OSError):
+                    mirror._apply(root, fixture_reader, fixture_directory)
+            self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+            self.assertFalse(any(root.rglob(".arxcovo-mirror-*")))
+
+    def test_parent_guards_file_count_and_empty_plan_refuse_before_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, _ = make_tree(directory)
+            for mode, uid in [(stat.S_IFDIR | 0o777, 0), (stat.S_IFDIR | 0o755, 1),
+                              (stat.S_IFLNK | 0o755, 0)]:
+                with self.subTest(mode=mode, uid=uid), patch.object(mirror.os, "replace") as publish:
+                    with self.assertRaises(mirror.Refusal):
+                        mirror._apply(root, fixture_reader,
+                                      lambda _: SimpleNamespace(st_mode=mode, st_uid=uid))
+                    publish.assert_not_called()
+            for i in range(32):
+                (root / "sources.list.d" / f"vendor-{i}.list").write_bytes(b"# empty\n")
+            with self.assertRaises(mirror.Refusal):
+                mirror._apply(root, fixture_reader, fixture_directory)
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = make_tree(directory)
+            source.write_bytes(b"# no active Ubuntu source\n")
+            with self.assertRaises(mirror.Refusal):
+                mirror._apply(root, fixture_reader, fixture_directory)
+
+    def test_lowercase_deb822_uri_is_recognized(self):
+        before = INDIRECT_SOURCE.replace(b"URIs:", b"uris:")
+        self.assertEqual(mirror.rewrite(before, ".sources", indirect=True),
+                         before.replace(mirror.MIRROR_LIST.encode(), mirror.MIRROR.encode()))
+
+    def test_uri_expansion_cannot_exceed_output_bound(self):
+        prefix = b"deb http://archive.ubuntu.com/ubuntu resolute main\n#"
+        before = prefix + b"x" * (mirror.MAX_BYTES - len(prefix))
+        self.assertEqual(len(before), mirror.MAX_BYTES)
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite(before, ".list")
+
+    def test_observed_runner_mirror_file_requires_validation(self):
+        before = (b"Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
+                  b"Suites: resolute resolute-updates resolute-backports resolute-security\n"
+                  b"Components: main restricted universe multiverse\n"
+                  b"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite(before, ".sources")
+
     def test_source_reads_are_bounded_and_check_native_facts(self):
         facts = dict(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1, st_size=5)
         cases = [(None, b"fixed", True), (dict(st_uid=1), b"fixed", False),
@@ -21,6 +183,7 @@ class UbuntuMirrorTests(unittest.TestCase):
             with self.subTest(changes=changes, accepted=accepted), \
                  patch.object(mirror.os, "O_NOFOLLOW", 0x20000, create=True), \
                  patch.object(mirror.os, "O_CLOEXEC", 0x80000, create=True), \
+                 patch.object(mirror.os, "O_NONBLOCK", 0x800, create=True), \
                  patch.object(mirror.os, "open", return_value=123) as opened, \
                  patch.object(mirror.os, "fstat", return_value=info), \
                  patch.object(mirror.os, "fdopen") as file:
@@ -33,7 +196,7 @@ class UbuntuMirrorTests(unittest.TestCase):
                     with self.assertRaises(mirror.Refusal):
                         mirror.read_source("fixed")
                 self.assertEqual(opened.call_args.args[1],
-                                 mirror.os.O_RDONLY | 0x20000 | 0x80000)
+                                 mirror.os.O_RDONLY | 0x20000 | 0x80000 | 0x800)
 
     def test_deb822_preserves_every_byte_except_uri_values(self):
         before = (b"# fixed comment\nTypes: deb deb-src\nURIs: http://azure.archive.ubuntu.com/ubuntu/\n"
@@ -76,11 +239,13 @@ class UbuntuMirrorTests(unittest.TestCase):
     def test_insecure_or_foreign_key_settings_refuse(self):
         for options in ("trusted=yes", "ALLOW-INSECURE=YES", "allow-weak=yes",
                         "allow-downgrade-to-insecure=yes", "check-valid-until=no",
-                        "signed-by=/private-keyring"):
+                        "signed-by=/private-keyring", "trusted=true", "trusted=1",
+                        "allow-insecure=true", "check-valid-until=false"):
             with self.subTest(options=options), self.assertRaises(mirror.Refusal):
                 mirror.rewrite(f"deb [{options}] http://archive.ubuntu.com/ubuntu resolute main\n".encode(), ".list")
         for field in ("Trusted: yes", "Allow-Insecure: yes", "Check-Valid-Until: no",
-                      "Signed-By: /private-keyring"):
+                      "Signed-By: /private-keyring", "Allow-Weak: yes",
+                      "Allow-Downgrade-To-Insecure: yes"):
             with self.subTest(field=field), self.assertRaises(mirror.Refusal):
                 mirror.rewrite(("Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\n"
                                 "Suites: resolute\nComponents: main\n" + field + "\n").encode(), ".sources")
