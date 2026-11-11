@@ -561,3 +561,21 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Installed service, dedicated-account execution and physical hardware paths
   remain **unverified on real hardware**. Architecture review and the full
   milestone acceptance remain open.
+
+## PR31 observation review follow-up
+
+- Independent Anthropic / claude-opus-5-5 review passed6dda6e3 (requested high
+  effort; the reviewer did not independently observe the effort setting). No
+  blocking finding was raised. The retained source metadata now also names the
+  immutable macos-26-arm64 image version20261102.0473.1, checked directly in the
+  original job130592903303 setup log. Observation rows are unchanged.
+- Each current_integrity_policy_accepts value checks that opened directory on
+  its own; it does not establish a complete protected path or installed layout.
+  The 0755 application's support group has no mode-bit write authority. The
+  0775 runtime-parent group has write/execute authority with no sticky bit,
+  allowing namespace entry creation/rename/removal; relaxing only the group-ID
+  rule would correctly still refuse it. Neither fact alone justifies a policy
+  relaxation. A dedicated macOS architecture correction remains in progress.
+- This follow-up changes documentation/metadata only. No new native runtime,
+  installed service or M2 acceptance is claimed. Hosted checks and the exact-head
+  documentation recheck remain required before merge.
