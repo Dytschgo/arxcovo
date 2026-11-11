@@ -223,3 +223,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod owner_scm;
+#[cfg(windows)]
+mod owner_scm_windows;
