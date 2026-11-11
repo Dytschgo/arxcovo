@@ -188,3 +188,14 @@ The newer head incorporates path-main b29f531 and needs fresh hosted checks and
 exact-head review. The executor, driver and manual workflow remain unchanged.
 No privileged cross-account test, runtime symlink mutation or controller-cap
 experiment has run. These paths remain **unverified on real hardware**.
+
+## Service-stack integration checkpoint
+
+The candidate now includes merged service/owner/SCM foundations through main
+`cd464b2`. Unix executor source is unchanged from published `9055ab0`. On the
+combined Windows tree, formatting, locked all-target Clippy and 172 normal
+nextest tests passed, along with 29 Python driver guards, 26 CI-helper tests
+and three artifact checks; two native artifact checks skipped. Subprocess-only
+fixtures were exercised through parents. This does not rerun the historical
+mutation checks or establish native Unix execution. Fresh exact-head independent
+review and hosted gates remain required; the privileged experiment remains unrun.
