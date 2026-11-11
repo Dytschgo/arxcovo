@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#25](https://github.com/Dytschgo/arxcovo/pull/25), `63b6555d21ea2f82e34c84ca02803e062078bde7`, 17:59:09 UTC, through all five required gates. Native validation foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: fix, independently re-review and land Application #27, then existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after configuration #21 passed on its first attempt, run 43071362527 at `2bdcb20`: **490 seconds**, below 15 minutes. The new native-validation main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -621,3 +621,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium aligned existing #25 with actual configuration squash `2bdcb20`, whose tree is identical to reviewed `9f74919`. Duplicate-history conflicts retained the already validated native-validation tree; the crate, packaging, Cargo/toolchain and script trees remain byte-identical to independently reviewed `d045cc4`, and CI workflows/helpers match merged main. All published history is preserved. No Rust implementation changed. The local preparation passed formatting, 26 helper tests and three portable artifact checks (two native Unix skips); source-equivalent prior Rust verification remains applicable, without claiming it was rerun now.
 - #21 merged at 17:46:19 UTC with all five gates green. #20 main CI completed successfully in 551 seconds. #25 requires a fresh exact-head independent recheck and all required hosted checks before merge; the full Application review is running separately on its unchanged public source. No new feature PR or privileged operation. M2 installed-service/dedicated-account acceptance remains open and **unverified on real hardware**.
+
+## CI history checkpoint after native validation merge
+
+- Codex / gpt-6.1-sol, medium aligned existing #26 locally with actual main `63b6555` without pushing. Code, workflow and helper trees match main; Current state records actual #25 merge first. All prior 21 history rows remain unchanged. A bounded API list of main push CI runs followed by each new first-attempt endpoint added 2 completed record(s): run 43071362527 at `2bdcb20`, 490 seconds, success; run 43073378419 at `63b6555`, 414 seconds, success. Live runs are excluded; the history still does not control the trusted budget gate. JSON/encoding/whitespace checks passed, no workflow/policy/timeout changed. Fresh independent review and required hosted gates remain pending; no installed/native M2 acceptance.
