@@ -2,11 +2,11 @@
 
 ## Current state
 
-- Milestone 1: setup acceptance in progress. Milestones 2–6 have not started.
-- Current task: merge reviewed setup acceptance evidence, then continue single-host implementation. Electron and policy-test follow-ups remain open.
-- Last merged PR: [#5](https://github.com/Dytschgo/arxcovo/pull/5), merge `416259fee4fd0644d0adbfd3e366b4b3479fe7d1`, 2026-11-11 08:12:14 UTC. All five required gates passed and GitHub auto-merged without another coordinator merge command after recovery.
+- Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
+- Current task: authenticated MCP inventory/activity and the Windows execution feasibility probe. Electron and policy-test follow-ups remain open.
+- Last merged PR: [#8](https://github.com/Dytschgo/arxcovo/pull/8), merge `3148241287c48178fefc5e13f1396cbc7ae1a757`, 2026-11-11 08:22:47 UTC. All five required gates passed; GitHub completed auto-merge before a redundant coordinator command could act.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
-- No milestone is declared complete. All VM/hypervisor paths remain **unverified on real hardware**.
+- Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
 ## Setup evidence and remaining work
 
@@ -32,7 +32,7 @@
 
 ## Milestones
 
-- [ ] 1. Setup: end-to-end acceptance passed; final evidence review/merge pending.
+- [x] 1. Setup: end-to-end acceptance passed; evidence reviewed and merged in #8.
 - [ ] 2. Single host: per-OS service, inventory MCP, dedicated-account commands and persisted activity; Claude Code MCP acceptance.
 - [ ] 3. Multiple hosts: join codes, CA/mTLS, Raft and remote commands; three-node failure and invalid-code acceptance.
 - [ ] 4. Test VMs: QEMU/WHPX, unattended Windows/Linux templates, guest agent, snapshot/expiry/caps/reserves; real lifecycle acceptance.
@@ -41,7 +41,7 @@
 
 ## Owner actions and local follow-up
 
-- Blockers: setup acceptance passed; evidence PR #8 needs corrected documentation, fresh review and green CI. Later hardware acceptance requires the owner setup below.
+- Blockers: dedicated-account and hardware acceptance require the owner setup below. No remaining setup acceptance blocker.
 - Read-only preflight: the dedicated local `Arxcovo` account is absent; QEMU is not on the current PATH. Owner must create the standard account before dedicated-account host acceptance and complete WHPX/QEMU/data caps before real VM acceptance. No agent performed administrative changes.
 - docs/dev-host-setup.md is prepared locally for a separate documentation PR. It includes resource reserves, disk limits, official installation media and verification steps. Never touch the old Lab Manager installation, state or `agent-windows-test` VM.
 - Electron follow-up #7 verifies rendering, isolation preferences, blocked navigation and popup denial. Clearing ELECTRON_RUN_AS_NODE only in the launched child fixes the harness launch failure. Hosted Ubuntu/macOS/Windows tests passed on b8c2187; no sandbox bypass was added. VM and hypervisor paths remain unverified.
@@ -78,6 +78,9 @@
 | Recovery PR #6 builder | Codex / gpt-6.1-sol | medium | Removed fixture, successful measured ci-speed exception and merge; fast main verified |
 | Evidence PR #8 builder | Codex / gpt-6.1-sol | medium | API-derived history and acceptance outcomes; correcting stale ADR/progress after review |
 | PR #8 review round 1 | Claude / claude-opus-5-5 | high | Failure on ebdb8f4: stale ADR status; acceptance evidence independently confirmed |
+| PR #8 review round 2 | Claude / claude-opus-5-5 | high | Success on 3b6c819 after documentation corrections; all CI passed and #8 merged |
+| MCP inventory/activity tracer | Codex / gpt-6.1-sol | high | Isolated builder running; authenticated official SDK transport, inventory and persisted activity only; no command execution or acceptance claim |
+| Windows execution feasibility probe | Codex / gpt-6.1-sol | high | Second isolated builder preparing disposable-CI-only identity/Job probe; no owner-PC privileged execution or account changes permitted |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
