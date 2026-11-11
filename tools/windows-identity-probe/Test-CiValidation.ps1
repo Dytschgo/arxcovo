@@ -141,4 +141,5 @@ foreach ($file in Get-ChildItem $PSScriptRoot -Include *.ps1,*.psm1 -File -Recur
     }
     $script:count++
 }
+& "$PSScriptRoot/Test-SetupDiagnostics.ps1"
 Write-Output ('{"stage":"helper-self-test","ok":true,"assertions":' + $count + ',"privilegedPathsRun":false}')
