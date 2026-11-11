@@ -4,6 +4,8 @@
 <dict>
     <key>Label</key>
     <string>com.arxcovo.arxd</string>
+    <key>Disabled</key>
+    <true/>
     <key>ProgramArguments</key>
     <array>
         <string>/Library/Application Support/Arxcovo/libexec/arxd</string>

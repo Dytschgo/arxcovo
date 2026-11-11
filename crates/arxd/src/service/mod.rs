@@ -5,9 +5,12 @@ pub mod config;
 pub mod layout;
 pub mod native;
 pub mod owner_plan;
-pub mod preflight;
+pub mod owner_query;
+pub mod owner_unix;
 
 pub mod owner_transactions;
+pub mod preflight;
+
 #[cfg(windows)]
 pub mod owner_windows;
 use std::{future::Future, time::Duration};
