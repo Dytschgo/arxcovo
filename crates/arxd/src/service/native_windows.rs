@@ -205,6 +205,21 @@ pub fn protection(file: &File) -> Result<Protection, Error> {
             return Err(Error::Permissions);
         }
         let _guard = Local(sd);
+        descriptor_protection(sd)
+    }
+}
+fn descriptor_protection(sd: PSECURITY_DESCRIPTOR) -> Result<Protection, Error> {
+    unsafe {
+        let mut owner = null_mut();
+        let mut acl = null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        if IsValidSecurityDescriptor(sd) == 0
+            || GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0
+            || GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) == 0
+        {
+            return Err(Error::Permissions);
+        }
         let owner = sid_string(owner).map_err(|_| Error::Permissions)?;
         let mut control = 0;
         let mut rev = 0;
@@ -247,7 +262,7 @@ pub fn protection(file: &File) -> Result<Protection, Error> {
                         } else {
                             Ace::Allow {
                                 sid: sid_string(sid).map_err(|_| Error::Permissions)?,
-                                writes: a.Mask & (0x10000000 | 0x40000000 | 0x000d0156) != 0,
+                                mask: a.Mask,
                                 inherit_only: h.AceFlags & 8 != 0,
                             }
                         }
@@ -329,7 +344,7 @@ fn open_impl(
         }
         let p = protection(&file)?;
         if trusted && !leaf {
-            check_protection(PLATFORM, Policy::BinaryIntegrity, true, &p)?;
+            super::super::layout::check_windows_ancestor(&p)?;
         }
         if leaf {
             return Ok(Observed {
@@ -346,6 +361,111 @@ fn open_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reparse_leaf_and_ancestor_refuse_on_local_junction() {
+        use std::os::windows::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target/file"), b"fixture").unwrap();
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        assert!(
+            std::process::Command::new(cmd)
+                .current_dir(tmp.path())
+                .raw_arg("/d /c mklink /J link target")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(open(&tmp.path().join("target"), true, false, false).is_ok());
+        assert!(open(&tmp.path().join("link"), true, false, false).is_err());
+        assert!(open(&tmp.path().join("link/file"), false, true, false).is_err());
+        std::fs::remove_dir(tmp.path().join("link")).unwrap();
+    }
+    #[test]
+    fn native_access_checks_distinguish_creation_inheritance_and_control() {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+        unsafe {
+            let mut primary = null_mut();
+            assert_ne!(
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_DUPLICATE,
+                    &mut primary
+                ),
+                0
+            );
+            let mut token = null_mut();
+            let duplicated = DuplicateToken(primary, SecurityImpersonation, &mut token);
+            CloseHandle(primary);
+            assert_ne!(duplicated, 0);
+            // Entirely in-memory descriptors: no ACL or owner changes on disk.
+            for (ace, allowed, ancestor_safe) in [
+                ("(A;;0x00000006;;;WD)", 6, true),
+                ("(A;OICIIO;FA;;;WD)", 0, true),
+                ("(A;;0x00000040;;;WD)", 0x40, false),
+                ("(A;;SD;;;WD)", DELETE, false),
+                ("(A;;WD;;;WD)", WRITE_DAC, false),
+                ("(A;;WO;;;WD)", WRITE_OWNER, false),
+            ] {
+                let mut sd = null_mut();
+                assert_ne!(
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide(&format!("O:SYG:SYD:{ace}")).as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut sd,
+                        null_mut()
+                    ),
+                    0
+                );
+                let _sd = Local(sd);
+                let observed = descriptor_protection(sd).unwrap();
+                assert_eq!(
+                    super::super::super::layout::check_windows_ancestor(&observed).is_ok(),
+                    ancestor_safe
+                );
+                for desired in [
+                    FILE_ADD_FILE,
+                    FILE_ADD_SUBDIRECTORY,
+                    FILE_DELETE_CHILD,
+                    DELETE,
+                    WRITE_DAC,
+                    WRITE_OWNER,
+                ] {
+                    let mapping = GENERIC_MAPPING {
+                        GenericRead: FILE_GENERIC_READ,
+                        GenericWrite: FILE_GENERIC_WRITE,
+                        GenericExecute: FILE_GENERIC_EXECUTE,
+                        GenericAll: FILE_ALL_ACCESS,
+                    };
+                    let mut privileges = PRIVILEGE_SET::default();
+                    let mut size = std::mem::size_of_val(&privileges) as u32;
+                    let mut granted = 0;
+                    let mut status = 0;
+                    assert_ne!(
+                        AccessCheck(
+                            sd,
+                            token,
+                            desired,
+                            &mapping,
+                            &mut privileges,
+                            &mut size,
+                            &mut granted,
+                            &mut status
+                        ),
+                        0
+                    );
+                    assert_eq!(status != 0, allowed & desired != 0, "{ace}: {desired:x}");
+                }
+            }
+            CloseHandle(token);
+        }
+    }
     #[test]
     fn real_current_user_is_local_or_refused_without_disclosure() {
         use windows_sys::Win32::{
