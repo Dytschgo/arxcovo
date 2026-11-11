@@ -352,8 +352,9 @@ temporary file. No secret-bearing payload is included in errors.
 `provision_state()` checks the fixed 0700 state directory, refuses WAL/SHM and
 nonempty or unsafe existing prerequisites, then exclusively creates missing
 0600 `activity.lock`, `activity.sqlite3` and `activity.sqlite3-journal`. It takes
-the same native file lock used by Activity and rechecks companions under that
-lock. Empty existing prerequisites allow recovery from a partial provisioning;
+the same native file lock used by Activity and rechecks the database and journal
+under that lock. WAL/SHM are checked only before the lock; the root-only state
+directory makes that acceptable (ADR 0014 section 6). Empty existing prerequisites allow recovery from a partial provisioning;
 nonempty state is never overwritten. Activity still initializes schema and host
 identity transactionally on first service startup. Its existing persistent
 TRUNCATE journal contract is retained (no store API change or SQLite invocation
@@ -363,11 +364,14 @@ Only absolute constant systemctl/launchctl vectors run, with a cleared explicit
 environment, null stdio, fixed cwd and no shell. The child gets 35 seconds, then
 kill and at most one second of reap polling. A timeout does not undo a request
 already delivered to the manager and does not prove the daemon stopped. Any
-nonzero manager result refuses subsequent steps, including unregister; already
-absent launchd jobs may therefore require owner reconciliation before retry.
+nonzero manager result refuses subsequent steps, including unregister. At this
+base, a launchd job that is already absent therefore makes install → uninstall
+and stop → uninstall halt. That defect is blocking. ADR 0014 replaces exit-code
+handling with typed known-absent queries.
 Uninstall removes only identical protected unit/drop-in/plist files, preserving
-config, state, credentials, accounts and directories. Install never enables or
-starts systemd. The plist is disabled by default to prevent first reboot startup;
+config, state, credentials, accounts and directories. **Superseded by ADR 0014
+(below):** the rest of this paragraph describes the PR29 head. Install never
+enables or starts systemd. The plist is disabled by default to prevent first reboot startup;
 install also disables the fixed launchd label before publishing the plist, after
 refusing a conflicting existing plist, so a prior start override cannot enable a
 reinstall. Only explicit start enables and bootstraps launchd after
@@ -405,3 +409,37 @@ the separate dedicated-account executor and account-scoped tool probe. All
 installed-manager/privileged paths remain **unverified on real hardware**. Full
 M2 dedicated-account cargo/Claude Code/activity acceptance remains open. No new
 architecture decision or owner-PC privileged operation is claimed.
+
+### Lifecycle corrections required by ADR 0014 (Opus 5.5 high, 2026-11-11)
+
+The PR29 review found two blocking defects and an unsettled boot rule. ADR 0014
+is the contract for the follow-up commit on that branch. It records no
+implementation, so nothing in this section has been executed. Summary:
+
+- **Boot intent.** Install never starts the service and leaves it off at boot.
+  Start runs enable then start (launchd: enable, then bootstrap if not loaded),
+  so the service also runs at every boot. Stop runs disable then stop
+  (launchd: disable, then bootout if loaded) and is followed by a typed proof
+  that the service stopped. The Windows auto-start (delayed) registration is a
+  recorded divergence for the Windows adapter, not part of this fix.
+- **Endpoint directory.** Install no longer creates it. The owner start
+  preflight accepts a missing endpoint directory, but an existing one must
+  pass the full check. systemd creates the Linux directory. The macOS service
+  creates its own directory with an exclusive, no-follow `mkdirat` and never
+  repairs an existing one. That alone does not prove macOS startup: the
+  stock-ancestor policy stays open.
+- **Absent jobs.** Absence comes only from a typed, bounded, allowlisted
+  `systemctl show` or `launchctl print` query. A foreign or unknown result
+  refuses, and so does any mutating command that is nonzero or times out.
+  The macOS absent exit status must be pinned from captured native evidence
+  and is never guessed.
+- **Status.** It returns one of the six fixed tokens from the mapping tables
+  in ADR 0014. Every other combination is a fixed error.
+- **Allowlist.** It is the exact (program, args, gate) table and now includes
+  every enable and disable call. `Constant` no longer runs manager commands.
+- **Provisioning.** `ProvisionState` is an install step that runs before any
+  artifact is published. It creates only empty, fsynced files and performs no
+  SQLite initialization.
+
+Every launchd and systemd behaviour these rules rely on remains **unverified on
+real hardware**. The evidence still needed is listed in ADR 0014.
