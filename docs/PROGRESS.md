@@ -135,4 +135,4 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 ## Unix executor integration with current main
 
-- Codex / gpt-6.1-sol, medium: integrated main d7f3ebd with the corrected Unix backend. The accessible positive controls and fixture-check forwarding remain present. Integration checks and fresh independent review are pending; no root experiment or owner administration has run.
+- Codex / gpt-6.1-sol, medium: integrated main d7f3ebd with the corrected Unix backend. The accessible positive controls and fixture-check forwarding remain present. Formatting, Clippy with warnings denied and all 44 Windows workspace nextest tests passed. The 29 pure Python tests passed and all ten driver guard mutations were killed with assertion failures and zero errors. Fresh independent review and hosted native checks are pending; no root experiment or owner administration has run.
