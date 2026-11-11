@@ -1,0 +1,31 @@
+{
+  "name": "arxcovo",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "ui",
+    "desktop"
+  ],
+  "engines": {
+    "node": "24.18.0",
+    "npm": "11.16.0"
+  },
+  "packageManager": "npm@11.16.0",
+  "scripts": {
+    "lint": "tsc -p ui/tsconfig.json && eslint .",
+    "test": "node --test scripts/*.test.mjs",
+    "build": "npm run build -w ui",
+    "smoke": "playwright test"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "eslint": "9.39.1",
+    "typescript-eslint": "8.48.1",
+    "typescript": "5.9.3",
+    "@playwright/test": "1.65.0"
+  },
+  "overrides": {
+    "minimatch": "11.0.1"
+  }
+}
