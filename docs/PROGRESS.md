@@ -6,7 +6,7 @@
 - Last merged PR: [#32](https://github.com/Dytschgo/arxcovo/pull/32), `3b6170bbd07e38873deecbd7750432b74fa4cb87`, 17:15:21 UTC, through all five required gates. Its first signed-mirror Ubuntu job passed in 130 seconds; no DNS root-cause fix is claimed.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
 - Queue priority: refresh and land service lifecycle #20, then configuration #21 and the existing dependencies. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` is tracked by run 43066365961; its completed result and duration must be verified before claiming a main pass. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -422,3 +422,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared #21 locally on refreshed lifecycle head `3195f5a` while #20 awaits normal gates. No new feature PR was opened and this preparation has not been pushed. Crate/configuration, packaging, Cargo/toolchain and script bytes match reviewed `aadfa05`; CI workflow/helpers match the refreshed parent. Both provider/evidence tables remain intact and Current state stays first.
 - Local formatting, locked workspace/all-target Clippy, **89/89 nextest tests**, **26/26 CI-helper tests** and three portable artifact checks passed. One direct-only subprocess fixture was exercised by its parent; two native Unix artifact checks skipped. No owner/admin/service operation ran. Publication waits for the actual #20 merge commit and a final metadata refresh; current-head hosted checks and independent review remain required. No installed-service/M2 acceptance is claimed.
+
+## Main CI recovery confirmation
+
+- Codex / gpt-6.1-sol, medium verified the Actions API for main run 43066365961: source `3b6170bbd07e38873deecbd7750432b74fa4cb87`, attempt 1, completed success. Using the repository policy's `updated_at - run_started_at` measure gives **548 seconds (9m08s)**. Main CI is green and under 15 minutes after #32. No rerun, timeout increase or gate exception was used. This record is prepared locally for the next dependency checkpoint; #20 remains the first service-stack merge target.
