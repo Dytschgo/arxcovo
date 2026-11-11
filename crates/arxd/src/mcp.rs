@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Inventory {
     pub activity: Arc<Activity>,
+    pub principal: Option<Principal>,
 }
 #[derive(Clone)]
 pub struct Principal(pub String);
@@ -41,10 +42,15 @@ impl ServerHandler for Inventory {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let principal = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|p| p.extensions.get::<Principal>())
+        let principal = self
+            .principal
+            .as_ref()
+            .or_else(|| {
+                context
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|p| p.extensions.get::<Principal>())
+            })
             .ok_or_else(|| ErrorData::internal_error("authentication context unavailable", None))?;
         // Never persist attacker-provided tool names or arguments.
         let id = self

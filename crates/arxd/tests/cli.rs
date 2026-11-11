@@ -8,6 +8,6 @@ fn missing_configuration_starts_no_listener() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("startup or server failure")
+            .contains("arxd: transport-frame-or-io")
     );
 }

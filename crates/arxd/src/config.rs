@@ -15,6 +15,7 @@ pub struct Config {
     pub listen: Option<SocketAddr>,
     pub state_dir: PathBuf,
     pub agents: Vec<Agent>,
+    pub local: Option<crate::local::Endpoint>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +41,9 @@ impl Config {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(endpoint) = &self.local {
+            endpoint.validate()?;
+        }
         if self.listen.is_some_and(|a| !a.ip().is_loopback()) {
             bail!("listener must be loopback");
         }
