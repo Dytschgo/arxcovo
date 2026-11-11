@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#25](https://github.com/Dytschgo/arxcovo/pull/25), `63b6555d21ea2f82e34c84ca02803e062078bde7`, 17:59:09 UTC, through all five required gates. Native validation foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: fix, independently re-review and land Application #27, then existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after configuration #21 passed on its first attempt, run 43071362527 at `2bdcb20`: **490 seconds**, below 15 minutes. The new native-validation main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -510,6 +510,48 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium found service config allowed the same decoded token hash for distinct principals, unlike foreground Config. The new regression first failed because the duplicate was accepted. Service parsing now rejects duplicate hashes regardless of hex casing while retaining a positive distinct-credential control. Formatting, workspace/all-target Clippy with warnings denied and all 88 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Independent review and hosted checks are pending. This enables no service or owner operation.
 
+## M2 fixed service Application candidate
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high, working alone on prepared
+  branch t3/m2-service-application (initially t3/46c79625) from verified clean pinned base
+  `7606c71b35ab906607c00efa96b99a76bca2409f`. Implemented native service
+  Application composition, separate static/client validation and dynamic build
+  preflight, protected pre-provisioned store with persistent journal, durable
+  lifecycle audit, local authenticated inventory/activity endpoint and tracked
+  bounded shutdown. Dedicated execution remains unavailable; no development
+  executor fallback. Last merged PR and milestone acceptance remain unchanged.
+- Windows checks executed: formatting check, workspace/all-target Clippy with
+  warnings denied, full workspace tests: 106 passed, one direct-only fixture
+  ignored and exercised by its passing parent. Artifact script: three passed,
+  two native Unix checks skipped. Actual normal-user pipe/SDK and durable
+  fixture-store evidence is in docs/service-foundation.md. No privileged
+  service/runtime acceptance or hosted Linux/macOS evidence is claimed.
+- Failure evidence: first Application pipe fixture used a dot in its generated
+  name and correctly failed endpoint validation; corrected the fixture name.
+  The new mutable-handle regression exposed metadata-only Windows handles
+  allowing rename despite share flags; adding read-data access made writes
+  succeed while rename/deletion refuse. Two test compile corrections addressed
+  typed ActivityRow fields. No symptom reached three distinct failed fixes.
+- Open integration: coordinator merges its case-insensitive token-hash
+  uniqueness guard and parent docs/lifecycle refresh; this slice retains its
+  assigned base and deliberately does not duplicate that guard. Independent
+  other-provider review and native Unix hosted checks remain required. Owner
+  adapter must prepare protected DB/journal/lock files; service refuses unsafe
+  or missing prerequisites. Privileged service manager/layout/endpoint/SQLite
+  paths are **unverified on real hardware**. Dedicated-account backend, scoped
+  tool discovery and full M2 cargo/Claude Code acceptance remain open.
+- No admin, provisioning, account/right/task/service/install/dispatch/settings,
+  old Lab Manager/state/VM operation, push, PR, merge, watch or branch switch
+  occurred. No new architecture deviation was introduced.
+
+## Service Application coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate16d3788 with current native/config/lifecycle parents. Credential uniqueness is enforced in shared validate_inventory and tested through both parse and parse_inventory (duplicate/case variants refused, distinct credentials accepted). Formatting, workspace/all-target Clippy with warnings denied and all 107 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. The shared intermittent Windows hosted handle-test failure is separately under diagnosis; this local pass is not a claimed resolution. Fresh independent review and native hosted checks remain pending. No installation or privileged service acceptance occurred.
+
+## Service Application Unix entry expectation
+
+- Hosted Ubuntu job130551366884 at585082c reached the service entry regression and observed permission exit4 while its obsolete pre-Application fixture expected integration-unavailable exit7. Codex / gpt-6.1-sol, medium aligned the assertion with the real Application identity preflight and fixed service-permissions category; the fixture explicitly requires an unprivileged Unix runner before launching. Production refusal logic is unchanged. Fresh hosted verification remains pending.
+
 ## Windows CI handle-probe investigation
 
 - Opus PR20 exact-head recheck passed d8f034f but identified a Windows failure shared by main66c1b17 and PR25/PR20: actual_job_tree_timeout_cancel_shutdown_overflow_and_handles sees child exit101. Production source is unchanged from earlier green runs. Codex / gpt-6.1-sol, medium ran the focused existing test twice locally; both passed, so no cause is claimed. The parent assertion now includes bounded child stderr as well as stdout for diagnosis. Dedicated high-effort diagnosis is pending; no gate is bypassed and no rerun is claimed as a fix.
@@ -571,6 +613,133 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Native ancestor correction coordinator integration
 
 - Codex / gpt-6.1-sol, medium integrated candidate12081f2 with reviewed configuration parentaadfa05 and merged main28 handle regression. Renumbered the Windows namespace ADR to0013 to reserve0012 for the separate owner-recovery contract. Combined formatting, workspace/all-target Clippy with warnings denied and all103 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Builder evidence reports eleven caught/restored mutations and native AccessCheck controls. Fresh exact-head independent review and hosted checks remain pending. PR27 sharing corrections must be preserved when the parent is integrated there; macOS ancestry and installed-service acceptance remain open.
+
+## Service Application ancestor integration
+
+- Codex / gpt-6.1-sol, medium integrated natived045cc4 into PR27, retaining Application FILE_READ_DATA ancestry pins and mutable-state write-sharing/no-delete-sharing behavior while adopting raw ACL masks and namespace authority checks. Formatting, workspace/all-target Clippy with warnings denied and all112 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Fresh security review and hosted checks remain pending. Privileged workspace metadata and detailed preflight-reason findings remain open, as do macOS ancestry and installed-service acceptance.
+
+## PR27 scoped preflight review corrections (2026-11-11)
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol / high, implementation child,
+  worked alone on `t3/service-preflight-review-fixes`, prepared base
+  `c7433438e2d618ca1e3fe010c88e68f03033d434`. Fixed the two assigned
+  preflight findings only. No architecture deviation; ADR 0009's identity-switch
+  boundary remains binding. Last merged PR is unchanged by this task (the latest
+  coordinator merge entry above records PR28); no push/PR/merge/watch performed.
+- Service inventory/startup/dynamic preflight never call workspace_safe; lexical
+  disjointness remains enforced. Only owner-local parse/revalidate/configure-plan
+  retains metadata validation. Poison/counting regression observes zero workspace
+  calls for repeated valid service preflights and failed identity/rights cases,
+  versus one on owner parse and another on configure-plan. Owner metadata refusal
+  is also retained. macOS legacy admin preflight refuses before any observation.
+- Added fixed response-only ExecutionUnavailable and exhaustive token/storedReason
+  matches. list_hosts carries the observed detail; absent-executor run_command
+  and discover_tools return execution_reason and finish refusal with the ADR's
+  coarse schema-3 Reason. Windows account lookup captures ERROR_NONE_MAPPED as
+  confirmed absence; access-denied, insufficient-buffer, no-domain and unknown
+  errors remain generic. Group-lookup failures and local SAM policy refusal do
+  not claim account absence. Unix/macOS resolver errors remain generic until
+  those adapters supply explicit absence evidence. No native error text or
+  private account/path values enter response details or stored metadata.
+- Evidence: synthetic codes run through the production native lookup classifier
+  with explicit absence and ambiguous-error controls; injected account models
+  separately exercise missing/changed/rights failures. SDK duplex MCP table covers
+  all 14 fixed reasons, both refusal tools, exact list_activity readback and SQL
+  completion checks, schema version 3, no detail/os_code columns, database-byte
+  absence of response-only tokens and private argument marker. This is not a
+  claim that native API failure injection or real account deletion was exercised.
+- Three deliberate mutations caught by assertion failures and restored: workspace
+  observation in service preflight; ambiguous Windows codes reported as missing;
+  account_missing persisted as unavailable instead of preflight_failed. The first
+  mapping mutation command hit a CRLF rewrite compile error (not evidence); its
+  byte-preserving rerun reached and failed the exact stored-reason assertion.
+- Actual checks: cargo fmt --all -- --check; cargo clippy --workspace --all-targets
+  --locked -- -D warnings; cargo nextest run --workspace --locked: **116/116 passed**,
+  preserving all 112 previous passing tests plus four regressions; one direct-only
+  fixture skipped by nextest and exercised by its subprocess parent. Test phase
+  7.665 seconds. Focused service tests also passed (53 passed, one fixture ignored).
+  Clippy initially caught a nested test if; collapsed it and Clippy passed.
+- Dedicated execution and tool discovery remain unavailable, with no foreground
+  fallback. Current service reason is a startup observation, not per-run execution
+  acceptance. Workspace access after identity switch, native failure paths on
+  installed hosts, SCM/LSA and Unix/macOS installed service behavior remain
+  **unverified on real hardware**. M2 acceptance is still open. No ignored
+  privileged harness, installation, account/right mutation, admin/elevation,
+  dispatch, service/settings operation, old Lab Manager or VM access occurred.
+  Existing normal-user fixture tests alone ran. Independent other-provider review
+  and hosted required checks remain coordinator work. Mac endpoint/ancestry and
+  SQLite crash-warning findings remain separate slices. ACL masks, namespace
+  policy, ancestry read-data pins and sharing fixes are retained unchanged.
+
+## Service preflight coordinator validation
+
+- Codex / gpt-6.1-sol, medium integrated candidate51a1dee without changing its implementation. Formatting, workspace/all-target Clippy with warnings denied and all116 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Source inspection confirms service preflight omits workspace_safe, owner validation retains it, and only explicit native lookup not-found becomes account_missing. Stored schema3 reason vocabulary is unchanged. Fresh independent review and hosted checks remain pending.
+- PR20 Ubuntu job130562335529 (run43032348219) failed browser dependency installation on DNS resolution of Ubuntu mirrors, after earlier checks. A single failed-job retry was requested at the unchanged reviewed4ead112. This is an environment retry, not a source-fix claim; Windows/macOS checks passed. No gate was bypassed.
+
+## PR27 focused hot-journal persistence investigation (2026-11-11)
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol / high, implementation child,
+  working alone on t3/m2-hot-journal-recovery from prepared base
+  bb077bb45f061c4512d9b2976bed92b7530b2f37. Applied dytschgo-debug; built and ran
+  the crash/reopen feedback loop before attempting a production fix. Last merged
+  PR remains #28 as recorded above. No architecture contract/fence was relaxed.
+- Reproduced reviewer hypothesis using actual child SQLite writes, a flushed
+  unfinished transaction, abrupt termination and verified hot-journal magic/page
+  records. Native Windows no-delete-sharing pins cover state directory ancestry,
+  DB, journal and lock via the same open_impl as production; actual delete
+  attempts fail. The exact reopen assertion failed with extended SQLite code
+  2570 (SQLITE_IOERR_DELETE). This is native evidence, not a simulated error.
+  The explicit cfg(test) service/current-owner policy and private temp ACL helper
+  substitute for SYSTEM ownership/trusted installed ancestors only. No production
+  runtime flag, fixed service path or privileged operation is involved.
+- One failed fix: moving TRUNCATE ahead of page reads still produced 2570.
+  Bundled SQLite marks journal_mode as needing schema, so that pragma itself
+  triggers recovery. Temporary locking_mode=EXCLUSIVE before TRUNCATE preserves
+  the protected journal during that recovery; return to NORMAL follows before
+  size/schema/reconciliation work. Activity lock/pins stay live. No ownership,
+  DACL, private ancestor, reparse/hardlink, FILE_READ_DATA, mutable write-sharing,
+  no-delete-sharing, schema-3 or caller-privacy policy changed.
+- Focused command actually run: cargo test -p arxd --lib
+  pinned_service_recovers_actual_hot_journal --locked -- --nocapture. Original
+  ordering red; pragma-only reorder red; final fix green. Deliberately removing
+  only temporary exclusive mode again failed at the exact reopen assertion with
+  2570; restored. No RerunUntilGreen or guard exception. Regression also verifies
+  identity rollback, child-pending reconciliation, schema/integrity, persistent
+  journal/modes, private caller readback, activity-lock exclusion and second reopen.
+  Child stdin/stdout/stderr are null, readiness 10 s, lifetime 20 s, kill/wait RAII.
+- Checks actually passed: cargo fmt --all -- --check;
+  cargo clippy --workspace --all-targets --locked -- -D warnings;
+  cargo nextest run --workspace --locked (**117/117 passed**, 7.787 s test phase;
+  two subprocess-only helpers skipped directly and exercised by parents);
+  python scripts/test-service-artifacts.py -v (three passed, two native checks
+  skipped); git diff --check. Full prior 116-test Windows baseline retained.
+- Detailed actual evidence and limitations: docs/service-foundation.md, PR27
+  hot-journal section. Native Unix/macOS and actual installed SYSTEM/root recovery
+  remain **unverified on real hardware**. Other-provider review and hosted gates
+  remain coordinator work. Owner-provisioned protected files, installed SCM/LSA,
+  systemd/launchd, dedicated-account execution/probe and real Claude Code M2
+  acceptance remain open. No push/PR/merge/watch, dispatch/settings, installation,
+  admin/elevation, account/right/task/service operation or old Lab Manager/VM
+  access occurred. Mac endpoint and other backends are outside this slice.
+
+## Protected SQLite recovery coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
+
+## Hosted hot-journal fixture owner correction
+
+- Codex / gpt-6.1-sol, medium inspected completed Windows job 130585845956
+  from PR30 run 43039115633. It failed at the initial fixture owner check,
+  before the crash/recovery path: 91 tests passed, one failed and 37 were not
+  run after fail-fast. This is not evidence of a SQLite recovery failure.
+- The parent Application fixture created private-DACL files without setting
+  their owner. It now assigns the current test user's owner SID explicitly on
+  its three newly created temporary files. The strict owner comparison and all
+  production code remain unchanged. No token default-owner change is made.
+- Formatting, workspace/all-target Clippy with warnings denied, and the focused
+  native hot-journal regression passed locally. Hosted full-admin-token evidence
+  is still pending; this correction does not establish installed SYSTEM/root
+  or physical-power-loss recovery. Those paths remain **unverified on real hardware**.
 ## Service lifecycle refresh after merged CI unblock
 
 - Codex / gpt-6.1-sol, medium refreshed #20 from reviewed head `4ead112` against actual main `3b6170b` (#32). The squash tree matches reviewed CI head `d6d3b31`. Only PROGRESS conflicted; both parents' provider tables and evidence were retained, Current state stays first, and last merged PR is #32. #31 is recorded closed as folded into #29.
@@ -595,7 +764,36 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - OpenAI / gpt-6.1-sol / medium prepared #25 locally on configuration head `9f74919` while #21 runs its fresh review and hosted gates. Published history is preserved. Only PROGRESS conflicted; the current state from the refreshed parent remains first, and both parent provider tables and task evidence are retained. Native source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `d045cc4`; CI helpers/workflows match the configuration parent.
 - This refresh ran formatting, 26/26 CI-helper tests and artifact checks (three passed, two native Unix skips). Clippy/nextest were not repeated because the Rust trees are identical to the reviewed head. No native service, owner, admin or account operation ran. No push or new feature PR; publication waits for #21 to merge, then a final refresh and exact-head independent review. Installed-service/dedicated-account M2 acceptance remains open and **unverified on real hardware**.
 
+## Application queue preparation
+
+- OpenAI / gpt-6.1-sol / medium prepared #27 locally on the refreshed #25 branch while #21 waits for its exact-head review and hosted gates. Only PROGRESS conflicted; Current state remains first and both provider/evidence tables are preserved. The entire crate, packaging, Cargo/toolchain and script trees are byte-identical to published Application head `a08187c`; the no-service-workspace preflight, typed refusal mapping, parent-sharing correction, hot-journal recovery and explicit test-owner fix are preserved. CI helpers/workflows match the prepared native-validation parent.
+- Formatting and 26/26 CI-helper tests passed on this integration. Rust tests were not repeated for this source-identical history/CI refresh. A fresh full independent Application review remains required after its parents land; prior review blockers must not be treated as cleared by equivalence alone. No push, new feature PR or privileged operation. Main CI run 43069045513 on merged lifecycle `64b50e9` is queued, not claimed green. Installed services, dedicated execution and M2 acceptance remain open and **unverified on real hardware**.
 ## Native validation refresh after configuration merge
 
 - Codex / gpt-6.1-sol, medium aligned existing #25 with actual configuration squash `2bdcb20`, whose tree is identical to reviewed `9f74919`. Duplicate-history conflicts retained the already validated native-validation tree; the crate, packaging, Cargo/toolchain and script trees remain byte-identical to independently reviewed `d045cc4`, and CI workflows/helpers match merged main. All published history is preserved. No Rust implementation changed. The local preparation passed formatting, 26 helper tests and three portable artifact checks (two native Unix skips); source-equivalent prior Rust verification remains applicable, without claiming it was rerun now.
 - #21 merged at 17:46:19 UTC with all five gates green. #20 main CI completed successfully in 551 seconds. #25 requires a fresh exact-head independent recheck and all required hosted checks before merge; the full Application review is running separately on its unchanged public source. No new feature PR or privileged operation. M2 installed-service/dedicated-account acceptance remains open and **unverified on real hardware**.
+
+## Application review blocker and parent alignment
+
+- Anthropic / claude-opus-5-5, high independently reviewed the full public PR27 range `d045cc4..a08187c`: 117 normal nextest tests passed, two direct fixtures were exercised only through their parents, formatting/Clippy passed, and 10 of 11 guard mutations were caught. Review failed on one confirmed blocker: long-lived read-share-only ancestor handles deny unrelated renames in shared Windows directories. Public evidence: https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091. This status is not waived.
+- Codex / gpt-6.1-sol, medium aligned the local Application with published parent #25 `7af3eac`; only PROGRESS conflicted and all source remains identical to reviewed `a08187c`. A separate Sol high worktree is fixing the ancestor-sharing blocker with owned-temp regressions; no implementation result is claimed yet. The lower-severity pipe casing, SYSTEM-check coverage, state-protection exit mapping, historical macOS endpoint creation and stale-doc findings remain tracked for follow-up. No new feature PR or privileged operation.
+- #25 hosted Ubuntu, Windows, macOS and budget gates have passed; its new-head agent review remains pending. The parent must merge normally before Application publication. Native installed-service and dedicated-account M2 acceptance remain **unverified on real hardware**.
+
+## Application alignment after native validation merge
+
+- Codex / gpt-6.1-sol, medium verified #25 merged as `63b6555` at 17:59:09 UTC through all five gates. Its tree equals independently reviewed `7af3eac`. The local Application already contained that exact parent; duplicate-history squash conflicts retained the current Application tree. Crate/packaging/Cargo/toolchain/script bytes remain identical to public `a08187c` pending the separate sharing fix. No source fix or new acceptance is claimed by this alignment.
+- Main configuration run 43071362527 was independently read from its first-attempt API, success, 2026-11-11T17:46:22Z to 2026-11-11T17:54:32Z = 490 seconds. Current state records the actual latest merge first. PR27 remains blocked by its review finding until the sharing fix, fresh independent review and hosted gates pass. No push/new feature PR or privileged operation; installed-service/dedicated-account paths remain **unverified on real hardware**.
+
+## PR27 blocking ancestor-sharing correction — local candidate
+
+- Provider/effort/task/outcome: OpenAI / gpt-6.1-sol / high; implement only the confirmed retained-ancestor sharing blocker from the [Opus review](https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091). Prepared base `4f29ecf843c01d82fe38da16e8ef42e0b53a7611` on parentpreparedApplication (crate source identical to public `a08187c1e14a5722d4c37bfc9f2690d273d62eb3`). Local implementation complete; independent review/hosted gates pending. Current state and last merged PR above are unchanged; no acceptance claim.
+- Only production change: service `native_windows::open_impl` adds FILE_SHARE_WRITE for non-leaf ancestors, preserving FILE_READ_DATA, retained handles and no FILE_SHARE_DELETE. Immutable final leaves still exclude writers; mutable DB/journal/lock leaves still share read/write without delete sharing. Structural, owner, DACL and namespace checks are unchanged. Owner Windows and development executor source/policies, other protected source and the separate handle-marker patch are untouched. ADR0013 and service-foundation now describe ACL namespace authority and retained nondelete handles accurately, without claiming pins freeze all modification.
+- Regression evidence: nested owned outer temp directory, using existing test-only `open_state_fixture` and production `open_impl`, never fixed installed paths or a production constructor. Before the fix, unrelated sibling-file rename failed with error 32. After the fix, sibling file/folder renames and file/folder moves into a pinned ancestor succeed; protected next-directory rename and DELETE access refuse; mutable leaf writes succeed; delete access, rename and cleanup succeed after drop. Immutable final leaf rejects writers while pinned and permits them after drop.
+- Required source mutations applied individually and restored: old read-only ancestor sharing failed the intended unrelated-sibling rename assertion (error 32); adding ancestor FILE_SHARE_DELETE failed the protected-directory DELETE-access assertion (unexpected successful open). Neither failure was a compiler failure. Restored candidate passed the four focused ancestor/immutable/mutable/hot-journal tests.
+- Checks actually run: `cargo fmt --all` and `cargo fmt --all -- --check` passed; `cargo clippy --workspace --all-targets --locked -- -D warnings` passed; `cargo nextest run --workspace --locked --no-fail-fast` passed **118/118**, with 2 ignored subprocess fixtures skipped and exercised only through normal parents. Real hot-journal recovery/pin tests remain passing. Known unrelated ETW/handle-marker flake did not occur; no repeat or weakening was needed.
+- Limits/remaining gates: fresh independent Opus review and green required hosted checks remain mandatory. Case-sensitive pipe check, Windows SYSTEM-guard test gap, macOS endpoint creation, state-file exit-code mapping and unrelated stale docs remain tracked nonblocking review follow-ups, outside this change. Native installed SYSTEM/service execution remains **unverified on real hardware**. No SYSTEM/root execution, SCM/LSA/account/rights/privilege/install/owner action, Lab Manager/VM operation, push, PR mutation, merge, watch or subagent was performed. Public review was read only; all changes remain local.
+
+## Application sharing correction coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated Sol high candidate `7544fa9` into the Application after actual native-validation merge `63b6555`. The complete crate/packaging/Cargo/toolchain/script trees match the tested candidate exactly; workflows/helpers match merged main. Only PROGRESS conflicted and both histories/provider rows remain. The production change is limited to ancestor FILE_SHARE_WRITE while keeping no-delete pins and strict final-leaf sharing; namespace authority still comes from the owner/DACL policy.
+- Builder evidence: the new sibling file/directory rename and move-in regression failed before the fix; old ancestor read-only sharing and added ancestor delete-sharing mutations failed intended assertions and were restored. Formatting, locked all-target Clippy and **118/118 normal nextest tests** passed, with both subprocess-only fixtures exercised through their parents. Coordinator reran formatting and equivalence/whitespace checks; it did not claim a second Clippy/nextest run. Fresh exact-head Opus re-review and hosted gates remain required. The lower-priority prior advisories stay open. No new feature PR, actual service/SYSTEM/owner/admin/SCM/LSA or VM operation; installed and dedicated-account M2 paths remain **unverified on real hardware**.

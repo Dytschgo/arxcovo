@@ -11,7 +11,7 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE, LocalFree},
+    Foundation::{ERROR_NONE_MAPPED, GENERIC_READ, GetLastError, INVALID_HANDLE_VALUE, LocalFree},
     NetworkManagement::NetManagement::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
@@ -65,6 +65,15 @@ fn string(p: *const u16, cap: usize) -> Result<String, Error> {
         String::from_utf16(std::slice::from_raw_parts(p, n)).map_err(|_| Error::Identity)
     }
 }
+// Only an explicit native not-found result establishes absence. Access denied,
+// insufficient buffers and directory-service failures establish no such fact.
+fn lookup_failure(code: u32) -> Error {
+    if code == ERROR_NONE_MAPPED {
+        Error::AccountMissing
+    } else {
+        Error::Identity
+    }
+}
 fn lookup(name: &str) -> Result<(Vec<u32>, SID_NAME_USE), Error> {
     let name = wide(name);
     let mut sid = vec![0u32; 17];
@@ -84,7 +93,7 @@ fn lookup(name: &str) -> Result<(Vec<u32>, SID_NAME_USE), Error> {
         )
     } == 0
     {
-        return Err(Error::Identity);
+        return Err(lookup_failure(unsafe { GetLastError() }));
     }
     Ok((sid, kind))
 }
@@ -113,8 +122,10 @@ pub fn account(value: &str) -> Result<Account, Error> {
                 &mut kind,
             )
         } == 0
-            || kind != SidTypeUser
         {
+            return Err(lookup_failure(unsafe { GetLastError() }));
+        }
+        if kind != SidTypeUser {
             return Err(Error::Identity);
         }
         let name = string(name.as_ptr(), 257)?;
@@ -172,7 +183,7 @@ pub fn account(value: &str) -> Result<Account, Error> {
     for i in 0..read as usize {
         let group = unsafe { &*p.cast::<LOCALGROUP_USERS_INFO_0>().add(i) };
         let name = string(group.lgrui0_name, 257)?;
-        let (sid, kind) = lookup(&name)?;
+        let (sid, kind) = lookup(&name).map_err(|_| Error::Identity)?;
         if kind != SidTypeAlias {
             return Err(Error::Identity);
         }
@@ -280,6 +291,24 @@ fn descriptor_protection(sd: PSECURITY_DESCRIPTOR) -> Result<Protection, Error> 
     }
 }
 pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<Observed, Error> {
+    open_impl(path, directory, read, trusted, false)
+}
+pub fn open_state_file(path: &Path) -> Result<Observed, Error> {
+    open_impl(path, false, false, true, true)
+}
+#[cfg(test)]
+pub(super) fn open_state_fixture(path: &Path, directory: bool) -> Result<Observed, Error> {
+    // Same native access/sharing and structural checks; owned-temp ancestry is
+    // deliberately not asserted to be SYSTEM-owned. No runtime policy switch.
+    open_impl(path, directory, false, false, !directory)
+}
+fn open_impl(
+    path: &Path,
+    directory: bool,
+    read: bool,
+    trusted: bool,
+    mutable_leaf: bool,
+) -> Result<Observed, Error> {
     let parts = components(path, true)?;
     let text = path.to_str().ok_or(Error::Layout)?;
     let mut current = std::path::PathBuf::from(format!("{}\\", &text[..2]));
@@ -294,16 +323,25 @@ pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<O
         }
         let leaf = i == parts.len();
         let name: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Retain ancestors and request read-only sharing. Metadata-only handles
-        // do not guarantee writer/delete exclusion; PR27 adds read-data access.
-        // Do not treat this observation as authority for a later path open.
-        let access =
-            READ_CONTROL | FILE_READ_ATTRIBUTES | if leaf && read { GENERIC_READ } else { 0 };
+        // FILE_READ_DATA (FILE_LIST_DIRECTORY on directories) makes the
+        // share restrictions effective: metadata-only access does not prevent
+        // rename. Ancestors share writes so unrelated sibling renames work;
+        // owner/DACL checks supply namespace authority. No handle shares delete.
+        // Only immutable final leaves exclude conflicting writers.
+        let access = READ_CONTROL
+            | FILE_READ_ATTRIBUTES
+            | FILE_READ_DATA
+            | if leaf && read { GENERIC_READ } else { 0 };
         let h = unsafe {
             CreateFileW(
                 name.as_ptr(),
                 access,
-                FILE_SHARE_READ,
+                FILE_SHARE_READ
+                    | if !leaf || mutable_leaf {
+                        FILE_SHARE_WRITE
+                    } else {
+                        0
+                    },
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
@@ -341,6 +379,23 @@ pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_lookup_errors_only_confirm_explicit_absence() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_SUCH_DOMAIN,
+        };
+        assert_eq!(lookup_failure(ERROR_NONE_MAPPED), Error::AccountMissing);
+        for code in [
+            0,
+            ERROR_ACCESS_DENIED,
+            ERROR_INSUFFICIENT_BUFFER,
+            ERROR_NO_SUCH_DOMAIN,
+            u32::MAX,
+        ] {
+            assert_eq!(lookup_failure(code), Error::Identity);
+        }
+    }
+
     #[test]
     fn reparse_leaf_and_ancestor_refuse_on_local_junction() {
         use std::os::windows::process::CommandExt;
@@ -520,13 +575,16 @@ mod tests {
     #[test]
     fn opened_objects_exclude_writers_and_rename_until_released() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test");
+        let owned = tmp.path().join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        let path = owned.join("test");
         std::fs::write(&path, b"fixture").unwrap();
         let opened = open(&path, false, true, false).unwrap();
         assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
-        assert!(std::fs::rename(&path, tmp.path().join("renamed")).is_err());
+        assert!(std::fs::rename(&path, owned.join("renamed")).is_err());
         drop(opened);
-        std::fs::rename(&path, tmp.path().join("renamed")).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        std::fs::rename(&path, owned.join("renamed")).unwrap();
     }
     #[test]
     fn hardlinked_file_refuses() {
@@ -537,5 +595,76 @@ mod tests {
         std::fs::hard_link(&path, &alias).unwrap();
         assert!(open(&path, false, true, false).is_err());
         assert!(open(&alias, false, true, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mutable_pin_tests {
+    use super::*;
+    #[test]
+    fn ancestor_pins_allow_unrelated_renames_but_prevent_replacement() {
+        // Never rename a direct child of TEMP: development executor tests may
+        // independently pin TEMP. All rename targets belong to this outer dir.
+        let outer = tempfile::tempdir().unwrap();
+        let ancestor = outer.path().join("ancestor");
+        let protected = ancestor.join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        let path = protected.join("db");
+        std::fs::write(&path, []).unwrap();
+        std::fs::write(ancestor.join("sibling-file"), []).unwrap();
+        std::fs::create_dir(ancestor.join("sibling-dir")).unwrap();
+        std::fs::write(outer.path().join("incoming-file"), []).unwrap();
+        std::fs::create_dir(outer.path().join("incoming-dir")).unwrap();
+
+        let pin = open_state_fixture(&path, false).unwrap();
+        std::fs::rename(ancestor.join("sibling-file"), ancestor.join("renamed-file"))
+            .expect("unrelated file rename within a pinned ancestor must succeed");
+        std::fs::rename(ancestor.join("sibling-dir"), ancestor.join("renamed-dir"))
+            .expect("unrelated directory rename within a pinned ancestor must succeed");
+        for name in ["incoming-file", "incoming-dir"] {
+            std::fs::rename(outer.path().join(name), ancestor.join(name))
+                .expect("unrelated move into a pinned ancestor must succeed");
+        }
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        assert!(std::fs::rename(&protected, ancestor.join("replaced")).is_err());
+        // Request DELETE on the nonempty directory itself: remove_dir alone
+        // could fail just because it is nonempty, masking missing delete pins.
+        use std::os::windows::fs::OpenOptionsExt;
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&protected)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32), // ERROR_SHARING_VIOLATION
+        );
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(pin);
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&protected)
+            .expect("directory delete access must be released after drop");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&protected, ancestor.join("replaced")).unwrap();
+        std::fs::remove_dir(ancestor.join("replaced")).unwrap();
+    }
+
+    #[test]
+    fn mutable_leaf_allows_database_writes_but_blocks_namespace_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        std::fs::write(&path, []).unwrap();
+        // Explicit untrusted fixture; production open_state_file requires
+        // trusted root/SYSTEM ancestry and the caller checks PrivateFile.
+        let pin = open_impl(&path, false, false, false, true).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        assert!(std::fs::rename(&path, dir.path().join("moved")).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(pin);
+        std::fs::rename(&path, dir.path().join("moved")).unwrap();
     }
 }

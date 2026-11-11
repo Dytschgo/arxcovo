@@ -11,6 +11,7 @@ pub enum Platform {
 pub enum Error {
     Config,
     Identity,
+    AccountMissing,
     Rights,
     Workspace,
     Permissions,
@@ -24,6 +25,7 @@ impl std::fmt::Display for Error {
         f.write_str(match self {
             Self::Config => "service-config",
             Self::Identity => "service-identity",
+            Self::AccountMissing => "service-account-missing",
             Self::Rights => "service-rights",
             Self::Workspace => "service-workspace",
             Self::Permissions => "service-permissions",
