@@ -100,8 +100,10 @@ token into chat, an issue, a command line or a log.
    It records the grant in a private file, `owner-record.json`, next to the
    config (ADR 0012). It never takes ownership of a right that was already
    there. To change any setting later, rerun `configure`. If a configure was
-   interrupted, the next `configure` or `uninstall` resolves it automatically,
-   and none of them ever removes a right whose origin it cannot prove. Do not edit
+   interrupted, the next `configure` or `uninstall` resolves it automatically
+   and does not remove a right whose origin it cannot prove. The one exception
+   follows a power failure or a Windows crash, and it is described under
+   Uninstall. Do not edit
    `arxd.json` or `owner-record.json` by hand: a changed owner stops the
    service from starting (exit code 4).
 
@@ -214,6 +216,19 @@ On Windows, it also prints one line about the batch-logon right (ADR 0012):
   Arxcovo, so it stays.
 - `batch-right-already-absent` or `batch-right-not-recorded`: there was
   nothing to remove.
+
+If `arxd` itself crashes or is closed partway through, the next run handles
+it as described above. A power failure, a Windows crash (blue screen), a hard
+reset or reverting a VM or disk snapshot is different: Windows may lose
+Arxcovo's last change to `owner-record.json` even after the command reported
+success. Suppose that happens soon after an uninstall, or soon after a
+`configure` that failed or was interrupted while granting the right again.
+If you later grant **Log on as a batch job** to the build account yourself, a
+future uninstall can remove your grant and print `batch-right-removed`. Restoring an older
+`owner-record.json` from a backup has the same effect. If you see that token
+and want to keep the right, grant it again in `secpol.msc`. No other right,
+account or file is affected. This case is not tested on real hardware (ADR
+0012, decision 6).
 
 Only if every `configure` or `uninstall` keeps reporting
 `service-owner-recovery-required` is the record damaged. In that case, delete
