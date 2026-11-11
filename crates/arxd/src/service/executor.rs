@@ -63,7 +63,7 @@ fn absolute_executable(p: &str) -> bool {
     #[cfg(windows)]
     let absolute = p.len() > 3
         && p.as_bytes()[0].is_ascii_alphabetic()
-        && &p[1..2] == ":"
+        && p.as_bytes()[1] == b':'
         && p.as_bytes()[2] == b'\\'
         && !p[2..].contains(':')
         && p.to_ascii_lowercase().ends_with(".exe")

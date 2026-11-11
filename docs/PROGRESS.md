@@ -1,5 +1,10 @@
 # Arxcovo progress
 
+## Service-executor coordinator validation
+
+- Codex / gpt-6.1-sol, medium found and reproduced a new service-schema panic for a malformed Unicode drive prefix. The failing regression became green after replacing the UTF-8 substring operation with a byte comparison. Valid Unicode executable names retain a positive control. All ten focused executor tests, formatting and workspace/all-target locked Clippy passed after correction.
+- The first coordinator full run on builder head `8461a3a` failed in the unchanged main handle-reuse test: its expected distinct-object marker was absent after child exit zero. Fail-fast summary: 118 passed, one failed, 26 unrun of 145, with two direct-only fixtures skipped. This supersedes any assumption that the coordinator repeated the builder's full pass. Failure evidence is in `docs/reviews/windows-handle-reuse-marker-failure.md`; dedicated diagnosis is required. No handle-test source was changed and no cause or fix is claimed.
+
 ## Hosted macOS namespace controls
 
 - Codex / gpt-6.1-sol, medium inspected completed macOS job [130636095317](https://github.com/Dytschgo/arxcovo/actions/runs/43053335906/job/130636095317), source `b052d940`, image `macos-26-arm64` version `20261102.0473.1`. Root, Library, Application Support, private, var, Logs, LaunchDaemons and bin passed ancestor policy; launchctl passed binary-leaf policy. The old group-writable runtime parent and Application Support as a strict leaf remained rejected. Exact source-bound rows are retained separately in `docs/evidence/macos-namespace-controls.json`; the earlier stock-directory evidence remains unchanged.

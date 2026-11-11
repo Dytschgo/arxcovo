@@ -66,6 +66,17 @@ async fn entered(calls: &AtomicUsize) {
     .unwrap();
 }
 #[test]
+#[cfg(windows)]
+fn malformed_unicode_drive_prefix_refuses_without_panicking() {
+    for path in ["Cé:\\tool.exe", "C中:\\tool.exe", "C🦀:\\tool.exe"] {
+        let request: Request = serde_json::from_value(json!({"executable":path})).unwrap();
+        assert!(!request.validate());
+    }
+    let request: Request =
+        serde_json::from_value(json!({"executable":"C:\\synthetic\\café.exe"})).unwrap();
+    assert!(request.validate());
+}
+#[test]
 fn strict_service_arguments_and_development_boundary() {
     assert!(request().validate());
     #[cfg(windows)]
