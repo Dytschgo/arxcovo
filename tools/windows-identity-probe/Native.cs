@@ -95,9 +95,10 @@ internal static class Native
         }
         finally { LsaDeregisterLogonProcess(lsa); }
     }
-    static nint TokenInfo(nint token, int kind)
+    static nint TokenInfo(nint token, int kind) => TokenInfo(token, kind, out _);
+    static nint TokenInfo(nint token, int kind, out int length)
     {
-        GetTokenInformation(token, kind, 0, 0, out int length);
+        GetTokenInformation(token, kind, 0, 0, out length);
         Program.Require(length is > 0 and <= 65536, "token: information length invalid");
         nint data = Marshal.AllocHGlobal(length);
         try { Win(GetTokenInformation(token, kind, data, length, out _), "GetTokenInformation"); return data; }
@@ -121,13 +122,7 @@ internal static class Native
         string? sid = identity.User?.Value;
         Program.Emit(new { stage, observedSid = sid, integrityRid = integrity, mediumIntegrity = integrity == 8192, tokenType });
         Program.Require(sid == expected && integrity == 8192 && tokenType == 1, "token: SID/Medium integrity/primary type mismatch");
-        // Reject privileged memberships even if deny-only (filtered admin is not a standard account).
-        foreach (IdentityReference group in identity.Groups ?? new IdentityReferenceCollection())
-        {
-            string value = group.Value;
-            Program.Require(!value.StartsWith("S-1-5-32-", StringComparison.Ordinal) || value == "S-1-5-32-545", "token: privileged or unexpected builtin membership");
-            Program.Require(!RegexPrivilegedDomainGroup(value), "token: privileged domain membership");
-        }
+        RejectPrivilegedGroups(ReadGroups(token));
         data = TokenInfo(token, 3);
         try
         {
@@ -142,6 +137,57 @@ internal static class Native
             }
         }
         finally { Marshal.FreeHGlobal(data); }
+    }
+    internal static (string Sid, uint Attributes)[] ReadGroups(nint token)
+    {
+        nint data = TokenInfo(token, 2, out int length);
+        try
+        {
+            int offset = IntPtr.Size == 8 ? 8 : 4;
+            int stride = Marshal.SizeOf<SidAttributes>();
+            Program.Require(length >= offset, "token: group header truncated");
+            int count = Marshal.ReadInt32(data);
+            Program.Require(count is >= 0 and <= 1024 && offset + (long)count * stride <= length, "token: group buffer invalid");
+            var groups = new (string, uint)[count];
+            for (int i = 0; i < count; i++)
+            {
+                var group = Marshal.PtrToStructure<SidAttributes>(data + offset + i * stride);
+                long relative = group.sid.ToInt64() - data.ToInt64();
+                Program.Require(relative >= 0 && relative <= length - 8, "token: group SID outside buffer");
+                int sidLength = 8 + Marshal.ReadByte(group.sid, 1) * 4;
+                Program.Require(sidLength <= 68 && relative + sidLength <= length, "token: group SID length invalid");
+                groups[i] = (new SecurityIdentifier(group.sid).Value, group.attributes);
+            }
+            return groups;
+        }
+        finally { Marshal.FreeHGlobal(data); }
+    }
+    internal static void RejectPrivilegedGroups((string Sid, uint Attributes)[] groups)
+    {
+        // Attributes deliberately do not filter entries: deny-only membership also rejects.
+        foreach (var group in groups)
+        {
+            string value = group.Sid;
+            Program.Require(!value.StartsWith("S-1-5-32-", StringComparison.Ordinal) || value == "S-1-5-32-545", "token: privileged or unexpected builtin membership");
+            Program.Require(value != "S-1-5-114" && !RegexPrivilegedDomainGroup(value), "token: privileged membership");
+        }
+    }
+    [StructLayout(LayoutKind.Sequential)] struct SidAttributes { public nint sid; public uint attributes; }
+    internal const uint CreationFlags = 0x0000040c; // SUSPENDED | UNICODE_ENVIRONMENT | DETACHED_PROCESS
+    internal static uint HandleFixture(uint flags)
+    {
+        string exe = Environment.ProcessPath!;
+        var startup = new StartupInfo { size = Marshal.SizeOf<StartupInfo>() };
+        Win(CreateProcessW(exe, new StringBuilder("\"" + exe + "\" --handle-fixture"), 0, 0, false, flags, 0, Environment.CurrentDirectory, ref startup, out var pi), "CreateProcessW-handle-fixture");
+        using var process = new OwnedHandle(pi.process); using var thread = new OwnedHandle(pi.thread);
+        try
+        {
+            Win(ResumeThread(thread.Handle) != uint.MaxValue, "ResumeThread-handle-fixture");
+            Program.Require(WaitForSingleObject(process.Handle, 10000) == 0, "self-test: fixture timeout");
+            Win(GetExitCodeProcess(process.Handle, out uint code), "GetExitCodeProcess-handle-fixture");
+            return code;
+        }
+        finally { TerminateProcess(process.Handle, 124); }
     }
     static bool RegexPrivilegedDomainGroup(string sid) => sid.StartsWith("S-1-5-21-", StringComparison.Ordinal) && new[] { "-512", "-516", "-518", "-519", "-520" }.Any(sid.EndsWith);
     internal static void ProcessIdentity(nint process, string sid, string stage)
@@ -162,9 +208,9 @@ internal static class Native
         try
         {
             var startup = new StartupInfo { size = Marshal.SizeOf<StartupInfo>() };
-            // CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW; no desktop override.
-            bool ok = token == 0 ? CreateProcessW(exe, command, 0, 0, false, 0x08000404, environment, directory, ref startup, out var pi)
-                : CreateProcessAsUserW(token, exe, command, 0, 0, false, 0x08000404, environment, directory, ref startup, out pi);
+            // CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS; no desktop override.
+            bool ok = token == 0 ? CreateProcessW(exe, command, 0, 0, false, CreationFlags, environment, directory, ref startup, out var pi)
+                : CreateProcessAsUserW(token, exe, command, 0, 0, false, CreationFlags, environment, directory, ref startup, out pi);
             Win(ok, token == 0 ? "CreateProcessW-leaf" : "CreateProcessAsUserW-suspended");
             return pi;
         }
@@ -176,7 +222,8 @@ internal static class Native
         nint buffer = Marshal.AllocHGlobal(8 + 16 * IntPtr.Size);
         try
         {
-            Win(QueryInformationJobObject(job, 3, buffer, 8 + 16 * IntPtr.Size, out _), "QueryInformationJobObject");
+            if (!QueryInformationJobObject(job, 3, buffer, 8 + 16 * IntPtr.Size, out _))
+                Win(false, "QueryInformationJobObject");
             int assigned = Marshal.ReadInt32(buffer), count = Marshal.ReadInt32(buffer, 4);
             Program.Require(count >= 0 && count <= 3 && count == assigned, "job: PID list incomplete");
             return Enumerable.Range(0, count).Select(i => checked((uint)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size))).ToArray();

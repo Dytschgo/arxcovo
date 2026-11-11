@@ -16,6 +16,13 @@ internal static class Program
         try
         {
             if (args.SequenceEqual(new[] { "--self-test" })) return SelfTest();
+            if (args.SequenceEqual(new[] { "--handle-fixture" }))
+            {
+                // Fixed unprivileged diagnostic; no environment, file, token or account changes.
+                int mask = 0;
+                for (int i = 0; i < 3; i++) { nint h = Native.GetStdHandle(-10 - i); if (h != 0 && h != -1) mask |= 1 << i; }
+                return mask;
+            }
             GuardCi(Environment.GetEnvironmentVariable);
             if (args.SequenceEqual(new[] { "--child" })) { payload = true; return Child(false); }
             if (args.SequenceEqual(new[] { "--leaf" })) { payload = true; return Child(true); }
@@ -36,11 +43,11 @@ internal static class Program
         }
         catch (ProbeFailure ex)
         {
-            Emit(new { stage = "failure", ok = false, reason = ex.Message });
+            if (lines < 128) Emit(new { stage = "failure", ok = false, reason = ex.Message });
             return payload && ex.NativeError != 0 ? unchecked((int)(0xe0000000u | ex.NativeError)) : 1;
         }
         // Never print exception messages, paths, environment values or stack traces.
-        catch (Exception) { Emit(new { stage = "failure", ok = false, reason = "unexpected-managed-failure" }); return 2; }
+        catch (Exception) { if (lines < 128) Emit(new { stage = "failure", ok = false, reason = "unexpected-managed-failure" }); return 2; }
     }
 
     internal static void Require(bool value, string reason) { if (!value) throw new ProbeFailure(reason); }
@@ -166,6 +173,26 @@ internal static class Program
         Require(block.EndsWith("\0\0", StringComparison.Ordinal) && block.Split('\0', StringSplitOptions.RemoveEmptyEntries).Length == 7 && !block.Contains("PATH="), "self-test: environment allowlist"); count++;
         Require(Marshal.SizeOf<Native.UnicodeString>() == (IntPtr.Size == 8 ? 16 : 8), "self-test: UNICODE_STRING layout"); count++;
         Require(Marshal.SizeOf<Native.JobLimits>() == (IntPtr.Size == 8 ? 144 : 112), "self-test: job layout"); count++;
+        Require(Native.HandleFixture(0x08000404) == 7, "self-test: hidden-console regression control"); count++;
+        Require(Native.HandleFixture(Native.CreationFlags) == 0, "self-test: detached handles"); count++;
+        Native.RejectPrivilegedGroups(new[] { ("S-1-5-32-545", 4u) }); count++;
+        foreach (string group in new[] { "S-1-5-32-544", "S-1-5-114", "S-1-5-21-1-2-3-512" })
+            foreach (uint attributes in new[] { 4u, 16u }) Reject(() => Native.RejectPrivilegedGroups(new[] { (group, attributes) }));
+        using var current = WindowsIdentity.GetCurrent();
+        var rawGroups = Native.ReadGroups(current.Token);
+        var denyAdmin = rawGroups.Where(g => g.Sid == "S-1-5-32-544" && (g.Attributes & 16) != 0).ToArray();
+        // Existing filtered admin token only; never create accounts, change UAC or elevate.
+        if (denyAdmin.Length != 0)
+        {
+            Require(!(current.Groups?.Any(g => g.Value == "S-1-5-32-544") ?? false), "self-test: filtered admin control"); count++;
+            Reject(() => Native.RejectPrivilegedGroups(rawGroups));
+        }
+        using var emptyJob = new OwnedHandle(Native.CreateJobObjectW(0, null));
+        Require(emptyJob.Handle != 0, "self-test: empty job creation");
+        int linesBeforePolling = lines;
+        for (int i = 0; i < 300; i++) Require(Native.JobPids(emptyJob.Handle).Length == 0, "self-test: empty job query");
+        Require(lines == linesBeforePolling, "self-test: drain poll output bound"); count++;
+        Emit(new { stage = "raw-groups-self-test", denyOnlyAdminObserved = denyAdmin.Length != 0 });
         Emit(new { stage = "self-test", ok = true, assertions = count, privilegedPathsRun = false });
         return 0;
     }
