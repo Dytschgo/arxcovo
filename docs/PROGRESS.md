@@ -803,3 +803,64 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   with DNS resolution failures for Ubuntu mirrors, as attempt 1 did. Windows,
   macOS and independent review passed; the Ubuntu gate remains required. No second
   automatic retry or check bypass was performed.
+
+## ADR0012 PR-B native adapter candidate (2026-11-11)
+
+Provider/effort/outcome: Codex / gpt-6.1-sol high; implemented locally in
+`4fb25ec`, awaiting independent other-provider review. Prepared base verified exactly as
+`a9327cff13db6e6998ed1332eb57ef918f669df1`, initially clean. Last merged PR and
+previous milestone history above are unchanged. No PR was created or merged.
+PR30/PR-A remains under independent review; its engine, config and plans were
+not edited or declared accepted. This establishes no installed or M2 acceptance.
+
+Completed PR-B tasks: callable WindowsOwnerSession with fixed production layout,
+elevated enabled-Administrators requirement, exact running/fixed binary file ID,
+retained strict ancestor/final pins, restore-privilege check, install-created
+zero-byte exclusive lock and checked leftover cleanup before recovery. The
+OwnerStore reads protection and bounded bytes through one no-follow handle,
+returns exact-byte SHA256, creates explicit SYSTEM-owner private staging with
+CREATE_NEW, flushes before publication, retains expected-target handles without
+write sharing, checks target and staged-source identity, renames through the
+staged handle and verifies final identity/bytes. No object ACL is repaired.
+Private cfg(test) fixture policy/layout has no production selector or fallback.
+Stage-config uses the fixed NativeResolver for fresh account pins and owner-only
+workspace metadata checks; no service-side workspace access was added.
+
+Narrow BatchRight wrappers implement only direct SeBatchLogonRight observation,
+one-right grant and one-right revoke (AllRights=false), with canonical bounded
+SID validation and RAII native buffers. LSA result/count/Unicode parsing and
+mutation statuses were tested synthetically only. No actual LSA/account/right,
+SCM, task, service, elevation, installation, dispatch or owner admin operation
+was invoked by the new tests. No old Lab Manager or VM access occurred.
+
+Evidence executed on Windows:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo test -p arxd --lib owner_ --locked`: 34 passed, one ignored by direct
+  discovery (existing subprocess-only TokenOwner helper exercised by its normal
+  parent); no ignored fixture was invoked directly by this agent. Includes 12
+  new tests covering N1-N10 plus create-new races and staged-source substitution.
+- Deliberately inverted the CAS hash comparison and disabled the hardlink refusal
+  separately: each targeted regression test failed an assertion (exit 101).
+  Restored both mutations before the passing final checks.
+- `git diff --check`: passed before documentation append; repeated before commit.
+
+Native fixture details: current-user owned protected temporary directories only;
+production SYSTEM layout never opened or mutated by these tests. Ancestor pins
+retain no delete sharing; immediate parent shares read/write so rename succeeds.
+Parallel fixtures initially blocked the N4 post-drop rename because their common
+temporary ancestor remained pinned. Fixtures are serialized so the positive
+post-drop control has no sibling pins; production sharing stays strict. Junction
+fixture initially hit cmd syntax errors from a mixed-separator executable path;
+using native path components fixed setup without a policy change. UTF16 synthetic
+positive control caught and corrected the right-name byte length before any LSA
+call. No ADR contradiction or architectural deviation was established.
+
+Remaining boundaries: production constructor, SYSTEM-owner/default-owner disk
+creation, restore privilege, native account/workspace validation and actual LSA
+rights are **unverified on real hardware**. N9 parses production descriptors only
+in memory; N10 uses only synthetic status/count/Unicode buffers. No SCM/CLI/MCP
+activation, installed integration, power-loss/name-binding durability proof or
+M2 acceptance. Coordinator owns independent review, PR30 API corrections and
+later integration. No push, GitHub write, PR, merge, watch or delegation occurred.

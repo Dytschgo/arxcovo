@@ -530,3 +530,37 @@ publication/locking/LSA/SCM tests, installed wiring/provisioning, dedicated-acco
 execution and installed M2 acceptance remain open. All native/installed paths
 are **unverified on real hardware**. Accepted architecture is not implementation
 acceptance; a fresh independent Opus review is required.
+
+## ADR0012 PR-B callable native candidate
+
+The local PR-B candidate adds `service::owner_windows` on Windows. Public API:
+`WindowsOwnerSession::open() -> Result<Self, OpenError>` validates production
+owner authority and fixed layout/binary identity, enables restore privilege,
+acquires the existing owner lock, cleans checked staging leftovers and invokes
+engine recovery. It takes no path, SID, descriptor, resolver or policy argument.
+`parts(&mut self) -> (&mut WindowsOwnerStore, &mut WindowsBatchRight)` lends the
+locked adapters together to the pure engine; neither adapter has a public
+constructor. `WindowsOwnerStore::read_config()` returns optional bounded exact
+protected bytes; the store implements OwnerStore and the right adapter implements
+BatchRight. None of these types Debug-print private payloads. OpenError displays
+only existing layout/Failure tokens.
+
+The session owns the staging and target handles, strict ancestor/binary pins and
+exclusive lock, dropping the lock last. Publication uses create-new staging,
+explicit SYSTEM owner/private descriptor, same-handle protection/bytes, exact
+SHA256 comparisons and handle-based rename with final file-ID/byte verification.
+A rename-attempt error has unknown publication outcome; callers must reread on
+the next session. Pre-rename cleanup is checked and acts on the retained source
+handle only. Unsafe leftovers are preserved and refused. Config parsing performs
+fresh native account validation and owner-only metadata inspection; it grants
+no provenance authority. No service workspace access is added.
+
+Twelve normal-user tests cover ADR N1-N10 and source/target race controls. N9
+checks the exact production descriptor in memory and rejects altered owner,
+inheritance and foreign grants. N10 exercises synthetic LSA buffers/statuses;
+no actual LSA policy is opened by tests. Test-only current-user policy cannot
+be selected in production. See PROGRESS for executed commands and mutation
+controls. Production privileged layout/identity/LSA behavior remains **unverified
+on real hardware**. This candidate adds no SCM executor, CLI/MCP route, install
+activation or Plan::execute path, and confers no installed/M2 acceptance. The
+PR-A engine remains under independent review coordinated by the coordinator.
