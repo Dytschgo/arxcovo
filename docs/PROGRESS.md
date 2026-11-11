@@ -1020,3 +1020,8 @@ later integration. No push, GitHub write, PR, merge, watch or delegation occurre
   sufficiency, real reboot persistence and privilege sufficiency remain
   **unverified on real hardware**. Poll deadlines cannot interrupt a blocking RPC.
   No installed acceptance is established; M2 remains open.
+
+## Windows SCM coordinator checkpoint
+
+- Codex / gpt-6.1-sol, medium verified candidate `6786a6f` on the Windows owner-store stack. Formatting, workspace/all-target locked Clippy and all 18 focused SCM tests passed. Native source is library-only; main/CLI routing is unchanged and no real SCM API call ran. The builder separately reported 163 normal workspace passes and ten restored source mutations caught by assertions. The coordinator did not repeat that full suite in this checkpoint.
+- Architecture has the separate Sol cross-provider review in `docs/reviews/windows-scm-contract-review.md`. Implementation still requires independent Opus review and hosted checks. The distinct-handle marker failure observed on the separate executor-interface branch remains under diagnosis; no fix or global full-suite reliability claim is made here. Installed behavior, root provisioning, real SCM readback/boot semantics and M2 acceptance remain **unverified on real hardware**.
