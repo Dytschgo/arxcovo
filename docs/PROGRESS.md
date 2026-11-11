@@ -125,7 +125,7 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 - SYSTEM/root and true cross-user identity cases remain **unverified on real
   hardware**. Same-user Windows development is not production service/account
   isolation; Unix cross-user socket provisioning remains a service prerequisite.
-- Architecture recorded in docs/adr/0003-local-inventory-mcp.md. Existing single
+- Architecture recorded in docs/adr/0008-local-inventory-mcp.md. Existing single
   Cargo.lock unchanged: explicitly enabled SDK/Tokio/Windows features require no
   additional resolved packages. No private permissions, Activity or executor rewrite.
 - Last merged base for this candidate: host identity/inventory #13 at `90d3ce7`.
@@ -138,3 +138,4 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   cleanup; it was corrected and both targets passed. No native Unix link/runtime
   claim follows from these checks. Final Windows nextest: 24/24 passed, including
   forged principal metadata and completion-failure withholding on the local path.
+

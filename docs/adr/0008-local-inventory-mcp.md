@@ -1,4 +1,4 @@
-# 0003: Bounded opt-in local inventory MCP transport
+# 0008: Bounded opt-in local inventory MCP transport
 
 Status: implemented candidate, pending independent review/integration.
 
