@@ -153,4 +153,51 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 - Codex / gpt-6.1-sol, medium: merged main `d7f3ebd` into the local configuration candidate, preserving the service foundation and current activity implementation. Formatting, workspace Clippy with warnings denied and all 61 runnable nextest tests passed (one direct-only fixture skipped; its parent exercised it). Package parser checks passed three tests; systemd/plutil native checks were skipped on Windows. These supersede the earlier 51-test builder-base evidence for this integrated revision. No installation or account/right/manager operations were performed.
 - Next service work: replace injected identity and permission observations with native read-only adapters and bounded configuration reads. Owner mutation adapters and service application wiring remain incomplete; native checks will receive their own independent security review before activation.
 
-- Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations are being implemented separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
+- Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations were committed separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
+## Read-only native service adapter checkpoint
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high. Prepared base
+  `b63959b681e3cc1b106b0dfad25c20c972917488`, branch
+  `t3/native-service-adapters`; implementation commit `678287d`.
+  Added service/native.rs, native_windows.rs, native_unix.rs plus necessary
+  module/Cargo wiring. No other task branch or development/store/MCP file edited.
+  This task changes no acceptance status: M1 is accepted and M2–6 remain unchecked.
+- Unchanged Windows baseline: `cargo test --workspace` passed 61 tests, one
+  directly ignored subprocess fixture exercised by its parent. Added nine
+  native/policy tests: real current-token/local-SAM observations (positive
+  control when local SAM matches), current-user file refusal under SYSTEM
+  private policy, actual writer/rename exclusion, hard-link refusal, metadata
+  workspace checks, lexical negatives, bounded reads, protection negatives and
+  rights/pin revalidation in both directions. No fixture claims SYSTEM/root.
+- Six temporary source mutations each failed at an assertion in the intended
+  focused test: removing SYSTEM owner, DACL presence, DACL protected, Unix root
+  UID, Unix root GID, or dot-dot path refusal. All mutated sources restored;
+  no policy relaxation was committed. These are guard-removal checks, not
+  evidence of installed ACL ownership or privileged execution.
+- Final Windows workspace result: 70 passed, one directly ignored fixture
+  exercised by its parent; formatting and workspace/all-target Clippy with
+  warnings denied pass. Artifact parser checks: three passed, two native
+  systemd/plutil checks skipped on Windows. No UI changes or UI checks.
+- Cross-target evidence is limited: full arxd Linux/macOS `cargo check` stopped
+  at bundled SQLite because x86_64-linux-gnu-gcc / Darwin cc are unavailable.
+  An uncommitted isolated manifest under target/native-check imports the ACTUAL
+  layout.rs, config.rs and native.rs modules by path with libc/serde/serde_json
+  and tempfile. `cargo check --tests` and `cargo clippy --tests` passed for
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin. Isolated Clippy uses
+  `-A dead_code -D warnings` only because config::serialized has no owner-plan
+  caller in that harness. This is Rust metadata/type-check evidence, not a
+  linked arxd build, native framework link validation, or Unix test execution.
+- Limits/blockers: modern macOS OpenDirectory/UID501 identity support refuses
+  pending a reviewed local-native adapter. Linux uses conservative local
+  passwd/NSS equality and bounded sudo/wheel groups, refusing system UID ranges,
+  unknown filesystems and ACLs. Windows protected SYSTEM layout success,
+  Linux/macOS runtime, native ACL checks on Unix and all installed service
+  paths are **unverified on real hardware**. Exact race boundaries, supported
+  APIs and pending obligations are in service-foundation.md. PR16's independently reviewed
+  stable-path fix is documented, not copied into unrelated foreground modules.
+- Production entry remains fail-closed. Application config/store/audit/endpoint
+  integration and owner mutation adapters (including atomic publication and
+  batch-right compensation) remain pending. Current-user development mode is
+  independent. No owner admin steps, installation, account/right/task changes,
+  service-manager mutation, push, PR, merge, settings, dispatch or watch occurred.
+  Independent other-provider security review remains coordinator work.
