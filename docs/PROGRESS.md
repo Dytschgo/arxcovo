@@ -1,5 +1,37 @@
 # Arxcovo progress
 
+## Windows owner adapter prerequisite handoff — 2026-11-11
+
+- Provider/effort: Codex / gpt-6.1-sol high, implementation sub-agent working
+  alone from `1a45ba15640b608ee4c953a104c06e451a85d07b`, branch
+  `t3/windows-service-owner-adapter`. Outcome: partial transaction prerequisite,
+  **native adapter task incomplete**. Last merged PR and milestone acceptance
+  remain unchanged. No push, PR, merge, watch or delegation.
+  Implementation commit: `e919c4d`.
+- Added an opaque Windows configure-plan extractor and injected durable-intent/
+  grant-receipt/publication recovery engine. Tests cover operation ordering,
+  stale observations, ambiguous LSA/receipt errors, compensation and retry,
+  publish-then-error, foreign-config conflict, existing-right preservation and
+  bounded strict journal parsing. Native `Plan::execute` remains unsafe for
+  configure: do not activate it.
+- Concrete handoff obstacle: a crash between LSA grant and durable receipt leaves
+  ownership ambiguous. Presence of the right cannot prove who granted it. The
+  candidate refuses that state and preserves evidence; native recovery policy
+  and durable uninstall provenance need other-provider architecture/security
+  review. Exact API, integration requirements and all unimplemented native work
+  are documented in service-foundation.md. This is not an ADR amendment.
+- Actual checks: nine new tests passed; 16 combined owner-plan/transaction tests
+  passed; four config and two layout tests passed. `cargo fmt --all -- --check`,
+  `cargo test --workspace --no-run`, and workspace/all-target Clippy with
+  `-D warnings` passed. Two safely
+  restored guard mutations failed assertions. Full workspace runtime tests are
+  excluded because existing tests invoke service dispatch/owner arguments.
+  No privileged, service, dispatch, installation, account/right mutation, settings,
+  provisioning, owner admin step or old Lab Manager/VM operation ran.
+- Pending: native owner_windows adapter, protected file publication and journal
+  storage, SCM/LSA calls and uninstall provenance, independent Opus review and
+  installed-service acceptance. All native paths are **unverified on real hardware**.
+
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
@@ -679,3 +711,95 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Protected SQLite recovery coordinator integration
 
 - Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
+
+## Owner transaction coordinator integration
+
+- Codex / gpt-6.1-sol, medium preserved candidatea8628c6 on feat/windows-owner-transactions above the integrated service Application. Formatting and all-target Clippy with warnings denied passed; all nine focused owner-transaction tests passed. This delivers only a pure transaction prerequisite, not the requested native Windows installer adapter. Native ConfigurationIo, SCM/LSA operations and durable uninstall provenance remain absent. A crash between right grant and durable receipt remains RecoveryRequired; presence never proves ownership. Cross-provider architecture guidance is required before native activation. No owner or privileged operation occurred.
+
+## Windows owner recovery architecture review
+
+- Anthropic / claude-opus-5-5, high delivered docs-only ADR0012 at784fb16, superseding the old pure Journal/ConfigurationIo design. Codex / gpt-6.1-sol, medium independently read all four changed docs and found changes required: P1 arbitrary record-rollback safety claim has a pure-model counterexample, and P2 missing-account reason contradicts ADR0009. Strict UTF-8, balanced fences and scoped whitespace checks passed; no runtime/privileged check ran. See docs/reviews/0012-owner-contract-review.md. Native owner implementation remains blocked on contract correction and the ancestor-policy fix.
+
+## Corrected Windows owner contract recheck
+
+- Anthropic / claude-opus-5-5, high corrected ADR0012 atb522125. Codex / gpt-6.1-sol, medium independently rechecked all three changed docs and accepts the bounded documentation contract: P1 unconditional power-loss claim removed, record rollback explicitly outside guarantee, P2 reason split preserved. UTF-8/fence/whitespace checks and depth6 bounded scratch model passed the stated characterization. No native behavior is proven; the old Journal implementation must be replaced before activation. See docs/reviews/0012-owner-contract-review.md.
+
+
+## ADR 0012 PR-A pure owner provenance candidate
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol, high, implementation sub-agent
+  working alone from pinned prepared base
+  `7e7d3bfd49b558f2e5057260694a099540534906` on
+  `t3/implement-owner-provenance-engine`. Replaced obsolete Journal,
+  ConfigurationIo and compensating configure/recovery with strict 512-byte
+  OwnerRecord, OwnerStore/BatchRight, opaque observe_batch, recover, configure
+  and uninstall_right. Intent resolves only to None/Unproven; configure/recover
+  never revoke; only Granted authorizes uninstall using the record's explicit
+  SID. Last merged PR and M2 acceptance are unchanged.
+- Completed tasks: P1-P17 plus P6b/P6c; config mirror/old canonical expected-byte
+  paths, stale presence and record-only observations, cross-SID states, record
+  decoding, CAS, receipt/publication and other store failures with/without
+  effects, fixed errors/reports, explicit old-SID uninstall, unavailable
+  account/workspace and no-config uninstall path. Windows Plan::execute fails
+  closed for configure/uninstall and uninstall plans contain no BatchRight.
+  Former reserved-SID/group coverage is retained alongside new provenance tests.
+- API integration: configure_plan takes Option<BatchObservation>: Windows
+  requires Some from the locked private store; Linux/macOS require None and
+  retain their owner planning/validation behavior without LSA/provenance.
+  Configure::from_plan takes the same opaque observation after resolver.
+  Unix adapter candidate 7e12abf / PR29 needs the coordinator's argument update;
+  no candidate files or unrelated Windows handle-flake fixes were copied.
+  See docs/service-foundation.md for precise session ordering, API and limits.
+- Actual Windows checks: cargo fmt --all -- --check; cargo clippy --workspace
+  --all-targets -- -D warnings; cargo check --workspace; cargo build --workspace;
+  cargo test -p arxd service::owner --lib -- --nocapture (19 passed);
+  cargo test -p arxd service::config --lib (7 passed);
+  cargo test -p arxd service::layout --lib (2 passed); git diff --check.
+  Final focused owner suite took 1.93 seconds after compilation. No complete
+  workspace runtime suite or hosted CI was run; the inherited intermittent
+  Windows handle test remains unresolved and unclaimed by these local passes.
+- Model bounds/results: depth 6, every adapter call prefix (0..15 plus complete),
+  both commands with recovery, both external toggles, three grant/revoke outcomes,
+  and equivalent-state merging. Completed record writes persist in P6/P6b.
+  P6: 11,544 transitions, zero unsafe revokes. P6b LSA-only earlier-value loss:
+  15,365 transitions, zero unsafe revokes. P6c record rollback to any previously
+  seen value: 47,281 transitions, 312 unsafe revokes, all characterized by stale
+  Granted restored over a later non-Granted write; exact decision 6 trace pinned.
+  Independent ghost attribution detects both seeded receipt mutations: taking a
+  pre-existing right (52 unsafe witnesses / 12,064 transitions) and recovery
+  promoting to Granted (376 / 12,168). These mutations fail the P6 safety
+  predicate; the harness requires witnesses. No physical NTFS/LSA proof is claimed.
+- Corrections during verification: a fixture initially asserted only the primary
+  SID on a valid cross-SID None replacement; another injected read-error fixture
+  failed to return Err when its effect flag was set. Both fixture issues were
+  corrected and the focused suite rerun. One Clippy let-and-return diagnostic
+  was corrected. No symptom reached three distinct failed fixes.
+- Remaining blockers/tasks: fresh independent Opus implementation review, native
+  store/locking/publication and LSA (PR-B), SCM (PR-C), checked CLI session wiring
+  (PR-D), corrected native ancestor authority, service workspace boundary,
+  protected state provisioning, dedicated-account execution and installed M2
+  cargo/Claude Code/activity acceptance. Native and installed paths remain
+  **unverified on real hardware**. The accepted architecture does not accept
+  this implementation automatically.
+- No subagents, push, PR creation, merge, watch, admin/account/right/task/service/
+  install/provision/dispatch/settings operation or old Lab Manager/VM access.
+  Record rollback remains explicitly outside the safety guarantee. No new
+  infrastructure, approval flow, acknowledgement flag or architectural deviation.
+
+## Windows owner provenance integration checkpoint
+
+- Codex / gpt-6.1-sol, medium integrated candidate 120752c onto the current
+  service Application, preserving the Windows namespace policy, typed preflight
+  reasons and protected SQLite hot-journal recovery. Both modules remain exported.
+  The service-boundary owner-plan fixture now passes the Unix `None` observation.
+- Formatting, workspace/all-target Clippy with warnings denied, and all 129
+  runnable Windows nextest tests passed. Two subprocess-only fixtures were skipped
+  directly and exercised by their parents. The bounded owner model and actual
+  normal-user hot-journal regression both passed in this combined run.
+- This is pure owner-provenance logic; no native OwnerStore/LSA/SCM implementation
+  or CLI activation is delivered. Independent Opus review and hosted checks remain
+  required. Installed services and dedicated execution remain **unverified on real hardware**.
+- PR20 attempt 2 Ubuntu job 130573258883 failed at Playwright dependency installation
+  with DNS resolution failures for Ubuntu mirrors, as attempt 1 did. Windows,
+  macOS and independent review passed; the Ubuntu gate remains required. No second
+  automatic retry or check bypass was performed.

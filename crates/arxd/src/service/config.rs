@@ -479,7 +479,7 @@ pub(crate) mod tests {
                             running_binary: layout.binary(),
                         };
                         let plan = super::super::owner_plan::configure_plan(
-                            &layout, &context, &previous, None, false, &resolver,
+                            &layout, &context, &previous, None, None, &resolver,
                         );
                         assert_eq!(plan.as_ref().err(), Some(&Error::Rights));
                         assert_eq!(plan.as_ref().map(|p| p.operations().len()).unwrap_or(0), 0);
@@ -847,7 +847,7 @@ mod service_boundary_tests {
             running_binary: layout.binary(),
         };
         assert!(
-            super::super::owner_plan::configure_plan(&layout, &context, &owner, None, false, &r)
+            super::super::owner_plan::configure_plan(&layout, &context, &owner, None, None, &r)
                 .is_ok()
         );
         assert_eq!(r.workspace.get(), 2);

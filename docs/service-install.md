@@ -95,11 +95,17 @@ token into chat, an issue, a command line or a log.
    & "C:\Program Files\Arxcovo\arxd.exe" service start
    ```
 
-   `configure` grants **Log on as a batch job** to the `Arxcovo` account only,
-   because S4U needs that right, and records that it did so. `uninstall`
-   removes the right again. To change any setting later, rerun `configure`.
-   Do not edit `arxd.json` by hand: a changed owner stops the service from
-   starting (exit code 4).
+   If the `Arxcovo` account does not already have **Log on as a batch job**,
+   `configure` grants it to that account only, because S4U needs that right.
+   It records the grant in a private file, `owner-record.json`, next to the
+   config (ADR 0012). It never takes ownership of a right that was already
+   there. To change any setting later, rerun `configure`. If a configure was
+   interrupted, the next `configure` or `uninstall` resolves it automatically
+   and does not remove a right whose origin it cannot prove. The one exception
+   follows a power failure or a Windows crash, and it is described under
+   Uninstall. Do not edit
+   `arxd.json` or `owner-record.json` by hand: a changed owner stops the
+   service from starting (exit code 4).
 
 ## Linux (systemd 254 or newer)
 
@@ -193,7 +199,39 @@ token into chat, an issue, a command line or a log.
 
 ## Uninstall
 
-**(admin)** Run `arxd service uninstall`. It stops and removes the service,
-removes the unit or plist, and removes the batch-logon right if `configure`
-granted it. It deliberately leaves the config, the activity state, the workspace
-and the build account. Delete those yourself if you no longer want them.
+**(admin)** Run `arxd service uninstall`. It stops and removes the service and
+removes the unit or plist. It deliberately leaves the config, the activity
+state, the workspace and the build account. Delete those yourself if you no
+longer want them.
+
+On Windows, it also prints one line about the batch-logon right (ADR 0012):
+
+- `batch-right-removed`: `configure` granted the right, and uninstall removed
+  it. This happens even if you also added the right yourself after
+  `configure`. If you want to keep it, add it again after uninstall.
+- `batch-right-retained-unproven`: a `configure` was interrupted while
+  granting, so Arxcovo cannot prove it added the right. It leaves the right in
+  place. If you don't want it, remove it in `secpol.msc`.
+- `batch-right-retained-not-arxcovo`: the right was already there before
+  Arxcovo, so it stays.
+- `batch-right-already-absent` or `batch-right-not-recorded`: there was
+  nothing to remove.
+
+If `arxd` itself crashes or is closed partway through, the next run handles
+it as described above. A power failure, a Windows crash (blue screen), a hard
+reset or reverting a VM or disk snapshot is different: Windows may lose
+Arxcovo's last change to `owner-record.json` even after the command reported
+success. Suppose that happens soon after an uninstall, or soon after a
+`configure` that failed or was interrupted while granting the right again.
+If you later grant **Log on as a batch job** to the build account yourself, a
+future uninstall can remove your grant and print `batch-right-removed`. Restoring an older
+`owner-record.json` from a backup has the same effect. If you see that token
+and want to keep the right, grant it again in `secpol.msc`. No other right,
+account or file is affected. This case is not tested on real hardware (ADR
+0012, decision 6).
+
+Only if every `configure` or `uninstall` keeps reporting
+`service-owner-recovery-required` is the record damaged. In that case, delete
+`C:\ProgramData\Arxcovo\config\owner-record.json` as an administrator. Arxcovo
+then treats the right as not its own, and you remove it yourself if you don't
+want it.
