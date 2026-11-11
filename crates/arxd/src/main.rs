@@ -18,7 +18,7 @@ async fn main() {
             _ => "transport-frame-or-io",
         };
         eprintln!("arxd: {safe}");
-        std::process::exit(1);
+        std::process::exit(if safe == "server-config" { 3 } else { 1 });
     }
     // Tokio stdin uses a blocking OS read that cannot be cancelled. Explicitly
     // terminate after transport EOF so a client holding stdin open cannot keep
@@ -70,6 +70,7 @@ async fn run() -> anyhow::Result<()> {
             None => std::future::pending().await,
         }
     };
+    let execution = config.execution.clone();
     let http_run = async move {
         match http {
             Some(listener) => {
@@ -81,15 +82,21 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     tokio::pin!(local_run, http_run);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut local_run => result,
         result = &mut http_run => result,
         _ = tokio::signal::ctrl_c() => {
+            if let Some(execution) = &execution { execution.shutdown(); }
             let _ = shutdown_tx.send(true);
             // Bound HTTP drain; local connections are aborted when this returns.
             tokio::time::timeout(std::time::Duration::from_secs(5), &mut http_run).await.unwrap_or(Ok(()))
         },
+    };
+    if let Some(execution) = &execution {
+        execution.shutdown();
+        execution.drain().await;
     }
+    result
 }
 
 async fn serve_http(
