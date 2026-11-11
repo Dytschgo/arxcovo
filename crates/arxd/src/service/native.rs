@@ -11,6 +11,10 @@ mod os;
 #[path = "native_windows.rs"]
 mod os;
 
+#[cfg(target_os = "macos")]
+#[path = "native_macos.rs"]
+mod macos;
+
 pub struct NativeResolver;
 impl Resolver for NativeResolver {
     fn account(&self, value: &str) -> Result<Account, Error> {
@@ -18,6 +22,10 @@ impl Resolver for NativeResolver {
             return Err(Error::Identity);
         }
         os::account(value)
+    }
+    #[cfg(target_os = "macos")]
+    fn revision(&self, value: &str) -> Result<Option<String>, Error> {
+        macos::revision(value).map(Some)
     }
     fn workspace_safe(&self, value: &str) -> Result<bool, Error> {
         os::open(Path::new(value), true, false, false)

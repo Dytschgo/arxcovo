@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use super::super::config::AccountKind;
 use super::*;
 use std::{
@@ -45,32 +46,7 @@ pub fn protection(file: &File) -> Result<Protection, Error> {
         }
     }
     #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn acl_get_fd_np(fd: i32, kind: i32) -> *mut std::ffi::c_void;
-            fn acl_get_entry(
-                acl: *mut std::ffi::c_void,
-                entry: i32,
-                out: *mut *mut std::ffi::c_void,
-            ) -> i32;
-            fn acl_valid(acl: *mut std::ffi::c_void) -> i32;
-            fn acl_free(acl: *mut std::ffi::c_void) -> i32;
-        }
-        unsafe {
-            let acl = acl_get_fd_np(file.as_raw_fd(), 0x100); // ACL_TYPE_EXTENDED
-            if acl.is_null() {
-                return Err(Error::Permissions);
-            }
-            let mut entry = std::ptr::null_mut();
-            let valid = acl_valid(acl);
-            let result = acl_get_entry(acl, 0, &mut entry);
-            let errno = std::io::Error::last_os_error().raw_os_error(); // ACL_FIRST_ENTRY
-            acl_free(acl);
-            if valid != 0 || result != -1 || errno != Some(libc::EINVAL) {
-                return Err(Error::Permissions);
-            }
-        }
-    }
+    super::macos::empty_acl(file.as_raw_fd())?;
     let m = file.metadata().map_err(|_| Error::Permissions)?;
     Ok(Protection::Unix {
         uid: m.uid(),
@@ -136,9 +112,9 @@ pub fn open(path: &Path, directory: bool, _read: bool, trusted: bool) -> Result<
     })
 }
 
-// Only the local files database is accepted. NSS/directory identities whose
-// locality cannot be established are refused, including modern macOS OD users.
+// Linux retains the conservative protected local-files database requirement.
 // getgrouplist still observes current supplementary membership (bounded).
+#[cfg(target_os = "linux")]
 pub fn account(value: &str) -> Result<Account, Error> {
     let mut passwd =
         open(Path::new("/etc/passwd"), false, true, true).map_err(|_| Error::Identity)?;
@@ -245,6 +221,9 @@ pub fn account(value: &str) -> Result<Account, Error> {
         administrative: admin,
     })
 }
+
+#[cfg(target_os = "macos")]
+pub use super::macos::account;
 
 #[cfg(test)]
 mod tests {
