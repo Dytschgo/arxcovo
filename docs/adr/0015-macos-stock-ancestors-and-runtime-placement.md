@@ -19,8 +19,8 @@ Hosted evidence (`docs/evidence/macos-stock-directory-observations.json`, run
 | `/private/var/run` | UID 0 | nonzero | `0775` | empty | rejects: gid and group write |
 
 The reviewer resolved the image from the job log as `macos-26-arm64`
-`20261102.0473.1`. The evidence file records only `macos-latest`. That advisory
-stays open; this ADR does not edit the evidence file. `/`, `/bin`,
+`20261102.0473.1`. The evidence metadata was subsequently pinned to that
+resolved image in the PR31 documentation follow-up. `/`, `/bin`,
 `/bin/launchctl`, `/Library/Logs` and `/Library/LaunchDaemons` are on the
 layout's trusted walks but were **not observed**.
 
@@ -76,13 +76,14 @@ Linux are unchanged.
 
 ## Decision 2: new objects get GID 0 on macOS
 
-Because of BSD group inheritance (above), every directory or file that the
-owner adapter or the service **newly creates** on macOS gets
+Because of BSD group inheritance (above), every directory or regular file that
+the owner adapter or service **newly creates** on macOS gets
 `fchown(fd, 0, 0)` on its new handle before `fchmod` and before the final
 check. This covers `Fs::directory`, `Fs::create`, the config temporary file and
 `ensure_endpoint_directory`. Existing objects are never chowned, chmodded,
-repaired or removed. A wrong existing object is still refused. Linux behaviour
-is unchanged. A portable `fchown` to the expected IDs is allowed, but it is not
+repaired or removed. Socket ownership remains the configured client UID with
+GID 0 as in ADR 0009; it is not changed to root ownership by this rule.
+A wrong existing object is still refused. Linux behaviour is unchanged. A portable `fchown` to the expected IDs is allowed, but it is not
 required there.
 
 ## Decision 3: runtime endpoint moves; config and state stay
@@ -132,8 +133,8 @@ open M2 item for a later ADR, not part of this contract.
 
 ## Compatibility and cleanup (no automatic action)
 
-- No working macOS service existed before this ADR, because startup was
-  blocked. Config and state paths are unchanged, so there is no migration.
+- No installed macOS service acceptance has been recorded. Config and state
+  paths are unchanged, so this contract requires no state migration.
 - An old `/private/var/run/arxcovo` (from any pre-0015 build, or created by
   hand) is never read, used, repaired or deleted. Its parent stays refused. The owner may
   remove it by hand: `sudo rm` a stale socket, then `sudo rmdir` the directory.
