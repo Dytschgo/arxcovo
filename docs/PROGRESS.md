@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: security review and hosted checks for the authenticated MCP inventory/activity slice; review the separate Windows execution probe next. Dedicated-account commands and services remain unimplemented.
-- Last merged PR: [#7](https://github.com/Dytschgo/arxcovo/pull/7), merge `9c623449f8341359283190f96d8222acfc7e5769`, 2026-11-11 08:29:43 UTC. All required checks and fresh Opus review passed; Electron tests ran on all three hosted OSes.
+- Current task: review Windows experiment PR #12 and the persistent host identity candidate; build the Unix execution backend. Dedicated-account commands, services and stdio remain unimplemented.
+- Last merged PR: [#11](https://github.com/Dytschgo/arxcovo/pull/11), merge `fa5e41418c1a5ae42337365c5217f177a0b9207d`, 2026-11-11 08:50:09 UTC. All required checks and independent security re-review passed.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -31,6 +31,15 @@
 - Electron tests are committed in [#7](https://github.com/Dytschgo/arxcovo/pull/7), reviewed head b8c2187. Local lint and the real Windows smoke test passed. Hosted run 42984639552 passed all three platforms, each running Electron once; independent Opus review passed. The branch needs updating after the newer main merges and re-review before merge. Auto-merge is off.
 
 ## Milestones
+
+### Milestone 2 delivery status
+
+- Inventory/activity: PR #11 merged the authenticated official-SDK HTTP tracer after all three hosted platforms and security re-review passed. It deliberately has no execution authority. Local and independent workspace validation passed 13 tests.
+- The macOS temporary-root fixture issue and blocking Windows inherit-only ACL exposure were fixed before merge. The permission regression failed old code and passed the correction. Windows path-prefix handling, owner checks, header/connection bounds and other non-blocking review observations remain tracked follow-ups before privileged service use.
+- Windows execution: PR #12 combines harness 24d3c7e with helper 852f6f0. Build/publish, 21 harness assertions and 82 helper assertions passed without privilege. Review is running before any disposable privileged experiment. No S4U/account-right/process-identity success is claimed.
+- Unix execution is being built separately. Persistent host identity is now implemented as a reviewed-candidate change: OS-random bytes are stored transactionally, survive restart and retention, and malformed metadata fails closed. Builder formatting/Clippy/16 tests passed; coordinator formatting and all 16 integrated workspace tests passed. Independent review and hosted checks remain required.
+- Still to implement and prove: stdio bridge and trusted local endpoint identity; per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
+- Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
 
 - [x] 1. Setup: end-to-end acceptance passed; evidence reviewed and merged in #8.
 - [ ] 2. Single host: per-OS service, inventory MCP, dedicated-account commands and persisted activity; Claude Code MCP acceptance.
@@ -83,6 +92,8 @@
 | PR #11 security review round 1 | Claude / claude-opus-5-5 | high | Failure on 6abff15: inherit-only Windows ACL grants exposed newly created activity files; remaining path/ownership/DoS observations recorded as follow-up work |
 | PR #11 ACL correction | Codex / gpt-6.1-sol | medium | New Windows inheritance-only regression failed before the fix; all 13 workspace tests, formatting and Clippy passed after rejecting those grants before file creation. Fresh review and hosted checks required |
 | Windows execution feasibility probe | Codex / gpt-6.1-sol | high | Commit 24d3c7e prepared separately; build/publish and 21 unprivileged self-test assertions passed. Privileged disposable-CI probe is unrun; review required before any such execution |
+| PR #11 security review round 2 | Claude / claude-opus-5-5 | high | Success on 181ddff; 13 tests and old-code mutation confirmed correction; all hosted checks passed and PR merged |
+| Persistent host identity | Codex / gpt-6.1-sol | high | Builder 2e5961b integrated on merged inventory; 16 tests pass, including real SDK restart/fresh-state and corruption/retention cases; independent review pending |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |

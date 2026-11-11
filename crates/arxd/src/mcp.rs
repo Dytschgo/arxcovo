@@ -58,11 +58,12 @@ impl ServerHandler for Inventory {
                 .map_err(|_| unavailable())?;
             return Err(ErrorData::invalid_params("unknown tool or arguments", None));
         }
+        let host_id = self.activity.host_id().map_err(|_| unavailable())?;
         let mut system = sysinfo::System::new();
         system.refresh_cpu_all();
         system.refresh_memory();
         let disks = sysinfo::Disks::new_with_refreshed_list();
-        let value = json!({"hosts":[{"os":std::env::consts::OS,"arch":sysinfo::System::cpu_arch(),"logical_cpus":system.cpus().len(),"ram_bytes":system.total_memory(),"disk_total_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.total_space())),"disk_available_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.available_space())),"execution_available":false,"execution_unavailable_reason":"dedicated account backend not implemented","tool_discovery":"unavailable until dedicated account backend exists"}]});
+        let value = json!({"hosts":[{"host_id":host_id,"os":std::env::consts::OS,"arch":sysinfo::System::cpu_arch(),"logical_cpus":system.cpus().len(),"ram_bytes":system.total_memory(),"disk_total_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.total_space())),"disk_available_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.available_space())),"execution_available":false,"execution_unavailable_reason":"dedicated account backend not implemented","tool_discovery":"unavailable until dedicated account backend exists"}]});
         self.activity
             .finish(id, "succeeded")
             .map_err(|_| unavailable())?;
