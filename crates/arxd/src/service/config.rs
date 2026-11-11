@@ -202,6 +202,7 @@ impl ServiceConfig {
             return Err(Error::Config);
         }
         let mut names = BTreeSet::new();
+        let mut hashes = BTreeSet::new();
         if w.agents.iter().any(|a| {
             a.principal == "arxd"
                 || a.principal.is_empty()
@@ -213,6 +214,7 @@ impl ServiceConfig {
                 || !names.insert(&a.principal)
                 || a.token_sha256.len() != 64
                 || !a.token_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                || !hashes.insert(a.token_sha256.to_ascii_lowercase())
         }) {
             return Err(Error::Config);
         }
@@ -437,6 +439,32 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn distinct_principals_require_distinct_decoded_credentials() {
+        for hash in ["a".repeat(64), "A".repeat(64)] {
+            let mut value = fixture();
+            value["agents"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "principal": "second",
+                    "token_sha256": hash,
+                }));
+            assert_eq!(
+                parse(value, &FakeResolver::default()).err(),
+                Some(Error::Config)
+            );
+        }
+        let mut value = fixture();
+        value["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "principal": "second",
+                "token_sha256": "b".repeat(64),
+            }));
+        assert!(parse(value, &FakeResolver::default()).is_ok());
     }
     #[test]
     fn strict_schema_and_redacted_errors() {
