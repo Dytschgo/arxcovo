@@ -855,3 +855,51 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - PR29 is not complete. Native and installed M2 paths remain **unverified on real
   hardware**. No real manager, privileged harness, owner administration, dispatch,
   settings, old Lab Manager or VM operation was invoked for this slice.
+
+## ADR0014 phase 3a: bounded native runner candidate (2026-11-11)
+
+- Provider/effort/outcome: OpenAI gpt-6.1-sol / medium / implementation and
+  metadata checks complete; Unix runtime acceptance remains outstanding.
+  Verified clean prepared base `3ced94d70fa990c5a61aabf4dde358602ca04210`.
+  Worked alone. Last merged PR unchanged (#28); no push, PR write, merge or watch.
+- `owner_unix::execute(&Plan) -> Result<(), Error>` now executes supported typed
+  expectations, fresh command gates and UnitAbsent publication. Every observation
+  checks the primary artifact and Linux drop-in through protected descriptor
+  traversal and exact bytes. Foreign/Unknown halt; false gates record a skip
+  count. The entire plan is allowlisted and scanned for unsupported StartPreflight
+  or ProvisionState before any operation. Install/start remain refused in phase 3a.
+- Added `owner_unix::status() -> Result<owner_query::Status, Error>`: fixed tokens,
+  same production root identity, installed-binary and namespace boundary as execute.
+  No CLI activation. macOS native parser remains Unknown for every result, pending
+  captured output/exit fixtures; typed scripted macOS results are test-only.
+- Private Runner uses fixed systemctl/launchctl vectors, cleared fixed environment,
+  constant cwd, null stdin/stderr, 35s mutation deadline and 10s query deadline.
+  Nonblocking stdout retention is capped at 4096/65536 bytes. Nonzero, signal,
+  timeout, overflow, read/spawn failures halt; failure kills and polls reaping for
+  at most 1s. No raw output escapes. No hidden enable/disable inside publication.
+- Added cfg(test)-only ordinary-user protected Fs/Script construction and six
+  tests covering whole Linux/macOS uninstall ordering, fresh bootstrap gates and
+  skips, active/foreign/unknown refusal, stop proof before removal, failed-command
+  suffix halting, whole-plan unsupported refusal, artifact checks/UnitAbsent,
+  and safe `/bin/sleep 5` 100ms timeout, echo stdout bounds and false nonzero.
+  These Unix tests compile as metadata but were NOT executed on this Windows host.
+- Passed: fmt check; workspace/all-target Clippy with warnings denied; workspace
+  test compilation; all 18 portable owner tests; diff whitespace check. Actual
+  source mutations killed: ungated bootstrap, Unknown-as-Absent, removed stop proof.
+  Mutations restored and portable owner tests passed afterwards. Ignored-timeout
+  and ignored-nonzero mutation execution remains outstanding on ordinary Unix.
+- Linux x86_64 and macOS arm64 actual-source test metadata and Clippy passed.
+  Commands used LIBSQLITE3_SYS_USE_PKG_CONFIG=1 and SQLITE3_LIB_DIR pointing at the
+  checkout solely to supply SQLite link hints for cargo check/Clippy, avoiding
+  bundled SQLite C compilation. No compiler shim, linking, native executable,
+  actual SQLite cross-build or native runtime success is claimed.
+- Phase 3b contract: implement optional-endpoint StartPreflight and protected
+  retained-state ProvisionState, then remove only those unsupported scan cases;
+  preserve fresh query gates, root/incarnation preflight, CAS/private permissions,
+  and bounded runner. macOS endpoint/ancestor policy and captured launchd fixtures
+  remain open. Coordinator integrates PR30 Option<BatchObservation> separately.
+- Acceptance gap: execute ordinary-user Unix fixtures and timeout/nonzero source
+  mutations before phase 3a acceptance; independent other-provider review remains
+  required. PR29, installed acceptance and remaining M2 are NOT complete. All real
+  manager and installed paths are **unverified on real hardware**. No real manager,
+  privileged fixture, owner admin, dispatch, settings, old Lab Manager or VM ran.
