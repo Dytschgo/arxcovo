@@ -1,5 +1,6 @@
-//! Inventory-only foreground development server. No execution authority.
+//! Authenticated foreground MCP server and a separate Unix execution library.
 pub mod config;
+pub mod exec;
 pub mod http;
 pub mod local;
 mod mcp;
