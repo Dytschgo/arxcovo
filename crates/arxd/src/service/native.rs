@@ -16,6 +16,10 @@ mod os;
 mod macos;
 
 pub struct NativeResolver;
+#[cfg(all(windows, test))]
+pub(crate) use os::descriptor_protection as windows_descriptor_protection;
+#[cfg(windows)]
+pub(crate) use os::protection as windows_protection;
 impl Resolver for NativeResolver {
     fn account(&self, value: &str) -> Result<Account, Error> {
         if value.is_empty() || value.len() > 256 || value.contains('\0') {
@@ -236,7 +240,7 @@ fn bounded_read(file: &mut impl Read) -> Result<Vec<u8>, Error> {
 
 /// Reject lexical aliases before the OS sees them. In particular Path::components
 /// normalizes dots, so it must not be used as the validator.
-fn components(path: &Path, windows: bool) -> Result<Vec<String>, Error> {
+pub(crate) fn components(path: &Path, windows: bool) -> Result<Vec<String>, Error> {
     let s = path.to_str().ok_or(Error::Layout)?;
     if s.len() > 4096 || s.contains('\0') {
         return Err(Error::Layout);
