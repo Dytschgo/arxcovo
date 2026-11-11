@@ -1,8 +1,8 @@
 # Arxcovo progress
 
-## Current state â€” 2026-11-11
+## Current state — 2026-11-11
 
-- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3â€“6 remain unimplemented apart from research and scaffolding.
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#35](https://github.com/Dytschgo/arxcovo/pull/35), `cd464b253368f7dadd71cc40038dc03b09508992`, 19:26:39 UTC, through all five gates. The SCM library is merged; native owner activation and installed/dedicated-account acceptance remain open.
 - Main includes lifecycle, fixed configuration, native observation, Application, owner provenance, protected owner storage and SCM libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; M2 stays unchecked.
 - Queue priority: finish independent review of refreshed Unix owner #29, then full executor/MCP #36 review and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
@@ -13,10 +13,13 @@
 - OpenAI / gpt-6.1-sol / high, implementation sub-agent, integration only. Prepared base `241dfa77fe865686c41e81a780415e8967d6dfff`; required local parent `e13e25f750f846b9c4742716aa7079177ab624a7` includes actual #35 main `cd464b253368f7dadd71cc40038dc03b09508992` and merged test-only #37. Both histories are preserved. No parent/public branch modification, push, PR operation or activation.
 - Resolved module declarations by retaining executor, owner transactions, owner store and SCM modules. Documentation conflicts retain both task histories and provider tables. Executor/MCP/store/Application implementation remains unchanged from the prepared executor base; parent source is retained exactly except the combined module declarations. No new behavior, backend or architectural deviation.
 - Production execution still refuses MechanismUnavailable; development/schema 3, immutable principal, durable start/completion, cancellation/shutdown joins, withholding/quarantine, bounded output, no service workspace/PATH access and corrected Application ancestor sharing remain intact. Windows opaque BatchObservation and record-only uninstall authority remain; Unix uses None and retains lifecycle/macOS namespace policy.
-- Verification in progress; local completion does not approve PR36. Public source `12aa968ea7ddb01a214bf435c4be3b35c9406f69` and the integrated candidate require FULL independent Opus high review later; parent e13e25f is under separate independent review. Prior 184-test parent and 149-test executor passes are historical, not current evidence. Existing intermittent ExecutionFailed remains unresolved; PR37 corrects only the handle marker.
+- Integration commit: `9dceedae951a7f10d0dd0a4fe91102e341c503e1` (parents exactly prepared base and required local parent). Local completion does not approve PR36. Public source `12aa968ea7ddb01a214bf435c4be3b35c9406f69` and the integrated candidate require FULL independent Opus high review later; parent e13e25f is under separate independent review. Prior 184-test parent and 149-test executor passes are historical, not current evidence. Existing intermittent ExecutionFailed remains unresolved; PR37 corrects only the handle marker.
+- Actual integrated Windows checks: `cargo fmt --all --check` passed; `cargo clippy --workspace --all-targets --locked -- -D warnings` passed; `cargo nextest run --workspace --locked --no-fail-fast --status-level fail --final-status-level fail` passed **197/197**, two subprocess-only fixtures skipped directly and exercised through normal parents. Run `e37ecc2c-b79b-43cc-9590-fcc4f0881f79`, 10.257-second test phase. No retries or speculative fixes. Focused executor/MCP, owner-plan/provenance/store/SCM and Application regressions ran in that full suite. ExecutionFailed did not recur here; its cause remains unresolved and this pass is not a fix claim.
+- Portable checks executed: `python -m unittest discover -s tools/ci -p 'test_*.py'` **26 passed**; `node --test scripts/*.test.mjs` **18 passed**; `python scripts/test-service-artifacts.py -v` **3 passed, 2 native Unix checks skipped**. No Unix metadata/link/runtime check was attempted. Source comparison confirms executor/tests, MCP, store, Application and main unchanged from the executor base; the owner modules/config/plan/native adapters are inherited unchanged from e13e25f. Both input provider-table row sets are retained, Current state is first and exactly one queue-priority row remains.
+- Whitespace: the merge diff check reports one inherited patch-data blank context line in `docs/reviews/windows-owner-store-fixture-isolation.patch:82`; its bytes match the required parent and were preserved as historical evidence. Subsequent documentation diff check passed. The documentation follow-up also preserves the original Unicode provider-history text.
 - Installed/native/dedicated M2 paths remain **unverified on real hardware**. No production owner/native constructor, SCM/LSA/privilege/account/admin/service/VM or old Lab Manager action was performed.
 
-## PR29 compatibility integration â€” Sol high, 2026-11-11
+## PR29 compatibility integration — Sol high, 2026-11-11
 
 - Integrated implementation commit: `79959a33a0422cf9bd594cb99d1323d85051740d`, parents exactly `06c7f6b646b64adf615c98353b9a5a9111636b5d` and `4f2b0c7177c8b7370d34484e4739082364859f4a`. Following documentation-only evidence commits do not alter tested code.
 - Files changed relative to prepared base: `crates/arxd/src/service/config.rs`, `mod.rs`, `owner_plan.rs`, `owner_transactions.rs`, `owner_transactions_tests.rs`; `docs/PROGRESS.md`, `docs/adr/0009-service-lifecycle-and-dedicated-execution.md`, `docs/adr/0012-windows-owner-transaction-and-right-provenance.md`, `docs/reviews/0012-owner-contract-review.md`, `docs/service-foundation.md`, `docs/service-install.md`. The provenance module/contract/review come from actual main; the shared plan resolves compatibility, Unix call sites use None, and the cross-platform test is strengthened. No new ADR was needed.
@@ -134,7 +137,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Task | Provider/model | Effort | Task-time outcome |
 | --- | --- | --- | --- |
-| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1â€“2 merged; full protection read back; first baseline verified |
+| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1–2 merged; full protection read back; first baseline verified |
 | Initial scaffold/CI builder | Codex / gpt-6.1-sol | medium | PR #1 built and locally verified |
 | CI gate architecture | Claude / claude-opus-5-5 | high | App-free workflow_run design and staged installation advised |
 | PR #1 review round 1 | Claude / claude-opus-5-5 | high | Failure on 835d06c: history deadlock, error handling, labels and extra approval requirements |
@@ -250,7 +253,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   `t3/native-service-adapters`; implementation commit `678287d`.
   Added service/native.rs, native_windows.rs, native_unix.rs plus necessary
   module/Cargo wiring. No other task branch or development/store/MCP file edited.
-  This task changes no acceptance status: M1 is accepted and M2â€“6 remain unchecked.
+  This task changes no acceptance status: M1 is accepted and M2–6 remain unchecked.
 - Unchanged Windows baseline: `cargo test --workspace` passed 61 tests, one
   directly ignored subprocess fixture exercised by its parent. Added nine
   native/policy tests: real current-token/local-SAM observations (positive
@@ -317,7 +320,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
 
-## Windows development execution candidate â€” implementation handoff (2026-11-11)
+## Windows development execution candidate — implementation handoff (2026-11-11)
 
 - Provider/effort: GPT-6.1 Sol, high. Outcome: incomplete candidate; stopped under
   the task's three-different-failed-fixes rule. Independent other-provider review
@@ -330,7 +333,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   unnamed Job memory/process/UI limits; token comparison before resume;
   cancellation/shutdown/output/time bounds; cleanup confirmation and quarantine;
   MCP execution/discovery/capability wiring; worker-owned audit completion;
-  transactional explicit v2â†’v3 identity_mode migration and development-row CHECKs.
+  transactional explicit v2→v3 identity_mode migration and development-row CHECKs.
 - Actual validation: `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed after final code
   edits. The last full `cargo test --workspace --no-fail-fast` failed: 12/13
@@ -367,7 +370,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   coordinator's post-review private acceptance are in
   `docs/windows-development-execution.md`.
 
-## Windows development execution â€” Opus continuation (2026-11-11)
+## Windows development execution — Opus continuation (2026-11-11)
 
 - Provider/effort: Anthropic claude-opus-5-5, high (other-provider continuation
   under the three-failed-fixes rule). Outcome: candidate complete locally and
@@ -924,7 +927,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   Clippy with warnings denied, and all three portable owner_unix tests. Native
   Unix manager behavior was not exercised by these Windows checks.
 
-## ADR0014 implementation foundation â€” incomplete
+## ADR0014 implementation foundation — incomplete
 
 - Provider/effort: OpenAI / gpt-6.1-sol / medium. Prepared base verified as
   `d1e2425e8b37c038b65076b799bcbddc332dc597`; initial worktree clean.
@@ -1145,7 +1148,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   **unverified on real hardware**. PR29 remains a work in progress.
 
 
-### ADR0014 phase 3b â€” bounded local implementation (2026-11-11)
+### ADR0014 phase 3b — bounded local implementation (2026-11-11)
 
 - Provider/effort/outcome: OpenAI gpt-6.1-sol / medium; implemented locally,
   independent review pending. Prepared base verified exactly as
@@ -1399,7 +1402,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared existing #36 locally on refreshed Unix owner branch `9c25864`. Crate, packaging, Cargo/toolchain and script trees remain identical to published `12aa968`; CI workflows/helpers match the parent. Only PROGRESS conflicted; both historical provider tables and task evidence are retained, with Current state first and #21 recorded merged. Formatting and 26/26 helper tests passed. No Rust suites were repeated for unchanged source, no push/new PR and no privileged operation.
 - Full independent interface/MCP review remains required after parent integration. Production dedicated execution still reports MechanismUnavailable; no current-user fallback, actual identity switch or dedicated-account acceptance is added by this history/CI refresh. Known test-only ETW handle fixture correction is retained separately and is not silently folded in. Installed/native M2 execution remains **unverified on real hardware**.
-## Windows owner adapter prerequisite handoff â€” 2026-11-11
+## Windows owner adapter prerequisite handoff — 2026-11-11
 
 - Provider/effort: Codex / gpt-6.1-sol high, implementation sub-agent working
   alone from `1a45ba15640b608ee4c953a104c06e451a85d07b`, branch
@@ -1520,7 +1523,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium verified #25 merged as `63b6555` at 17:59:09 UTC through all five gates. Its tree equals independently reviewed `7af3eac`. The local Application already contained that exact parent; duplicate-history squash conflicts retained the current Application tree. Crate/packaging/Cargo/toolchain/script bytes remain identical to public `a08187c` pending the separate sharing fix. No source fix or new acceptance is claimed by this alignment.
 - Main configuration run 43071362527 was independently read from its first-attempt API, success, 2026-11-11T17:46:22Z to 2026-11-11T17:54:32Z = 490 seconds. Current state records the actual latest merge first. PR27 remains blocked by its review finding until the sharing fix, fresh independent review and hosted gates pass. No push/new feature PR or privileged operation; installed-service/dedicated-account paths remain **unverified on real hardware**.
 
-## PR27 blocking ancestor-sharing correction â€” local candidate
+## PR27 blocking ancestor-sharing correction — local candidate
 
 - Provider/effort/task/outcome: OpenAI / gpt-6.1-sol / high; implement only the confirmed retained-ancestor sharing blocker from the [Opus review](https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091). Prepared base `4f29ecf843c01d82fe38da16e8ef42e0b53a7611` on parentpreparedApplication (crate source identical to public `a08187c1e14a5722d4c37bfc9f2690d273d62eb3`). Local implementation complete; independent review/hosted gates pending. Current state and last merged PR above are unchanged; no acceptance claim.
 - Only production change: service `native_windows::open_impl` adds FILE_SHARE_WRITE for non-leaf ancestors, preserving FILE_READ_DATA, retained handles and no FILE_SHARE_DELETE. Immutable final leaves still exclude writers; mutable DB/journal/lock leaves still share read/write without delete sharing. Structural, owner, DACL and namespace checks are unchanged. Owner Windows and development executor source/policies, other protected source and the separate handle-marker patch are untouched. ADR0013 and service-foundation now describe ACL namespace authority and retained nondelete handles accurately, without claiming pins freeze all modification.

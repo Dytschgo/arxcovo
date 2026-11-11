@@ -816,3 +816,19 @@ marked-for-delete handle/API behavior; privilege ordering and buffer sufficiency
 real reboot persistence; and sufficiency of the four privileges. These require a
 separately reviewed disposable hosted-runner experiment. Independent Opus review
 and hosted required checks remain required; M2 is open.
+
+## PR36 bounded integration status (2026-11-11)
+
+The executor/MCP interface now carries local Unix parent e13e25f, including
+merged Windows provenance, protected owner storage, SCM and the test-only PR37
+handle correction. Earlier candidate sections above are historical slice records.
+The source remains library-only: no production backend, owner CLI activation or
+new authority is introduced. Native execution still reports MechanismUnavailable.
+Unix configure uses None; Windows requires opaque BatchObservation. Windows
+uninstall remains config/account/workspace independent and owner-record based.
+
+The next obligations remain full independent Opus review of PR36, separate parent
+review, hosted gates, PR-D proof consumption and session-parts narrowing, safe
+fresh-state provisioning, and separately reviewed native execution adapters.
+Development/schema 3 and service no-workspace/PATH boundaries remain unchanged.
+Installed/native/dedicated-account M2 remains **unverified on real hardware**.
