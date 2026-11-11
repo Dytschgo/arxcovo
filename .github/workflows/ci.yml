@@ -31,9 +31,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo nextest run --workspace --locked
+      - name: Pure Windows probe guards (no provisioning)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/windows-identity-probe/Test-CiValidation.ps1
       - run: npm ci
       - run: npm run lint
       - run: npm test
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run smoke
+      - name: Electron smoke on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum npm run test:desktop
+      - name: Electron smoke on Windows and macOS
+        if: runner.os != 'Linux'
+        run: npm run test:desktop

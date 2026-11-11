@@ -1,0 +1,48 @@
+name: Disposable Windows identity experiment
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'Dytschgo/arxcovo' &&
+      github.actor == 'Dytschgo' && github.triggering_actor == 'Dytschgo' &&
+      github.ref == 'refs/heads/main' &&
+      vars.WINDOWS_IDENTITY_PROBE_REVIEWED_SHA != '' &&
+      github.sha == vars.WINDOWS_IDENTITY_PROBE_REVIEWED_SHA &&
+      github.workflow_sha == vars.WINDOWS_IDENTITY_PROBE_REVIEWED_SHA
+    runs-on: windows-2022
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ARXCOVO_DISPOSABLE_PROBE: reviewed-manual-ci-v1
+      REVIEWED_SHA: ${{ vars.WINDOWS_IDENTITY_PROBE_REVIEWED_SHA }}
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: '10.0.404'
+      - name: Validate provenance guards and pure tests
+        run: |
+          Import-Module ./tools/windows-identity-probe/CiValidation.psm1
+          Assert-ProbeContext (Get-ProbeContext)
+          ./tools/windows-identity-probe/Test-CiValidation.ps1
+      - name: Build, self-test and publish trusted source
+        run: |
+          dotnet build tools/windows-identity-probe/IdentityProbe.csproj -c Release --nologo
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project tools/windows-identity-probe/IdentityProbe.csproj -c Release --no-build -- --self-test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet publish tools/windows-identity-probe/IdentityProbe.csproj -c Release -r win-x64 --self-contained true --nologo
+          exit $LASTEXITCODE
+      - name: Disposable experiment with mandatory finally cleanup
+        run: ./tools/windows-identity-probe/Invoke-DisposableCi.ps1
