@@ -663,8 +663,53 @@ pub(crate) mod tests {
                     .unwrap()
                     .parse::<usize>()
                     .unwrap() as HANDLE;
-                let mut flags = 0;
-                assert_eq!(GetHandleInformation(sentinel, &mut flags), 0);
+                // Model loader/runtime reuse of the parent's numeric slot, using
+                // real child-local kernel objects rather than mocking Win32.
+                let mut held = Vec::new();
+                if std::env::var_os("ARX_UNIT_REUSE").is_some() {
+                    let mut flags = 0;
+                    for _ in 0..4096 {
+                        if GetHandleInformation(sentinel, &mut flags) != 0 {
+                            break;
+                        }
+                        let event = Handle(CreateEventW(null(), 1, 0, null()));
+                        assert!(!event.0.is_null());
+                        held.push(event);
+                    }
+                    assert_ne!(
+                        GetHandleInformation(sentinel, &mut flags),
+                        0,
+                        "reuse fixture did not occupy slot"
+                    );
+                }
+                // Snapshot BEFORE opening the reference: OpenEventW itself may
+                // otherwise occupy an absent sentinel slot and fake a leak.
+                let mut candidate = null_mut();
+                let present = DuplicateHandle(
+                    GetCurrentProcess(),
+                    sentinel,
+                    GetCurrentProcess(),
+                    &mut candidate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                ) != 0;
+                let candidate = present.then(|| Handle(candidate));
+                let name = std::env::var("ARX_UNIT_EVENT").unwrap();
+                let reference = Handle(OpenEventW(
+                    SYNCHRONIZE,
+                    0,
+                    wide(std::ffi::OsStr::new(&name)).as_ptr(),
+                ));
+                assert!(!reference.0.is_null(), "sentinel reference unavailable");
+                if let Some(candidate) = candidate {
+                    assert_eq!(
+                        CompareObjectHandles(candidate.0, reference.0),
+                        0,
+                        "unintended inherited sentinel object"
+                    );
+                    println!("ARX-HANDLE-REUSED-DISTINCT");
+                }
                 assert_eq!(GetFileType(GetStdHandle(STD_INPUT_HANDLE)), FILE_TYPE_CHAR);
                 assert_eq!(GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)), FILE_TYPE_PIPE);
                 assert_eq!(GetFileType(GetStdHandle(STD_ERROR_HANDLE)), FILE_TYPE_PIPE);
@@ -716,6 +761,44 @@ pub(crate) mod tests {
         (dir, fixture_execution(settings), r)
     }
     #[test]
+    fn handle_slot_reuse_is_not_inheritance() {
+        let (_dir, mut e, r) = fixture("handles");
+        let _sentinel = sentinel_event(&mut e);
+        e.settings
+            .environment
+            .insert("ARX_UNIT_REUSE".into(), "1".into());
+        let result = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        assert!(result.cleanup_confirmed && result.matches_current_user);
+        assert_eq!(result.stop_reason, StopReason::Exited);
+        assert_eq!(result.exit_code, Some(0), "stderr={}", result.stderr);
+        assert!(result.stdout.contains("ARX-HANDLE-REUSED-DISTINCT"));
+    }
+    fn sentinel_event(e: &mut Execution) -> Handle {
+        let name = format!("Local\\Arxcovo-test-{:032x}", rand::random::<u128>());
+        let sentinel = unsafe {
+            Handle(CreateEventW(
+                null(),
+                1,
+                0,
+                wide(std::ffi::OsStr::new(&name)).as_ptr(),
+            ))
+        };
+        assert!(!sentinel.0.is_null());
+        unsafe {
+            ok(SetHandleInformation(
+                sentinel.0,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            ))
+            .unwrap();
+        }
+        e.settings.environment.insert("ARX_UNIT_EVENT".into(), name);
+        e.settings
+            .environment
+            .insert("ARX_UNIT_HANDLE".into(), (sentinel.0 as usize).to_string());
+        sentinel
+    }
+    #[test]
     fn actual_job_tree_timeout_cancel_shutdown_overflow_and_handles() {
         for action in ["tree", "overflow", "handles", "cancel", "shutdown"] {
             let (_dir, mut e, r) = fixture(if action == "cancel" || action == "shutdown" {
@@ -724,20 +807,7 @@ pub(crate) mod tests {
                 action
             });
             let cancel = Cancellation::default();
-            let sentinel = unsafe { Handle(CreateEventW(null(), 1, 0, null())) };
-            if action == "handles" {
-                unsafe {
-                    ok(SetHandleInformation(
-                        sentinel.0,
-                        HANDLE_FLAG_INHERIT,
-                        HANDLE_FLAG_INHERIT,
-                    ))
-                    .unwrap();
-                }
-                e.settings
-                    .environment
-                    .insert("ARX_UNIT_HANDLE".into(), (sentinel.0 as usize).to_string());
-            }
+            let _sentinel = (action == "handles").then(|| sentinel_event(&mut e));
             if action == "cancel" {
                 cancel.cancel();
             }
@@ -757,7 +827,13 @@ pub(crate) mod tests {
             };
             assert_eq!(result.stop_reason, expected, "{action}");
             if action == "handles" {
-                assert_eq!(result.exit_code, Some(0), "{}", result.stdout);
+                assert_eq!(
+                    result.exit_code,
+                    Some(0),
+                    "stdout={} stderr={}",
+                    result.stdout,
+                    result.stderr
+                );
             }
         }
     }
