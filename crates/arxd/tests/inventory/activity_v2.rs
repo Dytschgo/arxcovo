@@ -94,9 +94,45 @@ fn read_flood_preserves_actions_and_lifecycle() {
         .unwrap(),
         "daemon:arxd"
     );
-    for _ in 0..1001 {
-        store.start("test-agent", "discover_tools").unwrap();
+    let oldest_action: i64 = db
+        .query_row(
+            "SELECT min(id) FROM activity WHERE class='action'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let oldest_read: i64 = db
+        .query_row("SELECT min(id) FROM activity WHERE class='read'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    // The action bucket is already full. Two more real starts exercise
+    // pruning without repeating a second complete fill of durable writes.
+    for _ in 0..2 {
+        let id = store.start("test-agent", "discover_tools").unwrap();
+        assert_eq!(
+            db.query_row("SELECT class FROM activity WHERE id=?1", [id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "action"
+        );
     }
+    assert!(
+        !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity WHERE id=?1)",
+            [oldest_action],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert!(
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity WHERE id=?1)",
+            [oldest_read],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM activity WHERE class='read'",
