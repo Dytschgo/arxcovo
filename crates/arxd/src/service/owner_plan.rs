@@ -9,7 +9,12 @@ pub const UNIT: &[u8] = include_bytes!("../../../../packaging/linux/arxd.service
 pub const DROPIN: &[u8] =
     include_bytes!("../../../../packaging/linux/50-arxcovo-standard-rights.conf");
 pub const PLIST: &[u8] = include_bytes!("../../../../packaging/macos/com.arxcovo.arxd.plist");
-const DROPIN_PATH: &str = "/etc/systemd/system/arxd.service.d/50-arxcovo-standard-rights.conf";
+pub use super::owner_query::{DROPIN_PATH, Expect, Gate};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstantGate {
+    Always,
+    UnitAbsent,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Install,
@@ -67,6 +72,9 @@ pub(super) fn registration(l: &Layout) -> Registration {
 /// points. No step authorizes taking over or repairing an existing object.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Operation {
+    Expect(Expect),
+    StartPreflight,
+    ProvisionState,
     Verify {
         path: PathBuf,
         policy: Policy,
@@ -80,6 +88,7 @@ pub enum Operation {
     Constant {
         path: PathBuf,
         bytes: &'static [u8],
+        when: ConstantGate,
     },
     /// Same-directory private temp, explicit service owner/protection, flush,
     /// compare expected old bytes (None = exclusive create), atomic rename.
@@ -104,6 +113,7 @@ pub enum Operation {
     Command {
         program: &'static str,
         args: Vec<&'static str>,
+        when: Gate,
     },
 }
 /// Fixed output only. Intentionally does not Debug-print Operation payloads.
@@ -193,6 +203,7 @@ fn manager(l: &Layout, action: Scm) -> Operation {
         },
         Platform::Linux => Operation::Command {
             program: "/usr/bin/systemctl",
+            when: Gate::Always,
             args: vec![
                 match action {
                     Scm::Start => "start",
@@ -205,14 +216,11 @@ fn manager(l: &Layout, action: Scm) -> Operation {
         },
         Platform::Macos => Operation::Command {
             program: "/bin/launchctl",
+            when: Gate::Always,
             args: match action {
-                Scm::Start => vec![
-                    "bootstrap",
-                    "system",
-                    "/Library/LaunchDaemons/com.arxcovo.arxd.plist",
-                ],
-                Scm::Stop => vec!["bootout", "system/com.arxcovo.arxd"],
-                Scm::Status => vec!["print", "system/com.arxcovo.arxd"],
+                Scm::Start => vec!["bootstrap", "system", super::owner_query::PLIST_PATH],
+                Scm::Stop => vec!["bootout", super::owner_query::LAUNCHD_TARGET],
+                Scm::Status => vec!["print", super::owner_query::LAUNCHD_TARGET],
                 _ => unreachable!(),
             },
         },
@@ -222,7 +230,122 @@ fn reload() -> Operation {
     Operation::Command {
         program: "/usr/bin/systemctl",
         args: vec!["daemon-reload"],
+        when: Gate::Always,
     }
+}
+fn unix_command(l: &Layout, verb: &'static str, when: Gate) -> Operation {
+    let (program, args) = if l.platform() == Platform::Linux {
+        ("/usr/bin/systemctl", vec![verb, "arxd.service"])
+    } else if verb == "bootstrap" {
+        (
+            "/bin/launchctl",
+            vec![verb, "system", super::owner_query::PLIST_PATH],
+        )
+    } else {
+        (
+            "/bin/launchctl",
+            vec![verb, super::owner_query::LAUNCHD_TARGET],
+        )
+    };
+    Operation::Command {
+        program,
+        args,
+        when,
+    }
+}
+fn unix_plan(l: &Layout, action: Action) -> Result<Plan, Error> {
+    let mut operations = guards(l);
+    let linux = l.platform() == Platform::Linux;
+    let stop = if linux { "stop" } else { "bootout" };
+    match action {
+        Action::Status => return Err(Error::Manager), // read-only owner_query API
+        Action::Install => {
+            operations.push(Operation::Expect(Expect::Installable));
+            for path in l.private_dirs() {
+                operations.push(Operation::EnsureDirectory {
+                    path: path.clone(),
+                    policy: Policy::PrivateDirectory,
+                });
+            }
+            operations.push(Operation::ProvisionState);
+            if linux {
+                operations.push(Operation::Constant {
+                    path: DROPIN_PATH.into(),
+                    bytes: DROPIN,
+                    when: ConstantGate::UnitAbsent,
+                });
+                operations.push(Operation::Constant {
+                    path: l.artifact().into(),
+                    bytes: UNIT,
+                    when: ConstantGate::Always,
+                });
+                operations.push(reload());
+                operations.push(unix_command(l, "disable", Gate::Always));
+            } else {
+                operations.push(unix_command(l, "disable", Gate::Always));
+                operations.push(Operation::Constant {
+                    path: l.artifact().into(),
+                    bytes: PLIST,
+                    when: ConstantGate::Always,
+                });
+            }
+            operations.push(Operation::Expect(Expect::Unloaded));
+        }
+        Action::Start => {
+            operations.push(Operation::StartPreflight);
+            operations.push(Operation::Expect(Expect::Installed));
+            operations.push(unix_command(l, "enable", Gate::Always));
+            operations.push(unix_command(
+                l,
+                if linux { "start" } else { "bootstrap" },
+                if linux { Gate::Always } else { Gate::NotLoaded },
+            ));
+        }
+        Action::Stop | Action::Uninstall => {
+            let uninstall = action == Action::Uninstall;
+            operations.push(Operation::Expect(if uninstall {
+                Expect::NotForeign
+            } else {
+                Expect::Installed
+            }));
+            operations.push(unix_command(
+                l,
+                "disable",
+                if uninstall && linux {
+                    Gate::ArtifactPresent
+                } else {
+                    Gate::Always
+                },
+            ));
+            operations.push(unix_command(
+                l,
+                stop,
+                if uninstall || !linux {
+                    Gate::Loaded
+                } else {
+                    Gate::Always
+                },
+            ));
+            operations.push(Operation::Expect(Expect::Unloaded));
+            if uninstall {
+                operations.push(Operation::RemoveConstant {
+                    path: l.artifact().into(),
+                    expected: if linux { UNIT } else { PLIST },
+                });
+                if linux {
+                    operations.push(Operation::RemoveConstant {
+                        path: DROPIN_PATH.into(),
+                        expected: DROPIN,
+                    });
+                    operations.push(reload());
+                }
+            }
+        }
+    }
+    Ok(Plan {
+        operations,
+        transaction_only: false,
+    })
 }
 pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Plan, Error> {
     authorize(
@@ -231,6 +354,9 @@ pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Pl
         action == Action::Install
             || (l.platform() == Platform::Windows && action == Action::Uninstall),
     )?;
+    if l.platform() != Platform::Windows {
+        return unix_plan(l, action);
+    }
     let mut operations = guards(l);
     match action {
         Action::Install => {
@@ -238,12 +364,6 @@ pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Pl
                 operations.push(Operation::EnsureDirectory {
                     path: path.clone(),
                     policy: Policy::PrivateDirectory,
-                });
-            }
-            if l.platform() != Platform::Windows {
-                operations.push(Operation::EnsureDirectory {
-                    path: l.endpoint().parent().unwrap().into(),
-                    policy: Policy::EndpointDirectory,
                 });
             }
             match l.platform() {
@@ -255,16 +375,19 @@ pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Pl
                     operations.push(Operation::Constant {
                         path: l.artifact().into(),
                         bytes: UNIT,
+                        when: ConstantGate::Always,
                     });
                     operations.push(Operation::Constant {
                         path: DROPIN_PATH.into(),
                         bytes: DROPIN,
+                        when: ConstantGate::Always,
                     });
                     operations.push(reload());
                 }
                 Platform::Macos => operations.push(Operation::Constant {
                     path: l.artifact().into(),
                     bytes: PLIST,
+                    when: ConstantGate::Always,
                 }),
             }
         }
@@ -344,6 +467,7 @@ pub fn configure_plan(
             Operation::Constant {
                 path: DROPIN_PATH.into(),
                 bytes: DROPIN,
+                when: ConstantGate::Always,
             }
         } else {
             Operation::RemoveConstant {
@@ -388,6 +512,239 @@ mod tests {
             }
             self.calls.push(op.clone());
             Ok(())
+        }
+    }
+    /// Scripted manager MODEL only: no native execution or boot evidence.
+    #[test]
+    fn lifecycle_reinstall_boot_model() {
+        use super::super::owner_query::{Artifact, Query, State};
+        struct Model {
+            os: Platform,
+            artifact: Artifact,
+            query: Query,
+            boot: bool,
+            retained: Vec<u8>,
+        }
+        impl OsManager for Model {
+            fn apply(&mut self, op: &Operation) -> Result<(), Error> {
+                match op {
+                    Operation::Expect(e) => self.query.expect(*e, self.artifact, self.os)?,
+                    Operation::Constant { path, when, .. }
+                        if (*when == ConstantGate::Always || self.artifact == Artifact::Absent)
+                            && path != Path::new(DROPIN_PATH) =>
+                    {
+                        self.artifact = Artifact::Identical;
+                    }
+                    Operation::Command { args, when, .. }
+                        if self.query.gate(*when, self.artifact)? =>
+                    {
+                        match args[0] {
+                            "enable" => self.boot = true,
+                            "disable" => self.boot = false,
+                            "start" | "bootstrap" => {
+                                self.query = Query::Ours(if self.os == Platform::Linux {
+                                    State::Running
+                                } else {
+                                    State::Loaded
+                                })
+                            }
+                            "stop" | "bootout" => {
+                                self.query = if self.os == Platform::Linux {
+                                    Query::Ours(State::Stopped)
+                                } else {
+                                    Query::Absent
+                                }
+                            }
+                            "daemon-reload" => {
+                                self.query = if self.artifact == Artifact::Absent {
+                                    Query::Absent
+                                } else {
+                                    Query::Ours(State::Stopped)
+                                }
+                            }
+                            _ => return Err(Error::Manager),
+                        }
+                    }
+                    Operation::RemoveConstant { path, .. } if path != Path::new(DROPIN_PATH) => {
+                        self.artifact = Artifact::Absent
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
+        for os in [Platform::Linux, Platform::Macos] {
+            let l = Layout::for_test(os);
+            let c = OwnerContext {
+                admin: true,
+                running_binary: l.binary(),
+            };
+            let mut m = Model {
+                os,
+                artifact: Artifact::Absent,
+                query: Query::Absent,
+                boot: true,
+                retained: b"retained database".to_vec(),
+            };
+            for (action, boot) in [
+                (Action::Install, false),
+                (Action::Start, true),
+                (Action::Start, true),
+                (Action::Stop, false),
+                (Action::Stop, false),
+                (Action::Install, false),
+                (Action::Uninstall, false),
+                (Action::Install, false),
+                (Action::Start, true),
+                (Action::Uninstall, false),
+            ] {
+                owner_plan(&l, &c, action).unwrap().execute(&mut m).unwrap();
+                assert_eq!(m.boot, boot);
+                assert_eq!(m.retained, b"retained database");
+            }
+            owner_plan(&l, &c, Action::Install)
+                .unwrap()
+                .execute(&mut m)
+                .unwrap();
+            owner_plan(&l, &c, Action::Start)
+                .unwrap()
+                .execute(&mut m)
+                .unwrap();
+            assert_eq!(
+                owner_plan(&l, &c, Action::Install).unwrap().execute(&mut m),
+                Err(Error::Active)
+            );
+            assert!(m.boot);
+        }
+    }
+    #[test]
+    fn unix_exact_typed_plans() {
+        for os in [Platform::Linux, Platform::Macos] {
+            let l = Layout::for_test(os);
+            let c = OwnerContext {
+                admin: true,
+                running_binary: l.binary(),
+            };
+            let linux = os == Platform::Linux;
+            for action in [
+                Action::Install,
+                Action::Start,
+                Action::Stop,
+                Action::Uninstall,
+            ] {
+                let p = owner_plan(&l, &c, action).unwrap();
+                let tail = &p.operations()[guards(&l).len()..];
+                let mut expected = Vec::new();
+                match action {
+                    Action::Install => {
+                        expected.push(Operation::Expect(Expect::Installable));
+                        for path in l.private_dirs() {
+                            expected.push(Operation::EnsureDirectory {
+                                path: path.clone(),
+                                policy: Policy::PrivateDirectory,
+                            });
+                        }
+                        expected.push(Operation::ProvisionState);
+                        if linux {
+                            expected.push(Operation::Constant {
+                                path: DROPIN_PATH.into(),
+                                bytes: DROPIN,
+                                when: ConstantGate::UnitAbsent,
+                            });
+                            expected.push(Operation::Constant {
+                                path: l.artifact().into(),
+                                bytes: UNIT,
+                                when: ConstantGate::Always,
+                            });
+                            expected.push(reload());
+                            expected.push(unix_command(&l, "disable", Gate::Always));
+                        } else {
+                            expected.push(unix_command(&l, "disable", Gate::Always));
+                            expected.push(Operation::Constant {
+                                path: l.artifact().into(),
+                                bytes: PLIST,
+                                when: ConstantGate::Always,
+                            });
+                        }
+                        expected.push(Operation::Expect(Expect::Unloaded));
+                    }
+                    Action::Start => {
+                        expected.extend([
+                            Operation::StartPreflight,
+                            Operation::Expect(Expect::Installed),
+                            unix_command(&l, "enable", Gate::Always),
+                            unix_command(
+                                &l,
+                                if linux { "start" } else { "bootstrap" },
+                                if linux { Gate::Always } else { Gate::NotLoaded },
+                            ),
+                        ]);
+                    }
+                    Action::Stop | Action::Uninstall => {
+                        let uninstall = action == Action::Uninstall;
+                        expected.extend([
+                            Operation::Expect(if uninstall {
+                                Expect::NotForeign
+                            } else {
+                                Expect::Installed
+                            }),
+                            unix_command(
+                                &l,
+                                "disable",
+                                if uninstall && linux {
+                                    Gate::ArtifactPresent
+                                } else {
+                                    Gate::Always
+                                },
+                            ),
+                            unix_command(
+                                &l,
+                                if linux { "stop" } else { "bootout" },
+                                if uninstall || !linux {
+                                    Gate::Loaded
+                                } else {
+                                    Gate::Always
+                                },
+                            ),
+                            Operation::Expect(Expect::Unloaded),
+                        ]);
+                        if uninstall {
+                            expected.push(Operation::RemoveConstant {
+                                path: l.artifact().into(),
+                                expected: if linux { UNIT } else { PLIST },
+                            });
+                            if linux {
+                                expected.push(Operation::RemoveConstant {
+                                    path: DROPIN_PATH.into(),
+                                    expected: DROPIN,
+                                });
+                                expected.push(reload());
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(tail == expected);
+                assert!(!p.operations().iter().any(|op| matches!(
+                    op,
+                    Operation::EnsureDirectory {
+                        policy: Policy::EndpointDirectory,
+                        ..
+                    }
+                )));
+                assert!(p.operations().iter().any(|op| matches!(
+                    op,
+                    Operation::Verify {
+                        policy: Policy::EndpointDirectory,
+                        required: false,
+                        ..
+                    }
+                )));
+            }
+            assert!(matches!(
+                owner_plan(&l, &c, Action::Status),
+                Err(Error::Manager)
+            ));
         }
     }
     #[test]
@@ -446,8 +803,10 @@ mod tests {
                 (Action::Stop, Scm::Stop),
                 (Action::Status, Scm::Status),
             ] {
-                let p = owner_plan(&l, &c, action).unwrap();
-                assert!(p.operations.last() == Some(&manager(&l, scm)));
+                if os == Platform::Windows {
+                    let p = owner_plan(&l, &c, action).unwrap();
+                    assert!(p.operations.last() == Some(&manager(&l, scm)));
+                }
             }
             let p = owner_plan(&l, &c, Action::Uninstall).unwrap();
             assert!(p.operations.iter().all(|o| match o {
@@ -463,7 +822,8 @@ mod tests {
             manager(&l, Scm::Start)
                 == Operation::Command {
                     program: "/usr/bin/systemctl",
-                    args: vec!["start", "arxd.service"]
+                    args: vec!["start", "arxd.service"],
+                    when: Gate::Always
                 }
         );
         let reg = registration(&Layout::for_test(Platform::Windows));
@@ -538,7 +898,7 @@ mod tests {
                 Operation::Verify { path, .. } if self.unsafe_path.as_ref() == Some(path) => {
                     Err(Error::Permissions)
                 }
-                Operation::Constant { path, bytes } => {
+                Operation::Constant { path, bytes, .. } => {
                     if self.files.get(path).is_some_and(|old| old != bytes) {
                         return Err(Error::Permissions);
                     }
