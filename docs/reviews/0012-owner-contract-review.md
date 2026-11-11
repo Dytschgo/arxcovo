@@ -34,3 +34,21 @@ review. Dedicated-account, installed-service and M2 acceptance remain open.
 
 Disposition: Codex corrected P2's two reason cases in the ADR after this review.
 P1 remains open; the architecture contract is not accepted.
+
+P1 correction (Anthropic / claude-opus-5-5, high, architecture author, base
+`68614bc`): the ADR now narrows the guarantee instead of adding a mechanism.
+Decision 6 separates three fault classes. Process termination is inside the
+guarantee, and so are lost LSA, registry or config writes while record writes
+persist. A lost or rolled-back record write is outside it: power loss, an OS
+crash, a snapshot revert or an administrator restoring the record. The
+reviewer's counterexample is now the documented example. P6 is restricted to
+the crash model, P6b covers LSA-only loss, and P6c pins the limit and
+characterizes it as needing a stale `granted` value. The durability section,
+the state invariant in decision 2, the external-change table, the limits, the
+build brief and the owner guide follow the same model. A scratch exhaustive
+model (depth 8) found no unsafe revoke under crash-only or LSA-only loss. Under
+record rollback, every unsafe revoke read a stale `granted`; the shortest one
+is the reviewer's trace. Two seeded engine mutations were caught under the
+crash model. No physical NTFS or LSA power-loss behavior was tested. P2's split
+is retained. This correction is not independent review, and P1 stays open
+until a fresh Sol recheck accepts or rejects it.
