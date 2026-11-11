@@ -52,6 +52,7 @@ struct Wire {
 pub struct ServiceConfig {
     wire: Wire,
     platform: Platform,
+    revisions: [Option<String>; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountKind {
@@ -66,9 +67,19 @@ pub struct Account {
     pub administrative: bool,
 }
 pub trait Resolver {
+    /// Internal point-in-time native incarnation evidence; never serialized.
+    fn revision(&self, _value: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
     fn account(&self, name_or_identity: &str) -> Result<Account, Error>;
     /// Metadata-only: existing directory, local disk, no symlinks/reparse ancestors.
     fn workspace_safe(&self, path: &str) -> Result<bool, Error>;
+}
+fn validate_platform_rights(platform: Platform, rights: Rights) -> Result<(), Error> {
+    if platform == Platform::Macos && rights == Rights::Admin {
+        return Err(Error::Rights);
+    }
+    Ok(())
 }
 impl ServiceConfig {
     pub fn parse(bytes: &[u8], layout: &Layout, resolver: &impl Resolver) -> Result<Self, Error> {
@@ -76,15 +87,31 @@ impl ServiceConfig {
             return Err(Error::Config);
         }
         let wire: Wire = serde_json::from_slice(bytes).map_err(|_| Error::Config)?;
+        // Revision resolution is also native account observation.
+        validate_platform_rights(layout.platform(), wire.rights)?;
+        let revisions = [
+            resolver.revision(&wire.build_account.name)?,
+            resolver.revision(&wire.client.identity)?,
+        ];
         let config = Self {
             wire,
             platform: layout.platform(),
+            revisions,
         };
-        config.validate(layout, resolver)?;
+        config.revalidate(layout, resolver)?;
         Ok(config)
     }
     pub fn revalidate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
-        self.validate(layout, resolver)
+        self.validate(layout, resolver)?;
+        if self.revisions
+            != [
+                resolver.revision(&self.wire.build_account.name)?,
+                resolver.revision(&self.wire.client.identity)?,
+            ]
+        {
+            return Err(Error::Identity);
+        }
+        Ok(())
     }
     fn validate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
         let w = &self.wire;
@@ -98,9 +125,7 @@ impl ServiceConfig {
         }
         // A build-UID sweep cannot contain descendants that acquired root.
         // Refuse before resolving accounts or preparing owner operations.
-        if self.platform == Platform::Macos && w.rights == Rights::Admin {
-            return Err(Error::Rights);
-        }
+        validate_platform_rights(self.platform, w.rights)?;
         if !identity_valid(&w.client.identity, self.platform)
             || !identity_valid(&w.build_account.identity, self.platform)
             || w.client.identity == w.build_account.identity
@@ -330,8 +355,13 @@ pub(crate) mod tests {
             platform: Platform,
             admin: bool,
             calls: Cell<usize>,
+            revision_calls: Cell<usize>,
         }
         impl Resolver for CountingResolver {
+            fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+                self.revision_calls.set(self.revision_calls.get() + 1);
+                Ok(None)
+            }
             fn account(&self, value: &str) -> Result<Account, Error> {
                 self.calls.set(self.calls.get() + 1);
                 Ok(Account {
@@ -361,6 +391,7 @@ pub(crate) mod tests {
                         platform,
                         admin,
                         calls: Cell::new(0),
+                        revision_calls: Cell::new(0),
                     };
                     let mut value = fixture();
                     value["rights"] = serde_json::to_value(rights).unwrap();
@@ -378,11 +409,13 @@ pub(crate) mod tests {
                     if platform == Platform::Macos && rights == Rights::Admin {
                         assert_eq!(result.err(), Some(Error::Rights));
                         assert_eq!(resolver.calls.get(), 0);
+                        assert_eq!(resolver.revision_calls.get(), 0);
                         // Model an old validated config reaching a newer
                         // configure path: revalidation must refuse it too.
                         let previous = ServiceConfig {
                             wire: serde_json::from_value(value).unwrap(),
                             platform,
+                            revisions: [None, None],
                         };
                         let context = super::super::owner_plan::OwnerContext {
                             admin: true,
@@ -394,6 +427,7 @@ pub(crate) mod tests {
                         assert_eq!(plan.as_ref().err(), Some(&Error::Rights));
                         assert_eq!(plan.as_ref().map(|p| p.operations().len()).unwrap_or(0), 0);
                         assert_eq!(resolver.calls.get(), 0);
+                        assert_eq!(resolver.revision_calls.get(), 0);
                     } else {
                         assert_eq!(resolver.calls.get(), 2);
                         if admin == (rights == Rights::Admin) {
@@ -530,5 +564,37 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Observations {
+        revision: Cell<u8>,
+    }
+    impl Resolver for Observations {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            tests::FakeResolver::default().account(value)
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            Ok(true)
+        }
+        fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+            Ok(Some(self.revision.get().to_string()))
+        }
+    }
+    #[test]
+    fn revalidation_refuses_changed_incarnation_even_with_same_numeric_pins() {
+        let r = Observations {
+            revision: Cell::new(0),
+        };
+        let layout = Layout::for_test(Platform::Macos);
+        let c = ServiceConfig::parse(&serde_json::to_vec(&tests::fixture()).unwrap(), &layout, &r)
+            .unwrap();
+        assert!(c.revalidate(&layout, &r).is_ok());
+        r.revision.set(1);
+        assert!(c.revalidate(&layout, &r) == Err(Error::Identity));
     }
 }

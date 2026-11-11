@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -220,6 +220,55 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 - Codex / gpt-6.1-sol, medium: merged main `d7f3ebd` into the local configuration candidate, preserving the service foundation and current activity implementation. Formatting, workspace Clippy with warnings denied and all 61 runnable nextest tests passed (one direct-only fixture skipped; its parent exercised it). Package parser checks passed three tests; systemd/plutil native checks were skipped on Windows. These supersede the earlier 51-test builder-base evidence for this integrated revision. No installation or account/right/manager operations were performed.
 - Next service work: replace injected identity and permission observations with native read-only adapters and bounded configuration reads. Owner mutation adapters and service application wiring remain incomplete; native checks will receive their own independent security review before activation.
 
+- Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations were committed separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
+## Read-only native service adapter checkpoint
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high. Prepared base
+  `b63959b681e3cc1b106b0dfad25c20c972917488`, branch
+  `t3/native-service-adapters`; implementation commit `678287d`.
+  Added service/native.rs, native_windows.rs, native_unix.rs plus necessary
+  module/Cargo wiring. No other task branch or development/store/MCP file edited.
+  This task changes no acceptance status: M1 is accepted and M2–6 remain unchecked.
+- Unchanged Windows baseline: `cargo test --workspace` passed 61 tests, one
+  directly ignored subprocess fixture exercised by its parent. Added nine
+  native/policy tests: real current-token/local-SAM observations (positive
+  control when local SAM matches), current-user file refusal under SYSTEM
+  private policy, actual writer/rename exclusion, hard-link refusal, metadata
+  workspace checks, lexical negatives, bounded reads, protection negatives and
+  rights/pin revalidation in both directions. No fixture claims SYSTEM/root.
+- Six temporary source mutations each failed at an assertion in the intended
+  focused test: removing SYSTEM owner, DACL presence, DACL protected, Unix root
+  UID, Unix root GID, or dot-dot path refusal. All mutated sources restored;
+  no policy relaxation was committed. These are guard-removal checks, not
+  evidence of installed ACL ownership or privileged execution.
+- Final Windows workspace result: 70 passed, one directly ignored fixture
+  exercised by its parent; formatting and workspace/all-target Clippy with
+  warnings denied pass. Artifact parser checks: three passed, two native
+  systemd/plutil checks skipped on Windows. No UI changes or UI checks.
+- Cross-target evidence is limited: full arxd Linux/macOS `cargo check` stopped
+  at bundled SQLite because x86_64-linux-gnu-gcc / Darwin cc are unavailable.
+  An uncommitted isolated manifest under target/native-check imports the ACTUAL
+  layout.rs, config.rs and native.rs modules by path with libc/serde/serde_json
+  and tempfile. `cargo check --tests` and `cargo clippy --tests` passed for
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin. Isolated Clippy uses
+  `-A dead_code -D warnings` only because config::serialized has no owner-plan
+  caller in that harness. This is Rust metadata/type-check evidence, not a
+  linked arxd build, native framework link validation, or Unix test execution.
+- Limits/blockers: modern macOS OpenDirectory/UID501 identity support refuses
+  pending a reviewed local-native adapter. Linux uses conservative local
+  passwd/NSS equality and bounded sudo/wheel groups, refusing system UID ranges,
+  unknown filesystems and ACLs. Windows protected SYSTEM layout success,
+  Linux/macOS runtime, native ACL checks on Unix and all installed service
+  paths are **unverified on real hardware**. Exact race boundaries, supported
+  APIs and pending obligations are in service-foundation.md. PR16's independently reviewed
+  stable-path fix is documented, not copied into unrelated foreground modules.
+- Production entry remains fail-closed. Application config/store/audit/endpoint
+  integration and owner mutation adapters (including atomic publication and
+  batch-right compensation) remain pending. Current-user development mode is
+  independent. No owner admin steps, installation, account/right/task changes,
+  service-manager mutation, push, PR, merge, settings, dispatch or watch occurred.
+  Independent other-provider security review remains coordinator work.
+
 - Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations are being implemented separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
 
 ## macOS administrative execution refusal
@@ -386,12 +435,72 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium: preserved PR20 review corrections while integrating main 8fafbe7, including the current-user executor and reviewed retention runtime correction. Combined formatting, workspace/all-target Clippy with warnings denied and all 75 runnable Windows nextest tests passed; one direct-only TokenOwner fixture is skipped and exercised by its passing parent. Fresh independent review and hosted checks remain pending. The real development acceptance record is independently reviewed in PR24; installed-service and dedicated-account M2 acceptance remain open.
 
+## macOS local-account observation candidate
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high, working alone from
+  `0a16eb2c81014093126eefa77f0901b86a485867`. Added a fixed-local-node
+  OpenDirectory resolver, conservative native Users/login-profile classification,
+  unique name/UID/UUID checks, native nested admin membership and nonserialized
+  incarnation revalidation. Linux conservative identity behavior and Windows
+  policy are retained. No admin execution is enabled; the concurrent architecture
+  correction remains separate. No ADR0009, service-install or development modules
+  were edited. Last merged PR and milestone acceptance statuses are unchanged.
+- ACL review found that acl_get_fd_np does not by itself distinguish absent ACL
+  property from retrieval failure. The adapter now checks filesec presence after
+  successful fstatx_np; absent/valid-empty pass observation, entries/errors refuse.
+  Added macOS-only unprivileged identity and temporary-file ACL positive/error
+  controls. User-owned files still refuse root private policy. Apple API/header
+  references and exact supported profiles are in service-foundation.md.
+- Executed on Windows: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace`: 71 passed (the original 70 plus incarnation test),
+  one subprocess-only fixture directly ignored and exercised by its parent.
+  `python scripts/test-service-artifacts.py -v`: three passed, two platform-native
+  checks skipped. An isolated rustc harness imported the actual macOS pure policy
+  source: three tests passed (classification negatives, result/error/count/ACL
+  contracts, rename/replacement/membership revision changes).
+- Eight restored source mutations were killed by assertions: skip local-node
+  classification, accept mismatched native record type, ignore membership error,
+  accept nonempty ACL, ignore array bound, accept duplicate records, skip config
+  incarnation comparison. The first six used the isolated actual-policy harness;
+  the incarnation mutation ran `cargo test -p arxd --lib service::config::revision_tests`.
+  Final Apple source review also corrected filesec presence to accept any nonzero
+  bitmask. Its eighth mutation (require exactly one) failed the new assertion.
+  The first run of that eighth mutation harness failed to launch its relative
+  executable path on Windows; the corrected absolute-path run passed baseline
+  and killed the mutation.
+  These demonstrate portable guard sensitivity, not native macOS execution.
+- Isolated manifest under ignored target/native-check imports actual service
+  layout/config/native sources: `cargo check --tests` and `cargo clippy --tests`
+  for aarch64-apple-darwin and x86_64-unknown-linux-gnu passed. Isolated Clippy
+  uses `-A dead_code -D warnings` because serialized has no owner-plan caller
+  there. Workspace Clippy used no suppression. Metadata is not framework link,
+  full cross-build or runtime proof. Full cross-builds were not rerun: the known
+  Windows-host bundled SQLite cross-C-compiler limitation remains.
+- Remaining: independent other-provider security review and hosted macOS native
+  link/runtime checks after coordinator publication. Modern local-Mac support
+  remains an unreviewed candidate; custom-shell, alias/multivalue, mobile and
+  directory profiles refuse. Native APIs can block; bounded traversal does not
+  supply a hard deadline. Installed-service identity/layout and M2 acceptance
+  remain **unverified on real hardware** and open. No provisioning, elevation,
+  owner steps, commands for identity lookup, push/PR/merge/watch, dispatch,
+  settings or old Lab Manager access occurred.
+
+## Integrated native service configuration checkpoint
+
+- Codex / gpt-6.1-sol, medium: integrated current main, lifecycle review corrections, fixed configuration and native macOS observation candidate b261457. A strengthened regression first failed because revision lookup ran twice before macOS admin refusal; platform policy now runs before revision resolution and revalidation still refuses before observations or owner plans. Formatting, workspace/all-target Clippy and all 97 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Native macOS/Linux and installed-service behavior remain unverified on real hardware. No provisioning or owner administration ran.
+
+
 ## Real Claude Code development acceptance
 
 - Codex / gpt-6.1-sol, medium coordinated private acceptance after PR22 merged. Claude Code 2.1.322 was requested to use Opus 5.5 high through its existing login, with unrelated instructions, memory, hooks, connectors and built-in tools disabled; only the explicit arxcovo MCP server and named calls were allowed. Actual MCP events were inspected in memory, not a natural-language success report.
 - A non-test arxd binary built from independently reviewed source 72a5e5f listed the host and executed literal cargo --version under the current unelevated Windows user. Production source equivalence to reviewed 59293a8 was checked. SQLite and MCP confirmed the caller's successful row, development identity mode, current-user match, Medium integrity and null raw owner identity/rights. A daemon restart and fresh Claude Code session returned the same row.
 - The native executor reported confirmed Job cleanup. The harness stopped its owned processes, an independent native process query found zero remaining acceptance arxd instances, and temporary config/credential files were deleted. Only sanitized booleans, fixed labels, build/source hashes and outcomes are committed in docs/evidence/windows-development-acceptance.json. No raw CLI stream or private owner values were logged or committed.
 - This is a passed development acceptance under the owner's explicit alternative, not M2 completion: dedicated-account/service execution, rights enforcement, service Application and native owner adapters remain unfinished. S4U/service and VM paths remain unverified on real hardware. No account, right, task, service, elevation or old Lab Manager action occurred.
+
+## Native hosted validation checkpoint
+
+- Codex / gpt-6.1-sol, medium inspected PR25 run43026547236 at7606c71: Ubuntu job130542582037 and macOS job130542582205 completed successfully; Windows was still running. These are native hosted CI results, not installed-layout or privileged service acceptance. PR24 merged the sanitized real current-user development evidence; dedicated-account and installed-service M2 acceptance remain open.
 
 ## Service lifecycle exact-head review integration
 
@@ -413,6 +522,55 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium merged PR28 at reviewed460b617 with all five required gates green. Independent Opus review reproduced the old-test failure3/3, deliberate real inheritance failure3/3 (plus combinedtest2/2), and restored native executor tests passed20/20 repeatedruns. This fixes the reproduced test defect; the exact old hosted assertion was not retained and is not claimed proven. Service lifecycle integrates the correction; formatting, all-target Clippy with warnings denied and all 76 runnable Windows nextest tests passed (one direct-only fixture exercised by its parent). Fresh exact-head review and hosted gates remain pending. Native ancestor-policy blocker in25/27 remains open.
 
+## Native ancestor-policy blocker reproduction
+
+- Independent Opus stack review passed PR21 but failed PR25/27 because trusted ancestor validation rejects stock Windows system parents. Codex / gpt-6.1-sol, medium added stock_system_directory_passes_trusted_ancestor_validation on isolated fix/native-ancestor-policy: the real read-only System32 trusted-open path fails deterministically with Permissions under the existing policy. No permission or owner mutation occurred. The regression is intentionally red until the per-edge namespace-integrity policy is corrected; no fix, service start or M2 acceptance is claimed. Final private-object ownership/DACL checks must remain strict.
+
+
+## PR25 Windows ancestor-policy implementation
+
+- Task/provider/effort/outcome: Codex / gpt-6.1-sol, high, implementation sub-agent;
+  fixed on prepared base `403742ec7136679e8fd3e457b53fa80f636a6efe` without delegation.
+  Native ACE masks now distinguish existing-ancestor namespace control from
+  sibling creation, directory metadata and inherit-only grants. Final binary
+  and private-object policies remain strict. Architectural refinement and
+  primary Microsoft references are in [ADR 0013](adr/0013-windows-existing-ancestor-namespace.md).
+- Reproduction: the untouched base's exact requested `cargo test -p arxd --lib
+  stock_system_directory_passes_trusted_ancestor_validation --locked -- --nocapture`
+  failed with Permissions. The final namespace regression passes for System32,
+  Program Files and ProgramData using read-only native opens. It now explicitly
+  checks shared-directory ancestry rather than treating System32 as a final
+  Arxcovo binary directory. Restoring the old ancestor call makes it fail again.
+- Native Windows evidence: AccessCheck on in-memory SDDL descriptors confirms
+  creation versus DELETE_CHILD/DELETE/WRITE_DAC/WRITE_OWNER and inherit-only
+  semantics. Pure countercontrols cover individual rights, unknown ACEs, missing
+  DACL, unsafe owner and final private inherit-only grants. Owned-temp junction
+  and hardlink fixtures refuse. No OS-path ACL mutation was performed.
+- Eleven deliberate guard/policy mutations were individually caught by assertion
+  failures and restored: old ancestor call; missing DELETE_CHILD, WRITE_DAC,
+  WRITE_OWNER or DELETE; removed ancestor owner check; accepted unknown ACE;
+  discarded native masks; removed reparse or hardlink checks; foreign final
+  private grants. Details and limitations are in ADR 0013.
+- Checks actually run and passed on this Windows host: `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  `cargo test --workspace --locked` (102 passed, one direct-only fixture ignored
+  and exercised by its subprocess parent); `python scripts/test-service-artifacts.py -v`
+  (three passed, two OS-specific checks skipped); `git diff --check`.
+  The focused service suite also passed (41 passed, one fixture ignored).
+  No shared-handle flake occurred in this workspace run. PR28 files were not copied.
+- Last merged PR remains #24 as recorded above. No push, PR, merge, watch,
+  provisioning, owner admin operation, dispatch or settings change occurred.
+  Independent other-provider review and hosted gates remain coordinator work.
+- Limits: metadata-only retained ancestors in this base do not guarantee
+  writer/delete exclusion. PR27's separate parent read-data change must survive
+  later integration. No macOS stock-parent fix or runtime service/store/endpoint
+  attestation is claimed. Installed service, dedicated account, SCM/LSA, owner
+  adapters and M2 acceptance remain **unverified on real hardware**. The other
+  stack findings remain outside this assignment. No old Lab Manager/VM access.
+
+## Native ancestor correction coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate12081f2 with reviewed configuration parentaadfa05 and merged main28 handle regression. Renumbered the Windows namespace ADR to0013 to reserve0012 for the separate owner-recovery contract. Combined formatting, workspace/all-target Clippy with warnings denied and all103 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Builder evidence reports eleven caught/restored mutations and native AccessCheck controls. Fresh exact-head independent review and hosted checks remain pending. PR27 sharing corrections must be preserved when the parent is integrated there; macOS ancestry and installed-service acceptance remain open.
 ## Service lifecycle refresh after merged CI unblock
 
 - Codex / gpt-6.1-sol, medium refreshed #20 from reviewed head `4ead112` against actual main `3b6170b` (#32). The squash tree matches reviewed CI head `d6d3b31`. Only PROGRESS conflicted; both parents' provider tables and evidence were retained, Current state stays first, and last merged PR is #32. #31 is recorded closed as folded into #29.
@@ -431,3 +589,13 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - OpenAI / gpt-6.1-sol / medium integrated the actual #20 squash `64b50e9` into #21 without rewriting published history. The squash tree is identical to reviewed head `3195f5a`; duplicate-history merge conflicts retained the already validated configuration tree. Configuration source, packaging and Cargo/toolchain files remain identical to reviewed `aadfa05`; CI helpers/workflows match merged main. Prior local verification therefore applies: formatting, locked all-target Clippy, 89/89 nextest and 26/26 CI-helper tests passed; artifact checks had three passes and two native Unix skips. No implementation changed in this refresh. Fresh exact-head independent review and required hosted checks remain necessary.
 - #20 merged at 17:31:46 UTC after all five gates passed; its Windows job completed successfully at 17:30:23. Main push CI for the earlier #32 unblock passed in 548 seconds. The new #20 main push is not yet claimed green. No new feature PR was opened, and Current state remains the first section.
+
+## Native validation queue preparation
+
+- OpenAI / gpt-6.1-sol / medium prepared #25 locally on configuration head `9f74919` while #21 runs its fresh review and hosted gates. Published history is preserved. Only PROGRESS conflicted; the current state from the refreshed parent remains first, and both parent provider tables and task evidence are retained. Native source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `d045cc4`; CI helpers/workflows match the configuration parent.
+- This refresh ran formatting, 26/26 CI-helper tests and artifact checks (three passed, two native Unix skips). Clippy/nextest were not repeated because the Rust trees are identical to the reviewed head. No native service, owner, admin or account operation ran. No push or new feature PR; publication waits for #21 to merge, then a final refresh and exact-head independent review. Installed-service/dedicated-account M2 acceptance remains open and **unverified on real hardware**.
+
+## Native validation refresh after configuration merge
+
+- Codex / gpt-6.1-sol, medium aligned existing #25 with actual configuration squash `2bdcb20`, whose tree is identical to reviewed `9f74919`. Duplicate-history conflicts retained the already validated native-validation tree; the crate, packaging, Cargo/toolchain and script trees remain byte-identical to independently reviewed `d045cc4`, and CI workflows/helpers match merged main. All published history is preserved. No Rust implementation changed. The local preparation passed formatting, 26 helper tests and three portable artifact checks (two native Unix skips); source-equivalent prior Rust verification remains applicable, without claiming it was rerun now.
+- #21 merged at 17:46:19 UTC with all five gates green. #20 main CI completed successfully in 551 seconds. #25 requires a fresh exact-head independent recheck and all required hosted checks before merge; the full Application review is running separately on its unchanged public source. No new feature PR or privileged operation. M2 installed-service/dedicated-account acceptance remains open and **unverified on real hardware**.
