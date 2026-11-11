@@ -8,20 +8,22 @@ real hardware**. No privileged CI experiment has run. Milestone 1 final gates
 remain the coordinator's work; this probe does not advance milestone acceptance.
 
 The harness lives in `tools/windows-identity-probe`, outside Cargo. It has no
-NuGet dependencies and requires the .NET 8 SDK or newer. There are no changes to
-Cargo, product code, existing workflows, policy gates, accounts, or services.
+NuGet dependencies and targets .NET 10 LTS. There are no changes to Cargo, product code, existing
+workflows or policy gates. Account/right/task mutations exist only in the new
+guarded disposable-CI entrypoint; none were executed during implementation.
 
 ## Safe local checks
 
 From the repository root, under the existing development identity:
 
 ```powershell
+./tools/windows-identity-probe/Test-CiValidation.ps1
 dotnet build tools/windows-identity-probe/IdentityProbe.csproj -c Release --nologo
 dotnet run --project tools/windows-identity-probe/IdentityProbe.csproj -c Release --no-build -- --self-test
 dotnet publish tools/windows-identity-probe/IdentityProbe.csproj -c Release -r win-x64 --self-contained true --nologo
 ```
 
-Only `--self-test` may run on the owner PC. It does not query tokens, create
+Only the pure helper tests and probe `--self-test` may run on the owner PC. It does not query tokens, create
 processes, mutate accounts, or call LSA. It tests account rejection, each CI
 precondition independently, workspace rejection, missing-path rejection, JSON
 serialization, environment construction, and native structure sizes. Build and
@@ -94,85 +96,108 @@ are not logged. Payloads have no output handles and communicate by exit status.
 Unexpected managed failures are deliberately generic; do not enable stack or
 environment dumps to debug them on a shared machine.
 
-## Coordinator-only future manual CI wiring, after independent review
+## Disposable CI helper and manual workflow (review required before use)
 
-This section is a proposed experiment, **not authorization to run it now**.
-Review the privileged surface with Opus (or the prescribed independent fallback)
-before adding any workflow. Use a separate `workflow_dispatch` workflow on a
-fresh GitHub-hosted `windows-2022` or supported newer disposable runner. Never
-use self-hosted runners, the owner PC, existing accounts, Lab Manager, or
-`agent-windows-test`. Do not modify the existing three-OS required workflow.
+Implemented files:
 
-The workflow should have read-only contents permission, no secrets, no id-token,
-no environment credentials, checkout with persisted credentials disabled, and
-an eight-minute job timeout. Permit only a trusted owner-triggered dispatch of
-the independently reviewed immutable source SHA; refuse PR/fork inputs. Pin
-third-party actions to reviewed SHAs. The harness environment checks are
-spoofable intent guards, **not a security boundary or proof of hosted provenance**.
-Runner selection, trusted source, isolation and short lifetime are operator
-preconditions. This must never become an elevated production entry point.
+- `CiValidation.psm1`: pure guard, fixed naming/path, cleanup plan and evidence validation.
+- `Test-CiValidation.ps1`: pure positive controls and mutations of every context key,
+  source SHA mismatch, name/path rejection, SID replacement, partial setup cleanup,
+  omitted evidence stages, failed kill/drain, wrong types, malformed/oversized output.
+  It parses the entrypoint and nested task script without executing either.
+- `ProbeBatchRight.cs`: narrow LSA add/remove of only SeBatchLogonRight for the
+  pinned generated SID. Refuses preexisting explicit rights before adding. Uses
+  POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT; removal uses AllRights=false.
+  No secedit, blanket policy import, password fallback or privilege adjustment.
+- `Invoke-DisposableCi.ps1`: the only orchestration/mutation entrypoint. A single
+  invocation retains creation flags and SID in memory and attempts cleanup in finally.
+- `.github/workflows/windows-identity-probe.yml`: manual dispatch only, fixed fresh
+  GitHub-hosted windows-2022 runner, eight-minute budget, contents read permission,
+  no secret/id-token inputs, checkout persist-credentials=false. No dispatch inputs.
 
-Plan the workflow's disposable setup/finally steps as follows:
+The entrypoint refuses anything except the exact trusted repo, owner actor and
+triggering actor, main ref, manual event, hosted Windows markers, numeric run IDs,
+and matching GITHUB_SHA/GITHUB_WORKFLOW_SHA/REVIEWED_SHA. It also checks the
+checkout HEAD and tracked cleanliness before loading native code. These are
+**spoofable intent/provenance guards, not a security proof**. Trusted reviewed
+source, fixed hosted runner selection and disposal are operator preconditions.
+Do not run this helper locally, even with spoofed environment variables.
 
-1. Compile, run self-tests, publish, then create a fresh control directory
-   `C:\arxcovo-probe\<run>-<attempt>`. Fail if it already exists. Validate every
-   ancestor against reparse points before writes. Copy the publish output into
-   a `bin` child. Create `work` empty. Create only a cryptographically random
-   `axp` plus eight-hex user after confirming it is absent. Keep a generated
-   high-entropy password as an in-memory SecureString only for New-LocalUser;
-   do not echo, pass on command lines, export, or store it. S4U receives none.
-   Never enumerate or modify existing user profiles or rights.
-2. Set protected ACLs: SYSTEM/Administrators control directory full control;
-   test SID read/execute on `bin`, no write; test SID modify only on `work`;
-   logs and task scripts in the control directory inaccessible to the test
-   SID. Remove broad inherited write ACLs. Do not place privileged task code
-   in the account-writable workspace. Assert the new user is standard and
-   belongs only to BUILTIN Users; retain its SID for cleanup comparison.
-3. A reviewed CI-only setup helper must grant **only that generated SID**
-   `SeBatchLogonRight` using LsaOpenPolicy/LsaAddAccountRights. Do not use a
-   broad secedit import replacing host policy. That helper is deliberately
-   not implemented by this research executable. Review its error handling and
-   account/SID lifetime checks alongside the future workflow. No account right
-   mutations are needed on this developer PC.
-4. Write a bounded SYSTEM task script in the protected control directory.
-   Embed only validated numeric run/attempt IDs and generated account name.
-   Scheduled tasks do not inherit the dispatch step's environment: explicitly
-   set the seven environment keys listed above (SystemRoot comes from the OS),
-   then invoke the absolute published executable. Redirect only the probe's
-   bounded JSON output into a fresh protected result file. Propagate `$LASTEXITCODE`
-   as the task result. Do not redirect PowerShell verbose/debug/error streams
-   containing arbitrary setup objects into published artifacts.
+Setup refuses an existing C:\arxcovo-probe parent, run tree, generated account or
+task. It creates a protected parent and exact run-attempt control tree. SYSTEM
+and Administrators alone have full control; generated SID gets bin RX and work
+Modify only. Code, task script and result stay private. Only fresh user group
+memberships are checked; existing profiles and account rights are not enumerated.
+The password is generated directly into a SecureString, with random bytes cleared
+and SecureString disposed; it is never converted to a plaintext string, logged,
+written, exported or sent through command arguments. S4U never receives it.
 
-The core invocation *inside that future protected task script* is:
+Task registration uses Task Scheduler COM TASK_CREATE (never update), service
+account SYSTEM, highest run level, protected SYSTEM/admin DACL, fixed absolute
+hosted pwsh path, no profile, no triggers/retries and a one-minute execution limit.
+The protected script starts only the self-contained probe, with a cleared fresh
+seven-key environment including SystemRoot from Windows. Output reads have a
+131072-character cap, followed by a 256-KiB file cap and 128-line/2048-character
+JSON limits. Polling lasts at most 75 seconds and requires a changed LastRunTime,
+nonrunning/nonqueued state and LastTaskResult 0. Parsed evidence must contain
+pinned SID/Medium observations, managed root exit 42, descendant exit 124 and
+zero live Job processes. Only a fixed allowlisted numeric/boolean summary is
+published; raw task output and setup exceptions are not printed or uploaded.
+An API creation success or empty result cannot pass.
 
-```powershell
-# Values substituted by the reviewed setup helper, never arbitrary dispatch input.
-$env:GITHUB_ACTIONS = 'true'
-$env:RUNNER_ENVIRONMENT = 'github-hosted'
-$env:RUNNER_OS = 'Windows'
-$env:ARXCOVO_DISPOSABLE_PROBE = 'reviewed-manual-ci-v1'
-$env:GITHUB_RUN_ID = '<numeric-run-id>'
-$env:GITHUB_RUN_ATTEMPT = '<numeric-attempt>'
-& 'C:\arxcovo-probe\<run>-<attempt>\bin\IdentityProbe.exe' 'axp<8-lower-hex>' 'C:\arxcovo-probe\<run>-<attempt>\work'
-exit $LASTEXITCODE
-```
+Cleanup compares current SID and task XML with captured identities, stops only
+the created task, waits boundedly for stop, unregisters it, removes only the
+newly granted right and account, then walks only the exact new tree without
+following reparse points. The empty newly created parent is removed nonrecursively.
+Tree cleanup stops at 512 entries or depth 32 rather than walking arbitrary data.
+Independent cleanup steps continue after failures; any failure fails the job.
+If identity/path checks fail, unsafe deletion is refused and the runner must be
+discarded. No runner reuse or automatic retry is allowed. The probe's held Job
+and process handles perform kill/drain; the wrapper never kills by recycled PID.
+A hard runner cancellation/crash can interrupt finally: hosted runner disposal,
+not a persisted recovery script, is the backstop. This is not production cleanup.
 
-Register its absolute PowerShell action with `New-ScheduledTaskPrincipal -UserId
-'SYSTEM' -LogonType ServiceAccount -RunLevel Highest`; set an execution time
-limit of one minute and no retries. Start only this newly named task. Poll its
-state for at most 75 seconds, require a completed run and LastTaskResult 0, then
-parse at most 256 KiB of results and require the final successful tree result.
-Creation API success or an empty result file must fail the workflow. Do not
-retry a failed privileged experiment automatically.
+### Exact coordinator steps for a future dispatch
 
-In a workflow `finally` / `if: always()` step: stop and unregister only the task
-just created, terminate only fixture processes whose handles/SID were captured,
-remove the newly granted right and only the newly created user after checking
-its SID matches, then remove only the fresh control tree after confirming its
-absolute path, prefix and absence of reparse points. Never recursively follow
-test-controlled links during cleanup. Cleanup failure fails the experiment;
-the disposable runner must be discarded, never reused. Publish only bounded
-allowlisted JSON evidence and numeric task result, never runner-wide logs.
+No dispatch is authorized by this implementation. After independent Opus security
+review (or prescribed fallback), integrate the reviewed change through all normal
+required gates. Keep this experiment separate from milestone acceptance and PR 11.
+
+1. Review the final immutable main SHA including this workflow, every helper and
+   probe source, and action pins. Confirm main has no additional unreviewed commits.
+2. Independently verify the immutable SHA and green required checks; record review
+   evidence before setting repository variable WINDOWS_IDENTITY_PROBE_REVIEWED_SHA
+   to that exact 40-lowercase-hex main commit SHA. This variable is an operator
+   precondition, not an automatic attestation. Leaving it unset disables the job.
+3. As Dytschgo, manually dispatch `windows-identity-probe.yml` on main, with no
+   inputs (UI Run workflow, or `gh workflow run windows-identity-probe.yml --ref main`).
+   Confirm GitHub reports the selected SHA equals the reviewed SHA. A moved main,
+   rerun by another actor, fork/repo/ref mismatch or absent variable is refused.
+4. Inspect task-result, ci-evidence and cleanup summaries. All must succeed.
+   Missing summaries, cancellation, timeout or cleanup failure mean failed experiment:
+   discard runner, preserve only sanitized evidence, no automatic retries.
+5. Clear the repository variable after the experiment. Review any future source or
+   negative fixture independently, then use another fresh hosted runner. Do not
+   add workflow inputs for commands, branches, account names, paths or negative modes.
+
+### Toolchain and action provenance (checked 2026-11-11)
+
+.NET 8 ended support November 10, 2026. The harness targets net10.0-windows;
+.NET 10 LTS is supported through November 14, 2028. The workflow explicitly
+installs SDK 10.0.404 (Microsoft release metadata, runtime 10.0.15); it does not
+assume a hosted toolcache version. Local verification used installed SDK 10.0.303,
+so the exact future workflow SDK installation remains CI-unverified.
+
+- [Microsoft support matrix](https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core)
+- [Microsoft .NET 10 release metadata](https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json)
+- [checkout v4.2.2 primary tag API](https://api.github.com/repos/actions/checkout/git/ref/tags/v4.2.2):
+  11bd71901bbe5b1630ceea73d27597364c9af683.
+- [setup-dotnet v5.0.0 primary tag API](https://api.github.com/repos/actions/setup-dotnet/git/ref/tags/v5.0.0):
+  d4c94342e560b34958eacfc5d055d21461ed1c5d.
+  Both SHA pins were verified by read-only primary GitHub API requests, not GitHub mutations.
+- [LsaAddAccountRights](https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-lsaaddaccountrights),
+  [LsaRemoveAccountRights](https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-lsaremoveaccountrights),
+  [TASK_CREATE and task DACL](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskfolder-registertaskdefinition).
 
 ## Negative matrix for that reviewed experiment
 
@@ -225,3 +250,22 @@ Implementation provider/effort: GPT-6.1 Sol, high. Outcome: buildable harness an
 safe tests; privileged feasibility remains unresolved. No architectural decision
 replaces ADR 0006. Coordinator should copy this task/evidence into PROGRESS.md
 when integrating; this bounded builder only owns probe-specific documentation.
+
+## Implementation verification record
+
+Provider/effort: GPT-6.1 Sol, high; base 24d3c7e. Scope stayed within probe
+files, this document and the new manual workflow; coordinator owns PROGRESS.md
+updates and independent review. No subagents, push, PR, dispatch or GitHub writes.
+Release build passed with zero warnings/errors; probe self-test passed 21
+assertions; helper pure tests passed 82 assertions; self-contained win-x64
+publish passed. No account/right/task/service/privilege/VM mutation ran locally.
+The native LSA helper compiled but was never invoked. All privileged APIs, ACLs,
+task execution, negative native fixtures and cleanup are **unverified on real
+hardware** until independently reviewed disposable CI. Source parsing and pure
+refusal tests do not establish native behavior or hosted provenance.
+
+Pure mutation testing on temporary copies removed, separately, the SID match,
+reviewed source SHA match and descendant-exit requirement. Each caused an expected
+test failure; the intact helper suite passed afterward. YAML parsing and assertions
+for manual-only triggers, windows-2022, contents-read and eight-minute budget passed.
+These tests establish validation sensitivity, not privileged/native correctness.

@@ -1,0 +1,87 @@
+# Pure decisions only. Importing this module performs no account/task/native actions.
+Set-StrictMode -Version Latest
+function Assert-Probe($Condition) { if (!$Condition) { throw 'probe-validation-refused' } }
+function Assert-ProbeContext([hashtable]$Context) {
+    $expected = @{
+        GITHUB_ACTIONS='true'; RUNNER_ENVIRONMENT='github-hosted'; RUNNER_OS='Windows'
+        ARXCOVO_DISPOSABLE_PROBE='reviewed-manual-ci-v1'; GITHUB_EVENT_NAME='workflow_dispatch'
+        GITHUB_REPOSITORY='Dytschgo/arxcovo'; GITHUB_ACTOR='Dytschgo'; GITHUB_TRIGGERING_ACTOR='Dytschgo'
+        GITHUB_REF='refs/heads/main'
+    }
+    foreach ($key in $expected.Keys) { Assert-Probe ($Context[$key] -ceq $expected[$key]) }
+    Assert-Probe ($Context.GITHUB_RUN_ID -cmatch '\A[0-9]{1,20}\z')
+    Assert-Probe ($Context.GITHUB_RUN_ATTEMPT -cmatch '\A[0-9]{1,5}\z')
+    Assert-Probe ($Context.REVIEWED_SHA -cmatch '\A[0-9a-f]{40}\z')
+    Assert-Probe ($Context.GITHUB_SHA -ceq $Context.REVIEWED_SHA)
+    Assert-Probe ($Context.GITHUB_WORKFLOW_SHA -ceq $Context.REVIEWED_SHA)
+}
+function Get-ProbeContext {
+    $c = @{}
+    foreach ($k in @('GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ARXCOVO_DISPOSABLE_PROBE','GITHUB_EVENT_NAME','GITHUB_REPOSITORY','GITHUB_ACTOR','GITHUB_TRIGGERING_ACTOR','GITHUB_REF','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_SHA','GITHUB_WORKFLOW_SHA','REVIEWED_SHA')) {
+        $c[$k] = [Environment]::GetEnvironmentVariable($k)
+    }
+    return $c
+}
+function Get-ProbePlan([string]$Run, [string]$Attempt, [string]$Account) {
+    Assert-Probe ($Run -cmatch '\A[0-9]{1,20}\z' -and $Attempt -cmatch '\A[0-9]{1,5}\z')
+    Assert-Probe ($Account -cmatch '\Aaxp[0-9a-f]{8}\z')
+    return @{ Root="C:\arxcovo-probe\$Run-$Attempt"; Account=$Account; Task="ArxcovoProbe-$Run-$Attempt" }
+}
+function Assert-ProbePath([string]$Path, [string]$Root) {
+    Assert-Probe ($Path -ceq $Root -or $Path.StartsWith($Root + '\', [StringComparison]::Ordinal))
+    Assert-Probe ([IO.Path]::GetFullPath($Path) -ceq $Path)
+    $part = [IO.DirectoryInfo]::new($Path)
+    while ($null -ne $part) {
+        if (Test-Path -LiteralPath $part.FullName) {
+            Assert-Probe (((Get-Item -Force -LiteralPath $part.FullName).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        }
+        $part = $part.Parent
+    }
+}
+function Get-ProbeCleanupPlan($State, [string]$ObservedSid) {
+    Assert-Probe ($State.Sid -cmatch '\AS-1-5-21-(?:[0-9]+-){3}[0-9]+\z')
+    Assert-Probe ($ObservedSid -ceq $State.Sid)
+    Assert-Probe ($State.AccountCreated)
+    $steps = @()
+    if ($State.TaskCreated) { $steps += 'task' }
+    if ($State.RightCreated) { $steps += 'right' }
+    $steps += 'account'
+    if ($State.PathCreated) { $steps += 'path' }
+    return $steps
+}
+function Read-ProbeEvidence([string]$Text, [string]$Sid) {
+    Assert-Probe ([Text.Encoding]::UTF8.GetByteCount($Text) -le 262144)
+    $lines = @($Text.TrimEnd("`r","`n") -split '\r?\n')
+    Assert-Probe ($lines.Count -ge 1 -and $lines.Count -le 128)
+    $seen = @{}
+    foreach ($line in $lines) {
+        Assert-Probe ($line.Length -le 2048)
+        $j = $line | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        Assert-Probe ($j -is [hashtable] -and $j.stage -is [string])
+        foreach ($field in @('ok','mediumIntegrity','productionAcceptance')) {
+            if ($j.ContainsKey($field)) { Assert-Probe ($j[$field] -is [bool]) }
+        }
+        foreach ($field in @('integrityRid','exitCode','descendantExitCode','liveJobProcesses')) {
+            if ($j.ContainsKey($field)) { Assert-Probe ($j[$field] -is [long] -or $j[$field] -is [int]) }
+        }
+        # Never publish arbitrary text from a compromised payload. Only selected typed fields.
+        switch -CaseSensitive ($j.stage) {
+            'preflight' { Assert-Probe ($j.ok -ceq $true -and $j.expectedSid -ceq $Sid); $seen.preflight=$true }
+            { $_ -cin @('logon-token','suspended-child','descendant') } {
+                Assert-Probe ($j.observedSid -ceq $Sid -and $j.integrityRid -eq 8192 -and $j.mediumIntegrity -ceq $true)
+                $seen[$j.stage]=$true
+            }
+            'child-exit' { Assert-Probe ($j.exitCode -eq 42); $seen.child=$true }
+            'bounded-tree-probe' {
+                Assert-Probe ($j.ok -ceq $true -and $j.descendantExitCode -eq 124 -and $j.liveJobProcesses -eq 0 -and $j.productionAcceptance -ceq $false)
+                $seen.tree=$true
+            }
+            'failure' { throw 'probe-reported-failure' }
+            default { Assert-Probe ($j.stage -cin @('win32','lsa','privilege','account','child-wait')) }
+        }
+    }
+    foreach ($s in @('preflight','logon-token','suspended-child','descendant','child','tree')) { Assert-Probe ($seen[$s] -ceq $true) }
+    Assert-Probe (($lines[-1] | ConvertFrom-Json).stage -ceq 'bounded-tree-probe' -or ($lines[-1] | ConvertFrom-Json).stage -ceq 'win32')
+    return '{"stage":"ci-evidence","ok":true,"rootExitCode":42,"descendantExitCode":124,"liveJobProcesses":0,"productionAcceptance":false}'
+}
+Export-ModuleMember -Function *-Probe*
