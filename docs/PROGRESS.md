@@ -969,3 +969,54 @@ later integration. No push, GitHub write, PR, merge, watch or delegation occurre
 
 - Anthropic / claude-opus-5-5 / requested high authored `7e4cf06a`: ADR0012 SCM amendment and PR-C brief align demand-start install and last-command boot intent with accepted ADR0014. OpenAI / gpt-6.1-sol / medium independently reviewed both changed documents and recorded `docs/reviews/windows-scm-contract-review.md`. No blockers remain after clarifying native-call deadline limits, accepted stop-control handling, failure-test exceptions and fresh-install ordering.
 - The adapter is not implemented yet. Pure/fake and synthetic-buffer implementation tests are specified; no actual SCM call, service, LSA, account, privilege, elevation or owner setup ran. Installed behavior and M2 acceptance remain **unverified on real hardware**.
+
+## ADR0012 PR-C Windows SCM library implementation (local)
+
+- Provider/effort/outcome: OpenAI / gpt-6.1-sol / high, implementation alone from
+  verified `24d97e16c10a14d4686c6aa6b5b50964916d2eab`. Implementation commit
+  `1c91ed9900cd40726c99c783eedc15787038971b`. Last merged PR is unchanged;
+  this task made no push, PR, GitHub write, merge or watch.
+- Complete: generic lifecycle/classification/status engine; opaque consuming
+  deregistration proof; narrow Windows FFI with RAII handles and checked fixed
+  aligned 8 KiB queries; portable stateful fake SCM/clock and synthetic native
+  structure tests. Install/start/stop persistence follows the revised contract.
+  layout::Error additions match object `1e1e48b` exactly; no Unix implementation
+  source, session/parts, provenance engine, CLI/MCP or Plan::execute changed.
+- Routine API visibility adjustment: WindowsScm is `pub(super)` to respect its
+  private ScmCalls/Clock bounds. This narrows visibility without adding authority;
+  the later wiring slice can export a concrete facade. No architectural deviation.
+- Passed locally on Windows (exact commands):
+  - `cargo build --workspace --all-targets --locked`
+  - `cargo fmt --check`
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  - `cargo nextest run -p arxd service::owner_scm --locked`: 18 passed.
+  - `cargo nextest run --workspace --locked`: final implementation 163 passed,
+    two existing subprocess fixtures skipped directly and exercised by parents;
+    nextest test execution 9.097 s. This is local evidence, not hosted CI timing.
+- Ten actual implementation-source mutations compiled and failed assertions:
+  auto creation, missing auto write, early demand stop, disabled identity,
+  1077 mapping, two recovery actions, case-folded image, ignored delete error,
+  removed deadline, and allowed start-pending registration. Originals restored.
+  Full failure-test names: `docs/reviews/windows-scm-mutation-evidence.md`.
+- The first targeted run exposed two harness errors (proof declaration counted
+  as construction, accepted 1056 incorrectly treated as an immediate halt); both
+  corrected. The mutation driver initially doubled CRLF and rejected its second
+  mutation at compilation; line handling corrected, then all ten compiled and
+  failed tests. Initial Clippy collapsible-if warning corrected. No guard weakened.
+- Blocked check: `cargo check -p arxd --tests --target
+  x86_64-unknown-linux-gnu --locked` failed in bundled SQLite's C build because
+  `x86_64-linux-gnu-gcc` is unavailable. No Unix metadata compilation pass or Unix
+  runtime test is claimed. Unix-host pure tests remain required.
+- No adapter test constructed the native adapter or made any real SCM call,
+  including manager-open/read-only queries. No owner/admin/LSA/account/privilege
+  operation, installation, dispatch or old Lab Manager/VM work was performed.
+  Normal workspace tests retain the existing safe entry-refusal and parent-owned
+  current-user fixtures; ignored fixtures were never run directly.
+- Remaining: independent Opus implementation review and hosted required checks;
+  PR-D proof consumption/session-parts narrowing, fresh protected-state
+  provisioning and CLI wiring; separately reviewed disposable native experiments.
+  LocalSystem/image readback, demand delayed-flag support/preservation, 1077,
+  recovery/delete races, marked-for-delete semantics, privilege ordering/buffer
+  sufficiency, real reboot persistence and privilege sufficiency remain
+  **unverified on real hardware**. Poll deadlines cannot interrupt a blocking RPC.
+  No installed acceptance is established; M2 remains open.
