@@ -308,3 +308,30 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix validation conflict resolution
 
 - Codex / gpt-6.1-sol, medium resolved the docs-only conflict with main66c1b17 so hosted CI can exercise the restrictive-umask fixture at the integrated head. Executor, driver and test source are unchanged from18d4f1f; native test evidence remains pending. No privileged experiment ran.
+
+## Windows CI handle-probe investigation
+
+- Opus PR20 exact-head recheck passed d8f034f but identified a Windows failure shared by main66c1b17 and PR25/PR20: actual_job_tree_timeout_cancel_shutdown_overflow_and_handles sees child exit101. Production source is unchanged from earlier green runs. Codex / gpt-6.1-sol, medium ran the focused existing test twice locally; both passed, so no cause is claimed. The parent assertion now includes bounded child stderr as well as stdout for diagnosis. Dedicated high-effort diagnosis is pending; no gate is bypassed and no rerun is claimed as a fix.
+
+- Scoped follow-up, Codex / gpt-6.1-sol / high: base 0de0b725ee976eaa0ac21a531fdd9ea6ab2131e9 (main66c1b173 plus diagnostic). Read the public PR20 addendum and all three exact failed Windows job logs. Locally the original cargo and nextest focused baselines passed once each. A temporary real-executor 64-slot sampler failed 1/64 children in each of two runs, surfacing GetHandleInformation return 1 versus 0 and child exit101. This proves the numeric-validity assumption is invalid locally; hosted logs still do not identify their child assertion.
+- Fixed only cfg(test) fixture code: randomly named sentinel, snapshot candidate before opening reference, compare kernel object identity. Child-local bounded native allocation makes reuse deterministic; standard handle type checks, production CreateProcess/three-handle list, Job cleanup and token checks remain unchanged. Restoring numeric-validity checking fails the regression (1/1); temporarily adding the sentinel to the actual production inheritance list also fails (1/1, explicit inherited-object assertion). Both mutations restored. Fixed controlled regression passed directly and under nextest (2/2). Final unforced named-event sampling passed 64/64, with zero spontaneous reuse markers in that run; do not interpret it as proof of a hosted fix.
+- Actual validation: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo nextest run --workspace --locked: **60/60 passed**, zero skipped, 7.369-second test phase. Original combined test also passed directly. Detailed loop, hypotheses, mutation results and limitations are in tools/windows-identity-probe/DEBUGGING.md. No architectural deviation. Last merged PR remains #24 / main66c1b173. Blockers: fresh hosted Windows result and independent other-provider review pending, coordinator integration required. No push/PR/merge/watch or privileged actions. Dedicated-account/service/VM paths remain **unverified on real hardware** by this fix.
+
+## Unix execution integration after Windows test correction
+
+- Codex / gpt-6.1-sol, medium integrated merged PR28 into PR14, retaining both
+  progress histories. The inherited changes are confined to the Windows handle
+  regression fixture and its debugging documentation; Unix execution and guarded
+  experiment behavior are unchanged. PR14 head d018a90 passed hosted Ubuntu,
+  macOS and Windows CI before this integration. No privileged experiment ran.
+- The integrated revision still requires fresh hosted checks and independent
+  exact-head review. Root/systemd/cgroup runtime remains **unverified on real hardware**.
+
+- Coordinator combined-head verification: formatting and workspace/all-target
+  Clippy passed, followed by 66/66 Windows nextest tests. The actual Ubuntu log
+  for run 43030809255 at d018a90 confirms the positive-control parent and nofollow
+  tests passed, along with 29 pure driver tests. This supplies native ordinary-user
+  fixture evidence, not root execution or cgroup containment acceptance.
+- PR21 Ubuntu job 130562541853 also failed during Playwright dependencies with
+  repeated Ubuntu-mirror DNS failures; its Windows and macOS jobs passed. The
+  failure is not waived, and no repeated automatic retry was requested.
