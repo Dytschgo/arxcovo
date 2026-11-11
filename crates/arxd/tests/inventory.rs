@@ -312,7 +312,9 @@ fn activity_retention_and_interrupted_restart() {
     let dir = private_dir();
     let store = Activity::open(dir.path()).unwrap();
     let host_id = store.host_id().unwrap();
-    for _ in 0..1005 {
+    // The read bucket retains 200 rows. Cross that actual boundary rather
+    // than the older pre-v2 1000-row action boundary.
+    for _ in 0..205 {
         store.start("test-agent", "list_hosts").unwrap();
     }
     drop(store);

@@ -3,7 +3,7 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#16](https://github.com/Dytschgo/arxcovo/pull/16), `b29f5317e94e03d033fcc1596a3e84c4d1d4d485`, 11:34:19 UTC. Exact-head independent Opus review passed on `8c3856a`; the coordinator enabled normal gated squash auto-merge. The drive-root validation correction is merged.
+- Last merged PR: [#23](https://github.com/Dytschgo/arxcovo/pull/23), `2be8268a656a754b03d560389f8486e5703eb98e`, 12:27:44 UTC. Exact-head independent Opus review passed on 0701079, all three hosted platforms and both gates passed, and normal gated squash auto-merge completed. Required CI and timeout policy are unchanged.
 - Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
 - Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
 
@@ -257,3 +257,15 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## PR #22 hosted portability correction
 
 - Codex / gpt-6.1-sol, medium: first hosted run 43014149384 failed Linux/macOS Clippy because Windows production helpers and Windows-only fault hooks were compiled unused. Added cfg gates matching their callers, retaining portable redaction/bounds tests under cfg(test); warning enforcement is unchanged. Local formatting, Clippy and all 59 Windows nextest tests pass after the correction. Fresh hosted checks and independent Sol review remain pending. No positive owner MCP acceptance ran.
+
+## CI runtime correction after Windows timeout
+
+- Codex / gpt-6.1-sol, medium: PR22 run 43015177578 passed 59 Windows Rust tests and UI lint/test/build, then hit the unchanged 12-minute job limit during browser installation; browser/Electron smoke steps did not run. No merge or budget gate was bypassed. Hosted logs show activity_retention_and_interrupted_restart at 247.801 seconds and read_flood_preserves_actions_and_lifecycle at 318.726 seconds; the latter controlled the test phase.
+- The old restart test still exceeded the pre-v2 1000-row limit even though reads retain 200 rows. It now performs 205 real durable starts. The separate-bucket test still fills/overflows the 1000-action and 200-read buckets, then performs two real additional action starts instead of filling a second complete action bucket. New assertions verify action classification, oldest-action pruning and oldest-read preservation. Production store, workflow, timeout, policy and all checks are unchanged.
+- Local focused tests passed before and after. After the correction, formatting, Clippy with warnings denied and all 39 workspace nextest tests pass. Three temporary production mutations (read retention removed, buckets merged, restart recovery removed) each caused assertion failures; the exact original store bytes were restored and verified unchanged. These prove coverage of the retained behaviors, not hosted runtime. Independent Opus review and a fresh complete three-OS CI run remain required.
+- Current priority: unblock PR22 through real green gates, then perform private current-user Claude Code acceptance. PR20 service implementation review found two small blockers (owner-fixture false pass and drain/audit deadline mismatch); fixes remain pending. No dedicated-account/service or M2 acceptance is claimed.
+
+## PR22 CI-runtime integration checkpoint
+
+- Codex / gpt-6.1-sol, medium: integrated main 2be8268 into reviewed PR22 head72a5e5f. Only the two reviewed retention tests and progress changed; all arxd production source, Cargo manifests/lock and pinned toolchain are byte-identical to the successful independent Sol review. That review is https://github.com/Dytschgo/arxcovo/pull/22#issuecomment-6795099160. Integrated-revision verification and fresh exact-head recheck are pending. No real cargo/Claude Code acceptance has run.
+- Service lifecycle review corrections are preserved on feat/service-lifecycle at b32ce16: TokenOwner execution proof, separate drain/audit budgets and bounded startup/unrequested serve failure, with 55 local tests. Configuration macOS-admin refusal is on PR21 at 8975520 with 63 local tests. Native macOS observation candidate b261457 has local type/policy tests but remains unmerged and unverified on native macOS. No service Application or owner installation adapter is activated.
