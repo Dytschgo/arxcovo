@@ -620,3 +620,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   and hosted required checks remain coordinator work. Mac endpoint/ancestry and
   SQLite crash-warning findings remain separate slices. ACL masks, namespace
   policy, ancestry read-data pins and sharing fixes are retained unchanged.
+
+## Service preflight coordinator validation
+
+- Codex / gpt-6.1-sol, medium integrated candidate51a1dee without changing its implementation. Formatting, workspace/all-target Clippy with warnings denied and all116 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Source inspection confirms service preflight omits workspace_safe, owner validation retains it, and only explicit native lookup not-found becomes account_missing. Stored schema3 reason vocabulary is unchanged. Fresh independent review and hosted checks remain pending.
+- PR20 Ubuntu job130562335529 (run43032348219) failed browser dependency installation on DNS resolution of Ubuntu mirrors, after earlier checks. A single failed-job retry was requested at the unchanged reviewed4ead112. This is an environment retry, not a source-fix claim; Windows/macOS checks passed. No gate was bypassed.
