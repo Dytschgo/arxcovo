@@ -1535,6 +1535,100 @@ mod imp {
 mod tests {
     use super::*;
     #[test]
+    fn command_gates_and_foreign_targets_are_exact() {
+        let gates = [
+            Gate::Always,
+            Gate::Loaded,
+            Gate::NotLoaded,
+            Gate::ArtifactPresent,
+        ];
+        for (os, program, args, permitted) in [
+            (
+                Platform::Linux,
+                "/usr/bin/systemctl",
+                vec!["stop", "arxd.service"],
+                vec![Gate::Always, Gate::Loaded],
+            ),
+            (
+                Platform::Linux,
+                "/usr/bin/systemctl",
+                vec!["disable", "arxd.service"],
+                vec![Gate::Always, Gate::ArtifactPresent],
+            ),
+            (
+                Platform::Macos,
+                "/bin/launchctl",
+                vec!["bootout", super::super::owner_query::LAUNCHD_TARGET],
+                vec![Gate::Loaded],
+            ),
+        ] {
+            let layout = Layout::for_test(os);
+            for when in gates {
+                assert_eq!(command(os, program, &args, when), permitted.contains(&when));
+                assert_eq!(
+                    allowed(
+                        &layout,
+                        &Operation::Command {
+                            program,
+                            args: args.clone(),
+                            when
+                        }
+                    )
+                    .is_ok(),
+                    permitted.contains(&when)
+                );
+            }
+        }
+        for when in gates {
+            assert!(!command(
+                Platform::Linux,
+                "/usr/bin/systemctl",
+                &["enable", "other.service"],
+                when
+            ));
+            assert!(!command(
+                Platform::Macos,
+                "/bin/launchctl",
+                &["disable", "system/other"],
+                when
+            ));
+        }
+    }
+    #[test]
+    fn only_linux_dropin_accepts_a_conditional_constant() {
+        let linux = Layout::for_test(Platform::Linux);
+        let macos = Layout::for_test(Platform::Macos);
+        for (layout, path, bytes, expected) in [
+            (&linux, Path::new(DROPIN_PATH), DROPIN, true),
+            (&linux, linux.artifact(), UNIT, false),
+            (&macos, macos.artifact(), PLIST, false),
+        ] {
+            assert_eq!(
+                allowed(
+                    layout,
+                    &Operation::Constant {
+                        path: path.into(),
+                        bytes,
+                        when: ConstantGate::UnitAbsent
+                    }
+                )
+                .is_ok(),
+                expected
+            );
+            assert!(
+                allowed(
+                    layout,
+                    &Operation::Constant {
+                        path: path.into(),
+                        bytes,
+                        when: ConstantGate::Always
+                    }
+                )
+                .is_ok()
+            );
+        }
+    }
+    #[test]
     fn typed_lifecycle_is_fail_closed_and_gates_are_allowlisted() {
         for os in [Platform::Linux, Platform::Macos] {
             let l = Layout::for_test(os);
@@ -1654,6 +1748,15 @@ mod tests {
                 let p = owner_plan(&l, &c, action).unwrap();
                 for op in p.operations() {
                     allowed(&l, op).unwrap();
+                    if matches!(
+                        op,
+                        Operation::Constant {
+                            when: ConstantGate::UnitAbsent,
+                            ..
+                        }
+                    ) {
+                        assert!(action == Action::Install);
+                    }
                 }
                 for fail_at in 0..p.operations().len() {
                     let mut m = Failure { calls: 0, fail_at };
