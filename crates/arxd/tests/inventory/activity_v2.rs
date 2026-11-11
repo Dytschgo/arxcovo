@@ -253,7 +253,7 @@ fn v1_migration_is_lossless_and_failure_is_atomic() {
             assert_eq!(
                 db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                2
+                3
             );
             let p = page(&store, &args(50, None, true));
             assert_eq!(p.activities.len(), 2);
@@ -307,6 +307,7 @@ async fn sdk_http_and_real_stdio_activity_visibility_storage_failures_and_bounds
         for _ in 0..51 {
             let id = store.start("test-agent", "discover_tools").unwrap();
             let m = Metadata {
+                identity_mode: Some(arxd::store::IdentityMode::DedicatedAccount),
                 argc: Some(128),
                 observed_kind: Some(arxd::store::ObservedKind::WindowsSid),
                 observed_id: Some(format!(
@@ -626,4 +627,87 @@ fn schema_checks_and_typed_metadata_reject_unsafe_values() {
         .list("test-agent", r, &args(50, Some(i64::MAX), true))
         .unwrap();
     assert!(p.activities.iter().all(|row| row.id < r));
+}
+
+#[test]
+fn v3_development_constraints_and_v2_migration_preserve_identity_sequence() {
+    let dir = private_dir();
+    let store = Activity::open(dir.path()).unwrap();
+    let host = store.host_id().unwrap();
+    let id = store.start("test-agent", "run_command").unwrap();
+    let m = Metadata {
+        identity_mode: Some(arxd::store::IdentityMode::DevelopmentCurrentUser),
+        ..Default::default()
+    };
+    store.finish_typed(id, Outcome::Succeeded, &m).unwrap();
+    let db = db(dir.path());
+    for assignment in [
+        "observed_kind='windows_sid'",
+        "observed_id='S-1-5-21-1',observed_kind='windows_sid'",
+        "rights='standard'",
+        "observed_gid=1",
+        "identity_mode='invalid'",
+        "elevation=1",
+        "integrity_rid=16384",
+        "observation_point='child'",
+        "tree_boundary='process_group'",
+    ] {
+        assert!(
+            db.execute_batch(&format!("UPDATE activity SET {assignment} WHERE id={id}"))
+                .is_err()
+        );
+    }
+    // Positive control: the fixed development facts are accepted.
+    db.execute_batch(&format!("UPDATE activity SET elevation=0,integrity_rid=8192,observation_point='pre_exec',tree_boundary='windows_job' WHERE id={id}")).unwrap();
+    // The start-time mode is authoritative: completion cannot relabel a row.
+    let dev = store
+        .start_development("test-agent", "run_command")
+        .unwrap();
+    let dedicated = Metadata {
+        identity_mode: Some(arxd::store::IdentityMode::DedicatedAccount),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .finish_typed(dev, Outcome::Succeeded, &dedicated)
+            .is_err()
+    );
+    assert!(
+        store
+            .finish_typed(dev, Outcome::Succeeded, &Metadata::default())
+            .is_ok()
+    );
+    let mode: String = db
+        .query_row(
+            &format!("SELECT identity_mode FROM activity WHERE id={dev}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "development_current_user");
+    let p = page(&store, &args(50, None, false));
+    assert_eq!(
+        p.activities[1].claim.as_deref(),
+        Some(arxd::development::CLAIM)
+    );
+    assert_eq!(
+        p.activities[0].execution_mode,
+        Some(arxd::store::IdentityMode::DevelopmentCurrentUser)
+    );
+    drop(store);
+    db.execute_batch("ALTER TABLE activity DROP COLUMN identity_mode; PRAGMA user_version=2; UPDATE sqlite_sequence SET seq=900 WHERE name='activity';").unwrap();
+    let store = Activity::open(dir.path()).unwrap();
+    assert_eq!(store.host_id().unwrap(), host);
+    assert!(store.start("test-agent", "run_command").unwrap() > 900);
+    assert_eq!(
+        db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        3
+    );
+    assert!(
+        page(&store, &args(50, None, false))
+            .activities
+            .iter()
+            .all(|r| r.metadata.identity_mode.is_none())
+    );
 }
