@@ -460,3 +460,176 @@ async fn dispatch_dropped_before_first_poll_still_completes_audit() {
         .unwrap();
     assert_eq!(facts, (None, None));
 }
+
+/// Dedicated fake is visibly synthetic; this proves IPC/audit integration only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
+    use std::sync::atomic::Ordering;
+    let state = private_dir();
+    let (execution, calls) = crate::service::executor::tests::fake(false, true);
+    let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
+    store.dedicated = Some(execution.clone());
+    let activity = Arc::new(store);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let agent = |principal: &str, token: &str| crate::config::Agent {
+        principal: principal.into(),
+        token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+    };
+    let alpha = "a".repeat(64);
+    let beta = "b".repeat(64);
+    let cfg = Arc::new(crate::config::Config {
+        execution: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![agent("alpha", &alpha), agent("beta", &beta)],
+    });
+    let stop = crate::service::Shutdown::default();
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = tokio::spawn(listener.run_service(cfg, activity.clone(), stop.clone()));
+    let a = connect(&address, &alpha).await;
+    let b = connect(&address, &beta).await;
+    let tools = a.list_tools(None).await.unwrap().tools;
+    let schema = &tools
+        .iter()
+        .find(|t| t.name == "run_command")
+        .unwrap()
+        .input_schema;
+    assert!(schema["properties"].get("executable").is_some());
+    assert_eq!(schema["additionalProperties"], false);
+    for key in ["mode", "principal", "identity", "executor", "config"] {
+        let mut v = json!({"tool":"cargo"});
+        v[key] = json!("forbidden");
+        assert!(
+            call(&a, "run_command", v)
+                .await
+                .unwrap_err()
+                .contains("invalid execution arguments")
+        );
+    }
+    for v in [
+        json!({"tool":"cargo","executable":r"C:\synthetic\tool.exe"}),
+        json!({"executable":"relative"}),
+        json!({"tool":"cargo","cwd":"../escape"}),
+        json!({"tool":"cargo","tool_typo":"cargo"}),
+        json!({"tool":null}),
+    ] {
+        assert!(call(&a, "run_command", v).await.is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let conn = db(state.path());
+    conn.execute_batch("PRAGMA journal_mode=TRUNCATE;").unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_start BEFORE INSERT ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+    assert!(
+        call(&a, "run_command", json!({"tool":"cargo"}))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    conn.execute_batch("DROP TRIGGER fail_start").unwrap();
+    let result = call(
+        &a,
+        "run_command",
+        json!({"executable":r"C:\synthetic\tool.exe","args":["private-argv"],"cwd":"private-cwd"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["test_outcome"], "FakeForTest");
+    assert_eq!(result["acceptance"], false);
+    assert_eq!(result["metadata"]["observed_id"], Value::Null);
+    let id = result["activity_id"].as_i64().unwrap();
+    let alpha_rows = rows(&a).await;
+    assert!(
+        alpha_rows
+            .iter()
+            .any(|r| r["id"] == id && r["program"] == "path")
+    );
+    assert!(rows(&b).await.iter().all(|r| r["id"] != id));
+    conn.execute_batch("CREATE TRIGGER fail_finish BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+    assert!(
+        call(&a, "run_command", json!({"tool":"cargo"}))
+            .await
+            .unwrap_err()
+            .contains("storage_failed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    conn.execute_batch("DROP TRIGGER fail_finish").unwrap();
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+    stop.cancel();
+    server.await.unwrap().unwrap();
+    assert!(execution.drain().await.is_err());
+    drop(conn);
+    drop(activity);
+    let bytes = std::fs::read(state.path().join("activity.sqlite3")).unwrap();
+    for marker in [
+        "private-argv",
+        "private-cwd",
+        r"C:\synthetic\tool.exe",
+        "FakeForTest",
+    ] {
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker.as_bytes()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_sdk_cancellation_propagates_without_shutdown() {
+    use std::sync::atomic::Ordering;
+    let state = private_dir();
+    let (execution, calls) = crate::service::executor::tests::fake(true, true);
+    let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
+    store.dedicated = Some(execution.clone());
+    let activity = Arc::new(store);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let token = "a".repeat(64);
+    let cfg = Arc::new(crate::config::Config {
+        execution: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![crate::config::Agent {
+            principal: "alpha".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+    });
+    let stop = crate::service::Shutdown::default();
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = tokio::spawn(listener.run_service(cfg, activity, stop.clone()));
+    let a = connect(&address, &token).await;
+    let mut options = PeerRequestOptions::no_options();
+    options.timeout = Some(Duration::from_millis(200));
+    let handle = a
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params(
+                "run_command",
+                json!({"tool":"cargo"}),
+            ))),
+            options,
+        )
+        .await
+        .unwrap();
+    let pending = tokio::spawn(handle.await_response());
+    until(|| calls.load(Ordering::SeqCst) == 1).await;
+    assert!(pending.await.unwrap().is_err());
+    let conn = db(state.path());
+    let state = || {
+        conn.query_row::<(String,Option<String>),_,_>("SELECT outcome,stop_reason FROM activity WHERE tool='run_command' ORDER BY id DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    until(|| state().0 != "started").await;
+    assert_eq!(state(), ("failed".into(), Some("cancelled".into())));
+    a.cancel().await.unwrap();
+    execution.shutdown();
+    stop.cancel();
+    server.await.unwrap().unwrap();
+    execution.drain().await.unwrap();
+}

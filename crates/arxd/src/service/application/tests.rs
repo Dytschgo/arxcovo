@@ -456,3 +456,40 @@ async fn response_only_reason_table_completes_and_reads_back_without_private_dat
         assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()));
     }
 }
+
+#[tokio::test]
+async fn endpoint_failure_still_drains_dedicated_worker_before_stop_audit() {
+    use std::sync::atomic::Ordering;
+    let dir = private_temp();
+    let mut app = ServiceApplication::new(injected(dir.path(), None));
+    let (executor, calls) = crate::service::executor::tests::fake(true, true);
+    let mut store = Activity::open_service_fixture(dir.path()).unwrap();
+    store.dedicated = Some(executor.clone());
+    let activity = Arc::new(store);
+    app.activity = Some(activity.clone());
+    let id = activity.start("alpha", "run_command").unwrap();
+    let work = executor.dispatch(None, activity.clone(), id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.serving = Some(tokio::spawn(async { Err(ExitCode::Endpoint) }));
+    app.stop_accepting().unwrap();
+    assert_eq!(app.drain().await, Err(ExitCode::Endpoint));
+    let result = work.await.ok().unwrap();
+    assert_eq!(result["metadata"]["stop_reason"], "shutdown");
+    app.service_stop().await.unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>(
+            "SELECT count(*) FROM activity WHERE outcome='started'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0
+    );
+}
