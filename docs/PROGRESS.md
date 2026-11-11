@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#29](https://github.com/Dytschgo/arxcovo/pull/29), `aafaa3ccfa6aaf190fbc0a97cc28a3f5d4579511`, 19:37:53 UTC, through all five gates. Unix owner lifecycle and macOS namespace libraries are merged; macOS manager parsing still refuses Unknown.
-- Main includes service, configuration, native observation, inventory/activity, owner provenance/storage, SCM and Unix owner libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; installed/dedicated M2 acceptance stays unchecked.
-- Queue priority: finish Unix executor #14 and full service executor/MCP #36 review, then remaining existing evidence/test PRs. No new feature PRs while the queue drains; #31 remains closed as folded into #29.
-- Main push CI after #35 passed on its first attempt, run 43087250975: **596 seconds**, below 15 minutes. The new #29 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Last merged PR: [#14](https://github.com/Dytschgo/arxcovo/pull/14), `5b4f6b20796d599a015ca048dc4edaeb72546387`, 19:51:48 UTC, through all five gates. The Unix executor is library-only; no Unix MCP execution route is activated.
+- Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. The macOS owner parser still refuses Unknown.
+- Queue priority: fix the three #36 execution/audit review blockers and finish existing evidence/test PRs through independent reviews. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
+- Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -185,6 +185,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | PR20 scoped docs review | Codex / gpt-6.1-sol | high | Changes required on `9b02fe2`: P1 macOS admin cleanup false assurance, P2 audit vocabulary mismatch with merged activity v2, P2 stale status/development contract |
 | PR20 service architecture corrections | Claude / claude-opus-5-5 | high | ADR 0009 and the owner guide corrected for all three findings; docs only, fresh Sol review required; no acceptance claimed |
 
+
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
 | Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
@@ -299,6 +300,25 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 - Drain has a separate 10-second budget and stop audit a separate 5-second budget; a timed-out drain still produces no stop row, audit timeout is non-clean, and earlier errors are retained. The late-drain regression failed on the prior combined budget, then passed. Two advisory functional issues are also fixed: cooperative startup is bounded at 30 seconds despite heartbeats, and an unrequested successful serve return is endpoint failure. Both regressions failed before their fixes. ADR0009 records the exact contracts and remaining native blocking-call limitations.
 - Formatting, workspace Clippy with warnings denied and all 55 runnable Windows nextest tests passed; one direct-only fixture was exercised by its parent. No SCM/systemd/launchd installation or privileged action ran. Fresh exact-head independent review and hosted checks remain required. CI runtime PR23 is separately reviewed and awaiting its full hosted run; no budget or required check was weakened.
 
+
+## Unix review correction checkpoint
+
+- PR #14 corrections integrated from 9417e62: bounded cgroup ownership checks, accessible symlink test controls, descriptor copying, cleanup failure reporting and runtime controller assertions. Builder evidence: 28 pure Python tests, nine killed mutations, 22 Windows workspace tests, formatting and Clippy passed. Unix metadata checks passed; full local Linux workspace build lacked a C cross-toolchain. All privileged runtime assertions remain unrun and **unverified on real hardware**. Fresh independent review and hosted checks are required before merge or a Linux experiment.
+
+## PR #14 positive-control correction
+
+- Second independent review failed at a5777bb: the plain directory inherited mode 0700 under service UMask=0077. Positive-control creation now starts at 0700 and explicitly sets 0755 through a shared helper for outside/plain, with a non-privileged Linux regression requiring traversal and refusing reuse. Its runtime cross-account assertion remains unrun.
+- Added pure fixture-check coverage proving the captured UID/GID are forwarded to the post-account scan. All 29 Python tests pass and ten driver mutations are killed by assertion failures. Fixed invalid UTF-8 and provider-table formatting. Provider: Codex / gpt-6.1-sol, medium effort. Fresh independent review and hosted checks are required; no privileged experiment has run.
+
+## Unix executor integration with current main
+
+- Codex / gpt-6.1-sol, medium: integrated main d7f3ebd with the corrected Unix backend. The accessible positive controls and fixture-check forwarding remain present. Formatting, Clippy with warnings denied and all 44 Windows workspace nextest tests passed. The 29 pure Python tests passed and all ten driver guard mutations were killed with assertion failures and zero errors. Fresh independent review and hosted native checks are pending; no root experiment or owner administration has run.
+
+## Unix path-main update and review checkpoint
+
+- Opus 5.5 high independently passed b3b808c: 44 Windows nextest tests, 29 Python tests and all ten assertion-failing mutations. Comment: https://github.com/Dytschgo/arxcovo/pull/14#issuecomment-6794916805. Main then contained #16, so the prior head conflicted only in progress and hosted checks did not run.
+- Codex / gpt-6.1-sol, medium: resolved progress against merged path main b29f531, retained all provider rows, removed the duplicate table header, and updated historical validation notes. Executor/tooling/workflow source is unchanged from the reviewed head; main adds its path helper/regression and README encoding fix. New-head formatting, Clippy with warnings denied and all 45 nextest tests passed on Windows. Executor, tooling and workflow source is byte-identical to the reviewed b3b808c. Fresh hosted checks and independent recheck are pending.
+- Advisory A3 remains open: the positive-control unit test checks explicit final mode but does not set a restrictive process umask. The actual privileged harness uses UMask0077, remains unrun, and no elevated/runtime containment acceptance is claimed.
 
 ## Historical development implementation records
 
@@ -445,6 +465,13 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium: integrated main 2be8268 into reviewed PR22 head72a5e5f. Only the two reviewed retention tests and progress changed; all arxd production source, Cargo manifests/lock and pinned toolchain are byte-identical to the successful independent Sol review. That review is https://github.com/Dytschgo/arxcovo/pull/22#issuecomment-6795099160. Integrated formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows. Fresh exact-head recheck and hosted checks are pending. No real cargo/Claude Code acceptance has run.
 - Service lifecycle review corrections are preserved on feat/service-lifecycle at b32ce16: TokenOwner execution proof, separate drain/audit budgets and bounded startup/unrequested serve failure, with 55 local tests. Configuration macOS-admin refusal is on PR21 at 8975520 with 63 local tests. Native macOS observation candidate b261457 has local type/policy tests but remains unmerged and unverified on native macOS. No service Application or owner installation adapter is activated.
 
+## Unix executor integration with current main
+
+- Codex / gpt-6.1-sol, medium: integrated main 8fafbe7 into PR14, preserving current-user Windows execution and the reviewed retention test correction. Formatting, workspace/all-target Clippy with warnings denied, all 65 Windows nextest tests, 29 pure Python guards and all ten executable guard mutations passed. The Unix executor and disposable driver production bytes are unchanged from the prior independently reviewed candidate; native/privileged Unix runtime remains unverified on real hardware. No experiment was dispatched and no owner administration ran. Fresh exact-head review and hosted checks remain pending.
+
+## Unix restrictive-umask test correction
+
+- Codex / gpt-6.1-sol, medium addressed PR14 advisoryA3: the ordinary Linux positive-control test now launches an exact subprocess-only fixture with umask0077 set before exec. The child verifies that mask, requires outside/plain end at0755 and rejects directory reuse. The parent bounds runtime/output and proves exactly one named test ran. This leaves the parallel runner umask unchanged and invokes no account/service operations. Formatting and Windows workspace/all-target Clippy passed; native Linux execution and the creation-mode-only mutation remain pending hosted verification. Production executor/driver and privileged harness bytes are unchanged.
 ## Service lifecycle integration with Windows development execution
 
 - Codex / gpt-6.1-sol, medium: preserved PR20 review corrections while integrating main 8fafbe7, including the current-user executor and reviewed retention runtime correction. Combined formatting, workspace/all-target Clippy with warnings denied and all 75 runnable Windows nextest tests passed; one direct-only TokenOwner fixture is skipped and exercised by its passing parent. Fresh independent review and hosted checks remain pending. The real development acceptance record is independently reviewed in PR24; installed-service and dedicated-account M2 acceptance remain open.
@@ -512,6 +539,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - The native executor reported confirmed Job cleanup. The harness stopped its owned processes, an independent native process query found zero remaining acceptance arxd instances, and temporary config/credential files were deleted. Only sanitized booleans, fixed labels, build/source hashes and outcomes are committed in docs/evidence/windows-development-acceptance.json. No raw CLI stream or private owner values were logged or committed.
 - This is a passed development acceptance under the owner's explicit alternative, not M2 completion: dedicated-account/service execution, rights enforcement, service Application and native owner adapters remain unfinished. S4U/service and VM paths remain unverified on real hardware. No account, right, task, service, elevation or old Lab Manager action occurred.
 
+## Unix validation conflict resolution
+
+- Codex / gpt-6.1-sol, medium resolved the docs-only conflict with main66c1b17 so hosted CI can exercise the restrictive-umask fixture at the integrated head. Executor, driver and test source are unchanged from18d4f1f; native test evidence remains pending. No privileged experiment ran.
 ## Native hosted validation checkpoint
 
 - Codex / gpt-6.1-sol, medium inspected PR25 run43026547236 at7606c71: Ubuntu job130542582037 and macOS job130542582205 completed successfully; Windows was still running. These are native hosted CI results, not installed-layout or privileged service acceptance. PR24 merged the sanitized real current-user development evidence; dedicated-account and installed-service M2 acceptance remain open.
@@ -583,6 +613,24 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   the strengthened completion assertion fail; production source was restored
   byte-for-byte. No gate, policy outcome or workflow was changed by this PR.
   Fresh independent review and hosted checks remain required.
+## Unix execution integration after Windows test correction
+
+- Codex / gpt-6.1-sol, medium integrated merged PR28 into PR14, retaining both
+  progress histories. The inherited changes are confined to the Windows handle
+  regression fixture and its debugging documentation; Unix execution and guarded
+  experiment behavior are unchanged. PR14 head d018a90 passed hosted Ubuntu,
+  macOS and Windows CI before this integration. No privileged experiment ran.
+- The integrated revision still requires fresh hosted checks and independent
+  exact-head review. Root/systemd/cgroup runtime remains **unverified on real hardware**.
+
+- Coordinator combined-head verification: formatting and workspace/all-target
+  Clippy passed, followed by 66/66 Windows nextest tests. The actual Ubuntu log
+  for run 43030809255 at d018a90 confirms the positive-control parent and nofollow
+  tests passed, along with 29 pure driver tests. This supplies native ordinary-user
+  fixture evidence, not root execution or cgroup containment acceptance.
+- PR21 Ubuntu job 130562541853 also failed during Playwright dependencies with
+  repeated Ubuntu-mirror DNS failures; its Windows and macOS jobs passed. The
+  failure is not waived, and no repeated automatic retry was requested.
 ## Windows handle regression merge integration
 
 - Codex / gpt-6.1-sol, medium merged PR28 at reviewed460b617 with all five required gates green. Independent Opus review reproduced the old-test failure3/3, deliberate real inheritance failure3/3 (plus combinedtest2/2), and restored native executor tests passed20/20 repeatedruns. This fixes the reproduced test defect; the exact old hosted assertion was not retained and is not claimed proven. Service lifecycle integrates the correction; formatting, all-target Clippy with warnings denied and all 76 runnable Windows nextest tests passed (one direct-only fixture exercised by its parent). Fresh exact-head review and hosted gates remain pending. Native ancestor-policy blocker in25/27 remains open.
@@ -1314,6 +1362,10 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Awaited policy-failure proof queue preparation
 
 - Codex / gpt-6.1-sol, medium prepared existing #9 locally on merged configuration main `2bdcb20`. JavaScript policy and test files remain identical to published `6c2b70c`; the only additional script inherited from main is the service-artifact checker. Both provider tables and task records are preserved and Current state is first. All **18/18 Node script tests** and **26/26 CI-helper tests** passed. No push/new PR, workflow/policy weakening, privileged action or merge. Fresh independent review and hosted gates remain required.
+## Unix executor queue refresh after configuration merge
+
+- Codex / gpt-6.1-sol, medium prepared existing #14 on actual main `2bdcb20` (#21). Unix executor code, validation driver and ADR 0007 are byte-identical to published `9055ab0`; the combined manifest/library exports retain both executor and merged service foundations. Workflow conflict resolution keeps the pure Unix guards and both merged Linux CI-unblock steps; no original step or gate is removed. Both parent provider tables/evidence are retained and Current state is first.
+- Actual Windows verification passed: formatting; locked workspace/all-target Clippy with warnings denied; **95/95 nextest** (one direct-only fixture exercised by its parent); **29/29 pure Unix driver guards**; **26/26 CI-helper tests**. Nextest run `e7dfa442-0229-4139-895d-c1599297095e`, 7.438-second test phase. No native Unix linking/runtime, root cgroup experiment, admin/account/service or VM action ran. No push/new PR; fresh independent review and hosted gates remain required. Installed/native dedicated execution remains **unverified on real hardware** and M2 acceptance stays open.
 ## Native validation queue preparation
 
 - OpenAI / gpt-6.1-sol / medium prepared #25 locally on configuration head `9f74919` while #21 runs its fresh review and hosted gates. Published history is preserved. Only PROGRESS conflicted; the current state from the refreshed parent remains first, and both parent provider tables and task evidence are retained. Native source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `d045cc4`; CI helpers/workflows match the configuration parent.
@@ -1533,6 +1585,11 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol / medium refreshed existing test-only #9 onto actual main `cd464b2`, preserving published history and the awaited policy-failure regression. Only its existing regression test and progress notes distinguish it from main; no workflow/runtime/budget behavior changes. Current state stays first. Focused test evidence and independent re-review remain required before merge.
 
 - Focused verification passed **18/18 Node policy/budget/auto-merge tests** and **26/26 CI-helper tests**. Temporarily removing the failure-publication await made the focused asynchronous regression fail; the production script was restored byte-for-byte. Runtime Rust/workflow files match merged main and were not retested for this test-only refresh.
+## Unix executor refresh on merged service stack
+
+- Codex / gpt-6.1-sol / medium refreshed existing #14 onto actual main `cd464b2` after the SCM merge. Executor source and Unix validation drivers remain unchanged from the published candidate; Cargo feature union preserves the merged service stack. Current state stays first, with no new feature PR. Combined verification, fresh independent review and hosted gates remain pending. No dedicated execution activation, owner operation or installed M2 acceptance is claimed; native privileged paths remain **unverified on real hardware**.
+
+- Refreshed #14 combined validation at `1d8cf24` passed formatting, locked workspace/all-target Clippy, **172/172 normal nextest**, **29/29 Unix driver guards**, **26/26 CI helpers** and **3 artifact checks** (2 native skips). Two subprocess fixtures were exercised only through parents. Nextest run `84551cf7-d7c1-41ca-8fa1-216596171209`, 9.889-second test phase. The automatic Cargo merge duplicated the identical Unix dependency table; it was consolidated before these checks. Executor source remains byte-identical to published `9055ab0`; no privileged experiment or native acceptance ran.
 ## Unix owner refresh after SCM merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #35 squash `cd464b2` while preserving published #29 history. Typed Unix gates and Windows provenance remain intact; shared error variants and owner modules merged without a source conflict. Independent exact-head review and hosted gates remain required. Native installed/service/dedicated M2 acceptance remains **unverified on real hardware**.
@@ -1542,3 +1599,12 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Policy regression refresh after Unix owner merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #9, retaining only the awaited-publication regression above main. Policy/test script bytes remain identical to verified `234b934`, so its 18-test pass and await-removal mutation evidence apply without a repeat claim. Main runtime and workflows are preserved; fresh independent exact-head review and hosted gates remain required.
+## Unix executor alignment after owner lifecycle merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #14. The native owner lifecycle and macOS namespace stack is retained alongside the Unix execution library. The CI merge retains both Unix driver guard and macOS namespace observation steps with all original gates. Source executor/driver behavior is unchanged; no command route or privileged experiment is activated. Combined checks and a fresh exact-head recheck remain required.
+
+- Post-#29 combined verification at `d8ee351` passed formatting, locked workspace/all-target Clippy, **190/190 normal nextest**, **29/29 Unix guard tests** and **26/26 CI helpers**. Two subprocess-only fixtures were exercised through parents. Nextest run `a273041d-e9c9-4cd8-a314-064143cf2eca`, 10.302-second test phase. Executor source remains byte-identical to the previous public head; CI preserves the main macOS observation and all gates. A fresh exact-head review remains required after this parent update. Native/privileged Unix execution remains **unverified on real hardware**.
+
+## Policy regression alignment with Unix library main
+
+- Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` with published history preserved. The six Node policy/budget/auto-merge source and test files remain byte-identical to verified 234b934; prior 18-test and await-removal mutation evidence applies without another run. Current state is first, with one queue priority; independent exact-head review and hosted gates remain required. No native activation, privileged experiment retry or new feature PR.
