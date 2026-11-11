@@ -13,7 +13,7 @@ pub const PLATFORM: super::super::layout::Platform = super::super::layout::Platf
 #[cfg(target_os = "macos")]
 pub const PLATFORM: super::super::layout::Platform = super::super::layout::Platform::Macos;
 
-fn local(file: &File) -> Result<(), Error> {
+pub(in crate::service) fn local(file: &File) -> Result<(), Error> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(Error::Layout);
