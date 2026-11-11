@@ -194,6 +194,14 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 /// No credential bytes are written until connect() has verified kernel identity.
 pub async fn bridge(config: ClientConfig) -> Result<()> {
+    bridge_io(config, tokio::io::stdin(), tokio::io::stdout()).await
+}
+/// The stdio bridge over any byte streams; tests drive it with in-memory pipes.
+async fn bridge_io<I: AsyncRead + Unpin, O: AsyncWrite + Unpin>(
+    config: ClientConfig,
+    input: I,
+    output: O,
+) -> Result<()> {
     let mut stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config))
         .await
         .context("peer-connect-timeout")?
@@ -217,8 +225,8 @@ pub async fn bridge(config: ClientConfig) -> Result<()> {
     // MCP's official newline-delimited stdio wire format, unchanged end to end.
     // The SDK owns initialize/tool dispatch on the daemon; the bridge owns no state.
     tokio::select! {
-        result = forward(tokio::io::stdin(), write) => result,
-        result = forward_bounded(read, tokio::io::stdout(), RESPONSE_LIMIT) => result,
+        result = forward(input, write) => result,
+        result = forward_bounded(read, output, RESPONSE_LIMIT) => result,
     }
 }
 async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, write: W) -> Result<()> {
@@ -473,3 +481,6 @@ mod tests {
         assert_eq!(bytes, b"{\"jsonrpc\":\"2.0\"}\n");
     }
 }
+#[cfg(all(test, windows))]
+#[path = "local_execution_tests.rs"]
+mod execution_tests;

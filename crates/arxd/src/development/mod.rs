@@ -13,6 +13,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+#[cfg(all(test, windows))]
+pub(crate) use windows::tests::{CHILD, fixture_settings};
 pub const MODE: &str = "development_current_user";
 pub const CLAIM: &str = "development_only_not_dedicated_account";
 pub const TOOLS: &[&str] = &[
@@ -208,6 +210,10 @@ impl Execution {
     #[cfg(test)]
     pub(crate) fn policy_fixture(settings: Settings) -> Self {
         Self::build(settings, true)
+    }
+    #[cfg(test)]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
     #[cfg(test)]
     pub(crate) fn tamper_identity(&self, on: bool) {
