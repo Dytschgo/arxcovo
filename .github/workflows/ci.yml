@@ -37,6 +37,9 @@ jobs:
           python3 tools/ci/observe_dns.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Read-only macOS stock-directory observations
+        if: runner.os == 'macOS'
+        run: cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture
       - run: cargo nextest run --workspace --locked
       - name: Pure Windows probe guards (no provisioning)
         if: runner.os == 'Windows'

@@ -28,6 +28,7 @@ class Artifacts(unittest.TestCase):
     def test_plist(self):
         value = plistlib.loads(PLIST.read_bytes())
         self.assertEqual(value["Label"], "com.arxcovo.arxd")
+        self.assertTrue(value["Disabled"])
         self.assertEqual(value["ProgramArguments"], ["/Library/Application Support/Arxcovo/libexec/arxd", "service", "run"])
         self.assertNotIn("UserName", value)
         self.assertEqual(value["KeepAlive"], {"SuccessfulExit": False})

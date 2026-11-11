@@ -907,7 +907,7 @@ fn windows_uninstall_skips_dead_account_workspace_and_direct_execution() {
 fn unix_planning_needs_no_windows_observation_and_preserves_validation() {
     use super::super::{
         config::tests::{FakeResolver, fixture},
-        owner_plan::{MissingNativeAdapter, OwnerContext, configure_plan, uninstall_plan},
+        owner_plan::{OsManager, OwnerContext, configure_plan, uninstall_plan},
     };
     for platform in [Platform::Linux, Platform::Macos] {
         let l = Layout::for_test(platform);
@@ -950,7 +950,30 @@ fn unix_planning_needs_no_windows_observation_and_preserves_validation() {
             Configure::from_plan(&l, &plan, &resolver, batch),
             Err(Failure::Unsupported)
         ));
-        assert!(plan.execute(&mut MissingNativeAdapter).is_err());
+        // Unix plans must still reach an injected manager, without Windows
+        // transaction activation. Never construct a production native manager.
+        struct Recording(usize);
+        impl OsManager for Recording {
+            fn apply(&mut self, op: &Operation) -> Result<(), super::super::layout::Error> {
+                assert!(!matches!(
+                    op,
+                    Operation::BatchRight { .. } | Operation::Scm { .. }
+                ));
+                self.0 += 1;
+                Ok(())
+            }
+        }
+        let mut manager = Recording(0);
+        plan.execute(&mut manager).unwrap();
+        assert_eq!(manager.0, plan.operations().len());
+        let uninstall = uninstall_plan(&l, &ctx, &config, &resolver).unwrap();
+        assert!(uninstall.operations().iter().any(|op| matches!(
+            op,
+            Operation::Expect(super::super::owner_query::Expect::Unloaded)
+        )));
+        manager.0 = 0;
+        uninstall.execute(&mut manager).unwrap();
+        assert_eq!(manager.0, uninstall.operations().len());
     }
 }
 #[test]

@@ -450,10 +450,11 @@ disposable hosted-runner experiment in ADR 0012, never the owner PC.
   assumes.
 - The SCM preserves the privilege multi-string order, and the 8 KiB buffers
   are sufficient.
-- Whether a default or partly installed service returns a non-NULL empty
-  privilege multi-string. The current parser refuses that shape as `Manager`,
-  rather than classifying it as not installed; observe-before-install retry
-  behavior must be verified before CLI activation.
+- Whether a default or partly installed service returns a non-NULL privilege
+  multi-string containing only a single NUL. The parser refuses that malformed
+  shape as `Manager`. A properly terminated double-NUL empty list parses as
+  empty and is classified as not installed. Native observe-before-install
+  retry behavior must be verified before CLI activation.
 - Auto-start versus demand behaviour across a real reboot.
 - The sufficiency of the four required privileges (ADR 0009).
 
