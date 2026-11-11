@@ -168,3 +168,7 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   Windows experiment, ADR0009, service architecture, privileged/owner operations
   or old Lab Manager changes were made. Services, dedicated-account execution,
   tool discovery and Claude Code cargo acceptance remain outstanding for M2.
+
+## Service implementation contract
+
+- Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18’s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.

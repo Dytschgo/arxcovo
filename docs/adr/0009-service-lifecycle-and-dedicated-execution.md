@@ -481,7 +481,7 @@ fails, nothing changes and the service exits with code 5.
 | `id` | INTEGER PK AUTOINCREMENT (the only order and cursor) |
 | `actor_kind` | `agent` \| `daemon` (`daemon` ⇒ principal `arxd`) |
 | `principal` | validated principal (existing rules) |
-| `tool` | `list_hosts` `list_activity` `run_command` `discover_tools` `service_start` `service_stop` |
+| `tool` | `list_hosts` `list_activity` `unknown_tool` `run_command` `discover_tools` `service_start` `service_stop` |
 | `class` | `read` (list_hosts, list_activity, rejected) \| `action` (run_command, discover_tools) \| `lifecycle` |
 | `outcome` | `started` `succeeded` `failed` `rejected` `refused` `interrupted` |
 | `reason` | NULL or fixed preflight/failure enum |
