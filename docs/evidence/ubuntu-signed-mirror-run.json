@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "kind": "disposable_runner_signed_mirror_execution",
+  "sourceCommit": "400903dce599ce4cb03c4139e3e46ba99a043071",
+  "runId": 43062892241,
+  "jobId": 130669921798,
+  "runnerLabel": "ubuntu-latest",
+  "jobConclusion": "success",
+  "durationSeconds": 130,
+  "updatedSourceFiles": 1,
+  "suiteInReleaseFetches": [
+    "resolute",
+    "resolute-backports",
+    "resolute-security",
+    "resolute-updates"
+  ],
+  "signatureOrFetchWarningCount": 0,
+  "dependencyInstall": "success",
+  "browserSmoke": "success",
+  "electronSmoke": "success",
+  "dnsObservations": [
+    {
+      "target": "ubuntu_azure",
+      "status": "resolved"
+    },
+    {
+      "target": "ubuntu_archive",
+      "status": "resolved"
+    },
+    {
+      "target": "ubuntu_security",
+      "status": "resolved"
+    },
+    {
+      "target": "kernel_mirror_control",
+      "status": "resolved"
+    },
+    {
+      "target": "github_control",
+      "status": "resolved"
+    },
+    {
+      "target": "microsoft_control",
+      "status": "resolved"
+    }
+  ],
+  "originalDnsFailureReproduced": false,
+  "dnsRootCauseEstablished": false,
+  "ownerMachineAptChanges": false,
+  "installedServiceAcceptance": false
+}

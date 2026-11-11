@@ -2,11 +2,61 @@
 
 ## Current state — 2026-11-11
 
-- Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#22](https://github.com/Dytschgo/arxcovo/pull/22), `8fafbe70451807cf419c8e47706259b24a49cf68`, 12:46:32 UTC. Fresh independent Sol review passed on 59293a8, all three hosted platforms and both status gates passed, and normal gated squash auto-merge completed.
-- Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
-- Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#28](https://github.com/Dytschgo/arxcovo/pull/28), `0ceb1745e2e6dafad6daf5394747a3e094102c35`, 13:46:02 UTC, through all five required gates. No later merge is claimed.
+- Main includes authenticated inventory/activity, persistent host identity and the accepted Windows current-user development path recorded in #24. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
+- Priority: land CI unblock #32, then refresh and merge the existing M2 service stack in dependency order, starting with #20 and #21. The first mirror execution at `400903d` passed all three OS jobs; this documentation-only follow-up still needs its own exact-head review and required checks. No new feature PRs while the queue drains.
+- No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized. Existing local candidates remain preserved; their existence is not acceptance.
 
+## Queue-drain oversight
+
+- Codex / gpt-6.1-sol, medium applied the babysitter's 17:03 UTC queue-drain steering: stop new feature PRs, finish #32 first, then merge existing M2 dependencies and fold or close superseded work. Current state is restored as the first section. Local mirror/progress evidence is committed; the babysitter and its schedule are unchanged.
+- The signed-mirror execution path has passed hosted Ubuntu; no further DNS root-cause investigation is planned. If the mitigation fails, record it under the three-attempt handoff rule rather than keep investigating. Do not bypass checks or increase the CI timeout.
+- The detailed preparation and failed-draft records below are historical evidence. The first successful hosted result includes the caveat that the original DNS names also resolved, so no causal DNS-fix claim is made.
+
+## CI mirror evidence
+
+### Signed Ubuntu mirror first hosted execution
+
+- Codex / gpt-6.1-sol, medium verified completed [Ubuntu job 130669921798](https://github.com/Dytschgo/arxcovo/actions/runs/43062892241/job/130669921798) at independently reviewed source `400903d`. The helper updated one source. All four resolute suites fetched InRelease metadata from the Kernel Archives HTTPS mirror; no signature/insecure/unsigned/failed-fetch warning appeared. Playwright dependency installation, browser smoke and Linux Electron smoke passed. The complete job took **130 seconds**, below the unchanged 12-minute limit.
+- All six DNS controls, including all three original Ubuntu-domain names, resolved on this run. The original DNS timeout did not reproduce. This establishes the reviewed signed-mirror execution path, not a proven DNS fix or root cause. Exact sanitized results are retained in `docs/evidence/ubuntu-signed-mirror-run.json`.
+- Independent Anthropic / claude-opus-5-5 / requested high published-head review passed at `400903d` ([evidence](https://github.com/Dytschgo/arxcovo/pull/32#issuecomment-6802018766)). Earlier preparation/unactivated notes below are historical. This documentation-only follow-up requires its own exact-head recheck and green required checks before merge. No owner-machine APT/admin change occurred; no installed-service or dedicated-account M2 acceptance is established.
+
+### Mirror mitigation review correction
+
+- Independent Anthropic / claude-opus-5-5 / requested high review at `a97fd74` found B1: the actual Ubuntu image uses `mirror+file:/etc/apt/apt-mirrors.txt`, so the original direct-URI candidate would refuse unchanged. Its report is retained in `docs/reviews/ubuntu-mirror-mitigation-review.md`; nothing had been published or executed. Root cause of the DNS failure remains unknown.
+- Codex / gpt-6.1-sol, medium added guarded support for that one exact mirror-list path, validating all entries and optional priorities before source replacement. A regression failed first. The 144-byte observed entry format now passes through the complete owned-temp plan/recheck/publication loop; the mirror list and third-party sources remain unchanged. Tests cover stale identity/bytes, atomic staging cleanup, mode requests, all-plan refusal, parent/file-count guards and an empty plan.
+- The helper now refuses alternate insecure boolean spellings, tests the missing deb822 weak/downgrade options, recognizes lowercase URI fields, opens files nonblocking before type checks and prepares isolated root Python. Twenty portable tests pass locally. Eight restored source mutations now fail assertions: indirect-list validation, fresh bytes, fresh identity, mode preservation, file-count limit, parent policy, empty-plan refusal and rewritten-output bound. Root facts and fchmod are injected only in owned-temp tests; actual root APT publication/installation is still unrun. No owner-machine APT access or sudo ran. The revised candidate requires a fresh independent review before publication and does not establish a CI fix or M2 acceptance.
+
+### Ubuntu signed-mirror mitigation candidate
+
+- Codex / gpt-6.1-sol, medium retained the PR32 observation: job 130635247058, source `b475bf1`, Ubuntu 26.04 image `20261101.186.1`, three Ubuntu-domain timeouts and resolved Kernel Archives/GitHub/Microsoft controls. The existing Playwright dependency install still failed; root cause is unknown.
+- Prepared an unactivated, fixed-context CI helper that changes only known Ubuntu APT URI values to the Kernel Archives HTTPS mirror. Suites/components/architectures/signing-key selection and third-party sources are preserved; no insecure option, new key, resolver edit or gate exemption is introduced. Both legacy and deb822 forms have byte-preservation tests and unsafe target sources refuse. All source files are validated before changes, bounded, no-follow, root-owned, single-link and not group/other writable.
+- Eleven portable tests passed locally, including synthetic native file facts. No APT file was opened or modified and no privileged operation ran. Independent review is required before workflow activation; actual root publication, signed metadata/dependency installation and a green CI run remain unverified. This is a mitigation candidate, not a claimed fix or M2 acceptance.
+- The exact workflow step is now prepared locally for review, before the unchanged Playwright installation. It forwards only four non-secret intent fields through sudo in the disposable Ubuntu runner. Four source mutations (foreign keyring acceptance, missing file-owner guard, hardlink acceptance and HTTP mirror) failed assertions and were restored. Nothing has been pushed or executed; no owner-machine sudo or APT operation ran.
+
+### Ubuntu mirror DNS investigation preparation
+
+- Codex / gpt-6.1-sol, medium added a read-only Linux CI diagnostic for three
+  fixed Ubuntu mirror names and GitHub/Microsoft controls. Five getent children
+  run concurrently, each with a five-second deadline, no shell and discarded
+  stdout/stderr. Only fixed labels and statuses are emitted (at most 1024 bytes).
+  No IPs, owner values, environment values or exception messages are retained.
+- Diagnostics do not decide merge eligibility or skip any existing check. The
+  workflow retains every previous step, platform, permission and timeout. There
+  are no retries or resolver/network modifications. The cause is still unknown;
+  this is evidence collection rather than a claimed DNS fix.
+- Six pure Python tests passed on Windows. Three restored mutations (capturing
+  output, removing the child deadline and reversing success classification)
+  each failed assertions. YAML structural comparison confirms only the bounded
+  diagnostic step was added. Native getent/network behavior on Ubuntu remains
+  pending, along with independent review and hosted checks.
+
+### Ubuntu DNS observations and next control
+
+- Codex / gpt-6.1-sol, medium inspected Ubuntu job [130608817837](https://github.com/Dytschgo/arxcovo/actions/runs/43045667306/job/130608817837) at source `2cf5ab9`. Before Rust tests, all three Ubuntu mirror probes timed out; GitHub and Microsoft resolved. The later Playwright dependency step failed resolving those Ubuntu names. Windows and macOS jobs passed. Sanitized source-bound observations are retained in `docs/evidence/ubuntu-mirror-dns-observations.json`. This rules out an application-test DNS change in that run, but does not establish the resolver failure's cause.
+- Added one fixed, read-only DNS control for `mirrors.edge.kernel.org`. The [Linux Kernel Archives mirror service](https://mirrors.edge.kernel.org/) lists its Ubuntu archive; this is a comparison target, not a selected package source or an availability guarantee. Six concurrent children retain the same five-second individual limit and 1024-byte output cap. No package source, resolver, signature check, install command or merge gate changes. The new control has not run on a hosted runner.
+- Six pure diagnostic tests passed locally after pinning all six expected labels and hostnames. Independent review and hosted checks remain pending. No installed-service, dedicated-account or M2 acceptance is established.
 ## Accepted milestone 1 evidence
 
 - Public AGPL-3.0 repository, Cargo/npm workspaces, pinned tools and lockfiles, React/Electron scaffolds, contribution/security guidance and post-v1 roadmap are merged.
