@@ -16,16 +16,23 @@ The public CLI accepts only `guard` or `run`, with no parameters. Run identity i
 two bounded positive decimal GitHub run numbers. The driver reserves an exclusive
 `/opt/arx-ci-<run>-<attempt>` directory and same-named transient systemd unit.
 Source, registry cache and Rust 1.95.0 toolchain are copied to root-private paths;
-links and special files refuse copying. No fixture task account can replace the
+links and special files refuse copying. Copying pins directory descriptors,
+uses O_NOFOLLOW for every open, verifies opened inode/type identity, and writes
+only into exclusive private staging. This prevents link-swap dereferencing; it
+does not attest a concurrently edited checkout by the trusted runner user. No fixture task account can replace the
 source, driver, Cargo, rustc, compiled executable or runner. Cargo is offline,
 locked, and receives only the explicit environment in `cargo_env`; no token,
 credential file, runner environment dump, or Git config is copied. Checkout's
 credential persistence is disabled. Compilation happens before fixture creation.
 
 Read-only preflight requires systemd, cgroup2, available memory+pids, protected
-ancestry and a bounded hierarchy scan without non-root ownership, links or
-group/other write grants. This deliberately conservative scan can refuse a
-hosted image with unrelated delegation. Do not weaken policy to make it pass.
+ancestry and a bounded (20,000-entry) hierarchy scan without links or group/other
+write grants. Unrelated delegated users are allowed. The unit ancestors and
+whole subtree must remain root-owned. After account creation and before the
+first Runner call, a synchronous internal fixture-check repeats the scan and
+refuses any entry owned by the generated UID or GID anywhere. Migration requires
+write access to both destination and common ancestor cgroup.procs; root-owned
+protected shared ancestors prevent migration into unrelated delegation.
 There is no claim that GitHub's default kernel/image satisfies these requirements.
 
 Only the generated service gets `Delegate=yes`. The driver moves itself into a
@@ -53,7 +60,8 @@ host is the last boundary, not proof of successful cleanup. Do not retry probes.
 
 The ten-minute job bounds a 360-second build, a 120-second exact Cargo invocation,
 and a transient service with 140-second runtime plus ten-second stop timeout.
-The service output file is capped at 1 MiB. Public evidence is restricted to fixed
+The service output is drained through a bounded 1 MiB collector; overflow fails
+the test. No inherited RLIMIT_FSIZE restricts Cargo/rustc artifact writes. Public evidence is restricted to fixed
 success/cleanup lines or allowlisted error codes. Raw build/test output stays
 root-private and is not uploaded; no panic text or environment is printed.
 
@@ -67,3 +75,13 @@ Primary references checked during preparation:
 Static tests are guard/planning evidence only. Runtime setup, systemd trimming,
 Cargo runner arguments, account cleanup and Linux containment are **unverified
 on real hardware**. No privileged experiment has been dispatched or executed.
+
+Git verification uses command-scoped safe.directory for the exact checkout path;
+it does not depend on the hosted image's global wildcard safe.directory setting.
+It still compares HEAD to the exact selected SHA. The trusted checkout/build
+steps remain the source provenance boundary (this is not content attestation).
+
+Safe mutation verification: `python -I tools/unix-exec-validation/mutation_check.py`.
+It executes the real mutated driver functions through the same mocked regressions,
+never provisioning accounts, services or real cgroups. Ordinary CI also runs the
+pure tests; the manual workflow guards, pins and default-off variable are unchanged.

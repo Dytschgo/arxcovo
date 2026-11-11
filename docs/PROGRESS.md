@@ -103,3 +103,26 @@
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
+
+
+### PR #14 first-review correction checkpoint
+
+- M2 remains incomplete. Candidate base `c508de09028979cfcd2e1e26347a59a522e1d4ae`;
+  first independent Opus review failed B1–B3 (comment 6792318373). Corrections
+  prepared locally: bounded cgroup ownership policy + post-account scan, meaningful
+  symlink controls, actual driver guard regressions/mutations, descriptor copying,
+  bounded output drain, cgroup removal failure reporting and runtime controller probes.
+- Evidence: 28 pure Python tests, nine executable guard mutants killed, 22 Windows
+  workspace tests, Windows Clippy and formatting passed. Linux/macOS standalone
+  library/test metadata passed; full Linux workspace check blocked by missing
+  x86_64-linux-gnu-gcc for SQLite. See docs/unix-exec-validation.md for exact scope.
+- Blockers: fresh different-provider review/required hosted checks before integration;
+  all Unix privileged paths and the symlink runtime mutation remain **unverified on
+  real hardware**. No root runtime experiment anywhere, owner-PC administration,
+  Lab Manager access, settings, dispatch, push or PR mutation performed. Last merged
+  PR remains #13; M2 acceptance is not claimed.
+
+| Task | Provider/model | Effort | Outcome |
+| --- | --- | --- | --- |
+| Guarded Unix disposable experiment c508de0 | Codex / gpt-6.1-sol | high | Manual-only reviewed-SHA wiring prepared; first independent review failed; no privileged run |
+| PR #14 review corrections | Codex / gpt-6.1-sol | high | B1–B3 corrections and practical nonblockers prepared; pure tests/mutations and Windows checks pass; Unix runtime remains unrun; coordinator integration/re-review required |

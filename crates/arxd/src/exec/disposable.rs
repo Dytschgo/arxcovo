@@ -71,6 +71,17 @@ fn disposable_linux_cross_account() {
         .trim()
         .parse()
         .unwrap();
+    // Re-scan after account creation, before any Runner::run. No delegation
+    // anywhere may belong to this generated build UID/GID.
+    checked(
+        "/usr/bin/python3",
+        &[
+            "-I",
+            &std::env::var("ARX_EXEC_GUARD_DRIVER").unwrap(),
+            "fixture-check",
+            &std::env::var("ARX_EXEC_RUN_ID").unwrap(),
+        ],
+    );
     let workspace = base.join("workspace");
     let private = base.join("private");
     fs::create_dir(&workspace).unwrap();
@@ -111,6 +122,90 @@ fn disposable_linux_cross_account() {
     assert_eq!(run.stdout.head, format!("{uid}\n").as_bytes());
     assert!(run.tree_cleanup_confirmed);
     assert_eq!(run.exit_code, Some(0));
+    // Actual membership and configured controls, plus enforced fork exhaustion.
+    // This ignored runtime evidence is unrun until independently reviewed.
+    let parent = config.cgroup_parent.clone().unwrap();
+    let controls = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            for entry in fs::read_dir(&parent).unwrap() {
+                let path = entry.unwrap().path();
+                if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("arx-")
+                {
+                    if fs::read_to_string(path.join("cgroup.procs"))
+                        .unwrap()
+                        .trim()
+                        .is_empty()
+                    {
+                        continue; // wait for child join after all limits are configured
+                    }
+                    assert_eq!(
+                        fs::read_to_string(path.join("pids.max")).unwrap().trim(),
+                        "32"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(path.join("memory.max")).unwrap().trim(),
+                        "67108864"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(path.join("memory.swap.max"))
+                            .unwrap()
+                            .trim(),
+                        "0"
+                    );
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run cgroup not observed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    spec.executable = "/usr/bin/python3".into();
+    spec.arguments = vec![
+        "-c".into(),
+        r#"import os, errno, time
+print(open('/proc/self/cgroup').read(), flush=True)
+children=[]
+try:
+    for i in range(64):
+        pid=os.fork()
+        if pid == 0:
+            time.sleep(1)
+            os._exit(0)
+        children.append(pid)
+except OSError as e:
+    assert e.errno == errno.EAGAIN
+else:
+    raise AssertionError('pids limit not enforced')
+assert 0 < len(children) < 32
+for pid in children:
+    os.waitpid(pid, 0)
+"#
+        .into(),
+    ];
+    let run = runner.run(&spec, &Cancellation::default()).unwrap();
+    controls.join().unwrap();
+    assert_eq!(run.exit_code, Some(0));
+    let membership = String::from_utf8(run.stdout.head).unwrap();
+    let expected = config
+        .cgroup_parent
+        .as_ref()
+        .unwrap()
+        .strip_prefix("/sys/fs/cgroup")
+        .unwrap();
+    assert!(
+        membership
+            .trim()
+            .starts_with(&format!("0::/{}/arx-", expected.display()))
+    );
+    assert!(run.tree_cleanup_confirmed);
     spec.executable = "/usr/bin/env".into();
     spec.arguments.clear();
     let run = runner.run(&spec, &Cancellation::default()).unwrap();
@@ -125,8 +220,38 @@ fn disposable_linux_cross_account() {
             .exit_code,
         Some(0)
     );
-    std::os::unix::fs::symlink(&private, workspace.join("link")).unwrap();
+    let outside = base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    // Positive controls: target is traversable by the build identity, and a
+    // normal workspace subdirectory succeeds with the same executable.
+    spec.executable = "/bin/sh".into();
+    spec.arguments = vec!["-c".into(), format!("cd {}", outside.display())];
+    assert_eq!(
+        runner
+            .run(&spec, &Cancellation::default())
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
+    fs::create_dir(workspace.join("plain")).unwrap();
+    spec.cwd = "plain".into();
+    spec.executable = "/usr/bin/true".into();
+    spec.arguments.clear();
+    assert_eq!(
+        runner
+            .run(&spec, &Cancellation::default())
+            .unwrap()
+            .exit_code,
+        Some(0)
+    );
+    std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
     spec.cwd = "link".into();
+    assert!(runner.run(&spec, &Cancellation::default()).is_err());
+    // This in-workspace target also catches removal of NO_SYMLINKS alone:
+    // BENEATH would otherwise allow it.
+    std::os::unix::fs::symlink("plain", workspace.join("inside-link")).unwrap();
+    spec.cwd = "inside-link".into();
     assert!(runner.run(&spec, &Cancellation::default()).is_err());
     spec.cwd = PathBuf::new();
     spec.executable = "/bin/sh".into();

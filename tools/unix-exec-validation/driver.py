@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import time
+import threading
 
 TEST = 'exec::disposable::disposable_linux_cross_account'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
@@ -61,20 +62,36 @@ def call(args, **kw):
 
 
 def copy_tree(src, dst, exclude=()):
-    # No dereferencing checkout/cache symlinks or special files into root code.
-    def ignore(directory, names):
-        return set(exclude) & set(names)
-    for root, dirs, files in os.walk(src, followlinks=False):
-        dirs[:] = [d for d in dirs if d not in exclude]
-        for name in dirs + [f for f in files if f not in exclude]:
-            s = (Path(root) / name).lstat()
+    # Open every component relative to a pinned directory; never reopen a checked
+    # pathname for copying. Destination is exclusively created private staging.
+    def copy_dir(fd, target):
+        target.mkdir(mode=0o700)
+        for name in os.listdir(fd):
+            if name in exclude:
+                continue
+            s = os.stat(name, dir_fd=fd, follow_symlinks=False)
             require(stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode), 'E_COPY_TYPE')
-    shutil.copytree(src, dst, ignore=ignore)
-    for root, dirs, files in os.walk(dst):
-        os.chmod(root, 0o700)
-        for name in files:
-            p = Path(root) / name
-            os.chmod(p, 0o700 if p.stat().st_mode & 0o111 else 0o600)
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if stat.S_ISDIR(s.st_mode):
+                flags |= os.O_DIRECTORY
+            child = os.open(name, flags, dir_fd=fd)
+            try:
+                opened = os.fstat(child)
+                require((s.st_dev, s.st_ino, stat.S_IFMT(s.st_mode)) ==
+                        (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode)), 'E_COPY_RACE')
+                if stat.S_ISDIR(opened.st_mode):
+                    copy_dir(child, target / name)
+                else:
+                    with os.fdopen(os.dup(child), 'rb') as source, (target / name).open('xb') as out:
+                        shutil.copyfileobj(source, out)
+                    (target / name).chmod(0o700 if opened.st_mode & 0o111 else 0o600)
+            finally:
+                os.close(child)
+    fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        copy_dir(fd, dst)
+    finally:
+        os.close(fd)
 
 
 def cg_preflight():
@@ -85,16 +102,26 @@ def cg_preflight():
     require(fs == b'cgroup2fs', 'E_CGROUP2')
     require({'memory', 'pids'} <= set(Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()),
             'E_CONTROLLERS')
-    # Conservative whole-hierarchy policy: a new fixture UID must not acquire
-    # writable cgroups outside our unit, including ACL grants (mask write bits).
+    cg_scan()
+
+
+def cg_scan(unit=None, uid=None, gid=None):
+    # v2 migration needs write access to destination AND common ancestor procs.
+    # Unrelated user delegation is safe; our ancestors/subtree remain root-owned.
+    # ACL write masks appear in group mode bits and therefore refuse globally.
     count = 0
     for root, dirs, files in os.walk('/sys/fs/cgroup', followlinks=False):
         for name in dirs + files:
             count += 1
             require(count <= 20000, 'E_CGROUP_SCAN_BOUND')
             s = (Path(root) / name).lstat()
-            require(s.st_uid == 0 and not s.st_mode & 0o022 and
+            path = Path(root) / name
+            require(not s.st_mode & 0o022 and
                     not stat.S_ISLNK(s.st_mode), 'E_CGROUP_WRITABLE_HIERARCHY')
+            if unit is not None and (path == unit or unit in path.parents or path in unit.parents):
+                require(s.st_uid == 0, 'E_CGROUP_UNIT_OWNER')
+            if uid is not None:
+                require(s.st_uid != uid and s.st_gid != gid, 'E_CGROUP_FIXTURE_OWNER')
 
 
 def cargo_env(stage):
@@ -123,6 +150,13 @@ def fixture_cleanup(stage):
         account = pwd.getpwnam(name)
     except KeyError:
         account = None
+    if base.exists() or base.is_symlink():
+        protected(base)
+        require((stage / 'fixture-directory').exists(), 'E_QUARANTINE_PATH_UNCAPTURED')
+        captured = json.loads((stage / 'fixture-directory').read_text())
+        require([base.stat().st_dev, base.stat().st_ino] == captured, 'E_FIXTURE_INODE')
+        # Descendants can be build-user owned but must never be followed.
+        require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
     if account:
         require((stage / 'fixture-identity').exists(), 'E_QUARANTINE_UID_UNCAPTURED')
         captured = json.loads((stage / 'fixture-identity').read_text())
@@ -141,12 +175,6 @@ def fixture_cleanup(stage):
                     pass
         call(['/usr/sbin/userdel', name])
     if base.exists() or base.is_symlink():
-        protected(base)
-        require((stage / 'fixture-directory').exists(), 'E_QUARANTINE_PATH_UNCAPTURED')
-        captured = json.loads((stage / 'fixture-directory').read_text())
-        require([base.stat().st_dev, base.stat().st_ino] == captured, 'E_FIXTURE_INODE')
-        # Descendants can be build-user owned but must never be followed.
-        require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
         shutil.rmtree(base)
     try:
         group = grp.getgrnam(name)
@@ -156,6 +184,16 @@ def fixture_cleanup(stage):
         require(account is not None and group.gr_gid == account.pw_gid and not group.gr_mem,
                 'E_GROUP_ORPHAN')
         call(['/usr/sbin/groupdel', name])
+
+
+def drain_output(source, target, exceeded, limit=1024 * 1024):
+    written = 0
+    while chunk := source.read(65536):
+        keep = min(len(chunk), limit - written)
+        target.write(chunk[:keep])
+        written += keep
+        if keep < len(chunk):
+            exceeded.set()
 
 
 def service(stage, run):
@@ -179,19 +217,22 @@ def service(stage, run):
     env = {**cargo_env(stage), 'CI': 'true', 'GITHUB_ACTIONS': 'true',
            'RUNNER_ENVIRONMENT': 'github-hosted', 'ARX_DISPOSABLE_EXEC_TEST': '1',
            'ARX_EXEC_CGROUP_PARENT': str(delegated),
+           'ARX_EXEC_GUARD_DRIVER': str(stage / 'source/tools/unix-exec-validation/driver.py'),
+           'ARX_EXEC_RUN_ID': run,
            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER': str(stage / 'runner')}
-    # File size limit bounds private diagnostics; output never copied wholesale.
-    import resource
-    resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
     with (stage / 'test-output').open('xb') as out:
         child = subprocess.Popen(['/usr/bin/timeout', '--signal=KILL', '120s'] +
                                  command(stage) + ['--', '--ignored', '--exact'],
                                  cwd=stage / 'source', env=env,
-                                 stdout=out, stderr=subprocess.STDOUT)
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        exceeded = threading.Event()
+        reader = threading.Thread(target=drain_output, args=(child.stdout, out, exceeded), daemon=True)
+        reader.start()
         deadline = time.monotonic() + 120
         try:
             while child.poll() is None:
                 capture_fixture(stage)
+                require(not exceeded.is_set(), 'E_TEST_LOG')
                 require(time.monotonic() < deadline, 'E_TEST_TIMEOUT')
                 time.sleep(0.01)
             capture_fixture(stage)
@@ -199,10 +240,19 @@ def service(stage, run):
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=5)
+            reader.join(timeout=5)
+            require(not reader.is_alive(), 'E_OUTPUT_DRAIN')
+            child.stdout.close()
+        require(not exceeded.is_set(), 'E_TEST_LOG')
+    verify_test_result(stage, child.returncode)
+    (stage / 'passed').write_text('1')
+
+
+def verify_test_result(stage, returncode):
+    require((stage / 'test-output').stat().st_size <= 1024 * 1024, 'E_TEST_LOG')
     text = (stage / 'test-output').read_text(errors='replace')
     passed = f'test {TEST} ... ok' in text and '1 passed; 0 failed' in text
-    require(child.returncode == 0 and passed and (stage / 'harness-pid').exists(), 'E_TEST')
-    (stage / 'passed').write_text('1')
+    require(returncode == 0 and passed and (stage / 'harness-pid').exists(), 'E_TEST')
 
 
 def capture_fixture(stage):
@@ -268,7 +318,7 @@ def run(env):
     unit_created = False
     try:
         source = Path.cwd()
-        require(subprocess.check_output(['/usr/bin/git', 'rev-parse', 'HEAD'], env=SAFE_ENV,
+        require(subprocess.check_output(['/usr/bin/git', '-c', 'safe.directory=' + str(source), 'rev-parse', 'HEAD'], env=SAFE_ENV,
                                         timeout=5).decode().strip() == env['GITHUB_SHA'], 'E_CHECKOUT')
         # Fixed hosted-runner tool locations; no user supplied paths or config.
         copy_tree(source, stage / 'source', ('.git', 'target', 'node_modules', '__pycache__'))
@@ -338,6 +388,11 @@ def main():
     protected(Path(__file__))
     if mode == 'service' and len(sys.argv) == 3:
         service(stage, sys.argv[2])
+    elif mode == 'fixture-check' and len(sys.argv) == 3:
+        capture_fixture(stage)
+        captured = json.loads((stage / 'fixture-identity').read_text())
+        _, unit = plan(sys.argv[2])
+        cg_scan(Path('/sys/fs/cgroup/system.slice') / unit, captured['uid'], captured['gid'])
     elif mode == 'harness':
         harness(stage, sys.argv[3:])
     else:

@@ -117,9 +117,61 @@ Implementation evidence: Codex / gpt-6.1-sol, high effort. Ten safe Python tests
 passed on Windows, including executable gate deletion mutations and workflow
 guard removal mutations. YAML manual-only/read-only structure validated with
 PyYAML; no runtime containment is established. Base `989f1c6` includes the reported
-PR #14/root-MCP stable-ID merge; this task did not verify or change remote merge
+PR #13 persistent host-identity merge; this task did not verify or change remote merge
 state. Progress is recorded here within the assigned validation-doc ownership;
-the coordinator must reconcile `docs/PROGRESS.md` and independent review status.
+`docs/PROGRESS.md` now also records the task and independent review status.
 Git Bash `bash -n` also passed on the workflow shell block and generated runner
 snippet. ShellCheck and actionlint were not available; neither was run. The
 required Cargo/three-OS suites were not run for this CI/docs-only change.
+
+
+## First security-review corrections (base c508de0)
+
+Builder: Codex / gpt-6.1-sol, high effort. The first Opus review failed B1–B3;
+no privileged run is authorized by these changes. Global cgroup checks retain
+no-links/no-group-or-other-write; unrelated user delegation is allowed. Unit
+ancestry/subtree stays root-owned and a synchronous post-account-creation scan
+rejects generated UID/GID ownership anywhere before the first Runner call.
+The 20,000-entry bound is retained; actual hosted hierarchy size remains unmeasured.
+
+The ignored test now checks an accessible outside symlink target, an ordinary
+subdirectory positive control, and an inside-workspace symlink (which would be
+allowed by BENEATH if NO_SYMLINKS were removed). It also asserts actual child
+cgroup membership, reads the run's pids/memory/swap controls from the root test
+observer, and forces fork exhaustion above pids.max. **All these runtime assertions
+are unrun and unverified on real hardware**, including the requested Rust
+symlink-protection deletion experiment. They require fresh independent review
+before a disposable root runtime experiment; no runtime mutation pass is claimed.
+
+Copying uses pinned no-follow descriptors and inode/type comparison. Output is
+bounded by a drain collector, rather than an inherited artifact file-size limit.
+Git uses exact-checkout command-scoped safe.directory and retains SHA equality.
+Normal Linux cleanup confirmation now includes successful leaf removal; removal
+failure reports false and requires caller quarantine. Drop/error-unwind cleanup
+remains best effort and cannot provide a success record by itself.
+
+Local evidence on Windows after changes:
+
+- `python -I -m unittest discover -s tools/unix-exec-validation -p test_driver.py`:
+  28 passed; mocks and temporary files only. Ordinary required CI now runs these.
+- `python -I tools/unix-exec-validation/mutation_check.py`: nine separate
+  executable guard mutants killed: fixture inode, live UID, unit ownership,
+  fixture ownership, global link/write scan, copy type refusal, exact argv,
+  zero-test acceptance and run gate. Each mutant reruns its actual regression.
+  These provide red/green evidence without privileged calls, not runtime containment.
+- `cargo test --workspace --locked` and `cargo nextest run --workspace --locked`:
+  22 Windows tests passed (post-#13 baseline).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all --check`: passed.
+- Direct rustc and clippy-driver library and test metadata checks with `-D warnings` for Linux x64
+  and macOS arm64: passed against exact registry libc 0.2.191. No Unix linking/run.
+- Full workspace Linux-target Cargo check attempted but unavailable: bundled SQLite
+  requires missing `x86_64-linux-gnu-gcc`. This is not a full Unix Cargo-check pass.
+
+The safe Python output-cap test also proves oversize output is truncated/refused
+without imposing any process-wide artifact limit. Descriptor race, cleanup identity,
+missing capture, orphan group and runner collision checks have pure regressions.
+The cgroup removal-failure regression is Linux-only and metadata-checked, unrun.
+No new hosted CI run, workflow dispatch, repository setting change, push or PR
+was made by this correction task. Review, integration and any privileged run
+remain coordinator work. ShellCheck/actionlint remain unrun.
