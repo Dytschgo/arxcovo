@@ -1,0 +1,33 @@
+{
+  "schema": "arxcovo-development-acceptance/1",
+  "verified_at_utc": "2026-11-11T12:50:31.959770+00:00",
+  "platform": "windows",
+  "execution_mode": "development_current_user",
+  "claim": "development_only_not_dedicated_account",
+  "build_source_sha": "72a5e5f7b5b1ac67b0f99b64442ba5edb6c5396c",
+  "reviewed_head_sha": "59293a8c4f185245c35c69b32a3b93c1420d7f21",
+  "merged_sha": "8fafbe70451807cf419c8e47706259b24a49cf68",
+  "binary_sha256": "66b7d1b89b6e0e19b2a1c97ff281696aab6051099cb6d57c0aaee7b5705d882f",
+  "production_source_equivalent": true,
+  "client": "Claude Code 2.1.322",
+  "requested_model": "claude-opus-5-5",
+  "requested_effort": "high",
+  "command": "cargo --version",
+  "verifications": {
+    "claude_code_tools_verified": true,
+    "cargo_version_succeeded": true,
+    "caller_scoped_activity_verified": true,
+    "restart_persistence_verified": true,
+    "medium_current_user_match": true,
+    "raw_identity_and_rights_null": true,
+    "cleanup_confirmed_by_executor": true,
+    "harness_processes_stopped": true,
+    "temporary_credentials_removed": true
+  },
+  "no_remaining_acceptance_arxd_processes": true,
+  "temporary_configuration_files_removed": true,
+  "raw_cli_stream_saved": false,
+  "dedicated_account_acceptance": false,
+  "installed_service_acceptance": false,
+  "milestone_2_complete": false
+}
