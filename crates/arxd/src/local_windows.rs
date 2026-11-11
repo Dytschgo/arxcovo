@@ -147,6 +147,10 @@ pub struct Listener {
     endpoint: Endpoint,
 }
 impl Listener {
+    pub fn bind_service(endpoint: &Endpoint) -> Result<Self> {
+        crate::service::native::require_service_identity()?;
+        Self::bind(endpoint)
+    }
     pub fn bind(endpoint: &Endpoint) -> Result<Self> {
         Ok(Self {
             next: create(endpoint, true)?,
@@ -189,6 +193,9 @@ impl super::Acceptor for Listener {
 }
 
 pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
+    if config.address == r"\\.\pipe\arxcovo-arxd" && config.expected_server_identity != "S-1-5-18" {
+        bail!("service identity required");
+    }
     unsafe {
         let wide: Vec<u16> = config.address.encode_utf16().chain(Some(0)).collect();
         // Specific rights match the DACL, and anonymous SQOS prevents impersonation.

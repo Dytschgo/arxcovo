@@ -11,6 +11,7 @@ pub enum Platform {
 pub enum Error {
     Config,
     Identity,
+    AccountMissing,
     Rights,
     Workspace,
     Permissions,
@@ -18,17 +19,24 @@ pub enum Error {
     OwnerRequired,
     Manager,
     NativeAdapterMissing,
+    NotInstalled,
+    Foreign,
+    Active,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Config => "service-config",
             Self::Identity => "service-identity",
+            Self::AccountMissing => "service-account-missing",
             Self::Rights => "service-rights",
             Self::Workspace => "service-workspace",
             Self::Permissions => "service-permissions",
             Self::Layout => "service-layout",
             Self::OwnerRequired => "service-owner-required",
+            Self::NotInstalled => "service-not-installed",
+            Self::Foreign => "service-foreign-registration",
+            Self::Active => "service-active",
             Self::Manager => "service-manager",
             Self::NativeAdapterMissing => "service-native-adapter-missing",
         })
@@ -260,7 +268,7 @@ pub enum Protection {
 pub enum Ace {
     Allow {
         sid: String,
-        writes: bool,
+        mask: u32,
         inherit_only: bool,
     },
     Deny,
@@ -272,6 +280,51 @@ pub enum Policy {
     PrivateFile,
     BinaryIntegrity,
     EndpointDirectory,
+}
+/// Namespace integrity for an existing Windows path edge. Each next component
+/// must also be checked on its own handle (or under the strict final policy).
+/// Creation of siblings cannot replace that existing component. Inherit-only
+/// grants have no effect here; effective inherited grants are checked on the child.
+/// Unknown ACEs and untrusted owners still refuse. Denies never excuse an allow.
+#[cfg(any(windows, test))]
+pub(crate) fn check_windows_ancestor(p: &Protection) -> Result<(), Error> {
+    let Protection::Windows {
+        owner,
+        dacl_present,
+        aces,
+        ..
+    } = p
+    else {
+        return Err(Error::Permissions);
+    };
+    // DELETE, WRITE_DAC, WRITE_OWNER, DELETE_CHILD and GENERIC_ALL.
+    // Directory creation/EA/attributes (including GENERIC_WRITE) cannot
+    // replace the protected existing child. Every ancestor is nonempty.
+    const CONTROL: u32 = 0x10000000 | 0x000d0040;
+    if *dacl_present
+        && windows_trusted(owner)
+        && aces.iter().all(|ace| match ace {
+            Ace::Deny => true,
+            Ace::Unsupported => false,
+            Ace::Allow {
+                sid,
+                mask,
+                inherit_only,
+            } => *inherit_only || mask & CONTROL == 0 || windows_trusted(sid),
+        })
+    {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
+    }
+}
+fn windows_trusted(s: &str) -> bool {
+    matches!(
+        s,
+        "S-1-5-18"
+            | "S-1-5-32-544"
+            | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+    )
 }
 /// `safe_local` means every ancestor was checked without following reparse points.
 pub fn check_protection(
@@ -293,14 +346,7 @@ pub fn check_protection(
                 aces,
             },
         ) => {
-            let trusted = |s: &str| {
-                matches!(
-                    s,
-                    "S-1-5-18"
-                        | "S-1-5-32-544"
-                        | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
-                )
-            };
+            let trusted = windows_trusted;
             let private = matches!(policy, Policy::PrivateDirectory | Policy::PrivateFile);
             *dacl_present
                 && if private {
@@ -317,7 +363,9 @@ pub fn check_protection(
                     trusted(owner)
                         && aces.iter().all(|a| match a {
                             Ace::Deny => true,
-                            Ace::Allow { sid, writes, .. } => !writes || trusted(sid),
+                            Ace::Allow { sid, mask, .. } => {
+                                mask & (0x10000000 | 0x40000000 | 0x000d0156) == 0 || trusted(sid)
+                            }
                             Ace::Unsupported => false,
                         })
                 }
@@ -340,6 +388,69 @@ pub fn check_protection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_namespace_edges_reject_control_but_allow_sibling_creation() {
+        let fixture = |mask, inherit_only| Protection::Windows {
+            owner: "S-1-5-18".into(),
+            protected: false,
+            dacl_present: true,
+            aces: vec![Ace::Allow {
+                sid: "S-1-1-0".into(),
+                mask,
+                inherit_only,
+            }],
+        };
+        for mask in [0, 2, 4, 6, 0x116, 0x40000000, 0x1200a9] {
+            assert!(check_windows_ancestor(&fixture(mask, false)).is_ok());
+        }
+        // Separate rights, not only FULL_CONTROL: each confers control or
+        // modification authority beyond creating a new sibling.
+        for mask in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000] {
+            assert_eq!(
+                check_windows_ancestor(&fixture(mask, false)),
+                Err(Error::Permissions)
+            );
+            assert!(check_windows_ancestor(&fixture(mask, true)).is_ok());
+            // A grant becoming effective on the next component must refuse.
+            assert!(
+                check_protection(
+                    Platform::Windows,
+                    Policy::BinaryIntegrity,
+                    true,
+                    &fixture(mask, false)
+                )
+                .is_err()
+            );
+        }
+        for policy in [Policy::PrivateFile, Policy::PrivateDirectory] {
+            // Even harmless or inherit-only foreign grants remain forbidden
+            // on the final private object.
+            for mask in [0, 4, 0x1f01ff] {
+                for inherit_only in [false, true] {
+                    let mut p = fixture(mask, inherit_only);
+                    if let Protection::Windows { protected, .. } = &mut p {
+                        *protected = true;
+                    }
+                    assert!(check_protection(Platform::Windows, policy, true, &p).is_err());
+                }
+            }
+        }
+        let mut bad_owner = fixture(0, false);
+        if let Protection::Windows { owner, .. } = &mut bad_owner {
+            *owner = "S-1-1-0".into();
+        }
+        assert!(check_windows_ancestor(&bad_owner).is_err());
+        let mut missing = fixture(0, false);
+        if let Protection::Windows { dacl_present, .. } = &mut missing {
+            *dacl_present = false;
+        }
+        assert!(check_windows_ancestor(&missing).is_err());
+        let mut unknown = fixture(0, false);
+        if let Protection::Windows { aces, .. } = &mut unknown {
+            aces.push(Ace::Unsupported);
+        }
+        assert!(check_windows_ancestor(&unknown).is_err());
+    }
     #[test]
     fn disjoint_paths_are_component_aware() {
         for os in [Platform::Windows, Platform::Linux, Platform::Macos] {
@@ -372,7 +483,7 @@ mod tests {
         if let Protection::Windows { aces, .. } = &mut p {
             aces.push(Ace::Allow {
                 sid: "S-1-1-0".into(),
-                writes: false,
+                mask: 0,
                 inherit_only: true,
             });
         }
@@ -387,7 +498,7 @@ mod tests {
             dacl_present: true,
             aces: vec![Ace::Allow {
                 sid: "S-1-1-0".into(),
-                writes: true,
+                mask: 0x40000000,
                 inherit_only: true,
             }],
         };
