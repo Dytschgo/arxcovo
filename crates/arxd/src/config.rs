@@ -54,7 +54,9 @@ impl Config {
             .transpose()?;
         Ok(value)
     }
-    pub fn validate(&self) -> Result<()> {
+    /// Development execution is Windows-only, never with HTTP, and its workspace
+    /// is disjoint from private state. Config::load also checks the config dir.
+    pub fn validate_development(&self) -> Result<()> {
         if let Some(dev) = &self.development_execution {
             if !cfg!(windows) || self.listen.is_some() {
                 bail!("invalid development configuration");
@@ -62,6 +64,10 @@ impl Config {
             dev.validate()?;
             dev.disjoint(&self.state_dir)?;
         }
+        Ok(())
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.validate_development()?;
         if let Some(endpoint) = &self.local {
             endpoint.validate()?;
         }
@@ -144,7 +150,10 @@ pub fn checked_path(path: &Path) -> Result<()> {
             }
         }
         prefix.push(part);
-        // A Windows drive prefix is not a filesystem root until RootDir follows.
+        // A disk prefix alone is drive-relative (C:) or not a filesystem
+        // object (\\?\C:). Inspect it only after RootDir forms the absolute
+        // root; every root and descendant still receives the checks below.
+        #[cfg(windows)]
         if matches!(part, Component::Prefix(_)) {
             continue;
         }
