@@ -813,3 +813,45 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   tests passed. No manager, owner or privileged operation ran. The next bounded
   slice is typed lifecycle plans and gate tests, followed by native runner and
   retained-state/runtime-directory work. PR29's functional blockers remain open.
+
+## ADR0014 phase 2: typed portable plans (2026-11-11)
+
+- Provider/effort/outcome: OpenAI gpt-6.1-sol / medium / typed-plan slice completed
+  locally from verified base 074530b5dc1ba51862c3927af6d9e1cbb2aebe97.
+  Work alone; no delegate, push, PR write, merge or watch. Last merged PR unchanged.
+- Explicit Expect, StartPreflight, ProvisionState, command gates and constant
+  gates encode the eight ADR0014 Unix lifecycle plans. Installable precedes all
+  mutation, drop-in precedes unit with UnitAbsent, install disables boot intent,
+  and stop proof precedes removal. Endpoint EnsureDirectory is disallowed.
+  Windows plans/source behavior and bool configure/uninstall APIs are retained.
+- Safe callable contracts: pure owner_plan/configure_plan/uninstall_plan remain
+  available; Unix Status returns fixed Manager rather than a mutating plan.
+  owner_query remains the read-only parsing/predicate/status API for a future
+  adapter. Query vectors are deliberately rejected by the mutating command gate.
+- Native Unix execute validates the entire plan and rejects new unsupported
+  expectations, preflight, provisioning and conditional gates with Manager before
+  applying any operation. apply also checks that boundary. Hidden launchd
+  enable/disable and hidden command preflight were removed. Configure's existing
+  Always drop-in/reload semantics remain. Existing standalone provision_state is
+  unchanged and does not implement retained-state provisioning.
+- Acceptance: cargo fmt --all -- --check; cargo clippy --workspace --all-targets
+  -- -D warnings; cargo test -p arxd --lib service::owner_ (18 passed); cargo test
+  -p arxd --all-targets --no-run; git diff --check all passed on restored sources.
+  Initial service suite exposed the obsolete Unix status-plan expectation; fixed.
+  Model lifecycle/reinstall/boot-intent tests are MODEL evidence, not runtime.
+- Actual source mutations run and killed by unix_exact_typed_plans: remove start
+  enable; remove install disable; swap stop disable/stop order; ungate install
+  drop-in; omit Installable; omit Unloaded. Sources restored and owner suite green.
+  No retained-state native mutation test is claimed.
+- Cross-target cargo check -p arxd --tests attempted for Linux and macOS. Both
+  blocked in bundled SQLite C build (missing x86_64-linux-gnu-gcc and cc,
+  respectively); no cross-target metadata success is claimed.
+- Phase 3: implement bounded native query runner and fresh gate observations,
+  optional-endpoint start preflight, retained-state ProvisionState with locks and
+  durability, macOS service endpoint creation and native fixtures/ancestor policy.
+  Validate actual-source Linux/macOS metadata and native failure/timeout behavior.
+  PR30 coordinator must integrate None Unix batch observation on its later base.
+  Independent different-provider review remains required before any merge.
+- PR29 is not complete. Native and installed M2 paths remain **unverified on real
+  hardware**. No real manager, privileged harness, owner administration, dispatch,
+  settings, old Lab Manager or VM operation was invoked for this slice.
