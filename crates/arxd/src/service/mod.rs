@@ -10,6 +10,9 @@ pub mod owner_unix;
 
 pub mod owner_transactions;
 pub mod preflight;
+
+#[cfg(windows)]
+pub mod owner_windows;
 use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 

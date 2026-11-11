@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#30](https://github.com/Dytschgo/arxcovo/pull/30), `4f2b0c7177c8b7370d34484e4739082364859f4a` (required merged main supplied by the coordinator). Windows owner provenance and the prior Application sharing correction are included; installed-service and dedicated-account acceptance remain open.
-- Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: owner provenance #30 is merged. Existing protected owner store #33 and SCM #35 remain coordinator dependencies; PR29 is integrated locally with actual main for fresh Opus review after dependencies land. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
-- Main push CI after native validation #25 passed on its first attempt, run 43073378419 at `63b6555`: **414 seconds**, below 15 minutes. The new Application main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Last merged PR: [#37](https://github.com/Dytschgo/arxcovo/pull/37), `f06e9a2f906dcf52102bb2ee18f9f1d3265d1b93`, 18:59:00 UTC, through all five gates. This test-only CI correction changes no production code; installed/dedicated-account M2 acceptance remains open.
+- Main includes lifecycle, fixed configuration, native observation, Application, owner provenance and protected owner-store libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; M2 acceptance stays unchecked.
+- Queue priority: land strengthened SCM #35, then existing Unix owner/executor dependencies and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29; #37 was the narrow test-only CI exception.
+- Main push CI after #33 passed on its first attempt, run 43079116241 at `7c150f0`: **532 seconds**, below 15 minutes. The new #37 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -186,6 +186,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
+| Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
@@ -1403,3 +1404,27 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Anthropic / claude-opus-5-5 / requested high could not reproduce `ExecutionFailed` in 124 isolated runs and three reduced-concurrency arxd suites; CPU-starvation timeout failures were kept separate. No cause or fix was established.
 - Codex / gpt-6.1-sol / medium then ran ten bounded default-concurrency full-workspace diagnostic passes at `f15a271`: nine passed 150/150; one failed only the older handle-slot reuse test. Zero `ExecutionFailed` occurrences or diagnostic error-stage lines. Original source bytes were restored; no instrumentation is committed. Details are in `docs/reviews/development-execution-failure-observations.md`. Passing reruns are not a repair or acceptance claim. Current-parent integration, independent review and hosted gates remain required; installed/dedicated M2 paths are **unverified on real hardware**.
+## Owner store integration with refreshed provenance
+
+- Codex / gpt-6.1-sol, medium prepared existing #33 locally on published provenance `bc3443f`, preserving published history and the Application sharing correction. The owner store, its tests and Cargo dependencies remain byte-identical to `d6df821`; native parsing exports and the new parent sharing test merged cleanly. Current state remains first and provider/task evidence is retained. No push or new feature PR while #30 runs normal gates.
+- Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **146/146 normal nextest** and **26/26 CI-helper tests**. Two subprocess-only fixtures were skipped directly and exercised through parents. Run `f820eda1-f85a-4d0e-9d33-d677b5cb35a6`, 14.628-second test phase. The earlier intermittent #29 combination failures are not claimed fixed by this separate passing run. No production owner session, SYSTEM layout, LSA/SCM/account/rights/admin/service or VM operation. Fresh exact-head independent recheck and hosted gates remain required after the parent merges; production installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Protected owner store refresh after provenance merge
+
+- Codex / gpt-6.1-sol, medium aligned existing #33 with actual provenance squash `4f2b0c7`, whose tree equals independently reviewed `bc3443f`. The local store already contained that exact parent; duplicate-history conflicts retained the validated combined tree. Complete crate/packaging/Cargo/toolchain/script trees are identical to tested `34a8f92`; owner_windows source/tests and dependencies remain unchanged from `d6df821`. Workflows/helpers match merged main. All published history and provider/task evidence remain, with Current state first.
+- Existing refreshed-tree verification applies: formatting, locked all-target Clippy, **146/146 normal nextest** (two subprocess fixtures through parents) and **26/26 CI helpers** passed. No test rerun is claimed for this identical-tree metadata refresh. Fresh exact-head independent recheck, including the d6df821 same-content identity-swap test follow-up, and hosted gates remain required. #30 merged at 18:24:31 UTC through all five gates; first-attempt Application main CI passed in 571 seconds. No native owner constructor, LSA/SCM/privilege/account/admin/service/VM operation. Installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Test-only occupied-handle CI correction publication
+
+- Codex / gpt-6.1-sol, medium integrated previously reviewed local `5b2e865` onto actual main `7c150f0`. Anthropic / claude-opus-5-5, requested high authored the diagnosis/patch; the independent Sol patch review is retained in `docs/reviews/windows-unduplicable-slot-review.md`. A valid child ETW registration can refuse duplication with error 50; treating that occupied slot as absent skips the distinct-object marker. The independent SCM review observed this known failure on its old hosted head, so the correction is a CI unblock, not a new feature PR. It does not claim to fix the separate intermittent ExecutionFailed symptoms.
+- All source changes are inside the existing test module and byte-identical to reviewed `5b2e865`. Production code, three-handle inheritance, Job/token checks, dependencies, workflows and timeouts are unchanged. The deterministic unsupported-slot fixture and real-leak countercontrols remain. Actual refreshed Windows verification passed formatting, locked all-target Clippy and **147/147 normal nextest**, with two subprocess-only fixtures exercised through parents; run `df181cad-0001-46ae-b0f8-bb99b0a31198`, 11.024-second test phase.
+- This separate one-concern test PR is the narrow CI exception to the feature-PR pause; it does not resume feature publication and keeps the open queue below the original 16-PR cap. Fresh published-head integration review and all hosted gates remain required. No production owner/SCM/LSA/privilege/account/admin/service/VM operation; installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Windows ETW handle-slot fixture correction
+
+- Anthropic / claude-opus-5-5 / requested high diagnosed the missing marker: valid child ETW-registration slots can reject duplication with error 50; the fixture treated that as absent. The deterministic new seam failed 50/50 without the correction and passed 100/100 with it. The author reports 1000 parallel plus 300 sequential original-test passes and real-leak mutation detection; records are retained in `docs/reviews/windows-handle-reuse-marker-failure.md`.
+- OpenAI / gpt-6.1-sol / medium independently reviewed and applied the test-only patch on main `0ceb174`. Personally reproduced the fallback-disabled failure and real handle-list-removal leak failure, restored all bytes, and passed formatting, locked all-target Clippy and **61/61 nextest tests** with zero skipped. See `docs/reviews/windows-unduplicable-slot-review.md`. Production behavior is unchanged; hosted checks and normal merge gates remain required. No installed-service or dedicated-account acceptance is claimed.
+
+## Unix owner integration with merged protected storage and CI fixture
+
+- Codex / gpt-6.1-sol / medium merged actual main `f06e9a2` into the local Unix owner candidate after recording the bounded diagnostic result. Preserved both typed Unix lifecycle modules and the Windows protected owner-store module; foundation and provider history retained. The merged PR37 test-only handle correction is included. No native authority or CLI activation is added. Combined checks and independent review remain required before publication; installed/dedicated M2 paths remain **unverified on real hardware**.
