@@ -1,5 +1,11 @@
 # Arxcovo progress
 
+## Ubuntu signed-mirror mitigation candidate
+
+- Codex / gpt-6.1-sol, medium retained the PR32 observation: job 130635247058, source `b475bf1`, Ubuntu 26.04 image `20261101.186.1`, three Ubuntu-domain timeouts and resolved Kernel Archives/GitHub/Microsoft controls. The existing Playwright dependency install still failed; root cause is unknown.
+- Prepared an unactivated, fixed-context CI helper that changes only known Ubuntu APT URI values to the Kernel Archives HTTPS mirror. Suites/components/architectures/signing-key selection and third-party sources are preserved; no insecure option, new key, resolver edit or gate exemption is introduced. Both legacy and deb822 forms have byte-preservation tests and unsafe target sources refuse. All source files are validated before changes, bounded, no-follow, root-owned, single-link and not group/other writable.
+- Eleven portable tests passed locally, including synthetic native file facts. No APT file was opened or modified and no privileged operation ran. Independent review is required before workflow activation; actual root publication, signed metadata/dependency installation and a green CI run remain unverified. This is a mitigation candidate, not a claimed fix or M2 acceptance.
+
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
