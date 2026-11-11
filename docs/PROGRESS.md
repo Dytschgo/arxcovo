@@ -3,9 +3,9 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#15](https://github.com/Dytschgo/arxcovo/pull/15), `3a7edc850b5b1c4763bcd182275350d6fed8143e`, 10:44:51 UTC. Exact-head independent Opus review passed on `282b84a`; all three hosted platforms and both status gates passed.
+- Last merged PR: [#16](https://github.com/Dytschgo/arxcovo/pull/16), `b29f5317e94e03d033fcc1596a3e84c4d1d4d485`, 11:34:19 UTC. Exact-head independent Opus review passed on `8c3856a`; the coordinator enabled normal gated squash auto-merge. The drive-root validation correction is merged.
 - Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
-- Current work: integrate/review activity v2 and lifecycle candidates, then implement the owner-authorized current-user Windows development command path. No third privileged Windows probe is planned.
+- Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
 
 ## Accepted milestone 1 evidence
 
@@ -27,8 +27,8 @@
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
 - Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
-- Windows rooted-path fix #16 and activity-integrity fix #18 remain open. Their meaningful local regressions passed; exact-head review/merge are pending. Activity v2 carries forward #18's completion and fixed unknown-tool-label semantics.
-- Activity candidate `6469862`, integrated on feat/activity-feed: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Coordinator integrated the merged transport and passed 38 Windows workspace tests, formatting and Clippy. Independent review and hosted checks remain pending. See ADR 0011.
+- Windows rooted-path fix #16 is merged after fresh independent review; its bare-prefix correction passed 39 local tests. Activity-integrity #18 is closed as superseded by merged #19, including completion and fixed unknown-tool-label regressions.
+- Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
 - Constant systemd/launchd artifacts are committed on feat/service-install-artifacts. INI/plist syntax, fixed argv and absence of interpolation were checked; no manager or installation was invoked. Full ADR 0009 and the owner service guide remain on the service branch.
 - Still required: actual service/configuration integration, execution backend and rights enforcement, account-scoped tool discovery, cancellation/restart cleanup, and the real Claude Code MCP command/activity check. Development-current-user results must identify that mode and avoid private owner identity in output. The original dedicated-account criterion remains open.
@@ -118,10 +118,16 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Lifecycle builder | Codex / gpt-6.1-sol | high | Candidate 522ed2b; 40 local tests; installed-service integration/acceptance pending |
 | Current-user development contract | Claude / claude-opus-5-5 | high | ADR 0010 candidate d4725f1; docs only, user-authorized deviation; implementation pending |
 | Coordination and integration | Codex / gpt-6.1-sol | medium | Merged #15/#17 through gates; cancelled S4U diagnosis request, reconciled this record, integrated local candidates without claiming acceptance |
+
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
+
+
+## Historical development implementation records
+
+These task-time records retain the failed Sol handoff and later Opus resolution; the newest checkpoint below governs current status.
 
 ## Current-user Windows implementation assignment
 
@@ -241,3 +247,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   independent elevation query only. ADR 0010's service-config rejection awaits a
   service schema. Redaction stays best effort, and nothing here isolates the
   owner. M2's dedicated-account criterion remains open.
+
+## Current-user development coordinator integration
+
+- Codex / gpt-6.1-sol, medium: integrated completed Opus candidate f1541ce with merged main b29f531. Main differed from the candidate activity base only in the already-carried checked_path correction, the committed Windows path regression and README encoding. The candidate source is retained, the main regression is added, and progress is reconciled. The Opus candidate passed 58 tests and 25 mutations; integrated-revision verification is pending. Fresh independent Sol review and hosted checks are required before any private acceptance run. No production owner execution or administrative operation has occurred.
