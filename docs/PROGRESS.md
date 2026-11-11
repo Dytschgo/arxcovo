@@ -3,7 +3,7 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#15](https://github.com/Dytschgo/arxcovo/pull/15), `3a7edc850b5b1c4763bcd182275350d6fed8143e`, 10:44:51 UTC. Exact-head independent Opus review passed on `282b84a`; all three hosted platforms and both status gates passed.
+- Last merged PR: [#19](https://github.com/Dytschgo/arxcovo/pull/19), `d7f3ebd26e69438abb41ff5d671959e576832803`, 11:00:14 UTC. Exact-head independent Opus review passed on 9e7a603; all three hosted platforms and both status gates passed. Caller-scoped activity v2 is now merged.
 - Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
 - Current work: integrate/review activity v2 and lifecycle candidates, then implement the owner-authorized current-user Windows development command path. No third privileged Windows probe is planned.
 
@@ -27,8 +27,8 @@
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
 - Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
-- Windows rooted-path fix #16 and activity-integrity fix #18 remain open. Their meaningful local regressions passed; exact-head review/merge are pending. Activity v2 carries forward #18's completion and fixed unknown-tool-label semantics.
-- Activity candidate `6469862`, integrated on feat/activity-feed: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Coordinator integrated the merged transport and passed 38 Windows workspace tests, formatting and Clippy. Independent review and hosted checks remain pending. See ADR 0011.
+- Windows rooted-path fix #16 remains open. Activity-integrity PR #18 is closed as superseded by merged #19, which includes its meaningful completion and safe-label regressions. No gate was bypassed.
+- Activity #19 merged the candidate originating at 6469862 after independent review and three-OS CI. Its 38 workspace tests cover atomic migration/recovery, caller isolation, bounded pagination, retention, conditional completion and 8 KiB request/64 KiB response bounds. No executor or installed service was added. See ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
 - Constant systemd/launchd artifacts are committed on feat/service-install-artifacts. INI/plist syntax, fixed argv and absence of interpolation were checked; no manager or installation was invoked. Full ADR 0009 and the owner service guide remain on the service branch.
 - Still required: actual service/configuration integration, execution backend and rights enforcement, account-scoped tool discovery, cancellation/restart cleanup, and the real Claude Code MCP command/activity check. Development-current-user results must identify that mode and avoid private owner identity in output. The original dedicated-account criterion remains open.
@@ -120,3 +120,10 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Coordination and integration | Codex / gpt-6.1-sol | medium | Merged #15/#17 through gates; cancelled S4U diagnosis request, reconciled this record, integrated local candidates without claiming acceptance |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
+
+## Windows rooted-path correction integration
+
+- Independent Opus 5.5 high review of `17b6bc9` found that bare verbatim drive prefixes passed without a filesystem check. The new rejection cases failed on that head. The correction requires an actual RootDir component before traversal, rejecting both existing-drive and nonexistent-drive bare verbatim prefixes. Fresh exact-head review and hosted checks are required; no merge is claimed.
+- Correction validation: Codex / gpt-6.1-sol, medium effort; formatting, workspace Clippy with warnings denied and all 39 nextest tests passed on Windows. Real drive-root junctions and non-NTFS volumes remain **unverified on real hardware**.
+- Source skips metadata lookup for a disk prefix until RootDir forms the absolute root. Every root and descendant retains link/reparse checks. The Windows regression reproduced Incorrect function in old code, then passed for plain/verbatim local paths while rejecting drive-relative, UNC/device, alternate-stream and explicit parent traversal inputs. This branch is updated to merged activity main d7f3ebd; fresh review and hosted validation remain pending. Provider: Codex / gpt-6.1-sol, medium effort.
+- Fixed the single Windows-1252 dash in the crate README reported by the #19 reviewer; no documentation behavior changed. The development current-user executor and service configuration tasks are active in isolated worktrees.
