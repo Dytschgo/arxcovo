@@ -305,6 +305,16 @@ mod tests {
             );
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn stock_system_directory_passes_trusted_ancestor_validation() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows fixture requires SystemRoot"),
+        )
+        .join("System32");
+        let _opened = checked(&path, true, Policy::BinaryIntegrity, false)
+            .unwrap_or_else(|error| panic!("stock system directory refused: {error:?}"));
+    }
     #[test]
     fn native_workspace_rejects_missing_and_aliases() {
         let r = NativeResolver;

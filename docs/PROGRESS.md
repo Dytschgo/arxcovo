@@ -458,3 +458,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Service credential uniqueness correction
 
 - Codex / gpt-6.1-sol, medium found service config allowed the same decoded token hash for distinct principals, unlike foreground Config. The new regression first failed because the duplicate was accepted. Service parsing now rejects duplicate hashes regardless of hex casing while retaining a positive distinct-credential control. Formatting, workspace/all-target Clippy with warnings denied and all 88 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Independent review and hosted checks are pending. This enables no service or owner operation.
+
+## Native ancestor-policy blocker reproduction
+
+- Independent Opus stack review passed PR21 but failed PR25/27 because trusted ancestor validation rejects stock Windows system parents. Codex / gpt-6.1-sol, medium added stock_system_directory_passes_trusted_ancestor_validation on isolated fix/native-ancestor-policy: the real read-only System32 trusted-open path fails deterministically with Permissions under the existing policy. No permission or owner mutation occurred. The regression is intentionally red until the per-edge namespace-integrity policy is corrected; no fix, service start or M2 acceptance is claimed. Final private-object ownership/DACL checks must remain strict.
