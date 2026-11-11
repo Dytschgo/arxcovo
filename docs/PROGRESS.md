@@ -3,9 +3,9 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#23](https://github.com/Dytschgo/arxcovo/pull/23), `2be8268a656a754b03d560389f8486e5703eb98e`, 12:27:44 UTC. Exact-head independent Opus review passed on 0701079, all three hosted platforms and both gates passed, and normal gated squash auto-merge completed. Required CI and timeout policy are unchanged.
-- Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
-- Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
+- Last merged PR: [#22](https://github.com/Dytschgo/arxcovo/pull/22), `8fafbe70451807cf419c8e47706259b24a49cf68`, 12:46:32 UTC. Fresh independent Sol review passed on 59293a8, all three hosted platforms and both status gates passed, and normal gated squash auto-merge completed.
+- Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
+- Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
 
 ## Accepted milestone 1 evidence
 
@@ -269,3 +269,10 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium: integrated main 2be8268 into reviewed PR22 head72a5e5f. Only the two reviewed retention tests and progress changed; all arxd production source, Cargo manifests/lock and pinned toolchain are byte-identical to the successful independent Sol review. That review is https://github.com/Dytschgo/arxcovo/pull/22#issuecomment-6795099160. Integrated formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows. Fresh exact-head recheck and hosted checks are pending. No real cargo/Claude Code acceptance has run.
 - Service lifecycle review corrections are preserved on feat/service-lifecycle at b32ce16: TokenOwner execution proof, separate drain/audit budgets and bounded startup/unrequested serve failure, with 55 local tests. Configuration macOS-admin refusal is on PR21 at 8975520 with 63 local tests. Native macOS observation candidate b261457 has local type/policy tests but remains unmerged and unverified on native macOS. No service Application or owner installation adapter is activated.
+
+## Real Claude Code development acceptance
+
+- Codex / gpt-6.1-sol, medium coordinated private acceptance after PR22 merged. Claude Code 2.1.322 was requested to use Opus 5.5 high through its existing login, with unrelated instructions, memory, hooks, connectors and built-in tools disabled; only the explicit arxcovo MCP server and named calls were allowed. Actual MCP events were inspected in memory, not a natural-language success report.
+- A non-test arxd binary built from independently reviewed source72a5e5f listed the host and executed literal cargo --version under the current unelevated Windows user. Production source equivalence to reviewed59293a8 was checked. SQLite and MCP confirmed the caller's successful row, development identity mode, current-user match, Medium integrity and null raw owner identity/rights. A daemon restart and fresh Claude Code session returned the same row.
+- The native executor reported confirmed Job cleanup. The harness stopped its owned processes, an independent native process query found zero remaining acceptance arxd instances, and temporary config/credential files were deleted. Only sanitized booleans, fixed labels, build/source hashes and outcomes are committed in docs/evidence/windows-development-acceptance.json. No raw CLI stream or private owner values were logged or committed.
+- This is a passed development acceptance under the owner's explicit alternative, not M2 completion: dedicated-account/service execution, rights enforcement, service Application and native owner adapters remain unfinished. S4U/service and VM paths remain unverified on real hardware. No account, right, task, service, elevation or old Lab Manager action occurred.
