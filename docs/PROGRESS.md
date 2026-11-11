@@ -958,3 +958,9 @@ later integration. No push, GitHub write, PR, merge, watch or delegation occurre
 - The native adapter candidate is now locally reviewable, but still needs full
   independent security review and hosted checks. No CLI or owner activation
   exists; privileged paths remain **unverified on real hardware**.
+
+## Windows owner-store target identity regression
+
+- Codex / gpt-6.1-sol, medium closed the fresh-target identity test gap from the independent PR33 review. The new native owned-temp test stages an update, renames the old target, creates a distinct protected file with identical bytes, and asserts that stale publication conflicts before replacement. It covers both owner-record and config targets, preserved target identities/bytes, staging cleanup and a fresh successful transaction as positive control.
+- Removing only the production fresh-target identity comparison made the test fail at its intended conflict assertion. The original production bytes were restored exactly. All 14 owner-store tests, formatting and workspace/all-target Clippy with warnings denied passed. Production behavior is unchanged; hosted checks and a fresh independent exact-head recheck remain required.
+- Production ancestor pins exclude write sharing as well as delete sharing for the duration of an owner command; this can temporarily interfere with other writers to shared ancestors. Native production constructor, actual LSA/SCM, installed ownership and M2 acceptance remain **unverified on real hardware**. Raw session parts must still be narrowed before CLI activation.

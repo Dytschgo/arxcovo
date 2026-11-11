@@ -181,6 +181,52 @@ fn n2_exact_hash_replace_and_conflict_cleanup() {
     );
 }
 #[test]
+fn same_bytes_target_swap_conflicts_before_publication() {
+    for name in ["owner-record.json", "arxd.json"] {
+        let (d, s) = open_fixture();
+        s.publish(s.stage(name, b"first", None, 100).unwrap())
+            .unwrap();
+        let staged = s
+            .stage(name, b"second", Some(digest(b"first")), 100)
+            .unwrap();
+        let old_id = identity(staged.old.as_ref().unwrap()).unwrap();
+        let target = d.path().join(name);
+        let saved = d.path().join("previous");
+        std::fs::rename(&target, &saved).unwrap();
+        let sd = descriptor(&s.policy.creation_descriptor()).unwrap();
+        let mut replacement = raw_open(
+            &target,
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            CREATE_NEW,
+            Some(&sd),
+        )
+        .unwrap();
+        replacement.write_all(b"first").unwrap();
+        replacement.sync_all().unwrap();
+        s.policy.check(&replacement, false).unwrap();
+        let replacement_id = identity(&replacement).unwrap();
+        assert_ne!(old_id, replacement_id);
+        drop(replacement);
+
+        assert!(matches!(s.publish(staged), Err(Failure::Conflict)));
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"first");
+        assert!(!d.path().join(format!("{name}.staging")).exists());
+        let current = s.target(&target, Some(digest(b"first")), 100).unwrap();
+        assert_eq!(identity(current.as_ref().unwrap()).unwrap(), replacement_id);
+        drop(current);
+        // A new transaction against the replacement is valid; only the stale
+        // transaction must refuse, even though its content hash still matches.
+        s.publish(
+            s.stage(name, b"second", Some(digest(b"first")), 100)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"second");
+    }
+}
+#[test]
 fn n3_hardlinked_target_and_staging_refuse() {
     let (d, s) = open_fixture();
     let target = d.path().join("arxd.json");
