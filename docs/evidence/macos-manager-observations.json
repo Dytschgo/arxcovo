@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "kind": "read_only_hosted_unix_manager_observation",
+  "sourceCommit": "533ec14e81e3d55596ffe48704abcd7d11c07c65",
+  "runId": 43055469150,
+  "jobId": 130643624743,
+  "runnerLabel": "macos-latest",
+  "image": "macos-26-arm64",
+  "imageVersion": "20261102.0473.1",
+  "jobConclusion": "success",
+  "diagnosticTestsPassed": 11,
+  "observations": [
+    {
+      "target": "arxcovo",
+      "status": "completed",
+      "exit_code": 113,
+      "target_header": false,
+      "state": "absent",
+      "path": "absent",
+      "pid_field": false,
+      "missing_service_phrase": true,
+      "missing_target_named": true,
+      "system_domain_phrase": true
+    },
+    {
+      "target": "apple_syslog_control",
+      "status": "completed",
+      "exit_code": 0,
+      "target_header": true,
+      "state": "duplicate",
+      "path": "apple_syslog",
+      "pid_field": true,
+      "missing_service_phrase": false,
+      "missing_target_named": false,
+      "system_domain_phrase": false
+    }
+  ],
+  "productionParserChanged": false,
+  "serviceMutationsPerformed": false,
+  "installedServiceAcceptance": false
+}

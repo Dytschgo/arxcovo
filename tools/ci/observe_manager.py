@@ -79,8 +79,11 @@ def capture(argv, timeout=TIMEOUT):
     return result
 
 
-def single_field(data, key, allowed):
-    values = re.findall(rb"(?m)^[ \t]*" + key + rb"[ \t]*=[ \t]*([^\r\n]*)", data)
+def single_field(data, key, allowed, top_level=False):
+    # launchctl print uses one tab for fields in the outer job object. Nested
+    # service dictionaries can also contain state/path keys; keep them separate.
+    indent = rb"\t" if top_level else rb"[ \t]*"
+    values = re.findall(rb"(?m)^" + indent + key + rb"[ \t]*=[ \t]*([^\r\n]*)", data)
     if not values:
         return "absent"
     if len(values) != 1:
@@ -98,11 +101,11 @@ def summarize(label, target, result, platform):
                                         + rb"\s*=\s*\{\s*$", result.stdout)),
             state=single_field(result.stdout, b"state", {
                 b"running": "running", b"not running": "not_running",
-                b"waiting": "waiting", b"exited": "exited"}),
+                b"waiting": "waiting", b"exited": "exited"}, top_level=True),
             path=single_field(result.stdout, b"path", {
                 b"/Library/LaunchDaemons/com.arxcovo.arxd.plist": "arxcovo",
-                b"/System/Library/LaunchDaemons/com.apple.syslogd.plist": "apple_syslog"}),
-            pid_field=bool(re.search(rb"(?m)^\s*pid = [0-9]+\s*$", result.stdout)),
+                b"/System/Library/LaunchDaemons/com.apple.syslogd.plist": "apple_syslog"}, top_level=True),
+            pid_field=bool(re.search(rb"(?m)^\tpid = [0-9]+[ \t]*$", result.stdout)),
             missing_service_phrase=b"Could not find service" in result.stderr,
             missing_target_named=target.split("/", 1)[1].encode() in result.stderr,
             system_domain_phrase=b"system" in result.stderr,

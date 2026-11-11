@@ -29,6 +29,13 @@ Capture the exact source SHA, job, image version and results before using these
 observations to implement a parser. Actual installed paths remain
 **unverified on real hardware**.
 
+The initial source `533ec14` macOS observation is retained separately in
+`docs/evidence/macos-manager-observations.json`: the absent job returned 113;
+the Apple control returned zero, but a broad state scan reported duplicate
+fields. The current diagnostic limits launchd state/path/PID fields to the
+one-tab outer job level, excluding nested dictionaries. That refinement still
+needs hosted confirmation; the original record is never rewritten to match it.
+
 Run `python -m unittest discover -s tools/ci -p test_observe_manager.py`.
 Three tests use ordinary Python child processes on Unix to verify output caps,
 timeout and exit/EOF handling; they skip on Windows. None invokes a manager.

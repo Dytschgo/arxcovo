@@ -58,7 +58,8 @@ class ManagerObservationTests(unittest.TestCase):
         result = diagnostic.Capture("completed", 0,
             b"system/com.apple.syslogd = {\n\tstate = running\n"
             b"\tpath = /System/Library/LaunchDaemons/com.apple.syslogd.plist\n"
-            b"\tpid = 12345\n}")
+            b"\tpid = 12345\n\tendpoints = {\n\t\tstate = private\n"
+            b"\t\tpath = private\n\t\tpid = 67890\n\t}\n}")
         row = diagnostic.summarize("apple_syslog_control", "system/com.apple.syslogd",
                                    result, "darwin")
         self.assertTrue(row["target_header"])
@@ -66,6 +67,17 @@ class ManagerObservationTests(unittest.TestCase):
         self.assertEqual(row["state"], "running")
         self.assertEqual(row["path"], "apple_syslog")
         self.assertNotIn("12345", json.dumps(row))
+
+    def test_nested_fields_cannot_stand_in_for_outer_job_fields(self):
+        result = diagnostic.Capture("completed", 0,
+            b"system/com.apple.syslogd = {\n\tendpoints = {\n\t\tstate = running\n"
+            b"\t\tpath = /System/Library/LaunchDaemons/com.apple.syslogd.plist\n"
+            b"\t\tpid = 12345\n\t}\n}")
+        row = diagnostic.summarize("apple_syslog_control", "system/com.apple.syslogd",
+                                   result, "darwin")
+        self.assertEqual(row["state"], "absent")
+        self.assertEqual(row["path"], "absent")
+        self.assertFalse(row["pid_field"])
 
     def test_encoded_output_bound_is_enforced(self):
         with patch.object(diagnostic.json, "dumps", return_value="x" * 2049):

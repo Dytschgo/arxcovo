@@ -1,5 +1,10 @@
 # Arxcovo progress
 
+## First native macOS manager observation
+
+- Codex / gpt-6.1-sol, medium inspected completed [macOS job 130643624743](https://github.com/Dytschgo/arxcovo/actions/runs/43055469150/job/130643624743), source `533ec14`, image `macos-26-arm64` version `20261102.0473.1`. All 11 diagnostic tests passed, including the three real ordinary-child Unix tests. The absent Arxcovo job returned 113 with all expected fixed absence-phrase booleans; the Apple control returned zero with matching target/path/PID shapes. Exact sanitized rows are retained in `docs/evidence/macos-manager-observations.json`.
+- The initial broad state scan reported duplicate fields on the nested Apple job output. The diagnostic now separates one-tab outer job fields from nested dictionaries; positive and negative synthetic controls cover that distinction. Nine portable tests pass locally, three native Unix tests await rerun. The refinement is not claimed as hosted evidence yet and the historical record retains its original duplicate classification. Production launchd parsing still returns Unknown; no service lifecycle or M2 acceptance is claimed.
+
 ## Read-only Unix manager evidence preparation
 
 - Codex / gpt-6.1-sol, medium prepared bounded fixed queries for the absent Arxcovo service on Linux/macOS and a read-only Apple system-service control. Numeric exit codes and fixed output-shape classifications will supply evidence for ADR0014's missing native launchd parser; no error code is guessed as absence and no production parser changes.
