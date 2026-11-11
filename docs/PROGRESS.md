@@ -1,5 +1,37 @@
 # Arxcovo progress
 
+## Windows owner adapter prerequisite handoff — 2026-11-11
+
+- Provider/effort: Codex / gpt-6.1-sol high, implementation sub-agent working
+  alone from `1a45ba15640b608ee4c953a104c06e451a85d07b`, branch
+  `t3/windows-service-owner-adapter`. Outcome: partial transaction prerequisite,
+  **native adapter task incomplete**. Last merged PR and milestone acceptance
+  remain unchanged. No push, PR, merge, watch or delegation.
+  Implementation commit: `e919c4d`.
+- Added an opaque Windows configure-plan extractor and injected durable-intent/
+  grant-receipt/publication recovery engine. Tests cover operation ordering,
+  stale observations, ambiguous LSA/receipt errors, compensation and retry,
+  publish-then-error, foreign-config conflict, existing-right preservation and
+  bounded strict journal parsing. Native `Plan::execute` remains unsafe for
+  configure: do not activate it.
+- Concrete handoff obstacle: a crash between LSA grant and durable receipt leaves
+  ownership ambiguous. Presence of the right cannot prove who granted it. The
+  candidate refuses that state and preserves evidence; native recovery policy
+  and durable uninstall provenance need other-provider architecture/security
+  review. Exact API, integration requirements and all unimplemented native work
+  are documented in service-foundation.md. This is not an ADR amendment.
+- Actual checks: nine new tests passed; 16 combined owner-plan/transaction tests
+  passed; four config and two layout tests passed. `cargo fmt --all -- --check`,
+  `cargo test --workspace --no-run`, and workspace/all-target Clippy with
+  `-D warnings` passed. Two safely
+  restored guard mutations failed assertions. Full workspace runtime tests are
+  excluded because existing tests invoke service dispatch/owner arguments.
+  No privileged, service, dispatch, installation, account/right mutation, settings,
+  provisioning, owner admin step or old Lab Manager/VM operation ran.
+- Pending: native owner_windows adapter, protected file publication and journal
+  storage, SCM/LSA calls and uninstall provenance, independent Opus review and
+  installed-service acceptance. All native paths are **unverified on real hardware**.
+
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.

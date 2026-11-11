@@ -1,5 +1,79 @@
 # Service config and owner-plan foundation
 
+## Windows owner transaction prerequisite: incomplete adapter handoff
+
+Sol / gpt-6.1-sol high, implementation sub-agent, base
+`1a45ba15640b608ee4c953a104c06e451a85d07b`. This change implements only an
+injected configure transaction prerequisite. It does **not** implement the
+requested native owner install/configure/uninstall adapter. No
+`owner_windows.rs`, native mutation, CLI/MCP route or auto-install is supplied.
+The existing `Plan::execute` remains nontransactional: do not use it for native
+Windows configure. Other-provider review remains pending. This candidate does
+not amend ADR0009 or establish M2 acceptance.
+
+Recovery obstacle: `configure_plan` orders `BatchRight(add)` before
+`AtomicConfig`. The LSA grant and filesystem publication have no common atomic
+commit. A process can die after changing the right and before durably recording
+success. Neither durable intent nor subsequent right presence proves who added
+the right. Automatically revoking in that state violates the ownership fence.
+The new engine preserves ambiguous evidence and refuses further mutation.
+Native recovery and durable uninstall ownership evidence still need architecture/
+security review and implementation; no product approval flow is introduced.
+
+Exact callable API in `service::owner_transactions`:
+
+- `Configure::from_plan(&Layout, &Plan, &impl Resolver) -> Result<Configure, Failure>`:
+  Windows configure shapes only; fresh new/expected config validation, build-pin
+  equality and grant-record consistency. Read-only `bytes()`, `expected()`,
+  `sid()`, `adds_right()` contain private data.
+- `configure(&Configure, &mut impl ConfigurationIo) -> Result<(), Failure>`:
+  refuse outstanding journal; prepare/flushed staging; durable intent; exact SID
+  grant; durable success receipt; publish. Grant/receipt errors preserve intent.
+  Publication errors invoke receipt-backed recovery. Pre-existing rights create
+  no new receipt and are never compensated.
+- `recover(&mut impl ConfigurationIo) -> Result<Recovery, Failure>`:
+  `Clean`, `Published` or `Compensated`. Intent always refuses regardless of
+  right presence. A granted receipt plus matching new config retains the right;
+  matching old config permits compensation. Other bytes refuse; failed
+  compensation/cleanup retains the receipt for retry.
+- `Journal::{encode, decode}`: bounded (1024 bytes), strict, versioned encoding.
+  Parsing is not provenance. Journal/Configure omit Debug; errors are fixed.
+- `ConfigurationIo`: `journal`, `prepare`, `write_journal`, `grant_batch`,
+  `revoke_batch`, `publish`, `config_hash`, `clear_journal`. Only the recording
+  test model implements this trait here.
+
+Coordinator requirements before activation: authenticate a native session,
+acquire the fixed transaction lock and validate elevation/current-binary file
+identity/layout protections **before any I/O method**, including recovery.
+Retain that authority and source/ancestor handles through use. `prepare` must
+revalidate accounts, actual right observations and exact expected config bytes.
+Implement exclusive protected SYSTEM-owner staging and atomic journal/config
+publication, strict ACL/inheritance/owner policy and reparse/hardlink refusal;
+never repair foreign objects. Resolve target-handle sharing for atomic replacement
+without losing target identity. Define the fixed private journal path, abandoned
+staging cleanup, and grant provenance retained after successful configure,
+including uninstall/reconfigure/reinstall semantics. Do not use right presence
+or `granted_batch_right` alone as a native uninstall receipt. Ambiguous intent
+must never invent ownership. Hashes compare config bytes, not filesystem identity,
+ACLs, journal origin or durability. Concurrent privileged account/right writers
+require explicit treatment; the model does not serialize them.
+
+Still absent: genuine native owner preconditions/file writes, SCM registration
+and identical-only verification, fixed service-state mapping, bounded stop/remove,
+LSA mutation, uninstall receipt storage and non-Windows native refusal entry.
+Do not wire CLI/Application to this candidate until implementation and independent
+review. Installed/native paths remain **unverified on real hardware**.
+
+Actual Windows evidence: nine new recording/parser/plan tests and all 16
+owner-plan/transaction tests passed. Two restored source mutations were killed
+by assertions: bypass intent refusal; bypass old-config hash check before revoke.
+Four config and two layout tests also passed. `cargo fmt --all -- --check`,
+`cargo test --workspace --no-run` and
+`cargo clippy --workspace --all-targets -- -D warnings` passed. These do not
+establish native ACL/atomic rename/LSA/SCM behavior. Full workspace runtime
+execution is excluded because existing tests launch `service run` (SCM dispatch)
+and owner-command arguments, explicitly prohibited on this PC even for tests.
+
 This M2 slice is library-only. It does not install, configure or start a service.
 No agent-facing API or CLI selects these plans. The lifecycle production entry
 continues to fail closed. No current-user execution config was added.
