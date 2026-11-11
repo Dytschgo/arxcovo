@@ -404,7 +404,8 @@ tests never relax a production check.
 | Someone adds the right while `granted` | Collapses into Arxcovo's membership, and uninstall removes it (decision 2). Re-add it after uninstall if you want to keep it. |
 | Someone adds the right while `none` | Never Arxcovo's, never revoked. |
 | Someone adds the right during the intent window | `unproven`, never revoked, reported. |
-| Account deleted, or recreated (new SID) | Config revalidation refuses (`account_identity_changed`). Configure refuses the SID change, as `configure_plan` already does, and the cross-SID record refuses. Uninstall revokes by the old SID, which does not require the account to exist. |
+| Configured account name missing | Preflight reports `account_missing`. Uninstall uses the record's old SID without requiring the account to exist. |
+| Configured name resolves to a different SID | Preflight reports `account_identity_changed`. Configure refuses the SID change, as `configure_plan` already does, and the cross-SID record refuses. Uninstall uses the record's old SID. |
 | Domain GPO manages User Rights Assignment | Outside the guarantee: a policy refresh may remove or replace the assignment. Preflight reports `batch_right_missing`. |
 | Record hand-edited or deleted by an administrator | Deleting it forgets the grant, so the right is never revoked. A valid edit is treated as the administrator's assertion. A record that is invalid or wrongly protected refuses with `RecoveryRequired` (manual repair below). |
 | Config hand-edited | Startup still fails with exit 4 if the owner changed. Configure refuses `Conflict` if the expected bytes differ. The record is unaffected. |

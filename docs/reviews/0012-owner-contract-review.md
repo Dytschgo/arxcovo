@@ -31,3 +31,6 @@ No application tests or privileged operations ran.
 Counts: Standards 0; Spec 2, worst P1 (unsupported power-loss guarantee).
 The owner record and native adapter are not implemented or accepted by this
 review. Dedicated-account, installed-service and M2 acceptance remain open.
+
+Disposition: Codex corrected P2's two reason cases in the ADR after this review.
+P1 remains open; the architecture contract is not accepted.
