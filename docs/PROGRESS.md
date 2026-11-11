@@ -160,6 +160,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
+| Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
@@ -925,3 +926,15 @@ later integration. No push, GitHub write, PR, merge, watch or delegation occurre
   the failed evidence for an Opus architecture/debugging handoff before another
   test-isolation correction. No native owner operation or installation ran.
   Privileged paths remain **unverified on real hardware**.
+- Anthropic / claude-opus-5-5, high, diagnosis handoff on base 586c8ca.
+  - Cause: a directory rename needs its parent open for write. The five
+    child-launching `development::windows` tests pin `%TEMP%` with read-only
+    sharing, the intended production ancestor rule. While they run, renames of
+    fixture parents placed directly under `%TEMP%` fail with error 32.
+    Process-local mutexes cannot help, so both nextest and `cargo test` failed.
+  - Test-only patch artifact: `docs/reviews/windows-owner-store-fixture-isolation.patch`.
+  - Patched results: full nextest 5/5 and `cargo test --workspace` 3/3, 144 passed
+    each. The minimal pair passed 12/12 after going red 6/6. Both
+    retained-ancestor and delete-sharing mutations fail.
+  - Evidence is in `docs/reviews/windows-owner-store-fixture-debug.md`. Sol
+    applies the patch; no source changed in this handoff.
