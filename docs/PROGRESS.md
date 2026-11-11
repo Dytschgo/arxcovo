@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -987,3 +987,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared existing #30 locally on refreshed Application head `4f29ecf`. Provenance/config/plan source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `4b2b769`, including both stale-plan directions and direct unresolved-Intent uninstall tests. CI helpers/workflows match the prepared Application. Only PROGRESS conflicted; historical task evidence and all provider rows are preserved. The older prerequisite-handoff section was moved below Current state, restoring the required first section.
 - Formatting and 26/26 CI-helper tests passed. Rust suites were not repeated for a source-identical history/CI update. No push, new feature PR or native owner/admin operation. Publish only after the Application parent lands, then refresh metadata and obtain a fresh exact-head independent recheck. Native provenance/LSA and installed dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Windows owner store and SCM queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #33 on the refreshed #30 branch, then existing #35 on that owner-store branch. Neither head was pushed and no new PR was opened. Source/packaging/Cargo/toolchain/script equivalence is exact against published owner-store `d6df821` and SCM `54c43fb` respectively; CI helpers/workflows match their refreshed parents. Only PROGRESS conflicted; provider rows and historical task evidence are preserved and Current state is first.
+- Formatting and 26/26 CI-helper tests passed on the combined SCM tree. Rust/SCM suites were not repeated for unchanged source. Full SCM independent review remains required; the owner-store fresh identity-test follow-up requires its own exact-head recheck after its parents land. Publication stays in dependency order after #25/#27/#30. No actual SCM/LSA, production owner session, privilege or admin operation. Native installed-service/dedicated-account M2 acceptance remains **unverified on real hardware**.
