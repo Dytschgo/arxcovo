@@ -17,7 +17,10 @@ fn private_dir() -> tempfile::TempDir {
     // macOS exposes its temporary root through /var, a system symlink.
     // Resolve that trusted test root before creating a valid fixture; application
     // paths and the explicit symlink rejection tests still reject links.
+    #[cfg(target_os = "macos")]
     let root = std::env::temp_dir().canonicalize().unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let root = std::env::temp_dir();
     let dir = tempfile::tempdir_in(root).unwrap();
     #[cfg(unix)]
     {
