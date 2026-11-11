@@ -122,18 +122,53 @@ and refuses entries rather than pretending mode bits describe their grants.
 No symbolic-path canonicalization is performed. In particular, macOS /var and
 /etc aliases are refused; the fixed macOS service layout uses explicit paths.
 
-Unix identity is deliberately narrower than the eventual installation contract:
-only a unique user in the protected, bounded (1 MiB) local /etc/passwd database,
-UID >= 1000 and a login shell, matching bounded getpwnam_r observation, can pass.
-getgrouplist is capped at 1024 groups and getgrnam_r at 64 KiB; Linux sudo/wheel
-membership is checked in both rights directions by the existing config policy.
-This is **not complete macOS identity support**: modern OpenDirectory users and
-UID 501 accounts refuse, as does the /etc link. A reviewed local OpenDirectory
-adapter with explicit user/service classification, bounded records and native
-admin-group membership remains required. No NSS-only or current-user fallback
-is used. Linux installations outside the conservative local-user profile also
-refuse pending explicit native classification. No claim about arbitrary sudoers
-policy or actual elevated execution follows from group membership alone.
+Linux identity retains the protected, bounded (1 MiB) local /etc/passwd
+requirement, UID >= 1000, login shell and bounded NSS equality. getgrouplist
+is capped at 1024 groups; getgrnam_r uses 64 KiB. No Linux cutoff was lowered.
+
+macOS instead opens only OpenDirectory's `/Local/Default` node. Exact Users
+queries cap results at two and require exactly one, with unique canonical
+name, decimal UID and generated UUID queries agreeing on the full observed
+profile. Requested attributes are limited to seven; dictionary/array/string
+counts are checked before application traversal (16 keys, one value per
+attribute, 1024 UTF-16 units). Local node location is required; original-node
+attributes refuse mobile/cached directory records. Only ordinary login profiles
+(UID >= 501, excluding root/reserved nobody, non-system name, nonzero group,
+recognized Apple login shell and well-formed nonzero UUID) pass. This is a
+conservative native Users/profile classification, not a claim that Apple has
+a Windows-style normal-account flag. Aliased/multivalued names, custom shells,
+and mobile/directory accounts deliberately refuse. UID 501 can pass only when
+these native observations establish the local profile. NSS supplies no authority.
+The unique local admin group is selected by its system group ID and canonical
+name; ODRecordContainsMember observes direct/nested membership and errors refuse.
+No command, authentication attribute, credential or account mutation is used.
+
+Config retains nonserialized incarnation observations for both principals and
+compares them on revalidation, covering canonical-name, UUID, group and admin
+membership changes even when numeric pins remain equal. Fresh OD objects are
+created on each observation; concurrent privileged edits are not transactional.
+The optional resolver revision hook defaults to no additional evidence for
+existing Windows/Linux adapters; their account and rights checks remain intact.
+This observes admin status only. It enables no execution: macOS admin execution
+must remain refused until a reviewed boundary contains root descendants. A
+build-UID sweep after sudo does not establish descendant cleanup.
+
+macOS ACL observation now uses fstatx_np and the filesec ACL-presence property:
+a successfully absent property is empty; a present valid ACL must exhaust its
+first-entry lookup with -1/EINVAL. Zero means an entry and refuses; retrieval,
+property and validity errors refuse. Native temporary-file tests cover absent,
+explicit empty, nonempty and invalid-descriptor cases. User-owned fixtures are
+explicitly refused by root private policy. No owner, mode, ACL or ancestry
+policy was relaxed. Native allocations are released on all owned paths.
+
+Query limits and application buffer bounds do not bound native internal memory
+allocation or elapsed time. ODQueryCopyResults(false), membership resolution,
+and filesystem APIs can block; no enforceable deadline or cancellation is
+claimed. A future service integration must isolate blocking observations if it
+requires a hard deadline. Native macOS identity/ACL tests are gated to macOS
+and remain **unverified on real hardware** on this Windows builder. Modern
+local-Mac support is an unreviewed implementation candidate until hosted native
+link/runtime checks pass; installed-service/M2 acceptance remains open.
 
 These are point-in-time observations. Unix retained directory handles prevent
 link traversal into a different object, but do not freeze renames; workspace
@@ -147,7 +182,7 @@ or implement equivalent secure reopen/identity checks, verify strict TokenUser
 at startup and all state/journal/lock objects, and cover runtime layout changes.
 
 Remaining integration: production Application config/store/audit/endpoint hooks;
-OpenDirectory identity support; privileged installed-layout tests; owner-context,
+hosted OpenDirectory identity/ACL validation; privileged installed-layout tests; owner-context,
 atomic config publication/recovery and SCM/LSA/systemd/launchd adapters. The
 PR16 stable Windows checked-path correction at
 `8c3856a8856548feeb233cd6960e920763412554` is not imported: this adapter validates
@@ -158,3 +193,12 @@ launch, account/right/task or service-manager mutation was performed here.
 Native API references used during implementation:
 [NetUserGetLocalGroups](https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netusergetlocalgroups)
 and [Apple acl_get_entry](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_entry.3.html).
+Apple contracts consulted for this revision:
+[CFOpenDirectory APIs and ownership](https://github.com/apple-oss-distributions/DirectoryService/blob/main/Server/CFOpenDirectory/CFOpenDirectory.h),
+[SDK match constants](https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX11.3.sdk/System/Library/Frameworks/OpenDirectory.framework/Versions/A/Frameworks/CFOpenDirectory.framework/Versions/A/Headers/CFOpenDirectoryConstants.h),
+[filesec properties](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h),
+[ACL retrieval](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_file.c),
+[filesec implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c),
+[entry iteration](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_entry.c),
+[ACL text syntax](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_translate.c),
+and [native membership test contracts](https://github.com/apple-oss-distributions/Libinfo/blob/main/membership.subproj/membership.h).

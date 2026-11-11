@@ -201,3 +201,49 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   independent. No owner admin steps, installation, account/right/task changes,
   service-manager mutation, push, PR, merge, settings, dispatch or watch occurred.
   Independent other-provider security review remains coordinator work.
+
+## macOS local-account observation candidate
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high, working alone from
+  `0a16eb2c81014093126eefa77f0901b86a485867`. Added a fixed-local-node
+  OpenDirectory resolver, conservative native Users/login-profile classification,
+  unique name/UID/UUID checks, native nested admin membership and nonserialized
+  incarnation revalidation. Linux conservative identity behavior and Windows
+  policy are retained. No admin execution is enabled; the concurrent architecture
+  correction remains separate. No ADR0009, service-install or development modules
+  were edited. Last merged PR and milestone acceptance statuses are unchanged.
+- ACL review found that acl_get_fd_np does not by itself distinguish absent ACL
+  property from retrieval failure. The adapter now checks filesec presence after
+  successful fstatx_np; absent/valid-empty pass observation, entries/errors refuse.
+  Added macOS-only unprivileged identity and temporary-file ACL positive/error
+  controls. User-owned files still refuse root private policy. Apple API/header
+  references and exact supported profiles are in service-foundation.md.
+- Executed on Windows: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace`: 71 passed (the original 70 plus incarnation test),
+  one subprocess-only fixture directly ignored and exercised by its parent.
+  `python scripts/test-service-artifacts.py -v`: three passed, two platform-native
+  checks skipped. An isolated rustc harness imported the actual macOS pure policy
+  source: three tests passed (classification negatives, result/error/count/ACL
+  contracts, rename/replacement/membership revision changes).
+- Seven restored source mutations were killed by assertions: skip local-node
+  classification, accept mismatched native record type, ignore membership error,
+  accept nonempty ACL, ignore array bound, accept duplicate records, skip config
+  incarnation comparison. The first six used the isolated actual-policy harness;
+  the last ran `cargo test -p arxd --lib service::config::revision_tests`.
+  These demonstrate portable guard sensitivity, not native macOS execution.
+- Isolated manifest under ignored target/native-check imports actual service
+  layout/config/native sources: `cargo check --tests` and `cargo clippy --tests`
+  for aarch64-apple-darwin and x86_64-unknown-linux-gnu passed. Isolated Clippy
+  uses `-A dead_code -D warnings` because serialized has no owner-plan caller
+  there. Workspace Clippy used no suppression. Metadata is not framework link,
+  full cross-build or runtime proof. Full cross-builds were not rerun: the known
+  Windows-host bundled SQLite cross-C-compiler limitation remains.
+- Remaining: independent other-provider security review and hosted macOS native
+  link/runtime checks after coordinator publication. Modern local-Mac support
+  remains an unreviewed candidate; custom-shell, alias/multivalue, mobile and
+  directory profiles refuse. Native APIs can block; bounded traversal does not
+  supply a hard deadline. Installed-service identity/layout and M2 acceptance
+  remain **unverified on real hardware** and open. No provisioning, elevation,
+  owner steps, commands for identity lookup, push/PR/merge/watch, dispatch,
+  settings or old Lab Manager access occurred.
