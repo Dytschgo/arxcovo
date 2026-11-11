@@ -540,3 +540,24 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Windows formatting and all-target Clippy passed for this diagnostic candidate.
   They do not compile or execute the macOS-only fixture. Hosted macOS collection
   and independent review are pending; no startup-policy result is claimed.
+
+## Hosted macOS stock-directory evidence
+
+- Codex / gpt-6.1-sol, medium inspected completed macOS job130592903303,
+  run43041133895 at69c1a6c. All five fixed-directory observations were captured.
+  The current integrity policy accepts library/private/var, but rejects
+  application_support (root owner, nonzero group, mode0755, confirmed empty ACL)
+  and runtime_parent (root owner, nonzero group, mode0775, confirmed empty ACL).
+  Exact bounded rows are in docs/evidence/macos-stock-directory-observations.json.
+- This confirms a startup policy blocker on the hosted image; the two cases
+  require distinct authority analysis before a rule is relaxed. No account IDs,
+  names, paths, directory contents or private owner data are in the artifact.
+  A diagnostic pass is evidence collection, not service acceptance.
+- Windows jobs130590445341 (PR27) and130594256686 (PR30) passed and each logged
+  the native hot-journal regression PASS after explicit fixture ownership.
+  Their Ubuntu jobs130590445512 and130594255972, and PR31 job130592903706,
+  each contain 52 mirror-DNS failure lines during Playwright dependencies.
+  Required Ubuntu checks remain failed; no further retry or gate bypass occurred.
+- Installed service, dedicated-account execution and physical hardware paths
+  remain **unverified on real hardware**. Architecture review and the full
+  milestone acceptance remain open.

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "kind": "read_only_hosted_macos_observation",
+  "source": {
+    "runId": 43041133895,
+    "jobId": 130592903303,
+    "head": "69c1a6c2d498e8d2089d3588c3f9039364b1515b",
+    "runner": "macos-latest"
+  },
+  "observations": [
+    {
+      "current_integrity_policy_accepts": true,
+      "empty_acl_confirmed": true,
+      "group_zero": true,
+      "mode": 493,
+      "root_owner": true,
+      "target": "library"
+    },
+    {
+      "current_integrity_policy_accepts": false,
+      "empty_acl_confirmed": true,
+      "group_zero": false,
+      "mode": 493,
+      "root_owner": true,
+      "target": "application_support"
+    },
+    {
+      "current_integrity_policy_accepts": true,
+      "empty_acl_confirmed": true,
+      "group_zero": true,
+      "mode": 493,
+      "root_owner": true,
+      "target": "private"
+    },
+    {
+      "current_integrity_policy_accepts": true,
+      "empty_acl_confirmed": true,
+      "group_zero": true,
+      "mode": 493,
+      "root_owner": true,
+      "target": "var"
+    },
+    {
+      "current_integrity_policy_accepts": false,
+      "empty_acl_confirmed": true,
+      "group_zero": false,
+      "mode": 509,
+      "root_owner": true,
+      "target": "runtime_parent"
+    }
+  ],
+  "installedServiceAcceptance": false
+}
