@@ -128,6 +128,12 @@ Unix uses descriptor-relative openat/O_NOFOLLOW, fstatfs, fstat metadata, and
 retained ancestor descriptors. Linux accepts only ext-family, XFS, Btrfs, tmpfs
 and F2FS filesystem magic values; unknown/network/overlay filesystems refuse.
 macOS requires MNT_LOCAL. Trusted ancestry must satisfy root integrity policy.
+ADR 0015 (macOS only): a traversed ancestor needs UID 0, `mode & 0o7022 == 0`
+and an empty ACL, and its GID is not compared. Final objects keep their exact
+GID 0 rules. The macOS endpoint is `/Library/Application Support/Arxcovo/run/
+arxd.sock`, because `/private/var/run` (`0775`, nonzero group) stays refused.
+Objects newly created on macOS are `fchown`ed to 0:0 because of BSD group
+inheritance. Not yet implemented; **unverified on real hardware**.
 Additional Linux access ACLs refuse; macOS uses native extended-ACL observation
 and refuses entries rather than pretending mode bits describe their grants.
 No symbolic-path canonicalization is performed. In particular, macOS /var and

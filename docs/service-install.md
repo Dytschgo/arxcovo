@@ -138,7 +138,11 @@ token into chat, an issue, a command line or a log.
 
 1. **(admin)** Create a **standard** (not administrator) user named `arxcovo`
    in System Settings › Users & Groups, and create its workspace under its home.
-2. **(admin)** Place the binary at
+2. **(admin)** Create `/Library/Application Support/Arxcovo` and its
+   `libexec` folder with
+   `sudo install -d -o root -g wheel -m 0755 "/Library/Application Support/Arxcovo/libexec"`.
+   `Arxcovo` must stay `0755`, so that your user can reach the endpoint
+   folder `Arxcovo/run`. Place the binary at
    `/Library/Application Support/Arxcovo/libexec/arxd`, owned by `root:wheel`
    with mode `0755`. Then run `sudo … service install`, run `client-config new`
    as yourself, and finish with `sudo … service configure …` and `sudo …
@@ -156,6 +160,13 @@ token into chat, an issue, a command line or a log.
    launchd, `cron` or `at` starts for that account later, blocks further
    commands until the service restarts. Do not use that account interactively
    or give it login items while the service is running.
+5. **Endpoint (ADR 0015, not yet implemented).** The service creates
+   `/Library/Application Support/Arxcovo/run` itself. Do not change stock
+   folders such as `/private/var/run`. An earlier `/private/var/run/arxcovo` is
+   ignored. You may remove it by hand: `sudo rm` a leftover socket, then
+   `sudo rmdir` the folder. Rerun `client-config new`, because older client
+   configs name the old path and are refused. After a crash or power loss,
+   remove the stale `run/arxd.sock` by hand; it now survives a reboot.
 
 ## Start, stop and reboot (Linux and macOS, ADR 0014)
 
@@ -188,8 +199,8 @@ token into chat, an issue, a command line or a log.
   the macOS one. If either path already exists with the wrong owner or mode,
   start is refused. Nothing repairs it for you.
 - macOS service startup is **not yet expected to work on a stock install**.
-  The ancestor-folder policy for `/Library/Application Support` and
-  `/private/var/run` is still an open decision.
+  ADR 0015 settles the pass-through policy and new runtime location, but
+  implementation and the required hosted positive controls are still pending.
 - Windows currently registers the service as automatic (delayed). It can
   therefore start at boot even after install alone, or after a stop. This will
   be aligned with the rules above in a later change.

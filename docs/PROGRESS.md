@@ -903,3 +903,83 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   required. PR29, installed acceptance and remaining M2 are NOT complete. All real
   manager and installed paths are **unverified on real hardware**. No real manager,
   privileged fixture, owner admin, dispatch, settings, old Lab Manager or VM ran.
+
+## macOS stock-directory observation preparation
+
+- Codex / gpt-6.1-sol, medium added a read-only macOS fixture and a targeted
+  hosted CI invocation to retain its bounded output. It opens five fixed system
+  directories with descriptor-relative no-follow traversal and reports fixed
+  labels, root-owner/group-zero booleans, mode bits, ACL-check success and the
+  existing integrity-policy result. No raw IDs, account names, paths, directory
+  listings or contents are emitted. It changes no owner, permission or policy.
+- This is diagnostic evidence collection, not a passing startup/containment
+  assertion. A diagnostic pass means the observations were captured, even when
+  the policy rejects a stock folder. Native macOS execution remains pending;
+  Windows-only checks cannot establish these facts. Architecture/security review
+  is required before any rule is relaxed. Installed services remain
+  **unverified on real hardware**.
+
+- Windows formatting and all-target Clippy passed for this diagnostic candidate.
+  They do not compile or execute the macOS-only fixture. Hosted macOS collection
+  and independent review are pending; no startup-policy result is claimed.
+
+## Hosted macOS stock-directory evidence
+
+- Codex / gpt-6.1-sol, medium inspected completed macOS job130592903303,
+  run43041133895 at69c1a6c. All five fixed-directory observations were captured.
+  The current integrity policy accepts library/private/var, but rejects
+  application_support (root owner, nonzero group, mode0755, confirmed empty ACL)
+  and runtime_parent (root owner, nonzero group, mode0775, confirmed empty ACL).
+  Exact bounded rows are in docs/evidence/macos-stock-directory-observations.json.
+- This confirms a startup policy blocker on the hosted image; the two cases
+  require distinct authority analysis before a rule is relaxed. No account IDs,
+  names, paths, directory contents or private owner data are in the artifact.
+  A diagnostic pass is evidence collection, not service acceptance.
+- Windows jobs130590445341 (PR27) and130594256686 (PR30) passed and each logged
+  the native hot-journal regression PASS after explicit fixture ownership.
+  Their Ubuntu jobs130590445512 and130594255972, and PR31 job130592903706,
+  each contain 52 mirror-DNS failure lines during Playwright dependencies.
+  Required Ubuntu checks remain failed; no further retry or gate bypass occurred.
+- Installed service, dedicated-account execution and physical hardware paths
+  remain **unverified on real hardware**. Architecture review and the full
+  milestone acceptance remain open.
+
+## PR31 observation review follow-up
+
+- Independent Anthropic / claude-opus-5-5 review passed6dda6e3 (requested high
+  effort; the reviewer did not independently observe the effort setting). No
+  blocking finding was raised. The retained source metadata now also names the
+  immutable macos-26-arm64 image version20261102.0473.1, checked directly in the
+  original job130592903303 setup log. Observation rows are unchanged.
+- Each current_integrity_policy_accepts value checks that opened directory on
+  its own; it does not establish a complete protected path or installed layout.
+  The 0755 application's support group has no mode-bit write authority. The
+  0775 runtime-parent group has write/execute authority with no sticky bit,
+  allowing namespace entry creation/rename/removal; relaxing only the group-ID
+  rule would correctly still refuse it. Neither fact alone justifies a policy
+  relaxation. A dedicated macOS architecture correction remains in progress.
+- This follow-up changes documentation/metadata only. No new native runtime,
+  installed service or M2 acceptance is claimed. Hosted checks and the exact-head
+  documentation recheck remain required before merge.
+
+## Unix runner and macOS contract integration checkpoint
+
+- Codex / gpt-6.1-sol, medium integrated candidatec7d7e85: bounded native
+  manager queries, fresh gates/expectations, skip counting and root-required
+  status. Builder formatting, Clippy, test compilation and 18 portable tests
+  passed; six native Unix fixtures compiled as metadata but were not run.
+  Timeout/nonzero mutation evidence is still outstanding. Unsupported
+  StartPreflight/ProvisionState refuse during whole-plan validation.
+- Anthropic / claude-opus-5-5, high supplied ADR0015; Codex / gpt-6.1-sol,
+  medium independently reviewed26364b9 and accepted the bounded contract.
+  Pass-through-only macOS ancestry can ignore a non-writing group, while leaves,
+  Linux and Windows stay strict. The old writable runtime parent remains
+  refused; the fixed endpoint moves beneath the existing traversable Arxcovo
+  root. Created regular-file/directory group ownership is explicit, and socket
+  ownership still follows the configured client. Primary XNU source checks,
+  scope and remaining controls are in the retained review.
+- This integration adds the reviewed contract and existing read-only observation
+  fixture, not the macOS policy implementation. Owner preflight, retained-state
+  provisioning and runtime-directory creation remain incomplete. No actual
+  manager, owner or privileged operation ran; installed paths remain
+  **unverified on real hardware**. PR29 remains a work in progress.

@@ -15,6 +15,10 @@ Decisions 1, 3 and 6, the plans, the matrix and the tests below are corrected
 in place, and decision 7 settles install retry and reinstall. No implementation
 exists yet, so nothing is superseded in code.
 
+Amended by ADR 0015 for the macOS pass-through policy, created-object group
+ownership and fixed endpoint location. Its boot and lifecycle rules otherwise
+remain as specified here; the old group-writable runtime parent stays refused.
+
 ## Context
 
 The PR29 review found these defects:
