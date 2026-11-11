@@ -1036,3 +1036,21 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   Mac startup stays blocked by the old strict ancestor/endpoint policy.
   All native manager/root-owned/installed paths are **unverified on real hardware**.
   No real manager, privileged harness, admin action, old Lab Manager or VM work ran.
+
+## Unix preflight and retained-state coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidatefc7aae4. Owner start now
+  validates protected config/state and accepts only a missing endpoint directory;
+  existing unsafe endpoint objects refuse. Config uses inventory parsing and a
+  workspace-observation trap protects the privilege boundary. ProvisionState
+  retains existing valid rollback-header DB/journal bytes, creates only missing
+  empty prerequisites, takes the nonblocking lock and rechecks companions.
+- Builder fmt, all-target Clippy, test compilation and33 relevant tests passed.
+  Linux/macOS metadata and Clippy passed without native linking or execution.
+  The header-bypass mutation failed and was restored. Filesystem/lock/workspace
+  and runner-timeout/nonzero mutation execution remain outstanding on Unix.
+- No Mac namespace/endpoint creation or installed-service acceptance is claimed;
+  that reviewed correction is a separate isolated build. Real managers, LSA/SCM,
+  account/right/task/service operations were not run. Native installed paths
+  remain **unverified on real hardware**. Full independent implementation review
+  and current-head hosted checks are still required.
