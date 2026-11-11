@@ -11,7 +11,7 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE, LocalFree},
+    Foundation::{ERROR_NONE_MAPPED, GENERIC_READ, GetLastError, INVALID_HANDLE_VALUE, LocalFree},
     NetworkManagement::NetManagement::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
@@ -65,6 +65,15 @@ fn string(p: *const u16, cap: usize) -> Result<String, Error> {
         String::from_utf16(std::slice::from_raw_parts(p, n)).map_err(|_| Error::Identity)
     }
 }
+// Only an explicit native not-found result establishes absence. Access denied,
+// insufficient buffers and directory-service failures establish no such fact.
+fn lookup_failure(code: u32) -> Error {
+    if code == ERROR_NONE_MAPPED {
+        Error::AccountMissing
+    } else {
+        Error::Identity
+    }
+}
 fn lookup(name: &str) -> Result<(Vec<u32>, SID_NAME_USE), Error> {
     let name = wide(name);
     let mut sid = vec![0u32; 17];
@@ -84,7 +93,7 @@ fn lookup(name: &str) -> Result<(Vec<u32>, SID_NAME_USE), Error> {
         )
     } == 0
     {
-        return Err(Error::Identity);
+        return Err(lookup_failure(unsafe { GetLastError() }));
     }
     Ok((sid, kind))
 }
@@ -113,8 +122,10 @@ pub fn account(value: &str) -> Result<Account, Error> {
                 &mut kind,
             )
         } == 0
-            || kind != SidTypeUser
         {
+            return Err(lookup_failure(unsafe { GetLastError() }));
+        }
+        if kind != SidTypeUser {
             return Err(Error::Identity);
         }
         let name = string(name.as_ptr(), 257)?;
@@ -172,7 +183,7 @@ pub fn account(value: &str) -> Result<Account, Error> {
     for i in 0..read as usize {
         let group = unsafe { &*p.cast::<LOCALGROUP_USERS_INFO_0>().add(i) };
         let name = string(group.lgrui0_name, 257)?;
-        let (sid, kind) = lookup(&name)?;
+        let (sid, kind) = lookup(&name).map_err(|_| Error::Identity)?;
         if kind != SidTypeAlias {
             return Err(Error::Identity);
         }
@@ -361,6 +372,23 @@ fn open_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_lookup_errors_only_confirm_explicit_absence() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_SUCH_DOMAIN,
+        };
+        assert_eq!(lookup_failure(ERROR_NONE_MAPPED), Error::AccountMissing);
+        for code in [
+            0,
+            ERROR_ACCESS_DENIED,
+            ERROR_INSUFFICIENT_BUFFER,
+            ERROR_NO_SUCH_DOMAIN,
+            u32::MAX,
+        ] {
+            assert_eq!(lookup_failure(code), Error::Identity);
+        }
+    }
+
     #[test]
     fn reparse_leaf_and_ancestor_refuse_on_local_junction() {
         use std::os::windows::process::CommandExt;

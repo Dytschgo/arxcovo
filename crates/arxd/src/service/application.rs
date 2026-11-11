@@ -4,6 +4,7 @@ use super::{
     config::ServiceConfig,
     layout::{Error, Layout},
     native,
+    preflight::ExecutionUnavailable,
 };
 use crate::{
     local::Listener,
@@ -19,7 +20,7 @@ pub(crate) trait Hooks: Send + Sync + 'static {
     fn layout(&self, layout: &Layout) -> Result<Vec<native::Observed>, ExitCode>;
     fn store(&self, layout: &Layout) -> Result<Activity, ExitCode>;
     fn bind(&self, layout: &Layout, client: String) -> Result<Listener, ExitCode>;
-    fn preflight(&self, layout: &Layout, config: &ServiceConfig) -> &'static str;
+    fn preflight(&self, layout: &Layout, config: &ServiceConfig) -> ExecutionUnavailable;
 }
 pub(crate) struct Native;
 impl Hooks for Native {
@@ -41,16 +42,20 @@ impl Hooks for Native {
     fn bind(&self, layout: &Layout, client: String) -> Result<Listener, ExitCode> {
         Listener::bind_service(layout, client).map_err(|_| ExitCode::Endpoint)
     }
-    fn preflight(&self, layout: &Layout, config: &ServiceConfig) -> &'static str {
+    fn preflight(&self, layout: &Layout, config: &ServiceConfig) -> ExecutionUnavailable {
         match config.execution_preflight(layout, &native::NativeResolver) {
-            Ok(()) => "mechanism_unavailable",
-            Err(_) => "preflight_failed",
+            Ok(()) => ExecutionUnavailable::MechanismUnavailable,
+            Err(reason) => reason,
         }
     }
 }
 fn category(error: Error) -> ExitCode {
     match error {
-        Error::Config | Error::Identity | Error::Rights | Error::Workspace => ExitCode::Config,
+        Error::Config
+        | Error::Identity
+        | Error::AccountMissing
+        | Error::Rights
+        | Error::Workspace => ExitCode::Config,
         Error::Permissions | Error::OwnerRequired => ExitCode::Permissions,
         _ => ExitCode::Layout,
     }
@@ -189,7 +194,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
                 .blocking
                 .run(move || Ok(hooks.preflight(&layout, &config)))
                 .await
-                .unwrap_or("preflight_failed");
+                .unwrap_or(ExecutionUnavailable::PreflightFailed);
             activity.set_service_reason(reason);
         }
     }

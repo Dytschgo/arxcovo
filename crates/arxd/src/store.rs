@@ -1,3 +1,4 @@
+use crate::service::preflight::ExecutionUnavailable;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
@@ -5,7 +6,7 @@ use std::{path::Path, sync::Mutex, time::Duration};
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     db: Mutex<Connection>,
-    service_reason: Mutex<Option<&'static str>>,
+    service_reason: Mutex<Option<ExecutionUnavailable>>,
     _lock: std::fs::File,
     _service_pins: Vec<crate::service::native::Observed>,
 }
@@ -116,15 +117,17 @@ impl Activity {
         tx.commit()?;
         Ok(Self {
             db: Mutex::new(db),
-            service_reason: Mutex::new(service.then_some("mechanism_unavailable")),
+            service_reason: Mutex::new(
+                service.then_some(ExecutionUnavailable::MechanismUnavailable),
+            ),
             _lock: lock,
             _service_pins: pins,
         })
     }
-    pub(crate) fn service_reason(&self) -> Option<&'static str> {
+    pub(crate) fn service_reason(&self) -> Option<ExecutionUnavailable> {
         self.service_reason.lock().ok().and_then(|r| *r)
     }
-    pub(crate) fn set_service_reason(&self, reason: &'static str) {
+    pub(crate) fn set_service_reason(&self, reason: ExecutionUnavailable) {
         if let Ok(mut r) = self.service_reason.lock() {
             *r = Some(reason);
         }

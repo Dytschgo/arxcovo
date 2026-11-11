@@ -118,9 +118,9 @@ impl Hooks for Injected {
         self.event("bind")?;
         Listener::bind(&self.endpoint).map_err(|_| ExitCode::Endpoint)
     }
-    fn preflight(&self, _: &Layout, _: &ServiceConfig) -> &'static str {
+    fn preflight(&self, _: &Layout, _: &ServiceConfig) -> ExecutionUnavailable {
         self.event("preflight").unwrap();
-        "preflight_failed"
+        ExecutionUnavailable::PreflightFailed
     }
 }
 struct Report {
@@ -312,4 +312,147 @@ async fn real_normal_user_endpoint_inventory_and_shutdown_audit() {
         )
         .unwrap();
     assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn response_only_reason_table_completes_and_reads_back_without_private_data() {
+    use crate::service::preflight::ExecutionUnavailable::*;
+    use crate::store::Reason;
+    use rmcp::{ServiceExt, model::CallToolRequestParams};
+    use serde_json::{Value, json};
+    let dir = private_temp();
+    let activity = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    let inventory = crate::mcp::Inventory {
+        execution: None,
+        activity: activity.clone(),
+        principal: Some(crate::mcp::Principal("fixture-agent".into())),
+    };
+    let (server_io, client_io) = tokio::io::duplex(65536);
+    let server =
+        tokio::spawn(async move { inventory.serve(server_io).await.unwrap().waiting().await });
+    let client = ().serve(client_io).await.unwrap();
+    let table = [
+        (NotConfigured, "not_configured", Reason::Unavailable),
+        (
+            ServiceModeRequired,
+            "service_mode_required",
+            Reason::Unavailable,
+        ),
+        (
+            PlatformUnsupported,
+            "platform_unsupported",
+            Reason::Unavailable,
+        ),
+        (AccountMissing, "account_missing", Reason::PreflightFailed),
+        (
+            AccountIdentityChanged,
+            "account_identity_changed",
+            Reason::PreflightFailed,
+        ),
+        (RightsMismatch, "rights_mismatch", Reason::PreflightFailed),
+        (
+            AdminUnsupportedOnPlatform,
+            "admin_unsupported_on_platform",
+            Reason::PreflightFailed,
+        ),
+        (
+            BatchRightMissing,
+            "batch_right_missing",
+            Reason::PreflightFailed,
+        ),
+        (
+            MechanismUnavailable,
+            "mechanism_unavailable",
+            Reason::PreflightFailed,
+        ),
+        (
+            ServiceReconfigurationRequired,
+            "service_reconfiguration_required",
+            Reason::PreflightFailed,
+        ),
+        (PreflightFailed, "preflight_failed", Reason::PreflightFailed),
+        (Quarantined, "quarantined", Reason::Quarantined),
+        (Busy, "busy", Reason::Busy),
+        (Stopping, "stopping", Reason::Shutdown),
+    ];
+    for (detail, token, stored) in table {
+        activity.set_service_reason(detail);
+        let hosts = client
+            .call_tool(CallToolRequestParams::new("list_hosts"))
+            .await
+            .unwrap();
+        let hosts: Value = serde_json::from_str(&hosts.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(hosts["hosts"][0]["execution"]["reason"], token);
+        assert_eq!(hosts["hosts"][0]["execution"]["available"], false);
+        for tool in ["run_command", "discover_tools"] {
+            let args = if tool == "run_command" {
+                json!({"tool":"cargo", "args":["--version", "private-argument-marker"]})
+            } else {
+                json!({})
+            };
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await;
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(token));
+            let page = client
+                .call_tool(CallToolRequestParams::new("list_activity"))
+                .await
+                .unwrap();
+            let page: Value =
+                serde_json::from_str(&page.content[0].as_text().unwrap().text).unwrap();
+            let row = page["activities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["tool"] == tool)
+                .unwrap();
+            assert_eq!(row["reason"], stored.as_str());
+            assert_eq!(row["outcome"], "refused");
+            assert!(!page.to_string().contains("private-argument-marker"));
+            let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            let row: (String,String) = db.query_row("SELECT outcome, reason FROM activity WHERE principal='fixture-agent' AND tool=?1 ORDER BY id DESC LIMIT 1", [tool], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(row, ("refused".into(), stored.as_str().into()));
+            assert_eq!(
+                db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+                    .unwrap(),
+                3
+            );
+            let columns: Vec<String> = db
+                .prepare("PRAGMA table_info(activity)")
+                .unwrap()
+                .query_map([], |r| r.get(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                !columns
+                    .iter()
+                    .any(|s| s == "execution_reason" || s == "os_code")
+            );
+        }
+    }
+    client.cancel().await.unwrap();
+    server.await.unwrap().unwrap();
+    drop(activity);
+    let bytes = std::fs::read(dir.path().join("activity.sqlite3")).unwrap();
+    for token in [
+        "account_missing",
+        "account_identity_changed",
+        "rights_mismatch",
+        "admin_unsupported_on_platform",
+        "batch_right_missing",
+        "mechanism_unavailable",
+        "service_reconfiguration_required",
+        "platform_unsupported",
+        "service_mode_required",
+        "not_configured",
+        "os_code",
+        "private-argument-marker",
+    ] {
+        assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()));
+    }
 }
