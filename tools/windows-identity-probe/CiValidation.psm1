@@ -11,6 +11,8 @@ function Get-ProbeSetupDiagnostic([string]$Phase, [Management.Automation.ErrorRe
     $allowed=@('preflight','root','account','groups','directory-acls','payload','batch-right','task-definition','task-path','task-registration','task-run','task-wait','result-read','result-validation')
     $safePhase=if ($Phase -cin $allowed) { $Phase } else { 'unknown' }
     $exception=$Failure.Exception
+    # PowerShell wraps static .NET calls. Read only one inner type/code, never text.
+    if ($exception -is [Management.Automation.MethodInvocationException] -and $null -ne $exception.InnerException) { $exception=$exception.InnerException }
     $category=if ($exception -is [UnauthorizedAccessException]) { 'access-denied' }
         elseif ($exception -is [Runtime.InteropServices.COMException]) { 'com' }
         elseif ($exception -is [IO.IOException]) { 'io' } else { 'other' }

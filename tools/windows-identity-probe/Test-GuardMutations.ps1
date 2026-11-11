@@ -9,11 +9,17 @@ $mutants=[ordered]@{
     'child-exit'='Assert-Probe ($j.exitCode -eq 42);'
     'reparse-ancestor'='Assert-Probe (((Get-Item -Force -LiteralPath $part.FullName).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)'
     'trusted-shell-case'='[StringComparison]::OrdinalIgnoreCase'
+    'setup-shell-reparse'='Assert-ProbePath $Path $Path'
+    'setup-shell-normalize'='[string]::Equals($Path,'
     'setup-phase'='$Phase -cin $allowed'
     'setup-category'='category=$category'
     'setup-hresult'='hresult=[int]$exception.HResult'
     'setup-private-text'="stage='setup-diagnostic';"
     'setup-missing-diagnostic'='Write-Output (Get-ProbeSetupDiagnostic $phase $_); '
+    'preflight-exit'='; exit 1 }'
+    'setup-preflight-diagnostic'="Write-Output (Get-ProbeSetupDiagnostic 'preflight' `$_); "
+    'setup-phase-order'="`$phase = 'batch-right'"
+    'setup-wrapped-error'='$exception=$exception.InnerException'
 }
 $tempBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $root=Join-Path $tempBase ('arx-mutations-'+[guid]::NewGuid().ToString('N'))
@@ -22,22 +28,27 @@ try {
     foreach ($file in @('Test-CiValidation.ps1','Test-SetupDiagnostics.ps1','Invoke-DisposableCi.ps1')) { Copy-Item -LiteralPath "$PSScriptRoot/$file" -Destination $root }
     foreach ($name in $mutants.Keys) {
         $guard=$mutants[$name]
-        $targetSource=if ($name -eq 'setup-missing-diagnostic') { $entrySource } else { $source }
+        $entryMutation=$name -in @('setup-missing-diagnostic','preflight-exit','setup-preflight-diagnostic','setup-phase-order')
+        $targetSource=if ($entryMutation) { $entrySource } else { $source }
         if (($targetSource.Split([string[]]@($guard),[StringSplitOptions]::None)).Count -ne 2) { throw 'mutation-target-count' }
         $replacement=if ($name -eq 'stage-sid') { ' ' } elseif ($name -eq 'reparse-ancestor') { 'Assert-Probe $true' } else { '' }
         switch ($name) {
             'trusted-shell-case' { $replacement='[StringComparison]::Ordinal' }
+            'setup-shell-reparse' { $replacement='' }
+            'setup-shell-normalize' { $replacement='[string]::Equals([IO.Path]::GetFullPath($Path),' }
             'setup-phase' { $replacement='$true' }
             'setup-category' { $replacement='category=$exception.Message' }
             'setup-hresult' { $replacement='hresult=0' }
             'setup-private-text' { $replacement="stage='setup-diagnostic';detail=`$exception.Message;" }
+            'preflight-exit' { $replacement=' }' }
+            'setup-phase-order' { $replacement="`$phase = 'payload'" }
         }
         [IO.File]::WriteAllText("$root/CiValidation.psm1", $source)
         [IO.File]::WriteAllText("$root/Invoke-DisposableCi.ps1", $entrySource)
-        $targetFile=if ($name -eq 'setup-missing-diagnostic') { 'Invoke-DisposableCi.ps1' } else { 'CiValidation.psm1' }
+        $targetFile=if ($entryMutation) { 'Invoke-DisposableCi.ps1' } else { 'CiValidation.psm1' }
         [IO.File]::WriteAllText("$root/$targetFile", $targetSource.Replace($guard,$replacement))
         $output=& (Get-Process -Id $PID).Path -NoProfile -File "$root/Test-CiValidation.ps1" 2>&1 | Out-String
-        $expected=if ($name -eq 'trusted-shell-case') { 'probe-validation-refused' } elseif ($name.StartsWith('setup-')) { 'setup-regression-failed' } else { 'expected-refusal-missing' }
+        $expected=if ($name -eq 'trusted-shell-case') { 'probe-validation-refused' } elseif ($name -eq 'setup-shell-normalize') { 'accepted-unsafe-path' } elseif ($name.StartsWith('setup-') -or $name -eq 'preflight-exit') { 'setup-regression-failed' } else { 'expected-refusal-missing' }
         if ($LASTEXITCODE -eq 0 -or !$output.Contains($expected)) { throw "mutation-not-killed-as-expected: $name" }
         Write-Output (ConvertTo-Json @{stage='guard-mutation';guard=$name;killed=$true} -Compress)
     }

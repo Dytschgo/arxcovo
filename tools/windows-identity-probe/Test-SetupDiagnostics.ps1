@@ -14,6 +14,62 @@ foreach ($path in @('pwsh.exe','C:Program Files\PowerShell\7\pwsh.exe','\\server
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot/Invoke-DisposableCi.ps1",[ref]$tokens,[ref]$errors)
 Check ($errors.Count -eq 0)
+$moduleAst=[Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot/CiValidation.psm1",[ref]$tokens,[ref]$errors)
+$shellGuard=@($moduleAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Assert-ProbeTrustedShellPath'},$true))
+Check ($shellGuard.Count -eq 1)
+# Isolate the exact-string layer from the path/reparse layer. A spy confirms
+# the latter is called with the original spelling, without normalizing it.
+& {
+    param($Definition)
+    $calls=[Collections.Generic.List[string]]::new()
+    function Assert-ProbePath([string]$Path,[string]$Root) { $calls.Add($Path); $calls.Add($Root) }
+    . ([scriptblock]::Create($Definition))
+    $valid='C:\Program Files\PowerShell\7\pwsh.EXE'
+    Assert-ProbeTrustedShellPath $valid
+    Check ($calls.Count -eq 2 -and $calls[0] -ceq $valid -and $calls[1] -ceq $valid)
+    $calls.Clear()
+    Refused { Assert-ProbeTrustedShellPath 'C:\Program Files\PowerShell\7\..\7\pwsh.exe' }
+    Check ($calls.Count -eq 0)
+} $shellGuard[0].Extent.Text
+$preflight=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $n.Body.Extent.Text.Contains('$context = Get-ProbeContext')},$true))
+Check ($preflight.Count -eq 1)
+# Extract only preflight. The provisioning body is never placed in the child.
+$module=(Join-Path $PSScriptRoot 'CiValidation.psm1').Replace("'","''")
+$scriptText=@('$ErrorActionPreference=''Stop''',"Import-Module '$module' -Force",$preflight[0].Extent.Text,"Write-Output 'AFTER-PREFLIGHT'") -join "`n"
+$start=[Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+$start.UseShellExecute=$false
+$start.RedirectStandardOutput=$true
+$start.RedirectStandardError=$true
+foreach ($arg in @('-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText)))) { $start.ArgumentList.Add($arg) }
+$start.Environment.Clear()
+$start.Environment['SystemRoot']=[Environment]::GetFolderPath('Windows')
+$start.Environment['GITHUB_ACTIONS']='false'
+function Read-BoundedTestOutput($Reader) {
+    $buffer=[char[]]::new(4097); $count=0
+    while ($count -lt $buffer.Length) {
+        $read=$Reader.ReadAsync($buffer,$count,$buffer.Length-$count)
+        if (!$read.Wait(5000)) { throw 'setup-regression-failed' }
+        $n=$read.Result
+        if ($n -eq 0) { break }
+        $count+=$n
+    }
+    Check ($count -le 4096)
+    return [string]::new($buffer,0,$count)
+}
+$child=[Diagnostics.Process]::Start($start)
+try {
+    $stdout=Read-BoundedTestOutput $child.StandardOutput
+    $stderr=Read-BoundedTestOutput $child.StandardError
+    Check ($child.WaitForExit(5000))
+    Check ($child.ExitCode -eq 1)
+    Check ($stderr.Length -eq 0 -and !$stdout.Contains('AFTER-PREFLIGHT'))
+    $rows=@($stdout -split '\r?\n' | Where-Object { $_.Length -gt 0 })
+    Check ($rows.Count -eq 2)
+    $diag=$rows[0] | ConvertFrom-Json -AsHashtable
+    Check (($diag.Keys | Sort-Object) -join ',' -ceq 'category,hresult,phase,stage')
+    Check ($diag.stage -ceq 'setup-diagnostic' -and $diag.phase -ceq 'preflight')
+    Check ($rows[1] -ceq '{"stage":"ci-experiment","ok":false}')
+} finally { if (!$child.HasExited) { $child.Kill($true); [void]$child.WaitForExit(5000) }; $child.Dispose() }
 $guards=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-ProbeTrustedShellPath'},$true))
 Check ($guards.Count -eq 1)
 $action=@{Path='C:\Program Files\PowerShell\7\pwsh.EXE'}
@@ -45,8 +101,8 @@ foreach ($case in @(
 }
 # Replay each actual phase assignment through the catch, so a missing/typo phase fails.
 $phases=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$phase'},$true))
-Check ($phases.Count -ge 13)
-Check ($phases[0].Extent.Text.Contains("'root'"))
+Check (($phases | ForEach-Object { $_.Right.Extent.Text.Trim("'") }) -join ',' -ceq 'root,account,groups,directory-acls,payload,batch-right,task-definition,task-path,task-registration,task-run,task-wait,result-read,result-validation')
+Check ($phases[7].Extent.EndOffset -lt $guards[0].Extent.StartOffset -and $guards[0].Extent.EndOffset -lt $phases[8].Extent.StartOffset)
 foreach ($assignment in $phases) {
     . ([scriptblock]::Create($assignment.Extent.Text))
     try { throw [Exception]::new($private) } catch { $rows=@(& $handler) }
@@ -57,5 +113,15 @@ foreach ($code in @([int]::MinValue,0,[int]::MaxValue)) {
     $text=Get-ProbeSetupDiagnostic 'preflight' $failure
     Check ($text.Length -le 256 -and !$text.Contains('PRIVATE'))
     Check (($text | ConvertFrom-Json).hresult -eq $code)
+}
+# Real static method invocation models PowerShell's wrapper rather than plain throw.
+$missing=Join-Path ([IO.Path]::GetTempPath()) ('PRIVATE-'+[guid]::NewGuid().ToString('N'))
+try { [void][IO.File]::ReadAllText($missing); throw 'expected-method-failure' } catch {
+    Check ($_.Exception -is [Management.Automation.MethodInvocationException])
+    $expectedCode=$_.Exception.InnerException.HResult
+    $text=Get-ProbeSetupDiagnostic 'result-read' $_
+    $diag=$text | ConvertFrom-Json
+    Check ($diag.hresult -eq $expectedCode -and $diag.category -ceq 'io')
+    Check (!$text.Contains('PRIVATE') -and $text.Length -le 256)
 }
 Write-Output ('{"stage":"setup-self-test","ok":true,"assertions":'+$count+',"privilegedPathsRun":false}')

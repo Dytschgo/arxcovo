@@ -2,7 +2,7 @@
 
 ## Current state
 
-- Milestone 1 complete: setup acceptance and evidence PR #8 passed all required gates and merged. Milestone 2 is active in published PRs and isolated correction worktrees. Milestones 3�6 remain unimplemented.
+- Milestone 1 complete: setup acceptance and evidence PR #8 passed all required gates and merged. Milestone 2 is active in published PRs and isolated correction worktrees. Milestones 3-6 remain unimplemented.
 - Current task: correct Unix validation PR #14 review blockers, diagnose the first Windows experiment failure, and independently review local MCP/stdio PR #15 including its hosted initialization failures. Dedicated-account command acceptance remains unverified.
 - Last merged PR: [#12](https://github.com/Dytschgo/arxcovo/pull/12), merge `03adb434c5f8ff5d5fb50303174ad95367fd8761`, 2026-11-11 09:26:11 UTC. All required checks and exact-head independent review passed. The subsequent manual Windows experiment failed; its dispatch gate is cleared.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
@@ -105,7 +105,6 @@
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local and hosted three-OS verification passed; merged in #7 |
 | PR #7 independent review | Claude / claude-opus-5-5 | high | Success on b8c2187; hosted Electron passed on three OSes, all five protection-removal mutations failed locally |
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
-
 | PR #12 full corrected security review | Claude / claude-opus-5-5 | high | Success on 9fbbb76; N1 requested before dispatch, subsequently corrected |
 | PR #12 final evidence review | Claude / claude-opus-5-5 | high | Success on 42d1165; all required checks passed, merged as 03adb434 |
 | First Windows disposable experiment | Codex / gpt-6.1-sol | medium | Run 42995659949 failed with generic setup error; cleanup reported true; dispatch variable cleared |
@@ -119,5 +118,12 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 
 ## Windows setup diagnostic correction
 
-- Candidate 9dc3011e adds fixed setup-phase/numeric HRESULT/category diagnostics, privacy tests against the production catch, and case-insensitive matching at the exact trusted PowerShell executable location. Existing absolute-path/reparse checks remain. The casing defect was reproduced unprivileged; the first hosted run's actual cause remains unknown.
+- PR #17 adds fixed setup-phase/numeric HRESULT/category diagnostics, privacy tests against the production catch, and case-insensitive matching at the exact trusted PowerShell executable location. Existing absolute-path/reparse checks remain. The casing defect was reproduced unprivileged; the first hosted run's actual cause remains unknown.
 - Builder evidence: 115 helper assertions, 73 setup diagnostic assertions, 11 killed mutations, Release build and 34 native self-test assertions passed. Provider: Codex / gpt-6.1-sol, high effort. Independent review and hosted checks remain required before another dispatch. The reviewed-SHA variable remains unset; no new privileged run was performed.
+
+## PR #17 preflight review correction
+
+- Review on ed20774 failed because the new preflight catch lacked a fail-closed regression. The test now extracts only that production preflight block into a child PowerShell with a deliberately invalid context, requiring exit 1, two fixed rows and no post-preflight marker. No provisioning statements are passed to that child.
+- Diagnostics unwrap one MethodInvocationException inner type/code, tested through a real failing static file read. Exact phase ordering and the task-path marker placement are checked. Separate path-layer tests require the original exact spelling and the reparse-check call. Current local helper suite: 115 assertions; setup suite: 90 assertions. Mutation and hosted results are recorded after execution; no privileged rerun has occurred. Provider: Codex / gpt-6.1-sol, medium effort; fresh independent review is required.
+
+- Coordinator verification of this correction: all 115 helper assertions and 90 setup assertions passed; all 17 guard mutations were killed, including preflight exit/diagnostic removal, phase ordering, wrapped errors, reparse-call removal and unsafe normalization. No native code changed or privileged operation ran.
