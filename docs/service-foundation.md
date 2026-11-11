@@ -237,7 +237,10 @@ Store integration deliberately requires owner-provisioned, existing
 activity.lock, activity.sqlite3 and activity.sqlite3-journal in the fixed private
 state directory. Empty DB/journal files are acceptable for first initialization.
 Every file requires root:root/0600 on Unix, or SYSTEM ownership and a protected
-SYSTEM/Administrators-only DACL on Windows. The existing foreground checks also
+SYSTEM/Administrators-only DACL on Windows. A nonempty database must have a
+rollback-mode SQLite header before SQLite opens it: WAL headers refuse before
+they can create inherited WAL/SHM files. SQLite temporary storage stays in memory.
+The existing foreground checks also
 run; they are not relaxed. WAL/SHM objects refuse. Service connections use SQLite
 TRUNCATE journaling with FULL synchronization so journal deletion/recreation
 cannot silently introduce an inherited Windows DACL. No ACL repair, ownership
@@ -281,7 +284,7 @@ and discovery must join this shutdown barrier when their backend is integrated.
 
 Executed Windows evidence for this candidate: cargo fmt --all -- --check;
 cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace
---no-fail-fast (105 passed; one directly ignored subprocess TokenOwner fixture is
+--no-fail-fast (106 passed; one directly ignored subprocess TokenOwner fixture is
 exercised by its passing parent); python scripts/test-service-artifacts.py -v
 (three passed, two native Unix checks skipped). New tests cover injected startup
 failures/order without readiness, durable partial-start lifecycle rows, cancelled

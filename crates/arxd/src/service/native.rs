@@ -142,6 +142,14 @@ pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
             true,
             observed.protection(),
         )?;
+        if name == "activity.sqlite3" {
+            // SQLite may create WAL/SHM as soon as it opens a WAL-mode DB,
+            // before our TRUNCATE pragma. Refuse that header before SQLite.
+            let mut header = [0u8; 20];
+            let mut file = &observed.file;
+            let length = file.read(&mut header).map_err(|_| Error::Permissions)?;
+            rollback_database_header(&header[..length])?;
+        }
         pins.push(observed);
     }
     for name in ["activity.sqlite3-wal", "activity.sqlite3-shm"] {
@@ -151,6 +159,39 @@ pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
         }
     }
     Ok(pins)
+}
+fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
+    if header.is_empty()
+        || (header.len() == 20 && &header[..16] == b"SQLite format 3\0" && header[18..20] == [1, 1])
+    {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
+    }
+}
+#[cfg(test)]
+mod database_header_tests {
+    use super::*;
+    #[test]
+    fn service_refuses_wal_before_sqlite_can_create_unprotected_companions() {
+        assert_eq!(rollback_database_header(&[]), Ok(()));
+        let mut header = [0u8; 20];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[18] = 1;
+        header[19] = 1;
+        assert_eq!(rollback_database_header(&header), Ok(()));
+        for index in [18, 19] {
+            header[index] = 2;
+            assert_eq!(rollback_database_header(&header), Err(Error::Permissions));
+            header[index] = 1;
+        }
+        assert_eq!(
+            rollback_database_header(&header[..19]),
+            Err(Error::Permissions)
+        );
+        header[0] = 0;
+        assert_eq!(rollback_database_header(&header), Err(Error::Permissions));
+    }
 }
 pub(crate) fn require_service_identity() -> Result<(), Error> {
     #[cfg(windows)]

@@ -72,7 +72,7 @@ impl Activity {
             anyhow::bail!("activity store exceeds size bound");
         }
         db.execute_batch(if service {
-            "PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;"
+            "PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA max_page_count=1024;"
         } else {
             "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;"
         })?;

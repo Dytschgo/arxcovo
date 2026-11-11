@@ -443,7 +443,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## M2 fixed service Application candidate
 
 - Implementation sub-agent: Codex / gpt-6.1-sol, high, working alone on prepared
-  branch t3/46c79625 from verified clean pinned base
+  branch t3/m2-service-application (initially t3/46c79625) from verified clean pinned base
   `7606c71b35ab906607c00efa96b99a76bca2409f`. Implemented native service
   Application composition, separate static/client validation and dynamic build
   preflight, protected pre-provisioned store with persistent journal, durable
@@ -451,7 +451,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   bounded shutdown. Dedicated execution remains unavailable; no development
   executor fallback. Last merged PR and milestone acceptance remain unchanged.
 - Windows checks executed: formatting check, workspace/all-target Clippy with
-  warnings denied, full workspace tests: 105 passed, one direct-only fixture
+  warnings denied, full workspace tests: 106 passed, one direct-only fixture
   ignored and exercised by its passing parent. Artifact script: three passed,
   two native Unix checks skipped. Actual normal-user pipe/SDK and durable
   fixture-store evidence is in docs/service-foundation.md. No privileged
