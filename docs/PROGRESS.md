@@ -532,3 +532,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Owner transaction coordinator integration
 
 - Codex / gpt-6.1-sol, medium preserved candidatea8628c6 on feat/windows-owner-transactions above the integrated service Application. Formatting and all-target Clippy with warnings denied passed; all nine focused owner-transaction tests passed. This delivers only a pure transaction prerequisite, not the requested native Windows installer adapter. Native ConfigurationIo, SCM/LSA operations and durable uninstall provenance remain absent. A crash between right grant and durable receipt remains RecoveryRequired; presence never proves ownership. Cross-provider architecture guidance is required before native activation. No owner or privileged operation occurred.
+
+## Windows owner recovery architecture review
+
+- Anthropic / claude-opus-5-5, high delivered docs-only ADR0012 at784fb16, superseding the old pure Journal/ConfigurationIo design. Codex / gpt-6.1-sol, medium independently read all four changed docs and found changes required: P1 arbitrary record-rollback safety claim has a pure-model counterexample, and P2 missing-account reason contradicts ADR0009. Strict UTF-8, balanced fences and scoped whitespace checks passed; no runtime/privileged check ran. See docs/reviews/0012-owner-contract-review.md. Native owner implementation remains blocked on contract correction and the ancestor-policy fix.
