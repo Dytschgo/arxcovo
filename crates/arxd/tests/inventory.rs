@@ -367,6 +367,8 @@ fn windows_rooted_paths_validate_plain_and_verbatim_without_drive_relative_looku
     for unsafe_path in [
         r"C:",
         r"C:relative",
+        r"\\?\C:",
+        r"\\?\Z:",
         r"\\server\share\file",
         r"\\?\UNC\server\share\file",
         r"\\.\pipe\arxcovo-test",

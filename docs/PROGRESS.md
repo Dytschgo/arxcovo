@@ -123,5 +123,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 ## Windows rooted-path correction integration
 
+- Independent Opus 5.5 high review of `17b6bc9` found that bare verbatim drive prefixes passed without a filesystem check. The new rejection cases failed on that head. The correction requires an actual RootDir component before traversal, rejecting both existing-drive and nonexistent-drive bare verbatim prefixes. Fresh exact-head review and hosted checks are required; no merge is claimed.
+- Correction validation: Codex / gpt-6.1-sol, medium effort; formatting, workspace Clippy with warnings denied and all 39 nextest tests passed on Windows. Real drive-root junctions and non-NTFS volumes remain **unverified on real hardware**.
 - Source skips metadata lookup for a disk prefix until RootDir forms the absolute root. Every root and descendant retains link/reparse checks. The Windows regression reproduced Incorrect function in old code, then passed for plain/verbatim local paths while rejecting drive-relative, UNC/device, alternate-stream and explicit parent traversal inputs. This branch is updated to merged activity main d7f3ebd; fresh review and hosted validation remain pending. Provider: Codex / gpt-6.1-sol, medium effort.
 - Fixed the single Windows-1252 dash in the crate README reported by the #19 reviewer; no documentation behavior changed. The development current-user executor and service configuration tasks are active in isolated worktrees.

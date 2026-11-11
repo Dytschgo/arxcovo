@@ -99,6 +99,7 @@ impl Config {
 }
 pub fn checked_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
+        || !path.components().any(|c| matches!(c, Component::RootDir))
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
