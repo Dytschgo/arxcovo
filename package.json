@@ -14,7 +14,7 @@
   "packageManager": "npm@11.16.0",
   "scripts": {
     "lint": "tsc -p ui/tsconfig.json && eslint .",
-    "test": "node --test scripts/*.test.mjs",
+    "test": "node --test scripts/*.test.mjs && npm test -w ui",
     "build": "npm run build -w ui",
     "smoke": "playwright test"
   },

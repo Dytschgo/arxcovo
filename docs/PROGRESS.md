@@ -3,7 +3,7 @@
 ## Current state
 
 - Milestone: 1 — Setup (in progress).
-- Current task: independent Opus review of PR #1 at `835d06cf6bd86a79645108dc0b940cb27e338ac9`; hosted CI and trusted-policy bootstrap activation pending.
+- Current task: correct review round 2 status-exhaustion finding, then request fresh Opus review; hosted CI and trusted-policy bootstrap activation pending.
 - Coordinator follow-up: guarded auto-merge, reviewed protection payload proposal, trusted workflow_run triggers and tested evaluator added. Twelve policy/auto-merge tests and UI lint pass. No configuration applied or auto-merge action performed.
 - Last merged PR: none.
 - Acceptance: no milestone acceptance checks have run yet.
@@ -36,6 +36,8 @@
 - Pending: revised-head Opus review, hosted CI, reviewed installation merge, baseline history, protection/readback, trivial auto-merge and slow-main end-to-end acceptance. No new reviewer App is required.
 - Owner selected Dytschgo as the current allowlisted agent author; their own same-repository PRs under this login are eligible too. Recorded in .github/agent-authors.json.
 - Review round 1: Opus posted agent-review failure on 835d06c. Blocking findings: history became an unintended gate; untested evaluator paths; stale-success and label races; unnecessary approving-user/App requirements. Revised evaluator separates history, invalidates discovered heads before measurement, handles failures and reads live head/labels under workflow concurrency. Fresh review required.
+- Review round 2: Opus posted failure on 0218ba8 for repeated status exhaustion and cross-PR failure propagation. Follow-up publication is idempotent, only old successes with changed main measurements become pending, and capped heads are isolated. A 1,100-evaluation regression test emits only two statuses; another proves a capped head cannot strand a fresh PR. Fourteen policy/auto-merge tests plus one React component test, UI lint/build and Chromium smoke pass locally.
+- Owner setup checklist prepared locally as docs/dev-host-setup.md; no admin changes performed. It is a follow-up document outside the bootstrap review target.
 - Coordinator steering applied: budget policy uses trusted default-branch checkout on pull_request_target/workflow_run, with API-only candidate measurements and completion re-evaluation. Gate architecture remains proposed pending independent review.
 
 ## Provider usage

@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideBudget, evaluatePullRequests } from './evaluate-budget.mjs';
+import { decideBudget, evaluatePullRequests, statusPublisher } from './evaluate-budget.mjs';
 
 function fixture() {
   const posts = [];
   const pr = { number: 1, state: 'open', head: { sha: 'a'.repeat(40) }, labels: [] };
-  const io = { listPullRequests: () => [pr], getPullRequest: () => pr, getMainRun: () => ({ runId: 42, seconds: 40 }), getCandidateRun: () => null, postStatus: (sha, state, description) => posts.push({ sha, state, description }) };
+  const io = { listPullRequests: () => [pr], getPullRequest: () => pr, getMainRun: () => ({ runId: 42, seconds: 40 }), getCandidateRun: () => null, getStatus: () => null, postStatus: (sha, state, description) => posts.push({ sha, state, description }) };
   return { io, posts, pr };
 }
 test('fast main passes without history or a candidate measurement', async () => {
@@ -20,7 +20,7 @@ test('measurement failure invalidates old success for every discovered PR', asyn
   io.listPullRequests = () => [pr, { ...pr, number: 2, head: { sha: 'b'.repeat(40) } }];
   io.getMainRun = () => { throw Error('API failed'); };
   await assert.rejects(evaluatePullRequests(io));
-  assert.deepEqual(posts.map(post => post.state), ['pending', 'pending', 'failure', 'failure']);
+  assert.deepEqual(posts.map(post => post.state), ['failure', 'failure']);
 });
 test('removed label cannot reuse the old ci-speed snapshot', async () => {
   const { io, posts, pr } = fixture();
@@ -30,6 +30,28 @@ test('removed label cannot reuse the old ci-speed snapshot', async () => {
   io.getCandidateRun = () => ({ seconds: 800, conclusion: 'success' });
   await evaluatePullRequests(io);
   assert.equal(posts.at(-1).state, 'failure');
+});
+test('repeated idle evaluations never consume statuses for unchanged results', async () => {
+  const { io, posts } = fixture();
+  const stored = new Map();
+  for (let i = 0; i < 1100; i++) {
+    const publisher = statusPublisher({ readStatus: sha => stored.get(sha), createStatus: (sha, state, description) => { posts.push({ sha, state, description }); stored.set(sha, { state, description }); } });
+    await evaluatePullRequests({ ...io, getStatus: publisher.get, postStatus: publisher.post });
+  }
+  assert.deepEqual(posts.map(post => post.state), ['pending', 'success']);
+});
+test('a capped PR cannot strand a fresh PR pending', async () => {
+  const { io, posts, pr } = fixture();
+  const fresh = { ...pr, number: 2, head: { sha: 'b'.repeat(40) } };
+  io.listPullRequests = () => [pr, fresh];
+  io.getPullRequest = number => number === 1 ? pr : fresh;
+  io.postStatus = (sha, state) => {
+    if (sha === pr.head.sha) throw Error('422 status limit');
+    posts.push({ sha, state });
+  };
+  await assert.rejects(evaluatePullRequests(io));
+  assert.equal(posts.at(-1).sha, fresh.head.sha);
+  assert.equal(posts.at(-1).state, 'success');
 });
 test('changed head stays pending and cannot inherit the previous decision', async () => {
   const { io, posts, pr } = fixture();
@@ -43,7 +65,7 @@ test('changed head stays pending and cannot inherit the previous decision', asyn
 test('per-PR API errors and discovery bounds publish failure', async () => {
   const { io, posts, pr } = fixture();
   io.getPullRequest = () => { throw Error('unavailable'); };
-  await evaluatePullRequests(io);
+  await assert.rejects(evaluatePullRequests(io));
   assert.equal(posts.at(-1).state, 'failure');
   io.listPullRequests = () => Array.from({ length: 100 }, () => pr);
   await assert.rejects(evaluatePullRequests(io));

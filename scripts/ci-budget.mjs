@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { duration } from './policy.mjs';
-import { evaluatePullRequests } from './evaluate-budget.mjs';
+import { evaluatePullRequests, statusPublisher } from './evaluate-budget.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
@@ -12,7 +12,11 @@ const getMainRun = () => {
   const run = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
   return run ? duration(firstAttempt(run)) : null;
 };
-const postStatus = (sha, state, description) => api(`statuses/${sha}`, ['-X', 'POST', '-f', `state=${state}`, '-f', 'context=ci-time-budget', '-f', `description=${description.slice(0, 140)}`]);
+const statuses = statusPublisher({
+  readStatus: sha => api(`commits/${sha}/status?per_page=100`).statuses.find(status => status.context === 'ci-time-budget') ?? null,
+  createStatus: (sha, state, description) => api(`statuses/${sha}`, ['-X', 'POST', '-f', `state=${state}`, '-f', 'context=ci-time-budget', '-f', `description=${description}`]),
+});
+const postStatus = statuses.post;
 
 if (process.argv.includes('--record')) {
   const latest = getMainRun();
@@ -27,6 +31,7 @@ if (process.argv.includes('--record')) {
       listPullRequests: () => api('pulls?state=open&per_page=100'),
       getPullRequest: number => api(`pulls/${number}`),
       getMainRun,
+      getStatus: statuses.get,
       getCandidateRun: pr => {
         const run = runs('event=pull_request&status=completed')
           .filter(run => run.head_sha === pr.head.sha && run.head_repository?.id === pr.head.repo?.id)
