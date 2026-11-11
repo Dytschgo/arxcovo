@@ -1,7 +1,8 @@
 # Disposable Ubuntu runner mirror mitigation candidate
 
-This helper is not wired into CI yet. It must receive independent review before
-activation. Never run `ubuntu_mirror.py` on an owner machine. Its environment
+The workflow activation is prepared locally but has not been pushed or run.
+It must receive independent review before publication. Never run
+`ubuntu_mirror.py` on an owner machine. Its environment
 checks express intent and are spoofable; they are not provenance or authority.
 
 Observed PR32 job 130635247058 (source `b475bf1`) ran on `ubuntu-26.04`, image
@@ -39,4 +40,4 @@ blindly or increase the CI timeout. Current required checks remain enforced.
 Portable tests use synthetic native file facts for root ownership, regular-file,
 link-count, mode, read-size and no-follow guards. They do not open owner-machine
 APT files. Actual root publication and package installation have not run and
-remain unverified; this candidate is not activated by any workflow yet.
+remain unverified; no workflow has executed this candidate yet.
