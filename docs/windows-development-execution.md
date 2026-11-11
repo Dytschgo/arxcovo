@@ -1,9 +1,16 @@
 # Windows development execution candidate
 
-This candidate is incomplete, has a failing native fixture test, and requires
-other-provider continuation and independent review before owner acceptance.
-The original M2 dedicated-account/service requirement remains open. The
-positive current-owner path is **unverified on real hardware**.
+This candidate (Sol start, Opus continuation) passes its local unit, policy
+fixture and transport tests and needs a fresh independent Sol review before the
+coordinator's owner acceptance. The original M2 dedicated-account/service
+requirement remains open. The positive current-owner production path is
+**unverified on real hardware**: tests use a unit-test-only policy fixture that
+skips the token *policy* (hosted runners are elevated). The fixture keeps the
+Job, the pre-resume child TokenUser comparison, the reparse checks and the bounds.
+
+It depends on the PR16 `checked_path` change (17b6bc9 prefix skip plus 8c3856a
+physical-root requirement). The same lines are carried here, so merging either
+first is a textual no-op for that function.
 
 Commands in this mode share the owner's files, credentials and network access.
 The bounds and Job controls do not create security isolation. Activity is not
@@ -62,14 +69,34 @@ Retain only sanitized booleans, fixed labels and outcomes as acceptance evidence
 Do not store raw output or owner paths/identity. This sequence has not been run
 by the implementation agent.
 
-## Current implementation limits and continuation
+## Current implementation limits
 
-Only fixed tool-table `.exe` names are supported. Arguments are bounded to 128;
-timeouts to 1–3600 seconds; retained output to 2–8192 bytes per stream with a
-further JSON budget to fit the 64 KiB bridge response. No shell resolution,
-whole-parent environment inheritance or product approval flow is introduced.
+- Only fixed tool-table `.exe` names are supported, resolved from the configured
+  `PATH` only. Arguments are bounded to 128, timeouts to 1–3600 seconds, and
+  returned output to 2–8192 bytes per stream, with a further JSON budget so the
+  result fits the 64 KiB bridge response. Results report
+  `stdout_dropped_bytes`/`stderr_dropped_bytes` (bytes read past the limit;
+  reading stops once the Job is terminated, so this is a lower bound).
+- Concurrency is one run. A second request is refused `busy`. A post-spawn error
+  (identity mismatch, unconfirmed cleanup, pipe or wait failure) quarantines the
+  executor until restart. Pre-spawn refusals (arguments, reparse, missing tool)
+  never quarantine.
+- Redaction is best effort. It replaces the workspace, `CARGO_HOME`,
+  `RUSTUP_HOME`, `TEMP`/`TMP`, the token profile directory, `USERPROFILE` and
+  `USERNAME` (case-insensitive, either slash), plus SID-shaped runs. It works on
+  up to 4 KiB of raw output beyond the limit before cutting. A path a command
+  prints in another form (8.3 short names, encoded or split output) can still
+  appear.
+- Reparse checks inspect each component by name (`checked_path`) and again
+  through the pinned handle. Both run before the suspended child is created. The
+  pins deny write/delete sharing until the run ends. This is not isolation: the
+  child can still reach anything the owner can.
+- The service-config rejection named in ADR 0010 is not applicable on this
+  branch, because no service configuration exists here yet. When the lifecycle
+  candidate lands, its service schema must not accept `development_execution`.
+- When execution is configured, every audited request (including `list_hosts`)
+  starts with `identity_mode=development_current_user`. Completion cannot relabel
+  a row.
 
-The failing junction fixture and missing execution-specific transport/fault
-coverage are recorded with reproduction and three failed fixes in PROGRESS.md.
 Do not treat passing inventory transport tests or the unit-only policy fixture
 as evidence of production dedicated-account execution or owner acceptance.

@@ -118,6 +118,8 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Lifecycle builder | Codex / gpt-6.1-sol | high | Candidate 522ed2b; 40 local tests; installed-service integration/acceptance pending |
 | Current-user development contract | Claude / claude-opus-5-5 | high | ADR 0010 candidate d4725f1; docs only, user-authorized deviation; implementation pending |
 | Coordination and integration | Codex / gpt-6.1-sol | medium | Merged #15/#17 through gates; cancelled S4U diagnosis request, reconciled this record, integrated local candidates without claiming acceptance |
+| Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
+| Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
@@ -175,3 +177,67 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   the owner-authorized development deviation in ADR 0010. Instructions for the
   coordinator's post-review private acceptance are in
   `docs/windows-development-execution.md`.
+
+## Windows development execution — Opus continuation (2026-11-11)
+
+- Provider/effort: Anthropic claude-opus-5-5, high (other-provider continuation
+  under the three-failed-fixes rule). Outcome: candidate complete locally and
+  pending a fresh independent Sol review. Base `8953246`, Sol candidate
+  `68c6dbd`, head recorded by the coordinator at handoff. No push, PR,
+  dispatch, settings, account, rights, service or task change, elevation, S4U
+  probe or owner acceptance was performed. Last merged PR is unchanged by this
+  work.
+- Junction root cause (deterministic loop first): the failure reproduced, and
+  captured stderr was `md`'s own error. cmd.exe scans its whole command line for
+  switches, so the fixture's argv0 `...\System32/cmd.exe` was parsed as
+  `/c md.exe" ...`. All three earlier fixes kept that forward slash. A
+  backslash-only path alone made the focused test pass. This was a fixture bug:
+  no production code and no reparse guard was weakened. The candidate also had a
+  31 KB mojibake literal in the quoter test, now replaced by escapes.
+- PR16 dependency: the candidate needed PR16's bare-prefix skip (17b6bc9) for
+  canonical verbatim workspaces. On the coordinator's update it also carries the
+  root correction 8c3856a (physical `RootDir` required). A new unit test was red
+  on the prior code: it accepted bare `\\?\C:` and `\\?\Z:`. The lines are
+  identical to PR16.
+- Production fixes found in review: `redact` looped forever when a label
+  contained its needle (for example a user named `user` or `temp`), wedging the
+  single execution slot. The worker was spawned lazily, so a request cancelled
+  before first poll left its audit row `started`. It is now spawned on dispatch
+  and starts no process if already cancelled. Completion could relabel a row's
+  identity mode. The v3 CHECK now also pins development rows to elevation 0,
+  integrity 8192, `pre_exec` and `windows_job`. The environment block is now
+  sorted case-insensitively, as CreateProcessW requires. SIDs are redacted
+  anywhere in the text and the token profile directory is redacted. Results
+  carry dropped-byte counts; capability reports `shutdown`.
+- New coverage: development execution over the real local transport, with an SDK
+  client, the real stdio bridge code (`bridge_io`) and a real named pipe with
+  kernel identity checks. Requests reach the authenticated listener and SDK
+  server, then the policy-fixture executor. Covered paths: schema without
+  mode/identity/executable fields, honest `list_hosts`, a redacted success row
+  with fixed development facts, seven argument negatives after `started`, busy,
+  SDK cancellation completing the row once with confirmed cleanup, principal
+  isolation, start-failure runs nothing, completion-failure withholds the
+  result, and identity mismatch never resuming the child and then quarantining.
+  Also covered: a dispatch dropped before first poll, junctioned cwd and PATH
+  directory (executable reparse) with controls, stable handle counts, nonzero
+  exit, config classification and a valid `run_command` when not configured.
+- Actual validation at the final code commit: `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+  `cargo test --workspace --no-fail-fast` passed 58 tests (arxd lib 23,
+  inventory 32 including the activity suites, daemon unit 1, CLI 2), all on this
+  Windows host only. Hosted macOS/Linux/Windows runs were not performed.
+- Mutations (literal, one at a time, each file restored by git): 25 applied,
+  25 killed. Two (handle-level reparse check, pre-spawn cancellation check)
+  first survived; the tests were strengthened and both are now killed. Covered:
+  token policy, child TokenUser comparison, reparse/cwd/executable pins,
+  quarantine, Job termination and process limit, dropped counts, redaction loop
+  and SIDs, env ordering, busy set/release, eager spawn, env allowlist, HTTP
+  refusal, physical root, identity relabel, dev-row CHECKs, MCP argument
+  validation and shutdown capability.
+- Remaining limits: the positive production current-owner path is
+  **unverified on real hardware** until the coordinator's post-review run in
+  `docs/windows-development-execution.md`. The `admin_group_enabled` and
+  `elevated_identity` token refusals are tested on injected facts and an
+  independent elevation query only. ADR 0010's service-config rejection awaits a
+  service schema. Redaction stays best effort, and nothing here isolates the
+  owner. M2's dedicated-account criterion remains open.
