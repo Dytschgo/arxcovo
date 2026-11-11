@@ -675,3 +675,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   acceptance remain open. No push/PR/merge/watch, dispatch/settings, installation,
   admin/elevation, account/right/task/service operation or old Lab Manager/VM
   access occurred. Mac endpoint and other backends are outside this slice.
+
+## Protected SQLite recovery coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
