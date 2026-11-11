@@ -4,7 +4,7 @@
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active; local transport PR #15 is under review correction. Milestones 3â€“6 remain unimplemented.
 - Current local transport task: correct PR #15 after its first independent Opus review; local branch `t3/fix-pr15-client-isolation` starts at `6f55eb23c33c83477b9ffa534c1a763c856a5f8c`. Fresh review and hosted checks are pending. Dedicated-account command acceptance remains unverified. Other execution/service tasks remain separately owned.
-- Last merged PR: [#12](https://github.com/Dytschgo/arxcovo/pull/12), merge `03adb434c5f8ff5d5fb50303174ad95367fd8761`, 2026-11-11 09:26:11 UTC. All required checks and exact-head independent reviews passed. Its manual experiment is running at that reviewed SHA; the repository dispatch gate must be cleared after completion.
+- Last merged PR: [#17](https://github.com/Dytschgo/arxcovo/pull/17), merge `2299ad4f3ba5b024c053e61a51135f9be9c070bb`, 2026-11-11 10:26:09 UTC. Exact-head Opus re-review and all required checks passed. Second disposable Windows experiment run 43003724132 failed at that immutable reviewed revision: scheduled task exit 2, result-validation failure, cleanup reported true. Its dispatch variable was cleared and the variable list read back empty. The child failure cause remains unknown.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -169,10 +169,25 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   or old Lab Manager changes were made. Services, dedicated-account execution,
   tool discovery and Claude Code cargo acceptance remain outstanding for M2.
 
-## Service implementation contract
+## macOS endpoint collision follow-up
 
-- Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18’s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.
+- Hosted run 43001228714 at 30f5c00 passed Windows and Linux. macOS passed daemon initialization and early-disconnect regressions, then failed the existing dangling-symlink collision refusal. Unix binding now lstat-checks the endpoint and refuses every existing object before binding; the test also requires the dangling target to remain absent. Windows 28-test rerun passed before this extra Unix-only assertion. Native macOS correction validation and fresh independent review remain pending; no service installation or privileged operation was performed. Provider: Codex / gpt-6.1-sol, medium effort.
 
+## PR #17 preflight review correction
+
+- Review on ed20774 failed because the new preflight catch lacked a fail-closed regression. The test now extracts only that production preflight block into a child PowerShell with a deliberately invalid context, requiring exit 1, two fixed rows and no post-preflight marker. No provisioning statements are passed to that child.
+- Diagnostics unwrap one MethodInvocationException inner type/code, tested through a real failing static file read. Exact phase ordering and the task-path marker placement are checked. Separate path-layer tests require the original exact spelling and the reparse-check call. Current local helper suite: 115 assertions; setup suite: 90 assertions. Mutation and hosted results are recorded after execution; no privileged rerun has occurred. Provider: Codex / gpt-6.1-sol, medium effort; fresh independent review is required.
+
+- Coordinator verification of this correction: all 115 helper assertions and 90 setup assertions passed; all 17 guard mutations were killed, including preflight exit/diagnostic removal, phase ordering, wrapped errors, reparse-call removal and unsafe normalization. No native code changed or privileged operation ran.
+
+## Current M2 integration checkpoint
+
+- PR #15 704649f fixed explicit Unix existing-object refusal after macOS exposed a dangling-symlink bind. The earlier initialization/disconnect and Windows ownership failures passed in hosted run 43001228714; the subsequent symlink fix still needs fresh hosted validation and independent review.
+- The coordinator integrated lifecycle candidate 522ed2b on feat/service-lifecycle, merged the transport correction, and ran formatting, Clippy and all 40 Windows tests successfully (one directly ignored ownership fixture was exercised by its parent). Production service startup still fails closed until fixed config/audit hooks are implemented. Native SCM/Unix manager operation is unverified.
+- Activity schema v2/list_activity is assigned separately to Codex / gpt-6.1-sol, high effort. No command backend or full M2 acceptance is claimed.
+- PR #17 re-review: Anthropic / claude-opus-5-5, high, success on d64e2aa; all previous findings cleared and all three hosted platforms passed. Second experiment 43003724132 is the only new dispatch; first run 42995659949 remains failed with cause unknown and cleanup reported true.
+
+- Second Windows probe follow-up: run 43003724132 at reviewed main 2299ad4 reached scheduled-task execution but returned task-result code 2, followed by setup-diagnostic phase=result-validation and HRESULT -2146233087. Cleanup reported true. No S4U or dedicated-account acceptance is established. The dispatch gate is cleared; diagnosis must add evidence before any new reviewed run.
 
 ## M2 ADR0009 slice 5: activity v2 candidate (Sol high, 2026-11-11)
 
@@ -220,3 +235,8 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   dedicated-account paths remain **unverified on real hardware**. Future execution
   metadata can remain NULL; no executor/tool stub route, command run, hardware evidence,
   service acceptance or full M2 acceptance is claimed.
+
+## Activity integration checkpoint
+
+- The preceding builder report describes its base snapshot; the current merged main is 2299ad4 (PR #17), as recorded above. Source integration includes the latest PR #15 transport and explicit Unix endpoint-collision refusal. Independent review and hosted validation of this combined candidate remain required.
+- Owner steering: the current unelevated Windows user is authorized for the development command test to avoid further dedicated-account blocking. ADR 0010 is preserved on docs/windows-current-user-development; S4U diagnosis cancellation was requested and no third privileged dispatch is planned. Production dedicated-account isolation remains unproven.
