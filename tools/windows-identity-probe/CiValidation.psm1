@@ -1,6 +1,21 @@
 # Pure decisions only. Importing this module performs no account/task/native actions.
 Set-StrictMode -Version Latest
 function Assert-Probe($Condition) { if (!$Condition) { throw 'probe-validation-refused' } }
+function Assert-ProbeTrustedShellPath([string]$Path) {
+    # Exact absolute trusted location; only Windows casing may differ. No normalization.
+    Assert-Probe ([string]::Equals($Path, 'C:\Program Files\PowerShell\7\pwsh.exe', [StringComparison]::OrdinalIgnoreCase))
+    Assert-ProbePath $Path $Path
+}
+function Get-ProbeSetupDiagnostic([string]$Phase, [Management.Automation.ErrorRecord]$Failure) {
+    # Never inspect message, stack, InvocationInfo, target, or arbitrary error data.
+    $allowed=@('preflight','root','account','groups','directory-acls','payload','batch-right','task-definition','task-path','task-registration','task-run','task-wait','result-read','result-validation')
+    $safePhase=if ($Phase -cin $allowed) { $Phase } else { 'unknown' }
+    $exception=$Failure.Exception
+    $category=if ($exception -is [UnauthorizedAccessException]) { 'access-denied' }
+        elseif ($exception -is [Runtime.InteropServices.COMException]) { 'com' }
+        elseif ($exception -is [IO.IOException]) { 'io' } else { 'other' }
+    return (ConvertTo-Json @{stage='setup-diagnostic';phase=$safePhase;hresult=[int]$exception.HResult;category=$category} -Compress)
+}
 function Assert-ProbeContext([hashtable]$Context) {
     $expected = @{
         GITHUB_ACTIONS='true'; RUNNER_ENVIRONMENT='github-hosted'; RUNNER_OS='Windows'
