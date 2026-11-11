@@ -47,9 +47,14 @@ impl ServerHandler for Inventory {
             .and_then(|p| p.extensions.get::<Principal>())
             .ok_or_else(|| ErrorData::internal_error("authentication context unavailable", None))?;
         // Never persist attacker-provided tool names or arguments.
+        let tool = if request.name == "list_hosts" {
+            "list_hosts"
+        } else {
+            "unknown_tool"
+        };
         let id = self
             .activity
-            .start(&principal.0, "list_hosts")
+            .start(&principal.0, tool)
             .map_err(|_| unavailable())?;
         if request.name != "list_hosts" || request.arguments.as_ref().is_some_and(|a| !a.is_empty())
         {

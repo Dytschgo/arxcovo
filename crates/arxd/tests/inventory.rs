@@ -282,6 +282,43 @@ async fn activity_failure_refuses_inventory() {
     task.abort();
     let _ = task.await;
 }
+
+#[tokio::test]
+async fn unknown_tool_is_audited_without_untrusted_name_or_arguments() {
+    let dir = private_dir();
+    let (cfg, token) = config(dir.path());
+    let (url, task) = server(cfg).await;
+    let peer = client(&url, &token).await;
+    let marker = "UNTRUSTED-TOOL-MARKER";
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("private_argument".into(), marker.into());
+    assert!(
+        peer.call_tool(CallToolRequestParams::new(marker).with_arguments(arguments))
+            .await
+            .is_err()
+    );
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    let record: (String, String, String) = db
+        .query_row("SELECT principal,tool,outcome FROM activity", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        record,
+        (
+            "test-agent".into(),
+            "unknown_tool".into(),
+            "rejected".into()
+        )
+    );
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(dir.path().join("activity.sqlite3")).unwrap())
+            .contains(marker)
+    );
+    peer.cancel().await.unwrap();
+    task.abort();
+    let _ = task.await;
+}
 #[test]
 fn activity_retention_and_interrupted_restart() {
     let dir = private_dir();

@@ -97,7 +97,7 @@ impl Activity {
             || !principal
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-            || tool != "list_hosts"
+            || !["list_hosts", "unknown_tool"].contains(&tool)
         {
             anyhow::bail!("invalid activity metadata");
         }
