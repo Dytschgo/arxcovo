@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#32](https://github.com/Dytschgo/arxcovo/pull/32), `3b6170bbd07e38873deecbd7750432b74fa4cb87`, 17:15:21 UTC, through all five required gates. Its first signed-mirror Ubuntu job passed in 130 seconds; no DNS root-cause fix is claimed.
+- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: refresh and land service lifecycle #20, then configuration #21 and the existing dependencies. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` is tracked by run 43066365961; its completed result and duration must be verified before claiming a main pass. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -190,6 +190,42 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 - Codex / gpt-6.1-sol, medium: integrated Opus corrections c149cb4 and path-main b29f531. Scoped Sol review findings are addressed in the contract: macOS admin refusal and activity-v2 mappings. Production lifecycle/platform source is unchanged from the prior 50-test revision; main adds the path regression. Integrated formatting, Clippy with warnings denied and all 51 runnable nextest tests passed on Windows (one direct-only fixture skipped and exercised by its parent). Fresh scoped Sol recheck and full independent Opus implementation review remain pending. No service installation or administrative operation ran.
 
+## Historical configuration candidate integration
+
+## Fixed config and owner-plan foundation checkpoint
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high. Base
+  `62dd9a9976602e7673370fd89ecd7db7a63fecc6` (PR20 foundation). Added fixed
+  Layout, pure permission policies, bounded service config with injected account
+  resolution, typed owner plans and recording/model manager tests. No native
+  owner adapter or agent/CLI integration. Last merged PR above is unchanged.
+- Acceptance evidence: Windows `cargo test --workspace`: 51 passed, one ignored
+  subprocess-only fixture (the existing parent test invokes it explicitly);
+  original 40-test baseline retained plus 11 new unit tests. Formatting and
+  all-target workspace Clippy with warnings denied pass. Package parser tests:
+  three pass, native systemd-analyze/plutil checks skipped on Windows. No UI rerun.
+- Deliverable is foundation, not installed-service acceptance. Production
+  identity resolver, local-disk/reparse/ACL inspection, atomic privileged writes,
+  SCM/LSA and Unix manager actions remain **unverified on real hardware**.
+  Atomic writes are plan steps only. Native configure needs recovery for a
+  batch grant followed by failed config publication; no transaction is claimed.
+- Owner action blockers and M2 acceptance remain open. No owner commands,
+  account/rights/task changes, installation, GitHub writes, push or PR occurred.
+  The active development executor and Host/platform adapters were not edited.
+  Independent different-provider review and hosted checks remain coordinator work.
+- API and remaining native obligations: [service-foundation.md](service-foundation.md).
+
+## Service configuration integration with merged activity
+
+- Codex / gpt-6.1-sol, medium: merged main `d7f3ebd` into the local configuration candidate, preserving the service foundation and current activity implementation. Formatting, workspace Clippy with warnings denied and all 61 runnable nextest tests passed (one direct-only fixture skipped; its parent exercised it). Package parser checks passed three tests; systemd/plutil native checks were skipped on Windows. These supersede the earlier 51-test builder-base evidence for this integrated revision. No installation or account/right/manager operations were performed.
+- Next service work: replace injected identity and permission observations with native read-only adapters and bounded configuration reads. Owner mutation adapters and service application wiring remain incomplete; native checks will receive their own independent security review before activation.
+
+- Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations are being implemented separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
+
+## macOS administrative execution refusal
+
+- Codex / gpt-6.1-sol, medium: integrating the reviewed-contract correction from PR20. A regression must reject macOS/admin before resolver observations and owner plan construction, while retaining Linux/Windows admin validation and refusing an admin account in macOS standard mode. The new regression failed before the guard (account lookups occurred) and passed after it. Its twelve cases cover all three platforms, both rights settings and both observed membership states, including zero account lookups and no configure plan for macOS/admin. Formatting, Clippy with warnings denied and all 63 runnable nextest tests passed; one direct-only fixture is exercised by its parent. Package checks passed three tests and skipped two native checks. No owner operation was performed.
+
 ## Service guide negative-check correction
 
 - Scoped Sol high recheck of 302dbb5 resolved the original architecture findings but found one guide contradiction (https://github.com/Dytschgo/arxcovo/pull/20#issuecomment-6795284384). Codex / gpt-6.1-sol, medium corrected a renamed/missing account to account_missing; a configured name resolving to a different SID/UID remains account_identity_changed. UTF-8 and diff checks pass. No runtime or administrative action ran; full lifecycle implementation review remains pending.
@@ -361,6 +397,10 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Anthropic / claude-opus-5-5, high independently passed PR20 at1d41f0d: both prior blockers resolved; 75 runnable Windows tests and seven of eight valid scratch mutations passed their intended checks. The surviving owner-default mutation and other advisory findings remain recorded in the review. Codex / gpt-6.1-sol, medium merged docs-only main66c1b17 and corrected stale evidence wording. Production lifecycle source is unchanged. Fresh exact-head recheck and hosted gates are pending; no service installation or M2 acceptance is claimed.
 
+## Service credential uniqueness correction
+
+- Codex / gpt-6.1-sol, medium found service config allowed the same decoded token hash for distinct principals, unlike foreground Config. The new regression first failed because the duplicate was accepted. Service parsing now rejects duplicate hashes regardless of hex casing while retaining a positive distinct-credential control. Formatting, workspace/all-target Clippy with warnings denied and all 88 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Independent review and hosted checks are pending. This enables no service or owner operation.
+
 ## Windows CI handle-probe investigation
 
 - Opus PR20 exact-head recheck passed d8f034f but identified a Windows failure shared by main66c1b17 and PR25/PR20: actual_job_tree_timeout_cancel_shutdown_overflow_and_handles sees child exit101. Production source is unchanged from earlier green runs. Codex / gpt-6.1-sol, medium ran the focused existing test twice locally; both passed, so no cause is claimed. The parent assertion now includes bounded child stderr as well as stdout for diagnosis. Dedicated high-effort diagnosis is pending; no gate is bypassed and no rerun is claimed as a fix.
@@ -377,3 +417,17 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium refreshed #20 from reviewed head `4ead112` against actual main `3b6170b` (#32). The squash tree matches reviewed CI head `d6d3b31`. Only PROGRESS conflicted; both parents' provider tables and evidence were retained, Current state stays first, and last merged PR is #32. #31 is recorded closed as folded into #29.
 - All service/crate, packaging, Cargo, toolchain and script bytes are unchanged from reviewed `4ead112`; CI workflow/helpers match merged main. Local formatting, locked workspace/all-target Clippy, **76/76 nextest tests** and **26/26 CI-helper tests** passed. The one direct-only subprocess fixture was skipped and exercised by its passing parent. No privileged service or owner operation ran. Fresh exact-head review and required hosted checks remain mandatory. Installed-service and dedicated-account M2 acceptance remain open.
+
+## Configuration queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared #21 locally on refreshed lifecycle head `3195f5a` while #20 awaits normal gates. No new feature PR was opened and this preparation has not been pushed. Crate/configuration, packaging, Cargo/toolchain and script bytes match reviewed `aadfa05`; CI workflow/helpers match the refreshed parent. Both provider/evidence tables remain intact and Current state stays first.
+- Local formatting, locked workspace/all-target Clippy, **89/89 nextest tests**, **26/26 CI-helper tests** and three portable artifact checks passed. One direct-only subprocess fixture was exercised by its parent; two native Unix artifact checks skipped. No owner/admin/service operation ran. Publication waits for the actual #20 merge commit and a final metadata refresh; current-head hosted checks and independent review remain required. No installed-service/M2 acceptance is claimed.
+
+## Main CI recovery confirmation
+
+- Codex / gpt-6.1-sol, medium verified the Actions API for main run 43066365961: source `3b6170bbd07e38873deecbd7750432b74fa4cb87`, attempt 1, completed success. Using the repository policy's `updated_at - run_started_at` measure gives **548 seconds (9m08s)**. Main CI is green and under 15 minutes after #32. No rerun, timeout increase or gate exception was used. This record is prepared locally for the next dependency checkpoint; #20 remains the first service-stack merge target.
+
+## Configuration refresh after lifecycle merge
+
+- OpenAI / gpt-6.1-sol / medium integrated the actual #20 squash `64b50e9` into #21 without rewriting published history. The squash tree is identical to reviewed head `3195f5a`; duplicate-history merge conflicts retained the already validated configuration tree. Configuration source, packaging and Cargo/toolchain files remain identical to reviewed `aadfa05`; CI helpers/workflows match merged main. Prior local verification therefore applies: formatting, locked all-target Clippy, 89/89 nextest and 26/26 CI-helper tests passed; artifact checks had three passes and two native Unix skips. No implementation changed in this refresh. Fresh exact-head independent review and required hosted checks remain necessary.
+- #20 merged at 17:31:46 UTC after all five gates passed; its Windows job completed successfully at 17:30:23. Main push CI for the earlier #32 unblock passed in 548 seconds. The new #20 main push is not yet claimed green. No new feature PR was opened, and Current state remains the first section.
