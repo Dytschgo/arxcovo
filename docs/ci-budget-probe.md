@@ -1,12 +1,13 @@
 # CI budget acceptance probe
 
-This documentation-only PR preserves the temporary CI delay from main. It has no
-`ci-speed` exception. Once the delayed main run finishes, the required
-`ci-time-budget` status must prevent merging even after platform checks and the
-independent review pass.
+This documentation-only probe has no `ci-speed` exception. At its original head
+`690bf5d`, the three platform checks and independent review passed, but the budget
+status failed against main run 42952698370 (1016 seconds). Enabling auto-merge at
+08:05:19 UTC on 2026-11-11 left the PR open and blocked. The budget gate was the
+sole failing requirement.
 
-The coordinator enables auto-merge only after observing the slow-main failure,
-then records the blocked outcome. A separate measured `ci-speed` PR removes the
-delay. After recovery this probe is updated against main and reviewed again to
-verify that normal merging resumes. This file describes the test; it does not
-claim any acceptance result.
+Recovery PR #6 removed the temporary CI delay and merged through the measured
+`ci-speed` exception at 08:05:25 UTC. This probe now includes recovered main, so
+its CI no longer sleeps. A fresh independent review, green required checks, and
+normal merging on this updated head are still required to prove recovery. No
+complete setup acceptance is claimed here yet.
