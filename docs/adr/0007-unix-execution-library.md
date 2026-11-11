@@ -53,7 +53,10 @@ of `cgroup.kill` must succeed before spawn. The child writes itself into the run
 cgroup before dropping identity or executing any untrusted code. The build UID
 must not be delegated any writable cgroup elsewhere; provisioning must verify
 that policy. Every outcome kills the cgroup, polls populated state and attempts
-removal. Cleanup failure is explicit; the integration must quarantine failed
+removal. Normal completion confirms both `populated 0` and successful leaf
+removal; either failure sets `tree_cleanup_confirmed=false`. Error-unwind/Drop
+cleanup remains best effort, and every execution error requires caller quarantine;
+Drop alone cannot emit a confirmed result. Cleanup failure is explicit; the integration must quarantine failed
 cleanup and reconcile remaining run directories after daemon restart. This is
 not yet a crash/restart janitor. No process-group fallback exists on Linux.
 

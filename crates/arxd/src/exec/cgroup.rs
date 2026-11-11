@@ -18,6 +18,7 @@ pub(super) struct Group {
     dir: OwnedFd,
     name: CString,
     pub procs: File,
+    removed: std::cell::Cell<bool>,
 }
 fn text(fd: i32, name: &std::ffi::CStr) -> std::io::Result<String> {
     let mut s = String::new();
@@ -101,6 +102,7 @@ impl Group {
                 dir,
                 name,
                 procs,
+                removed: std::cell::Cell::new(false),
             }),
             Err(e) => {
                 unsafe {
@@ -111,13 +113,26 @@ impl Group {
         }
     }
     pub fn kill_and_confirm(&self) -> bool {
+        if self.removed.get() {
+            return true;
+        }
         if put(self.dir.as_raw_fd(), c"cgroup.kill", b"1").is_err() {
             return false;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match text(self.dir.as_raw_fd(), c"cgroup.events") {
-                Ok(s) if s.lines().any(|l| l == "populated 0") => return true,
+                Ok(s) if s.lines().any(|l| l == "populated 0") => {
+                    let removed = unsafe {
+                        libc::unlinkat(
+                            self.parent.as_raw_fd(),
+                            self.name.as_ptr(),
+                            libc::AT_REMOVEDIR,
+                        )
+                    } == 0;
+                    self.removed.set(removed);
+                    return removed;
+                }
                 Err(_) => return false,
                 _ => (),
             }
@@ -131,12 +146,36 @@ impl Group {
 impl Drop for Group {
     fn drop(&mut self) {
         self.kill_and_confirm();
-        unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            );
-        }
+        // Normal completion reports removal failure through kill_and_confirm.
+        // Error unwinding remains best effort; caller must quarantine errors.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn populated_zero_with_removal_failure_is_not_confirmed() {
+        // Ordinary temporary files only; never a real cgroup or privileged write.
+        let base = std::env::temp_dir().join(format!(
+            "arx-cgroup-test-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let leaf = base.join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::write(leaf.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(leaf.join("cgroup.events"), b"populated 0\n").unwrap();
+        let group = Group {
+            parent: File::open(&base).unwrap().into(),
+            dir: File::open(&leaf).unwrap().into(),
+            name: CString::new("leaf").unwrap(),
+            procs: File::open(leaf.join("cgroup.events")).unwrap(),
+            removed: std::cell::Cell::new(false),
+        };
+        assert!(!group.kill_and_confirm());
+        drop(group);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
