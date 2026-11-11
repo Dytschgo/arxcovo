@@ -171,7 +171,7 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 
 ## Service implementation contract
 
-- Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18�s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.
+- Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18’s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.
 
 ### M2 ADR0009 slices 1–2: lifecycle candidate (2026-11-11)
 
@@ -241,3 +241,7 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   stays with activity-v2 work. Store/MCP/local transport/inventory tests, execution
   backends, owner commands, accounts, rights and old Lab Manager are untouched.
   Root must integrate and obtain independent review before any installation.
+
+## macOS endpoint collision follow-up
+
+- Hosted run 43001228714 at 30f5c00 passed Windows and Linux. macOS passed daemon initialization and early-disconnect regressions, then failed the existing dangling-symlink collision refusal. Unix binding now lstat-checks the endpoint and refuses every existing object before binding; the test also requires the dangling target to remain absent. Windows 28-test rerun passed before this extra Unix-only assertion. Native macOS correction validation and fresh independent review remain pending; no service installation or privileged operation was performed. Provider: Codex / gpt-6.1-sol, medium effort.
