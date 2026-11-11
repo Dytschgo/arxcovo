@@ -1,22 +1,32 @@
-# Windows development execution candidate
+# Windows development execution
 
-This candidate (Sol start, Opus continuation) passes its local unit, policy
-fixture and transport tests and needs a fresh independent Sol review before the
-coordinator's owner acceptance. The original M2 dedicated-account/service
-requirement remains open. The positive current-owner production path is
-**unverified on real hardware**: tests use a unit-test-only policy fixture that
-skips the token *policy* (hosted runners are elevated). The fixture keeps the
-Job, the pre-resume child TokenUser comparison, the reparse checks and the bounds.
+PR #22 merged as `8fafbe70451807cf419c8e47706259b24a49cf68` after independent
+Sol review at `59293a8` and all three hosted platforms and status gates passed.
+The private production-path acceptance below was then exercised successfully on
+the existing Windows host with a non-test binary. It used source `72a5e5f`, whose
+production code, Cargo manifests/lock and toolchain are byte-identical to the
+reviewed integrated head. The build hash and sanitized proof are in
+[evidence/windows-development-acceptance.json](evidence/windows-development-acceptance.json).
 
-It depends on the PR16 `checked_path` change (17b6bc9 prefix skip plus 8c3856a
-physical-root requirement). The same lines are carried here, so merging either
-first is a textual no-op for that function.
+Claude Code listed the host, ran `cargo --version` through local MCP and read its
+successful activity row. After restarting the daemon, a fresh Claude Code session
+read the same row. Independent database checks confirmed the development mode,
+Medium integrity, current-user match, null raw identity/rights fields and Job
+cleanup. The harness stopped its processes, a native process query found no
+remaining acceptance arxd instance, and all temporary configuration/credential
+files were removed. No raw CLI stream, private paths, token or owner SID is saved
+in the public evidence.
+
+This verifies the explicitly authorized current-user development path only.
+Original M2 dedicated-account and installed-service acceptance remain open.
+S4U, cross-account service execution and all VM/hypervisor paths remain
+**unverified on real hardware**. The PR16 path correction is merged.
 
 Commands in this mode share the owner's files, credentials and network access.
 The bounds and Job controls do not create security isolation. Activity is not
 tamper-evident against commands running as the owner. Redaction is best effort.
 
-## Private configuration for acceptance after review
+## Private configuration for repeating development acceptance
 
 The coordinator is already authorized to provision this setting without asking
 again. Do not commit the configuration, token, account identity, tool paths or
@@ -52,7 +62,7 @@ The development key is not accepted in service configuration and no MCP argument
 can enable or select this mode. There is no automatic fallback. A startup config
 or token refusal exits 3 with fixed `server-config` text.
 
-After review and completion, use the existing Claude Code MCP stdio bridge
+For a reviewed build, use the Claude Code MCP stdio bridge
 `arxd mcp-stdio --client-config <private-client-config>` and call:
 
 1. `list_hosts {}`: expect execution mode `development_current_user`, isolation
@@ -66,8 +76,8 @@ After review and completion, use the existing Claude Code MCP stdio bridge
 4. Restart the daemon and read the same principal's history to confirm durability.
 
 Retain only sanitized booleans, fixed labels and outcomes as acceptance evidence.
-Do not store raw output or owner paths/identity. This sequence has not been run
-by the implementation agent.
+Do not store raw output or owner paths/identity. The coordinator ran this sequence successfully after review and green hosted
+checks. The implementation agent did not perform the private acceptance.
 
 ## Current implementation limits
 
