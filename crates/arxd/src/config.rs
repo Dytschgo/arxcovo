@@ -126,6 +126,7 @@ impl Config {
 }
 pub fn checked_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
+        || !path.components().any(|c| matches!(c, Component::RootDir))
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
@@ -170,4 +171,23 @@ pub fn checked_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+#[cfg(all(test, windows))]
+mod tests {
+    /// Mirrors PR16 8c3856a: a disk prefix is skipped only once a physical
+    /// RootDir follows, so bare verbatim drives are refused, never accepted
+    /// without filesystem inspection.
+    #[test]
+    fn rooted_prefix_skip_requires_physical_root() {
+        for unsafe_path in [r"C:", r"C:relative", r"\\?\C:", r"\\?\Z:"] {
+            assert!(
+                super::checked_path(std::path::Path::new(unsafe_path)).is_err(),
+                "{unsafe_path}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = dir.path().canonicalize().unwrap();
+        assert!(super::checked_path(&verbatim).is_ok(), "positive control");
+        assert!(super::checked_path(dir.path()).is_ok(), "positive control");
+    }
 }
