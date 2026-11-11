@@ -16,7 +16,7 @@ Current status (2026-11-11):
 
 - Main (`d7f3ebd`, #19) has inventory, host identity, the local IPC/stdio
   bridge and activity v2. The lifecycle plumbing in the PR20 candidate
-  passed 55 runnable Windows tests but is not installed anywhere.
+  passed 75 runnable Windows tests after integration with main 8fafbe7 but is not installed anywhere.
 - Owner commands and native application wiring do not exist yet. The
   configuration foundation (PR21) is separate and unmerged.
 - Windows S4U is **not established**. Both disposable experiments failed (runs

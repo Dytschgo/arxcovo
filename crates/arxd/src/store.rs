@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
 /// Private local identity and bounded activity; no credentials or host paths.
@@ -69,7 +69,7 @@ impl Activity {
                     [hex::encode(random)],
                 )?;
             }
-            1 | 2 => {}
+            1..=3 => {}
             _ => anyhow::bail!("unsupported local state version"),
         }
         read_host_id(&tx)?;
@@ -83,6 +83,9 @@ impl Activity {
             tx.execute_batch("ALTER TABLE activity RENAME TO activity_v1;")?;
             tx.execute_batch(&schema())?;
             tx.execute_batch("INSERT INTO activity(id,principal,tool,outcome,actor_kind,class) SELECT id,principal,tool,outcome,'agent','read' FROM activity_v1; UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_v1'),0)) WHERE name='activity'; DROP TABLE activity_v1; PRAGMA user_version=2;")?;
+        }
+        if version < 3 {
+            tx.execute_batch("ALTER TABLE activity ADD COLUMN identity_mode TEXT CHECK(identity_mode IS NULL OR (typeof(identity_mode)='text' AND identity_mode IN ('dedicated_account','development_current_user'))) CHECK(identity_mode IS NOT 'development_current_user' OR (observed_kind IS NULL AND observed_id IS NULL AND observed_gid IS NULL AND rights IS NULL AND (elevation IS NULL OR elevation=0) AND (integrity_rid IS NULL OR integrity_rid=8192) AND (observation_point IS NULL OR observation_point='pre_exec') AND (tree_boundary IS NULL OR tree_boundary='windows_job'))); PRAGMA user_version=3;")?;
         }
         tx.execute(
             "UPDATE activity SET outcome='interrupted',finished_at_ms=?1 WHERE outcome='started'",
@@ -109,7 +112,15 @@ impl Activity {
         if matches!(tool, Tool::ServiceStart | Tool::ServiceStop) {
             anyhow::bail!("invalid agent tool");
         }
-        self.start_typed(principal, tool, false)
+        self.start_typed(principal, tool, false, None)
+    }
+    pub fn start_development(&self, principal: &str, tool: &str) -> Result<i64> {
+        self.start_typed(
+            principal,
+            Tool::parse(tool)?,
+            false,
+            Some(IdentityMode::DevelopmentCurrentUser),
+        )
     }
     /// Lifecycle records are daemon-only, with a fixed principal.
     pub fn start_lifecycle(&self, event: Lifecycle) -> Result<i64> {
@@ -120,16 +131,23 @@ impl Activity {
                 Lifecycle::Stop => Tool::ServiceStop,
             },
             true,
+            None,
         )
     }
-    fn start_typed(&self, principal: &str, tool: Tool, daemon: bool) -> Result<i64> {
+    fn start_typed(
+        &self,
+        principal: &str,
+        tool: Tool,
+        daemon: bool,
+        mode: Option<IdentityMode>,
+    ) -> Result<i64> {
         validate_principal(principal)?;
         let mut db = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let tx = db.transaction()?;
-        tx.execute("INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms) VALUES (?1,?2,'started',?3,?4,?5)", params![principal,tool.as_str(),if daemon {"daemon"} else {"agent"},tool.class(),now_ms()?])?;
+        tx.execute("INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode) VALUES (?1,?2,'started',?3,?4,?5,?6)", params![principal,tool.as_str(),if daemon {"daemon"} else {"agent"},tool.class(),now_ms()?,mode.map(IdentityMode::as_str)])?;
         let id = tx.last_insert_rowid();
         tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' ORDER BY id DESC LIMIT 200); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' ORDER BY id DESC LIMIT 1000);")?;
         check_size(&tx)?;
@@ -151,6 +169,20 @@ impl Activity {
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let tx = db.transaction()?;
+        // The mode recorded at start is authoritative; completion cannot relabel it.
+        if let Some(mode) = metadata.identity_mode {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT identity_mode FROM activity WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if current.is_some_and(|c| c != mode.as_str()) {
+                anyhow::bail!("activity completion refused");
+            }
+        }
         let value = serde_json::to_value(metadata)?;
         let mut values = vec![
             rusqlite::types::Value::Text(outcome.as_str().into()),
@@ -162,7 +194,13 @@ impl Activity {
         values.push(id.into());
         let assignments = FIELDS
             .iter()
-            .map(|(n, _)| format!("{n}=?"))
+            .map(|(n, _)| {
+                if *n == "identity_mode" {
+                    "identity_mode=coalesce(identity_mode,?)".into()
+                } else {
+                    format!("{n}=?")
+                }
+            })
             .collect::<Vec<_>>()
             .join(",");
         let changed = tx.execute(&format!("UPDATE activity SET outcome=?,finished_at_ms=?,class=CASE WHEN ?1='rejected' THEN 'read' ELSE class END,{assignments} WHERE id=? AND outcome='started'"), rusqlite::params_from_iter(values))?;
@@ -243,9 +281,13 @@ impl Activity {
                 };
                 object.insert((*name).into(), v);
             }
-            let entry: ActivityRow = serde_json::from_value(object.into())
+            let mut entry: ActivityRow = serde_json::from_value(object.into())
                 .map_err(|_| anyhow::anyhow!("invalid activity record"))?;
             entry.validate()?;
+            entry.execution_mode = entry.metadata.identity_mode;
+            if entry.execution_mode == Some(IdentityMode::DevelopmentCurrentUser) {
+                entry.claim = Some(crate::development::CLAIM.into());
+            }
             result.push(entry);
         }
         let more = result.len() > args.limit as usize;
@@ -559,6 +601,7 @@ pub enum Lifecycle {
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
+    pub identity_mode: Option<IdentityMode>,
     pub reason: Option<Reason>,
     pub program: Option<Program>,
     pub argc: Option<u16>,
@@ -575,8 +618,30 @@ pub struct Metadata {
     pub tree_boundary: Option<TreeBoundary>,
     pub cleanup_confirmed: Option<bool>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityMode {
+    DedicatedAccount,
+    DevelopmentCurrentUser,
+}
+impl IdentityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DedicatedAccount => "dedicated_account",
+            Self::DevelopmentCurrentUser => "development_current_user",
+        }
+    }
+}
 impl Metadata {
     fn validate(&self) -> Result<()> {
+        if self.identity_mode == Some(IdentityMode::DevelopmentCurrentUser)
+            && (self.observed_id.is_some()
+                || self.observed_kind.is_some()
+                || self.observed_gid.is_some()
+                || self.rights.is_some())
+        {
+            anyhow::bail!("invalid development metadata");
+        }
         if self.argc.is_some_and(|n| n > 128) {
             anyhow::bail!("invalid activity metadata");
         }
@@ -613,6 +678,10 @@ pub struct ActivityRow {
     pub finished_at_ms: Option<i64>,
     #[serde(flatten)]
     pub metadata: Metadata,
+    #[serde(default)]
+    pub execution_mode: Option<IdentityMode>,
+    #[serde(default)]
+    pub claim: Option<String>,
 }
 impl ActivityRow {
     fn validate(&self) -> Result<()> {
@@ -693,6 +762,7 @@ fn sql_value(v: &serde_json::Value) -> Result<rusqlite::types::Value> {
     })
 }
 const FIELDS: &[(&str, &str)] = &[
+    ("identity_mode", "text"),
     ("reason", "text"),
     ("program", "text"),
     ("argc", "integer"),
@@ -750,7 +820,7 @@ fn validate_columns(db: &Connection) -> Result<()> {
         "finished_at_ms",
     ];
     expected.extend(FIELDS.iter().map(|(name, _)| *name));
-    let mut stmt = db.prepare("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name ELSE NULL END FROM pragma_table_info('activity') LIMIT 24")?;
+    let mut stmt = db.prepare("SELECT CASE WHEN length(CAST(name AS BLOB))<=64 THEN name ELSE NULL END FROM pragma_table_info('activity') LIMIT 25")?;
     let names = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

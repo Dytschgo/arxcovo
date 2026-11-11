@@ -37,6 +37,8 @@ fn config(path: &Path) -> (Config, String) {
     let token = hex::encode(bytes);
     (
         Config {
+            execution: None,
+            development_execution: None,
             local: None,
             listen: Some("127.0.0.1:0".parse().unwrap()),
             state_dir: path.to_owned(),
@@ -76,7 +78,7 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     let peer = client(&url, &token).await;
     assert!(peer.peer_info().is_some());
     let tools = peer.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 2);
+    assert_eq!(tools.tools.len(), 4);
     assert_eq!(tools.tools[0].name, "list_hosts");
     let response = peer
         .call_tool(CallToolRequestParams::new("list_hosts"))
@@ -96,11 +98,24 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     assert!(host["ram_bytes"].as_u64().unwrap() > 0);
     assert!(host["disk_total_bytes"].as_u64().unwrap() > 0);
     assert_eq!(host["execution_available"], false);
+    assert_eq!(host["execution"]["reason"], "not_configured");
+    assert!(host["execution"].get("mode").is_none());
     assert!(
         peer.call_tool(CallToolRequestParams::new("run_command"))
             .await
             .is_err()
     );
+    // Valid arguments without the private development key: refused, no fallback.
+    let valid = serde_json::json!({"tool":"cargo","args":["--version"]});
+    let refused = peer
+        .call_tool(
+            CallToolRequestParams::new("run_command")
+                .with_arguments(valid.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("execution unavailable"));
     let args = serde_json::json!({"secret_marker":token})
         .as_object()
         .unwrap()
@@ -171,7 +186,16 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     assert_eq!(
         db.query_row("SELECT count(*) FROM activity", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        4
+        5
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM activity WHERE tool='run_command' AND outcome='refused' AND reason='unavailable' AND identity_mode IS NULL",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
     );
     drop(db);
     let fresh = private_dir();
@@ -288,7 +312,9 @@ fn activity_retention_and_interrupted_restart() {
     let dir = private_dir();
     let store = Activity::open(dir.path()).unwrap();
     let host_id = store.host_id().unwrap();
-    for _ in 0..1005 {
+    // The read bucket retains 200 rows. Cross that actual boundary rather
+    // than the older pre-v2 1000-row action boundary.
+    for _ in 0..205 {
         store.start("test-agent", "list_hosts").unwrap();
     }
     drop(store);
@@ -652,7 +678,7 @@ fn corrupt_identity_fails_closed_without_replacement() {
         "UPDATE local_host_identity SET host_id=printf('%0100000d',0)",
         "DELETE FROM local_host_identity",
         "DROP TABLE local_host_identity",
-        "PRAGMA user_version=3",
+        "PRAGMA user_version=4",
         "PRAGMA user_version=0",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,NULL)",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(2,printf('%064d',0))",

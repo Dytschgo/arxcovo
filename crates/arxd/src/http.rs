@@ -77,6 +77,7 @@ pub fn router(
     let service = StreamableHttpService::new(
         move || {
             Ok(Inventory {
+                execution: None,
                 activity: activity.clone(),
                 principal: None,
             })
