@@ -1019,3 +1019,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   merge/watch, elevation, manager/install, old Lab Manager or VM operation.
 - Native installed/cross-user/real hardware and dedicated-account M2 acceptance
   stay open and **unverified on real hardware**.
+
+- Final portable ACL follow-up: included the existing pure native_macos_policy
+  source in non-Mac test builds. All 66 scoped service tests passed, including
+  its ACL absent/nonempty/unknown contracts. Final formatting, workspace/all-target
+  Clippy, workspace test compilation and both Unix actual-source metadata Clippy
+  checks passed again. Native runtime/ownership mutations remain outstanding.

@@ -15,6 +15,11 @@ mod os;
 #[path = "native_macos.rs"]
 mod macos;
 
+// Exercise the same pure macOS ACL/identity contracts on every test host.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "native_macos_policy.rs"]
+mod macos_policy;
+
 pub struct NativeResolver;
 impl Resolver for NativeResolver {
     fn account(&self, value: &str) -> Result<Account, Error> {

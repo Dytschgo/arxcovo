@@ -2,7 +2,7 @@
 
 Provider: OpenAI gpt-6.1-sol / high. Prepared base verified clean:
 `a24926310410239116b0bba0c888457d4c38109e`. Worked alone, no delegates.
-Implementation commit: `93b06a8fe4738f7195cece0885594262da13e97a`.
+Initial implementation commit: `93b06a8fe4738f7195cece0885594262da13e97a`.
 Implementation candidate only; native acceptance and independent Opus review pending.
 No push, PR write, merge, watch, manager or installed-service operation.
 
@@ -42,11 +42,13 @@ No shared-checkout coordination or writes to the other builder occurred.
 
 - Final formatting check, workspace/all-target Clippy with warnings denied,
   workspace test compilation passed on Windows.
-- Scoped service library suite: 63 passed, zero ignored. Filters excluded
+- Final scoped service library suite: 66 passed, zero ignored. Filters excluded
   windows owner fixtures, production normal-user load and non-Unix execution.
   Local bridge suite: seven passed, including fixed server identity refusal.
   Integration service-entry tests were compiled but not run because they invoke
   the production service entry.
+- The same pure macOS policy source now runs its three ACL/identity tests on
+  non-Mac hosts too; all passed on Windows. No native FFI is substituted.
 - Five layout tests passed after correcting runtime-directory workspace overlap.
 - Actual-source Linux x86_64 and macOS arm64 all-target Clippy passed as metadata
   checks. They used LIBSQLITE3_SYS_USE_PKG_CONFIG=1 and SQLITE3_LIB_DIR pointing
