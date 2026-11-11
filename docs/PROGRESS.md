@@ -3,7 +3,7 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#19](https://github.com/Dytschgo/arxcovo/pull/19), `d7f3ebd26e69438abb41ff5d671959e576832803`, 11:00:14 UTC. Exact-head independent Opus review passed on `9e7a603`; all three hosted platforms and both status gates passed. Caller-scoped activity v2 is merged.
+- Last merged PR: [#16](https://github.com/Dytschgo/arxcovo/pull/16), `b29f5317e94e03d033fcc1596a3e84c4d1d4d485`, 11:34:19 UTC (Windows rooted-path validation). Before it, [#19](https://github.com/Dytschgo/arxcovo/pull/19) merged as `d7f3ebd26e69438abb41ff5d671959e576832803` at 11:00:14 UTC; its exact-head independent Opus review passed on `9e7a603`, and all three hosted platforms and both status gates passed. Caller-scoped activity v2 is merged.
 - Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
 - Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
 
@@ -27,7 +27,7 @@
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
 - Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
-- Windows rooted-path fix #16 remains open; its bare-prefix correction `8c3856a` passed 39 local tests and awaits fresh review. Activity-integrity #18 is closed as superseded by merged #19, including its completion and fixed unknown-tool-label regressions.
+- Windows rooted-path fix #16 merged as `b29f531`. Activity-integrity #18 is closed as superseded by merged #19, including its completion and fixed unknown-tool-label regressions.
 - Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
 - Constant systemd/launchd artifacts are committed on feat/service-install-artifacts. INI/plist syntax, fixed argv and absence of interpolation were checked; no manager or installation was invoked. Full ADR 0009 and the owner service guide remain on the service branch.
@@ -118,8 +118,14 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Lifecycle builder | Codex / gpt-6.1-sol | high | Candidate 522ed2b; 40 local tests; installed-service integration/acceptance pending |
 | Current-user development contract | Claude / claude-opus-5-5 | high | ADR 0010 candidate d4725f1; docs only, user-authorized deviation; implementation pending |
 | Coordination and integration | Codex / gpt-6.1-sol | medium | Merged #15/#17 through gates; cancelled S4U diagnosis request, reconciled this record, integrated local candidates without claiming acceptance |
+| PR20 scoped docs review | Codex / gpt-6.1-sol | high | Changes required on `9b02fe2`: P1 macOS admin cleanup false assurance, P2 audit vocabulary mismatch with merged activity v2, P2 stale status/development contract |
+| PR20 service architecture corrections | Claude / claude-opus-5-5 | high | ADR 0009 and the owner guide corrected for all three findings; docs only, fresh Sol review required; no acceptance claimed |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
+
+## PR20 architecture correction checkpoint
+
+- Claude / claude-opus-5-5, high: architecture corrections after Sol's scoped PR20 documentation review. ADR 0009 now refuses macOS admin mode at configuration, start and per-run preflight until a separately reviewed containment ADR provides timeout/cancel/restart evidence with an elevated descendant, and states exactly what `cleanup_confirmed` attests per OS and rights. Preflight detail is response-only and maps exhaustively onto merged v2 `Reason`; Windows observations persist as `post_switch` and Unix as `pre_exec`; no schema migration is added. The mapping, readback and privacy tests are implementation obligations that have not run. A PR21 config follow-up (macOS admin refused before resolution) is specified in the ADR but not implemented. Status reflects two failed S4U experiments with no third planned, and the separate owner-authorized ADR 0010 development mode. M2 dedicated-account acceptance remains open.
 
 ## Service lifecycle integration checkpoint
 
