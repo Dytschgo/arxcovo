@@ -2,7 +2,7 @@
 
 ## Current state
 
-- Milestone 1 complete: setup acceptance and evidence PR #8 passed all required gates and merged. Milestone 2 is active in published PRs and isolated correction worktrees. Milestones 3�6 remain unimplemented.
+- Milestone 1 complete: setup acceptance and evidence PR #8 passed all required gates and merged. Milestone 2 is active in published PRs and isolated correction worktrees. Milestones 3-6 remain unimplemented.
 - Current task: correct Unix validation PR #14 review blockers, diagnose the first Windows experiment failure, and independently review local MCP/stdio PR #15 including its hosted initialization failures. Dedicated-account command acceptance remains unverified.
 - Last merged PR: [#12](https://github.com/Dytschgo/arxcovo/pull/12), merge `03adb434c5f8ff5d5fb50303174ad95367fd8761`, 2026-11-11 09:26:11 UTC. All required checks and exact-head independent review passed. The subsequent manual Windows experiment failed; its dispatch gate is cleared.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
@@ -37,7 +37,7 @@
 - Inventory/activity: PR #11 merged the authenticated official-SDK HTTP tracer after all three hosted platforms and security re-review passed. It deliberately has no execution authority. Local and independent workspace validation passed 13 tests.
 - The macOS temporary-root fixture issue and blocking Windows inherit-only ACL exposure were fixed before merge. The permission regression failed old code and passed the correction. Windows path-prefix handling, owner checks, header/connection bounds and other non-blocking review observations remain tracked follow-ups before privileged service use.
 - Windows execution: PR #12 merged after four blocker corrections, the deny-only regression and final documentation review. Unprivileged self-test: 34 assertions; helper validation: 114 assertions; five guard mutations detected. First manual experiment [run 42995659949](https://github.com/Dytschgo/arxcovo/actions/runs/42995659949) at reviewed main 03adb434 failed on 2026-11-11: setup/build/self-tests passed, experiment emitted ci-experiment ok:false and cleanup ok:true, without identifying the failed setup phase. Cause remains unknown. WINDOWS_IDENTITY_PROBE_REVIEWED_SHA was deleted after completion, and a later variable-list readback was empty. Bounded diagnostics are being prepared before any new reviewed dispatch. No S4U or dedicated-account acceptance is claimed.
-- Unix execution: [PR #14](https://github.com/Dytschgo/arxcovo/pull/14), head c508de0, contains the library and manual disposable validation tooling. All three hosted platform checks passed, with the privileged runtime test skipped. Independent review failed with three tooling blockers: overbroad global cgroup ownership checks, an inconclusive symlink-cwd negative, and missing cleanup/evidence guard tests. Corrections are assigned in an isolated worktree; no Linux privileged experiment has run. Restart cleanup and audited caller integration remain unfinished.
+- Unix execution: [PR #14](https://github.com/Dytschgo/arxcovo/pull/14), initial head c508de0, contains the library and manual disposable validation tooling. All three hosted platform checks passed, with the privileged runtime test skipped. Independent review failed with three tooling blockers: overbroad global cgroup ownership checks, an inconclusive symlink-cwd negative, and missing cleanup/evidence guard tests. Corrections are assigned in an isolated worktree; no Linux privileged experiment has run. Restart cleanup and audited caller integration remain unfinished.
 - Local transport: [PR #15](https://github.com/Dytschgo/arxcovo/pull/15), head 6f55eb2, adds opt-in local IPC and an authenticated bounded stdio bridge. Hosted run 42996013708 passed Ubuntu but failed daemon/stdio initialization on Windows and macOS. The coordinator reran the focused test and all 24 workspace tests locally on Windows successfully; that does not resolve the hosted failures. Independent security/failure review is active. Services, cross-user provisioning and execution are not implemented by this slice.
 - Still to implement and prove: per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; restart cleanup; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
 - Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
@@ -105,13 +105,12 @@
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local and hosted three-OS verification passed; merged in #7 |
 | PR #7 independent review | Claude / claude-opus-5-5 | high | Success on b8c2187; hosted Electron passed on three OSes, all five protection-removal mutations failed locally |
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
-
 | PR #12 full corrected security review | Claude / claude-opus-5-5 | high | Success on 9fbbb76; N1 requested before dispatch, subsequently corrected |
 | PR #12 final evidence review | Claude / claude-opus-5-5 | high | Success on 42d1165; all required checks passed, merged as 03adb434 |
 | First Windows disposable experiment | Codex / gpt-6.1-sol | medium | Run 42995659949 failed with generic setup error; cleanup reported true; dispatch variable cleared |
 | Windows experiment diagnosis | Codex / gpt-6.1-sol | high | Isolated implementation active; bounded diagnostics required before another reviewed run |
 | PR #14 security review | Claude / claude-opus-5-5 | high | Failure on c508de0: three disposable tooling/test blockers; Rust library had no blocking finding |
-| PR #14 corrections | Codex / gpt-6.1-sol | high | Isolated implementation active; no privileged run or acceptance claimed |
+| PR #14 corrections | Codex / gpt-6.1-sol | high | Corrections integrated at a5777bb; second review found R1 in positive-control directory permissions; no privileged run or acceptance claimed |
 | Local MCP/stdio transport | Codex / gpt-6.1-sol | high | Candidate integrated in #15; 24 local Windows tests pass, hosted Windows/macOS initialization fails |
 | PR #15 independent security/failure review | Claude / claude-opus-5-5 | high | Active on pinned 6f55eb2; verdict pending |
 
@@ -120,3 +119,8 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 ## Unix review correction checkpoint
 
 - PR #14 corrections integrated from 9417e62: bounded cgroup ownership checks, accessible symlink test controls, descriptor copying, cleanup failure reporting and runtime controller assertions. Builder evidence: 28 pure Python tests, nine killed mutations, 22 Windows workspace tests, formatting and Clippy passed. Unix metadata checks passed; full local Linux workspace build lacked a C cross-toolchain. All privileged runtime assertions remain unrun and **unverified on real hardware**. Fresh independent review and hosted checks are required before merge or a Linux experiment.
+
+## PR #14 positive-control correction
+
+- Second independent review failed at a5777bb: the plain directory inherited mode 0700 under service UMask=0077. Positive-control creation now starts at 0700 and explicitly sets 0755 through a shared helper for outside/plain, with a non-privileged Linux regression requiring traversal and refusing reuse. Its runtime cross-account assertion remains unrun.
+- Added pure fixture-check coverage proving the captured UID/GID are forwarded to the post-account scan. All 29 Python tests pass and ten driver mutations are killed by assertion failures. Fixed invalid UTF-8 and provider-table formatting. Provider: Codex / gpt-6.1-sol, medium effort. Fresh independent review and hosted checks are required; no privileged experiment has run.

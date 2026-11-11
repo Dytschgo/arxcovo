@@ -3,7 +3,7 @@
 use super::*;
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, chown},
+    os::unix::fs::{DirBuilderExt, PermissionsExt, chown},
     process::Command,
 };
 
@@ -22,6 +22,27 @@ fn checked(tool: &str, args: &[&str]) -> Vec<u8> {
     let out = Command::new(tool).args(args).output().unwrap();
     assert!(out.status.success(), "fixture tool failed: {tool}");
     out.stdout
+}
+
+fn accessible_control_directory(path: &Path) -> std::io::Result<()> {
+    // Start private regardless of the caller's umask, then explicitly grant
+    // traversal for the generated build identity. These contain fixture data.
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+#[test]
+fn positive_control_directories_are_traversable_without_provisioning() {
+    let base = tempfile::tempdir().unwrap();
+    for name in ["outside", "plain"] {
+        let path = base.path().join(name);
+        accessible_control_directory(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(accessible_control_directory(&path).is_err());
+    }
 }
 
 #[test]
@@ -221,8 +242,7 @@ for pid in children:
         Some(0)
     );
     let outside = base.join("outside");
-    fs::create_dir(&outside).unwrap();
-    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    accessible_control_directory(&outside).unwrap();
     // Positive controls: target is traversable by the build identity, and a
     // normal workspace subdirectory succeeds with the same executable.
     spec.executable = "/bin/sh".into();
@@ -234,7 +254,7 @@ for pid in children:
             .exit_code,
         Some(0)
     );
-    fs::create_dir(workspace.join("plain")).unwrap();
+    accessible_control_directory(&workspace.join("plain")).unwrap();
     spec.cwd = "plain".into();
     spec.executable = "/usr/bin/true".into();
     spec.arguments.clear();

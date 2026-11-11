@@ -127,7 +127,7 @@ required Cargo/three-OS suites were not run for this CI/docs-only change.
 
 ## First security-review corrections (base c508de0)
 
-Builder: Codex / gpt-6.1-sol, high effort. The first Opus review failed B1–B3;
+Builder: Codex / gpt-6.1-sol, high effort. The first Opus review failed B1â€“B3;
 no privileged run is authorized by these changes. Global cgroup checks retain
 no-links/no-group-or-other-write; unrelated user delegation is allowed. Unit
 ancestry/subtree stays root-owned and a synchronous post-account-creation scan

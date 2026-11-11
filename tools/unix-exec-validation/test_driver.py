@@ -196,6 +196,20 @@ class RuntimeGuards(unittest.TestCase):
         self.remove.assert_called_once_with(self.base)
         self.assertEqual(self.calls.call_args_list[1].args[0], ['/usr/sbin/groupdel', 'arxexec123'])
 
+    def test_fixture_check_mode_scans_captured_uid_and_gid(self):
+        unit = 'arx-unit.service'
+        with patch.object(driver.sys, 'platform', 'linux'), \
+             patch.object(driver.sys, 'argv', ['driver.py', 'fixture-check', '123-1']), \
+             patch.object(driver.os, 'getuid', return_value=0, create=True), \
+             patch.object(driver.os, 'geteuid', return_value=0, create=True), \
+             patch.object(driver, '__file__', str(self.stage / 'source/tools/unix-exec-validation/driver.py'), create=True), \
+             patch.object(driver, 'plan', return_value=(self.stage, unit)), \
+             patch.object(driver, 'capture_fixture') as capture, \
+             patch.object(driver, 'cg_scan') as scan:
+            driver.main()
+            capture.assert_called_once_with(self.stage)
+            scan.assert_called_once_with(Path('/sys/fs/cgroup/system.slice') / unit, 1234, 1234)
+
     def test_inode_replacement_quarantines_before_deletion(self):
         (self.stage / 'fixture-directory').write_text('[0, 0]')
         self.refuse_cleanup('E_FIXTURE_INODE')

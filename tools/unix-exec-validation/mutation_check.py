@@ -22,6 +22,7 @@ CASES = [
     ('exact argv', 'E_TEST_ARGS', 'RuntimeGuards.test_harness_exact_argv_and_collisions'),
     ('zero tests', 'passed', 'RuntimeGuards.test_zero_test_success_is_failure'),
     ('run gate', 'gate', 'Guards.test_refusal_before_any_runtime_call'),
+    ('post-account scan', 'fixture-check-call', 'RuntimeGuards.test_fixture_check_mode_scans_captured_uid_and_gid'),
 ]
 
 
@@ -31,7 +32,10 @@ def main():
         tree = ast.parse(source)
         changed = 0
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'require' and len(node.args) == 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == guard:
+            if guard == 'fixture-check-call' and isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'cg_scan' and len(node.args) == 3:
+                node.args[1:] = [ast.Constant(None), ast.Constant(None)]
+                changed += 1
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'require' and len(node.args) == 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value == guard:
                 node.args[0] = ast.Constant(True)
                 changed += 1
             elif guard == 'passed' and isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'passed' for t in node.targets):
