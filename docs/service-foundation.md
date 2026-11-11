@@ -186,10 +186,13 @@ and bounded; native API-owned strings have bounded scans. USER_INFO_23 and
 GetSecurityInfo allocate their documented native response before application
 validation; no caller-supplied unbounded allocation length is used. Administrators
 is recognized by SID rather than a localized name. Files use CreateFileW with
-OPEN_REPARSE_POINT, metadata rights, READ_CONTROL, and read-only sharing. Every
-ancestor stays open with that sharing request through observation/read. Metadata-only
-parent handles do not exclude all writers; PR27 separately adds read-data access.
-This PR25 fix must not overwrite PR27 access-mask changes during integration.
+OPEN_REPARSE_POINT, metadata rights, READ_CONTROL and FILE_READ_DATA
+(FILE_LIST_DIRECTORY on directories). Every ancestor stays open with read/write
+sharing and no delete sharing through observation/read and while pins are held.
+Unrelated sibling renames and moves into these ancestors remain possible.
+Immutable final leaves use read-only sharing; mutable state leaves share
+read/write without delete sharing. Owner/DACL namespace authority remains
+essential: the retained handles alone do not exclude all modification.
 GetDriveTypeW requires a fixed local drive. GetSecurityInfo supplies exact owner,
 protected/present DACL and bounded ACE observations; unknown ACE types refuse.
 Native allow ACE observations retain the full access mask. Final binary-integrity
@@ -355,8 +358,11 @@ files is an open owner-adapter integration requirement, not an owner action
 performed by this candidate.
 
 State handles and protected ancestry remain held for the store lifetime. On
-Windows, immutable handles exclude write/delete sharing, mutable database,
-journal and lock handles allow write sharing but exclude deletion. All request
+Windows, immutable final handles exclude write/delete sharing, while ancestor,
+mutable database, journal and lock handles share read/write but exclude deletion.
+Ancestor ACL checks reject foreign namespace-control rights; write sharing
+permits unrelated sibling renames and moves into the ancestor. Pins alone do
+not freeze directory contents or ACLs. All request
 FILE_READ_DATA (FILE_LIST_DIRECTORY for directories): metadata-only handles did
 not actually prevent rename in the new normal-user regression. The strengthened
 regression proves mutable writes succeed while rename/deletion fail, then rename
