@@ -3,9 +3,9 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#22](https://github.com/Dytschgo/arxcovo/pull/22), `8fafbe70451807cf419c8e47706259b24a49cf68`, 12:46:32 UTC, after fresh independent review and all required gates.
-- Main includes authenticated inventory/activity, persistent host identity and explicitly opt-in Windows current-user development execution. The separate Unix executor remains library-only; installed services and dedicated-account acceptance remain open.
-- Current work: review the service lifecycle foundation, integrate fixed configuration with merged activity v2, and complete the owner-authorized current-user Windows development executor after its other-provider handoff. No third privileged Windows probe is planned.
+- Last merged PR: [#24](https://github.com/Dytschgo/arxcovo/pull/24), `66c1b173546f1df9faa419c34845339f9cdf0fec`, 13:12:55 UTC. Sanitized development acceptance is merged; dedicated-account/service M2 acceptance remains open.
+- Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
+- Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
 
 ## Accepted milestone 1 evidence
 
@@ -297,3 +297,14 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix restrictive-umask test correction
 
 - Codex / gpt-6.1-sol, medium addressed PR14 advisoryA3: the ordinary Linux positive-control test now launches an exact subprocess-only fixture with umask0077 set before exec. The child verifies that mask, requires outside/plain end at0755 and rejects directory reuse. The parent bounds runtime/output and proves exactly one named test ran. This leaves the parallel runner umask unchanged and invokes no account/service operations. Formatting and Windows workspace/all-target Clippy passed; native Linux execution and the creation-mode-only mutation remain pending hosted verification. Production executor/driver and privileged harness bytes are unchanged.
+
+## Real Claude Code development acceptance
+
+- Codex / gpt-6.1-sol, medium coordinated private acceptance after PR22 merged. Claude Code 2.1.322 was requested to use Opus 5.5 high through its existing login, with unrelated instructions, memory, hooks, connectors and built-in tools disabled; only the explicit arxcovo MCP server and named calls were allowed. Actual MCP events were inspected in memory, not a natural-language success report.
+- A non-test arxd binary built from independently reviewed source72a5e5f listed the host and executed literal cargo --version under the current unelevated Windows user. Production source equivalence to reviewed59293a8 was checked. SQLite and MCP confirmed the caller's successful row, development identity mode, current-user match, Medium integrity and null raw owner identity/rights. A daemon restart and fresh Claude Code session returned the same row.
+- The native executor reported confirmed Job cleanup. The harness stopped its owned processes, an independent native process query found zero remaining acceptance arxd instances, and temporary config/credential files were deleted. Only sanitized booleans, fixed labels, build/source hashes and outcomes are committed in docs/evidence/windows-development-acceptance.json. No raw CLI stream or private owner values were logged or committed.
+- This is a passed development acceptance under the owner's explicit alternative, not M2 completion: dedicated-account/service execution, rights enforcement, service Application and native owner adapters remain unfinished. S4U/service and VM paths remain unverified on real hardware. No account, right, task, service, elevation or old Lab Manager action occurred.
+
+## Unix validation conflict resolution
+
+- Codex / gpt-6.1-sol, medium resolved the docs-only conflict with main66c1b17 so hosted CI can exercise the restrictive-umask fixture at the integrated head. Executor, driver and test source are unchanged from18d4f1f; native test evidence remains pending. No privileged experiment ran.
