@@ -2,6 +2,7 @@
 pub mod config;
 pub mod exec;
 pub mod http;
+pub mod local;
 mod mcp;
 mod security;
 pub mod store;
