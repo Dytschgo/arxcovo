@@ -8,28 +8,30 @@ disposable experiment or the owner's install exercises it.
 Owner steps: docs/service-install.md. Builds on: proposed ADR 0006
 (`docs/early-hardware-and-raft-spikes`) and these states:
 
-- **Merged on main.** `d7f3ebd` (#19) contains inventory, persistent host
-  identity, the authenticated local IPC/stdio transport (#15, ADR 0008) and
-  activity v2 (ADR 0011). Windows probe diagnostics (#17, `2299ad4`) and the
-  drive-prefix path fix (#16, `b29f531`, merged after `d7f3ebd`) are also on
-  main. PR18 is closed, superseded by #19.
-- **Implemented in the PR20 candidate, not installed.** Lifecycle plumbing:
-  the `service::Host` state machine, shutdown ordering, the Windows SCM adapter,
-  Unix signals and notify, the exact `arxd service run` entry and the constant
-  manager artifacts. 50 runnable tests passed on Windows. Production entry still
-  fails closed. Owner commands, `client-config` and native application wiring
-  (config, store and inventory hooks) are absent.
-- **Separate, unmerged.** The fixed-config and owner-plan foundation (PR21,
-  61 tests, library-only). A native read-only adapter candidate (`9712c9f`,
-  70 tests), in which modern macOS identity resolution is incomplete; nothing
-  here assumes it is integrated. The Unix executor library (PR14, ADR 0007).
+- **Merged on main.** `66c1b17` (#24) includes inventory, persistent host
+  identity, authenticated local IPC/stdio (#15), activity v3 and explicitly
+  opt-in current-user development execution (#22), plus its real development
+  acceptance record (#24). The path correction (#16) is merged and PR18 was
+  superseded by #19.
+- **Implemented in PR20, not installed.** Lifecycle plumbing includes the Host
+  state machine, separate drain/audit deadlines, bounded startup, SCM and Unix
+  signal/notify adapters, exact service entry and constant manager artifacts.
+  All 75 runnable Windows tests passed at the independently reviewed code head.
+  Production service entry still fails closed until application wiring exists.
+- **Separate, unmerged.** Fixed configuration and typed owner plans are PR21;
+  read-only native identity/layout validation is PR25, including local macOS
+  OpenDirectory support. Its integrated Windows suite passed 97 runnable tests,
+  and hosted Ubuntu/macOS jobs passed; installed-layout proof remains open.
+  The Unix executor library is PR14 (ADR0007). Application wiring and the Windows
+  owner adapter are separate ongoing implementations, with no installation
+  acceptance claimed.
 - **Windows S4U.** Both disposable experiments failed: run 42995659949 in an
   unlocated setup phase, and run 43003724132 (at `2299ad4`) with result
   validation failing after successful privilege and account API diagnostics.
   No S4U success is established, and no third experiment is planned.
 - **Development exception.** The owner explicitly authorized a separate,
-  foreground, local-only, current-user Windows development mode (ADR 0010, on
-  `docs/windows-current-user-development`, not yet on main). It is not a
+  foreground, local-only, current-user Windows development mode (ADR 0010,
+  merged in #22 and verified by the development acceptance in #24). It is not a
   production identity fallback and does not satisfy the M2 dedicated-account
   criterion below. This ADR does not define that mode.
 
