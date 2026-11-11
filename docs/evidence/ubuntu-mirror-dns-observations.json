@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "kind": "read_only_hosted_dns_observation",
+  "sourceCommit": "2cf5ab9aa770c6802e8f31c2a0136394392b2667",
+  "runId": 43045667306,
+  "jobId": 130608817837,
+  "runnerLabel": "ubuntu-latest",
+  "observedAt": "2026-11-11T15:10:54Z",
+  "beforeRustTests": true,
+  "observations": [
+    {
+      "target": "ubuntu_azure",
+      "status": "timeout"
+    },
+    {
+      "target": "ubuntu_archive",
+      "status": "timeout"
+    },
+    {
+      "target": "ubuntu_security",
+      "status": "timeout"
+    },
+    {
+      "target": "github_control",
+      "status": "resolved"
+    },
+    {
+      "target": "microsoft_control",
+      "status": "resolved"
+    }
+  ],
+  "jobConclusion": "failure",
+  "rootCauseEstablished": false,
+  "packageSourcesChanged": false
+}
