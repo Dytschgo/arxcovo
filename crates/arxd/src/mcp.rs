@@ -135,9 +135,12 @@ impl ServerHandler for Inventory {
                     .map_err(|_| unavailable())?;
                 return Err(ErrorData::internal_error("execution unavailable", None));
             };
+            // Spawned here, before any await: the worker completes the audit row
+            // even if cancellation wins the race below or the future is dropped.
+            let work = executor.dispatch(parsed, self.activity.clone(), id);
             let result = tokio::select! {
-                result=executor.dispatch(parsed,self.activity.clone(),id)=>result,
-                _=context.ct.cancelled()=>return Err(ErrorData::internal_error("cancelled",None)),
+                result = work => result,
+                _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
             }
             .map_err(|r| ErrorData::internal_error(r.as_str(), None))?;
             return Ok(
