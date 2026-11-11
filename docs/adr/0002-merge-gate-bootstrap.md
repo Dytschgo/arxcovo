@@ -1,6 +1,6 @@
 # 0002: Install and activate merge gates
 
-Status: installed and enforced after reviewed PRs #1–2. The trivial auto-merge acceptance passed in PR #3; slow-main rejection and measured recovery are still under test in PRs #4–6.
+Status: installed and enforced after reviewed PRs #1–2. Trivial auto-merge passed in PR #3. PRs #4–6 proved slow-main rejection and measured recovery; updated probe #5 then auto-merged normally. The setup evidence is retained in PROGRESS.md and the committed CI history.
 
 The repository begins without workflows or a main CI baseline. Install the infrastructure through PR #1 after actual three-platform CI and an independent other-provider review pass. Bootstrap protection requires those available CI/review checks before installation; add the budget requirement after the first real main baseline. Record this first merge as an installation merge before budget enforcement, not milestone acceptance. No status is fabricated and no installed protection is weakened.
 

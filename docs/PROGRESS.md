@@ -11,7 +11,7 @@
 ## Setup evidence and remaining work
 
 - Public AGPL-3.0 repository, Rust/npm workspaces, pinned tools/lockfiles, README/CONTRIBUTING/SECURITY and roadmap are merged.
-- Hosted Windows, macOS and Ubuntu CI passed on both merged PRs. Local Rust formatting, Clippy with warnings denied and two nextest integration tests passed.
+- Hosted Windows, macOS and Ubuntu CI passed on every merged PR. Local Rust formatting, Clippy with warnings denied and two nextest integration tests passed.
 - First main CI: [run 42948900419](https://github.com/Dytschgo/arxcovo/actions/runs/42948900419), commit `708afbd`, attempt 1, success. Started 02:52:03 UTC and completed 02:55:12 UTC: **189 seconds**. The API-derived record is in docs/ci-duration-history.json.
 - Eighteen policy/guard tests and one React component test pass locally. UI lint/build and Chromium smoke pass. Hosted CI repeats the relevant checks for each PR.
 - Main protection readback requires `verify (ubuntu-latest)`, `verify (windows-latest)`, `verify (macos-latest)`, `ci-time-budget` and `agent-review`. CI/budget are pinned to Actions App 15368; reviewer status permits the authenticated external publisher. Strict mode and administrator enforcement are on, zero approving GitHub users are required, and force pushes/deletion are blocked.
@@ -28,7 +28,7 @@
 - Probe [#5](https://github.com/Dytschgo/arxcovo/pull/5), head 690bf5d, has no ci-speed label. Its three platform checks and independent Opus review passed; Ubuntu finished at 03:52:59 UTC. At 08:05:19 UTC the guarded command enabled auto-merge. GitHub still reported OPEN/BLOCKED with ci-time-budget as the sole failing required gate. This proves live rejection of an otherwise green PR.
 - Recovery [#6](https://github.com/Dytschgo/arxcovo/pull/6), reviewed head 1da52c2, removed only the delay and restored the 12-minute timeout. Its attempt-1 [run 42953952528](https://github.com/Dytschgo/arxcovo/actions/runs/42953952528) succeeded from 03:37:12 to 03:41:47 UTC: **275 seconds**. The ci-speed budget exception passed against the slow main baseline. After recording the blocked probe, the coordinator invoked the guarded merge command; GitHub merged at 08:05:25 UTC.
 - Recovery main [run 42984281226](https://github.com/Dytschgo/arxcovo/actions/runs/42984281226), attempt 1 at e692b20, succeeded from 08:05:27 to 08:09:38 UTC: **251 seconds**. The evaluator restored probe #5's budget success at 08:10:01. Probe head aaaf52c passed fresh independent review, final Windows CI passed at 08:11:52, and GitHub auto-merged at 08:12:14. No subsequent coordinator merge command was issued for the probe; normal merging resumed through all five gates.
-- Electron tests are committed in [#7](https://github.com/Dytschgo/arxcovo/pull/7), now based on main at head b8c2187. Local lint and the real Windows smoke test passed. The earlier head passed hosted Ubuntu/macOS CI; the updated head's hosted results and final review remain pending. Auto-merge is off.
+- Electron tests are committed in [#7](https://github.com/Dytschgo/arxcovo/pull/7), reviewed head b8c2187. Local lint and the real Windows smoke test passed. Hosted run 42984639552 passed all three platforms, each running Electron once; independent Opus review passed. The branch needs updating after the newer main merges and re-review before merge. Auto-merge is off.
 
 ## Milestones
 
@@ -41,10 +41,10 @@
 
 ## Owner actions and local follow-up
 
-- Blockers: only the owner setup actions below are known; setup acceptance is still running.
+- Blockers: setup acceptance passed; evidence PR #8 needs corrected documentation, fresh review and green CI. Later hardware acceptance requires the owner setup below.
 - Read-only preflight: the dedicated local `Arxcovo` account is absent; QEMU is not on the current PATH. Owner must create the standard account before dedicated-account host acceptance and complete WHPX/QEMU/data caps before real VM acceptance. No agent performed administrative changes.
 - docs/dev-host-setup.md is prepared locally for a separate documentation PR. It includes resource reserves, disk limits, official installation media and verification steps. Never touch the old Lab Manager installation, state or `agent-windows-test` VM.
-- Electron follow-up #7 verifies rendering, isolation preferences, blocked navigation and popup denial. Clearing ELECTRON_RUN_AS_NODE only in the launched child fixes the harness launch failure. Hosted/Linux/macOS test results remain pending; no sandbox bypass was added.
+- Electron follow-up #7 verifies rendering, isolation preferences, blocked navigation and popup denial. Clearing ELECTRON_RUN_AS_NODE only in the launched child fixes the harness launch failure. Hosted Ubuntu/macOS/Windows tests passed on b8c2187; no sandbox bypass was added. VM and hypervisor paths remain unverified.
 - Blanket minimatch override and duplicated tool pins remain lower-priority scaffold follow-ups. No new reviewer App or model API credential is required for the current flow.
 
 ## Oversight
@@ -74,9 +74,14 @@
 | PR #5 independent review | Claude / claude-opus-5-5 | high | Success on 690bf5d; doc-only probe, slow baseline and otherwise-green rejection still pending |
 | PR #5 recovered-main review | Claude / claude-opus-5-5 | high | Success on aaaf52c; rejection evidence independently checked, final Windows CI and normal merge pending |
 | PR #6 independent review | Claude / claude-opus-5-5 | high | Success on 1da52c2; all real CI checks preserved, measured recovery still pending |
-| Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | Local commit 0c16a9e on test/await-policy-failure; 10 evaluator tests pass, asynchronous assertion strengthened; review/merge pending after recovery |
+| Probe PR #5 builder | Codex / gpt-6.1-sol | medium | Rejection observed on 690bf5d; recovered aaaf52c auto-merged through all gates |
+| Recovery PR #6 builder | Codex / gpt-6.1-sol | medium | Removed fixture, successful measured ci-speed exception and merge; fast main verified |
+| Evidence PR #8 builder | Codex / gpt-6.1-sol | medium | API-derived history and acceptance outcomes; correcting stale ADR/progress after review |
+| PR #8 review round 1 | Claude / claude-opus-5-5 | high | Failure on ebdb8f4: stale ADR status; acceptance evidence independently confirmed |
+| Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
+| PR #7 independent review | Claude / claude-opus-5-5 | high | Success on b8c2187; hosted Electron passed on three OSes, all five protection-removal mutations failed locally |
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
