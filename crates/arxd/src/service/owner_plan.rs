@@ -47,7 +47,7 @@ pub struct Registration {
     pub reset_seconds: u32,
     pub restart_non_crash: bool,
 }
-fn registration(l: &Layout) -> Registration {
+pub(super) fn registration(l: &Layout) -> Registration {
     Registration {
         name: "arxd",
         image: l.binary().into(),

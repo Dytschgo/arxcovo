@@ -5,15 +5,24 @@ Status: settled architecture contract (Opus 5.5 high, design sub-agent),
 Corrected the same day from base `68614bcdf7281f161c1d5ed339340685200b0f8c`
 after independent Sol review finding P1
 (docs/reviews/0012-owner-contract-review.md): the safety guarantee is
-narrowed to an explicit fault model (decision 6). It needs a fresh independent
-Sol recheck before implementation is merged. Nothing
-here is implemented, installed or exercised. Every native path is **unverified
+narrowed to an explicit fault model (decision 6). Its independent Sol recheck of `b522125` is retained in the same review report.
+Acceptance is limited to that stated fault model, not physical durability. Amended the same day from base
+`d6df821dcd2ec827bcf2cd3c86bea32a2c639ca4` in the **SCM** part of "Native
+adapter contract" only, to apply the Windows boot-intent rule of ADR 0014
+decision 1. The amendment has the independent Sol review retained in
+`docs/reviews/windows-scm-contract-review.md`. The pure engine and protected
+store have separate implementation/review records. The SCM library is
+implemented in PR35; its full Opus implementation review at `54c43fb` found no
+blocking issue, and the final refresh needs its own exact-head recheck. No SCM
+installation or real-manager exercise is established. Every production native path is **unverified
 on real hardware**. This ADR establishes no milestone 2 acceptance.
 
 Amends ADR 0009 "Owner subcommands" (`service configure` and `service
 uninstall`) for Windows only. It replaces the `Journal`/`ConfigurationIo` shape
-of the pure candidate in `service::owner_transactions` (`a8628c6`). Linux and
-macOS owner paths are unchanged.
+of the pure candidate in `service::owner_transactions` (`a8628c6`). Its SCM
+amendment also replaces the start type in ADR 0009's "Windows SCM host entry":
+install registers demand-start, and `start` and `stop` switch the start type
+(ADR 0014 decision 1). Linux and macOS owner paths are unchanged.
 
 ## Problem
 
@@ -420,36 +429,99 @@ type is a value. The production constructor fixes SYSTEM and the descriptor
 above. A `#[cfg(test)]` fixture constructor uses the current user's SID, so
 tests never relax a production check.
 
-**SCM** (a separate PR; ADR 0009's `Registration` is the contract):
+**SCM** (PR-C; ADR 0009's `Registration` is the contract, as amended here).
+The exact procedures, error table and tests are in
+[docs/briefs/windows-scm-adapter.md](../briefs/windows-scm-adapter.md).
 
-- *Install.* Use `CreateServiceW` with the quoted fixed image and
-  `service run`, `SERVICE_WIN32_OWN_PROCESS`, `SERVICE_AUTO_START`, account
-  NULL (LocalSystem), and never start the service. Then apply each
-  `ChangeServiceConfig2W` value: delayed auto-start, unrestricted service SID,
-  the four required privileges, a 30000 ms preshutdown, failure actions
-  5000/30000 ms with an 86400 s reset, and the non-crash flag set to false.
-  An existing `arxd` service is treated as Arxcovo's only when its base
-  configuration exactly matches: own-process type, auto start, exact
-  `lpBinaryPathName` bytes and LocalSystem. In that case install converges
-  the config2 values. This recovers from a crash between `CreateServiceW` and
-  the config2 calls without manual repair, which is a small departure from
-  ADR 0009's identical-only rule. Any other mismatch refuses with `Conflict`.
-  The SCM object DACL is left at its default and is not compared.
-- *Start, stop, status, uninstall.* Each first runs the same base-configuration
-  comparison, and a mismatch refuses: a foreign `arxd` is never started,
-  stopped or deleted. Stop polls until stopped, with a 30 s bound; a timeout
-  returns `Io` and deletes nothing. Uninstall order:
-  1. stop;
-  2. `DeleteService`; a missing service counts as already removed, so a rerun
-     after a partial uninstall continues;
-  3. `uninstall_right`.
+*Amendment, 2026-11-11 (base `d6df821d`).* The accepted ADR 0014 decision 1
+(pinned as `feat/unix-owner-operations` at
+`b052d94058444f56186ed0a75c5e1e79196d35a3`,
+`docs/adr/0014-unix-owner-lifecycle-corrections.md`) requires the Windows
+adapter to "register demand-start, switch to delayed auto-start before
+`StartService`, and switch back to demand after a confirmed stop". The rule is
+that the last successful explicit command decides boot intent. That
+requirement replaces three things: `SERVICE_AUTO_START` at creation in the
+earlier text of this section, "auto start (delayed)" in ADR 0009's "Windows
+SCM host entry", and "auto start" as part of the base identity. The engine,
+the record, the store and the LSA contract do not change.
 
-  An SCM failure stops the uninstall before the right is touched.
-- *Status mapping.* `ERROR_SERVICE_DOES_NOT_EXIST` → `not-installed`. Stopped
-  with a zero exit → `stopped`, and with a nonzero `dwWin32ExitCode` or
-  service-specific code → `failed`. Start pending → `starting`, running →
-  `running`, stop pending → `stopping`. Any paused or continue state →
-  `failed`.
+- *Base identity ("Ours").* `dwServiceType` is exactly
+  `SERVICE_WIN32_OWN_PROCESS` (no interactive bit). `lpBinaryPathName` is the
+  exact UTF-16 sequence `"` + fixed binary + `" service run`, with no case
+  folding, normalisation or prefix tolerance. `lpServiceStartName` is exactly
+  `LocalSystem`. The start type is `SERVICE_DEMAND_START` or
+  `SERVICE_AUTO_START`. The start type is boot intent, not identity, but only
+  the two values Arxcovo writes are accepted. Boot, system, disabled or any
+  other start type, and any other type, image or account, make the service
+  **Foreign**. Arxcovo never starts, stops, reconfigures or deletes a
+  Foreign service, and it never takes one over. The display name, error
+  control, load-order group, dependencies, triggers, description and object
+  DACL are neither compared nor converged.
+- *Installed.* The service is Ours and all six config2 values match exactly:
+  the delayed flag is TRUE, the service SID is unrestricted, the four
+  privileges form an exact set, preshutdown is 30000 ms, failure actions are
+  restart 5000 ms, restart 30000 ms and then none (0 ms) with an 86400 s reset
+  and an empty reboot message and command, and the non-crash flag is FALSE.
+  "Then none" needs the explicit third action, because the SCM repeats the
+  last action for later failures.
+- *Install.* Install never starts the service and never sets
+  `SERVICE_AUTO_START`. A missing service is created with `CreateServiceW`
+  (demand start, account and password NULL). An existing Ours service in
+  `SERVICE_STOPPED` first gets `ChangeServiceConfigW(SERVICE_DEMAND_START)`.
+  Any state other than stopped refuses with `Active` and changes nothing.
+  Then every config2 value is written, in a fixed order, and the result is
+  read back. Install succeeds only if the registration is Installed, demand
+  start and stopped. Create reopens at most once on
+  `ERROR_SERVICE_EXISTS`, and otherwise there is no internal retry. Rerunning
+  install converges from any earlier failure point. This keeps the existing
+  departure from ADR 0009's identical-only rule.
+- *Start.* Start requires Installed. A missing or incomplete registration
+  refuses with `NotInstalled`. Then `ChangeServiceConfigW(SERVICE_AUTO_START)`
+  runs, followed by a re-assert of the delayed flag. That re-assert is
+  idempotent, and it is robust if the base change resets the flag, which is
+  **unverified**. `StartServiceW` runs only when the
+  service is stopped, and start then polls until running, with a 35 s bound.
+  If a failure happens after the start-type change, the service is left
+  stopped but auto-start, as in the ADR 0014 Unix rows.
+- *Stop.* Stop requires Ours only, so a half-installed service can still be
+  stopped and removed. It sends the stop control and polls until
+  `SERVICE_STOPPED`, with a 30 s bound. Only after that confirmed stop does it
+  run `ChangeServiceConfigW(SERVICE_DEMAND_START)`. A failure before the
+  confirmed stop leaves the start type as it was and removes nothing. ADR
+  0014's general sentence "the persistence change runs before the runtime
+  change" does not apply to Windows stop, because its explicit Windows text
+  governs. As a result, a stop that fails keeps the boot intent of the last
+  *successful* command.
+- *Uninstall* runs stop, with `ERROR_SERVICE_MARKED_FOR_DELETE` accepted on
+  the demand change. `DeleteService` then runs, and success or
+  `ERROR_SERVICE_MARKED_FOR_DELETE` both count. A final status read must show
+  the service gone or stopped. Only then does the SCM API return the
+  unforgeable proof `Deregistered`. A service that is missing from the start
+  is already removed, and also yields `Deregistered`. A Foreign service and
+  every other SCM error return `Err` with no proof. `uninstall_right` may run
+  only after `Deregistered`, so every SCM error halts uninstall before the
+  right is touched. The SCM API never accepts, returns or reaches the store,
+  the `BatchRight` adapter or `parts()`. Narrowing `parts()` so that wiring
+  cannot call `uninstall_right` without the proof is a prerequisite for PR-D.
+- *Status mapping.* This is read-only. A missing service → `not-installed`.
+  A stopped service whose `dwWin32ExitCode` is `0` or
+  `ERROR_SERVICE_NEVER_STARTED` and whose service-specific code is `0` →
+  `stopped`. Any other stopped service → `failed`. Start pending →
+  `starting`, running → `running`, stop pending → `stopping`, and any paused
+  or continue state → `failed`. Foreign gives `Foreign`. Ours but not
+  Installed gives `NotInstalled`. An unrecognised value gives `Manager`. Status
+  does not report boot intent.
+- *Errors.* The SCM API returns only `layout::Error`. It adds `NotInstalled`
+  (`service-not-installed`), `Foreign` (`service-foreign-registration`) and
+  `Active` (`service-active`), which are identical to ADR 0014's variants and
+  tokens, and it uses `Manager` for everything else. Win32 codes, buffers and
+  strings never reach output. Query buffers are 8 KiB, aligned and fixed, and
+  each query makes one call. Every embedded pointer is range-checked, and
+  polling uses an injected monotonic clock with fixed deadlines that
+  `dwWaitHint` never extends. These bound polling between synchronous calls,
+  not an in-flight native API stall. After a stop control succeeds no further
+  control is sent while waiting for stopped. There is no fallback, no password, no S4U retry
+  and no approval step.
 
 ## External and stale changes
 
@@ -542,7 +614,7 @@ privilege call.
 | N8 | A foreign handle holding write access makes compare-and-replace refuse, and the target is unchanged. |
 | N9 | The production descriptor constant parses to owner SY, a protected DACL and exactly two ACEs (SY and BA). |
 | N10 | LSA result mapping over synthetic buffers: not-found, empty, present, over-count, odd length, and other status. |
-| N11 | SCM base-configuration comparison and status mapping over synthetic structures, including the exact quoted image bytes. |
+| N11 | SCM base-identity and Installed comparison, config2 and status parsing over synthetic native structures (with range-checked embedded pointers), status mapping, and fake-call ordering for the boot-intent rule, including the exact quoted image bytes. The full list is in the PR-C brief. No test makes a real SCM call. |
 
 **Disposable experiment.** This needs its own review before any dispatch, in
 the pattern of PR12 and PR14. It runs only on an ephemeral GitHub-hosted
@@ -567,7 +639,9 @@ rename path is **unverified on real hardware**.
   N tests use a fixture root, and production `open` must fail closed with
   `Layout`. No CLI.
 - **PR-C (SCM).** Install, start, stop, status and uninstall adapters, plus
-  N11. No CLI.
+  N11, exactly as in
+  [docs/briefs/windows-scm-adapter.md](../briefs/windows-scm-adapter.md).
+  No CLI, no session or `parts()` change, and no `Plan::execute` route.
 - **PR-D (wiring).** Connect the `arxd service install|configure|start|stop|status|uninstall`
   commands to the session. Uninstall prints one fixed `RightReport` token,
   `batch-right-{removed,already-absent,retained-unproven,retained-not-arxcovo,not-recorded}`.
