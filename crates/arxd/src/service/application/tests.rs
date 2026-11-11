@@ -9,7 +9,7 @@ use super::super::{
 use super::*;
 use std::{path::PathBuf, sync::Mutex};
 
-fn private_temp() -> tempfile::TempDir {
+pub(crate) fn private_temp() -> tempfile::TempDir {
     #[cfg(target_os = "macos")]
     let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     #[cfg(not(target_os = "macos"))]

@@ -263,4 +263,4 @@ impl<H: Hooks> Application for ServiceApplication<H> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
