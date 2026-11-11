@@ -1674,3 +1674,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Local executor interface refresh after #14
 
 - Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` into local #36 preparation. The reviewed Unix library remains uncalled by the production backend; MechanismUnavailable stays explicit. Executor/MCP/store/Application behavior is unchanged from public `a52d360`; the parent supplies only the unactivated Unix library and CI guard. Public #36 stays frozen for its full pinned review; this local refresh requires subsequent exact-head review and hosted gates before merge.
+
+- Local combined #36/#14 verification at `58e4953` passed formatting, locked workspace/all-target Clippy and **203/203 normal nextest**, two direct-only fixtures exercised through parents. Run `73007f5f-5307-4147-84a4-a18f5c9dadec`, 10.220-second test phase. Executor/MCP/local execution/store/Application files are byte-identical to public `a52d360`; the Unix library has no production caller. No push while the full pinned review remains active; no privileged experiment or acceptance was rerun.
