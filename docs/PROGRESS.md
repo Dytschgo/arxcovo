@@ -1070,3 +1070,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Early feasibility documentation refresh on service stack
 
 - Codex / gpt-6.1-sol / medium refreshed existing #10 onto actual main `cd464b2`, preserving the earlier proposed research and owner-only setup checklist. ADR0006 remains historical and points to the settled dedicated-service and separate development contracts; no password fallback, new authority or architecture adoption is introduced. Research documents and setup prerequisites do not establish hardware or M2 acceptance. Current state stays first; fresh exact-head independent review and hosted gates remain required.
+
+- Checked the five feasibility/setup documents for valid UTF-8, balanced fences and resolving local Markdown links; whitespace checks passed. Runtime, dependency, workflow and tool trees match merged main, so no Rust or hardware run is claimed for this documentation-only refresh. The proposed M3/M4 designs remain research and require their milestone-specific decisions, implementation and acceptance.
