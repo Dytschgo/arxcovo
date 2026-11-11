@@ -8,6 +8,8 @@ pub mod owner_plan;
 pub mod preflight;
 
 pub mod owner_transactions;
+#[cfg(windows)]
+pub mod owner_windows;
 use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 
@@ -221,3 +223,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod owner_scm;
+#[cfg(windows)]
+mod owner_scm_windows;

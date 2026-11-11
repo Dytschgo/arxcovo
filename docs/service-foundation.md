@@ -536,3 +536,76 @@ publication/locking/LSA/SCM tests, installed wiring/provisioning, dedicated-acco
 execution and installed M2 acceptance remain open. All native/installed paths
 are **unverified on real hardware**. Accepted architecture is not implementation
 acceptance; a fresh independent Opus review is required.
+
+## ADR0012 PR-B callable native candidate
+
+The local PR-B candidate adds `service::owner_windows` on Windows. Public API:
+`WindowsOwnerSession::open() -> Result<Self, OpenError>` validates production
+owner authority and fixed layout/binary identity, enables restore privilege,
+acquires the existing owner lock, cleans checked staging leftovers and invokes
+engine recovery. It takes no path, SID, descriptor, resolver or policy argument.
+`parts(&mut self) -> (&mut WindowsOwnerStore, &mut WindowsBatchRight)` lends the
+locked adapters together to the pure engine; neither adapter has a public
+constructor. `WindowsOwnerStore::read_config()` returns optional bounded exact
+protected bytes; the store implements OwnerStore and the right adapter implements
+BatchRight. None of these types Debug-print private payloads. OpenError displays
+only existing layout/Failure tokens.
+
+The session owns the staging and target handles, strict ancestor/binary pins and
+exclusive lock, dropping the lock last. Publication uses create-new staging,
+explicit SYSTEM owner/private descriptor, same-handle protection/bytes, exact
+SHA256 comparisons and handle-based rename with final file-ID/byte verification.
+A rename-attempt error has unknown publication outcome; callers must reread on
+the next session. Pre-rename cleanup is checked and acts on the retained source
+handle only. Unsafe leftovers are preserved and refused. Config parsing performs
+fresh native account validation and owner-only metadata inspection; it grants
+no provenance authority. No service workspace access is added.
+
+Twelve normal-user tests cover ADR N1-N10 and source/target race controls. N9
+checks the exact production descriptor in memory and rejects altered owner,
+inheritance and foreign grants. N10 exercises synthetic LSA buffers/statuses;
+no actual LSA policy is opened by tests. Test-only current-user policy cannot
+be selected in production. See PROGRESS for executed commands and mutation
+controls. Production privileged layout/identity/LSA behavior remains **unverified
+on real hardware**. This candidate adds no SCM executor, CLI/MCP route, install
+activation or Plan::execute path, and confers no installed/M2 acceptance. The
+PR-A engine remains under independent review coordinated by the coordinator.
+
+## ADR0012 PR-C library candidate
+
+`service::owner_scm` contains a generic SCM lifecycle engine with observe,
+register, start, stop, status and deregister methods. Its seam and concrete
+facade currently have service-module visibility to respect private trait bounds;
+PR-D may expose a concrete facade. Status, Boot and Observation carry only fixed
+values. The non-Clone/non-Copy/non-Default opaque Deregistered proof records an
+absent service or successful deletion request followed by a stopped/gone
+observation; it does not promise physical database-entry disappearance.
+
+Registration consumes owner_plan::Registration and uses the exact quoted UTF-16
+image. Identity requires exact own-process type, LocalSystem, and demand or auto
+start. Config2 requires the exact four-privilege set, delayed flag, unrestricted
+SID, preshutdown, restart 5s/30s/explicit-none recovery and non-crash flag. Install
+converges only while stopped, writes demand before config2, then reads everything
+back. Start selects auto and reasserts delayed before activation. Stop selects
+demand only after stopped. A successful STOP is never repeated while polling.
+Marked-for-delete is accepted only at deregistration's demand/delete writes.
+
+The Windows seam uses RAII handles, operation-specific access, one aligned fixed
+8 KiB buffer per query and safe checked-slice parsing of embedded pointer values.
+No embedded pointer is dereferenced. The injected 30s/35s deadlines bound polling;
+they cannot interrupt an in-flight synchronous native RPC. Fake SCM boot/crash
+models are explicit models, not Windows reboot or recovery evidence. Synthetic
+native structures require no SCM constructor or native service query.
+
+This slice changes no session, raw parts, provenance engine, right-removal path,
+Plan::execute, CLI or MCP route. PR-D must consume the proof before right removal,
+narrow session parts, implement safe fresh-install provisioning and run start
+preflight. Owner-store and service-state provisioning remain separate work.
+
+All installed/native SCM behavior remains **unverified on real hardware**:
+LocalSystem/image readback; demand-start delayed flag support and preservation;
+1077 on never-started/rebooted demand services; crash recovery during deletion;
+marked-for-delete handle/API behavior; privilege ordering and buffer sufficiency;
+real reboot persistence; and sufficiency of the four privileges. These require a
+separately reviewed disposable hosted-runner experiment. Independent Opus review
+and hosted required checks remain required; M2 is open.
