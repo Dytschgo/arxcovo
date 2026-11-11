@@ -1,4 +1,5 @@
 //! Owner-only operation plans; deliberately no CLI, MCP route or native executor.
+use super::owner_transactions::BatchObservation;
 use super::{
     config::{Resolver, Rights, ServiceConfig},
     layout::{Error, Layout, Platform, Policy},
@@ -108,6 +109,7 @@ pub enum Operation {
 /// Fixed output only. Intentionally does not Debug-print Operation payloads.
 pub struct Plan {
     operations: Vec<Operation>,
+    transaction_only: bool,
 }
 /// This evidence must come from an owner-local native adapter, never MCP input.
 pub struct OwnerContext<'a> {
@@ -118,11 +120,18 @@ pub trait OsManager {
     fn apply(&mut self, operation: &Operation) -> Result<(), Error>;
 }
 impl Plan {
+    #[cfg(test)]
+    pub(super) fn test_operations_mut(&mut self) -> &mut [Operation] {
+        &mut self.operations
+    }
     pub fn operations(&self) -> &[Operation] {
         &self.operations
     }
     /// Stops on the first error. No automatic rollback/takeover after partial failure.
     pub fn execute(&self, manager: &mut impl OsManager) -> Result<(), Error> {
+        if self.transaction_only {
+            return Err(Error::NativeAdapterMissing);
+        }
         for op in &self.operations {
             manager.apply(op)?;
         }
@@ -216,7 +225,12 @@ fn reload() -> Operation {
     }
 }
 pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Plan, Error> {
-    authorize(l, c, action == Action::Install)?;
+    authorize(
+        l,
+        c,
+        action == Action::Install
+            || (l.platform() == Platform::Windows && action == Action::Uninstall),
+    )?;
     let mut operations = guards(l);
     match action {
         Action::Install => {
@@ -282,20 +296,26 @@ pub fn owner_plan(l: &Layout, c: &OwnerContext<'_>, action: Action) -> Result<Pl
             }
         }
     }
-    Ok(Plan { operations })
+    Ok(Plan {
+        operations,
+        transaction_only: l.platform() == Platform::Windows && action == Action::Uninstall,
+    })
 }
-/// Actual observed right, plus a previously validated service config. Caller
-/// must read previous bytes through the private native reader. No caller flag
-/// may assert ownership of a right. Changing the build pin requires uninstall.
+/// Windows requires Some(observe_batch(...)) from the locked private session;
+/// Unix requires None and has no LSA/provenance dependency. The config mirror
+/// never authorizes ownership. Changing the build pin requires uninstall.
 pub fn configure_plan(
     l: &Layout,
     c: &OwnerContext<'_>,
     config: &ServiceConfig,
     previous: Option<&ServiceConfig>,
-    batch_present: bool,
+    batch: Option<BatchObservation>,
     resolver: &impl Resolver,
 ) -> Result<Plan, Error> {
-    authorize(l, c, false)?;
+    authorize(l, c, l.platform() == Platform::Windows)?;
+    if (l.platform() == Platform::Windows) != batch.is_some() {
+        return Err(Error::Config);
+    }
     config.revalidate(l, resolver)?;
     if let Some(old) = previous {
         old.revalidate(l, resolver)?;
@@ -305,8 +325,8 @@ pub fn configure_plan(
     }
     let mut operations = guards(l);
     let granted = l.platform() == Platform::Windows
-        && (!batch_present || previous.is_some_and(|v| v.granted_batch_right()));
-    if l.platform() == Platform::Windows && !batch_present {
+        && batch.is_some_and(|b| !b.present() || b.recorded_grant());
+    if l.platform() == Platform::Windows && batch.is_some_and(|b| !b.present()) {
         operations.push(Operation::BatchRight {
             sid: config.build_identity().into(),
             add: true,
@@ -333,24 +353,23 @@ pub fn configure_plan(
         });
         operations.push(reload());
     }
-    Ok(Plan { operations })
+    Ok(Plan {
+        operations,
+        transaction_only: l.platform() == Platform::Windows,
+    })
 }
-/// Right removal only from the previously privately read, validated config.
+/// Windows ignores config/resolver: use owner_plan(Uninstall) without a config,
+/// then uninstall_right under the session lock. Unix retains revalidation.
 pub fn uninstall_plan(
     l: &Layout,
     c: &OwnerContext<'_>,
     previous: &ServiceConfig,
     resolver: &impl Resolver,
 ) -> Result<Plan, Error> {
-    previous.revalidate(l, resolver)?;
-    let mut plan = owner_plan(l, c, Action::Uninstall)?;
-    if l.platform() == Platform::Windows && previous.granted_batch_right() {
-        plan.operations.push(Operation::BatchRight {
-            sid: previous.build_identity().into(),
-            add: false,
-        });
+    if l.platform() != Platform::Windows {
+        previous.revalidate(l, resolver)?;
     }
-    Ok(plan)
+    owner_plan(l, c, Action::Uninstall)
 }
 
 #[cfg(test)]
@@ -460,7 +479,7 @@ mod tests {
             running_binary: l.binary(),
         };
         let config = parse(fixture(), &FakeResolver::default()).unwrap();
-        let p = configure_plan(&l, &c, &config, None, false, &FakeResolver::default()).unwrap();
+        let p = configure_plan(&l, &c, &config, None, None, &FakeResolver::default()).unwrap();
         let atomic = p
             .operations
             .iter()
@@ -481,7 +500,7 @@ mod tests {
             ..Default::default()
         };
         let admin_config = parse(v, &admin).unwrap();
-        let admin_plan = configure_plan(&l, &c, &admin_config, None, false, &admin).unwrap();
+        let admin_plan = configure_plan(&l, &c, &admin_config, None, None, &admin).unwrap();
         assert!(admin_plan.operations.iter().any(|o|matches!(o,Operation::RemoveConstant {path,expected} if path==Path::new(DROPIN_PATH) && *expected==DROPIN)));
         let mut m = RecordingOsManager {
             fail_at: Some(0),
@@ -495,7 +514,7 @@ mod tests {
                 &c,
                 &config,
                 None,
-                false,
+                None,
                 &FakeResolver {
                     changed: true,
                     ..Default::default()
@@ -576,7 +595,7 @@ mod tests {
             running_binary: l.binary(),
         };
         let config = parse(fixture(), &FakeResolver::default()).unwrap();
-        let p = configure_plan(&l, &c, &config, None, false, &FakeResolver::default()).unwrap();
+        let p = configure_plan(&l, &c, &config, None, None, &FakeResolver::default()).unwrap();
         let mut m = ModelManager::default();
         p.execute(&mut m).unwrap();
         let old = m.files[l.config()].clone();
@@ -587,7 +606,7 @@ mod tests {
             &c,
             &config,
             Some(&config),
-            false,
+            None,
             &FakeResolver::default(),
         )
         .unwrap();
@@ -600,110 +619,6 @@ mod tests {
             p.execute(&mut MissingNativeAdapter),
             Err(Error::NativeAdapterMissing)
         );
-    }
-    struct WindowsResolver {
-        group: bool,
-    }
-    impl Resolver for WindowsResolver {
-        fn account(&self, n: &str) -> Result<crate::service::config::Account, Error> {
-            use crate::service::config::{Account, AccountKind};
-            Ok(Account {
-                identity: if n == "builder" {
-                    "S-1-5-21-1-2-3-1002"
-                } else {
-                    n
-                }
-                .into(),
-                gid: None,
-                kind: if self.group {
-                    AccountKind::Group
-                } else {
-                    AccountKind::User
-                },
-                administrative: false,
-            })
-        }
-        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
-            Ok(true)
-        }
-    }
-    #[test]
-    fn windows_right_is_only_for_pinned_build_user_and_records_own_change() {
-        let l = Layout::for_test(Platform::Windows);
-        let c = OwnerContext {
-            admin: true,
-            running_binary: l.binary(),
-        };
-        let mut v = fixture();
-        v["client"]["identity"] = "S-1-5-21-1-2-3-1001".into();
-        v["build_account"]["identity"] = "S-1-5-21-1-2-3-1002".into();
-        v["build_account"]["gid"] = serde_json::Value::Null;
-        v["workspace"] = r"D:\work".into();
-        for sid in ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-80-1-2-3"] {
-            let mut unsafe_config = v.clone();
-            unsafe_config["build_account"]["identity"] = sid.into();
-            assert!(
-                ServiceConfig::parse(
-                    &serde_json::to_vec(&unsafe_config).unwrap(),
-                    &l,
-                    &WindowsResolver { group: false }
-                )
-                .is_err()
-            );
-        }
-        let bytes = serde_json::to_vec(&v).unwrap();
-        assert!(ServiceConfig::parse(&bytes, &l, &WindowsResolver { group: true }).is_err());
-        let config = ServiceConfig::parse(&bytes, &l, &WindowsResolver { group: false }).unwrap();
-        for present in [false, true] {
-            let p = configure_plan(
-                &l,
-                &c,
-                &config,
-                None,
-                present,
-                &WindowsResolver { group: false },
-            )
-            .unwrap();
-            let grants: Vec<_> = p
-                .operations
-                .iter()
-                .filter(|o| matches!(o, Operation::BatchRight { .. }))
-                .collect();
-            assert_eq!(grants.len(), usize::from(!present));
-            if !present {
-                assert!(
-                    grants[0]
-                        == &Operation::BatchRight {
-                            sid: config.build_identity().into(),
-                            add: true
-                        }
-                );
-            }
-            let bytes = p
-                .operations
-                .iter()
-                .find_map(|o| {
-                    if let Operation::AtomicConfig { bytes, .. } = o {
-                        Some(bytes)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap();
-            let written =
-                ServiceConfig::parse(bytes, &l, &WindowsResolver { group: false }).unwrap();
-            assert_eq!(written.granted_batch_right(), !present);
-            let uninstall =
-                uninstall_plan(&l, &c, &written, &WindowsResolver { group: false }).unwrap();
-            assert_eq!(
-                uninstall
-                    .operations
-                    .iter()
-                    .filter(|o| matches!(o, Operation::BatchRight { add: false, .. }))
-                    .count(),
-                usize::from(!present)
-            );
-        }
     }
     #[test]
     fn embedded_artifacts_have_fixed_program_arguments() {

@@ -1,8 +1,6 @@
-//! Windows configure transaction prerequisite. No native mutation is enabled.
-//!
-//! LSA and NTFS have no common transaction. A durable intent is not proof that
-//! this installation added a right. In particular, recovery never promotes an
-//! intent to a receipt by inspecting the current account rights.
+//! Pure Windows owner provenance engine. No native adapter or activation.
+//! Authority is supplied only by a private OwnerStore session holding the owner
+//! lock. Parsing or the configuration mirror does not establish provenance.
 use super::{
     config::{MAX_CONFIG_BYTES, Resolver, ServiceConfig},
     layout::{Layout, Platform},
@@ -10,13 +8,14 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
     InvalidPlan,
     Io,
     Conflict,
+    Busy,
     RecoveryRequired,
+    RightUnproven,
     Unsupported,
 }
 impl std::fmt::Display for Failure {
@@ -25,48 +24,50 @@ impl std::fmt::Display for Failure {
             Self::InvalidPlan => "service-owner-plan",
             Self::Io => "service-owner-io",
             Self::Conflict => "service-owner-conflict",
+            Self::Busy => "service-owner-busy",
             Self::RecoveryRequired => "service-owner-recovery-required",
+            Self::RightUnproven => "service-owner-right-unproven",
             Self::Unsupported => "service-owner-unsupported",
         })
     }
 }
 impl std::error::Error for Failure {}
-
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Phase {
+#[serde(rename_all = "lowercase")]
+pub enum RightState {
+    None,
     Intent,
     Granted,
+    Unproven,
 }
-
-/// Private data: never Debug-print or return through MCP. Native storage must
-/// protect and pin the journal exactly as the config, and reject hardlinks.
+/// Private owner data; intentionally no Debug or public constructor.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Journal {
+pub struct OwnerRecord {
     version: u8,
     sid: String,
-    before: Option<[u8; 32]>,
-    after: [u8; 32],
-    phase: Phase,
+    state: RightState,
 }
-impl Journal {
+impl OwnerRecord {
     pub fn encode(&self) -> Result<Vec<u8>, Failure> {
         serde_json::to_vec(self).map_err(|_| Failure::Io)
     }
-    /// Call only on bytes read from the pinned private journal handle. Parsing
-    /// is not provenance. No CLI or caller boolean may supply a receipt.
+    /// Only a read through the pinned private store establishes authority.
     pub fn decode(bytes: &[u8]) -> Result<Self, Failure> {
-        if bytes.len() > 1024 {
+        if bytes.len() > 512 {
             return Err(Failure::RecoveryRequired);
         }
-        let j: Self = serde_json::from_slice(bytes).map_err(|_| Failure::RecoveryRequired)?;
-        if j.version != 1 || !ordinary_sid(&j.sid) {
+        let record: Self = serde_json::from_slice(bytes).map_err(|_| Failure::RecoveryRequired)?;
+        if record.version != 1 || !ordinary_sid(&record.sid) {
             return Err(Failure::RecoveryRequired);
         }
-        Ok(j)
+        Ok(record)
     }
 }
 fn ordinary_sid(s: &str) -> bool {
+    if s.len() > 52 {
+        return false;
+    }
     let Some(tail) = s.strip_prefix("S-1-5-21-") else {
         return false;
     };
@@ -83,19 +84,20 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// Opaque request extracted from a complete validated Windows configure plan.
-/// Contains private bytes, so intentionally has no Debug implementation.
+/// Opaque validated Windows request. Contains private bytes; never Debug/log.
 pub struct Configure {
     bytes: Vec<u8>,
     expected: Option<Vec<u8>>,
     sid: String,
     add: bool,
+    batch: BatchObservation,
 }
 impl Configure {
     pub fn from_plan(
         layout: &Layout,
         plan: &Plan,
         resolver: &impl Resolver,
+        batch: BatchObservation,
     ) -> Result<Self, Failure> {
         if layout.platform() != Platform::Windows {
             return Err(Failure::Unsupported);
@@ -138,7 +140,8 @@ impl Configure {
             }
         }
         if !ordinary_sid(config.build_identity())
-            || config.granted_batch_right() != (add || old.is_some_and(|o| o.granted_batch_right()))
+            || config.granted_batch_right() != (add || batch.recorded_grant)
+            || add == batch.present
         {
             return Err(Failure::InvalidPlan);
         }
@@ -147,6 +150,7 @@ impl Configure {
             expected: expected.clone(),
             sid: config.build_identity().into(),
             add,
+            batch,
         })
     }
     pub fn bytes(&self) -> &[u8] {
@@ -163,95 +167,183 @@ impl Configure {
     }
 }
 
-/// Required native contract; no production implementation is supplied here.
-/// One owner transaction lock must cover all methods, including recovery.
-/// `prepare` verifies elevation, fixed layout/current binary identity, fresh
-/// account pins and exact old config bytes, and pins ancestors/source handles
-/// without write/delete sharing. It creates/flushes a SYSTEM-owned protected
-/// same-directory temp exclusively, before any right mutation. It must reject
-/// conflicting right observations rather than reinterpret a stale plan.
-/// Journal writes are atomic, flushed, compare-and-replace publications with
-/// the same no-takeover protection. `publish` must preserve the staged bytes
-/// and identity through rename; its error may mean publication already occurred.
-/// Native failures must map to these fixed errors, never OS error text.
-pub trait ConfigurationIo {
-    fn journal(&mut self) -> Result<Option<Journal>, Failure>;
-    fn prepare(&mut self, request: &Configure) -> Result<(), Failure>;
-    fn write_journal(&mut self, journal: &Journal) -> Result<(), Failure>;
-    fn grant_batch(&mut self, sid: &str) -> Result<(), Failure>;
-    fn revoke_batch(&mut self, sid: &str) -> Result<(), Failure>;
-    fn publish(&mut self) -> Result<(), Failure>;
-    /// Hash from the pinned, bounded, rechecked private config; None = absent.
-    fn config_hash(&mut self) -> Result<Option<[u8; 32]>, Failure>;
-    fn clear_journal(&mut self) -> Result<(), Failure>;
+/// SYSTEM-private, bounded, pinned store under a single owner lock. Reads
+/// validate protection, one link and no reparse points. Replacement compares the
+/// exact-byte SHA-256 (None means absent), stages/flushes private bytes, and
+/// checks identity through publication. Errors may have taken effect; reread on
+/// the next command. Native errors must use fixed Failure tokens only.
+pub trait OwnerStore {
+    fn record(&mut self) -> Result<Option<(OwnerRecord, [u8; 32])>, Failure>;
+    fn replace_record(
+        &mut self,
+        expected: Option<[u8; 32]>,
+        next: &OwnerRecord,
+    ) -> Result<[u8; 32], Failure>;
+    /// Recheck expected config hash and fresh account pins, pin source/parent,
+    /// create-new private staging and flush it. Do not publish or mutate rights.
+    fn stage_config(&mut self, bytes: &[u8], expected: Option<[u8; 32]>) -> Result<(), Failure>;
+    /// Publish only the staged identity/bytes with compare-and-replace checks.
+    /// An error may mean publication already happened; never infer rollback.
+    fn publish_config(&mut self) -> Result<(), Failure>;
 }
-
-/// No right grant occurs until staging and durable intent have succeeded.
-/// A failed receipt write preserves intent and refuses automatic compensation:
-/// the caller must not later infer ownership from right presence.
-pub fn configure(request: &Configure, io: &mut impl ConfigurationIo) -> Result<(), Failure> {
-    if io.journal()?.is_some() {
-        return Err(Failure::RecoveryRequired);
+/// Direct assignment only, exactly the validated ordinary SID. Errors from a
+/// mutation mean unknown outcome. No production implementation in this slice.
+pub trait BatchRight {
+    fn observe(&mut self, sid: &str) -> Result<bool, Failure>;
+    fn grant(&mut self, sid: &str) -> Result<(), Failure>;
+    fn revoke(&mut self, sid: &str) -> Result<(), Failure>;
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BatchObservation {
+    present: bool,
+    recorded_grant: bool,
+}
+impl BatchObservation {
+    pub(crate) fn present(self) -> bool {
+        self.present
     }
-    io.prepare(request)?;
-    if !request.add {
-        return io.publish();
-    }
-    let mut j = Journal {
-        version: 1,
-        sid: request.sid.clone(),
-        before: request.expected.as_deref().map(hash),
-        after: hash(&request.bytes),
-        phase: Phase::Intent,
-    };
-    io.write_journal(&j)?;
-    // Even an error can be ambiguous. Keep the durable intent.
-    io.grant_batch(&request.sid)
-        .map_err(|_| Failure::RecoveryRequired)?;
-    j.phase = Phase::Granted;
-    io.write_journal(&j)
-        .map_err(|_| Failure::RecoveryRequired)?;
-    match io.publish() {
-        Ok(()) => io.clear_journal(),
-        Err(_) => match recover(io)? {
-            Recovery::Published => Ok(()),
-            Recovery::Compensated => Err(Failure::Io),
-            Recovery::Clean => Err(Failure::RecoveryRequired),
-        },
+    pub(crate) fn recorded_grant(self) -> bool {
+        self.recorded_grant
     }
 }
-
+pub fn observe_batch(
+    sid: &str,
+    s: &mut impl OwnerStore,
+    r: &mut impl BatchRight,
+) -> Result<BatchObservation, Failure> {
+    if !ordinary_sid(sid) {
+        return Err(Failure::InvalidPlan);
+    }
+    let record = s.record()?;
+    let present = r.observe(sid)?;
+    Ok(BatchObservation {
+        present,
+        recorded_grant: present
+            && record.is_some_and(|(v, _)| v.sid == sid && v.state == RightState::Granted),
+    })
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
     Clean,
-    Published,
-    Compensated,
+    NotGranted,
+    Unproven,
 }
-
-/// Never revoke using `granted_batch_right` alone: only a durable Granted
-/// receipt plus exact old config identity permits failed-publication rollback.
-/// Recovery itself is restartable: clear the receipt only after compensation.
-pub fn recover(io: &mut impl ConfigurationIo) -> Result<Recovery, Failure> {
-    let Some(j) = io.journal()? else {
+pub fn recover(s: &mut impl OwnerStore, r: &mut impl BatchRight) -> Result<Recovery, Failure> {
+    let Some((mut record, expected)) = s.record()? else {
         return Ok(Recovery::Clean);
     };
-    if j.phase == Phase::Intent {
+    if record.state != RightState::Intent {
+        return Ok(Recovery::Clean);
+    }
+    let present = r.observe(&record.sid)?;
+    record.state = if present {
+        RightState::Unproven
+    } else {
+        RightState::None
+    };
+    s.replace_record(Some(expected), &record)?;
+    Ok(if present {
+        Recovery::Unproven
+    } else {
+        Recovery::NotGranted
+    })
+}
+/// Caller runs recovery first, all calls under the same owner lock. Never
+/// compensates a grant, including publication errors with an unknown effect.
+pub fn configure(
+    req: &Configure,
+    s: &mut impl OwnerStore,
+    r: &mut impl BatchRight,
+) -> Result<(), Failure> {
+    let old = s.record()?;
+    if let Some((v, _)) = &old {
+        if v.state == RightState::Intent {
+            return Err(Failure::RecoveryRequired);
+        }
+        if v.sid != req.sid && v.state != RightState::None {
+            return Err(Failure::Conflict);
+        }
+    }
+    if observe_batch(&req.sid, s, r)? != req.batch {
+        return Err(Failure::Conflict);
+    }
+    s.stage_config(&req.bytes, req.expected.as_deref().map(hash))?;
+    let expected = old.as_ref().map(|(_, h)| *h);
+    let mut next = OwnerRecord {
+        version: 1,
+        sid: req.sid.clone(),
+        state: RightState::None,
+    };
+    if req.add {
+        next.state = RightState::Intent;
+        let intent = s.replace_record(expected, &next)?;
+        let granted = r.grant(&req.sid).is_ok();
+        next.state = if granted {
+            RightState::Granted
+        } else if r.observe(&req.sid)? {
+            RightState::Unproven
+        } else {
+            RightState::None
+        };
+        s.replace_record(Some(intent), &next)
+            .map_err(|_| Failure::RecoveryRequired)?;
+        if !granted {
+            return Err(if next.state == RightState::Unproven {
+                Failure::RightUnproven
+            } else {
+                Failure::Io
+            });
+        }
+    } else if old.as_ref().is_none_or(|(v, _)| v.sid != req.sid) {
+        s.replace_record(expected, &next)?;
+    }
+    s.publish_config().map_err(|_| Failure::Io)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightReport {
+    Removed,
+    AlreadyAbsent,
+    RetainedUnproven,
+    RetainedNotArxcovo,
+    NotRecorded,
+}
+impl std::fmt::Display for RightReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Removed => "batch-right-removed",
+            Self::AlreadyAbsent => "batch-right-already-absent",
+            Self::RetainedUnproven => "batch-right-retained-unproven",
+            Self::RetainedNotArxcovo => "batch-right-retained-not-arxcovo",
+            Self::NotRecorded => "batch-right-not-recorded",
+        })
+    }
+}
+/// No config, account resolution or workspace dependency. Caller recovers first.
+pub fn uninstall_right(
+    s: &mut impl OwnerStore,
+    r: &mut impl BatchRight,
+) -> Result<RightReport, Failure> {
+    let Some((mut record, expected)) = s.record()? else {
+        return Ok(RightReport::NotRecorded);
+    };
+    if record.state == RightState::Intent {
         return Err(Failure::RecoveryRequired);
     }
-    let actual = io.config_hash()?;
-    let result = if actual == Some(j.after) {
-        Recovery::Published
-    } else if actual == j.before {
-        io.revoke_batch(&j.sid)
-            .map_err(|_| Failure::RecoveryRequired)?;
-        Recovery::Compensated
-    } else {
-        return Err(Failure::Conflict);
+    let present = r.observe(&record.sid)?;
+    let report = match (record.state, present) {
+        (RightState::Granted, true) => {
+            r.revoke(&record.sid).map_err(|_| Failure::Io)?;
+            RightReport::Removed
+        }
+        (RightState::Granted | RightState::Unproven, false) => RightReport::AlreadyAbsent,
+        (RightState::Unproven, true) => RightReport::RetainedUnproven,
+        (RightState::None, true) => RightReport::RetainedNotArxcovo,
+        _ => RightReport::NotRecorded,
     };
-    io.clear_journal()?;
-    Ok(result)
+    record.state = RightState::None;
+    s.replace_record(Some(expected), &record)?;
+    Ok(report)
 }
-
 #[cfg(test)]
 #[path = "owner_transactions_tests.rs"]
 mod tests;
