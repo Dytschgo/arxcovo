@@ -213,3 +213,92 @@ Apple contracts consulted for this revision:
 [entry iteration](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_entry.c),
 [ACL text syntax](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_translate.c),
 and [native membership test contracts](https://github.com/apple-oss-distributions/Libinfo/blob/main/membership.subproj/membership.h).
+
+
+## Fixed service Application candidate (Sol high, 2026-11-11)
+
+Prepared from pinned base `7606c71b35ab906607c00efa96b99a76bca2409f`.
+The actual SCM and Unix service entries now instantiate only the concrete native
+Application. Test hooks are internal Rust injection points, with no runtime
+selector. Foreground CLI/config and current-user development execution remain
+separate. No service HTTP listener, config override or development switch exists.
+
+Startup requires root:root or SYSTEM before reading fixed config, validates its
+protected handle and client identity, verifies the fixed binary location and
+protected layout, opens/reconciles the durable store, commits service_start,
+binds the local endpoint, and performs dynamic execution preflight before ready.
+Malformed static configuration or client identity is fatal. Missing/mismatched
+build accounts and unavailable workspace execution facts produce preflight_failed;
+a successful preflight still reports mechanism_unavailable. Neither outcome
+selects the development executor. No privileged PATH/tool discovery is performed.
+macOS admin rights still refuse before any native account/revision observation.
+
+Store integration deliberately requires owner-provisioned, existing
+activity.lock, activity.sqlite3 and activity.sqlite3-journal in the fixed private
+state directory. Empty DB/journal files are acceptable for first initialization.
+Every file requires root:root/0600 on Unix, or SYSTEM ownership and a protected
+SYSTEM/Administrators-only DACL on Windows. The existing foreground checks also
+run; they are not relaxed. WAL/SHM objects refuse. Service connections use SQLite
+TRUNCATE journaling with FULL synchronization so journal deletion/recreation
+cannot silently introduce an inherited Windows DACL. No ACL repair, ownership
+change or broad ACL creation is attempted. Missing/unsafe state refuses with
+service-store-or-drain (exit 5), before SQLite mutations. Provisioning these
+files is an open owner-adapter integration requirement, not an owner action
+performed by this candidate.
+
+State handles and protected ancestry remain held for the store lifetime. On
+Windows, immutable handles exclude write/delete sharing, mutable database,
+journal and lock handles allow write sharing but exclude deletion. All request
+FILE_READ_DATA (FILE_LIST_DIRECTORY for directories): metadata-only handles did
+not actually prevent rename in the new normal-user regression. The strengthened
+regression proves mutable writes succeed while rename/deletion fail, then rename
+succeeds after releasing the pin. Unix no-follow descriptor traversal plus
+root-owned nonwritable ancestry excludes unprivileged pathname replacement;
+retained descriptors alone are not permission for a later unchecked open.
+Concurrent privileged changes, mount changes and root in-place writes are
+outside that guarantee. Installed SQLite behavior under actual SYSTEM/root
+protection is **unverified on real hardware**.
+
+Unix service endpoints require the fixed root-owned 0755 parent; service umask
+is 0077 and the bound socket becomes client-UID-owned 0600 before serving. The
+foreground arbitrary endpoint retains its current-user private parent rule.
+Windows retains explicit SYSTEM owner, specific client DACL rights excluding
+pipe-instance creation, NETWORK denial and remote-client rejection. Both bridges
+require root/SYSTEM as the expected identity for the fixed service endpoint, then
+verify the kernel peer/pipe identity before sending credentials. Existing objects
+are never reclaimed. The native Unix socket ownership path is unrun here.
+
+Native startup/preflight/store/audit/bind hooks execute in tracked blocking jobs.
+Cancellation stops awaiting a job; it does not cancel a stuck OS API. Drain waits
+for outstanding jobs, stops the listener, aborts/joins inventory connections,
+and durably marks unfinished agent reads failed/shutdown before the stop audit.
+The Host retains its separate 10-second drain and 5-second stop-audit budgets;
+the service runtime has a further one-second blocking-worker shutdown grace.
+If a native call outlives the budget, no completed cleanup or hard API
+cancellation is claimed. A late blocking audit may finish after its deadline;
+its row is evidence of that commit, not evidence of a clean exit. Dedicated runs
+and discovery must join this shutdown barrier when their backend is integrated.
+
+Executed Windows evidence for this candidate: cargo fmt --all -- --check;
+cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace
+--no-fail-fast (105 passed; one directly ignored subprocess TokenOwner fixture is
+exercised by its passing parent); python scripts/test-service-artifacts.py -v
+(three passed, two native Unix checks skipped). New tests cover injected startup
+failures/order without readiness, durable partial-start lifecycle rows, cancelled
+blocking work/drain, actual normal-user named-pipe authentication/SDK inventory,
+honest unavailable execution, caller/daemon isolation, persistent service-fixture
+journal/restart identity/reconciliation, shutdown rows, strict service schema,
+missing/mismatched build-account separation and fixed bridge identity refusal.
+The application fixture uses an explicit current-user storage policy and injected
+bindings; it is not a production-readiness or SYSTEM-layout acceptance test.
+
+Integration obligations: merge the coordinator's independent credential-hash
+uniqueness fix (this branch intentionally does not duplicate it); reconcile the
+parent lifecycle/docs refresh; independent other-provider security review; native
+Linux/macOS compile/link/runtime and systemd/plutil checks; disposable privileged
+SCM/systemd/launchd readiness, protected files, socket/pipe identity and shutdown
+experiments; owner adapters that provision the persistent journal safely; then
+the separate dedicated-account executor and account-scoped tool probe. All
+installed-manager/privileged paths remain **unverified on real hardware**. Full
+M2 dedicated-account cargo/Claude Code/activity acceptance remains open. No new
+architecture decision or owner-PC privileged operation is claimed.
