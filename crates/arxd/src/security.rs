@@ -65,9 +65,8 @@ pub fn private(path: &Path) -> Result<()> {
                     bail!("cannot inspect DACL entry");
                 }
                 let header = &*(ace.cast::<ACE_HEADER>());
-                if header.AceFlags & 0x08 != 0 {
-                    continue;
-                } // inherit-only
+                // Inherit-only grants also expose files created in a private
+                // directory, so validate their recipients before any creation.
                 if header.AceType == 1 {
                     continue;
                 } // deny ACE grants nothing

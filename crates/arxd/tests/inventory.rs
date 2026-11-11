@@ -328,6 +328,10 @@ fn cli_does_not_echo_configuration_secrets() {
 
 #[cfg(windows)]
 fn protect(path: &Path) {
+    protect_with_extra(path, "");
+}
+#[cfg(windows)]
+fn protect_with_extra(path: &Path, extra: &str) {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -357,10 +361,11 @@ fn protect(path: &Path) {
             len += 1;
         }
         let sid_text = String::from_utf16(std::slice::from_raw_parts(sid, len)).unwrap();
-        let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid_text})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
+        let sddl: Vec<u16> =
+            format!("D:P(A;OICI;FA;;;{sid_text})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){extra}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
         let mut descriptor = ptr::null_mut();
         assert_ne!(
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -482,6 +487,29 @@ fn permissive_files_and_symlinks_are_rejected() {
     assert!(Activity::open(&state).is_err());
 }
 
+#[cfg(windows)]
+#[test]
+fn inherit_only_shared_acl_refuses_before_creating_activity_files() {
+    let dir = private_dir();
+    protect_with_extra(dir.path(), "(A;OICIIO;FA;;;WD)");
+    let (cfg, _) = config(dir.path());
+    let config_refused = cfg.validate().is_err();
+    let store_refused = Activity::open(dir.path()).is_err();
+    let created_files = std::fs::read_dir(dir.path()).unwrap().count();
+    protect(dir.path());
+    assert!(
+        config_refused,
+        "inherit-only grants must invalidate state configuration"
+    );
+    assert!(
+        store_refused,
+        "activity creation must also reject inherited child access"
+    );
+    assert_eq!(
+        created_files, 0,
+        "refusal must precede private file creation"
+    );
+}
 #[cfg(windows)]
 #[test]
 fn inherited_shared_acl_is_rejected() {
