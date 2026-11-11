@@ -1,0 +1,23 @@
+[Unit]
+Description=Arxcovo host service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/libexec/arxcovo/arxd service run
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2 3 4 5 7 10
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=mixed
+Delegate=memory pids
+DelegateSubgroup=supervisor
+RuntimeDirectory=arxcovo
+RuntimeDirectoryMode=0755
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

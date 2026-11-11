@@ -76,8 +76,13 @@ For a reviewed build, use the Claude Code MCP stdio bridge
 4. Restart the daemon and read the same principal's history to confirm durability.
 
 Retain only sanitized booleans, fixed labels and outcomes as acceptance evidence.
-Do not store raw output or owner paths/identity. The coordinator ran this sequence successfully after review and green hosted
-checks. The implementation agent did not perform the private acceptance.
+Do not store raw output or owner paths/identity. The coordinator exercised all
+four calls after review and green hosted checks. The harness checked host
+execution mode but did not assert the host response's isolation or null rights.
+It matched the activity row's ID, tool and outcome over MCP; the identity mode,
+Medium integrity, current-user match, null raw identity/rights and cleanup fields
+were asserted directly in SQLite. The implementation agent did not perform the
+private acceptance.
 
 ## Current implementation limits
 

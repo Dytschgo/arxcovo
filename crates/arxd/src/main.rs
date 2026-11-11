@@ -1,7 +1,26 @@
 use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
-#[tokio::main]
-async fn main() {
+fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "service") {
+        let code = if args.len() == 2 && args[1] == "run" {
+            arxd::service::run()
+        } else {
+            arxd::service::ExitCode::Usage
+        };
+        if code != arxd::service::ExitCode::Clean {
+            eprintln!("arxd: {}", code.category());
+        }
+        std::process::exit(code as i32);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("foreground runtime")
+        .block_on(foreground());
+}
+
+async fn foreground() {
     if let Err(error) = run().await {
         // Only fixed categories, never the source chain (paths/credentials/OS errors).
         let category = error.to_string();

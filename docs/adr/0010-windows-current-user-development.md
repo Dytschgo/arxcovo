@@ -1,8 +1,10 @@
 # 0010: Current-user Windows development execution
 
 Status: owner-authorized temporary development deviation, 2026-11-11.
-Contract settled (Opus 5.5 high, architecture). Docs only: nothing here is
-implemented, and no acceptance is claimed.
+Contract settled (Opus 5.5 high, architecture), implemented in merged PR #22.
+The real current-user development acceptance is recorded in merged PR #24 and
+`docs/evidence/windows-development-acceptance.json`. Dedicated-account and
+installed-service M2 acceptance remain open.
 
 The owner authorized using the existing Windows user for the development test
 after the dedicated-account experiment failed, to avoid spending more time on
