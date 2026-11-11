@@ -3,7 +3,8 @@
 ## Current state
 
 - Milestone: 1 — Setup (in progress).
-- Current task: bootstrap public repository, workspace and CI/review gates.
+- Current task: independent Opus review of PR #1 at `835d06cf6bd86a79645108dc0b940cb27e338ac9`; hosted CI and trusted-policy bootstrap activation pending.
+- Coordinator follow-up: guarded auto-merge, reviewed protection payload proposal, trusted workflow_run triggers and tested evaluator added. Twelve policy/auto-merge tests and UI lint pass. No configuration applied or auto-merge action performed.
 - Last merged PR: none.
 - Acceptance: no milestone acceptance checks have run yet.
 - Milestone 1 implementation: Rust workspace, React/Vite and Electron scaffolds, locked dependencies, pinned tools, three-OS CI and fail-closed budget policy prepared on feat/milestone-1. Bootstrap main is not acceptance.
@@ -32,7 +33,9 @@
 
 - None confirmed yet. Administrative host configuration will require the owner before real VM acceptance; prepare the checklist first.
 - Main has no CI baseline/workflow yet. Coordinator must resolve trusted-policy bootstrap activation; no gate bypass was performed. Duration history remains honestly empty.
-- Pending: independent Opus review, three-OS hosted CI, protected branch/reviewer App setup, owner-agent allowlist and coordinator-only auto-merge automation, trivial PR acceptance. Proposed settings: docs/ci-administration.md.
+- Pending: revised-head Opus review, hosted CI, reviewed installation merge, baseline history, protection/readback, trivial auto-merge and slow-main end-to-end acceptance. No new reviewer App is required.
+- Owner selected Dytschgo as the current allowlisted agent author; their own same-repository PRs under this login are eligible too. Recorded in .github/agent-authors.json.
+- Review round 1: Opus posted agent-review failure on 835d06c. Blocking findings: history became an unintended gate; untested evaluator paths; stale-success and label races; unnecessary approving-user/App requirements. Revised evaluator separates history, invalidates discovered heads before measurement, handles failures and reads live head/labels under workflow concurrency. Fresh review required.
 - Coordinator steering applied: budget policy uses trusted default-branch checkout on pull_request_target/workflow_run, with API-only candidate measurements and completion re-evaluation. Gate architecture remains proposed pending independent review.
 
 ## Provider usage
@@ -41,7 +44,10 @@
 | --- | --- | --- | --- |
 | Bootstrap coordination | Codex / gpt-6.1-sol | medium | Empty workspace and local prerequisites inspected |
 | Milestone 1 implementation | Codex / gpt-6.1-sol | medium | Scaffold and local checks prepared; hosted gates and independent review pending |
-| Oversight | Claude / claude-opus-5-5 | medium | Thread launched; schedule result pending |
+| Oversight | Claude / claude-opus-5-5 | medium | Initial check-in completed on track; three-hour schedule active |
+| CI gate architecture | Claude / claude-opus-5-5 | high | Completed; app-free trusted workflow_run design and reviewed installation sequence proposed |
+| PR #1 independent review | Claude / claude-opus-5-5 | high | Completed on `835d06c`; changes requested, failure status posted |
+| Review corrections and merge command | Codex / gpt-6.1-sol | medium | Twelve local tests pass; revised-head review pending |
 
 Exact allowances and per-task cost are not exposed; do not invent usage percentages.
 

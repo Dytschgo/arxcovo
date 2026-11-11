@@ -2,8 +2,8 @@
 
 Status: proposed for independent Opus review.
 
-Use one locked Cargo workspace and one locked npm workspace. Binaries identify themselves and exit. Electron loads local UI in a sandboxed renderer with navigation and new windows denied. Electron behavior is unverified on real hardware.
+Use one locked Cargo workspace and one locked npm workspace. Binaries identify themselves and exit. Electron loads local UI in a sandboxed renderer with navigation and new windows denied. An independent reviewer exercised these software behaviors on Windows at 835d06c; committed Electron coverage remains pending. VM/hypervisor paths are unverified on real hardware.
 
-Budget evaluation uses trusted default-branch code with pull_request_target and workflow_run. It never installs or executes candidate code. It posts a status on the current candidate head, using API measurements and bounded candidate history JSON as data. CI completion re-evaluates ci-speed exceptions.
+Budget evaluation uses trusted default-branch code with workflow_run, an unprivileged label-change signal and periodic retry. It never installs or executes candidate code. It posts a status on the current candidate head using API measurements. History recording is separate from merge decisions. See ADR 0002 for activation, trust and failure handling.
 
 No workflow manufactures reviewer approval. A separate reviewer integration must post agent-review for the exact reviewed SHA. Bootstrap has no main CI baseline; policy fails closed. Coordinator must resolve activation before milestone acceptance.

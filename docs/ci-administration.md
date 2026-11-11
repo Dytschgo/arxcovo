@@ -1,25 +1,31 @@
 # Coordinator CI administration
 
-No protection, reviewer integration or auto-merge configuration was applied by the implementation agent.
+Implementation and settings are awaiting independent review. No protection or auto-merge setting has been applied. Follow docs/adr/0002-merge-gate-bootstrap.md for the initial installation exception and subsequent acceptance sequence.
 
-Proposed main protection:
+## Review and protection
 
-- Require PRs, one independent approving review, dismissal of stale reviews, last-push approval, resolved conversations and up-to-date branches.
-- Required checks: `verify (ubuntu-latest)`, `verify (windows-latest)`, `verify (macos-latest)`, `ci-time-budget`, `agent-review`.
-- Pin GitHub Actions as expected source for CI and budget. Pin a separately controlled reviewer GitHub App as expected source for agent-review. Shared builder credentials cannot establish reviewer independence.
-- Block force pushes and deletion; enforce protections for administrators. Restrict direct main writes to the coordinator/bootstrap identity. Independently review workflow and policy changes.
-- Reviewer reads the exact base/head diff, verifies Codex Sol medium builder versus Claude Opus 5.5 high reviewer, and posts agent-review on that exact SHA with linked review evidence. Fallback grok-4.7 high applies only on provider limits. Never fabricate success for bootstrap.
+Apply `.github/main-protection.json` only after infrastructure installation, a real main CI baseline and review. Read the resulting API configuration back and compare it with this payload. It requires all three platform checks, ci-time-budget and agent-review, up-to-date branches, resolved conversations and linear history. Administrators are included; force pushes and deletion are blocked. GitHub Actions checks are pinned to App 15368, confirmed through the repository's check-runs API. Verify that the Actions token's budget status satisfies that source pin during activation.
 
-Keep repository auto-merge disabled until coordinator-owned automation is installed. Only coordinator automation may enable auto-merge, after checking the PR author against an explicit owner-agent allowlist, same-repository head and OWNER/MEMBER/COLLABORATOR association. Initial allowlist is empty: the owner's ordinary login alone does not prove agent authorship. Outsiders always wait for the owner. `eligible` in scripts/policy.mjs defines and tests the predicate; it does not merge anything.
+A PR is required with zero additional GitHub approving users: the same owner login cannot approve its own PR. The independent other-provider reviewer must actually read the exact base/head diff, recheck the current SHA, publish its findings and post agent-review success or failure on that SHA. New commits require a new review. Existing owner credentials can publish this status; no new App is required. Do not include private T3 links in public review comments. See the ADR for the trust limitation of shared owner credentials.
 
-## Baseline and activation
+## Guarded auto-merge
 
-Main initially contains only the settled documents. It has no CI workflow or duration baseline. This is an unresolved bootstrap dependency: trusted policy cannot activate until installed on main, and absent baseline fails closed. Coordinator must reconcile a reviewed bootstrap procedure before acceptance. This implementation does not bypass gates.
+The owner chose Dytschgo as the agent identity for now, including their own PRs under that login. `.github/agent-authors.json` is the trusted allowlist. Outsiders always wait for the owner; agents do not approve fork workflows.
 
-After a completed main CI run, use an already authenticated environment to set GITHUB_REPOSITORY to Dytschgo/arxcovo and run `node scripts/ci-budget.mjs --record`. Commit docs/ci-duration-history.json in the next PR. Empty history is intentional; no duration is invented. The baseline is the latest completed main push run, including failed runs. Wall-clock is workflow start to completed update, not sum of parallel jobs. Candidate CI must succeed at the exact PR head for a ci-speed exception and take less time than the slow baseline. workflow_run re-evaluates open heads on completion. API queries are bounded to 100 entries; larger histories need pagination before scaling.
+After activating protection and enabling the repository setting, run from independently reviewed trusted source:
 
-The policy workflow checks out only the trusted default branch, does not install PR packages, and reads candidate history through the API as bounded JSON. Its write permission is limited to commit statuses.
+```text
+node scripts/enable-auto-merge.mjs Dytschgo/arxcovo PR_NUMBER EXACT_HEAD_SHA
+```
 
-Acceptance still needed: install protection and reviewer integration, establish and commit measured baseline, run a trivial owner-agent PR through every gate and coordinator auto-merge, and prove slow-main blocking. Local policy tests alone do not establish end-to-end acceptance.
+The command checks the allowlist, same-repository source, OWNER/MEMBER/COLLABORATOR association, open/non-draft state, main target, exact SHA and all required protection settings before requesting `gh pr merge --auto --squash --match-head-commit`. It never bypasses checks. Do not run candidate PR code with privileged credentials. Leave default Actions token permission read-only, Actions PR creation/approval disabled, and external workflow runs subject to owner approval.
 
-Primary references consulted: [workflow runs API](https://docs.github.com/en/rest/actions/workflow-runs), [nextest installation](https://nexte.st/docs/installation/pre-built-binaries/).
+## Measurement and records
+
+Policy runs trusted default-branch code on workflow_run for CI and label signals, with a periodic retry. It never executes candidate code. API calls are bounded; discovery at 100 open PRs fails closed and needs pagination before scaling. Head and labels are read live; statuses are per SHA. Attempt 1 supplies the wall-clock measurement so a partial rerun cannot appear faster. The latest completed main push run is authoritative. Missing baseline fails. Above 900 seconds, only a successful faster PR CI run at the same source repository/head with ci-speed passes.
+
+Record completed main runs separately with authenticated `gh`, GITHUB_REPOSITORY=Dytschgo/arxcovo and `node scripts/ci-budget.mjs --record`; commit docs/ci-duration-history.json in follow-up work. History absence never blocks an otherwise fast PR. No timings are invented. A GitHub API outage can prevent status updates; the evaluator fails and retries, rather than claiming it can update unreachable heads.
+
+## Acceptance remaining
+
+After the reviewed installation merge: measure main CI, commit the first baseline, install/read back protection and settings, demonstrate an allowlisted trivial PR auto-merging after all gates, and demonstrate a slow-main probe remaining blocked plus measured ci-speed recovery. Unit tests do not prove this end-to-end acceptance. Nothing has merged yet.

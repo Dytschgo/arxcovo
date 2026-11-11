@@ -1,36 +1,46 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { budget, duration } from './policy.mjs';
+import { duration } from './policy.mjs';
+import { evaluatePullRequests } from './evaluate-budget.mjs';
+
 const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
-const get = (query) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/actions/workflows/ci.yml/runs?${query}&per_page=100`], { encoding: 'utf8' })).workflow_runs;
-const runs = get('branch=main&event=push&status=completed');
-const latestRun = runs.sort((a,b) => b.run_number - a.run_number)[0];
-const latest = latestRun ? duration(latestRun) : null;
-const history = readFileSync('docs/ci-duration-history.json', 'utf8');
+const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+const runs = query => api(`actions/workflows/ci.yml/runs?${query}&per_page=100`).workflow_runs;
+const firstAttempt = run => api(`actions/runs/${run.id}/attempts/1`);
+const getMainRun = () => {
+  const run = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
+  return run ? duration(firstAttempt(run)) : null;
+};
+const postStatus = (sha, state, description) => api(`statuses/${sha}`, ['-X', 'POST', '-f', `state=${state}`, '-f', 'context=ci-time-budget', '-f', `description=${description.slice(0, 140)}`]);
+
 if (process.argv.includes('--record')) {
+  const latest = getMainRun();
   if (!latest) throw Error('No baseline to record');
-  const records = JSON.parse(history);
-  if (!records.some(r => r.runId === latest.runId)) records.push(latest);
-  writeFileSync('docs/ci-duration-history.json', JSON.stringify(records, null, 2) + '\n');
+  const path = 'docs/ci-duration-history.json';
+  const records = JSON.parse(readFileSync(path, 'utf8'));
+  if (!records.some(record => record.runId === latest.runId)) records.push(latest);
+  writeFileSync(path, JSON.stringify(records, null, 2) + '\n');
 } else {
-  const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
-  const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-  const prs = event.pull_request ? [event.pull_request] : api('pulls?state=open&per_page=100');
-  if (prs.length >= 100) throw Error('Too many open PRs; bounded evaluation refused');
-  for (const pr of prs) {
-    let state = 'failure';
-    let description = 'CI time budget evaluation failed';
-    try {
-      const candidates = get('event=pull_request&status=completed');
-      const run = candidates.filter(r => r.head_sha === pr.head.sha && r.pull_requests?.some(p => p.number === pr.number)).sort((a,b) => b.run_number - a.run_number)[0];
-      budget(latest, run ? duration(run) : null, pr.labels.some(l => l.name === 'ci-speed'));
-      const file = api(`contents/docs/ci-duration-history.json?ref=${pr.head.sha}`);
-      if (file.size > 65536) throw Error('History exceeds bound');
-      const records = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
-      if (!records.some(r => r.runId === latest.runId && r.seconds === latest.seconds)) throw Error('Latest baseline missing from committed history');
-      state = 'success'; description = 'Latest main CI meets budget or measured reduction';
-    } catch (error) { console.error(pr.number, error.message); }
-    api(`statuses/${pr.head.sha}`, ['-X', 'POST', '-f', `state=${state}`, '-f', 'context=ci-time-budget', '-f', `description=${description}`]);
+  try {
+    await evaluatePullRequests({
+      listPullRequests: () => api('pulls?state=open&per_page=100'),
+      getPullRequest: number => api(`pulls/${number}`),
+      getMainRun,
+      getCandidateRun: pr => {
+        const run = runs('event=pull_request&status=completed')
+          .filter(run => run.head_sha === pr.head.sha && run.head_repository?.id === pr.head.repo?.id)
+          .sort((a, b) => b.run_number - a.run_number)[0];
+        return run ? duration(firstAttempt(run)) : null;
+      },
+      postStatus,
+    });
+  } catch (error) {
+    // Discovery can fail before all heads are known. Invalidate the triggering
+    // head when available; scheduled evaluation retries discovery later.
+    const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+    const sha = event.pull_request?.head.sha ?? event.workflow_run?.head_sha;
+    if (/^[a-f0-9]{40}$/.test(sha ?? '')) postStatus(sha, 'failure', 'Policy discovery failed; retry required');
+    throw error;
   }
 }
