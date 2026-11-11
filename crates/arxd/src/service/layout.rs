@@ -99,7 +99,7 @@ impl Layout {
                 "/Library/Application Support/Arxcovo/libexec/arxd",
                 "/Library/Application Support/Arxcovo/config/arxd.json",
                 "/Library/Application Support/Arxcovo/state",
-                "/private/var/run/arxcovo/arxd.sock",
+                "/Library/Application Support/Arxcovo/run/arxd.sock",
                 super::owner_query::PLIST_PATH,
                 vec![
                     "/Library/Application Support/Arxcovo/config",
@@ -157,6 +157,15 @@ impl Layout {
             .parent()
             .and_then(|p| lexical(&p.to_string_lossy(), self.platform))
             .is_some_and(|p| overlap(&w, &p))
+        {
+            return false;
+        }
+        if self.platform == Platform::Macos
+            && self
+                .endpoint
+                .parent()
+                .and_then(|p| lexical(&p.to_string_lossy(), self.platform))
+                .is_some_and(|p| overlap(&w, &p))
         {
             return false;
         }
@@ -318,6 +327,18 @@ pub(crate) fn check_windows_ancestor(p: &Protection) -> Result<(), Error> {
         Err(Error::Permissions)
     }
 }
+/// Only for pass-through Unix directories, after native ACL validation.
+#[cfg(any(unix, test))]
+pub(crate) fn check_unix_ancestor(platform: Platform, p: &Protection) -> Result<(), Error> {
+    match (platform, p) {
+        (Platform::Linux | Platform::Macos, Protection::Unix { uid, gid, mode })
+            if *uid == 0 && (platform == Platform::Macos || *gid == 0) && mode & 0o7022 == 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Permissions),
+    }
+}
 fn windows_trusted(s: &str) -> bool {
     matches!(
         s,
@@ -388,6 +409,60 @@ pub fn check_protection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unix_ancestor_and_leaf_roles() {
+        let facts = |uid, gid, mode| Protection::Unix { uid, gid, mode };
+        for (gid, mode) in [(0, 0o755), (80, 0o755), (1, 0o711)] {
+            assert_eq!(
+                check_unix_ancestor(Platform::Macos, &facts(0, gid, mode)),
+                Ok(())
+            );
+        }
+        for uid in [1, 501] {
+            for gid in [0, 1, 80] {
+                assert!(check_unix_ancestor(Platform::Macos, &facts(uid, gid, 0o755)).is_err());
+            }
+        }
+        for mode in [0o775, 0o757, 0o777, 0o1755, 0o2755, 0o4755] {
+            assert!(check_unix_ancestor(Platform::Macos, &facts(0, 1, mode)).is_err());
+        }
+        assert!(check_unix_ancestor(Platform::Linux, &facts(0, 1, 0o755)).is_err());
+        assert!(check_unix_ancestor(Platform::Windows, &facts(0, 0, 0o755)).is_err());
+        let windows = Protection::Windows {
+            owner: "S-1-5-18".into(),
+            protected: true,
+            dacl_present: true,
+            aces: vec![],
+        };
+        assert!(check_unix_ancestor(Platform::Macos, &windows).is_err());
+        for (policy, mode) in [
+            (Policy::BinaryIntegrity, 0o755),
+            (Policy::PrivateDirectory, 0o700),
+            (Policy::PrivateFile, 0o600),
+            (Policy::EndpointDirectory, 0o755),
+        ] {
+            assert!(check_protection(Platform::Macos, policy, true, &facts(0, 80, mode)).is_err());
+            assert!(check_protection(Platform::Macos, policy, true, &facts(0, 0, mode)).is_ok());
+        }
+    }
+    #[test]
+    fn mac_endpoint_layout_is_traversable_and_bounded() {
+        let l = Layout::for_test(Platform::Macos);
+        assert!(l.endpoint() == Path::new("/Library/Application Support/Arxcovo/run/arxd.sock"));
+        assert_eq!(l.endpoint().as_os_str().len(), 50);
+        assert!(l.endpoint().as_os_str().len() < 100);
+        for private in l.private_dirs() {
+            assert!(!l.endpoint().starts_with(private));
+        }
+        for w in [
+            "/Library/Application Support/Arxcovo/run",
+            "/Library/Application Support/Arxcovo/run/child",
+            "/Library/Application Support/Arxcovo",
+        ] {
+            assert!(!l.workspace_disjoint(w));
+        }
+        assert!(l.workspace_disjoint("/work/arxcovo"));
+    }
     #[test]
     fn existing_namespace_edges_reject_control_but_allow_sibling_creation() {
         let fixture = |mask, inherit_only| Protection::Windows {

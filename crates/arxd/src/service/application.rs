@@ -34,7 +34,16 @@ impl Hooks for Native {
         if std::env::current_exe().map_err(|_| ExitCode::Layout)? != layout.binary() {
             return Err(ExitCode::Layout);
         }
-        native::observe_layout(layout).map_err(category)
+        #[cfg(target_os = "macos")]
+        let endpoint = native::ensure_endpoint_directory(layout).map_err(|_| ExitCode::Layout)?;
+        let pins = native::observe_layout(layout).map_err(category)?;
+        #[cfg(target_os = "macos")]
+        let pins = {
+            let mut pins = pins;
+            pins.push(endpoint);
+            pins
+        };
+        Ok(pins)
     }
     fn store(&self, layout: &Layout) -> Result<Activity, ExitCode> {
         Activity::open_service(layout).map_err(|_| ExitCode::Store)

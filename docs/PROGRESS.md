@@ -1054,3 +1054,44 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   account/right/task/service operations were not run. Native installed paths
   remain **unverified on real hardware**. Full independent implementation review
   and current-head hosted checks are still required.
+
+## ADR0015 ancestor/runtime implementation candidate (2026-11-11)
+
+- Provider/effort/outcome: OpenAI gpt-6.1-sol / high / scoped implementation
+  complete locally from verified clean base a24926310410239116b0bba0c888457d4c38109e;
+  native acceptance pending. Worked alone. Last merged PR unchanged (#28).
+- Added Mac-only pass-through GID relaxation with unchanged ACL, UID, write and
+  special-bit fences; Linux and all leaves stay strict. Fs and native traversal
+  share the role policy. New directory/file handles get fchown before chmod;
+  existing objects remain check-only. Config temporary files use the same helper.
+- Fixed Mac endpoint moved per ADR0015. One generic-layout Mac service creator
+  creates only missing run beneath its protected existing parent, checks EEXIST
+  without repair, and pins descriptors before layout observation/binding. Linux
+  creation remains with systemd. Socket ownership is configured client UID/GID0.
+- Passed formatting, workspace/all-target Clippy, workspace test compilation,
+  63 explicitly scoped service tests and seven local bridge tests. Linux/macOS
+  actual-source all-target Clippy metadata checks passed with SQLite link hints;
+  no Unix linking or runtime pass is claimed. Three pure-policy source mutations
+  killed; two ownership mutations require native execution and remain unrun.
+- Initial broad filter accidentally ran the existing production-refusal hook and
+  ignored TokenOwner subprocess fixture via its parent test. This exceeded the
+  requested boundary and was not repeated. The initial new layout test found
+  runtime-directory overlap; corrected and all five layout tests passed. Exact
+  selections, evidence limits and mutation obligations are in
+  docs/briefs/0015-implementation-handoff.md.
+- Hosted fixed-label read-only controls expanded to ten targets and now assert
+  the required positives/refusals. No hosted execution here; historical evidence
+  JSON is unchanged. Any native positive failure requires architecture handoff,
+  with safe WIP retained and no ad hoc allowances. Opus review remains required.
+- Phase 3b merge overlap: owner_unix Fs impl/tests and appended progress only;
+  preserve strict leaf checks/new-owner helper. No StartPreflight/ProvisionState
+  or manager changes, no duplicate endpoint creator. No push/PR/GitHub write,
+  merge/watch, elevation, manager/install, old Lab Manager or VM operation.
+- Native installed/cross-user/real hardware and dedicated-account M2 acceptance
+  stay open and **unverified on real hardware**.
+
+- Final portable ACL follow-up: included the existing pure native_macos_policy
+  source in non-Mac test builds. All 66 scoped service tests passed, including
+  its ACL absent/nonempty/unknown contracts. Final formatting, workspace/all-target
+  Clippy, workspace test compilation and both Unix actual-source metadata Clippy
+  checks passed again. Native runtime/ownership mutations remain outstanding.
