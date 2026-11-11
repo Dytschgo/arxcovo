@@ -522,3 +522,61 @@ implementation, so nothing in this section has been executed. Summary:
 
 Every launchd and systemd behaviour these rules rely on remains **unverified on
 real hardware**. The evidence still needed is listed in ADR 0014.
+
+### ADR0009 slice 6: dedicated executor interface (Sol high, 2026-11-11)
+
+`service::executor::Executor` defines synchronous `preflight` and `run` hooks.
+They run inside the tracked blocking dispatch worker, after the action's started
+transaction commits. `Execution` owns concurrency, cancellation, shutdown,
+quarantine and worker joins. `Request` is separate from ADR0010's development
+request: service input accepts exactly one fixed tool or absolute executable;
+development input still accepts tools only. Path validation here is lexical and
+performs no filesystem lookup. The eventual switched child must open and verify
+workspace/executable components under its own identity.
+
+The service Activity instance holds the internal dedicated runtime handle; it is
+not a SQLite column. Application installs the native implementation once from
+its validated layout/config before sharing that instance with connections.
+Foreground Activity has no dedicated handle. MCP arguments cannot select a
+backend or replace the immutable authenticated local principal. Service routing
+wins over a development handle even in an incorrectly composed internal handler.
+HTTP cannot supply the immutable local connection principal. Existing pipe/peer,
+TokenUser, development enablement, labels and HTTP prohibition are unchanged.
+
+Native preflight revalidates the configured account without opening workspace
+paths, then returns MechanismUnavailable. Native run also returns unavailable;
+no command, shim, S4U, account switch, service-identity PATH search or probe is
+implemented or dispatched. list_hosts remains available=false, with no observed
+identity, an empty tool list and no tool timestamp. Optional response-only
+os_code is absent because no native mechanism is attempted. No available result,
+owner operation or M2 acceptance is claimed.
+
+The worker owns one conditional terminal commit even after request cancellation
+or an unpolled result future is dropped. Failed completion commits withhold the
+result and make drain fail. Shutdown reconciliation now affects only unfinished
+reads; failed action commits remain started for restart reconciliation to
+interrupted. Application joins workers even if the endpoint task failed, before
+read reconciliation and the stop audit. Host drain/audit deadlines are unchanged.
+CleanupUnconfirmed overrides identity/execution/stop reasons and quarantines
+until restart. Pre-spawn failure and post-spawn unconfirmed cleanup have separate
+report variants. Native adapters must honor cooperative cancellation and bound
+their cleanup; this interface cannot interrupt a stuck native API.
+
+Schema 3 and its vocabulary are unchanged. Fake execution exists only under
+cfg(test), returns typed FakeForTest with acceptance=false and never supplies
+observed identity or rights. Windows/Unix observation mapping tests use explicitly
+synthetic facts and do not persist them as execution observations. Output capture
+is sanitized and capped to the requested quota, with a further 7168-byte per
+stream serialization cap (head/tail split); discarded retained bytes count toward
+dropped_bytes. This reserves space for the SDK's second JSON escaping layer,
+metadata and framing below 64 KiB. Tool probe reports require the exact ordered
+fixed table and printable ASCII versions of at most 128 bytes, without paths.
+
+Backend follow-ups, only after independent Opus review and PR14: install genuine
+native execution/containment adapters; enforce child-side workspace and executable
+opens; supply real observation/rights/tree/cleanup facts; run the fixed
+account-scoped discovery probe through that backend; cache its genuine observation,
+tools and timestamp in memory; preserve unavailable status until genuine backend
+preflight succeeds. Installed-manager, identity-switch, cross-user isolation,
+containment and dedicated-account cargo/Claude Code/activity acceptance remain
+**unverified on real hardware**. M2 stays open.

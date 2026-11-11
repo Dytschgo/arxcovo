@@ -1107,3 +1107,53 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium integrated the ADR0015 implementation candidate `546ca708` with retained-state/start-preflight head `7b346f1`. Only appended progress history conflicted; both histories were retained. The shared Fs code merged automatically and retains creation-only ownership plus StartPreflight/ProvisionState.
 - On the integrated Windows tree, formatting and workspace/all-target Clippy with warnings denied passed. Full nextest passed **133/133**, with two subprocess-only fixtures skipped directly and exercised through parents. No owner operation, manager, account, rights or elevation action was performed.
 - Hosted macOS positive controls and ordinary-user Unix fixtures remain required. Any failed stock-path positive control returns to architecture; no historical observation JSON was replaced. Native ownership mutations, macOS manager parsing, independent review and installed-service/dedicated-account acceptance remain outstanding and **unverified on real hardware**.
+
+## ADR0009 slice 6 dedicated executor candidate (2026-11-11)
+
+- Provider/effort/outcome: OpenAI gpt-6.1-sol / high / implementation candidate
+  from verified clean base 1e1e48b5636eb1d171affa8784fee6dc1a48534e; worked alone.
+  Last merged PR unchanged (#28). No remote writes, PR, push, watch or merge.
+- Added dedicated Executor preflight/run and unavailable native implementation,
+  separate strict service command schema, authenticated local MCP routing,
+  audit-owned blocking dispatch, cancellation/shutdown joins, busy refusal and
+  restart-only quarantine. Dedicated selection stays internal and never falls
+  back to development. Schema 3, strict peer/TokenUser checks, development
+  schemas/labels/HTTP prohibition, owner_unix/native namespace source and static
+  state remain unchanged. No new dependency or privileged operation.
+- Fixed integration interactions: endpoint failure still joins execution workers;
+  completion storage failure withholds the result, fails drain and leaves action
+  rows started for restart reconciliation. Shutdown reconciliation handles reads.
+- Tests cover pure synthetic observation and all terminal reason mappings, all
+  existing response-only preflight mappings through SDK/list_activity, lexical
+  path refusal, fixed discovery names/version bounds, busy/quarantine, unpolled
+  drop and SDK cancellation, shutdown joins and endpoint-failure drain. Real
+  bridge/named-pipe SDK tests inject SQLite start/completion failures, prove
+  principal isolation, strict schemas and privacy. FakeForTest has no observed
+  identity/rights and cannot claim acceptance. Worst-case double-escaped output
+  including long synthetic identity metadata stays below 64 KiB.
+- Six actual-source mutations each failed the intended test assertion and were
+  restored: bypass start-commit refusal, swallow completion failure, duplicate
+  finish, remove drop cancellation, replace authenticated principal and accept
+  unknown mode fields. Local logs are under ignored target/slice6-mutation-*.
+- Initial full run found external fault-injection connections using SQLite
+  DELETE journaling against the service TRUNCATE journal (IOERR_DELETE). Fixed
+  the fixture connections to retain TRUNCATE; targeted tests then passed. A new
+  SDK cancellation test's delimiter typo was corrected before its first pass.
+- Validation and limits are recorded below. Independent Opus implementation /
+  security review is required before native adapters or integration. PR14 and
+  genuine account-scoped discovery/containment remain follow-ups. No installed
+  service or dedicated command/probe was run. M2 stays open; native execution
+  and installed-service acceptance remain **unverified on real hardware**.
+- Executed final validation: `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  `cargo test --workspace --locked --no-fail-fast` (**145 passed**, two existing
+  subprocess-only fixtures ignored directly and exercised by passing parents);
+  `python scripts/test-service-artifacts.py -v` (three passed, two native skips).
+  Targeted new executor tests: nine passed. Dedicated real bridge tests: two
+  passed. Endpoint-failure/drain integration test: passed.
+- Actual-source all-target metadata Clippy passed for x86_64-unknown-linux-gnu
+  and aarch64-apple-darwin, with the installed Rust target compilers and
+  `LIBSQLITE3_SYS_USE_PKG_CONFIG=1`, `SQLITE3_LIB_DIR` set to this checkout solely
+  to supply SQLite link hints. No Unix C compilation, linking, runtime, native
+  manager check or real dedicated identity execution is claimed. Local build/
+  mutation logs remain under ignored target/. No CI run or CI duration claim.
