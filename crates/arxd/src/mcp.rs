@@ -83,7 +83,11 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
-        let id = if self.execution.is_some() && self.activity.dedicated.is_none() {
+        let id = if self.activity.dedicated.is_some()
+            && matches!(label, "run_command" | "discover_tools")
+        {
+            self.activity.start_dedicated(&principal.0, label)
+        } else if self.execution.is_some() && self.activity.dedicated.is_none() {
             self.activity.start_development(&principal.0, label)
         } else {
             self.activity.start(&principal.0, label)

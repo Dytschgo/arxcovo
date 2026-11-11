@@ -493,3 +493,165 @@ async fn endpoint_failure_still_drains_dedicated_worker_before_stop_audit() {
         0
     );
 }
+
+#[derive(Clone)]
+struct HttpPrincipal(crate::mcp::Inventory);
+impl rmcp::ServerHandler for HttpPrincipal {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        parts
+            .extensions
+            .insert(crate::mcp::Principal("fixture-agent".into()));
+        context.extensions.insert(parts);
+        self.0.call_tool(request, context).await
+    }
+}
+#[tokio::test]
+async fn dedicated_http_principal_rejected_and_audited() {
+    use rmcp::ServiceExt;
+    let dir = private_temp();
+    let (e, calls) = crate::service::executor::tests::fake(false, true);
+    let mut a = Activity::open_service_fixture(dir.path()).unwrap();
+    a.dedicated = Some(e);
+    let handler = HttpPrincipal(crate::mcp::Inventory {
+        execution: None,
+        activity: Arc::new(a),
+        principal: None,
+    });
+    let (s, c) = tokio::io::duplex(65536);
+    let server = tokio::spawn(async move { handler.serve(s).await.unwrap().waiting().await });
+    let client = ().serve(c).await.unwrap();
+    for tool in ["run_command", "discover_tools"] {
+        let args = if tool == "run_command" {
+            serde_json::json!({"tool":"cargo"})
+        } else {
+            serde_json::json!({})
+        };
+        assert!(
+            client
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().unwrap().clone())
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM activity WHERE outcome='rejected' AND reason='invalid_arguments' AND identity_mode='dedicated_account'",[],|r|r.get(0)).unwrap(),2);
+    client.cancel().await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn dedicated_start_mode_precedes_development_and_survives_refusal() {
+    use rmcp::ServiceExt;
+    use serde_json::{Value, json};
+    let dir = private_temp();
+    let (_fixture, settings) = crate::development::fixture_settings("echo");
+    let development = Arc::new(crate::development::Execution::policy_fixture(settings));
+    let mut a = Activity::open_service_fixture(dir.path()).unwrap();
+    let e = a.dedicated.as_ref().unwrap().clone();
+    a.dedicated = Some(e.clone());
+    let activity = Arc::new(a);
+    let inventory = crate::mcp::Inventory {
+        execution: Some(development),
+        activity: activity.clone(),
+        principal: Some(crate::mcp::Principal("fixture-agent".into())),
+    };
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=TRUNCATE; CREATE TRIGGER check_mode BEFORE INSERT ON activity WHEN NEW.tool IN ('run_command','discover_tools') AND NEW.identity_mode IS NOT 'dedicated_account' BEGIN SELECT RAISE(FAIL,'wrong start mode'); END;").unwrap();
+    let (s, c) = tokio::io::duplex(65536);
+    let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+    let client = ().serve(c).await.unwrap();
+    for tool in ["run_command", "discover_tools"] {
+        let args = if tool == "run_command" {
+            json!({"tool":"cargo"})
+        } else {
+            json!({})
+        };
+        let err = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(tool)
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("preflight_failed"), "{err}");
+    }
+    assert!(
+        client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("discover_tools")
+                    .with_arguments(json!({"unexpected":true}).as_object().unwrap().clone())
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid execution arguments")
+    );
+    assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM activity WHERE identity_mode='dedicated_account' AND ((outcome='refused' AND reason='preflight_failed') OR (outcome='rejected' AND reason='invalid_arguments'))",[],|r|r.get(0)).unwrap(),3);
+    let hosts = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("list_hosts"))
+        .await
+        .unwrap();
+    let text = hosts.content[0].as_text().unwrap();
+    let value: Value = serde_json::from_str(&text.text).unwrap();
+    let h = &value["hosts"][0];
+    assert_eq!(h["tools"], json!([]));
+    assert_eq!(h.get("tools_observed_at"), Some(&Value::Null));
+    assert_eq!(h.get("last_observed_identity"), Some(&Value::Null));
+    assert_eq!(h["tool_discovery"], "unavailable");
+    client.cancel().await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dedicated_started_row_is_authoritative_even_on_refusal() {
+    use crate::store::{IdentityMode, Metadata, Outcome, Reason};
+    let dir = private_temp();
+    let a = Activity::open_service_fixture(dir.path()).unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    for tool in ["run_command", "discover_tools"] {
+        let id = a.start_dedicated("alpha", tool).unwrap();
+        let read = || {
+            db.query_row::<(String, String), _, _>(
+                "SELECT outcome,identity_mode FROM activity WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(), ("started".into(), "dedicated_account".into()));
+        assert!(
+            a.finish_typed(
+                id,
+                Outcome::Refused,
+                &Metadata {
+                    identity_mode: Some(IdentityMode::DevelopmentCurrentUser),
+                    reason: Some(Reason::PreflightFailed),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(read(), ("started".into(), "dedicated_account".into()));
+        a.finish_typed(
+            id,
+            Outcome::Refused,
+            &Metadata {
+                reason: Some(Reason::PreflightFailed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(read(), ("refused".into(), "dedicated_account".into()));
+        assert!(a.finish(id, "failed").is_err());
+    }
+}

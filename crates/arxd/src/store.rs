@@ -176,6 +176,13 @@ impl Activity {
         }
         self.start_typed(principal, tool, false, None)
     }
+    pub(crate) fn start_dedicated(&self, principal: &str, tool: &str) -> Result<i64> {
+        let tool = Tool::parse(tool)?;
+        if !matches!(tool, Tool::RunCommand | Tool::DiscoverTools) {
+            anyhow::bail!("invalid dedicated tool");
+        }
+        self.start_typed(principal, tool, false, Some(IdentityMode::DedicatedAccount))
+    }
     pub fn start_development(&self, principal: &str, tool: &str) -> Result<i64> {
         self.start_typed(
             principal,
