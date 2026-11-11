@@ -90,3 +90,23 @@
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
+
+## M2 Unix execution library candidate (isolated implementation)
+
+- Codex / gpt-6.1-sol, high: library-only bounded Unix runner built from parent
+  `181ddff`; no MCP/CLI integration, pushes, PRs, merges or CI-gate changes.
+- Added pinned UID/GID and dedicated-group refusal, child-only privilege drop,
+  Linux no-new-privileges/capability clearing, owner environment whitelist,
+  descriptor-relative cwd resolution, output head/tail/drop bounds and shared
+  timeout/cancellation/shutdown cleanup. Linux refuses without root-protected
+  delegated cgroup2 memory+pids controls and cgroup.kill. macOS explicitly reports
+  best-effort process groups and never confirms tree containment.
+- Local Windows Clippy passed; 19 nextest tests passed. Linux/macOS standalone
+  library and test metadata cross-compiles/lints passed against exact libc source.
+  Full hosted Unix workspace builds and privileged harness are unrun; execution
+  is **unverified on real hardware**. See docs/unix-exec-validation.md and ADR 0007.
+- Remaining: independent security review, reviewed disposable cgroup setup and
+  real account/tree tests, macOS platform tests, restart janitor, owner-only
+  configuration loader and audited caller integration. M2 acceptance incomplete.
+- Last merged PR is unchanged by this isolated task; no owner administration or
+  protected Lab Manager/VM operations were performed.
