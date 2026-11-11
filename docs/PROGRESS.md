@@ -7,7 +7,7 @@
 - Last merged PR: none.
 - Acceptance: no milestone acceptance checks have run yet.
 - Milestone 1 implementation: Rust workspace, React/Vite and Electron scaffolds, locked dependencies, pinned tools, three-OS CI and fail-closed budget policy prepared on feat/milestone-1. Bootstrap main is not acceptance.
-- Local evidence (Windows): cargo fmt --all --check, clippy workspace/all-targets with warnings denied, cargo test, cargo nextest (2 integration tests), npm lint, policy tests (3), UI production build and Playwright Chromium smoke (1) passed. Final verification rerun is recorded below before handoff.
+- Local evidence (Windows): cargo fmt --all --check, clippy workspace/all-targets with warnings denied, cargo test, cargo nextest (2 integration tests), npm lint, policy tests (3), UI production build and Playwright Chromium smoke (1) passed. Final rerun before PR: fmt, clippy, npm ci, lint, policy tests, build and Chromium smoke all passed.
 - Slow-main simulation: policy tests reject 901-second main for normal PRs, missing/unimproved/failed ci-speed measurements; successful measured reduction and 900-second boundary pass. Missing baseline rejects.
 - npm audit after pinned minimatch override: zero vulnerabilities. ESLint 9 remains pinned; major upgrade dependency resolution failed twice, so upgrade deferred rather than forced.
 - Coordinator WIP observation: nextest 0.9.151 installed and both scaffold tests passed; not independent final-head review.
@@ -45,3 +45,10 @@
 
 Exact allowances and per-task cost are not exposed; do not invent usage percentages.
 
+
+## Implementation handoff
+
+- Public repository created; bootstrap base `176af7a` intentionally includes coordinator-authored AGENTS.md, KICKOFF.md and PROGRESS.md.
+- PR: https://github.com/Dytschgo/arxcovo/pull/1 (feat/milestone-1 to main). Nothing merged; last merged PR remains none.
+- Required next actions: independent Opus review, coordinator reconciliation of trusted-policy activation/baseline, branch protection and separately authenticated agent-review integration, then trivial PR through all gates.
+- Hosted CI pending at handoff. Electron runtime and VM/hypervisor paths **unverified on real hardware**. No Lab Manager, host admin, babysitter or schedule changes performed.
