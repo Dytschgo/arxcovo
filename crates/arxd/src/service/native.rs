@@ -104,7 +104,64 @@ pub fn read_config(layout: &Layout) -> Result<ServiceConfig, Error> {
         true,
         &os::protection(&opened.file)?,
     )?;
-    ServiceConfig::parse(&bytes, layout, &NativeResolver)
+    ServiceConfig::parse_inventory(&bytes, layout, &NativeResolver)
+}
+#[cfg(unix)]
+pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
+    checked(
+        layout.endpoint().parent().ok_or(Error::Layout)?,
+        true,
+        Policy::EndpointDirectory,
+        false,
+    )
+}
+/// Service state is provisioned by the owner, never repaired or ACL-relaxed here.
+/// SQLite uses a persistent TRUNCATE journal, so every mutable file can be
+/// checked before the first write. Retain namespace pins for its entire life.
+pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
+    require_service_identity()?;
+    let mut pins = vec![checked(
+        layout.state(),
+        true,
+        Policy::PrivateDirectory,
+        false,
+    )?];
+    for name in [
+        "activity.lock",
+        "activity.sqlite3",
+        "activity.sqlite3-journal",
+    ] {
+        let path = layout.state().join(name);
+        #[cfg(windows)]
+        let observed = os::open_state_file(&path)?;
+        #[cfg(unix)]
+        let observed = os::open(&path, false, false, true)?;
+        check_protection(
+            os::PLATFORM,
+            Policy::PrivateFile,
+            true,
+            observed.protection(),
+        )?;
+        pins.push(observed);
+    }
+    for name in ["activity.sqlite3-wal", "activity.sqlite3-shm"] {
+        match std::fs::symlink_metadata(layout.state().join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(Error::Permissions),
+        }
+    }
+    Ok(pins)
+}
+pub(crate) fn require_service_identity() -> Result<(), Error> {
+    #[cfg(windows)]
+    let valid = crate::local::current_identity().map_err(|_| Error::Permissions)? == "S-1-5-18";
+    #[cfg(unix)]
+    let valid = unsafe { libc::geteuid() == 0 && libc::getegid() == 0 };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
+    }
 }
 fn bounded_read(file: &mut impl Read) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();

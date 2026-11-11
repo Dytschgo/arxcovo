@@ -5,10 +5,28 @@ use std::{path::Path, sync::Mutex, time::Duration};
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     db: Mutex<Connection>,
+    service_reason: Mutex<Option<&'static str>>,
     _lock: std::fs::File,
+    _service_pins: Vec<crate::service::native::Observed>,
 }
 impl Activity {
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_inner(dir, Vec::new(), false)
+    }
+    pub(crate) fn open_service(layout: &crate::service::layout::Layout) -> Result<Self> {
+        let pins = crate::service::native::state_guard(layout)?;
+        Self::open_inner(layout.state(), pins, true)
+    }
+    #[cfg(test)]
+    pub(crate) fn open_service_fixture(dir: &Path) -> Result<Self> {
+        // Explicit current-user fixture policy; unreachable from Native hooks.
+        Self::open_inner(dir, Vec::new(), true)
+    }
+    fn open_inner(
+        dir: &Path,
+        pins: Vec<crate::service::native::Observed>,
+        service: bool,
+    ) -> Result<Self> {
         crate::config::checked_path(dir)?;
         crate::security::private(dir)?;
         let lock_path = dir.join("activity.lock");
@@ -53,9 +71,11 @@ impl Activity {
         if page_size > 4096 || page_count > 1024 {
             anyhow::bail!("activity store exceeds size bound");
         }
-        db.execute_batch(
-            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;",
-        )?;
+        db.execute_batch(if service {
+            "PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;"
+        } else {
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;"
+        })?;
         let tx = db.transaction()?;
         let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
@@ -96,8 +116,27 @@ impl Activity {
         tx.commit()?;
         Ok(Self {
             db: Mutex::new(db),
+            service_reason: Mutex::new(service.then_some("mechanism_unavailable")),
             _lock: lock,
+            _service_pins: pins,
         })
+    }
+    pub(crate) fn service_reason(&self) -> Option<&'static str> {
+        self.service_reason.lock().ok().and_then(|r| *r)
+    }
+    pub(crate) fn set_service_reason(&self, reason: &'static str) {
+        if let Ok(mut r) = self.service_reason.lock() {
+            *r = Some(reason);
+        }
+    }
+    /// Called only after service connection tasks have stopped; no executor exists.
+    pub(crate) fn shutdown_pending(&self) -> Result<()> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        db.execute("UPDATE activity SET outcome='failed',reason='shutdown',stop_reason='shutdown',finished_at_ms=?1 WHERE outcome='started' AND actor_kind='agent'", [now_ms()?])?;
+        Ok(())
     }
     /// Application host identity only, unrelated to Raft node IDs or certificates.
     pub fn host_id(&self) -> Result<String> {

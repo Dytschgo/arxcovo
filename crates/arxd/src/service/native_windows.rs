@@ -265,6 +265,18 @@ pub fn protection(file: &File) -> Result<Protection, Error> {
     }
 }
 pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<Observed, Error> {
+    open_impl(path, directory, read, trusted, false)
+}
+pub fn open_state_file(path: &Path) -> Result<Observed, Error> {
+    open_impl(path, false, false, true, true)
+}
+fn open_impl(
+    path: &Path,
+    directory: bool,
+    read: bool,
+    trusted: bool,
+    mutable_leaf: bool,
+) -> Result<Observed, Error> {
     let parts = components(path, true)?;
     let text = path.to_str().ok_or(Error::Layout)?;
     let mut current = std::path::PathBuf::from(format!("{}\\", &text[..2]));
@@ -279,15 +291,24 @@ pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<O
         }
         let leaf = i == parts.len();
         let name: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
-        // Denying write/delete sharing pins the checked ancestry until the
-        // final read finishes. An existing conflicting writer causes refusal.
-        let access =
-            READ_CONTROL | FILE_READ_ATTRIBUTES | if leaf && read { GENERIC_READ } else { 0 };
+        // FILE_READ_DATA (FILE_LIST_DIRECTORY on directories) makes the
+        // share restrictions effective: metadata-only access does not prevent
+        // rename. Mutable DB leaves permit writes, but never delete sharing.
+        // An existing conflicting writer causes refusal on immutable objects.
+        let access = READ_CONTROL
+            | FILE_READ_ATTRIBUTES
+            | FILE_READ_DATA
+            | if leaf && read { GENERIC_READ } else { 0 };
         let h = unsafe {
             CreateFileW(
                 name.as_ptr(),
                 access,
-                FILE_SHARE_READ,
+                FILE_SHARE_READ
+                    | if leaf && mutable_leaf {
+                        FILE_SHARE_WRITE
+                    } else {
+                        0
+                    },
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
@@ -416,5 +437,24 @@ mod tests {
         std::fs::hard_link(&path, &alias).unwrap();
         assert!(open(&path, false, true, false).is_err());
         assert!(open(&alias, false, true, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mutable_pin_tests {
+    use super::*;
+    #[test]
+    fn mutable_leaf_allows_database_writes_but_blocks_namespace_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        std::fs::write(&path, []).unwrap();
+        // Explicit untrusted fixture; production open_state_file requires
+        // trusted root/SYSTEM ancestry and the caller checks PrivateFile.
+        let pin = open_impl(&path, false, false, false, true).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        assert!(std::fs::rename(&path, dir.path().join("moved")).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(pin);
+        std::fs::rename(&path, dir.path().join("moved")).unwrap();
     }
 }
