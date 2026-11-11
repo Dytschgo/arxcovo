@@ -2,8 +2,8 @@
 
 ## Current state
 
-- Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: inspect reviewed Windows experiment run 42995659949, review Unix execution PR #14, and validate the local MCP/stdio candidate. Dedicated-account command acceptance remains unverified.
+- Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active; local transport PR #15 is under review correction. Milestones 3–6 remain unimplemented.
+- Current local transport task: correct PR #15 after its first independent Opus review; local branch `t3/fix-pr15-client-isolation` starts at `6f55eb23c33c83477b9ffa534c1a763c856a5f8c`. Fresh review and hosted checks are pending. Dedicated-account command acceptance remains unverified. Other execution/service tasks remain separately owned.
 - Last merged PR: [#12](https://github.com/Dytschgo/arxcovo/pull/12), merge `03adb434c5f8ff5d5fb50303174ad95367fd8761`, 2026-11-11 09:26:11 UTC. All required checks and exact-head independent reviews passed. Its manual experiment is running at that reviewed SHA; the repository dispatch gate must be cleared after completion.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
@@ -99,7 +99,7 @@
 | PR #12 blocker corrections | Codex / gpt-6.1-sol | high | Candidate 94be783: four blockers addressed with unprivileged reproductions and guard mutations; independent re-review required before privileged dispatch |
 | PR #12 pre-dispatch N1 regression | Codex / gpt-6.1-sol | medium | f9e3b92: independent elevation-type check; 34 unprivileged assertions pass, deny-only removal mutation fails at the new assertion |
 | PR #12 pre-dispatch recheck | Claude / claude-opus-5-5 | high | Success on f9e3b92; independent build/self-test and mutation confirmed N1 fixed. Requested final docs count/date correction; no privileged execution |
-| Local MCP/stdio integration | Codex / gpt-6.1-sol | high | Candidate 8d86fef integrated; builder build/fmt/Clippy/24 tests and coordinator fmt/24 tests passed on Windows. Unix native CI, independent review and all privileged/cross-user service paths remain pending |
+| Local MCP/stdio integration | Codex / gpt-6.1-sol | high | PR #15 base 6f55eb2 received blocking Opus review; correction on t3/fix-pr15-client-isolation. Local Windows 28/28 workspace tests pass; three discriminating mutations fail. Fresh independent review and hosted native CI required |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
@@ -108,40 +108,63 @@
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
 
-### Local transport implementation candidate (2026-11-11)
+### Local transport PR #15 correction (2026-11-11)
 
-- Provider/effort/outcome: GPT-6.1 Sol high; implemented in isolated branch
-  `t3/bounded-mcp-stdio-transport` from merged host identity/inventory base `90d3ce7`.
-  Root must independently review/integrate; no push, PR, merge or watch performed.
-- Opt-in Windows named-pipe / Unix socket endpoint, private client configuration,
-  expected kernel identity before token bytes, bounded authentication and official
-  rmcp 3.9.0 daemon AsyncRwTransport. Immutable connection principal shares existing
-  Activity/host ID; HTTP per-request principal behavior retained. No execution.
-- Windows checks run: fmt; workspace Clippy -D warnings; workspace nextest (24
-  passing tests). Real SDK subprocess stdio and local-only daemon binary exercised,
-  including two simultaneous principals, persisted identity, zero-byte wrong-peer
-  trap, missing daemon, malformed/missing credentials, config/auth/frame bounds,
-  real five-second auth deadline, capacity, storage-start failure and shutdown
-  while bridge stdin stays open. Existing HTTP regression/failure tests passed.
-- Ordinary Linux/macOS cross-checks blocked by missing native C compilers for
-  bundled SQLite. Rust-only all-target cross-checks pass with
-  LIBSQLITE3_SYS_USE_PKG_CONFIG=1 and SQLITE3_LIB_DIR pointing to the build directory;
-  these checks use generated bindings and do not link or exercise native SQLite.
-  Native CI and all Unix behavior remain **unverified on real hardware**.
-- SYSTEM/root and true cross-user identity cases remain **unverified on real
-  hardware**. Same-user Windows development is not production service/account
-  isolation; Unix cross-user socket provisioning remains a service prerequisite.
-- Architecture recorded in docs/adr/0008-local-inventory-mcp.md. Existing single
-  Cargo.lock unchanged: explicitly enabled SDK/Tokio/Windows features require no
-  additional resolved packages. No private permissions, Activity or executor rewrite.
-- Last merged base for this candidate: host identity/inventory #13 at `90d3ce7`.
-  Windows probe #12 remains under separate review; Unix backend #14 is separate.
-  M2 services, dedicated-account execution/tool discovery and Claude Code acceptance
-  are not done. No admin/account/service/old Lab Manager operations performed.
-- Final portable verification: Rust-only Clippy with -D warnings also passed for
-  x86_64-unknown-linux-gnu and aarch64-apple-darwin with the same linked-SQLite
-  override. The first cross-Clippy run found a collapsible conditional in Unix
-  cleanup; it was corrected and both targets passed. No native Unix link/runtime
-  claim follows from these checks. Final Windows nextest: 24/24 passed, including
-  forged principal metadata and completion-failure withholding on the local path.
-
+- Provider/effort/outcome: Codex / GPT-6.1 Sol / high, implementation sub-agent,
+  no delegation. Base `6f55eb23c33c83477b9ffa534c1a763c856a5f8c`, local branch
+  `t3/fix-pr15-client-isolation`. PR [#15](https://github.com/Dytschgo/arxcovo/pull/15)
+  remains blocked by its [first independent Opus review](https://github.com/Dytschgo/arxcovo/pull/15#issuecomment-6792699854)
+  and hosted Windows/macOS initialization failures on run 42996013708. This local
+  correction code commit is `c744d73944c3b260ddc93cc6569b99ca7b5d1b00`;
+  it was not pushed and no remote state was changed. Last merged PR is
+  unchanged in Current state above; historical 24/24 results were local Windows
+  only, not evidence of hosted acceptance.
+- Corrected per-peer disconnect/credential-query rejection versus unrecoverable
+  listener errors, paced rejected/busy admission, bounded Windows instance retries
+  and busy connects. Malformed clients cannot terminate the listener; failed
+  credential queries never admit a peer. Listener reservations remain exclusive.
+- Strict production TokenUser ownership retained. Fixtures explicitly assign
+  TokenUser ownership to private parents/client files and derive identities from
+  TokenUser independently. Positive config-load control precedes negative cases.
+  ADR0008 documents standard/filtered, full/elevated and SYSTEM applicability and
+  the remaining independent security decision; group owners are not broadly trusted.
+- Safe fixed diagnostics distinguish client config, connect/identity, auth and
+  daemon config/state/bind/listener stages. Test subprocess stderr reads cap at
+  512 bytes/2 seconds, report read failures/timeouts and only expose known categories.
+  Binary readiness/SDK failure paths retain daemon and bridge status/context.
+- Restored graceful HTTP drain with a real in-flight response regression; main
+  bounds drain to five seconds. Buffered frame forwarding retains the 8192-byte
+  cap in both directions, withholding oversized/partial frames. Eight slots,
+  five-second auth/initialize/write limits and 300-second partial-frame limits
+  replace the arbitrary total lease: initialized clients may idle indefinitely.
+  Same-user slot occupancy is an explicit accepted limitation; oversized inventory
+  responses terminate only that connection and require pagination before growth.
+- Local Windows validation: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo nextest run --workspace --locked --no-fail-fast`: **28/28 passed**
+  (27 arxd + 1 guest CLI). Added actual connect/close before accept followed by
+  malformed auth and real subprocess SDK initialization; deterministic injected
+  credential-query rejection followed by SDK initialization; fatal-listener no-spin;
+  virtual-time idle survival/partial-frame expiry; HTTP in-flight shutdown drain.
+- Red/green mutations (each restored; all exit 101 with assertion failures):
+  treating rejected peers as fatal fails the injected-seam initialization test;
+  inverting current TokenUser config ownership fails the fixture positive control;
+  bypassing expected server identity fails the zero-byte trap (credential bytes
+  observed). Windows trap explicitly uses TokenUser pipe owner and wrong expected
+  `S-1-5-32-544`, reproducing the reviewer's BuiltinAdmins mismatch.
+- During development the new unit fixture initially lacked a private DACL, and
+  the early-disconnect test hit ERROR_PIPE_BUSY before replenishment. The fixture
+  now has a private DACL and busy retry is explicitly bounded. These were observed
+  Windows failures; the macOS LOCAL_PEEREPID early-close failure remains a
+  source-checked hypothesis, **unverified on real hardware** here.
+- Native macOS/Linux, full/elevated administrator, SYSTEM and actual cross-user
+  service runtime remain **unverified on real hardware**. No native Unix runtime
+  or hosted rerun/dispatch was performed. Existing CI will exercise the actual
+  early-disconnect path; a coordinator-owned `--no-fail-fast` hosted run is advised
+  to preserve all platform failures. Fresh exact-head independent review and all
+  hosted required checks must pass before merge; neither is claimed here.
+- Root PR #16 path-prefix fix `5bb0969` remains separate and unmerged; it was not
+  cherry-picked or duplicated and did not block local tests. No Unix executor,
+  Windows experiment, ADR0009, service architecture, privileged/owner operations
+  or old Lab Manager changes were made. Services, dedicated-account execution,
+  tool discovery and Claude Code cargo acceptance remain outstanding for M2.

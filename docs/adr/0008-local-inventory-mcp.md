@@ -17,7 +17,7 @@ client never receives the pipe-instance creation bit through its client grant.
 
 A fixed, timed auth preamble maps the credential to one immutable connection
 principal; HTTP continues authenticating each request. SDK frames, connections,
-handshake, frame reads/writes and connection lease are bounded. Inventory/activity
+handshake, partial-frame reads, writes, frame sizes and connection count are bounded. Inventory/activity
 semantics and persistent host identity are shared without a second storage path.
 
 This is foreground same-user development trust, not binary attestation or service
@@ -29,3 +29,33 @@ permissions are owner-only. Existing endpoint objects are never reclaimed.
 See crates/arxd/README.md for exact bounds, configuration and references. Services,
 dedicated-account execution, Claude Code acceptance and their production security
 review remain outstanding. There is no change to the settled execution design.
+
+## PR #15 review correction decision (2026-11-11)
+
+Keep strict current TokenUser ownership for Windows private client configuration
+and its parent. Do not accept arbitrary group owners. The daemon already forces
+its TokenUser as pipe owner; fixtures now obtain TokenUser directly and explicitly
+assign it to file and parent, even when TokenOwner is BuiltinAdmins. Expected
+server identity is independent of filesystem ownership. Standard/filtered tokens,
+full/elevated administrator tokens, and SYSTEM can all designate their TokenUser
+as owner of objects they provision. Only the filtered Windows runtime has been
+exercised locally; full/elevated and SYSTEM runtime remain **unverified on real
+hardware**. Service installer/cross-user provisioning and security approval belong
+to the independent reviewer and service work, not this transport correction.
+
+Rejected/disconnected peers are isolated from listener failures. On Unix, a failed
+Tokio peer_cred query (macOS LOCAL_PEEREPID before getpeereid) drops only that stream.
+The review's macOS early-close mechanism was source-checked, not runtime-observed
+here. No credential is sent before kernel server identity matches. Fatal listener
+errors return; rejected/busy peers are paced and Windows replenishment has three
+bounded attempts. There is no indefinite error retry loop.
+
+Replace the 300-second total lease with bounded slots and partial-frame deadlines:
+eight initialized authenticated clients may stay idle indefinitely; unauthenticated
+or uninitialized clients have five seconds each. A started frame has 300 seconds;
+writes have five seconds, both directions have an 8192-byte including-newline cap.
+This accepts same-user slot occupancy rather than silently ending normal Claude
+Code idle sessions. Oversized responses terminate that connection and withhold
+partial bytes; pagination is required before inventory exceeds the cap. HTTP
+shutdown drains for at most five seconds. No M2 service/Claude Code acceptance is
+claimed. Fresh independent review and green hosted checks are still required.

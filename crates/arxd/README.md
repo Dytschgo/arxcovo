@@ -160,7 +160,17 @@ The private client JSON contains exactly:
 ```
 
 Provision this file outside the repository with the private permissions described
-above. Its parent must also be private; file and parent must belong to the bridge
+above. On Windows explicitly set **both file and parent owner to the bridge's
+TokenUser SID**, alongside the private protected DACL. Do not use TokenOwner or
+infer identity from a newly created directory: a full administrator token commonly
+creates BUILTIN\Administrators-owned objects. Provision using the client account
+(or its installer), setting OWNER_SECURITY_INFORMATION to that account's user SID.
+A group-owned file is rejected even if its ACL is otherwise private. Standard and
+filtered users usually default to their TokenUser; elevated/full admin users need
+explicit ownership; SYSTEM needs S-1-5-18 ownership for its own client files. These
+are provisioning requirements, not instructions for agents to elevate. Set
+expected_server_identity independently to the daemon TokenUser (pipe owner), never
+to a config directory's owner. Elevated/SYSTEM runtime remains unverified here. Its parent must also be private; file and parent must belong to the bridge
 user. It is limited to 16 KiB. The raw credential resides only in this private
 client configuration; the daemon retains only the hash. Never put it in argv,
 environment, MCP arguments or shell output. Configure MCP clients to invoke this
@@ -180,7 +190,8 @@ The bridge uses anonymous SQOS, preventing server impersonation of the client.
 See Microsoft's [pipe security reference](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
 and [GetSecurityInfo reference](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo).
 
-Unix uses Tokio peer_cred (kernel SO_PEERCRED on Linux and LOCAL_PEERCRED on macOS)
+Unix uses Tokio 1.48 peer_cred (kernel SO_PEERCRED on Linux; LOCAL_PEEREPID
+followed by getpeereid on macOS)
 to compare the connected server UID before sending credentials, and to restrict
 accepted client UIDs. The socket is 0600 under an owner-only parent. Bind refuses
 every existing object, including stale sockets and symlinks. Normal shutdown
@@ -207,10 +218,26 @@ and rejects oversized or incomplete frames without forwarding their partial data
 The API and feature names were verified against the exact downloaded crate's
 `transport/async_rw.rs` and Cargo.toml, not inferred from another SDK version.
 There are at most eight admitted connections, a five-second authentication limit,
-a five-second bridge write limit and a five-minute total daemon connection lease.
-The bridge also bounds each frame read to five minutes. Clients reconnect after
-the lease expires. Dropping the listener aborts admitted connection tasks. The
-binary explicitly exits after bridge transport closure because Tokio stdin reads
+a five-second initialization limit and a five-second write limit. Authenticated
+initialized sessions have no arbitrary total or between-frame idle deadline. Each
+may retain one of the eight slots while idle; this deliberately accepts same-user
+slot exhaustion to preserve long-lived Claude Code sessions. New excess clients
+are closed; busy/rejected accepts are paced at 25 ms (at most 40/s per listener).
+Once the first byte arrives, a frame must complete within five minutes. Both
+server and bridge enforce the 8192-byte cap in both directions, including newline:
+an oversized inventory response closes that connection without forwarding the
+partial frame; inventory growth needs pagination before exceeding this bound.
+Buffers are capped; no frame accumulation across idle periods is permitted.
+Unrecoverable accept/reset errors stop the listener. Windows replenishment keeps
+the reservation and attempts creation at most three times with 50 ms spacing;
+persistent failure stops the listener. Windows busy connects retry every 10 ms
+within the five-second connect deadline. Peer credential lookup failure always
+rejects that peer; it never substitutes an identity. The first rejected peer emits
+one fixed diagnostic per listener lifetime, preventing log flooding. Dropping the listener aborts admitted connection tasks. The
+binary emits only fixed client-config, peer-connect/identity, peer-authentication,
+server-config/state/bind/listener or transport failure categories (no source error
+chains, paths or tokens). HTTP Ctrl-C shutdown again drains gracefully, bounded to
+five seconds. The binary explicitly exits after bridge transport closure because Tokio stdin reads
 cannot be cancelled; holding stdin open cannot orphan the bridge.
 
 Each authenticated connection gets one immutable server-side principal. No
