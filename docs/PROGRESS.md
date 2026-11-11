@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#25](https://github.com/Dytschgo/arxcovo/pull/25), `63b6555d21ea2f82e34c84ca02803e062078bde7`, 17:59:09 UTC, through all five required gates. Native validation foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: fix, independently re-review and land Application #27, then existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after configuration #21 passed on its first attempt, run 43071362527 at `2bdcb20`: **490 seconds**, below 15 minutes. The new native-validation main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -778,3 +778,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Anthropic / claude-opus-5-5, high independently reviewed the full public PR27 range `d045cc4..a08187c`: 117 normal nextest tests passed, two direct fixtures were exercised only through their parents, formatting/Clippy passed, and 10 of 11 guard mutations were caught. Review failed on one confirmed blocker: long-lived read-share-only ancestor handles deny unrelated renames in shared Windows directories. Public evidence: https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091. This status is not waived.
 - Codex / gpt-6.1-sol, medium aligned the local Application with published parent #25 `7af3eac`; only PROGRESS conflicted and all source remains identical to reviewed `a08187c`. A separate Sol high worktree is fixing the ancestor-sharing blocker with owned-temp regressions; no implementation result is claimed yet. The lower-severity pipe casing, SYSTEM-check coverage, state-protection exit mapping, historical macOS endpoint creation and stale-doc findings remain tracked for follow-up. No new feature PR or privileged operation.
 - #25 hosted Ubuntu, Windows, macOS and budget gates have passed; its new-head agent review remains pending. The parent must merge normally before Application publication. Native installed-service and dedicated-account M2 acceptance remain **unverified on real hardware**.
+
+## Application alignment after native validation merge
+
+- Codex / gpt-6.1-sol, medium verified #25 merged as `63b6555` at 17:59:09 UTC through all five gates. Its tree equals independently reviewed `7af3eac`. The local Application already contained that exact parent; duplicate-history squash conflicts retained the current Application tree. Crate/packaging/Cargo/toolchain/script bytes remain identical to public `a08187c` pending the separate sharing fix. No source fix or new acceptance is claimed by this alignment.
+- Main configuration run 43071362527 was independently read from its first-attempt API, success, 2026-11-11T17:46:22Z to 2026-11-11T17:54:32Z = 490 seconds. Current state records the actual latest merge first. PR27 remains blocked by its review finding until the sharing fix, fresh independent review and hosted gates pass. No push/new feature PR or privileged operation; installed-service/dedicated-account paths remain **unverified on real hardware**.
