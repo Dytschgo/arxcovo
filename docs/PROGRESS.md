@@ -917,3 +917,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Pending: native owner_windows adapter, protected file publication and journal
   storage, SCM/LSA calls and uninstall provenance, independent Opus review and
   installed-service acceptance. All native paths are **unverified on real hardware**.
+
+## Windows provenance queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #30 locally on refreshed Application head `4f29ecf`. Provenance/config/plan source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `4b2b769`, including both stale-plan directions and direct unresolved-Intent uninstall tests. CI helpers/workflows match the prepared Application. Only PROGRESS conflicted; historical task evidence and all provider rows are preserved. The older prerequisite-handoff section was moved below Current state, restoring the required first section.
+- Formatting and 26/26 CI-helper tests passed. Rust suites were not repeated for a source-identical history/CI update. No push, new feature PR or native owner/admin operation. Publish only after the Application parent lands, then refresh metadata and obtain a fresh exact-head independent recheck. Native provenance/LSA and installed dedicated-account M2 paths remain **unverified on real hardware**.
