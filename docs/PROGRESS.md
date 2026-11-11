@@ -226,11 +226,16 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   checks skipped. An isolated rustc harness imported the actual macOS pure policy
   source: three tests passed (classification negatives, result/error/count/ACL
   contracts, rename/replacement/membership revision changes).
-- Seven restored source mutations were killed by assertions: skip local-node
+- Eight restored source mutations were killed by assertions: skip local-node
   classification, accept mismatched native record type, ignore membership error,
   accept nonempty ACL, ignore array bound, accept duplicate records, skip config
   incarnation comparison. The first six used the isolated actual-policy harness;
-  the last ran `cargo test -p arxd --lib service::config::revision_tests`.
+  the incarnation mutation ran `cargo test -p arxd --lib service::config::revision_tests`.
+  Final Apple source review also corrected filesec presence to accept any nonzero
+  bitmask. Its eighth mutation (require exactly one) failed the new assertion.
+  The first run of that eighth mutation harness failed to launch its relative
+  executable path on Windows; the corrected absolute-path run passed baseline
+  and killed the mutation.
   These demonstrate portable guard sensitivity, not native macOS execution.
 - Isolated manifest under ignored target/native-check imports actual service
   layout/config/native sources: `cargo check --tests` and `cargo clippy --tests`

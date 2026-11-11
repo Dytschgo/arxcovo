@@ -82,6 +82,9 @@ pub(super) fn membership(value: bool, error: bool) -> Result<bool, Error> {
         Ok(value)
     }
 }
+pub(super) fn acl_present(value: i32) -> bool {
+    value != 0
+}
 pub(super) fn acl_empty(result: i32, invalid: bool) -> Result<(), Error> {
     if result == -1 && invalid {
         Ok(())
@@ -130,6 +133,9 @@ mod tests {
         assert!(membership(false, false) == Ok(false));
         assert!(membership(false, true).is_err());
         assert!(membership(true, true).is_err());
+        assert!(!acl_present(0));
+        assert!(acl_present(1));
+        assert!(acl_present(32));
         assert!(acl_empty(-1, true).is_ok());
         assert!(acl_empty(0, true).is_err());
         assert!(acl_empty(-1, false).is_err());

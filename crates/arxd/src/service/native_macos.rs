@@ -314,11 +314,8 @@ pub(super) fn empty_acl(fd: i32) -> Result<(), Error> {
     {
         return Err(Error::Permissions);
     }
-    if present == 0 {
+    if !policy::acl_present(present) {
         return Ok(());
-    }
-    if present != 1 {
-        return Err(Error::Permissions);
     }
     let mut raw = NIL;
     if unsafe { filesec_get_property(security.0, 5, &mut raw) } != 0
