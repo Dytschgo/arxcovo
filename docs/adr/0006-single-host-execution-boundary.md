@@ -1,9 +1,12 @@
 # 0006: Separate service authority from build execution
 
-Status: proposed from the Opus 5.5 high single-host security design. No service,
-account switching or MCP acceptance has been implemented. Platform behavior is
-**unverified on real hardware**. This records preparation while setup acceptance
-finishes; it does not authorize agents to perform owner administration.
+Status: historical proposal from the Opus 5.5 high single-host security design.
+For the current production contract, follow [ADR 0009](0009-service-lifecycle-and-dedicated-execution.md).
+The separately owner-authorized development mode is [ADR 0010](0010-windows-current-user-development.md).
+Service/inventory foundations and development acceptance now exist; installed
+services and dedicated-account execution remain unaccepted and **unverified on real hardware**.
+The proposal below is retained as research and does not override those later
+contracts or authorize agents to perform owner administration.
 
 ## Required boundary
 
