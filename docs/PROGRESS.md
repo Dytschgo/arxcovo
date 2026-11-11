@@ -3,9 +3,9 @@
 ## Current state
 
 - Milestone: 1 — Setup (in progress).
-- Current task: correct review round 2 status-exhaustion finding, then request fresh Opus review; hosted CI and trusted-policy bootstrap activation pending.
+- Current task: merge-policy follow-up, first main CI baseline and complete gate activation; then end-to-end setup acceptance.
 - Coordinator follow-up: guarded auto-merge, reviewed protection payload proposal, trusted workflow_run triggers and tested evaluator added. Twelve policy/auto-merge tests and UI lint pass. No configuration applied or auto-merge action performed.
-- Last merged PR: none.
+- Last merged PR: #1, installation merge `708afbd3f7a5a262a0f21ca9cb11bce991c41aff` at 2026-11-11 02:52 UTC. All three platform checks and independent Opus review passed at reviewed head `5b07ea1`. Budget was not yet installed; this is installation, not setup acceptance.
 - Acceptance: no milestone acceptance checks have run yet.
 - Milestone 1 implementation: Rust workspace, React/Vite and Electron scaffolds, locked dependencies, pinned tools, three-OS CI and fail-closed budget policy prepared on feat/milestone-1. Bootstrap main is not acceptance.
 - Local evidence (Windows): cargo fmt --all --check, clippy workspace/all-targets with warnings denied, cargo test, cargo nextest (2 integration tests), npm lint, policy tests (3), UI production build and Playwright Chromium smoke (1) passed. Final rerun before PR: fmt, clippy, npm ci, lint, policy tests, build and Chromium smoke all passed.
@@ -31,12 +31,16 @@
 
 ## Blockers and owner actions
 
+- Installation protection: coordinator applied the independently reviewed CI/review requirements as bootstrap controls (all three platform checks pinned to Actions and agent-review, strict/up-to-date, administrators included, zero approving users, force push/deletion blocked). Budget becomes required after its first real main baseline. GitHub rejected `contexts: []` together with `checks` (422, ambiguous schema); removing `contexts` succeeded. Final payload correction is prepared locally. Full gate acceptance remains pending.
+- Read-only host preflight confirmed the dedicated local `Arxcovo` account is absent and QEMU is not available on the current PATH. Owner must create the standard account before dedicated-account host acceptance, and complete QEMU/WHPX/data-cap setup before real VM acceptance. Follow docs/dev-host-setup.md. No account, feature, installation or other admin change was made by agents.
+- Repository settings readback: default Actions token permission is `read`; Actions PR approval is disabled. Coordinator changed fork workflow approval from first-time contributors to `all_external_contributors` and verified the API readback. This matches the independently advised setup. Main protection and repository auto-merge remain unapplied.
 - None confirmed yet. Administrative host configuration will require the owner before real VM acceptance; prepare the checklist first.
 - Main has no CI baseline/workflow yet. Coordinator must resolve trusted-policy bootstrap activation; no gate bypass was performed. Duration history remains honestly empty.
 - Pending: revised-head Opus review, hosted CI, reviewed installation merge, baseline history, protection/readback, trivial auto-merge and slow-main end-to-end acceptance. No new reviewer App is required.
 - Owner selected Dytschgo as the current allowlisted agent author; their own same-repository PRs under this login are eligible too. Recorded in .github/agent-authors.json.
 - Review round 1: Opus posted agent-review failure on 835d06c. Blocking findings: history became an unintended gate; untested evaluator paths; stale-success and label races; unnecessary approving-user/App requirements. Revised evaluator separates history, invalidates discovered heads before measurement, handles failures and reads live head/labels under workflow concurrency. Fresh review required.
 - Review round 2: Opus posted failure on 0218ba8 for repeated status exhaustion and cross-PR failure propagation. Follow-up publication is idempotent, only old successes with changed main measurements become pending, and capped heads are isolated. A 1,100-evaluation regression test emits only two statuses; another proves a capped head cannot strand a fresh PR. Fourteen policy/auto-merge tests plus one React component test, UI lint/build and Chromium smoke pass locally.
+- Review round 3: Opus posted success on 5b07ea1, with Windows/macOS/Ubuntu CI green before merge. Non-blocking event fallback issue corrected in follow-up: only discovery failures publish the triggering-head fallback, and publication is awaited. Regression tests preserve a good PR's success when another PR errors. Additional guard tests cover unready PRs and weakened protection. Electron smoke and owner checklist remain separate local follow-up work.
 - Owner setup checklist prepared locally as docs/dev-host-setup.md; no admin changes performed. It is a follow-up document outside the bootstrap review target.
 - Coordinator steering applied: budget policy uses trusted default-branch checkout on pull_request_target/workflow_run, with API-only candidate measurements and completion re-evaluation. Gate architecture remains proposed pending independent review.
 

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideBudget, evaluatePullRequests, statusPublisher } from './evaluate-budget.mjs';
+import { decideBudget, evaluatePullRequests, evaluateEvent, statusPublisher } from './evaluate-budget.mjs';
 
 function fixture() {
   const posts = [];
@@ -52,6 +52,23 @@ test('a capped PR cannot strand a fresh PR pending', async () => {
   await assert.rejects(evaluatePullRequests(io));
   assert.equal(posts.at(-1).sha, fresh.head.sha);
   assert.equal(posts.at(-1).state, 'success');
+});
+test('aggregate failure never overwrites the triggering good PR with a discovery failure', async () => {
+  const { io, posts, pr } = fixture();
+  const broken = { ...pr, number: 2, head: { sha: 'b'.repeat(40) } };
+  io.listPullRequests = () => [pr, broken];
+  io.getPullRequest = number => { if (number === 2) throw Error('broken PR'); return pr; };
+  await assert.rejects(evaluateEvent(io, pr.head.sha));
+  assert.equal(posts.filter(post => post.sha === pr.head.sha).at(-1).state, 'success');
+  assert.equal(posts.some(post => post.description === 'Policy discovery failed; retry required'), false);
+});
+test('discovery failure awaits the triggering-head failure status', async () => {
+  const { io, posts, pr } = fixture();
+  io.listPullRequests = () => { throw Error('discovery unavailable'); };
+  io.postStatus = async (sha, state, description) => { await Promise.resolve(); posts.push({ sha, state, description }); };
+  await assert.rejects(evaluateEvent(io, pr.head.sha));
+  assert.equal(posts.at(-1).state, 'failure');
+  assert.match(posts.at(-1).description, /discovery failed/);
 });
 test('changed head stays pending and cannot inherit the previous decision', async () => {
   const { io, posts, pr } = fixture();

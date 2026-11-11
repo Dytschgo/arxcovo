@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { duration } from './policy.mjs';
-import { evaluatePullRequests, statusPublisher } from './evaluate-budget.mjs';
+import { evaluateEvent, statusPublisher } from './evaluate-budget.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
@@ -26,8 +26,9 @@ if (process.argv.includes('--record')) {
   if (!records.some(record => record.runId === latest.runId)) records.push(latest);
   writeFileSync(path, JSON.stringify(records, null, 2) + '\n');
 } else {
-  try {
-    await evaluatePullRequests({
+  const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+  const triggeringHead = event.workflow_run?.event === 'pull_request' ? event.workflow_run.head_sha : event.pull_request?.head.sha;
+  await evaluateEvent({
       listPullRequests: () => api('pulls?state=open&per_page=100'),
       getPullRequest: number => api(`pulls/${number}`),
       getMainRun,
@@ -39,13 +40,5 @@ if (process.argv.includes('--record')) {
         return run ? duration(firstAttempt(run)) : null;
       },
       postStatus,
-    });
-  } catch (error) {
-    // Discovery can fail before all heads are known. Invalidate the triggering
-    // head when available; scheduled evaluation retries discovery later.
-    const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-    const sha = event.pull_request?.head.sha ?? event.workflow_run?.head_sha;
-    if (/^[a-f0-9]{40}$/.test(sha ?? '')) postStatus(sha, 'failure', 'Policy discovery failed; retry required');
-    throw error;
-  }
+  }, triggeringHead);
 }

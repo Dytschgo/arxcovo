@@ -1,5 +1,18 @@
 import { budget } from './policy.mjs';
 
+export class DiscoveryError extends Error {}
+
+export async function evaluateEvent(io, triggeringHead) {
+  try {
+    await evaluatePullRequests(io);
+  } catch (error) {
+    if (error instanceof DiscoveryError && /^[a-f0-9]{40}$/.test(triggeringHead ?? '')) {
+      await io.postStatus(triggeringHead, 'failure', 'Policy discovery failed; retry required');
+    }
+    throw error;
+  }
+}
+
 export function decideBudget(latest, candidate, labels) {
   try {
     budget(latest, candidate, labels.some(label => label.name === 'ci-speed'));
@@ -27,7 +40,8 @@ export function statusPublisher({ readStatus, createStatus }) {
 }
 
 export async function evaluatePullRequests({ listPullRequests, getPullRequest, getMainRun, getCandidateRun, getStatus, postStatus }) {
-  const prs = await listPullRequests();
+  let prs;
+  try { prs = await listPullRequests(); } catch (cause) { throw new DiscoveryError('Open PR discovery failed', { cause }); }
   let latest;
   try {
     if (prs.length >= 100) throw Error('Open PR limit reached; evaluation refused');
