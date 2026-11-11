@@ -1086,3 +1086,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Read-only Unix manager diagnostic refresh
 
 - Codex / gpt-6.1-sol / medium refreshed existing #34 locally onto actual main `cd464b2`. The diagnostic helper, refined privacy tests and retained historical evidence are unchanged from the earlier prepared candidate; no production manager parser or owner command is activated. ADR0014 still arrives through pending #29, so publication/re-review waits for that dependency. No manager query or owner action runs on this machine.
+
+- The refreshed helper suite ran 39 tests: **36 passed, 3 Unix child-process tests skipped on Windows**. Diagnostic/tool bytes remain unchanged; no Rust build, native manager capture, or hosted revalidation is claimed for this local refresh. No push while the ADR0014 parent remains pending.
