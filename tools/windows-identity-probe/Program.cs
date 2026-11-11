@@ -181,6 +181,12 @@ internal static class Program
         using var current = WindowsIdentity.GetCurrent();
         var rawGroups = Native.ReadGroups(current.Token);
         var denyAdmin = rawGroups.Where(g => g.Sid == "S-1-5-32-544" && (g.Attributes & 16) != 0).ToArray();
+        // UAC limited tokens have a linked full token. Check that independently
+        // so filtering deny-only groups cannot silently skip this regression.
+        if (Native.ElevationType(current.Token) == 3)
+        {
+            Require(denyAdmin.Length == 1, "self-test: limited token lost deny-only Administrators"); count++;
+        }
         // Existing filtered admin token only; never create accounts, change UAC or elevate.
         if (denyAdmin.Length != 0)
         {

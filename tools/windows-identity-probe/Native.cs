@@ -138,6 +138,17 @@ internal static class Native
         }
         finally { Marshal.FreeHGlobal(data); }
     }
+    internal static int ElevationType(nint token)
+    {
+        nint data = TokenInfo(token, 18); // TokenElevationType, independent of TokenGroups.
+        try
+        {
+            int value = Marshal.ReadInt32(data);
+            Program.Require(value is >= 1 and <= 3, "token: invalid elevation type");
+            return value;
+        }
+        finally { Marshal.FreeHGlobal(data); }
+    }
     internal static (string Sid, uint Attributes)[] ReadGroups(nint token)
     {
         nint data = TokenInfo(token, 2, out int length);

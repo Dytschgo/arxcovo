@@ -1,5 +1,15 @@
 # Windows identity feasibility probe
 
+Coordinator pre-dispatch regression check: the unprivileged self-test now reads
+TokenElevationType independently of TokenGroups. A limited token must retain its
+deny-only Administrators entry; otherwise the self-test fails rather than skipping
+the group-reader check. Release build passed with no warnings/errors and all 34
+assertions passed. In a scratch copy, removing deny-only entries from ReadGroups
+failed specifically at this assertion on the existing filtered token. No account,
+right, task, S4U or elevation operation ran. See the Microsoft definitions of
+[token information classes](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class)
+and [elevation types](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_elevation_type).
+
 Status: standalone research harness for the proposed ADR 0006 contract, based on
 `3b6c819` and `git show dd0840f:docs/adr/0006-single-host-execution-boundary.md`.
 It is not the production executor or milestone 2 acceptance. All S4U, privileged
