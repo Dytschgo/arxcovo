@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: correct Windows experiment PR #12 blockers, review Unix execution and host identity candidates, then implement service/stdio integration. Dedicated-account command acceptance remains unverified.
-- Last merged PR: [#13](https://github.com/Dytschgo/arxcovo/pull/13), merge `90d3ce7c3758773e7a50b1ec5d5c272245033939`, 2026-11-11 09:03:32 UTC. All required checks and independent Opus review passed; MCP host identity is now persistent.
+- Current task: inspect reviewed Windows experiment run 42995659949, review Unix execution PR #14, and validate the local MCP/stdio candidate. Dedicated-account command acceptance remains unverified.
+- Last merged PR: [#12](https://github.com/Dytschgo/arxcovo/pull/12), merge `03adb434c5f8ff5d5fb50303174ad95367fd8761`, 2026-11-11 09:26:11 UTC. All required checks and exact-head independent reviews passed. Its manual experiment is running at that reviewed SHA; the repository dispatch gate must be cleared after completion.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -99,6 +99,7 @@
 | PR #12 blocker corrections | Codex / gpt-6.1-sol | high | Candidate 94be783: four blockers addressed with unprivileged reproductions and guard mutations; independent re-review required before privileged dispatch |
 | PR #12 pre-dispatch N1 regression | Codex / gpt-6.1-sol | medium | f9e3b92: independent elevation-type check; 34 unprivileged assertions pass, deny-only removal mutation fails at the new assertion |
 | PR #12 pre-dispatch recheck | Claude / claude-opus-5-5 | high | Success on f9e3b92; independent build/self-test and mutation confirmed N1 fixed. Requested final docs count/date correction; no privileged execution |
+| Local MCP/stdio integration | Codex / gpt-6.1-sol | high | Candidate 8d86fef integrated; builder build/fmt/Clippy/24 tests and coordinator fmt/24 tests passed on Windows. Unix native CI, independent review and all privileged/cross-user service paths remain pending |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
