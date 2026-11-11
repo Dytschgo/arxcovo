@@ -2,15 +2,61 @@
 
 ## Current state — 2026-11-11
 
-- Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#28](https://github.com/Dytschgo/arxcovo/pull/28), `0ceb1745e2e6dafad6daf5394747a3e094102c35`, 13:46:02 UTC. Independent Opus review and all required checks passed; kernel object-identity regression merged through normal gates.
-- Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
-- Scoped PR25 blocker: Windows existing-ancestor namespace policy implemented locally; independent review and hosted checks pending. PR27 sharing fix remains separate; see ADR 0013.
-- PR27 persistence investigation: actual normal-user Windows hot-journal restart
-  failure reproduced (SQLITE_IOERR_DELETE 2570); local temporary-exclusive recovery
-  fix and crash regression pass. Independent review/hosted and installed acceptance
-  remain pending; see the scoped evidence at the end of this file.
-- Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
+- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+
+## Queue-drain oversight
+
+- Codex / gpt-6.1-sol, medium applied the babysitter's 17:03 UTC queue-drain steering: stop new feature PRs, finish #32 first, then merge existing M2 dependencies and fold or close superseded work. Current state is restored as the first section. Local mirror/progress evidence is committed; the babysitter and its schedule are unchanged.
+- The signed-mirror execution path has passed hosted Ubuntu; no further DNS root-cause investigation is planned. If the mitigation fails, record it under the three-attempt handoff rule rather than keep investigating. Do not bypass checks or increase the CI timeout.
+- The detailed preparation and failed-draft records below are historical evidence. The first successful hosted result includes the caveat that the original DNS names also resolved, so no causal DNS-fix claim is made.
+
+## CI mirror evidence
+
+### Signed Ubuntu mirror first hosted execution
+
+- Codex / gpt-6.1-sol, medium verified completed [Ubuntu job 130669921798](https://github.com/Dytschgo/arxcovo/actions/runs/43062892241/job/130669921798) at independently reviewed source `400903d`. The helper updated one source. All four resolute suites fetched InRelease metadata from the Kernel Archives HTTPS mirror; no signature/insecure/unsigned/failed-fetch warning appeared. Playwright dependency installation, browser smoke and Linux Electron smoke passed. The complete job took **130 seconds**, below the unchanged 12-minute limit.
+- All six DNS controls, including all three original Ubuntu-domain names, resolved on this run. The original DNS timeout did not reproduce. This establishes the reviewed signed-mirror execution path, not a proven DNS fix or root cause. Exact sanitized results are retained in `docs/evidence/ubuntu-signed-mirror-run.json`.
+- Independent Anthropic / claude-opus-5-5 / requested high published-head review passed at `400903d` ([evidence](https://github.com/Dytschgo/arxcovo/pull/32#issuecomment-6802018766)). Earlier preparation/unactivated notes below are historical. This documentation-only follow-up requires its own exact-head recheck and green required checks before merge. No owner-machine APT/admin change occurred; no installed-service or dedicated-account M2 acceptance is established.
+
+### Mirror mitigation review correction
+
+- Independent Anthropic / claude-opus-5-5 / requested high review at `a97fd74` found B1: the actual Ubuntu image uses `mirror+file:/etc/apt/apt-mirrors.txt`, so the original direct-URI candidate would refuse unchanged. Its report is retained in `docs/reviews/ubuntu-mirror-mitigation-review.md`; nothing had been published or executed. Root cause of the DNS failure remains unknown.
+- Codex / gpt-6.1-sol, medium added guarded support for that one exact mirror-list path, validating all entries and optional priorities before source replacement. A regression failed first. The 144-byte observed entry format now passes through the complete owned-temp plan/recheck/publication loop; the mirror list and third-party sources remain unchanged. Tests cover stale identity/bytes, atomic staging cleanup, mode requests, all-plan refusal, parent/file-count guards and an empty plan.
+- The helper now refuses alternate insecure boolean spellings, tests the missing deb822 weak/downgrade options, recognizes lowercase URI fields, opens files nonblocking before type checks and prepares isolated root Python. Twenty portable tests pass locally. Eight restored source mutations now fail assertions: indirect-list validation, fresh bytes, fresh identity, mode preservation, file-count limit, parent policy, empty-plan refusal and rewritten-output bound. Root facts and fchmod are injected only in owned-temp tests; actual root APT publication/installation is still unrun. No owner-machine APT access or sudo ran. The revised candidate requires a fresh independent review before publication and does not establish a CI fix or M2 acceptance.
+
+### Ubuntu signed-mirror mitigation candidate
+
+- Codex / gpt-6.1-sol, medium retained the PR32 observation: job 130635247058, source `b475bf1`, Ubuntu 26.04 image `20261101.186.1`, three Ubuntu-domain timeouts and resolved Kernel Archives/GitHub/Microsoft controls. The existing Playwright dependency install still failed; root cause is unknown.
+- Prepared an unactivated, fixed-context CI helper that changes only known Ubuntu APT URI values to the Kernel Archives HTTPS mirror. Suites/components/architectures/signing-key selection and third-party sources are preserved; no insecure option, new key, resolver edit or gate exemption is introduced. Both legacy and deb822 forms have byte-preservation tests and unsafe target sources refuse. All source files are validated before changes, bounded, no-follow, root-owned, single-link and not group/other writable.
+- Eleven portable tests passed locally, including synthetic native file facts. No APT file was opened or modified and no privileged operation ran. Independent review is required before workflow activation; actual root publication, signed metadata/dependency installation and a green CI run remain unverified. This is a mitigation candidate, not a claimed fix or M2 acceptance.
+- The exact workflow step is now prepared locally for review, before the unchanged Playwright installation. It forwards only four non-secret intent fields through sudo in the disposable Ubuntu runner. Four source mutations (foreign keyring acceptance, missing file-owner guard, hardlink acceptance and HTTP mirror) failed assertions and were restored. Nothing has been pushed or executed; no owner-machine sudo or APT operation ran.
+
+### Ubuntu mirror DNS investigation preparation
+
+- Codex / gpt-6.1-sol, medium added a read-only Linux CI diagnostic for three
+  fixed Ubuntu mirror names and GitHub/Microsoft controls. Five getent children
+  run concurrently, each with a five-second deadline, no shell and discarded
+  stdout/stderr. Only fixed labels and statuses are emitted (at most 1024 bytes).
+  No IPs, owner values, environment values or exception messages are retained.
+- Diagnostics do not decide merge eligibility or skip any existing check. The
+  workflow retains every previous step, platform, permission and timeout. There
+  are no retries or resolver/network modifications. The cause is still unknown;
+  this is evidence collection rather than a claimed DNS fix.
+- Six pure Python tests passed on Windows. Three restored mutations (capturing
+  output, removing the child deadline and reversing success classification)
+  each failed assertions. YAML structural comparison confirms only the bounded
+  diagnostic step was added. Native getent/network behavior on Ubuntu remains
+  pending, along with independent review and hosted checks.
+
+### Ubuntu DNS observations and next control
+
+- Codex / gpt-6.1-sol, medium inspected Ubuntu job [130608817837](https://github.com/Dytschgo/arxcovo/actions/runs/43045667306/job/130608817837) at source `2cf5ab9`. Before Rust tests, all three Ubuntu mirror probes timed out; GitHub and Microsoft resolved. The later Playwright dependency step failed resolving those Ubuntu names. Windows and macOS jobs passed. Sanitized source-bound observations are retained in `docs/evidence/ubuntu-mirror-dns-observations.json`. This rules out an application-test DNS change in that run, but does not establish the resolver failure's cause.
+- Added one fixed, read-only DNS control for `mirrors.edge.kernel.org`. The [Linux Kernel Archives mirror service](https://mirrors.edge.kernel.org/) lists its Ubuntu archive; this is a comparison target, not a selected package source or an availability guarantee. Six concurrent children retain the same five-second individual limit and 1024-byte output cap. No package source, resolver, signature check, install command or merge gate changes. The new control has not run on a hosted runner.
+- Six pure diagnostic tests passed locally after pinning all six expected labels and hostnames. Independent review and hosted checks remain pending. No installed-service, dedicated-account or M2 acceptance is established.
 
 ## Accepted milestone 1 evidence
 
@@ -694,3 +740,26 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   native hot-journal regression passed locally. Hosted full-admin-token evidence
   is still pending; this correction does not establish installed SYSTEM/root
   or physical-power-loss recovery. Those paths remain **unverified on real hardware**.
+## Service lifecycle refresh after merged CI unblock
+
+- Codex / gpt-6.1-sol, medium refreshed #20 from reviewed head `4ead112` against actual main `3b6170b` (#32). The squash tree matches reviewed CI head `d6d3b31`. Only PROGRESS conflicted; both parents' provider tables and evidence were retained, Current state stays first, and last merged PR is #32. #31 is recorded closed as folded into #29.
+- All service/crate, packaging, Cargo, toolchain and script bytes are unchanged from reviewed `4ead112`; CI workflow/helpers match merged main. Local formatting, locked workspace/all-target Clippy, **76/76 nextest tests** and **26/26 CI-helper tests** passed. The one direct-only subprocess fixture was skipped and exercised by its passing parent. No privileged service or owner operation ran. Fresh exact-head review and required hosted checks remain mandatory. Installed-service and dedicated-account M2 acceptance remain open.
+
+## Configuration queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared #21 locally on refreshed lifecycle head `3195f5a` while #20 awaits normal gates. No new feature PR was opened and this preparation has not been pushed. Crate/configuration, packaging, Cargo/toolchain and script bytes match reviewed `aadfa05`; CI workflow/helpers match the refreshed parent. Both provider/evidence tables remain intact and Current state stays first.
+- Local formatting, locked workspace/all-target Clippy, **89/89 nextest tests**, **26/26 CI-helper tests** and three portable artifact checks passed. One direct-only subprocess fixture was exercised by its parent; two native Unix artifact checks skipped. No owner/admin/service operation ran. Publication waits for the actual #20 merge commit and a final metadata refresh; current-head hosted checks and independent review remain required. No installed-service/M2 acceptance is claimed.
+
+## Main CI recovery confirmation
+
+- Codex / gpt-6.1-sol, medium verified the Actions API for main run 43066365961: source `3b6170bbd07e38873deecbd7750432b74fa4cb87`, attempt 1, completed success. Using the repository policy's `updated_at - run_started_at` measure gives **548 seconds (9m08s)**. Main CI is green and under 15 minutes after #32. No rerun, timeout increase or gate exception was used. This record is prepared locally for the next dependency checkpoint; #20 remains the first service-stack merge target.
+
+## Configuration refresh after lifecycle merge
+
+- OpenAI / gpt-6.1-sol / medium integrated the actual #20 squash `64b50e9` into #21 without rewriting published history. The squash tree is identical to reviewed head `3195f5a`; duplicate-history merge conflicts retained the already validated configuration tree. Configuration source, packaging and Cargo/toolchain files remain identical to reviewed `aadfa05`; CI helpers/workflows match merged main. Prior local verification therefore applies: formatting, locked all-target Clippy, 89/89 nextest and 26/26 CI-helper tests passed; artifact checks had three passes and two native Unix skips. No implementation changed in this refresh. Fresh exact-head independent review and required hosted checks remain necessary.
+- #20 merged at 17:31:46 UTC after all five gates passed; its Windows job completed successfully at 17:30:23. Main push CI for the earlier #32 unblock passed in 548 seconds. The new #20 main push is not yet claimed green. No new feature PR was opened, and Current state remains the first section.
+
+## Native validation queue preparation
+
+- OpenAI / gpt-6.1-sol / medium prepared #25 locally on configuration head `9f74919` while #21 runs its fresh review and hosted gates. Published history is preserved. Only PROGRESS conflicted; the current state from the refreshed parent remains first, and both parent provider tables and task evidence are retained. Native source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `d045cc4`; CI helpers/workflows match the configuration parent.
+- This refresh ran formatting, 26/26 CI-helper tests and artifact checks (three passed, two native Unix skips). Clippy/nextest were not repeated because the Rust trees are identical to the reviewed head. No native service, owner, admin or account operation ran. No push or new feature PR; publication waits for #21 to merge, then a final refresh and exact-head independent review. Installed-service/dedicated-account M2 acceptance remains open and **unverified on real hardware**.
