@@ -27,6 +27,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "getrandom 0.3.4",
  "hex",
  "libc",
  "rand 0.9.2",

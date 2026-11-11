@@ -89,6 +89,8 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     let payload: serde_json::Value =
         serde_json::from_str(response.content[0].as_text().unwrap().text.as_str()).unwrap();
     let host = &payload["hosts"][0];
+    let host_id = host["host_id"].as_str().unwrap().to_owned();
+    assert_host_id(&host_id);
     assert!(host["logical_cpus"].as_u64().unwrap() > 0);
     assert!(host["ram_bytes"].as_u64().unwrap() > 0);
     assert!(host["disk_total_bytes"].as_u64().unwrap() > 0);
@@ -154,9 +156,13 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
         401
     );
     let peer = client(&url, &replacement).await;
-    peer.call_tool(CallToolRequestParams::new("list_hosts"))
+    let response = peer
+        .call_tool(CallToolRequestParams::new("list_hosts"))
         .await
         .unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(payload["hosts"][0]["host_id"], host_id);
     peer.cancel().await.unwrap();
     task.abort();
     let _ = task.await;
@@ -166,6 +172,24 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
             .unwrap(),
         4
     );
+    drop(db);
+    let fresh = private_dir();
+    let (cfg, token) = config(fresh.path());
+    let (url, task) = server(cfg).await;
+    let peer = client(&url, &token).await;
+    let response = peer
+        .call_tool(CallToolRequestParams::new("list_hosts"))
+        .await
+        .unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+    let fresh_id = payload["hosts"][0]["host_id"].as_str().unwrap();
+    assert_host_id(fresh_id);
+    assert_ne!(fresh_id, host_id);
+    assert!(payload["hosts"][0]["ram_bytes"].as_u64().unwrap() > 0);
+    peer.cancel().await.unwrap();
+    task.abort();
+    let _ = task.await;
 }
 #[tokio::test]
 async fn http_boundary_denies_before_sdk_without_activity() {
@@ -253,6 +277,7 @@ async fn activity_failure_refuses_inventory() {
         .to_string();
     assert!(error.contains("activity unavailable"));
     assert!(!error.contains("ram_bytes"));
+    assert!(!error.contains("host_id"));
     peer.cancel().await.unwrap();
     task.abort();
     let _ = task.await;
@@ -261,11 +286,13 @@ async fn activity_failure_refuses_inventory() {
 fn activity_retention_and_interrupted_restart() {
     let dir = private_dir();
     let store = Activity::open(dir.path()).unwrap();
+    let host_id = store.host_id().unwrap();
     for _ in 0..1005 {
         store.start("test-agent", "list_hosts").unwrap();
     }
     drop(store);
     let store = Activity::open(dir.path()).unwrap();
+    assert_eq!(store.host_id().unwrap(), host_id);
     let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
     assert_eq!(
         db.query_row(
@@ -456,6 +483,7 @@ async fn completion_storage_failure_withholds_inventory_and_sdk_bad_token_fails(
         .to_string();
     assert!(error.contains("activity unavailable"));
     assert!(!error.contains("ram_bytes"));
+    assert!(!error.contains("host_id"));
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM activity WHERE outcome='started'",
@@ -592,4 +620,111 @@ async fn distinct_sdk_credentials_persist_distinct_principals() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(names, ["test-agent", "second-agent"]);
+}
+
+fn assert_host_id(id: &str) {
+    assert_eq!(id.len(), 64);
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+}
+
+#[test]
+fn corrupt_identity_fails_closed_without_replacement() {
+    for mutation in [
+        "UPDATE local_host_identity SET host_id=''",
+        "UPDATE local_host_identity SET host_id='SENSITIVE-IDENTITY-MARKER'",
+        "UPDATE local_host_identity SET host_id=replace(printf('%064d',0),'0','A')",
+        "UPDATE local_host_identity SET host_id=zeroblob(64)",
+        "UPDATE local_host_identity SET host_id=printf('%0100000d',0)",
+        "DELETE FROM local_host_identity",
+        "DROP TABLE local_host_identity",
+        "PRAGMA user_version=2",
+        "PRAGMA user_version=0",
+        "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,NULL)",
+        "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(2,printf('%064d',0))",
+        "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,printf('%064d',0)),(1,printf('%064d',0))",
+    ] {
+        let dir = private_dir();
+        drop(Activity::open(dir.path()).unwrap());
+        let path = dir.path().join("activity.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(mutation).unwrap();
+        drop(db);
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            Activity::open(dir.path()).is_err(),
+            "accepted mutation: {mutation}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "rewrote corrupt metadata"
+        );
+    }
+}
+
+#[test]
+fn identity_migration_and_activity_recovery_commit_atomically() {
+    let dir = private_dir();
+    let store = Activity::open(dir.path()).unwrap();
+    store.start("test-agent", "list_hosts").unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    // Reproduce the pre-identity schema, preserving an actual started activity.
+    db.execute_batch("DROP TABLE local_host_identity; PRAGMA user_version=0; CREATE TRIGGER fail_recovery BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'storage unavailable'); END;").unwrap();
+    assert!(Activity::open(dir.path()).is_err());
+    assert_eq!(
+        db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='local_host_identity'",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute_batch("DROP TRIGGER fail_recovery").unwrap();
+    let store = Activity::open(dir.path()).unwrap();
+    let id = store.host_id().unwrap();
+    assert_host_id(&id);
+    assert_eq!(
+        db.query_row("SELECT outcome FROM activity", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "interrupted"
+    );
+    drop(store);
+    assert_eq!(Activity::open(dir.path()).unwrap().host_id().unwrap(), id);
+}
+
+#[tokio::test]
+async fn identity_corruption_during_server_lifetime_withholds_inventory() {
+    let dir = private_dir();
+    let (cfg, token) = config(dir.path());
+    let (url, task) = server(cfg).await;
+    let peer = client(&url, &token).await;
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE local_host_identity SET host_id=?1",
+        ["SENSITIVE-IDENTITY-MARKER"],
+    )
+    .unwrap();
+    let error = peer
+        .call_tool(CallToolRequestParams::new("list_hosts"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("activity unavailable"));
+    for withheld in ["ram_bytes", "host_id", "SENSITIVE-IDENTITY-MARKER", &token] {
+        assert!(!error.contains(withheld));
+    }
+    peer.cancel().await.unwrap();
+    task.abort();
+    let _ = task.await;
 }

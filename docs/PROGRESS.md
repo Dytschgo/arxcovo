@@ -4,7 +4,7 @@
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
 - Current task: correct Windows experiment PR #12 blockers, review Unix execution and host identity candidates, then implement service/stdio integration. Dedicated-account command acceptance remains unverified.
-- Last merged PR: [#11](https://github.com/Dytschgo/arxcovo/pull/11), merge `fa5e41418c1a5ae42337365c5217f177a0b9207d`, 2026-11-11 08:50:09 UTC. All required checks and independent security re-review passed.
+- Last merged PR: [#13](https://github.com/Dytschgo/arxcovo/pull/13), merge `90d3ce7c3758773e7a50b1ec5d5c272245033939`, 2026-11-11 09:03:32 UTC. All required checks and independent Opus review passed; MCP host identity is now persistent.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -37,7 +37,7 @@
 - Inventory/activity: PR #11 merged the authenticated official-SDK HTTP tracer after all three hosted platforms and security re-review passed. It deliberately has no execution authority. Local and independent workspace validation passed 13 tests.
 - The macOS temporary-root fixture issue and blocking Windows inherit-only ACL exposure were fixed before merge. The permission regression failed old code and passed the correction. Windows path-prefix handling, owner checks, header/connection bounds and other non-blocking review observations remain tracked follow-ups before privileged service use.
 - Windows execution: PR #12 combines harness 24d3c7e with helper 852f6f0. Its review failed on child console handles, ancestor access, deny-only group inspection and missing evidence-guard regressions. Sol is correcting these in isolation. No privileged experiment has run and no S4U/account-right/process-identity success is claimed.
-- Unix execution candidate 46cba1f is integrated for review as a library only, without an MCP or CLI execution entry point. Builder formatting/Clippy/19 Windows tests and standalone Unix metadata checks passed; coordinator formatting and all 19 integrated Windows tests passed. Linux/macOS runtime, privileged harness, restart cleanup and audit integration remain unverified. Persistent identity is separately proposed in PR #13.
+- Unix execution candidate 46cba1f is integrated for review as a library only, without an MCP or CLI execution entry point. Builder formatting/Clippy/19 Windows tests and standalone Unix metadata checks passed; coordinator formatting and 19 tests passed before updating against merged host identity. Linux/macOS runtime, privileged harness, restart cleanup and audit integration remain unverified. Persistent identity merged in PR #13 after its atomicity test and legacy rollback were independently checked.
 - Still to implement and prove: stdio bridge and trusted local endpoint identity; per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
 - Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
 
@@ -95,6 +95,7 @@
 | PR #11 security review round 2 | Claude / claude-opus-5-5 | high | Success on 181ddff; 13 tests and old-code mutation confirmed correction; all hosted checks passed and PR merged |
 | Unix execution library | Codex / gpt-6.1-sol | high | Candidate 46cba1f: 19 portable Windows tests passed; Unix metadata compilation passed, runtime and privileged harness unverified; independent review required |
 | PR #12 security review round 1 | Claude / claude-opus-5-5 | high | Failure on d42c33e: four blockers; no privileged execution performed |
+| PR #13 independent review | Claude / claude-opus-5-5 | high | Success on 978065b; migration/recovery atomicity mutation and legacy rollback replay passed; all hosted checks passed and PR merged |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
