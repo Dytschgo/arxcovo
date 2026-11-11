@@ -71,13 +71,28 @@ with privilege or present it as dedicated-account execution isolation.
 
 `list_hosts` accepts an empty argument object and reports observed OS, machine
 architecture, logical CPU count, RAM and aggregate mounted-volume disk capacity
-and availability. No process/tool probes execute. It explicitly reports execution
+and availability, plus a persistent `host_id`. No process/tool probes execute. It explicitly reports execution
 and tool discovery unavailable pending the dedicated-account backend. No hostname,
 user name, mount paths, environment values or configured execution identity is
 returned. Mounted volumes may overlap; disk totals are inventory facts, not a
 VM storage allocation budget.
 
-SQLite stores only principal, fixed tool classification, numeric ID and outcome.
+The application `host_id` is 32 bytes from the OS cryptographic random source,
+encoded as 64 lowercase hex characters. It contains no hostname, account, MAC,
+machine GUID or hardware fingerprint. A separate singleton metadata table in the
+private activity database keeps it outside activity retention. Initialization and
+the schema-version marker commit in one transaction with activity recovery;
+pre-identity stores migrate without discarding their activity. The version marker
+distinguishes those stores from initialized stores missing their identity table.
+Missing, malformed, duplicate or unsupported-version metadata fails closed;
+inventory revalidates metadata on each call and withholds results on failure.
+Restore valid private state when metadata is corrupt; restarting does not repair
+or replace the identity. Copying the entire state copies its identity, so separate
+hosts require fresh state. This is local application identity for future routing,
+not a future Raft numeric node ID or certificate identity; no Raft design changes.
+Using the existing transactional store avoids another private file or write path.
+
+The activity table stores only principal, fixed tool classification, numeric ID and outcome.
 A durable transaction records `started` before inventory collection; storage
 failure prevents dispatch/results. Completion failure withholds inventory and
 leaves the durable started row. Restart marks unfinished rows `interrupted`.

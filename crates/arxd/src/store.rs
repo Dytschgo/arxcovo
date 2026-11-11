@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
-/// Fixed-size metadata only; no arguments, environment, credentials or host paths.
+/// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     db: Mutex<Connection>,
     _lock: std::fs::File,
@@ -46,18 +46,50 @@ impl Activity {
                 crate::security::private(&companion)?;
             }
         }
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_millis(250))?;
         let page_size: u64 = db.pragma_query_value(None, "page_size", |r| r.get(0))?;
         let page_count: u64 = db.pragma_query_value(None, "page_count", |r| r.get(0))?;
         if page_size > 4096 || page_count > 1024 {
             anyhow::bail!("activity store exceeds size bound");
         }
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024; CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT, principal TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL); UPDATE activity SET outcome='interrupted' WHERE outcome='started';")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;",
+        )?;
+        let tx = db.transaction()?;
+        let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match version {
+            0 => {
+                // No IF NOT EXISTS: unexpected identity metadata must fail closed.
+                // This also migrates pre-identity activity stores without losing events.
+                tx.execute_batch("CREATE TABLE local_host_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), host_id TEXT NOT NULL);")?;
+                let mut random = [0u8; 32];
+                getrandom::fill(&mut random)
+                    .map_err(|_| anyhow::anyhow!("host identity randomness unavailable"))?;
+                tx.execute(
+                    "INSERT INTO local_host_identity VALUES(1, ?1)",
+                    [hex::encode(random)],
+                )?;
+                tx.pragma_update(None, "user_version", 1)?;
+            }
+            1 => {}
+            _ => anyhow::bail!("unsupported local state version"),
+        }
+        read_host_id(&tx)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT, principal TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL); UPDATE activity SET outcome='interrupted' WHERE outcome='started';")?;
+        tx.commit()?;
         Ok(Self {
             db: Mutex::new(db),
             _lock: lock,
         })
+    }
+    /// Application host identity only, unrelated to Raft node IDs or certificates.
+    pub fn host_id(&self) -> Result<String> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        read_host_id(&db)
     }
     pub fn start(&self, principal: &str, tool: &str) -> Result<i64> {
         if principal.is_empty()
@@ -96,4 +128,29 @@ impl Activity {
             )?;
         Ok(())
     }
+}
+
+fn read_host_id(db: &Connection) -> Result<String> {
+    // Bound even malformed values and reject missing/extra rows and non-text data.
+    let mut stmt = db.prepare(
+        "SELECT singleton, length(host_id), substr(host_id,1,65) FROM local_host_identity LIMIT 2",
+    )?;
+    let mut rows = stmt.query([])?;
+    let row = rows
+        .next()?
+        .ok_or_else(|| anyhow::anyhow!("missing host identity"))?;
+    let singleton: i64 = row.get(0)?;
+    let length: i64 = row.get(1)?;
+    let id: String = row.get(2)?;
+    if singleton != 1
+        || length != 64
+        || id.len() != 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || rows.next()?.is_some()
+    {
+        anyhow::bail!("invalid host identity");
+    }
+    Ok(id)
 }
