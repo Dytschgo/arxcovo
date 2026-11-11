@@ -9,6 +9,7 @@ mod crash_tests;
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     db: Mutex<Connection>,
+    pub(crate) dedicated: Option<std::sync::Arc<crate::service::executor::Execution>>,
     service_reason: Mutex<Option<ExecutionUnavailable>>,
     _lock: std::fs::File,
     _service_pins: Vec<crate::service::native::Observed>,
@@ -132,6 +133,7 @@ impl Activity {
         tx.commit()?;
         Ok(Self {
             db: Mutex::new(db),
+            dedicated: service.then(crate::service::executor::Execution::unavailable),
             service_reason: Mutex::new(
                 service.then_some(ExecutionUnavailable::MechanismUnavailable),
             ),
@@ -143,17 +145,20 @@ impl Activity {
         self.service_reason.lock().ok().and_then(|r| *r)
     }
     pub(crate) fn set_service_reason(&self, reason: ExecutionUnavailable) {
+        if let Some(e) = &self.dedicated {
+            e.set_reason(reason);
+        }
         if let Ok(mut r) = self.service_reason.lock() {
             *r = Some(reason);
         }
     }
-    /// Called only after service connection tasks have stopped; no executor exists.
+    /// Called only after service connections and dedicated workers have drained.
     pub(crate) fn shutdown_pending(&self) -> Result<()> {
         let db = self
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
-        db.execute("UPDATE activity SET outcome='failed',reason='shutdown',stop_reason='shutdown',finished_at_ms=?1 WHERE outcome='started' AND actor_kind='agent'", [now_ms()?])?;
+        db.execute("UPDATE activity SET outcome='failed',reason='shutdown',stop_reason='shutdown',finished_at_ms=?1 WHERE outcome='started' AND actor_kind='agent' AND class='read'", [now_ms()?])?;
         Ok(())
     }
     /// Application host identity only, unrelated to Raft node IDs or certificates.
