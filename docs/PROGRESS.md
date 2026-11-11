@@ -679,3 +679,18 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Protected SQLite recovery coordinator integration
 
 - Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
+
+## Hosted hot-journal fixture owner correction
+
+- Codex / gpt-6.1-sol, medium inspected completed Windows job 130585845956
+  from PR30 run 43039115633. It failed at the initial fixture owner check,
+  before the crash/recovery path: 91 tests passed, one failed and 37 were not
+  run after fail-fast. This is not evidence of a SQLite recovery failure.
+- The parent Application fixture created private-DACL files without setting
+  their owner. It now assigns the current test user's owner SID explicitly on
+  its three newly created temporary files. The strict owner comparison and all
+  production code remain unchanged. No token default-owner change is made.
+- Formatting, workspace/all-target Clippy with warnings denied, and the focused
+  native hot-journal regression passed locally. Hosted full-admin-token evidence
+  is still pending; this correction does not establish installed SYSTEM/root
+  or physical-power-loss recovery. Those paths remain **unverified on real hardware**.

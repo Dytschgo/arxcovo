@@ -38,6 +38,33 @@ fn hot_journal_child() {
     panic!("parent failed to terminate child before rollback");
 }
 
+fn set_fixture_owner(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::*, *},
+    };
+    let identity = crate::local::current_identity().unwrap();
+    let text: Vec<u16> = identity.encode_utf16().chain(Some(0)).collect();
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let mut sid = ptr::null_mut();
+        assert_ne!(ConvertStringSidToSidW(text.as_ptr(), &mut sid), 0);
+        let result = SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            sid,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        LocalFree(sid);
+        assert_eq!(result, 0, "fixture owner assignment");
+    }
+}
+
 #[test]
 fn pinned_service_recovers_actual_hot_journal() {
     let dir = crate::service::application::tests::private_temp();
@@ -46,7 +73,11 @@ fn pinned_service_recovers_actual_hot_journal() {
         "activity.sqlite3",
         "activity.sqlite3-journal",
     ] {
-        std::fs::write(dir.path().join(name), []).unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, []).unwrap();
+        // A full administrator token can default new files to the group owner.
+        // This fixture deliberately models the current user, never SYSTEM.
+        set_fixture_owner(&path);
     }
     let store = Activity::open_pinned_fixture(dir.path()).expect("initial pinned open");
     let host_id = store.host_id().unwrap();
