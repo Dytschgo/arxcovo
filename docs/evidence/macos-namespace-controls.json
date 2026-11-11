@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "kind": "read_only_hosted_macos_namespace_controls",
+  "sourceCommit": "b052d94058444f56186ed0a75c5e1e79196d35a3",
+  "runId": 43053335906,
+  "jobId": 130636095317,
+  "runnerLabel": "macos-latest",
+  "image": "macos-26-arm64",
+  "imageVersion": "20261102.0473.1",
+  "jobConclusion": "success",
+  "observations": [
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "root"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "library"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": false,
+      "per_directory_ancestor_accepts": true,
+      "target": "application_support"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "private"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "var"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": false,
+      "per_directory_ancestor_accepts": false,
+      "target": "runtime_parent"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "logs"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "launch_daemons"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": true,
+      "target": "bin"
+    },
+    {
+      "empty_acl_confirmed": true,
+      "leaf_binary_integrity_accepts": true,
+      "per_directory_ancestor_accepts": false,
+      "target": "launchctl"
+    }
+  ],
+  "workspaceTestsPassed": 132,
+  "directOnlyFixturesSkipped": 1,
+  "installedServiceAcceptance": false,
+  "crossUserAcceptance": false,
+  "nativeMutationsRun": false
+}
