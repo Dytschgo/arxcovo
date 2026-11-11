@@ -798,3 +798,18 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   remain open. Last merged PR remains #28 as recorded above.
 - No manager, privileged harness, owner administration, dispatch, settings,
   old Lab Manager or VM operation ran. No push, PR write, merge or watch ran.
+
+## Unix typed-query continuation checkpoint
+
+- Codex / gpt-6.1-sol, medium integrated incomplete candidatece7d044. It supplies
+  bounded systemd parsing, fail-closed launchd queries, typed gates/expectations
+  and status mapping; lifecycle plan and native runner integration are unfinished.
+- Coordinator found contradictory not-found/active observations were classified
+  Absent. A new regression failed before correction. Absent now additionally
+  requires inactive and no fragment/drop-in path; active, transitioning and failed
+  not-found observations remain Unknown and cannot prove stop. ADR0014 documents
+  that fail-closed consistency requirement.
+- Formatting and workspace/all-target Clippy passed; all five portable query
+  tests passed. No manager, owner or privileged operation ran. The next bounded
+  slice is typed lifecycle plans and gate tests, followed by native runner and
+  retained-state/runtime-directory work. PR29's functional blockers remain open.

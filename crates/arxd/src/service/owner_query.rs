@@ -183,7 +183,9 @@ pub fn systemd(success: bool, stdout: &[u8]) -> Query {
         return Query::Foreign;
     }
     match load {
-        "not-found" if fragment.is_empty() && dropin.is_empty() => Query::Absent,
+        "not-found" if fragment.is_empty() && dropin.is_empty() && state == State::Stopped => {
+            Query::Absent
+        }
         "loaded" if fragment == "/etc/systemd/system/arxd.service" => Query::Ours(state),
         _ => Query::Unknown,
     }
@@ -261,6 +263,26 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn not_found_cannot_hide_an_active_or_transitioning_unit() {
+        for active in [
+            "active",
+            "reloading",
+            "activating",
+            "deactivating",
+            "failed",
+        ] {
+            assert_eq!(
+                systemd(true, &output("not-found", active, "", "")),
+                Query::Unknown
+            );
+        }
+        assert_eq!(
+            systemd(true, &output("not-found", "inactive", "", "")),
+            Query::Absent
+        );
+    }
+
     #[test]
     fn active_unknown_and_foreign_cannot_pass_installable_or_stop_proof() {
         for state in [

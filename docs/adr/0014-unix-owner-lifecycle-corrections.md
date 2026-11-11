@@ -114,7 +114,9 @@ result, never raw text:
 with output capped at 4 KiB. Every `Key=Value` line must appear exactly once,
 in any order.
 
-- **Absent:** `LoadState=not-found` and an empty `FragmentPath`.
+- **Absent:** `LoadState=not-found`, an empty `FragmentPath` and
+  `DropInPaths`, and `ActiveState=inactive`. A contradictory active,
+  transitioning or failed not-found observation is Unknown and cannot prove stop.
 - **Ours:** `loaded`, with `FragmentPath=/etc/systemd/system/arxd.service` and
   `DropInPaths` either empty or exactly the fixed drop-in path.
 - **Foreign:** any other path, a masked unit or another drop-in.
