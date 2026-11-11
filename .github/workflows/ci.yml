@@ -37,3 +37,9 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run smoke
+      - name: Electron smoke on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum npm run test:desktop
+      - name: Electron smoke on Windows and macOS
+        if: runner.os != 'Linux'
+        run: npm run test:desktop

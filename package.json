@@ -16,7 +16,8 @@
     "lint": "tsc -p ui/tsconfig.json && eslint .",
     "test": "node --test scripts/*.test.mjs && npm test -w ui",
     "build": "npm run build -w ui",
-    "smoke": "playwright test"
+    "smoke": "playwright test",
+    "test:desktop": "playwright test --config desktop/playwright.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "9.39.1",
