@@ -128,12 +128,24 @@ impl ServerHandler for Inventory {
                         id,
                         Outcome::Refused,
                         &crate::store::Metadata {
-                            reason: Some(Reason::Unavailable),
+                            reason: Some(
+                                self.activity
+                                    .service_reason()
+                                    .map(|r| r.stored_reason())
+                                    .unwrap_or(Reason::Unavailable),
+                            ),
                             ..Default::default()
                         },
                     )
                     .map_err(|_| unavailable())?;
-                return Err(ErrorData::internal_error("execution unavailable", None));
+                let reason = self
+                    .activity
+                    .service_reason()
+                    .unwrap_or(crate::service::preflight::ExecutionUnavailable::NotConfigured);
+                return Err(ErrorData::internal_error(
+                    "execution unavailable",
+                    Some(json!({"execution_reason":reason.as_str()})),
+                ));
             };
             // Spawned here, before any await: the worker completes the audit row
             // even if cancellation wins the race below or the future is dropped.
@@ -189,7 +201,7 @@ impl ServerHandler for Inventory {
             .execution
             .as_ref()
             .map(|e| e.capability())
-            .unwrap_or_else(|| json!({"available":false,"reason":"not_configured"}));
+            .unwrap_or_else(|| json!({"available":false,"reason":self.activity.service_reason().map(|r| r.as_str()).unwrap_or("not_configured")}));
         value["hosts"][0]["execution_available"] = execution["available"].clone();
         value["hosts"][0]["execution_unavailable_reason"] = execution["reason"].clone();
         value["hosts"][0]["execution"] = execution;

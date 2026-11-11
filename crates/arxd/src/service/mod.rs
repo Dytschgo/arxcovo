@@ -1,9 +1,15 @@
-//! ADR0009 lifecycle plumbing. Production application integration is deliberately
-//! unavailable until fixed config, inventory and durable daemon audit are wired.
+//! ADR0009 service lifecycle and fixed protected inventory application.
+//! Dedicated-account execution remains unavailable until its backend is integrated.
+pub(crate) mod application;
 pub mod config;
 pub mod layout;
 pub mod native;
 pub mod owner_plan;
+pub mod preflight;
+
+pub mod owner_transactions;
+#[cfg(windows)]
+pub mod owner_windows;
 use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 
@@ -202,8 +208,8 @@ async fn pending<F: Future<Output = Result<(), ExitCode>>, R: Reporter>(
     }
 }
 
-/// No fixed-layout config/store/inventory adapter exists in slices 1–2. In
-/// particular, do not open foreground state or claim ready with a fake adapter.
+/// Enter the OS manager adapter with the concrete fixed-layout application.
+/// No foreground configuration or test hook is selectable from this entry.
 pub fn run() -> ExitCode {
     #[cfg(windows)]
     {
@@ -217,3 +223,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod owner_scm;
+#[cfg(windows)]
+mod owner_scm_windows;

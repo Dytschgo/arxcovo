@@ -11,6 +11,7 @@ pub enum Platform {
 pub enum Error {
     Config,
     Identity,
+    AccountMissing,
     Rights,
     Workspace,
     Permissions,
@@ -18,17 +19,24 @@ pub enum Error {
     OwnerRequired,
     Manager,
     NativeAdapterMissing,
+    NotInstalled,
+    Foreign,
+    Active,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Config => "service-config",
             Self::Identity => "service-identity",
+            Self::AccountMissing => "service-account-missing",
             Self::Rights => "service-rights",
             Self::Workspace => "service-workspace",
             Self::Permissions => "service-permissions",
             Self::Layout => "service-layout",
             Self::OwnerRequired => "service-owner-required",
+            Self::NotInstalled => "service-not-installed",
+            Self::Foreign => "service-foreign-registration",
+            Self::Active => "service-active",
             Self::Manager => "service-manager",
             Self::NativeAdapterMissing => "service-native-adapter-missing",
         })

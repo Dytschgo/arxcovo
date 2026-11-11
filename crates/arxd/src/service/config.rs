@@ -1,5 +1,6 @@
 //! Strict, bounded service-only schema. No foreground or CLI config overrides.
 use super::layout::{Error, Layout, Platform};
+use super::preflight::ExecutionUnavailable;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -72,7 +73,8 @@ pub trait Resolver {
         Ok(None)
     }
     fn account(&self, name_or_identity: &str) -> Result<Account, Error>;
-    /// Metadata-only: existing directory, local disk, no symlinks/reparse ancestors.
+    /// Owner configure only: existing directory, local disk, no symlinks/reparse ancestors.
+    /// Service inventory/preflight must never call this method.
     fn workspace_safe(&self, path: &str) -> Result<bool, Error>;
 }
 fn validate_platform_rights(platform: Platform, rights: Rights) -> Result<(), Error> {
@@ -114,6 +116,41 @@ impl ServiceConfig {
         Ok(())
     }
     fn validate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
+        self.validate_inventory(layout, resolver)?;
+        self.execution_preflight(layout, resolver)
+            .map_err(|reason| match reason {
+                ExecutionUnavailable::RightsMismatch
+                | ExecutionUnavailable::AdminUnsupportedOnPlatform => Error::Rights,
+                _ => Error::Identity,
+            })?;
+        if !resolver
+            .workspace_safe(&self.wire.workspace)
+            .map_err(|_| Error::Workspace)?
+        {
+            return Err(Error::Workspace);
+        }
+        Ok(())
+    }
+    /// Startup validation deliberately makes no build-account observations.
+    pub fn parse_inventory(
+        bytes: &[u8],
+        layout: &Layout,
+        resolver: &impl Resolver,
+    ) -> Result<Self, Error> {
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(Error::Config);
+        }
+        let wire: Wire = serde_json::from_slice(bytes).map_err(|_| Error::Config)?;
+        validate_platform_rights(layout.platform(), wire.rights)?;
+        let config = Self {
+            wire,
+            platform: layout.platform(),
+            revisions: [None, None],
+        };
+        config.validate_inventory(layout, resolver)?;
+        Ok(config)
+    }
+    fn validate_inventory(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
         let w = &self.wire;
         if self.platform != layout.platform()
             || w.schema != "arxd-service/1"
@@ -134,29 +171,16 @@ impl ServiceConfig {
         {
             return Err(Error::Identity);
         }
-        let build = resolver
-            .account(&w.build_account.name)
-            .map_err(|_| Error::Identity)?;
         let client = resolver
             .account(&w.client.identity)
             .map_err(|_| Error::Identity)?;
-        if build.kind != AccountKind::User
-            || client.kind != AccountKind::User
-            || build.identity != w.build_account.identity
+        if client.kind != AccountKind::User
             || client.identity != w.client.identity
-            || build.gid != w.build_account.gid
-            || (self.platform == Platform::Windows && build.gid.is_some())
+            || (self.platform == Platform::Windows && w.build_account.gid.is_some())
         {
             return Err(Error::Identity);
         }
-        if build.administrative != (w.rights == Rights::Admin) {
-            return Err(Error::Rights);
-        }
-        if !layout.workspace_disjoint(&w.workspace)
-            || !resolver
-                .workspace_safe(&w.workspace)
-                .map_err(|_| Error::Workspace)?
-        {
+        if !layout.workspace_disjoint(&w.workspace) {
             return Err(Error::Workspace);
         }
         let allowed: &[&str] = if self.platform == Platform::Windows {
@@ -218,6 +242,39 @@ impl ServiceConfig {
         }) {
             return Err(Error::Config);
         }
+        Ok(())
+    }
+    /// Dynamic execution facts are independent of inventory availability.
+    pub fn execution_preflight(
+        &self,
+        layout: &Layout,
+        resolver: &impl Resolver,
+    ) -> Result<(), ExecutionUnavailable> {
+        validate_platform_rights(self.platform, self.wire.rights)
+            .map_err(|_| ExecutionUnavailable::AdminUnsupportedOnPlatform)?;
+        let build =
+            resolver
+                .account(&self.wire.build_account.name)
+                .map_err(|error| match error {
+                    Error::AccountMissing => ExecutionUnavailable::AccountMissing,
+                    _ => ExecutionUnavailable::PreflightFailed,
+                })?;
+        if build.kind != AccountKind::User {
+            return Err(ExecutionUnavailable::PreflightFailed);
+        }
+        if build.identity != self.wire.build_account.identity
+            || build.gid != self.wire.build_account.gid
+        {
+            return Err(ExecutionUnavailable::AccountIdentityChanged);
+        }
+        if build.administrative != (self.wire.rights == Rights::Admin) {
+            return Err(ExecutionUnavailable::RightsMismatch);
+        }
+        if !layout.workspace_disjoint(&self.wire.workspace) {
+            return Err(ExecutionUnavailable::PreflightFailed);
+        }
+        // Workspace/PATH observation belongs after switching identity. Until
+        // that backend exists, the caller always reports execution unavailable.
         Ok(())
     }
     pub fn client_identity(&self) -> &str {
@@ -422,7 +479,7 @@ pub(crate) mod tests {
                             running_binary: layout.binary(),
                         };
                         let plan = super::super::owner_plan::configure_plan(
-                            &layout, &context, &previous, None, false, &resolver,
+                            &layout, &context, &previous, None, None, &resolver,
                         );
                         assert_eq!(plan.as_ref().err(), Some(&Error::Rights));
                         assert_eq!(plan.as_ref().map(|p| p.operations().len()).unwrap_or(0), 0);
@@ -452,8 +509,17 @@ pub(crate) mod tests {
                     "token_sha256": hash,
                 }));
             assert_eq!(
-                parse(value, &FakeResolver::default()).err(),
+                parse(value.clone(), &FakeResolver::default()).err(),
                 Some(Error::Config)
+            );
+            assert_eq!(
+                ServiceConfig::parse_inventory(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &Layout::for_test(Platform::Linux),
+                    &FakeResolver::default(),
+                )
+                .err(),
+                Some(Error::Config),
             );
         }
         let mut value = fixture();
@@ -464,7 +530,15 @@ pub(crate) mod tests {
                 "principal": "second",
                 "token_sha256": "b".repeat(64),
             }));
-        assert!(parse(value, &FakeResolver::default()).is_ok());
+        assert!(parse(value.clone(), &FakeResolver::default()).is_ok());
+        assert!(
+            ServiceConfig::parse_inventory(
+                &serde_json::to_vec(&value).unwrap(),
+                &Layout::for_test(Platform::Linux),
+                &FakeResolver::default(),
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn strict_schema_and_redacted_errors() {
@@ -596,5 +670,221 @@ mod revision_tests {
         assert!(c.revalidate(&layout, &r).is_ok());
         r.revision.set(1);
         assert!(c.revalidate(&layout, &r) == Err(Error::Identity));
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    struct Observe(std::sync::Mutex<Vec<String>>);
+    impl Resolver for Observe {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            self.0.lock().unwrap().push(value.into());
+            if value == "builder" {
+                return Err(Error::Identity);
+            }
+            Ok(Account {
+                identity: value.into(),
+                gid: Some(1001),
+                kind: AccountKind::User,
+                administrative: false,
+            })
+        }
+        fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+            panic!("no startup incarnation lookup")
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            panic!("no startup workspace lookup")
+        }
+    }
+    #[test]
+    fn missing_build_account_is_dynamic_and_macos_admin_refuses_before_observation() {
+        let r = Observe(Default::default());
+        let layout = Layout::for_test(Platform::Linux);
+        let bytes = serde_json::to_vec(&tests::fixture()).unwrap();
+        let config = ServiceConfig::parse_inventory(&bytes, &layout, &r).unwrap();
+        assert_eq!(*r.0.lock().unwrap(), ["1001"]);
+        assert_eq!(
+            config.execution_preflight(&layout, &r),
+            Err(ExecutionUnavailable::PreflightFailed)
+        );
+        let changed = tests::FakeResolver {
+            changed: true,
+            ..Default::default()
+        };
+        let mismatched = ServiceConfig::parse_inventory(&bytes, &layout, &changed).unwrap();
+        assert_eq!(
+            mismatched.execution_preflight(&layout, &changed),
+            Err(ExecutionUnavailable::AccountIdentityChanged)
+        );
+        r.0.lock().unwrap().clear();
+        let mut v = tests::fixture();
+        v["rights"] = "admin".into();
+        assert!(matches!(
+            ServiceConfig::parse_inventory(
+                &serde_json::to_vec(&v).unwrap(),
+                &Layout::for_test(Platform::Macos),
+                &r
+            ),
+            Err(Error::Rights)
+        ));
+        assert!(r.0.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn inventory_schema_still_refuses_http_development_and_bad_static_values() {
+        let r = tests::FakeResolver::default();
+        let layout = Layout::for_test(Platform::Linux);
+        for key in [
+            "listen",
+            "development_execution",
+            "config",
+            "state_dir",
+            "local",
+        ] {
+            let mut v = tests::fixture();
+            v[key] = serde_json::json!({});
+            assert!(
+                ServiceConfig::parse_inventory(&serde_json::to_vec(&v).unwrap(), &layout, &r)
+                    .is_err()
+            );
+        }
+        let mut v = tests::fixture();
+        v["agents"][0]["token_sha256"] = "invalid".into();
+        assert!(
+            ServiceConfig::parse_inventory(&serde_json::to_vec(&v).unwrap(), &layout, &r).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_boundary_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Observe {
+        workspace: Cell<usize>,
+        safe: bool,
+        failure: Option<Error>,
+        changed: bool,
+        admin: bool,
+    }
+    impl Resolver for Observe {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            if value == "builder"
+                && let Some(error) = self.failure
+            {
+                return Err(error);
+            }
+            tests::FakeResolver {
+                changed: self.changed,
+                admin: self.admin,
+                ..Default::default()
+            }
+            .account(value)
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            self.workspace.set(self.workspace.get() + 1);
+            assert!(self.safe, "service must not observe workspace");
+            Ok(true)
+        }
+    }
+    #[test]
+    fn service_never_observes_workspace_and_owner_configure_still_does() {
+        let layout = Layout::for_test(Platform::Linux);
+        let bytes = serde_json::to_vec(&tests::fixture()).unwrap();
+        let mut r = Observe {
+            workspace: Cell::new(0),
+            safe: false,
+            failure: None,
+            changed: false,
+            admin: false,
+        };
+        let config = ServiceConfig::parse_inventory(&bytes, &layout, &r).unwrap();
+        for _ in 0..3 {
+            assert_eq!(config.execution_preflight(&layout, &r), Ok(()));
+        }
+        assert_eq!(r.workspace.get(), 0);
+        for (failure, changed, admin, expected) in [
+            (
+                Some(Error::AccountMissing),
+                false,
+                false,
+                ExecutionUnavailable::AccountMissing,
+            ),
+            (
+                Some(Error::Identity),
+                false,
+                false,
+                ExecutionUnavailable::PreflightFailed,
+            ),
+            (
+                Some(Error::Permissions),
+                false,
+                false,
+                ExecutionUnavailable::PreflightFailed,
+            ),
+            (
+                None,
+                true,
+                false,
+                ExecutionUnavailable::AccountIdentityChanged,
+            ),
+            (None, false, true, ExecutionUnavailable::RightsMismatch),
+        ] {
+            r.failure = failure;
+            r.changed = changed;
+            r.admin = admin;
+            assert_eq!(config.execution_preflight(&layout, &r), Err(expected));
+            assert_eq!(r.workspace.get(), 0);
+        }
+        r.failure = None;
+        r.changed = false;
+        r.admin = false;
+        r.safe = true;
+        let owner = ServiceConfig::parse(&bytes, &layout, &r).unwrap();
+        assert_eq!(r.workspace.get(), 1);
+        let context = super::super::owner_plan::OwnerContext {
+            admin: true,
+            running_binary: layout.binary(),
+        };
+        assert!(
+            super::super::owner_plan::configure_plan(&layout, &context, &owner, None, None, &r)
+                .is_ok()
+        );
+        assert_eq!(r.workspace.get(), 2);
+        assert!(
+            ServiceConfig::parse(
+                &bytes,
+                &layout,
+                &tests::FakeResolver {
+                    safe: false,
+                    ..Default::default()
+                }
+            )
+            .err()
+                == Some(Error::Workspace)
+        );
+    }
+    #[test]
+    fn macos_legacy_admin_preflight_observes_no_accounts_or_workspace() {
+        struct Poison;
+        impl Resolver for Poison {
+            fn account(&self, _: &str) -> Result<Account, Error> {
+                panic!("no account observation")
+            }
+            fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+                panic!("no workspace observation")
+            }
+        }
+        let mut wire: Wire = serde_json::from_value(tests::fixture()).unwrap();
+        wire.rights = Rights::Admin;
+        let config = ServiceConfig {
+            wire,
+            platform: Platform::Macos,
+            revisions: [None, None],
+        };
+        assert_eq!(
+            config.execution_preflight(&Layout::for_test(Platform::Macos), &Poison),
+            Err(ExecutionUnavailable::AdminUnsupportedOnPlatform)
+        );
     }
 }
