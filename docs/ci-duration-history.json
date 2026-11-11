@@ -28,11 +28,5 @@
     "sha": "e692b2023703d21652683c3ec024bac5cd63a043",
     "seconds": 251,
     "conclusion": "success"
-  },
-  {
-    "runId": 42985179459,
-    "sha": "416259fee4fd0644d0adbfd3e366b4b3479fe7d1",
-    "seconds": 259.0,
-    "conclusion": "success"
   }
 ]
