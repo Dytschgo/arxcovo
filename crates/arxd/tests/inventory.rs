@@ -1238,6 +1238,7 @@ async fn local_socket_collision_and_replacement_cleanup() {
             .file_type()
             .is_symlink()
     );
+    assert!(!dir.path().join("target").exists());
 }
 
 #[tokio::test]

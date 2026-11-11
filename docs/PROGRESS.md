@@ -168,3 +168,7 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
   Windows experiment, ADR0009, service architecture, privileged/owner operations
   or old Lab Manager changes were made. Services, dedicated-account execution,
   tool discovery and Claude Code cargo acceptance remain outstanding for M2.
+
+## macOS endpoint collision follow-up
+
+- Hosted run 43001228714 at 30f5c00 passed Windows and Linux. macOS passed daemon initialization and early-disconnect regressions, then failed the existing dangling-symlink collision refusal. Unix binding now lstat-checks the endpoint and refuses every existing object before binding; the test also requires the dangling target to remain absent. Windows 28-test rerun passed before this extra Unix-only assertion. Native macOS correction validation and fresh independent review remain pending; no service installation or privileged operation was performed. Provider: Codex / gpt-6.1-sol, medium effort.

@@ -42,6 +42,13 @@ impl Listener {
     pub fn bind(endpoint: &Endpoint) -> Result<Self> {
         // The protected parent makes the brief bind/chmod window inaccessible to others.
         // bind refuses every existing object; never unlink a stale endpoint automatically.
+        // Darwin may bind through a dangling symlink, unlike Linux. Inspect the
+        // link itself before asking the OS to bind, without following its target.
+        match std::fs::symlink_metadata(&endpoint.address) {
+            Ok(_) => bail!("endpoint already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let listener = UnixListener::bind(&endpoint.address)?;
         let m = std::fs::symlink_metadata(&endpoint.address)?;
         let listener = Self {
