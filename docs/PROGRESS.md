@@ -124,3 +124,26 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 ## Service lifecycle integration checkpoint
 
 - The coordinator merged current main 3a7edc8 into the lifecycle branch. Its Rust source is unchanged from the revision that passed all 40 Windows tests, formatting and Clippy. Fixed service artifacts are prepared for this branch. Production entry still fails closed until configuration/store/inventory hooks are connected; no installed-service acceptance is claimed.
+
+## Fixed config and owner-plan foundation checkpoint
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high. Base
+  `62dd9a9976602e7673370fd89ecd7db7a63fecc6` (PR20 foundation). Added fixed
+  Layout, pure permission policies, bounded service config with injected account
+  resolution, typed owner plans and recording/model manager tests. No native
+  owner adapter or agent/CLI integration. Last merged PR above is unchanged.
+- Acceptance evidence: Windows `cargo test --workspace`: 51 passed, one ignored
+  subprocess-only fixture (the existing parent test invokes it explicitly);
+  original 40-test baseline retained plus 11 new unit tests. Formatting and
+  all-target workspace Clippy with warnings denied pass. Package parser tests:
+  three pass, native systemd-analyze/plutil checks skipped on Windows. No UI rerun.
+- Deliverable is foundation, not installed-service acceptance. Production
+  identity resolver, local-disk/reparse/ACL inspection, atomic privileged writes,
+  SCM/LSA and Unix manager actions remain **unverified on real hardware**.
+  Atomic writes are plan steps only. Native configure needs recovery for a
+  batch grant followed by failed config publication; no transaction is claimed.
+- Owner action blockers and M2 acceptance remain open. No owner commands,
+  account/rights/task changes, installation, GitHub writes, push or PR occurred.
+  The active development executor and Host/platform adapters were not edited.
+  Independent different-provider review and hosted checks remain coordinator work.
+- API and remaining native obligations: [service-foundation.md](service-foundation.md).

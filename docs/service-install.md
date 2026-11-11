@@ -7,6 +7,10 @@ because the real fixed-layout application integration is unavailable. It cannot
 report ready or serve inventory yet. Owner commands and `arxd client-config …`
 are not implemented. Do not run anything here until a merged release contains
 the complete installation and application integration.
+The config/owner-plan foundation adds library-only validated types and recording
+fake tests. It does not implement owner commands or an installer. See
+[foundation API and limits](service-foundation.md) before wiring native adapters.
+
 Every step is **unverified on real hardware** until someone performs it and
 records the result in docs/PROGRESS.md. Agents never perform these steps. Leave
 the old Lab Manager installation, its state and the `agent-windows-test` VM
