@@ -27,8 +27,8 @@
 - Main [run 42952698370](https://github.com/Dytschgo/arxcovo/actions/runs/42952698370), attempt 1 at 5c82988, succeeded from 03:25:47 to 03:42:43 UTC: **1016 seconds**. The Actions evaluator failed the probe's budget status at 03:43:02, naming this run and duration.
 - Probe [#5](https://github.com/Dytschgo/arxcovo/pull/5), head 690bf5d, has no ci-speed label. Its three platform checks and independent Opus review passed; Ubuntu finished at 03:52:59 UTC. At 08:05:19 UTC the guarded command enabled auto-merge. GitHub still reported OPEN/BLOCKED with ci-time-budget as the sole failing required gate. This proves live rejection of an otherwise green PR.
 - Recovery [#6](https://github.com/Dytschgo/arxcovo/pull/6), reviewed head 1da52c2, removed only the delay and restored the 12-minute timeout. Its attempt-1 [run 42953952528](https://github.com/Dytschgo/arxcovo/actions/runs/42953952528) succeeded from 03:37:12 to 03:41:47 UTC: **275 seconds**. The ci-speed budget exception passed against the slow main baseline. After recording the blocked probe, the coordinator invoked the guarded merge command; GitHub merged at 08:05:25 UTC.
-- Recovery main run 42984281226 is pending verification. Update the probe against current main, re-review its new SHA, and verify normal merging resumes. Retain the resulting history before declaring setup complete.
-- Electron tests are committed in dependent [#7](https://github.com/Dytschgo/arxcovo/pull/7), head 8e7090f, initially based on the recovery branch. Local lint and the real Windows smoke test passed. Hosted results and final review remain pending; auto-merge is off.
+- Recovery main run 42984281226 is pending verification. Probe #5 now includes recovered main at head aaaf52c; its updated document records the observed rejection. Fresh review and required checks must pass before normal merging resumes. Retain the resulting history before declaring setup complete.
+- Electron tests are committed in [#7](https://github.com/Dytschgo/arxcovo/pull/7), now based on main at head b8c2187. Local lint and the real Windows smoke test passed. The earlier head passed hosted Ubuntu/macOS CI; the updated head's hosted results and final review remain pending. Auto-merge is off.
 
 ## Milestones
 
@@ -51,7 +51,7 @@
 
 - [Arxcovo babysitter](t3-thread://v2/950f5165-f55d-4ffd-9b15-4b87e10b4d15/mcp:launch:6ddd1ab43a55d1439cb40e2639d67190751dd74482d63b63ba999264bd36f7b0).
 - Schedule `scheduled-task:91fbb832-3283-440c-8a0d-e4a89b2d19d0`, every three hours. Initial check-in passed; first scheduled run 2026-11-11 05:16:43 UTC. Agents have not cancelled or rescheduled it.
-- Babysitter flagged the 03:42–08:03 stall after tool/provider failures and requested live recovery plus committed checkpoints. Resumed, verified the existing Electron commit before pushing/opening #7, proved #5 rejection, and merged #6 through all normal gates. Local work is being checkpointed on separate branches; no protection was weakened.
+- Babysitter flagged the 03:42–08:03 stall after tool/provider failures and requested live recovery plus committed checkpoints. Resumed, verified the existing Electron commit before pushing/opening #7, proved #5 rejection, and merged #6 through all normal gates. All local WIP is committed on separate branches: docs/setup-acceptance-evidence, docs/early-hardware-and-raft-spikes (4481301), docs/security-reporting (f977b29), test/await-policy-failure (0c16a9e), plus published Electron/probe branches. The working tree is clean; these local documentation/test checkpoints still require review and merging. No protection was weakened.
 
 ## Provider usage
 
