@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewed_disposable_linux_execution_experiment",
+  "sourceCommit": "5b4f6b20796d599a015ca048dc4edaeb72546387",
+  "reviewedPrHead": "9513b2dc125f67382ef6961000e7bcf36d94c3cf",
+  "reviewUrl": "https://github.com/Dytschgo/arxcovo/pull/14#issuecomment-6805600438",
+  "runId": 43091339273,
+  "jobId": 130768897109,
+  "attempt": 1,
+  "conclusion": "failure",
+  "refusalCode": "E_PROTECTION",
+  "harnessPassObserved": false,
+  "cleanupConfirmedObserved": false,
+  "mutationPhaseEstablished": false,
+  "reviewedShaVariableCleared": true,
+  "installedServiceAcceptance": false,
+  "dedicatedAccountAcceptance": false
+}
