@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#30](https://github.com/Dytschgo/arxcovo/pull/30), `4f2b0c7177c8b7370d34484e4739082364859f4a`, 18:24:31 UTC, through all five required gates. Pure owner provenance is merged; native owner activation and installed/dedicated-account acceptance remain open.
+- Last merged PR: [#33](https://github.com/Dytschgo/arxcovo/pull/33), `7c150f0b2f62269e6e1c21f197f96c89c7d1be1b`, 18:34:47 UTC, through all five required gates. Protected owner storage is merged; native owner/SCM activation and installed/dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land protected owner store #33, then SCM #35; refresh the existing Unix owner/executor dependencies afterward. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
-- Main push CI after Application #27 passed on its first attempt, run 43075630346 at `3f7c515`: **571 seconds**, below 15 minutes. The new provenance main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: complete full SCM review and land #35, then refresh the existing Unix owner/executor dependencies and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after provenance #30 passed on its first attempt, run 43077489596 at `4f2b0c7`: **535 seconds**, below 15 minutes. New owner-store main run 43079116241 is live, not claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -1040,3 +1040,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium aligned existing #33 with actual provenance squash `4f2b0c7`, whose tree equals independently reviewed `bc3443f`. The local store already contained that exact parent; duplicate-history conflicts retained the validated combined tree. Complete crate/packaging/Cargo/toolchain/script trees are identical to tested `34a8f92`; owner_windows source/tests and dependencies remain unchanged from `d6df821`. Workflows/helpers match merged main. All published history and provider/task evidence remain, with Current state first.
 - Existing refreshed-tree verification applies: formatting, locked all-target Clippy, **146/146 normal nextest** (two subprocess fixtures through parents) and **26/26 CI helpers** passed. No test rerun is claimed for this identical-tree metadata refresh. Fresh exact-head independent recheck, including the d6df821 same-content identity-swap test follow-up, and hosted gates remain required. #30 merged at 18:24:31 UTC through all five gates; first-attempt Application main CI passed in 571 seconds. No native owner constructor, LSA/SCM/privilege/account/admin/service/VM operation. Installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## SCM alignment after protected owner-store merge
+
+- Codex / gpt-6.1-sol, medium aligned local #35 with published store `6eb4b9e` and actual squash `7c150f0`, whose trees match. The SCM branch already contained the exact reviewed store source; duplicate-history conflicts retained the validated combination. Crate/packaging/Cargo/toolchain/script trees remain byte-identical to tested `ebe081e` (164 normal tests passed); workflows/helpers match main. No repeated tests are claimed for this metadata-only alignment.
+- #33 merged at 18:34:47 UTC through all five gates, including independent identity-swap mutation coverage. Main provenance run 43077489596 passed on its first attempt in 535 seconds. Current state records the actual merge first. The public SCM head stays frozen at `54c43fb` during its full independent Opus review; no push/new PR or privileged action. A final refresh/recheck and hosted gates remain mandatory. Real SCM readback/registration/reboot and installed/dedicated-account M2 acceptance remain **unverified on real hardware**.
