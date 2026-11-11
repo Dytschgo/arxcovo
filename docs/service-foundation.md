@@ -287,6 +287,59 @@ Concurrent privileged changes, mount changes and root in-place writes are
 outside that guarantee. Installed SQLite behavior under actual SYSTEM/root
 protection is **unverified on real hardware**.
 
+### PR27 hot-journal recovery investigation (2026-11-11)
+
+On prepared base bb077bb45f061c4512d9b2976bed92b7530b2f37, the normal-user
+Windows crash fixture reproduced a pinned-store restart failure: SQLite extended
+error 2570 (SQLITE_IOERR_DELETE). This is native Windows/SQLite evidence, not an
+injected error model. A real child opens a service-mode store, commits activity,
+starts another transaction, updates identity/activity, flushes dirty pages, and
+signals readiness without committing. The parent terminates it without unwinding,
+then verifies rollback-journal magic, a positive page-record count and size above
+512 bytes before reopening. No hand-authored journal is substituted.
+
+The fixture reuses the existing cfg(test) current-user service storage policy and
+Application private-temp ACL helper. Test-only native adapters use the production
+open_impl with identical FILE_READ_DATA, mutable write-sharing, no-delete-sharing,
+retained ancestor handles, reparse/type and single-link checks. Actual deletion
+attempts against all three pinned files fail before recovery. The fixture checks
+current-user leaf ownership/private ACLs, rather than claiming SYSTEM ownership
+or trusted production ancestor ACLs. It never selects the fixed installed paths.
+This is a test policy only; production state_guard and all its ownership, DACL,
+ancestor, header, hardlink, WAL/SHM and service-identity refusals are unchanged.
+
+Moving journal_mode=TRUNCATE before the page reads alone still failed with 2570.
+Bundled SQLite's journal_mode pragma has PragFlg_NeedSchema, so it can itself
+recover before changing journal mode. The fix selects locking_mode=EXCLUSIVE
+before that pragma, retaining the protected journal during recovery, then selects
+TRUNCATE and returns to NORMAL before the bounded page checks and schema-3
+transaction. The activity lock and native pins remain held throughout. SQLite's
+pager_end_transaction uses journal-header invalidation instead of deletion for
+DELETE mode under exclusive locking. See the [SQLite locking-mode contract](https://www.sqlite.org/pragma.html#pragma_locking_mode)
+and [rollback recovery description](https://www.sqlite.org/lockingv3.html).
+No journal is removed/recreated by application code, and no fence is relaxed.
+
+Focused command: cargo test -p arxd --lib pinned_service_recovers_actual_hot_journal
+--locked -- --nocapture. It failed on the original ordering and on the attempted
+pragma-only reorder, then passed with temporary exclusive recovery. Removing
+only the exclusive pragma deliberately restored the same 2570 failure; mutation
+restored. Assertions verify stable host identity, rollback of uncommitted changes,
+interrupted committed activity (including a child-created pending row), schema 3,
+integrity_check=ok, TRUNCATE/NORMAL modes, caller-only readback without private
+fields, persistent zero-length journal, no WAL/SHM, concurrent-store refusal and
+a second successful reopen. Child output is discarded; readiness is bounded to
+10 seconds, child lifetime to 20 seconds, with kill/wait cleanup on parent failure.
+
+Windows checks passed: formatting, workspace/all-target Clippy with warnings
+denied, workspace nextest (117/117 passed; two direct-only helpers skipped and
+exercised by their parent tests), and git diff --check. This closes the reproduced
+normal-user Windows persistence case only. Native Unix/macOS recovery and actual
+SYSTEM/root installed recovery remain **unverified on real hardware**. Independent
+other-provider review, hosted gates, owner provisioning, installed-manager and
+dedicated-account/tool-probe/Claude Code M2 acceptance remain open. No installation,
+elevation, owner operation, account/right/task/service/settings change, old Lab
+Manager/VM access, push, PR, merge or watch occurred.
+
 Unix service endpoints require the fixed root-owned 0755 parent; service umask
 is 0077 and the bound socket becomes client-UID-owned 0600 before serving. The
 foreground arbitrary endpoint retains its current-user private parent rule.

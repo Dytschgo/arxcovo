@@ -296,6 +296,12 @@ pub fn open(path: &Path, directory: bool, read: bool, trusted: bool) -> Result<O
 pub fn open_state_file(path: &Path) -> Result<Observed, Error> {
     open_impl(path, false, false, true, true)
 }
+#[cfg(test)]
+pub(super) fn open_state_fixture(path: &Path, directory: bool) -> Result<Observed, Error> {
+    // Same native access/sharing and structural checks; owned-temp ancestry is
+    // deliberately not asserted to be SYSTEM-owned. No runtime policy switch.
+    open_impl(path, directory, false, false, !directory)
+}
 fn open_impl(
     path: &Path,
     directory: bool,

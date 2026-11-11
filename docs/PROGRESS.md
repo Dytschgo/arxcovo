@@ -6,6 +6,10 @@
 - Last merged PR: [#28](https://github.com/Dytschgo/arxcovo/pull/28), `0ceb1745e2e6dafad6daf5394747a3e094102c35`, 13:46:02 UTC. Independent Opus review and all required checks passed; kernel object-identity regression merged through normal gates.
 - Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
 - Scoped PR25 blocker: Windows existing-ancestor namespace policy implemented locally; independent review and hosted checks pending. PR27 sharing fix remains separate; see ADR 0013.
+- PR27 persistence investigation: actual normal-user Windows hot-journal restart
+  failure reproduced (SQLITE_IOERR_DELETE 2570); local temporary-exclusive recovery
+  fix and crash regression pass. Independent review/hosted and installed acceptance
+  remain pending; see the scoped evidence at the end of this file.
 - Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
 
 ## Accepted milestone 1 evidence
@@ -675,3 +679,68 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix owner adapter preflight-parent refresh
 
 - Codex / gpt-6.1-sol, medium aligned PR29 with Applicationbb077bb, retaining both owner_unix and preflight module exports. Formatting and all-target Clippy with warnings denied passed; three portable owner-adapter tests and nine configuration/boundary tests passed. Native Unix fixtures, root-owned paths and installed managers remain unverified here. Hosted CI and independent review remain pending.
+
+## PR27 focused hot-journal persistence investigation (2026-11-11)
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol / high, implementation child,
+  working alone on t3/m2-hot-journal-recovery from prepared base
+  bb077bb45f061c4512d9b2976bed92b7530b2f37. Applied dytschgo-debug; built and ran
+  the crash/reopen feedback loop before attempting a production fix. Last merged
+  PR remains #28 as recorded above. No architecture contract/fence was relaxed.
+- Reproduced reviewer hypothesis using actual child SQLite writes, a flushed
+  unfinished transaction, abrupt termination and verified hot-journal magic/page
+  records. Native Windows no-delete-sharing pins cover state directory ancestry,
+  DB, journal and lock via the same open_impl as production; actual delete
+  attempts fail. The exact reopen assertion failed with extended SQLite code
+  2570 (SQLITE_IOERR_DELETE). This is native evidence, not a simulated error.
+  The explicit cfg(test) service/current-owner policy and private temp ACL helper
+  substitute for SYSTEM ownership/trusted installed ancestors only. No production
+  runtime flag, fixed service path or privileged operation is involved.
+- One failed fix: moving TRUNCATE ahead of page reads still produced 2570.
+  Bundled SQLite marks journal_mode as needing schema, so that pragma itself
+  triggers recovery. Temporary locking_mode=EXCLUSIVE before TRUNCATE preserves
+  the protected journal during that recovery; return to NORMAL follows before
+  size/schema/reconciliation work. Activity lock/pins stay live. No ownership,
+  DACL, private ancestor, reparse/hardlink, FILE_READ_DATA, mutable write-sharing,
+  no-delete-sharing, schema-3 or caller-privacy policy changed.
+- Focused command actually run: cargo test -p arxd --lib
+  pinned_service_recovers_actual_hot_journal --locked -- --nocapture. Original
+  ordering red; pragma-only reorder red; final fix green. Deliberately removing
+  only temporary exclusive mode again failed at the exact reopen assertion with
+  2570; restored. No RerunUntilGreen or guard exception. Regression also verifies
+  identity rollback, child-pending reconciliation, schema/integrity, persistent
+  journal/modes, private caller readback, activity-lock exclusion and second reopen.
+  Child stdin/stdout/stderr are null, readiness 10 s, lifetime 20 s, kill/wait RAII.
+- Checks actually passed: cargo fmt --all -- --check;
+  cargo clippy --workspace --all-targets --locked -- -D warnings;
+  cargo nextest run --workspace --locked (**117/117 passed**, 7.787 s test phase;
+  two subprocess-only helpers skipped directly and exercised by parents);
+  python scripts/test-service-artifacts.py -v (three passed, two native checks
+  skipped); git diff --check. Full prior 116-test Windows baseline retained.
+- Detailed actual evidence and limitations: docs/service-foundation.md, PR27
+  hot-journal section. Native Unix/macOS and actual installed SYSTEM/root recovery
+  remain **unverified on real hardware**. Other-provider review and hosted gates
+  remain coordinator work. Owner-provisioned protected files, installed SCM/LSA,
+  systemd/launchd, dedicated-account execution/probe and real Claude Code M2
+  acceptance remain open. No push/PR/merge/watch, dispatch/settings, installation,
+  admin/elevation, account/right/task/service operation or old Lab Manager/VM
+  access occurred. Mac endpoint and other backends are outside this slice.
+
+## Protected SQLite recovery coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
+
+## Hosted hot-journal fixture owner correction
+
+- Codex / gpt-6.1-sol, medium inspected completed Windows job 130585845956
+  from PR30 run 43039115633. It failed at the initial fixture owner check,
+  before the crash/recovery path: 91 tests passed, one failed and 37 were not
+  run after fail-fast. This is not evidence of a SQLite recovery failure.
+- The parent Application fixture created private-DACL files without setting
+  their owner. It now assigns the current test user's owner SID explicitly on
+  its three newly created temporary files. The strict owner comparison and all
+  production code remain unchanged. No token default-owner change is made.
+- Formatting, workspace/all-target Clippy with warnings denied, and the focused
+  native hot-journal regression passed locally. Hosted full-admin-token evidence
+  is still pending; this correction does not establish installed SYSTEM/root
+  or physical-power-loss recovery. Those paths remain **unverified on real hardware**.

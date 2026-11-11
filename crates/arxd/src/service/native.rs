@@ -160,6 +160,25 @@ pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
     }
     Ok(pins)
 }
+#[cfg(all(test, windows))]
+pub(crate) fn state_fixture_pins(dir: &Path) -> anyhow::Result<Vec<Observed>> {
+    let mut pins = vec![os::open_state_fixture(dir, true)?];
+    for name in [
+        "activity.lock",
+        "activity.sqlite3",
+        "activity.sqlite3-journal",
+    ] {
+        let path = dir.join(name);
+        crate::security::private(&path)?;
+        let pin = os::open_state_fixture(&path, false)?;
+        let Protection::Windows { owner, .. } = pin.protection() else {
+            anyhow::bail!("fixture platform");
+        };
+        anyhow::ensure!(*owner == crate::local::current_identity()?, "fixture owner");
+        pins.push(pin);
+    }
+    Ok(pins)
+}
 fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
     if header.is_empty()
         || (header.len() == 20 && &header[..16] == b"SQLite format 3\0" && header[18..20] == [1, 1])

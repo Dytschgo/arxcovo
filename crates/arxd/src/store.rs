@@ -3,6 +3,9 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
+#[cfg(all(test, windows))]
+mod crash_tests;
+
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     db: Mutex<Connection>,
@@ -22,6 +25,10 @@ impl Activity {
     pub(crate) fn open_service_fixture(dir: &Path) -> Result<Self> {
         // Explicit current-user fixture policy; unreachable from Native hooks.
         Self::open_inner(dir, Vec::new(), true)
+    }
+    #[cfg(all(test, windows))]
+    fn open_pinned_fixture(dir: &Path) -> Result<Self> {
+        Self::open_inner(dir, crate::service::native::state_fixture_pins(dir)?, true)
     }
     fn open_inner(
         dir: &Path,
@@ -67,13 +74,21 @@ impl Activity {
         }
         let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_millis(250))?;
+        if service {
+            // journal_mode itself loads the schema and recovers a hot journal
+            // in the default DELETE mode. Exclusive locking keeps that journal
+            // in place during recovery, preserving its protected object and
+            // no-delete-sharing pin. Return to normal locking only after
+            // TRUNCATE has been selected. The activity lock stays held throughout.
+            db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL;")?;
+        }
         let page_size: u64 = db.pragma_query_value(None, "page_size", |r| r.get(0))?;
         let page_count: u64 = db.pragma_query_value(None, "page_count", |r| r.get(0))?;
         if page_size > 4096 || page_count > 1024 {
             anyhow::bail!("activity store exceeds size bound");
         }
         db.execute_batch(if service {
-            "PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA max_page_count=1024;"
+            "PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA max_page_count=1024;"
         } else {
             "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=1024;"
         })?;
