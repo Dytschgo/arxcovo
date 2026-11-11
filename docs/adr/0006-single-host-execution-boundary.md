@@ -68,3 +68,16 @@ list the host and run `cargo --version` as the dedicated account, with the
 authenticated agent, observed execution identity and outcome in persisted
 activity. Owner account/service setup is required on the real development PC;
 disposable hosted-runner tests can prove software behavior separately.
+
+## SDK feasibility check
+
+On 2026-11-11, the official rmcp documentation and `cargo info rmcp` agree on
+version 3.9.0 (Rust minimum 1.88, compatible with this repository's pinned 1.95).
+The crate exposes `transport-io`, `transport-async-rw` and
+`transport-streamable-http-server`; the generic transport supports an
+AsyncRead/AsyncWrite pair. This resolves the advisory's uncertainty about the
+generic transport feature and outdated 3.7 candidate. It does not pin a workspace
+dependency or prove client interoperability: the first implementation must test
+a real initialize/tools-list exchange and authentication through both transports.
+
+Source: [official rmcp crate documentation](https://docs.rs/rmcp/3.9.0/rmcp/).
