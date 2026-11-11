@@ -181,8 +181,9 @@ token into chat, an issue, a command line or a log.
    record your own login name or the client token.
 5. Negative checks, which are worth doing once:
    - Stop the service, rename the build account, and start the service again.
-     `list_hosts` must report `account_identity_changed`, and `run_command` must
-     be refused, never run as another identity.
+     `list_hosts` must report `account_missing`, and `run_command` must be
+     refused, never run as another identity. If the configured name instead
+     resolves to a different SID or UID, the reason is `account_identity_changed`.
    - Add the account to Administrators while `rights` is `standard`. The result
      must be `rights_mismatch`.
 
