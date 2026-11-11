@@ -1078,3 +1078,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Awaited policy-failure regression refresh
 
 - Codex / gpt-6.1-sol / medium refreshed existing test-only #9 onto actual main `cd464b2`, preserving published history and the awaited policy-failure regression. Only its existing regression test and progress notes distinguish it from main; no workflow/runtime/budget behavior changes. Current state stays first. Focused test evidence and independent re-review remain required before merge.
+
+- Focused verification passed **18/18 Node policy/budget/auto-merge tests** and **26/26 CI-helper tests**. Temporarily removing the failure-publication await made the focused asynchronous regression fail; the production script was restored byte-for-byte. Runtime Rust/workflow files match merged main and were not retested for this test-only refresh.
