@@ -9,6 +9,9 @@ or removes anything. The only manager command vectors are:
 - Linux: `/usr/bin/systemctl show` for `arxd.service`, requesting only
   `LoadState`, `ActiveState`, `FragmentPath` and `DropInPaths`.
 
+ADR 0014 is currently on [PR29's pinned contract](https://github.com/Dytschgo/arxcovo/blob/1e1e48b5636eb1d171affa8784fee6dc1a48534e/docs/adr/0014-unix-owner-lifecycle-corrections.md),
+not on main. This diagnostic does not require that branch at runtime.
+
 Each child has a six-second polling deadline after process creation, a combined
 16 KiB stdout/stderr cap, then a kill and bounded one-second reap if needed.
 No shell or inherited environment is used. Queries run sequentially, at most

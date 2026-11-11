@@ -108,7 +108,7 @@ def summarize(label, target, result, platform):
             pid_field=bool(re.search(rb"(?m)^\tpid = [0-9]+[ \t]*$", result.stdout)),
             missing_service_phrase=b"Could not find service" in result.stderr,
             missing_target_named=target.split("/", 1)[1].encode() in result.stderr,
-            system_domain_phrase=b"system" in result.stderr,
+            system_domain_phrase=b"in domain for system" in result.stderr,
         )
     else:
         row.update(

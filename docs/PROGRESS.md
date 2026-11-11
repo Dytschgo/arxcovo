@@ -1,5 +1,10 @@
 # Arxcovo progress
 
+## Manager diagnostic review follow-up
+
+- Codex / gpt-6.1-sol, medium fixed PR34 review advisories A1/A4. The privacy fixture now supplies one-tab outer macOS fields, and the system-domain boolean matches the specific `in domain for system` phrase. A new negative regression failed before that predicate correction. The outer-field raw-value leak mutation now fails the privacy assertion.
+- Current local suite: ten portable tests passed, three Unix tests skipped on Windows. The previous head `50a5303` separately passed all twelve tests on hosted macOS and Ubuntu; that native evidence does not claim the new predicate has run. The older `533ec14` artifact remains unchanged. ADR0014 is explicitly linked to its unmerged PR29 contract, not described as present on main. Fresh exact-head review and hosted checks remain required. No production parser, service or owner operation changed.
+
 ## First native macOS manager observation
 
 - Codex / gpt-6.1-sol, medium inspected completed [macOS job 130643624743](https://github.com/Dytschgo/arxcovo/actions/runs/43055469150/job/130643624743), source `533ec14`, image `macos-26-arm64` version `20261102.0473.1`. All 11 diagnostic tests passed, including the three real ordinary-child Unix tests. The absent Arxcovo job returned 113 with all expected fixed absence-phrase booleans; the Apple control returned zero with matching target/path/PID shapes. Exact sanitized rows are retained in `docs/evidence/macos-manager-observations.json`.

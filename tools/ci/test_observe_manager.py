@@ -29,7 +29,7 @@ class ManagerObservationTests(unittest.TestCase):
     def test_no_raw_output_or_error_values(self):
         for platform in ("darwin", "linux"):
             result = diagnostic.Capture("completed", 113,
-                b"path = private-owner\nstate = private-value\nFragmentPath=private-path\n",
+                b"\tpath = private-owner\n\tstate = private-value\nFragmentPath=private-path\n",
                 b"private-error")
             encoded = diagnostic.observe(platform, lambda _: result)
             self.assertNotIn("private", encoded)
@@ -45,6 +45,11 @@ class ManagerObservationTests(unittest.TestCase):
         self.assertTrue(row["missing_service_phrase"])
         self.assertTrue(row["missing_target_named"])
         self.assertEqual(row["state"], "absent")
+
+    def test_system_word_alone_does_not_prove_domain_phrase(self):
+        result = diagnostic.Capture("completed", 113, b"", b"system error")
+        row = diagnostic.summarize("arxcovo", "system/com.arxcovo.arxd", result, "darwin")
+        self.assertFalse(row["system_domain_phrase"])
 
     def test_duplicate_fields_and_unknown_values_stay_explicit(self):
         result = diagnostic.Capture("completed", 0,
