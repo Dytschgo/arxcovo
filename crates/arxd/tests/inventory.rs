@@ -14,7 +14,11 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 
 fn private_dir() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    // macOS exposes its temporary root through /var, a system symlink.
+    // Resolve that trusted test root before creating a valid fixture; application
+    // paths and the explicit symlink rejection tests still reject links.
+    let root = std::env::temp_dir().canonicalize().unwrap();
+    let dir = tempfile::tempdir_in(root).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
