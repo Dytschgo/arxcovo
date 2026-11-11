@@ -293,3 +293,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix executor integration with current main
 
 - Codex / gpt-6.1-sol, medium: integrated main 8fafbe7 into PR14, preserving current-user Windows execution and the reviewed retention test correction. Formatting, workspace/all-target Clippy with warnings denied, all 65 Windows nextest tests, 29 pure Python guards and all ten executable guard mutations passed. The Unix executor and disposable driver production bytes are unchanged from the prior independently reviewed candidate; native/privileged Unix runtime remains unverified on real hardware. No experiment was dispatched and no owner administration ran. Fresh exact-head review and hosted checks remain pending.
+
+## Unix restrictive-umask test correction
+
+- Codex / gpt-6.1-sol, medium addressed PR14 advisoryA3: the ordinary Linux positive-control test now launches an exact subprocess-only fixture with umask0077 set before exec. The child verifies that mask, requires outside/plain end at0755 and rejects directory reuse. The parent bounds runtime/output and proves exactly one named test ran. This leaves the parallel runner umask unchanged and invokes no account/service operations. Formatting and Windows workspace/all-target Clippy passed; native Linux execution and the creation-mode-only mutation remain pending hosted verification. Production executor/driver and privileged harness bytes are unchanged.

@@ -33,6 +33,62 @@ fn accessible_control_directory(path: &Path) -> std::io::Result<()> {
 
 #[test]
 fn positive_control_directories_are_traversable_without_provisioning() {
+    use std::{io::Read, os::unix::process::CommandExt, process::Stdio, time::Instant};
+    const TEST: &str = "exec::disposable::restrictive_umask_control_fixture";
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            TEST,
+            "--ignored",
+            "--nocapture",
+            "--color",
+            "never",
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // umask is process-global: change it only in the isolated child before exec,
+    // never in the parallel test runner. This syscall is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("isolated umask fixture timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .take(4097)
+        .read_to_end(&mut output)
+        .unwrap();
+    assert!(status.success(), "isolated umask fixture failed");
+    assert!(output.len() <= 4096);
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains(&format!("test {TEST} ... ok")));
+    assert!(output.contains("1 passed"));
+}
+
+#[test]
+#[ignore = "subprocess-only non-privileged umask fixture; exercised by parent"]
+fn restrictive_umask_control_fixture() {
+    assert_eq!(unsafe { libc::umask(0o077) }, 0o077);
     let base = tempfile::tempdir().unwrap();
     for name in ["outside", "plain"] {
         let path = base.path().join(name);
