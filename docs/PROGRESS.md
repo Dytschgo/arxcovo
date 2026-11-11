@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: review Windows experiment PR #12 and the persistent host identity candidate; build the Unix execution backend. Dedicated-account commands, services and stdio remain unimplemented.
-- Last merged PR: [#11](https://github.com/Dytschgo/arxcovo/pull/11), merge `fa5e41418c1a5ae42337365c5217f177a0b9207d`, 2026-11-11 08:50:09 UTC. All required checks and independent security re-review passed.
+- Current task: correct Windows experiment PR #12 blockers, review Unix execution and host identity candidates, then implement service/stdio integration. Dedicated-account command acceptance remains unverified.
+- Last merged PR: [#13](https://github.com/Dytschgo/arxcovo/pull/13), merge `90d3ce7c3758773e7a50b1ec5d5c272245033939`, 2026-11-11 09:03:32 UTC. All required checks and independent Opus review passed; MCP host identity is now persistent.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -36,8 +36,8 @@
 
 - Inventory/activity: PR #11 merged the authenticated official-SDK HTTP tracer after all three hosted platforms and security re-review passed. It deliberately has no execution authority. Local and independent workspace validation passed 13 tests.
 - The macOS temporary-root fixture issue and blocking Windows inherit-only ACL exposure were fixed before merge. The permission regression failed old code and passed the correction. Windows path-prefix handling, owner checks, header/connection bounds and other non-blocking review observations remain tracked follow-ups before privileged service use.
-- Windows execution: PR #12 combines harness 24d3c7e with helper 852f6f0. Build/publish, 21 harness assertions and 82 helper assertions passed without privilege. Review is running before any disposable privileged experiment. No S4U/account-right/process-identity success is claimed.
-- Unix execution is being built separately. Persistent host identity is now implemented as a reviewed-candidate change: OS-random bytes are stored transactionally, survive restart and retention, and malformed metadata fails closed. Builder formatting/Clippy/16 tests passed; coordinator formatting and all 16 integrated workspace tests passed. Independent review and hosted checks remain required.
+- Windows execution: PR #12 includes the four blocker corrections and the pre-dispatch N1 regression. Ordinary child reproduction showed handle mask 7 before and 0 after detached creation; raw TokenGroups rejected the existing filtered admin's deny-only membership. Current local self-test passes 34 assertions; filtering deny-only groups now fails it. The earlier 114 helper assertions and five guard mutations passed independently. Current-head review and hosted checks remain required. No privileged experiment has run and no S4U/cross-account/task/cleanup success is claimed.
+- Unix execution candidate 46cba1f is integrated for review as a library only, without an MCP or CLI execution entry point. Builder formatting/Clippy/19 Windows tests and standalone Unix metadata checks passed; coordinator formatting and 19 tests passed before updating against merged host identity. Linux/macOS runtime, privileged harness, restart cleanup and audit integration remain unverified. Persistent identity merged in PR #13 after its atomicity test and legacy rollback were independently checked.
 - Still to implement and prove: stdio bridge and trusted local endpoint identity; per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
 - Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
 
@@ -93,7 +93,12 @@
 | PR #11 ACL correction | Codex / gpt-6.1-sol | medium | New Windows inheritance-only regression failed before the fix; all 13 workspace tests, formatting and Clippy passed after rejecting those grants before file creation. Fresh review and hosted checks required |
 | Windows execution feasibility probe | Codex / gpt-6.1-sol | high | Commit 24d3c7e prepared separately; build/publish and 21 unprivileged self-test assertions passed. Privileged disposable-CI probe is unrun; review required before any such execution |
 | PR #11 security review round 2 | Claude / claude-opus-5-5 | high | Success on 181ddff; 13 tests and old-code mutation confirmed correction; all hosted checks passed and PR merged |
-| Persistent host identity | Codex / gpt-6.1-sol | high | Builder 2e5961b integrated on merged inventory; 16 tests pass, including real SDK restart/fresh-state and corruption/retention cases; independent review pending |
+| Unix execution library | Codex / gpt-6.1-sol | high | Candidate 46cba1f: 19 portable Windows tests passed; Unix metadata compilation passed, runtime and privileged harness unverified; independent review required |
+| PR #12 security review round 1 | Claude / claude-opus-5-5 | high | Failure on d42c33e: four blockers; no privileged execution performed |
+| PR #13 independent review | Claude / claude-opus-5-5 | high | Success on 978065b; migration/recovery atomicity mutation and legacy rollback replay passed; all hosted checks passed and PR merged |
+| PR #12 blocker corrections | Codex / gpt-6.1-sol | high | Candidate 94be783: four blockers addressed with unprivileged reproductions and guard mutations; independent re-review required before privileged dispatch |
+| PR #12 pre-dispatch N1 regression | Codex / gpt-6.1-sol | medium | f9e3b92: independent elevation-type check; 34 unprivileged assertions pass, deny-only removal mutation fails at the new assertion |
+| PR #12 pre-dispatch recheck | Claude / claude-opus-5-5 | high | Success on f9e3b92; independent build/self-test and mutation confirmed N1 fixed. Requested final docs count/date correction; no privileged execution |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
