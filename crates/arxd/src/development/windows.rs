@@ -757,7 +757,7 @@ pub(crate) mod tests {
             };
             assert_eq!(result.stop_reason, expected, "{action}");
             if action == "handles" {
-                assert_eq!(result.exit_code, Some(0), "{}", result.stdout);
+                assert_eq!(result.exit_code, Some(0), "stdout={} stderr={}", result.stdout, result.stderr);
             }
         }
     }
