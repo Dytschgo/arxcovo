@@ -270,9 +270,13 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         }
         self.blocking.drain().await;
         if let Some(activity) = self.activity.clone() {
-            self.blocking
+            let pending = self
+                .blocking
                 .run(move || activity.shutdown_pending().map_err(|_| ExitCode::Store))
-                .await?;
+                .await;
+            if result.is_ok() {
+                result = pending;
+            }
         }
         result
     }

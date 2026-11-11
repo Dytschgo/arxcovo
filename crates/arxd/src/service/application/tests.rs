@@ -459,30 +459,54 @@ async fn response_only_reason_table_completes_and_reads_back_without_private_dat
 
 #[tokio::test]
 async fn endpoint_failure_still_drains_dedicated_worker_before_stop_audit() {
-    use std::sync::atomic::Ordering;
+    use crate::service::executor::tests::{Gate, GatedBackend, backend_fixture};
+    use std::sync::atomic::AtomicUsize;
     let dir = private_temp();
     let mut app = ServiceApplication::new(injected(dir.path(), None));
-    let (executor, calls) = crate::service::executor::tests::fake(true, true);
+    let gate = Gate::new();
+    let executor = backend_fixture(Arc::new(GatedBackend {
+        gate: gate.clone(),
+        preflight_gate: false,
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
     let mut store = Activity::open_service_fixture(dir.path()).unwrap();
     store.dedicated = Some(executor.clone());
     let activity = Arc::new(store);
     app.activity = Some(activity.clone());
     let id = activity.start("alpha", "run_command").unwrap();
     let work = executor.dispatch(None, activity.clone(), id);
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while calls.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    gate.entered.notified().await;
     app.serving = Some(tokio::spawn(async { Err(ExitCode::Endpoint) }));
+    while !app.serving.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
     app.stop_accepting().unwrap();
-    assert_eq!(app.drain().await, Err(ExitCode::Endpoint));
+    let mut drain = Box::pin(app.drain());
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
+            .await;
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row::<String, _, _>("SELECT outcome FROM activity WHERE id=?", [id], |r| r
+            .get(0))
+            .unwrap(),
+        "started"
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>(
+            "SELECT count(*) FROM activity WHERE tool='service_stop'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0
+    );
+    gate.release();
+    assert!(pending, "application drain returned before backend cleanup");
+    assert_eq!(drain.await, Err(ExitCode::Endpoint));
     let result = work.await.ok().unwrap();
     assert_eq!(result["metadata"]["stop_reason"], "shutdown");
     app.service_stop().await.unwrap();
-    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
     assert_eq!(
         db.query_row::<i64, _, _>(
             "SELECT count(*) FROM activity WHERE outcome='started'",
@@ -492,6 +516,19 @@ async fn endpoint_failure_still_drains_dedicated_worker_before_stop_audit() {
         .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn endpoint_error_survives_shutdown_pending_failure() {
+    let dir = private_temp();
+    let mut app = ServiceApplication::new(injected(dir.path(), None));
+    let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    a.start("alpha", "list_hosts").unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=TRUNCATE; CREATE TRIGGER fail_pending BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+    app.activity = Some(a);
+    app.serving = Some(tokio::spawn(async { Err(ExitCode::Endpoint) }));
+    assert_eq!(app.drain().await, Err(ExitCode::Endpoint));
 }
 
 #[derive(Clone)]
