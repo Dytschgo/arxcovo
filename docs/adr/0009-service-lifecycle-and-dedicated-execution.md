@@ -1,16 +1,39 @@
 # 0009: Per-OS service lifecycle and dedicated-account execution
 
-Status: settled implementation contract (Opus 5.5 high, architecture). Docs only.
-Nothing here is implemented, and no acceptance is claimed. Every privileged
-path below is **unverified on real hardware** until a disposable experiment or
-the owner's install exercises it.
+Status: settled implementation contract (Opus 5.5 high, architecture), revised
+2026-11-11 after the scoped other-provider review of PR20. No acceptance is
+claimed. Every privileged path below is **unverified on real hardware** until a
+disposable experiment or the owner's install exercises it.
 
-Owner steps: docs/service-install.md. Builds on: main `03adb434` (inventory, durable activity, host identity), proposed
-ADR 0006 (`docs/early-hardware-and-raft-spikes`), and these unmerged candidates,
-which are not yet independently accepted: PR14 Unix executor `a5777bb` (ADR 0007),
-PR15 local transport `6f55eb2` (ADR 0008, first review failed), PR16 drive-prefix
-path fix, PR17 Windows probe diagnostics and PR18 conditional `finish` (`97cea83`).
-Where this ADR depends on one of them, it states the property it needs, not a
+Owner steps: docs/service-install.md. Builds on: proposed ADR 0006
+(`docs/early-hardware-and-raft-spikes`) and these states:
+
+- **Merged on main.** `d7f3ebd` (#19) contains inventory, persistent host
+  identity, the authenticated local IPC/stdio transport (#15, ADR 0008) and
+  activity v2 (ADR 0011). Windows probe diagnostics (#17, `2299ad4`) and the
+  drive-prefix path fix (#16, `b29f531`, merged after `d7f3ebd`) are also on
+  main. PR18 is closed, superseded by #19.
+- **Implemented in the PR20 candidate, not installed.** Lifecycle plumbing:
+  the `service::Host` state machine, shutdown ordering, the Windows SCM adapter,
+  Unix signals and notify, the exact `arxd service run` entry and the constant
+  manager artifacts. 50 runnable tests passed on Windows. Production entry still
+  fails closed. Owner commands, `client-config` and native application wiring
+  (config, store and inventory hooks) are absent.
+- **Separate, unmerged.** The fixed-config and owner-plan foundation (PR21,
+  61 tests, library-only). A native read-only adapter candidate (`9712c9f`,
+  70 tests), in which modern macOS identity resolution is incomplete; nothing
+  here assumes it is integrated. The Unix executor library (PR14, ADR 0007).
+- **Windows S4U.** Both disposable experiments failed: run 42995659949 in an
+  unlocated setup phase, and run 43003724132 (at `2299ad4`) with result
+  validation failing after successful privilege and account API diagnostics.
+  No S4U success is established, and no third experiment is planned.
+- **Development exception.** The owner explicitly authorized a separate,
+  foreground, local-only, current-user Windows development mode (ADR 0010, on
+  `docs/windows-current-user-development`, not yet on main). It is not a
+  production identity fallback and does not satisfy the M2 dedicated-account
+  criterion below. This ADR does not define that mode.
+
+Where this ADR depends on unmerged work, it states the property it needs, not a
 particular commit.
 
 ## Decision summary
@@ -31,14 +54,19 @@ particular commit.
 4. Windows execution uses an MSV1_0 S4U batch logon as the pinned build SID,
    then a fixed `arxd exec-child` shim inside a kill-on-close Job. Linux uses
    ADR 0007's setresuid with cgroup v2, under a systemd-delegated subtree. macOS
-   uses ADR 0007's setuid, then a build-UID process sweep after each run.
+   uses ADR 0007's setuid, then a build-UID process sweep after each run, and
+   supports **standard rights only**. macOS admin mode is refused at configure,
+   at start and before every run until a separately reviewed containment
+   mechanism exists (see "macOS admin mode is refused").
 5. The service reads the account-scoped tool inventory by running the fixed
    `arxd tool-probe` subcommand *as the build account*. The service never
    resolves `PATH` and never opens workspace paths with its own privilege.
-6. Activity schema v2 adds timestamps, an actor kind, a fixed tool vocabulary
-   and the observed execution identity. Agents read only their own rows through
-   `list_activity`, using keyset pagination. Output, argv, environment and paths
-   are never persisted.
+6. Activity schema v2 (merged in #19, ADR 0011) adds timestamps, an actor
+   kind, a fixed tool vocabulary and the observed execution identity. Agents
+   read only their own rows through `list_activity`, using keyset pagination.
+   Output, argv, environment and paths are never persisted. This ADR maps its
+   finer preflight and observation detail onto the merged `Reason` and
+   `ObservationPoint` values and needs no schema migration of its own.
 7. M2 does **not** need key material, so no keyfile exists. The OS-keychain
    design for M3 CA keys is a separate ADR. A root-only or SYSTEM-only keyfile
    is not an accepted substitute.
@@ -299,6 +327,9 @@ Validation rules:
   NetworkService, root or UID 0.
 - In standard mode the build account must not belong to any administrative group
   (Windows Administrators, Linux `sudo`/`wheel`, macOS `admin`).
+- On macOS, `rights` must be `standard`. `"rights": "admin"` is a config
+  validation error (exit code 3 at start, refused by `configure`), checked
+  before any account resolution.
 - The workspace must already exist. It must be on a local disk, free of reparse
   points and symlinks, and lexically disjoint from every layout path. Configure
   inspects it by metadata only and never creates it.
@@ -310,7 +341,11 @@ Validation rules:
 - Agent principals must not equal the reserved daemon principal `arxd`.
 - Service mode rejects ADR 0008 `listen` (HTTP) and `local` keys. For M2 the
   service exposes only the fixed local endpoint. HTTP remains available in
-  foreground development mode, which has **no execution capability at all**.
+  foreground development mode. Foreground mode has no dedicated-account
+  execution. Its only execution path is ADR 0010's separately authorized,
+  local-only, current-user Windows mode: explicit owner opt-in, unelevated, and
+  reported as development. The service never selects it, never falls back to
+  it, and its results never satisfy this ADR's acceptance.
 
 ADR 0007's protected directories are derived from Layout (config and state),
 never entered by the owner. The service, not the owner, reads its Linux
@@ -320,21 +355,49 @@ never entered by the owner. The service, not the owner, reads its Linux
 
 ### Preflight
 
-Preflight runs at start and again before **every** run. Its failure reasons form
-a fixed enum, reported in `list_hosts` and stored in the activity `reason`:
+Preflight runs at start and again before **every** run. Its failure detail is a
+fixed in-memory enum, `ExecutionUnavailable`. That detail is **response-only**:
+it appears in `list_hosts.execution.reason` and in a refused `run_command`
+response, and it is never written to SQLite. The persisted activity `reason` is
+always one of the merged schema v2 `store::Reason` values, through this
+exhaustive mapping (a `match` with no wildcard arm):
 
-- `not_configured`, `service_mode_required`
-- `account_missing`, `account_identity_changed` (name now resolves to a
-  different SID or UID)
-- `rights_mismatch` (the observed admin membership disagrees with `rights`)
-- `batch_right_missing`
-- `mechanism_unavailable` (with a numeric NTSTATUS or errno)
-- `service_reconfiguration_required`
-- `quarantined` (a previous cleanup is unconfirmed)
-- `busy`
-- `platform_unsupported`
+| `ExecutionUnavailable` (response only) | meaning | activity `outcome` / `reason` |
+| --- | --- | --- |
+| `not_configured` | no dedicated executor configured in this process | `refused` / `unavailable` |
+| `service_mode_required` | foreground process; no dedicated-account execution | `refused` / `unavailable` |
+| `platform_unsupported` | no backend for this OS | `refused` / `unavailable` |
+| `account_missing` | the pinned account name no longer resolves | `refused` / `preflight_failed` |
+| `account_identity_changed` | the name resolves to a different SID or UID | `refused` / `preflight_failed` |
+| `rights_mismatch` | observed admin membership, logon-token elevation or (Unix) `sudo -n true` effect disagrees with `rights` | `refused` / `preflight_failed` |
+| `admin_unsupported_on_platform` | `rights: admin` on macOS (defence in depth; config validation already refuses it) | `refused` / `preflight_failed` |
+| `batch_right_missing` | Windows build SID lacks `SeBatchLogonRight` | `refused` / `preflight_failed` |
+| `mechanism_unavailable` | logon, cgroup, systemd or sweep primitive unavailable | `refused` / `preflight_failed` |
+| `service_reconfiguration_required` | Linux config says `admin` but the standard-rights drop-in is active | `refused` / `preflight_failed` |
+| `quarantined` | an earlier cleanup is unconfirmed, or the macOS pre-run check found build-UID processes | `refused` / `quarantined` |
+| `busy` | `max_concurrent_runs` reached | `refused` / `busy` |
+| `stopping` | the host is `Stopping` | `refused` / `shutdown` |
 
-No reason ever falls back to another identity.
+Failures after preflight use the remaining merged values. If cleanup is
+unconfirmed, `cleanup_unconfirmed` takes precedence over every other reason.
+
+| situation | `outcome` / `reason` | other fields |
+| --- | --- | --- |
+| invalid `run_command` arguments | `rejected` / `invalid_arguments` | execution fields NULL |
+| spawn or executor error before an identity observation | `failed` / `execution_failed` | observed fields NULL |
+| observed child identity ≠ pin, or wrong child integrity or elevation | `failed` / `identity_mismatch` | observed fields as observed, `identity_matches_pin = 0` |
+| timeout, cancel, output limit or shutdown, cleanup confirmed | `failed` / NULL | `stop_reason` carries the cause |
+| cleanup unconfirmed (any stop cause) | `failed` / `cleanup_unconfirmed` | `cleanup_confirmed = 0`, real `stop_reason` |
+| target exited | `succeeded` (exit 0) or `failed` (non-zero) / NULL | `stop_reason = exited`, `exit_code` |
+
+This ADR never writes `storage_failed`. A completion that cannot commit leaves
+the row `started`, and restart reconciliation turns it into `interrupted`.
+
+Privacy bounds: `ExecutionUnavailable` values are fixed tokens. The only
+attached datum is an optional numeric `os_code` (NTSTATUS or errno, 32-bit) for
+`mechanism_unavailable`, also response-only. Responses never carry account
+names, SIDs, UIDs other than the observed build identity, paths or OS error
+text. No reason ever falls back to another identity.
 
 ### Windows
 
@@ -372,8 +435,14 @@ A blocking worker performs these steps:
    - no breakaway
    - UI limits (desktop, handles, clipboard, global atoms)
 7. Read the child's token SID, integrity and elevation type **before resume**.
-   This is the persisted observed identity, with observation point
-   `child_token_pre_resume`. Any mismatch kills the Job.
+   This is the persisted observed identity, stored with the merged
+   `ObservationPoint::PostSwitch` (`post_switch`): the token of the suspended
+   child, after the logon switch and before any child code runs. Persisted
+   fields: `observed_kind = windows_sid`, `observed_id` = token user SID,
+   `observed_gid` NULL, `integrity_rid` = the mandatory-label RID (Medium is
+   8192), and `elevation` = `TokenElevation.TokenIsElevated` (0 or 1). The
+   three-valued elevation type is checked in memory and not persisted. Any
+   mismatch kills the Job.
 8. Resume the child. The shim reads a bounded JSON spec from stdin: executable
    or tool, argv, relative cwd and output quota. As the build account it opens
    the cwd beneath the workspace, refusing reparse points at every component. It
@@ -389,29 +458,76 @@ A blocking worker performs these steps:
 ### Linux and macOS
 
 These use ADR 0007's `Runner` unchanged in principle. The observed identity is
-the child-reported identity after the ID drop and before exec, with observation
-point `child_post_drop_pre_exec`.
+the child-reported identity after the ID drop and before exec, stored with the
+merged `ObservationPoint::PreExec` (`pre_exec`): `observed_kind = unix_uid`,
+`observed_id` = real UID, `observed_gid` = real GID, and `integrity_rid` and
+`elevation` NULL. The merged `child` value is reserved for an identity that a
+running target reports about itself. No M2 path writes it, so it never
+satisfies acceptance.
 
-Admin mode keeps exactly one supplementary group (`sudo`/`wheel` on Linux,
-`admin` on macOS) and does not set NNP. The owner provisions a NOPASSWD sudoers
-rule. Its *effect* is observed by the `tool-probe` result for `sudo -n true`
-(`admin_effective`) rather than assumed.
+**Linux admin mode** keeps exactly one supplementary group (`sudo` or `wheel`)
+and does not set NNP. The owner provisions a NOPASSWD sudoers rule. Its
+*effect* is observed by the `tool-probe` result for `sudo -n true`
+(`admin_effective`) rather than assumed. In **standard** mode on every Unix
+OS, a successful `sudo -n true` is `rights_mismatch`.
 
-macOS has no fence on the process tree. After each run, a child that has done
-`setuid(build_uid)` calls `kill(-1, SIGKILL)`. The service then confirms through
-`sysctl(KERN_PROC_UID)` that no build-UID process remains, which sets
-`cleanup_confirmed`. The tree boundary is reported as `mac_uid_sweep`. This
-needs a small ADR 0007 extension (a new `TreeBoundary` variant) and also kills
-any of the build account's own interactive processes, which is acceptable for a
-dedicated account and documented.
+**macOS admin mode is refused.** On macOS `sudo` creates root descendants that
+leave the build UID. The unprivileged `kill(-1)` sweep cannot signal them,
+because `kill(2)` requires a matching user ID, and a build-UID count cannot see
+them. A UID sweep therefore cannot contain or confirm cleanup of privileged
+descendants. `rights: admin` on macOS is refused at three layers:
+
+- config validation and `configure` (exit code 3);
+- start, which reports `execution.available = false` with
+  `admin_unsupported_on_platform` if an invalid config somehow loaded;
+- every run's preflight, with the same code.
+
+Lifting the refusal requires a new, separately reviewed ADR. It must name a
+containment mechanism that bounds root descendants, and it must provide
+disposable-host evidence of timeout, cancel and service-restart cleanup with a
+`sudo`-launched descendant that changes UID and session (for example `setsid`
+or a daemonizing child). It must never certify cleanup from a build-UID count.
+This deviates from the kickoff's per-host rights dropdown on macOS, where admin
+is shown unavailable with this reason. The M2 acceptance below (Windows,
+standard) is unaffected.
+
+**macOS standard mode** has no fence on the process tree. Before each run, the
+service requires zero processes whose real *or* effective UID is the build UID
+(`sysctl` `KERN_PROC_RUID` and `KERN_PROC_UID`). Any match refuses the run as
+`quarantined`. After each run, a child that has done `setuid(build_uid)` calls
+`kill(-1, SIGKILL)`. The service then repeats the same real-or-effective
+check, and only zero matches sets `cleanup_confirmed = 1` with tree boundary
+`mac_uid_sweep`. The real-UID query covers set-user-ID-root programs, whose
+real UID stays the build UID and which `kill(-1)` from that UID can signal.
+This needs a small ADR 0007 extension (a new `TreeBoundary` variant). It also
+kills any of the build account's own interactive processes, which is acceptable
+for a dedicated account and documented.
+
+### What `cleanup_confirmed = 1` attests
+
+| OS / rights | attests | does not attest (precise residual) |
+| --- | --- | --- |
+| Windows standard | `TerminateJobObject` done and the Job holds zero processes | processes created *outside* the Job on the build account's behalf by OS brokers (Task Scheduler, WMI process creation, out-of-process COM servers) |
+| Windows admin | as standard; descendants created directly from the elevated token stay in the Job (no breakaway) | as standard, plus anything an elevated child starts through privileged OS facilities (services, SYSTEM tasks, consent-broker elevation) |
+| Linux standard | `cgroup.kill` done and the run leaf is empty | processes started by a systemd user manager (only if lingering is enabled for the account) or by `cron`/`at` if the account may use them |
+| Linux admin | as standard; `sudo` descendants stay in the leaf and are killed regardless of UID | a root descendant can deliberately migrate to another cgroup or start a transient unit (`systemd-run`) and leave the leaf |
+| macOS standard | zero processes with the build UID as real or effective UID at check time | a set-user-ID-root program that also sets its real UID to another user; build-UID processes that launchd, `cron` or `at` creates for the account *after* the check, which the next run's pre-run check refuses as `quarantined` |
+| macOS admin | refused; never reported | — |
+
+`list_hosts` keeps `service_state_protected = false` in admin mode, and the
+guide states these residuals. Admin rights are an owner choice, so these are
+documented technical limits, not approval flows.
 
 ### Bounds and quarantine
 
 Runs execute in `spawn_blocking`, joined on stop. MCP `notifications/cancelled`
 maps to the run's `Cancellation`. An unconfirmed cleanup, or any executor error
 after spawn, sets in-memory `quarantined`, which refuses further runs until
-restart. The restart janitor then cleans up: cgroup leaves on Linux, a UID sweep
-on macOS, and nothing on Windows because the Job dies with the process.
+restart. The restart janitor then cleans up: cgroup leaves on Linux; on macOS
+the root service signals every process whose real or effective UID is the
+build UID and requires zero before execution becomes available; nothing on
+Windows because the Job dies with the process. These janitors have the same
+residuals as the table above.
 
 ### Tool discovery
 
@@ -436,8 +552,10 @@ and an immutable per-connection value on the local endpoint. No tool takes a
 principal, identity, path override or config value.
 
 - `list_hosts {}`: the current fields plus these:
-  - `execution {available, reason, rights, service_hardening,
-    service_state_protected}`. `service_state_protected` is `false` in admin
+  - `execution {available, reason, os_code?, rights, service_hardening,
+    service_state_protected}`. `reason` is the response-only
+    `ExecutionUnavailable` token or null; `os_code` appears only with
+    `mechanism_unavailable`. `service_state_protected` is `false` in admin
     mode, because admin builds can read service state; this is an honest
     limitation, not a fix.
   - `last_observed_identity`.
@@ -446,9 +564,12 @@ principal, identity, path override or config value.
   1..=3600, output_bytes 2..=8192}`. ADR 0007 bounds the argv. `tool` and
   `executable` are mutually exclusive, and `executable` must be absolute. The
   result is:
-  - `activity_id`, `outcome`, `exit_code`
+  - `activity_id`, `outcome`, `reason` (the persisted `store::Reason` or
+    null), `exit_code`; a refusal adds the response-only `execution_reason`
+    (`ExecutionUnavailable`) and optional `os_code`
   - `observed_identity {kind, id, gid?, integrity_rid?, elevation?,
-    observation_point}`
+    observation_point}`, using the persisted values (`post_switch` on Windows,
+    `pre_exec` on Unix)
   - `rights`, `tree_boundary`, `cleanup_confirmed`
   - `stdout`/`stderr` as `{head, tail, dropped_bytes}`. Head and tail are lossy
     UTF-8 in which every byte other than printable, TAB, LF and CR becomes
@@ -459,8 +580,8 @@ principal, identity, path override or config value.
 - `list_activity {limit?: 1..=50 (default 20), before_id?: positive integer,
   include_reads?: bool (default false)}` (see below).
 
-These are integration requirements on the local transport. PR15 corrections must
-satisfy them; they do not mean this ADR reviewed PR15.
+These are integration requirements on the local transport (merged in #15 and
+#19) that service wiring must preserve. This ADR did not review that code.
 
 - A per-connection error must never terminate the listener.
 - There is no absolute connection lifetime. An idle timeout of at most 15 min
@@ -471,10 +592,22 @@ satisfy them; they do not mean this ADR reviewed PR15.
 
 ## Activity schema v2 and audit semantics
 
-Migration `user_version` 1 → 2 runs in one transaction with restart
-reconciliation. Legacy rows keep their data and become `actor_kind='agent'`,
-`class='read'`, with NULL timestamps and execution fields. If the migration
-fails, nothing changes and the service exits with code 5.
+Schema v2 is merged (#19, ADR 0011), and `crates/arxd/src/store.rs` is the
+authoritative vocabulary. Migration `user_version` 1 → 2 runs in one
+transaction with restart reconciliation. Legacy rows keep their data and become
+`actor_kind='agent'`, `class='read'`, with NULL timestamps and execution
+fields. If the migration fails, nothing changes and the service exits with
+code 5.
+
+This ADR adds **no** migration. Its detail maps onto v2 as specified under
+Preflight, Windows step 7 and Linux and macOS. Any future persisted value
+outside v2 (a new reason, observation point or mode column) needs a
+`user_version` 3 migration in its own reviewed PR, with the same atomic
+migration, rollback and legacy-replay tests. The current store refuses a
+version above 2, so a v3 database cannot be opened by an older binary. A
+separate unmerged development candidate proposes such a v3 `identity_mode`
+column for ADR 0010; this ADR neither depends on it nor reuses `rights`,
+`identity_matches_pin` or `observation_point` to mark development rows.
 
 | column | values |
 | --- | --- |
@@ -484,25 +617,25 @@ fails, nothing changes and the service exits with code 5.
 | `tool` | `list_hosts` `list_activity` `unknown_tool` `run_command` `discover_tools` `service_start` `service_stop` |
 | `class` | `read` (list_hosts, list_activity, rejected) \| `action` (run_command, discover_tools) \| `lifecycle` |
 | `outcome` | `started` `succeeded` `failed` `rejected` `refused` `interrupted` |
-| `reason` | NULL or fixed preflight/failure enum |
+| `reason` | NULL \| `unavailable` `busy` `quarantined` `invalid_arguments` `preflight_failed` `storage_failed` `execution_failed` `identity_mismatch` `cleanup_unconfirmed` `shutdown` (`storage_failed` unused here) |
 | `started_at_ms`, `finished_at_ms` | UTC wall clock; informational, may be non-monotonic |
 | `program` | NULL, a discovery-table name, or `path` (absolute executable; the path itself is not stored) |
 | `argc` | NULL or 0..=128 |
 | `rights` | NULL \| `standard` \| `admin` |
-| `observed_kind`, `observed_id`, `observed_gid`, `integrity_rid`, `elevation`, `observation_point`, `identity_matches_pin` | NULL or as observed; `observed_id` ≤ 184 chars, SID/decimal syntax checked |
-| `stop_reason`, `exit_code`, `tree_boundary`, `cleanup_confirmed` | NULL or executor result |
+| `observed_kind`, `observed_id`, `observed_gid`, `integrity_rid`, `elevation`, `observation_point`, `identity_matches_pin` | NULL or as observed; `observed_kind` `windows_sid` \| `unix_uid`; `observed_id` ≤ 184 chars, SID/decimal syntax checked; `elevation` 0/1; `observation_point` `post_switch` \| `pre_exec` \| `child` |
+| `stop_reason`, `exit_code`, `tree_boundary`, `cleanup_confirmed` | NULL or executor result; `stop_reason` `exited` `timeout` `cancelled` `output_limit` `shutdown` `failed`; `tree_boundary` `windows_job` `linux_cgroup` `mac_uid_sweep` `process_group` |
 
 Every text column has a `CHECK` against its fixed vocabulary or syntax. Rows
 never hold argv, environment, cwd, paths, output, tool-call names supplied by
 the caller, or error strings.
 
-Ordering, extending the current store and PR18:
+Ordering, as implemented by merged #19 (PR18 was superseded):
 
 - `start` commits a `started` row before any dispatch, inventory read, query or
   spawn. If that commit fails, nothing runs.
 - `finish(id, …)` is a single transaction that updates exactly one row where
-  `outcome='started'`. Any other count rolls back and refuses, which is PR18's
-  semantics. Execution fields are written in that same update.
+  `outcome='started'`. Any other count rolls back and refuses.
+  Execution fields are written in that same update.
 - If `run_command` completion fails after the process ran, the caller gets an
   error with no result. The row stays `started`, and the next restart sets it to
   `interrupted`.
@@ -596,17 +729,19 @@ CI.
    - reserved principal;
    - client = build refused;
    - admin-group membership in standard mode refused, using fake resolvers;
+   - `rights: admin` refused on the macOS platform, before resolution and
+     even with an administrative fake account (see "Config-layer follow-up");
    - atomic write with ownership on temp dirs;
    - generated tokens never reach stdout.
-5. **Activity v2.** Migration, columns with CHECKs, two-class retention and
-   `list_activity`. Tests:
+5. **Activity v2 (merged in #19).** Migration, columns with CHECKs,
+   two-class retention and `list_activity`. Tests:
    - v1 store with rows migrates losslessly;
    - failed migration leaves v1 intact;
    - keyset pages are exact at `limit`/`limit + 1` boundaries;
    - another principal's rows and daemon rows are invisible;
    - the call's own row is excluded;
    - read floods cannot evict actions;
-   - PR18 duplicate or missing finish refuses;
+   - duplicate or missing finish refuses;
    - secret-marker strings in args never appear in the DB file bytes.
 6. **Executor trait and MCP tools.** `Executor { preflight, run }`, the
    unavailable implementation, `run_command`, `discover_tools` and the extended
@@ -617,12 +752,39 @@ CI.
    - completion failure withholds the result;
    - cancellation propagates;
    - `busy` and `quarantined` are refused;
-   - the 64 KiB response bound holds for worst-case output.
+   - the 64 KiB response bound holds for worst-case output;
+   - **reason mapping, table-driven:** for every `ExecutionUnavailable`
+     variant (listed by an exhaustive `match`, so a new variant fails to
+     compile until mapped), a `run_command` refusal is completed through
+     `finish_typed` with the mapped `Outcome`/`Reason`, then read back by
+     `list_activity` for the same principal; the row's `outcome` and `reason`
+     equal the table, and the response carries the original variant as
+     `execution_reason`;
+   - **post-preflight mapping, table-driven:** each row of the second table
+     (invalid arguments, spawn error, identity mismatch, each stop cause with
+     confirmed cleanup, unconfirmed cleanup with each stop cause, exit 0 and
+     non-zero) completes and reads back with the specified `outcome`,
+     `reason`, `stop_reason`, `cleanup_confirmed` and `identity_matches_pin`;
+     `cleanup_unconfirmed` wins over every other reason;
+   - **observation mapping:** a Windows-shaped observation completes and reads
+     back as `windows_sid`, `post_switch`, integrity 8192, `elevation = 0`,
+     `observed_gid` NULL; a Unix-shaped one as `unix_uid`, `pre_exec`, GID set,
+     integrity and elevation NULL; neither path ever produces `child`;
+   - **privacy:** after refusals carrying every `ExecutionUnavailable` token and
+     an `os_code`, the database file bytes contain none of the response-only
+     tokens that are not also v2 values (such as `account_identity_changed`
+     and `admin_unsupported_on_platform`), and the table has no column beyond
+     the v2 set, so no `os_code` can be stored.
+
+   These mapping tests are obligations; none has run yet.
 
    The fake cannot report a real identity kind. Its results are typed
    `FakeForTest`, so they can never satisfy acceptance.
 7. **Unix executor integration** after PR14 merges: derive protected dirs and
-   `cgroup_parent`, the janitor, the macOS UID sweep and admin group handling.
+   `cgroup_parent`, the janitor, the macOS real-or-effective UID pre-run check
+   and sweep, and Linux admin group handling. macOS admin is refused here
+   too, with a test that a macOS admin config reaching preflight yields
+   `admin_unsupported_on_platform` and no spawn.
    Unprivileged tests run against the existing library. Privileged evidence
    comes only from the reviewed disposable experiment.
 8. **Windows backend.** Port the probe mechanism to Rust, plus the `exec-child`
@@ -636,8 +798,10 @@ CI.
    - handle-list leakage: the child sees only the three handles.
 
    S4U itself requires the disposable experiment.
-9. **Admin-rights verification** (both directions) on all OSes. Only the pure
-   classification logic is tested; the real paths are unverified.
+9. **Admin-rights verification** (both directions) on Windows and Linux, and
+   standard-only verification on macOS (`sudo -n true` succeeding is
+   `rights_mismatch`). Only the pure classification logic is tested; the real
+   paths are unverified.
 10. **Guarded disposable experiments**, in the pattern of PR12 and PR14. Install
     the service on a fresh hosted runner, configure a generated account, run
     `cargo --version` through `arxd mcp-stdio`, then uninstall. These need a
@@ -646,27 +810,61 @@ CI.
 The coordinator may parallelize slices 1–2, 3–4 and 5–6. Slices 7 and 8 depend
 on 6 and on their probe PRs.
 
+### Config-layer follow-up (PR21, not edited here)
+
+PR21's `crates/arxd/src/service/config.rs` currently accepts `rights: admin`
+on macOS when the resolver reports an administrative account. Its follow-up
+must, in that PR or a stacked one:
+
+1. In `validate`, before any resolver call, return `Error::Rights` when the
+   platform is macOS and `rights` is `Admin`. `revalidate` inherits this, so
+   start refuses with exit code 3.
+2. `configure_plan` already calls `revalidate`; confirm that a macOS admin
+   config returns `Error::Rights` and yields no plan, so no operation reaches
+   the `OsManager`.
+3. Add tests: a macOS layout with an admin config and an administrative fake
+   account gives `Error::Rights` with zero resolver calls; `configure_plan`
+   for it records zero operations; an equivalent admin config with an
+   administrative account remains accepted on Linux and Windows layouts; macOS
+   standard with an administrative account still gives `Error::Rights`.
+
 ## What can proceed now, and what is blocked
 
-- **Can proceed now:** slices 1–6, the unprivileged parts of 7–9, and the guide.
+- **Done or in review:** slice 5 is merged (#19). Slices 1–2 lifecycle plumbing
+  and the slice 3 constant artifacts are implemented in the PR20 candidate (50
+  runnable tests on Windows), not installed, with full-code review pending.
+  The slice 3–4 config and owner-plan foundation is separate in PR21
+  (library-only, unmerged).
+- **Can proceed now:** owner commands and native application wiring for
+  slices 3–4, slice 6, the unprivileged parts of 7–9, and the guide.
 - **Blocked on runtime evidence:**
   - Windows S4U feasibility, privilege-list sufficiency and the private desktop.
-    The first experiment failed in an unidentified setup phase, and PR17
-    diagnostics are unreviewed.
+    Both disposable experiments failed (42995659949 in an unlocated setup
+    phase; 43003724132 at `2299ad4` in result validation after successful
+    privilege and account API diagnostics). No S4U success is established and
+    no third experiment is planned.
   - Linux privileged execution and delegation (the PR14 experiment has not run).
-  - Any macOS privileged path.
+  - Any macOS privileged path. macOS admin mode stays refused until the
+    separate containment ADR and evidence described above exist.
 - **Blocked on the owner:**
   - creating the `Arxcovo` standard account;
   - providing the tools (Rust) for it;
   - `service install` and `configure` on the development PC.
-- **M2 acceptance (unchanged):** Claude Code, over `arxd mcp-stdio`, runs
+- **Development exception (separate):** ADR 0010's foreground, local-only,
+  current-user Windows mode was explicitly authorized by the owner for
+  development verification. It does not change this ADR's identity rules, is
+  never a fallback, and does not meet the criterion below.
+- **M2 acceptance (unchanged, open):** Claude Code, over `arxd mcp-stdio`, runs
   `list_hosts`, and then runs `run_command {tool:"cargo", args:["--version"]}`.
   The result and the persisted `list_activity` row must show the authenticated
   principal, `observed_kind=windows_sid` with the pinned build SID and
   `identity_matches_pin=1`, Medium integrity, `rights=standard`, and outcome
   `succeeded`. Hosted experiments prove software behaviour, not the owner's PC.
 
-If S4U proves infeasible, that triggers a new ADR. The candidates are a
+S4U is neither established nor proven infeasible: diagnosis stopped at the
+owner's steering after two failures. The Windows steps above remain the S4U
+contract, unverified. Resuming S4U diagnosis, or choosing another mechanism,
+needs a new reviewed decision. Alternative candidates for that ADR are a
 per-account service whose password the owner enters into the SCM, or an
 owner-entered credential held in LSA private data. It is never an automatic
 fallback, never a password in chat or config, and never the owner's identity.
