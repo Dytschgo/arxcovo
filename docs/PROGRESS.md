@@ -32,6 +32,14 @@
 
 ## Milestones
 
+### Milestone 2 delivery status
+
+- Inventory/activity: PR #11 contains the authenticated official-SDK HTTP tracer. Builder checks passed locally; current-head security review and three-OS CI are required before merge. It deliberately has no execution authority.
+- Hosted macOS first rejected the test fixture's symlinked temporary root. The fixture now resolves that trusted root only on macOS; production rejection and symlink-negative tests remain intact. An initial cross-platform fixture change failed Windows checks, was narrowed, and all ten Windows inventory tests passed again. Hosted results on 6abff15 remain pending.
+- Windows execution: the standalone 24d3c7e harness compiled/published and passed 21 unprivileged self-test assertions. A separate builder is preparing the reviewable disposable-CI setup/cleanup helper and manual workflow. No S4U/account-right/process-identity success is claimed.
+- Still to implement and prove: stdio bridge and trusted local endpoint identity; per-OS service integration; protected service/build-account separation; actual dedicated-account command execution and rights enforcement; account-scoped tool discovery; bounded command-tree cancellation/output; persisted execution identity/outcome and activity access.
+- Final acceptance remains Claude Code through real MCP listing the host and running cargo --version as the dedicated account, with the action visible in persisted activity. The missing owner-created account is a real acceptance prerequisite, not permission to fall back to the owner or daemon identity.
+
 - [x] 1. Setup: end-to-end acceptance passed; evidence reviewed and merged in #8.
 - [ ] 2. Single host: per-OS service, inventory MCP, dedicated-account commands and persisted activity; Claude Code MCP acceptance.
 - [ ] 3. Multiple hosts: join codes, CA/mTLS, Raft and remote commands; three-node failure and invalid-code acceptance.
