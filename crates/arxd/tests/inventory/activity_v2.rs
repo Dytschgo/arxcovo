@@ -611,15 +611,47 @@ fn v3_development_constraints_and_v2_migration_preserve_identity_sequence() {
         "rights='standard'",
         "observed_gid=1",
         "identity_mode='invalid'",
+        "elevation=1",
+        "integrity_rid=16384",
+        "observation_point='child'",
+        "tree_boundary='process_group'",
     ] {
         assert!(
             db.execute_batch(&format!("UPDATE activity SET {assignment} WHERE id={id}"))
                 .is_err()
         );
     }
+    // Positive control: the fixed development facts are accepted.
+    db.execute_batch(&format!("UPDATE activity SET elevation=0,integrity_rid=8192,observation_point='pre_exec',tree_boundary='windows_job' WHERE id={id}")).unwrap();
+    // The start-time mode is authoritative: completion cannot relabel a row.
+    let dev = store
+        .start_development("test-agent", "run_command")
+        .unwrap();
+    let dedicated = Metadata {
+        identity_mode: Some(arxd::store::IdentityMode::DedicatedAccount),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .finish_typed(dev, Outcome::Succeeded, &dedicated)
+            .is_err()
+    );
+    assert!(
+        store
+            .finish_typed(dev, Outcome::Succeeded, &Metadata::default())
+            .is_ok()
+    );
+    let mode: String = db
+        .query_row(
+            &format!("SELECT identity_mode FROM activity WHERE id={dev}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mode, "development_current_user");
     let p = page(&store, &args(50, None, false));
     assert_eq!(
-        p.activities[0].claim.as_deref(),
+        p.activities[1].claim.as_deref(),
         Some(arxd::development::CLAIM)
     );
     assert_eq!(
