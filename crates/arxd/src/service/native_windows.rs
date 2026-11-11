@@ -219,7 +219,7 @@ pub fn protection(file: &File) -> Result<Protection, Error> {
         descriptor_protection(sd)
     }
 }
-fn descriptor_protection(sd: PSECURITY_DESCRIPTOR) -> Result<Protection, Error> {
+pub(crate) fn descriptor_protection(sd: PSECURITY_DESCRIPTOR) -> Result<Protection, Error> {
     unsafe {
         let mut owner = null_mut();
         let mut acl = null_mut();
