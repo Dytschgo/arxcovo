@@ -4,4 +4,5 @@ pub mod http;
 pub mod local;
 mod mcp;
 mod security;
+pub mod service;
 pub mod store;
