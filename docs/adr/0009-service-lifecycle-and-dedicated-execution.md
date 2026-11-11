@@ -5,6 +5,12 @@ Status: settled implementation contract (Opus 5.5 high, architecture), revised
 claimed. Every privileged path below is **unverified on real hardware** until a
 disposable experiment or the owner's install exercises it.
 
+Amended by [ADR 0014](0014-unix-owner-lifecycle-corrections.md), which changes
+boot intent (start/stop enable or disable), endpoint runtime-directory ownership,
+typed manager queries, status mapping, the `Disabled` plist key,
+`enable`/`disable` vectors and the `ProvisionState` install step. Where the two
+conflict, ADR 0014 wins.
+
 Owner steps: docs/service-install.md. Builds on: proposed ADR 0006
 (`docs/early-hardware-and-raft-spikes`) and these states:
 
