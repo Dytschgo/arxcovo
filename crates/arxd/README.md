@@ -92,15 +92,45 @@ hosts require fresh state. This is local application identity for future routing
 not a future Raft numeric node ID or certificate identity; no Raft design changes.
 Using the existing transactional store avoids another private file or write path.
 
-The activity table stores only principal, fixed tool classification, numeric ID and outcome.
-A durable transaction records `started` before inventory collection; storage
-failure prevents dispatch/results. Completion failure withholds inventory and
-leaves the durable started row. Restart marks unfinished rows `interrupted`.
-A file lock prevents concurrent instances sharing state. Retention is 1000 rows;
-database page size/count are capped at 4096/1024 (4 MiB, plus bounded rollback
-journal). Older rows are pruned transactionally. Rejected calls use the fixed
-inventory classification and `rejected`; attacker tool names/arguments are never
-stored. There is no activity-reading tool or HTTP configuration authority.
+Activity schema v2 is durable M2 groundwork, not M2 acceptance. Version 0
+identity initialization and version 1 migration, preservation of host ID/events,
+and restart reconciliation commit atomically. Legacy rows become agent/read rows
+with NULL timestamps and execution metadata. Unsupported versions and malformed
+columns fail closed. Timestamps are nullable bounded UTC milliseconds
+(0..=253402300799999), informational rather than ordering keys.
+
+`list_activity` accepts only `limit` (integer 1–50, default 20), `before_id`
+(positive i64) and `include_reads` (boolean, default false). It returns
+`{activities, next_before_id}` in descending ID order. Only the transport's
+immutable principal's agent rows are visible; principal and daemon rows are
+omitted. Its own committed started row bounds the SQL query, together with the
+optional cursor. SQL reads at most limit+1 rows, with bounded text columns; all
+returned values are validated against typed vocabulary and numeric/identity
+bounds. The last returned ID becomes the next cursor only if an extra row exists.
+Completion commits before results are exposed. Invalid arguments are rejected
+before querying, but still audited. Unknown calls persist only `unknown_tool`.
+
+Start commits before dispatch. `finish_typed(id, Outcome, &Metadata)` updates
+exactly one started row in a transaction; missing, duplicate or already completed
+rows refuse and roll back. Future execution metadata is nullable and typed, with
+fixed reason/program/rights/observation/stop/tree vocabulary. No argv, environment,
+workspace, executable path, output, caller tool name or arbitrary error is stored.
+`Program::Path` records only the literal `path`. An observed identity is optional;
+when present its SID/decimal syntax and 184-byte maximum are validated.
+
+Cancellation, timeout and shutdown map to **Outcome::Failed plus
+StopReason::Cancelled / Timeout / Shutdown**, respectively. They are not outcome
+strings; `finish` rejects them. Stop reason and outcome persist in the same update.
+A clean service lifecycle event may finish succeeded. `start_lifecycle(Start|Stop)`
+creates only daemon/arxd lifecycle records; service Host integration belongs to the
+service builder. No executor, command tool or discovery route is added here.
+
+Restart marks unfinished rows interrupted. Retention independently keeps the
+newest 200 reads and 1000 actions+lifecycle rows, pruned transactionally. Rejected
+calls become reads, so read floods cannot evict action history. A file lock prevents
+concurrent instances. Page size/count stay capped at 4096/1024 (4 MiB, plus bounded
+rollback journal); checks run after the whole migration/start/finish transaction's
+work and before commit. Completion storage failure withholds results.
 
 Verification: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
 --locked -- -D warnings`, `cargo nextest run --workspace --locked`. Tests use the
@@ -213,7 +243,7 @@ After identity verification, the bridge sends a fixed 70-byte `ARX1 <token>\n`
 preamble and waits for `OK\n`, each within five seconds. Only then does it pump
 newline-delimited MCP stdio frames unchanged. Official rmcp 3.9.0
 AsyncRwTransport::new_server owns MCP initialize/list/tool dispatch on the daemon,
-with an 8192-byte line cap. The bridge forwards complete frames up to 8192 bytes
+with an 8192-byte request line cap. The bridge forwards complete request frames up to 8192 bytes and response frames up to 65536 bytes
 and rejects oversized or incomplete frames without forwarding their partial data.
 The API and feature names were verified against the exact downloaded crate's
 `transport/async_rw.rs` and Cargo.toml, not inferred from another SDK version.
@@ -224,9 +254,9 @@ may retain one of the eight slots while idle; this deliberately accepts same-use
 slot exhaustion to preserve long-lived Claude Code sessions. New excess clients
 are closed; busy/rejected accepts are paced at 25 ms (at most 40/s per listener).
 Once the first byte arrives, a frame must complete within five minutes. Both
-server and bridge enforce the 8192-byte cap in both directions, including newline:
+server and bridge enforce 8192-byte requests and 65536-byte responses, including newline:
 an oversized inventory response closes that connection without forwarding the
-partial frame; inventory growth needs pagination before exceeding this bound.
+partial frame. Activity pages contain at most 50 validated rows.
 Buffers are capped; no frame accumulation across idle periods is permitted.
 Unrecoverable accept/reset errors stop the listener. Windows replenishment keeps
 the reservation and attempts creation at most three times with 50 ms spacing;
@@ -244,8 +274,8 @@ Each authenticated connection gets one immutable server-side principal. No
 client metadata or tool argument chooses that principal. HTTP retains stateless
 per-request principal binding. Both transports share the same Activity store and
 persistent host identity, including start-before-inventory and withholding results
-on activity/storage failure. There are no configuration, activity-reading or
-execution tools.
+on activity/storage failure. `list_activity` shares those semantics. No configuration or
+execution tools are exposed.
 
 Local Windows evidence: real SDK client subprocess stdio initialize/list/call,
 local-only daemon binary, concurrent principals and persisted identity, missing

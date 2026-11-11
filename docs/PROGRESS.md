@@ -172,3 +172,51 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 ## Service implementation contract
 
 - Opus / claude-opus-5-5 high authored docs-only ADR 0009 and the owner service guide, originating at dd0eb7e. The coordinator read both in full against KICKOFF M2 and the current executor/transport boundaries; no service or account action was run. The tool vocabulary includes PR #18’s fixed unknown_tool audit label. Lifecycle and activity implementation slices are next; all privileged mechanisms and full M2 acceptance remain unverified.
+
+
+## M2 ADR0009 slice 5: activity v2 candidate (Sol high, 2026-11-11)
+
+- Base `2aba6c3154201ca6e9afcd1ab53f984a002de600` includes unmerged PR15
+  correction `30f5c00` and Opus ADR0009. Last merged PR remains #12 (`03adb434`)
+  as recorded above; no remote status was queried or changed here.
+- Provider/effort/outcome: Sol / gpt-6.1-sol high / implemented local candidate.
+  Store: transactional version 0 identity initialization and version 1-to-2 migration,
+  lossless legacy IDs/data and AUTOINCREMENT high-water preservation, atomic recovery,
+  bounded UTC timestamps, typed nullable metadata with SQL CHECKs, daemon/arxd lifecycle
+  entrypoints, separate read-200/action+lifecycle-1000 retention, post-work transaction
+  page-cap checks. Service Host integration belongs to the other builder.
+- MCP: exact list_activity arguments; immutable authenticated principal; agent-only
+  visibility; limit+1 SQL pages below min(own committed read ID,before_id); own-row
+  exclusion; completion-before-exposure; rejected-argument audit; fixed unknown_tool.
+  PR18 exact-one-started transactional completion semantics adopted from `6b24111`
+  source without cherry-picking unrelated commits/docs.
+- Transport: strict 8 KiB requests and 64 KiB responses through the SDK pump and real
+  stdio bridge; no total connection deadline. Serialized 50-row maximum-field pages
+  (184-byte SID, large IDs/timestamps/numerics, full metadata), including a conservative
+  8 KiB request-ID envelope, fit 64 KiB and exceed 8 KiB over HTTP and actual subprocess
+  stdio. Exact 65536/65537-byte frame tests verify newline and partial withholding.
+- Coordinator clarification: cancellation/timeout/shutdown finish as Outcome::Failed
+  with typed StopReason::Cancelled/Timeout/Shutdown, persisted in the same update.
+  Those strings are rejected as outcomes. Clean lifecycle completion can succeed.
+  README and API docs state the mapping; no inconsistent outcome is introduced.
+- Local Windows evidence: fmt check; workspace/all-target Clippy with -D warnings;
+  locked workspace nextest **38/38 passed** (baseline 28). Coverage: atomic/lossless
+  migration; legacy-0 recovery; unsupported version 3; exact pagination boundaries;
+  principal/daemon isolation and own row; read/action floods; missing/duplicate/repeated
+  completion rollback; bounded corrupt values and extra/missing columns; SQL CHECKs;
+  secret-marker args/unknown calls absent from DB bytes; invalid args audited rejected;
+  token revocation after restart on SDK HTTP and real stdio; start failures refusing
+  dispatch and finish failures withholding results on both. Triggers are fault injection.
+- Actual red/green mutations, each restored: targeted tests exited 101 with assertion
+  failures when exact-one completion was bypassed, query included own row, read retention
+  expanded to 1000, v1 reconciliation committed before migration, or unknown calls used
+  list_hosts label. Restored source passed the full suite. Fixture corrections recreated
+  actual legacy tables rather than relabeling v2 and kept secret markers out of trigger DDL.
+- Scope: store/MCP, inventory tests, narrowly necessary frame bounds, crate README and
+  this progress entry. No main/service/probe/executor/CI workflow changes; no agents,
+  push, PR, GitHub writes, dispatch, account/admin or old Lab Manager work.
+- Remaining: independent different-provider exact-head review, dependency integration
+  and hosted gates are unaccepted. Linux/macOS native runtime and all privileged or
+  dedicated-account paths remain **unverified on real hardware**. Future execution
+  metadata can remain NULL; no executor/tool stub route, command run, hardware evidence,
+  service acceptance or full M2 acceptance is claimed.
