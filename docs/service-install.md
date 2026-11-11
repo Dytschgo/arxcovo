@@ -16,6 +16,21 @@ records the result in docs/PROGRESS.md. Agents never perform these steps. Leave
 the old Lab Manager installation, its state and the `agent-windows-test` VM
 untouched.
 
+Current status (2026-11-11):
+
+- Main (`d7f3ebd`, #19) has inventory, host identity, the local IPC/stdio
+  bridge and activity v2. The lifecycle plumbing in the PR20 candidate
+  passed 75 runnable Windows tests after integration with main 8fafbe7 but is not installed anywhere.
+- Owner commands and native application wiring do not exist yet. The
+  configuration foundation (PR21) is separate and unmerged.
+- Windows S4U is **not established**. Both disposable experiments failed (runs
+  42995659949 and 43003724132), and no third is planned. The Windows recipe
+  below is the intended contract, not a proven path.
+- You have separately authorized a foreground, current-user Windows
+  development mode (ADR 0010). It is not part of this guide, it is not a
+  fallback for the service, and it does not meet the milestone 2 acceptance
+  below.
+
 Some steps need administrator or root rights. They are marked **(admin)**.
 Everything else runs as your normal, unelevated login. Never paste a password or
 token into chat, an issue, a command line or a log.
@@ -35,8 +50,9 @@ token into chat, an issue, a command line or a log.
 
 1. **(admin)** Create the build account as a standard user, and type the
    password at the hidden prompt: `net user Arxcovo * /add`. Leave it out of
-   Administrators. Arxcovo does not need this password: it uses S4U, a logon
-   that needs no password. Keep the password for your own records or disable
+   Administrators. The intended design does not need this password: it uses
+   S4U, a logon that needs no password (not yet established; see Current
+   status). Keep the password for your own records or disable
    interactive use if you like. Optional hardening: in `secpol.msc`, add the
    account to "Deny log on locally" and "Deny log on through Remote Desktop
    Services". Do not add it to "Deny log on as a batch job".
@@ -111,7 +127,12 @@ token into chat, an issue, a command line or a log.
    Install writes the fixed unit and the standard-rights drop-in. Choosing
    `--rights admin` later removes that drop-in. It also requires you to add the
    account to `sudo` or `wheel` and to provision a NOPASSWD sudoers rule
-   yourself.
+   yourself. In admin mode, root commands started with `sudo` stay in the run's
+   cgroup and are killed with it. A root command can still deliberately move
+   itself to another cgroup or start a separate systemd unit, and such a
+   process can outlive the run. Builds can also read the service's private
+   state, and `list_hosts` reports that. Do not enable lingering
+   (`loginctl enable-linger`) for `arxcovo` in either mode.
 
 ## macOS
 
@@ -122,9 +143,19 @@ token into chat, an issue, a command line or a log.
    with mode `0755`. Then run `sudo … service install`, run `client-config new`
    as yourself, and finish with `sudo … service configure …` and `sudo …
    service start`.
-3. macOS limits: only one command runs at a time. After each command, every
-   process owned by `arxcovo` is killed, so do not use that account
-   interactively while the service is running.
+3. macOS supports **standard rights only**. `configure --rights admin` is
+   refused, and the service refuses to execute with an admin config. Do not
+   add `arxcovo` to `admin` or give it a sudoers rule: in standard mode a
+   working `sudo -n true` makes every command be refused with
+   `rights_mismatch`.
+   Admin mode stays unavailable until a separately reviewed design can contain
+   and clean up root processes started through `sudo`.
+4. macOS limits: only one command runs at a time. Before and after each
+   command, every process whose real or effective user is `arxcovo` must be
+   gone; after a command they are killed. A process left behind, or one that
+   launchd, `cron` or `at` starts for that account later, blocks further
+   commands until the service restarts. Do not use that account interactively
+   or give it login items while the service is running.
 
 ## Verify
 
@@ -154,8 +185,9 @@ token into chat, an issue, a command line or a log.
    record your own login name or the client token.
 5. Negative checks, which are worth doing once:
    - Stop the service, rename the build account, and start the service again.
-     `list_hosts` must report `account_identity_changed`, and `run_command` must
-     be refused, never run as another identity.
+     `list_hosts` must report `account_missing`, and `run_command` must be
+     refused, never run as another identity. If the configured name instead
+     resolves to a different SID or UID, the reason is `account_identity_changed`.
    - Add the account to Administrators while `rights` is `standard`. The result
      must be `rights_mismatch`.
 

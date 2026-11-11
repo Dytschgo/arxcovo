@@ -12,6 +12,9 @@ use subtle::ConstantTimeEq;
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub execution: Option<std::sync::Arc<crate::development::Execution>>,
+    pub development_execution: Option<crate::development::Settings>,
     pub listen: Option<SocketAddr>,
     pub state_dir: PathBuf,
     pub agents: Vec<Agent>,
@@ -35,12 +38,36 @@ impl Config {
         if bytes.len() > 16384 {
             bail!("configuration too large");
         }
-        let value: Self =
+        let mut value: Self =
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
         value.validate()?;
+        if let Some(dev) = &value.development_execution {
+            dev.disjoint(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("invalid configuration"))?,
+            )?;
+        }
+        value.execution = value
+            .development_execution
+            .clone()
+            .map(crate::development::Execution::new)
+            .transpose()?;
         Ok(value)
     }
+    /// Development execution is Windows-only, never with HTTP, and its workspace
+    /// is disjoint from private state. Config::load also checks the config dir.
+    pub fn validate_development(&self) -> Result<()> {
+        if let Some(dev) = &self.development_execution {
+            if !cfg!(windows) || self.listen.is_some() {
+                bail!("invalid development configuration");
+            }
+            dev.validate()?;
+            dev.disjoint(&self.state_dir)?;
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
+        self.validate_development()?;
         if let Some(endpoint) = &self.local {
             endpoint.validate()?;
         }
@@ -99,6 +126,7 @@ impl Config {
 }
 pub fn checked_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
+        || !path.components().any(|c| matches!(c, Component::RootDir))
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
@@ -123,6 +151,13 @@ pub fn checked_path(path: &Path) -> Result<()> {
             }
         }
         prefix.push(part);
+        // A disk prefix alone is drive-relative (C:) or not a filesystem
+        // object (\\?\C:). Inspect it only after RootDir forms the absolute
+        // root; every root and descendant still receives the checks below.
+        #[cfg(windows)]
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         let m = std::fs::symlink_metadata(&prefix)?;
         if m.file_type().is_symlink() {
             bail!("links forbidden");
@@ -136,4 +171,23 @@ pub fn checked_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+#[cfg(all(test, windows))]
+mod tests {
+    /// Mirrors PR16 8c3856a: a disk prefix is skipped only once a physical
+    /// RootDir follows, so bare verbatim drives are refused, never accepted
+    /// without filesystem inspection.
+    #[test]
+    fn rooted_prefix_skip_requires_physical_root() {
+        for unsafe_path in [r"C:", r"C:relative", r"\\?\C:", r"\\?\Z:"] {
+            assert!(
+                super::checked_path(std::path::Path::new(unsafe_path)).is_err(),
+                "{unsafe_path}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = dir.path().canonicalize().unwrap();
+        assert!(super::checked_path(&verbatim).is_ok(), "positive control");
+        assert!(super::checked_path(dir.path()).is_ok(), "positive control");
+    }
 }

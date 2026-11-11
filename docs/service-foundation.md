@@ -158,3 +158,13 @@ launch, account/right/task or service-manager mutation was performed here.
 Native API references used during implementation:
 [NetUserGetLocalGroups](https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netusergetlocalgroups)
 and [Apple acl_get_entry](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_entry.3.html).
+
+## macOS rights policy correction
+
+Configuration parsing and revalidation now reject macOS admin rights with
+Error::Rights before account resolution or workspace observations. Configure
+therefore returns no operation plan even for an object validated by an older
+implementation. Standard mode still refuses an administrative build account.
+Linux and Windows retain explicit admin-mode validation. This follows the
+corrected ADR0009 containment limit; it does not establish native macOS cleanup.
+The portable regression covers all twelve platform/rights/membership cases.

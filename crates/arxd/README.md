@@ -99,7 +99,7 @@ with NULL timestamps and execution metadata. Unsupported versions and malformed
 columns fail closed. Timestamps are nullable bounded UTC milliseconds
 (0..=253402300799999), informational rather than ordering keys.
 
-`list_activity` accepts only `limit` (integer 1–50, default 20), `before_id`
+`list_activity` accepts only `limit` (integer 1â€“50, default 20), `before_id`
 (positive i64) and `include_reads` (boolean, default false). It returns
 `{activities, next_before_id}` in descending ID order. Only the transport's
 immutable principal's agent rows are visible; principal and daemon rows are

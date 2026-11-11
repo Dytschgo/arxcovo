@@ -109,22 +109,26 @@ impl Host {
         let mut audit_started = false;
         let mut result = reporter.report(State::Starting, ExitCode::Clean);
         if result.is_ok() {
-            result = pending(
-                async {
-                    app.load_config().await?;
-                    app.verify_layout().await?;
-                    app.open_store().await?;
-                    app.service_start().await?;
-                    audit_started = true;
-                    app.bind(cancellation.clone()).await?;
-                    app.preflight().await;
-                    Ok(())
-                },
-                &request,
-                reporter,
-                State::Starting,
+            result = tokio::time::timeout(
+                Duration::from_secs(30),
+                pending(
+                    async {
+                        app.load_config().await?;
+                        app.verify_layout().await?;
+                        app.open_store().await?;
+                        app.service_start().await?;
+                        audit_started = true;
+                        app.bind(cancellation.clone()).await?;
+                        app.preflight().await;
+                        Ok(())
+                    },
+                    &request,
+                    reporter,
+                    State::Starting,
+                ),
             )
-            .await;
+            .await
+            .unwrap_or(Err(ExitCode::Layout));
         }
         if result.is_ok() && !request.is_cancelled() {
             result = reporter.report(State::Running, ExitCode::Clean);
@@ -133,7 +137,10 @@ impl Host {
                 result = tokio::select! {
                     biased;
                     _ = request.cancelled() => Ok(()),
-                    result = app.serve() => result,
+                    returned = app.serve() => match returned {
+                        Ok(()) if !request.is_cancelled() => Err(ExitCode::Endpoint),
+                        returned => returned,
+                    },
                 };
             }
         }
@@ -144,20 +151,24 @@ impl Host {
         );
         retain(&mut result, app.stop_accepting());
         cancellation.cancel();
-        let cleanup = async {
-            let mut cleanup = app.drain().await;
-            if audit_started {
-                retain(&mut cleanup, app.service_stop().await);
-            }
-            cleanup
-        };
         let deadline = Shutdown::default(); // cleanup is bounded, never cancelled by a second stop
         let drained = tokio::time::timeout(
             Duration::from_secs(10),
-            pending(cleanup, &deadline, reporter, State::Stopping),
+            pending(app.drain(), &deadline, reporter, State::Stopping),
         )
         .await;
+        let drain_returned = drained.is_ok();
         retain(&mut result, drained.unwrap_or(Err(ExitCode::Store)));
+        // A successful late drain must not consume the stop row's budget.
+        // If drain never returned, preserve the existing no-stop-row behavior.
+        if audit_started && drain_returned {
+            let audited = tokio::time::timeout(
+                Duration::from_secs(5),
+                pending(app.service_stop(), &deadline, reporter, State::Stopping),
+            )
+            .await;
+            retain(&mut result, audited.unwrap_or(Err(ExitCode::Store)));
+        }
         retain(&mut result, app.release());
         let code = result.err().unwrap_or(ExitCode::Clean);
         retain(&mut result, reporter.report(State::Stopped, code));

@@ -298,25 +298,44 @@ mod owner_tests {
     use super::*;
     #[tokio::test]
     async fn current_process_owner_change_is_isolated_and_real() {
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "service::windows::owner_tests::owner_fixture",
-                    "--ignored",
-                ])
-                .env("ARX_SERVICE_OWNER_FIXTURE", "1")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated TokenOwner fixture failed"
-        );
+        for (filter, expected_ran) in [
+            ("service::windows::owner_tests::owner_fixture", true),
+            (
+                "service::windows::owner_tests::missing_owner_fixture",
+                false,
+            ),
+        ] {
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        filter,
+                        "--ignored",
+                        "--format",
+                        "pretty",
+                        "--color",
+                        "never",
+                    ])
+                    .env("ARX_SERVICE_OWNER_FIXTURE", "1")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated TokenOwner fixture failed"
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let ran = stdout.contains("test service::windows::owner_tests::owner_fixture ... ok")
+                && stdout.contains("test result: ok. 1 passed;");
+            assert_eq!(ran, expected_ran, "TokenOwner fixture execution evidence");
+            if !expected_ran {
+                assert!(stdout.contains("test result: ok. 0 passed;"));
+            }
+        }
     }
     #[test]
     #[ignore = "subprocess-only current-token fixture; never changes the parent token"]

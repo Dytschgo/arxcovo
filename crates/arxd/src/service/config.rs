@@ -96,6 +96,11 @@ impl ServiceConfig {
         {
             return Err(Error::Config);
         }
+        // A build-UID sweep cannot contain descendants that acquired root.
+        // Refuse before resolving accounts or preparing owner operations.
+        if self.platform == Platform::Macos && w.rights == Rights::Admin {
+            return Err(Error::Rights);
+        }
         if !identity_valid(&w.client.identity, self.platform)
             || !identity_valid(&w.build_account.identity, self.platform)
             || w.client.identity == w.build_account.identity
@@ -315,6 +320,89 @@ pub(crate) mod tests {
             &Layout::for_test(Platform::Linux),
             r,
         )
+    }
+    #[test]
+    fn macos_admin_refuses_before_observation_or_owner_operations() {
+        use std::cell::Cell;
+        struct CountingResolver {
+            platform: Platform,
+            admin: bool,
+            calls: Cell<usize>,
+        }
+        impl Resolver for CountingResolver {
+            fn account(&self, value: &str) -> Result<Account, Error> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(Account {
+                    identity: if value == "builder" {
+                        if self.platform == Platform::Windows {
+                            "S-1-5-21-100-200-300-1002".into()
+                        } else {
+                            "1002".into()
+                        }
+                    } else {
+                        value.into()
+                    },
+                    gid: (self.platform != Platform::Windows).then_some(1002),
+                    kind: AccountKind::User,
+                    administrative: self.admin,
+                })
+            }
+            fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+                Ok(true)
+            }
+        }
+        for platform in [Platform::Macos, Platform::Linux, Platform::Windows] {
+            let layout = Layout::for_test(platform);
+            for rights in [Rights::Admin, Rights::Standard] {
+                for admin in [false, true] {
+                    let resolver = CountingResolver {
+                        platform,
+                        admin,
+                        calls: Cell::new(0),
+                    };
+                    let mut value = fixture();
+                    value["rights"] = serde_json::to_value(rights).unwrap();
+                    if platform == Platform::Windows {
+                        value["client"]["identity"] = "S-1-5-21-100-200-300-1001".into();
+                        value["build_account"]["identity"] = "S-1-5-21-100-200-300-1002".into();
+                        value["build_account"]["gid"] = serde_json::Value::Null;
+                        value["workspace"] = r"D:\work".into();
+                    }
+                    let result = ServiceConfig::parse(
+                        &serde_json::to_vec(&value).unwrap(),
+                        &layout,
+                        &resolver,
+                    );
+                    if platform == Platform::Macos && rights == Rights::Admin {
+                        assert_eq!(result.err(), Some(Error::Rights));
+                        assert_eq!(resolver.calls.get(), 0);
+                        // Model an old validated config reaching a newer
+                        // configure path: revalidation must refuse it too.
+                        let previous = ServiceConfig {
+                            wire: serde_json::from_value(value).unwrap(),
+                            platform,
+                        };
+                        let context = super::super::owner_plan::OwnerContext {
+                            admin: true,
+                            running_binary: layout.binary(),
+                        };
+                        let plan = super::super::owner_plan::configure_plan(
+                            &layout, &context, &previous, None, false, &resolver,
+                        );
+                        assert_eq!(plan.as_ref().err(), Some(&Error::Rights));
+                        assert_eq!(plan.as_ref().map(|p| p.operations().len()).unwrap_or(0), 0);
+                        assert_eq!(resolver.calls.get(), 0);
+                    } else {
+                        assert_eq!(resolver.calls.get(), 2);
+                        if admin == (rights == Rights::Admin) {
+                            assert!(result.is_ok());
+                        } else {
+                            assert_eq!(result.err(), Some(Error::Rights));
+                        }
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn strict_schema_and_redacted_errors() {
