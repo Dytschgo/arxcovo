@@ -2,7 +2,11 @@
 
 Status: settled architecture contract (Opus 5.5 high, design sub-agent),
 2026-11-11, prepared from base `39f9b0ccebb73a885357f82d82de0f41b580132d`.
-It needs an independent Sol review before implementation is merged. Nothing
+Corrected the same day from base `68614bcdf7281f161c1d5ed339340685200b0f8c`
+after independent Sol review finding P1
+(docs/reviews/0012-owner-contract-review.md): the safety guarantee is
+narrowed to an explicit fault model (decision 6). It needs a fresh independent
+Sol recheck before implementation is merged. Nothing
 here is implemented, installed or exercised. Every native path is **unverified
 on real hardware**. This ADR establishes no milestone 2 acceptance.
 
@@ -29,8 +33,10 @@ inside the grant window. LSA keeps no per-assignment author. Assignment is
 idempotent: an add reports success whether or not the right was already
 there. Security event 4704 depends on an audit policy that is off by default,
 and Arxcovo must not change audit policy. So the contract does not try to
-prove who added the right in that window. It resolves the state automatically
-in the direction that can never remove someone else's right. The remaining
+prove who added the right in that window. It resolves a crash in that window
+automatically, in the direction that never removes someone else's right.
+Decision 6 states the fault model under which that holds, and the one
+power-loss case where it does not. The remaining
 cost is a batch right Arxcovo may have added that is left in place, and
 uninstall reports it with a fixed token.
 
@@ -54,8 +60,11 @@ uninstall reports it with a fixed token.
    - the direct assignment was observed absent;
    - `LsaAddAccountRights` for exactly that SID then returned success.
 
-   While the record stays `granted`, the direct `SeBatchLogonRight`
-   assignment of that SID belongs to Arxcovo. Uninstall removes it even if
+   While the last record value that Arxcovo wrote and saw succeed is
+   `granted`, the direct `SeBatchLogonRight` assignment of that SID belongs to
+   Arxcovo. A `granted` value that reappears because a later record write was
+   lost or rolled back carries no authority in this contract. Decision 6 says
+   when that can happen. Uninstall removes it even if
    someone else also asserted it during that time, because a membership
    cannot have two owners. The owner guide states this.
 3. **The only ambiguous state is `intent`.** The engine writes `intent`
@@ -73,11 +82,52 @@ uninstall reports it with a fixed token.
    There is no `recover` subcommand, no acknowledge flag and no prompt. The
    one manual repair is for a record that is corrupt or wrongly protected, and
    it is documented.
-6. **Safety depends on program order only.** Durability affects completeness,
-   never safety. Under any loss or reordering of LSA, registry or NTFS writes,
-   the outcome is at worst an orphan right, a re-grant, or a config that
-   reverts to its previous bytes. A revoke of a membership whose record never
-   reached `granted` is impossible.
+6. **The safety guarantee holds under a stated fault model, not under any
+   loss.** The contract distinguishes three classes of event:
+   - **Process termination (inside the guarantee).** The owner process
+     crashes, is killed or exits at any point, and Windows keeps running. Every
+     LSA call and rename that returned success stays visible to the next
+     process. Under this class, together with external rights changes made
+     while no owner command runs, a revoke happens only for a membership that
+     Arxcovo added from an observed absence, or that collapsed into it, while
+     the last record value Arxcovo wrote was `granted` (P6). The worst outcomes
+     are `unproven`, an orphan right, a re-grant, or a config that keeps its
+     previous bytes.
+   - **Lost LSA or registry writes alone (inside the guarantee).** Power loss,
+     an OS crash or a hive rollback may lose or reorder LSA writes while every
+     record write that returned success persists. The same invariant then
+     holds (P6b). A lost grant behind a `granted` record leaves the right
+     absent, and a later external add collapses into Arxcovo's membership
+     (decision 2). A lost revoke behind a `none` record leaves an orphan that
+     is never revoked. A lost config publication only reverts the config
+     bytes, and the mirror is never authoritative.
+   - **A lost or rolled-back record write (outside the guarantee).** Power
+     loss, an OS crash (bugcheck), a hard reset or a crash-consistent disk or
+     VM snapshot can lose a record rename that had returned success, because
+     the new name binding has no documented flush (durability section). An
+     administrator restoring an older `owner-record.json` from backup has the
+     same effect, and the contract treats that as the administrator's
+     assertion. If the lost write was a transition out of `granted` (to
+     `none`, `intent` or `unproven`), the old `granted` value reappears, and
+     Arxcovo cannot detect that. The next uninstall then revokes an external
+     add made after the lost transition and reports `batch-right-removed`.
+     Example: the record is `granted`; uninstall revokes and writes `none`;
+     the owner grants the right; power loss restores `granted`; the next
+     uninstall removes the owner's grant. Every unsafe outcome in this class
+     needs a stale `granted` value (P6c). A stale `none`, `intent` or
+     `unproven` value only causes an orphan or `unproven`, and a torn record is
+     never published. The harm is limited to one direct `SeBatchLogonRight`
+     assignment on the recorded SID. The uninstall token reports it, and the
+     owner can re-add the right.
+
+   Mechanisms that could close the third class were rejected as
+   disproportionate or unproven. A whole-volume `FlushFileBuffers` needs an
+   elevated raw-volume write handle, has no documented rename-durability
+   guarantee, and does nothing against snapshot or backup restores. A
+   rollback-resistant epoch in LSA private data adds a second LSA mutation and
+   depends on undocumented write ordering inside the SECURITY hive. An owner
+   acknowledgement step would be a product approval flow, which the kickoff
+   forbids. None of these is part of the contract.
 
 ## Dependencies (not supplied here)
 
@@ -196,8 +246,13 @@ never published, assuming the disk honours the flush. Microsoft documents no
 user-mode, non-administrative directory flush. `MOVEFILE_WRITE_THROUGH` only
 guarantees copy-and-delete moves. So the durability of the new name binding
 across a power loss is **not guaranteed**. LSA rights live in the registry
-SECURITY hive, which is also lazily flushed. Decision 6 covers both cases:
-every possible reordering leads to a safe outcome.
+SECURITY hive, which is also lazily flushed. Decision 6 states the
+consequences. Lost LSA, registry or config writes stay inside the safety
+guarantee. A lost record rename that undoes a transition out of `granted` is
+outside it, and can revoke one later external grant. Nothing in this ADR has
+been tested against physical power loss, OS crashes, NTFS metadata loss or
+SECURITY hive rollback. These statements rest on the documented API
+guarantees and the pure state model only.
 
 ## Owner session preconditions (native, before any engine call)
 
@@ -402,12 +457,13 @@ tests never relax a production check.
 | --- | --- |
 | Someone removes a `granted` right | The next configure observes it absent and goes through intent and grant again, which the owner's own configure authorizes. Uninstall reports `AlreadyAbsent`. |
 | Someone adds the right while `granted` | Collapses into Arxcovo's membership, and uninstall removes it (decision 2). Re-add it after uninstall if you want to keep it. |
-| Someone adds the right while `none` | Never Arxcovo's, never revoked. |
-| Someone adds the right during the intent window | `unproven`, never revoked, reported. |
+| Someone adds the right while `none` | Never Arxcovo's, never revoked, unless a later power loss or restore brings back a stale `granted` record (decision 6, outside the guarantee). |
+| Someone adds the right while an owner command runs | The lock does not serialize them. If the owner process dies before the receipt, recovery records `unproven`, never revokes it, and reports it. If the grant returns Ok and the record reaches `granted`, the add cannot be told apart from Arxcovo's and collapses into it (decision 2). |
+| Power loss, OS crash or snapshot revert after an owner command | Lost LSA, registry or config writes stay safe. A lost record write that undoes a transition out of `granted` is outside the guarantee (decision 6). |
 | Configured account name missing | Preflight reports `account_missing`. Uninstall uses the record's old SID without requiring the account to exist. |
 | Configured name resolves to a different SID | Preflight reports `account_identity_changed`. Configure refuses the SID change, as `configure_plan` already does, and the cross-SID record refuses. Uninstall uses the record's old SID. |
 | Domain GPO manages User Rights Assignment | Outside the guarantee: a policy refresh may remove or replace the assignment. Preflight reports `batch_right_missing`. |
-| Record hand-edited or deleted by an administrator | Deleting it forgets the grant, so the right is never revoked. A valid edit is treated as the administrator's assertion. A record that is invalid or wrongly protected refuses with `RecoveryRequired` (manual repair below). |
+| Record hand-edited, restored from backup or deleted by an administrator | Deleting it forgets the grant, so the right is never revoked. A valid edit or a restored older copy is treated as the administrator's assertion, including a restored `granted` (decision 6). A record that is invalid or wrongly protected refuses with `RecoveryRequired` (manual repair below). |
 | Config hand-edited | Startup still fails with exit 4 if the owner changed. Configure refuses `Conflict` if the expected bytes differ. The record is unaffected. |
 
 ## Limits nothing here can resolve
@@ -419,7 +475,10 @@ tests never relax a production check.
   in flight once the lock can be acquired. Microsoft does not document this.
   If the assumption fails, `none` is recorded and the right appears later as
   an unreported orphan. That outcome is safe but incomplete.
-- Durability across power loss (see the storage section).
+- A record write lost to power loss, an OS crash or a snapshot revert can
+  bring back a stale `granted` value, and the next uninstall can then revoke
+  one later external grant (decision 6). Arxcovo cannot detect this.
+  Uninstall reports `batch-right-removed`, and the owner can re-add the right.
 - Privileged writers that ignore the lock can race compare-and-replace.
   Domain GPO can change rights. Neither is serialized.
 - Ownership of a set membership cannot be exclusive (decision 2).
@@ -435,9 +494,15 @@ requires manual repair.
 
 ## Test matrix
 
-**Pure tests.** These use a recording model with a ghost variable that tracks
-who actually added the membership: Arxcovo while not `granted`, Arxcovo while
-`granted`, or someone else.
+**Pure tests.** These use a recording model with two ghost variables. The
+first is the last record value Arxcovo wrote and saw succeed. The second is
+the latest acknowledged act on the membership: an Arxcovo grant or revoke, an
+external remove, or an external add tagged with whether that last written
+record value was `granted` at the time. An **unsafe revoke** removes a present
+membership whose latest acknowledged act is an external add made while the
+last written record value was not `granted`. External events happen only
+between commands or after a crash. Concurrent writers inside a command are
+outside the model.
 
 | # | Case | Required assertion |
 | --- | --- | --- |
@@ -446,7 +511,9 @@ who actually added the membership: Arxcovo while not `granted`, Arxcovo while
 | P3 | stale observation in either direction | `Conflict` before staging, with no LSA mutation. |
 | P4 | grant Err, then absent | `none`, `Io`, no publish, no revoke. |
 | P5 | grant Err, then present | `unproven`, `RightUnproven`. A rerun without add succeeds and keeps `unproven`. Uninstall gives `RetainedUnproven` and `none`, with no revoke. |
-| P6 | crash after each call, both external toggles | Run recover and then uninstall on the durable model. **Invariant: revoke is called only when the ghost shows Arxcovo added the right, or an add collapsed into it, while the record was durably `granted`.** |
+| P6 | process crash after each call, both external toggles | Crash model: every completed write persists. Sequences combine configure and uninstall (each crashed after every call, with grant or revoke returning Ok, Err with effect, or Err without effect), external add and external remove. Each command starts with recovery. **Invariant: no unsafe revoke.** |
+| P6b | lost LSA writes | P6 sequences plus a fault that reverts the LSA membership to any earlier value while every record write persists. **Same invariant: no unsafe revoke.** |
+| P6c | lost record writes (documented limit) | P6 sequences plus a fault that reverts the record to any earlier written value. Assert the decision 6 example exactly: the second uninstall revokes and returns `Removed`. **Characterization: every unsafe revoke happens in an uninstall that read a `granted` value restored over a later non-`granted` write. A rollback to any other value never produces one.** This test pins the limit. It is not a safety claim. |
 | P7 | receipt write fails | `RecoveryRequired`, durable `intent`. Recover gives `Unproven` when the right is present. |
 | P8 | publish fails | `Io`, record `granted`, no revoke. |
 | P9 | uninstall from `granted`, present | exactly one revoke, with the record's SID. A revoke Err leaves `granted`; the rerun gives `Removed`. |
@@ -488,8 +555,12 @@ rename path is **unverified on real hardware**.
 
 - **PR-A (pure).** Revise the engine, `configure_plan`, `Configure::from_plan`
   and `uninstall_plan` to the exact API above. Delete `Journal`,
-  `ConfigurationIo` and compensation. Add P1–P17, with P6 exhaustive over
-  crash prefixes. No native code.
+  `ConfigurationIo` and compensation. Add P1–P17 with P6b and P6c. P6, P6b
+  and P6c are exhaustive over crash prefixes and over bounded event sequences
+  of at least depth 6. Two mutations must fail P6: writing `granted` for a
+  right that was already present, and recovery writing `granted` for a
+  present right. Neither P6b nor P6c may be described as modelling physical
+  NTFS or LSA behavior. No native code.
 - **PR-B (native store and LSA).** Add `owner_windows.rs` with
   `WindowsOwnerSession`, `OwnerStore` and `BatchRight`. Run N1–N10 locally
   without privilege. The session's ancestor pins wait on D1. Until D1 merges,
