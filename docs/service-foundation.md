@@ -211,6 +211,12 @@ Unix uses descriptor-relative openat/O_NOFOLLOW, fstatfs, fstat metadata, and
 retained ancestor descriptors. Linux accepts only ext-family, XFS, Btrfs, tmpfs
 and F2FS filesystem magic values; unknown/network/overlay filesystems refuse.
 macOS requires MNT_LOCAL. Trusted ancestry must satisfy root integrity policy.
+ADR 0015 (macOS only): a traversed ancestor needs UID 0, `mode & 0o7022 == 0`
+and an empty ACL, and its GID is not compared. Final objects keep their exact
+GID 0 rules. The macOS endpoint is `/Library/Application Support/Arxcovo/run/
+arxd.sock`, because `/private/var/run` (`0775`, nonzero group) stays refused.
+Objects newly created on macOS are `fchown`ed to 0:0 because of BSD group
+inheritance. Not yet implemented; **unverified on real hardware**.
 Additional Linux access ACLs refuse; macOS uses native extended-ACL observation
 and refuses entries rather than pretending mode bits describe their grants.
 No symbolic-path canonicalization is performed. In particular, macOS /var and
@@ -459,6 +465,88 @@ missing/mismatched build-account separation and fixed bridge identity refusal.
 The application fixture uses an explicit current-user storage policy and injected
 bindings; it is not a production-readiness or SYSTEM-layout acceptance test.
 
+### Independent Unix owner adapter (Sol high, 2026-11-11)
+
+Callable integration is `service::owner_unix::execute(&owner_plan::Plan)` and
+`service::owner_unix::provision_state()`. Neither is wired into the CLI or
+Application. Windows/non-Unix calls return `NativeAdapterMissing`. No public
+manager constructor, fixture identity switch or arbitrary provisioning path exists.
+The only native-reader visibility change makes its existing Unix observations
+available inside `service`; its protection checks remain intact.
+
+Execution freshly requires real/effective UID and GID zero, exact `current_exe`
+equality with the system layout's binary, and protected no-follow binary/ancestry.
+The plan's `OwnerContext.admin` is never native authority. Every operation is
+allowlisted again by fixed path, policy, artifact bytes and command vector.
+Descriptor-relative traversal checks local filesystem, owner/group, type, link
+count, access ACL and (Linux directories) default ACL. Missing optional guards
+are accepted only after checking existing ancestry. Existing objects are never
+chmodded, chowned or taken over. New objects use exclusive creation; only their
+new handles get exact modes, so a restrictive caller umask is supported.
+
+Config publication locks the pinned private parent without waiting, compares
+expected bytes, writes a random exclusive 0600 sibling, fsyncs it, checks old
+inode identity, and publishes with rename (or exclusive link for first create).
+The temporary link is removed and the parent fsynced before success. Conflicting
+owner publishers refuse; noncooperating root writes, root namespace replacement
+and mount changes are outside this guarantee, as in the Application's native
+pins. This is not a kernel CAS against a hostile root process. Failures retain
+partial artifacts and do not attempt repair; a failed write may retain a private
+temporary file. No secret-bearing payload is included in errors.
+
+`provision_state()` checks the fixed 0700 state directory, refuses WAL/SHM and
+nonempty or unsafe existing prerequisites, then exclusively creates missing
+0600 `activity.lock`, `activity.sqlite3` and `activity.sqlite3-journal`. It takes
+the same native file lock used by Activity and rechecks the database and journal
+under that lock. WAL/SHM are checked only before the lock; the root-only state
+directory makes that acceptable (ADR 0014 section 6). Empty existing prerequisites allow recovery from a partial provisioning;
+nonempty state is never overwritten. At this base a nonempty database refuses.
+The corrected ADR 0014 decision 6 replaces that refusal: a database that passes
+the existing rollback-header check, and a nonempty journal, are kept untouched
+(Retained). That change is not implemented yet. Activity still initializes schema and host
+identity transactionally on first service startup. Its existing persistent
+TRUNCATE journal contract is retained (no store API change or SQLite invocation
+in provisioning); “persistent” here does not change SQLite to PERSIST mode.
+
+Only absolute constant systemctl/launchctl vectors run, with a cleared explicit
+environment, null stdio, fixed cwd and no shell. The child gets 35 seconds, then
+kill and at most one second of reap polling. A timeout does not undo a request
+already delivered to the manager and does not prove the daemon stopped. Any
+nonzero manager result refuses subsequent steps, including unregister. At this
+base, a launchd job that is already absent therefore makes install → uninstall
+and stop → uninstall halt. That defect is blocking. ADR 0014 replaces exit-code
+handling with typed known-absent queries.
+Uninstall removes only identical protected unit/drop-in/plist files, preserving
+config, state, credentials, accounts and directories. **Superseded by ADR 0014
+(below):** the rest of this paragraph describes the PR29 head. Install never
+enables or starts systemd. The plist is disabled by default to prevent first reboot startup;
+install also disables the fixed launchd label before publishing the plist, after
+refusing a conflicting existing plist, so a prior start override cannot enable a
+reinstall. Only explicit start enables and bootstraps launchd after
+config/layout/state checks. macOS admin refusal
+before account/revision lookup and Linux admin policy remain in shared config.
+
+Executed evidence: Windows workspace/all-target Clippy with warnings denied;
+formatting check; 47 service library tests passed (one direct current-token
+fixture ignored, exercised by its existing normal-user parent); three new
+portable adapter tests passed; artifact script three passed/two native skips.
+Three restored mutations (arbitrary manager program, changed artifact bytes,
+arbitrary config path) each failed the intended assertion, then baseline passed.
+An ignored `target/owner-native-check` manifest imported the actual service
+sources and passed isolated `cargo clippy --tests -- -D warnings` metadata checks
+for Linux x86_64 and macOS arm64, without lint suppression or native execution.
+Its reference to `endpoint_guard` replaces Application's absent caller only.
+
+Six Unix ordinary-user fixture tests compile but have not run: real helper CAS,
+hardlink/symlink/wrong-mode/wrong-identity refusal, lexical paths, protected empty
+store provisioning, publisher/store lock contention and caller-bool refusal.
+They use private current-user temp roots; no public fixture selector exists.
+Native fixture execution, filesystem/ACL/fsync semantics, full native workspace
+linking, launchd disabled/enable behavior, systemd reload and bounded stop,
+protected SQLite initialization/restart and installed service acceptance remain
+**unverified on real hardware**. Independent other-provider security review is
+required before integration. No privileged owner adapter was invoked locally.
+
 Integration obligations: merge the coordinator's independent credential-hash
 uniqueness fix (this branch intentionally does not duplicate it); reconcile the
 parent lifecycle/docs refresh; independent other-provider security review; native
@@ -469,6 +557,57 @@ the separate dedicated-account executor and account-scoped tool probe. All
 installed-manager/privileged paths remain **unverified on real hardware**. Full
 M2 dedicated-account cargo/Claude Code/activity acceptance remains open. No new
 architecture decision or owner-PC privileged operation is claimed.
+
+### Lifecycle corrections required by ADR 0014 (Opus 5.5 high, 2026-11-11)
+
+The PR29 review found two blocking defects and an unsettled boot rule. ADR 0014
+is the contract for the follow-up commit on that branch. It records no
+implementation, so nothing in this section has been executed. Summary:
+
+- **Boot intent.** The last explicit command that succeeded decides it.
+  Install never starts or stops the service and leaves it off at boot: Linux
+  runs `daemon-reload` then `disable` after publication, and macOS runs
+  `disable` before the plist is published. Start runs enable then start
+  (launchd: enable, then bootstrap if not loaded), so the service also runs at
+  every boot. Stop runs disable then stop (launchd: disable, then bootout if
+  loaded) and is followed by a typed proof that the service stopped. The
+  Windows auto-start (delayed) registration is a recorded divergence for the
+  Windows adapter, not part of this fix.
+- **Reinstall and retry (decision 7).** Install first runs a read-only
+  `Expect(Installable)`. It refuses an active job with `service-active`, and a
+  foreign or non-identical registration with `service-foreign-registration`,
+  before any change. Otherwise every step accepts its own completed result.
+  Rerunning install after a failure therefore resumes, and reinstalling over a
+  stopped registration changes no file but turns boot off. The Linux drop-in is
+  published before the unit and only while the unit is absent, so an
+  admin-mode host keeps its configure choice.
+- **Endpoint directory.** Install no longer creates it. The owner start
+  preflight accepts a missing endpoint directory, but an existing one must
+  pass the full check. systemd creates the Linux directory. The macOS service
+  creates its own directory with an exclusive, no-follow `mkdirat` and never
+  repairs an existing one. That alone does not prove macOS startup: the
+  stock-ancestor policy stays open.
+- **Absent jobs.** Absence comes only from a typed, bounded, allowlisted
+  `systemctl show` or `launchctl print` query. A foreign or unknown result
+  refuses, and so does any mutating command that is nonzero or times out.
+  The macOS absent exit status must be pinned from captured native evidence
+  and is never guessed.
+- **Status.** It returns one of the six fixed tokens from the mapping tables
+  in ADR 0014. Every other combination is a fixed error.
+- **Allowlist.** It is the exact (program, args, gate) table and now includes
+  every enable and disable call. `Constant` no longer runs manager commands.
+- **Provisioning.** `ProvisionState` is an install step that runs before any
+  artifact is published. It creates only empty, fsynced files and performs no
+  SQLite initialization. It keeps a nonempty database (after the existing
+  header check) and journal untouched, so `uninstall` then `install` keeps the
+  activity history. WAL/SHM files, unsafe members, a nonempty lock and a held
+  lock still refuse.
+- **macOS absence.** Until the absent exit status of `launchctl print` is
+  pinned from captured evidence, every macOS install halts with
+  `service-manager`. The PR29 unloaded-job blocker stays open.
+
+Every launchd and systemd behaviour these rules rely on remains **unverified on
+real hardware**. The evidence still needed is listed in ADR 0014.
 
 
 ## ADR 0012 pure owner provenance candidate (PR-A)
@@ -536,6 +675,17 @@ publication/locking/LSA/SCM tests, installed wiring/provisioning, dedicated-acco
 execution and installed M2 acceptance remain open. All native/installed paths
 are **unverified on real hardware**. Accepted architecture is not implementation
 acceptance; a fresh independent Opus review is required.
+
+## PR29 shared owner-plan compatibility integration
+
+The Unix candidate now incorporates merged ADR 0012 provenance main. Unix
+configure call sites pass None, Windows supplies Some(BatchObservation), and
+Windows uninstall never derives authority from the retained config mirror.
+The typed Unix Operation variants and lifecycle gates remain unchanged. The
+existing direct Windows configure/uninstall execution refusal remains in force;
+Unix injected-manager execution remains available. This reconciliation adds no
+CLI activation, native authority or architecture deviation. Verification and
+the unresolved normal Windows ExecutionFailed recurrence are in PROGRESS.md.
 
 ## ADR0012 PR-B callable native candidate
 

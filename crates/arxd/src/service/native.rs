@@ -1,4 +1,4 @@
-//! Read-only native observations. No owner operations or service entry wiring.
+//! Protected native observations and fixed macOS service endpoint creation.
 use super::{
     config::{Account, MAX_CONFIG_BYTES, Resolver, ServiceConfig},
     layout::{Error, Layout, Policy, Protection, check_protection},
@@ -6,7 +6,7 @@ use super::{
 use std::{fs::File, io::Read, path::Path};
 #[cfg(unix)]
 #[path = "native_unix.rs"]
-mod os;
+pub(super) mod os;
 #[cfg(windows)]
 #[path = "native_windows.rs"]
 mod os;
@@ -14,6 +14,11 @@ mod os;
 #[cfg(target_os = "macos")]
 #[path = "native_macos.rs"]
 mod macos;
+
+// Exercise the same pure macOS ACL/identity contracts on every test host.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "native_macos_policy.rs"]
+mod macos_policy;
 
 pub struct NativeResolver;
 #[cfg(all(windows, test))]
@@ -119,6 +124,12 @@ pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
         false,
     )
 }
+/// Service-only macOS creation; Linux continues requiring the manager directory.
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_endpoint_directory(layout: &Layout) -> Result<Observed, Error> {
+    require_service_identity()?;
+    os::ensure_endpoint_directory(layout)
+}
 /// Service state is provisioned by the owner, never repaired or ACL-relaxed here.
 /// SQLite uses a persistent TRUNCATE journal, so every mutable file can be
 /// checked before the first write. Retain namespace pins for its entire life.
@@ -183,7 +194,7 @@ pub(crate) fn state_fixture_pins(dir: &Path) -> anyhow::Result<Vec<Observed>> {
     }
     Ok(pins)
 }
-fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
+pub(super) fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
     if header.is_empty()
         || (header.len() == 20 && &header[..16] == b"SQLite format 3\0" && header[18..20] == [1, 1])
     {
@@ -472,5 +483,77 @@ mod tests {
                 .is_err()
         );
         assert!(r.account("secret-marker\0").is_err());
+    }
+}
+
+// Diagnostic evidence only: these reads never relax an ancestor policy or
+// establish installed-service acceptance. Keep output to public fixed labels.
+#[cfg(all(test, target_os = "macos"))]
+mod stock_directory_observations {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn fixed_system_directory_observations() {
+        let mut rows = Vec::new();
+        let mut controls = Vec::new();
+        for (label, path, directory, expected) in [
+            ("root", "/", true, true),
+            ("library", "/Library", true, true),
+            (
+                "application_support",
+                "/Library/Application Support",
+                true,
+                true,
+            ),
+            ("private", "/private", true, true),
+            ("var", "/private/var", true, true),
+            ("runtime_parent", "/private/var/run", true, false),
+            ("logs", "/Library/Logs", true, true),
+            ("launch_daemons", "/Library/LaunchDaemons", true, true),
+            ("bin", "/bin", true, true),
+            ("launchctl", "/bin/launchctl", false, true),
+        ] {
+            let observed = os::open(Path::new(path), directory, false, false)
+                .unwrap_or_else(|_| panic!("fixed read-only observation required"));
+            let empty_acl = macos::empty_acl(observed.file.as_raw_fd()).is_ok();
+            let protection = os::protection(&observed.file);
+            let ancestor = directory
+                && protection.as_ref().is_ok_and(|p| {
+                    super::super::layout::check_unix_ancestor(os::PLATFORM, p).is_ok()
+                });
+            let leaf = protection.as_ref().is_ok_and(|p| {
+                check_protection(os::PLATFORM, Policy::BinaryIntegrity, true, p).is_ok()
+            });
+            rows.push(serde_json::json!({ "target": label,
+                "empty_acl_confirmed": empty_acl,
+                "per_directory_ancestor_accepts": ancestor,
+                "leaf_binary_integrity_accepts": leaf }));
+            controls.push((
+                label,
+                if directory {
+                    ancestor == expected
+                } else {
+                    leaf == expected
+                },
+            ));
+            if label == "application_support" {
+                controls.push(("application_support leaf", !leaf));
+            }
+        }
+        controls.push((
+            "old runtime protected walk",
+            matches!(
+                os::open(Path::new("/private/var/run/arxcovo"), true, false, true),
+                Err(Error::Permissions)
+            ),
+        ));
+        let encoded = serde_json::to_string(&rows).unwrap();
+        assert!(encoded.len() <= 4096);
+        assert_eq!(rows.len(), 10);
+        println!("ARXCOVO_STOCK_DIRECTORY_OBSERVATIONS={encoded}");
+        for (label, accepted) in controls {
+            assert!(accepted, "{label}");
+        }
     }
 }
