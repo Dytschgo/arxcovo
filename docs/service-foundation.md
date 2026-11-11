@@ -87,3 +87,13 @@ The Python tests parse INI and plist bytes using standard parsers. Read-only
 systemd-analyze verification requires Linux and the fixed binary to exist;
 plutil lint requires macOS. Both are unrun on this Windows host, not installation
 acceptance. No UI change requires a UI rerun.
+
+## macOS rights policy correction
+
+Configuration parsing and revalidation now reject macOS admin rights with
+Error::Rights before account resolution or workspace observations. Configure
+therefore returns no operation plan even for an object validated by an older
+implementation. Standard mode still refuses an administrative build account.
+Linux and Windows retain explicit admin-mode validation. This follows the
+corrected ADR0009 containment limit; it does not establish native macOS cleanup.
+The portable regression covers all twelve platform/rights/membership cases.
