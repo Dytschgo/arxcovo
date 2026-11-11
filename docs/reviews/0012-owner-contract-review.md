@@ -52,3 +52,23 @@ is the reviewer's trace. Two seeded engine mutations were caught under the
 crash model. No physical NTFS or LSA power-loss behavior was tested. P2's split
 is retained. This correction is not independent review, and P1 stays open
 until a fresh Sol recheck accepts or rejects it.
+
+
+## Independent Sol recheck of b522125
+
+Codex / gpt-6.1-sol, medium, read the complete three-file correction from
+68614bc to b522125. P1 is resolved for this documentation contract: decisions,
+durability, external-change cases, test matrix and owner guide consistently
+exclude record rollback from the guarantee and retain the counterexample as a
+characterized limitation. P2's missing-name/different-SID split remains correct.
+Standards: no new findings. Spec: no remaining blocking findings in the contract.
+
+Executed checks: strict UTF-8/no BOM/replacement characters, balanced code
+fences, scoped diff whitespace, and the supplied scratch model at depth 6.
+That bounded model reports no unsafe revoke for crash-only or LSA-only loss;
+record rollback reproduces the documented stale-granted failure. It uses a
+three-transition rollback lookback and is not a physical NTFS/LSA proof or the
+future implementation's required complete test suite. No native API, account,
+right, installation or privileged operation was exercised. Acceptance here is
+of the scoped contract, not of the old Journal implementation it supersedes,
+the future native adapter or M2.
