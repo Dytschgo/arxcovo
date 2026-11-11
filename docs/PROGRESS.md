@@ -5,8 +5,8 @@
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#14](https://github.com/Dytschgo/arxcovo/pull/14), `5b4f6b20796d599a015ca048dc4edaeb72546387`, 19:51:48 UTC, through all five gates. The Unix executor is library-only; no Unix MCP execution route is activated.
 - Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. The macOS owner parser still refuses Unknown.
-- Queue priority: finish full service executor/MCP #36 review, then existing evidence/test PRs. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
-- Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. The new #14 main push is not yet claimed green. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
+- Queue priority: fix the three #36 execution/audit review blockers and finish existing evidence/test PRs through independent reviews. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
+- Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -1626,3 +1626,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Local Windows E1 narrowing handoff
 
 - OpenAI / gpt-6.1-sol / high implemented only the reviewed local E1 scope on base `ce30060`, final `ff5a198`. Added guard/session wrappers, proof-gated uninstall and shared private pinning; removed raw parts and public concrete adapters. Reported formatting, locked workspace/all-target Clippy, 20 focused U/N/S tests, 190 normal nextest (two parent-driven direct fixtures) and four pin-call/checker mutations caught. Coordinator has not independently reproduced those checks. E2, publication and activation remain absent; fresh independent Opus review is required before publication/merge.
+
+- Main #14 first-attempt push run 43091130349 completed successfully in **549 seconds**, verified against the Actions attempt API. Appended this as row 30 while preserving the prior 29 rows. The separately failed disposable Linux experiment is not a main-CI timing row. PR36 full review found three latent execution/audit blockers; Sol high is fixing them locally before any re-review or merge. No gate bypass or privileged probe retry.
