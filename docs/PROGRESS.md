@@ -6,6 +6,11 @@
 - Current task: bootstrap public repository, workspace and CI/review gates.
 - Last merged PR: none.
 - Acceptance: no milestone acceptance checks have run yet.
+- Milestone 1 implementation: Rust workspace, React/Vite and Electron scaffolds, locked dependencies, pinned tools, three-OS CI and fail-closed budget policy prepared on feat/milestone-1. Bootstrap main is not acceptance.
+- Local evidence (Windows): cargo fmt --all --check, clippy workspace/all-targets with warnings denied, cargo test, cargo nextest (2 integration tests), npm lint, policy tests (3), UI production build and Playwright Chromium smoke (1) passed. Final verification rerun is recorded below before handoff.
+- Slow-main simulation: policy tests reject 901-second main for normal PRs, missing/unimproved/failed ci-speed measurements; successful measured reduction and 900-second boundary pass. Missing baseline rejects.
+- npm audit after pinned minimatch override: zero vulnerabilities. ESLint 9 remains pinned; major upgrade dependency resolution failed twice, so upgrade deferred rather than forced.
+- Coordinator WIP observation: nextest 0.9.151 installed and both scaffold tests passed; not independent final-head review.
 - Hardware: all hardware paths unverified on real hardware.
 - Repository started empty; local Rust 1.95.0 and Node 24.18.0 available.
 
@@ -26,12 +31,16 @@
 ## Blockers and owner actions
 
 - None confirmed yet. Administrative host configuration will require the owner before real VM acceptance; prepare the checklist first.
+- Main has no CI baseline/workflow yet. Coordinator must resolve trusted-policy bootstrap activation; no gate bypass was performed. Duration history remains honestly empty.
+- Pending: independent Opus review, three-OS hosted CI, protected branch/reviewer App setup, owner-agent allowlist and coordinator-only auto-merge automation, trivial PR acceptance. Proposed settings: docs/ci-administration.md.
+- Coordinator steering applied: budget policy uses trusted default-branch checkout on pull_request_target/workflow_run, with API-only candidate measurements and completion re-evaluation. Gate architecture remains proposed pending independent review.
 
 ## Provider usage
 
 | Task | Provider/model | Effort | Outcome |
 | --- | --- | --- | --- |
 | Bootstrap coordination | Codex / gpt-6.1-sol | medium | Empty workspace and local prerequisites inspected |
+| Milestone 1 implementation | Codex / gpt-6.1-sol | medium | Scaffold and local checks prepared; hosted gates and independent review pending |
 | Oversight | Claude / claude-opus-5-5 | medium | Thread launched; schedule result pending |
 
 Exact allowances and per-task cost are not exposed; do not invent usage percentages.
