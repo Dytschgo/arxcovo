@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1 complete: setup acceptance and its evidence PR #8 passed all required gates and merged. Milestone 2 is active in isolated unpublished worktrees. Milestones 3–6 remain unimplemented.
-- Current task: authenticated MCP inventory/activity and the Windows execution feasibility probe. Electron and policy-test follow-ups remain open.
-- Last merged PR: [#8](https://github.com/Dytschgo/arxcovo/pull/8), merge `3148241287c48178fefc5e13f1396cbc7ae1a757`, 2026-11-11 08:22:47 UTC. All five required gates passed; GitHub completed auto-merge before a redundant coordinator command could act.
+- Current task: security review and hosted checks for the authenticated MCP inventory/activity slice; review the separate Windows execution probe next. Dedicated-account commands and services remain unimplemented.
+- Last merged PR: [#7](https://github.com/Dytschgo/arxcovo/pull/7), merge `9c623449f8341359283190f96d8222acfc7e5769`, 2026-11-11 08:29:43 UTC. All required checks and fresh Opus review passed; Electron tests ran on all three hosted OSes.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - Only milestone 1 is complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -79,8 +79,10 @@
 | Evidence PR #8 builder | Codex / gpt-6.1-sol | medium | API-derived history and acceptance outcomes; correcting stale ADR/progress after review |
 | PR #8 review round 1 | Claude / claude-opus-5-5 | high | Failure on ebdb8f4: stale ADR status; acceptance evidence independently confirmed |
 | PR #8 review round 2 | Claude / claude-opus-5-5 | high | Success on 3b6c819 after documentation corrections; all CI passed and #8 merged |
-| MCP inventory/activity tracer | Codex / gpt-6.1-sol | high | Isolated builder running; authenticated official SDK transport, inventory and persisted activity only; no command execution or acceptance claim |
-| Windows execution feasibility probe | Codex / gpt-6.1-sol | high | Second isolated builder preparing disposable-CI-only identity/Job probe; no owner-PC privileged execution or account changes permitted |
+| MCP inventory/activity tracer | Codex / gpt-6.1-sol | high | Builder commit e53b582: fmt/clippy/12 nextest tests and UI checks passed locally. Integrated for independent review and hosted CI; execution remains unavailable and M2 incomplete |
+| PR #11 security review round 1 | Claude / claude-opus-5-5 | high | Failure on 6abff15: inherit-only Windows ACL grants exposed newly created activity files; remaining path/ownership/DoS observations recorded as follow-up work |
+| PR #11 ACL correction | Codex / gpt-6.1-sol | medium | New Windows inheritance-only regression failed before the fix; all 13 workspace tests, formatting and Clippy passed after rejecting those grants before file creation. Fresh review and hosted checks required |
+| Windows execution feasibility probe | Codex / gpt-6.1-sol | high | Commit 24d3c7e prepared separately; build/publish and 21 unprivileged self-test assertions passed. Privileged disposable-CI probe is unrun; review required before any such execution |
 | Awaited policy-failure regression | Codex / gpt-6.1-sol | medium | PR #9, originating commit 0c16a9e; 10 evaluator tests pass; independent review/merge pending |
 | Single-host security contract | Claude / claude-opus-5-5 | high | Advisory design running while setup acceptance waits; no implementation or acceptance claimed |
 | Electron verification follow-up | Codex / gpt-6.1-sol | medium | Local Windows test passed; not yet merged |
