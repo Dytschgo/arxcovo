@@ -109,8 +109,8 @@ after ready.
 Stop order:
 1. Stop accepting connections.
 2. Signal `Shutdown`, which cancels runs.
-3. Wait up to 10 s for run threads to finish cleanup and persist outcome
-   `shutdown`.
+3. Wait up to 10 s for run threads to finish cleanup and persist the final outcome with stop reason `shutdown` (a failed run outcome,
+   rather than a separate storage outcome string).
 4. Write a daemon `service_stop` row.
 5. Release the lock and exit 0.
 
