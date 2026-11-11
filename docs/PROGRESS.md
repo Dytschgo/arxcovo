@@ -5,6 +5,7 @@
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#28](https://github.com/Dytschgo/arxcovo/pull/28), `0ceb1745e2e6dafad6daf5394747a3e094102c35`, 13:46:02 UTC. Independent Opus review and all required checks passed; kernel object-identity regression merged through normal gates.
 - Main has authenticated host inventory/activity over HTTP and local IPC/stdio, persistent host identity and opt-in local-only Windows current-user command execution. The non-test Claude Code development acceptance passed; per-OS installed services and dedicated-account execution remain incomplete.
+- Scoped PR25 blocker: Windows existing-ancestor namespace policy implemented locally; independent review and hosted checks pending. PR27 sharing fix remains separate; see ADR 0013.
 - Current work: record the passed Windows development acceptance, finish service lifecycle review corrections, integrate fixed/native service configuration and wire the real service application. Dedicated-account/installed-service M2 acceptance and M3–6 remain open. No third S4U probe is planned.
 
 ## Accepted milestone 1 evidence
@@ -470,3 +471,53 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Windows handle regression merge integration
 
 - Codex / gpt-6.1-sol, medium merged PR28 at reviewed460b617 with all five required gates green. Independent Opus review reproduced the old-test failure3/3, deliberate real inheritance failure3/3 (plus combinedtest2/2), and restored native executor tests passed20/20 repeatedruns. This fixes the reproduced test defect; the exact old hosted assertion was not retained and is not claimed proven. Service lifecycle integrates the correction; formatting, all-target Clippy with warnings denied and all 76 runnable Windows nextest tests passed (one direct-only fixture exercised by its parent). Fresh exact-head review and hosted gates remain pending. Native ancestor-policy blocker in25/27 remains open.
+
+## Native ancestor-policy blocker reproduction
+
+- Independent Opus stack review passed PR21 but failed PR25/27 because trusted ancestor validation rejects stock Windows system parents. Codex / gpt-6.1-sol, medium added stock_system_directory_passes_trusted_ancestor_validation on isolated fix/native-ancestor-policy: the real read-only System32 trusted-open path fails deterministically with Permissions under the existing policy. No permission or owner mutation occurred. The regression is intentionally red until the per-edge namespace-integrity policy is corrected; no fix, service start or M2 acceptance is claimed. Final private-object ownership/DACL checks must remain strict.
+
+
+## PR25 Windows ancestor-policy implementation
+
+- Task/provider/effort/outcome: Codex / gpt-6.1-sol, high, implementation sub-agent;
+  fixed on prepared base `403742ec7136679e8fd3e457b53fa80f636a6efe` without delegation.
+  Native ACE masks now distinguish existing-ancestor namespace control from
+  sibling creation, directory metadata and inherit-only grants. Final binary
+  and private-object policies remain strict. Architectural refinement and
+  primary Microsoft references are in [ADR 0013](adr/0013-windows-existing-ancestor-namespace.md).
+- Reproduction: the untouched base's exact requested `cargo test -p arxd --lib
+  stock_system_directory_passes_trusted_ancestor_validation --locked -- --nocapture`
+  failed with Permissions. The final namespace regression passes for System32,
+  Program Files and ProgramData using read-only native opens. It now explicitly
+  checks shared-directory ancestry rather than treating System32 as a final
+  Arxcovo binary directory. Restoring the old ancestor call makes it fail again.
+- Native Windows evidence: AccessCheck on in-memory SDDL descriptors confirms
+  creation versus DELETE_CHILD/DELETE/WRITE_DAC/WRITE_OWNER and inherit-only
+  semantics. Pure countercontrols cover individual rights, unknown ACEs, missing
+  DACL, unsafe owner and final private inherit-only grants. Owned-temp junction
+  and hardlink fixtures refuse. No OS-path ACL mutation was performed.
+- Eleven deliberate guard/policy mutations were individually caught by assertion
+  failures and restored: old ancestor call; missing DELETE_CHILD, WRITE_DAC,
+  WRITE_OWNER or DELETE; removed ancestor owner check; accepted unknown ACE;
+  discarded native masks; removed reparse or hardlink checks; foreign final
+  private grants. Details and limitations are in ADR 0013.
+- Checks actually run and passed on this Windows host: `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  `cargo test --workspace --locked` (102 passed, one direct-only fixture ignored
+  and exercised by its subprocess parent); `python scripts/test-service-artifacts.py -v`
+  (three passed, two OS-specific checks skipped); `git diff --check`.
+  The focused service suite also passed (41 passed, one fixture ignored).
+  No shared-handle flake occurred in this workspace run. PR28 files were not copied.
+- Last merged PR remains #24 as recorded above. No push, PR, merge, watch,
+  provisioning, owner admin operation, dispatch or settings change occurred.
+  Independent other-provider review and hosted gates remain coordinator work.
+- Limits: metadata-only retained ancestors in this base do not guarantee
+  writer/delete exclusion. PR27's separate parent read-data change must survive
+  later integration. No macOS stock-parent fix or runtime service/store/endpoint
+  attestation is claimed. Installed service, dedicated account, SCM/LSA, owner
+  adapters and M2 acceptance remain **unverified on real hardware**. The other
+  stack findings remain outside this assignment. No old Lab Manager/VM access.
+
+## Native ancestor correction coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate12081f2 with reviewed configuration parentaadfa05 and merged main28 handle regression. Renumbered the Windows namespace ADR to0013 to reserve0012 for the separate owner-recovery contract. Combined formatting, workspace/all-target Clippy with warnings denied and all103 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Builder evidence reports eleven caught/restored mutations and native AccessCheck controls. Fresh exact-head independent review and hosted checks remain pending. PR27 sharing corrections must be preserved when the parent is integrated there; macOS ancestry and installed-service acceptance remain open.
