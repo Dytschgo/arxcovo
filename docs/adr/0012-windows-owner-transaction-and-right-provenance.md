@@ -10,8 +10,9 @@ Sol recheck before implementation is merged. Amended the same day from base
 `d6df821dcd2ec827bcf2cd3c86bea32a2c639ca4` in the **SCM** part of "Native
 adapter contract" only, to apply the Windows boot-intent rule of ADR 0014
 decision 1. The amendment needs independent Sol review before PR-C is
-implemented. Nothing
-here is implemented, installed or exercised. Every native path is **unverified
+implemented. The pure engine and protected store have separate implementation
+and review records; the SCM adapter described by this amendment is not yet
+implemented, installed or exercised. Every production native path is **unverified
 on real hardware**. This ADR establishes no milestone 2 acceptance.
 
 Amends ADR 0009 "Owner subcommands" (`service configure` and `service
@@ -515,7 +516,9 @@ the record, the store and the LSA contract do not change.
   strings never reach output. Query buffers are 8 KiB, aligned and fixed, and
   each query makes one call. Every embedded pointer is range-checked, and
   polling uses an injected monotonic clock with fixed deadlines that
-  `dwWaitHint` never extends. There is no fallback, no password, no S4U retry
+  `dwWaitHint` never extends. These bound polling between synchronous calls,
+  not an in-flight native API stall. After a stop control succeeds no further
+  control is sent while waiting for stopped. There is no fallback, no password, no S4U retry
   and no approval step.
 
 ## External and stale changes

@@ -1,7 +1,8 @@
 # Brief: Windows SCM adapter (ADR 0012 PR-C)
 
 Status: ready for **Sol, high effort**, after an independent Sol review of this
-brief and the matching ADR 0012 SCM amendment. Prepared by Opus 5.5 high
+brief and the matching ADR 0012 SCM amendment. Independent Sol review is
+recorded in `docs/reviews/windows-scm-contract-review.md`. Prepared by Opus 5.5 high
 (architecture) from base `feat/windows-owner-store` at
 `d6df821dcd2ec827bcf2cd3c86bea32a2c639ca4`. The PR-C implementation is then
 reviewed by Opus, a different provider. This document describes no
@@ -99,7 +100,7 @@ is `Error::Layout`.
 pub enum Status { NotInstalled, Stopped, Starting, Running, Stopping, Failed } // token(): ADR 0014 strings
 pub enum Boot { Demand, Auto }
 pub enum Observation { Absent, Ours { boot: Boot, installed: bool, active: bool }, Foreign }
-#[must_use] pub struct Deregistered(());          // only `deregister` constructs it
+#[must_use] pub struct Deregistered(());          // only `deregister` constructs it; no Clone/Copy/Default
 
 pub(super) trait Clock { fn now(&self) -> Duration; fn sleep(&mut self, d: Duration); }
 pub(super) trait ScmCalls { /* section 6 */ }
@@ -181,6 +182,9 @@ pub(super) trait ScmCalls {
 - **Raw values.** Raw pointers are never dereferenced outside this checked
   slice view.
 - **Clock.** `MonotonicClock` uses `Instant` and `thread::sleep`.
+  The deadlines bound polling and are checked after every native call. They
+  cannot interrupt an in-flight synchronous SCM call. Native API stalls may
+  exceed the deadline; no strict end-to-end wall-clock bound is claimed.
 
 ## 7. Classification
 
@@ -243,8 +247,10 @@ If Ours, read all six `config2` levels and the `state`.
 1. Open `Stop`. Absent → `NotInstalled`. Then run `O`; Ours is sufficient.
 2. Poll loop, with the deadline set at the first `state` read:
    - stopped → go to step 3;
-   - running → `control_stop`, at most once per running observation.
-     Ok, 1061 and 1062 continue polling; any other code → `Manager`;
+   - running → `control_stop`, unless a stop control already returned Ok.
+     After Ok, only poll until stopped or the deadline; never send another
+     control. 1061 and 1062 continue polling without setting that success flag;
+     any other code → `Manager`;
    - start pending or stop pending → keep polling;
    - paused or continue states → `control_stop`, the same as running;
    - an unknown state → `Manager`.
@@ -370,8 +376,10 @@ All of these are unprivileged and make no real SCM call.
    start that never runs gets `Manager` at 35 s. 1061 during start pending
    followed by running → exactly one more control.
 7. **Provenance boundary.**
-   - Every `deregister` failure injection (each call × {each Win32 code in
-     section 9, `Malformed`}) returns `Err` and no `Deregistered`.
+   - For every `deregister` call, inject each code in section 9 and `Malformed`.
+     Cases classified as failures return `Err` and no `Deregistered`; the
+     explicitly accepted absent/marked-for-delete cases instead have their own
+     positive tests, including the required final stopped observation.
    - A source scan asserts that the `owner_scm*` files contain none of
      `owner_transactions`, `OwnerStore`, `BatchRight`, `uninstall_right` or
      `parts(`.
@@ -453,6 +461,10 @@ If any assumption fails, the adapter fails closed with `Manager` or
   `observe()`, which must be Absent or Ours and inactive, before any
   directory, lock or state is created; then layout creation; then
   `register()` last. Start runs the ADR 0009 start preflight before `start()`.
+  Here preconditions mean identity and the trusted running binary, not calling
+  `WindowsOwnerSession::open()` before fresh private directories and `owner.lock`
+  exist. Full owner-store session opening happens only after those prerequisites
+  are provisioned. A fresh install must not require its own output beforehand.
 - Windows protected-state provisioning, the counterpart of ADR 0014 decision
   6, is still open and outside ADR 0012.
 - `Operation::Scm` and `Plan::execute` stay fail-closed
