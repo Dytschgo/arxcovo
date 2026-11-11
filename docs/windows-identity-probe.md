@@ -321,3 +321,9 @@ negative fixtures and cleanup remain **unverified on real hardware**. No milesto
 acceptance is claimed. Fresh different-provider independent review on the final
 integrated head and green required gates are required before any future dispatch.
 Get-LocalGroupMember unresolved-SID enumeration still fails closed (N6).
+
+## Setup diagnostics follow-up (PR #17)
+
+The first run 42995659949 failed with generic setup output and cleanup reported true; its actual cause remains unknown. The reviewed-SHA variable was cleared. PR #17 adds fixed setup phase, signed numeric HRESULT and allowlisted category fields, excluding exception messages, invocation data, paths and credentials. One static-method wrapper is unwrapped for its type/code only. Trusted PowerShell casing is accepted at the same exact path, followed by reparse checks.
+
+Current pure suites pass 115 helper assertions and 90 setup assertions, including a real child-process invalid preflight, exact phase ordering and independent trusted-path layers. See [diagnostic feedback loop](../tools/windows-identity-probe/DEBUGGING.md). The original 114/five-guard figures above describe the earlier PR #12 run. No C# changed in this correction; no new native or privileged pass is claimed. Fresh review and all required checks precede any second fixed-SHA experiment.

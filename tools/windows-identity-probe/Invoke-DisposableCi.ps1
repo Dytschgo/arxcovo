@@ -2,13 +2,15 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module "$PSScriptRoot/CiValidation.psm1" -Force
-$context = Get-ProbeContext
-Assert-ProbeContext $context
-Assert-Probe $IsWindows
-$id = [Security.Principal.WindowsIdentity]::GetCurrent()
-try { Assert-Probe ([Security.Principal.WindowsPrincipal]::new($id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) } finally { $id.Dispose() }
-Assert-Probe ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -ceq $context.REVIEWED_SHA)
-Assert-Probe ([string]::IsNullOrEmpty((& git -C $env:GITHUB_WORKSPACE status --porcelain --untracked-files=no)))
+try {
+    $context = Get-ProbeContext
+    Assert-ProbeContext $context
+    Assert-Probe $IsWindows
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try { Assert-Probe ([Security.Principal.WindowsPrincipal]::new($id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) } finally { $id.Dispose() }
+    Assert-Probe ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -ceq $context.REVIEWED_SHA)
+    Assert-Probe ([string]::IsNullOrEmpty((& git -C $env:GITHUB_WORKSPACE status --porcelain --untracked-files=no)))
+} catch { Write-Output (Get-ProbeSetupDiagnostic 'preflight' $_); Write-Output '{"stage":"ci-experiment","ok":false}'; exit 1 }
 $account = 'axp' + [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(4)).ToLowerInvariant()
 $plan = Get-ProbePlan $context.GITHUB_RUN_ID $context.GITHUB_RUN_ATTEMPT $account
 $state = @{ Sid=''; AccountCreated=$false; RightCreated=$false; TaskCreated=$false; PathCreated=$false; ParentCreated=$false }
@@ -43,6 +45,7 @@ function Remove-SafeTree([string]$Path, [int]$Depth = 0) {
     }
     Remove-Item -Force -LiteralPath $Path
 }
+$phase = 'root'
 try {
     Assert-ProbePath $root $root
     Assert-Probe (!(Test-Path -LiteralPath $root))
@@ -53,6 +56,7 @@ try {
     [void][IO.Directory]::CreateDirectory($root)
     $state.PathCreated = $true
     Set-PrivateAcl $root
+    $phase = 'account'
     Assert-Probe ($null -eq (Get-LocalUser -Name $account -ErrorAction SilentlyContinue))
     $password = [Security.SecureString]::new()
     try {
@@ -65,6 +69,7 @@ try {
         $state.AccountCreated = $true
     } finally { $password.Dispose() }
     [void](Assert-Lifetime)
+    $phase = 'groups'
     $users = Get-LocalGroup -SID 'S-1-5-32-545'
     $members = @(Get-LocalGroupMember -Group $users | ForEach-Object { $_.SID.Value })
     if ($state.Sid -cnotin $members) { Add-LocalGroupMember -Group $users -Member $user }
@@ -72,9 +77,11 @@ try {
         $members = @(Get-LocalGroupMember -Group $group | ForEach-Object { $_.SID.Value })
         if ($state.Sid -cin $members) { Assert-Probe ($group.SID.Value -ceq 'S-1-5-32-545') }
     }
+    $phase = 'directory-acls'
     Set-PrivateAcl 'C:\arxcovo-probe' 'ReadAttributes,Traverse'
     Set-PrivateAcl $root 'ReadAttributes,Traverse'
     foreach ($dir in @('bin','work')) { [void][IO.Directory]::CreateDirectory("$root\$dir") }
+    $phase = 'payload'
     $publish = "$PSScriptRoot\bin\Release\net10.0-windows\win-x64\publish"
     Assert-ProbePath $publish $publish
     foreach ($file in Get-ChildItem -LiteralPath $publish -File) {
@@ -84,6 +91,7 @@ try {
     Assert-Probe (Test-Path -LiteralPath "$root\bin\IdentityProbe.exe")
     Set-PrivateAcl "$root\bin" 'ReadAndExecute'
     Set-PrivateAcl "$root\work" 'Modify'
+    $phase = 'batch-right'
     Add-Type -Path "$PSScriptRoot/ProbeBatchRight.cs"
     [void](Assert-Lifetime)
     [ProbeBatchRight]::Change($state.Sid, $true)
@@ -127,6 +135,7 @@ try {
 '@
     $taskCode = $taskCode.Replace('__ROOT__',$root).Replace('__RUN__',$context.GITHUB_RUN_ID).Replace('__ATTEMPT__',$context.GITHUB_RUN_ATTEMPT).Replace('__ACCOUNT__',$account)
     [IO.File]::WriteAllText("$root\task.ps1",$taskCode)
+    $phase = 'task-definition'
     $scheduler = New-Object -ComObject 'Schedule.Service'
     $scheduler.Connect()
     $folder = $scheduler.GetFolder('\')
@@ -138,16 +147,20 @@ try {
     $definition.Settings.RestartCount = 0
     $definition.Settings.AllowDemandStart = $true
     $action = $definition.Actions.Create(0)
+    $phase = 'task-path'
     $action.Path = (Get-Process -Id $PID).Path
-    Assert-Probe ($action.Path -ceq 'C:\Program Files\PowerShell\7\pwsh.exe')
+    Assert-ProbeTrustedShellPath $action.Path
     $action.Arguments = '-NoLogo -NoProfile -NonInteractive -File "' + $root + '\task.ps1"'
     # TASK_CREATE (2) refuses existing names atomically. Protected SYSTEM/admin DACL.
+    $phase = 'task-registration'
     $registered = $folder.RegisterTaskDefinition($plan.Task,$definition,2,'SYSTEM',$null,5,'D:P(A;;FA;;;SY)(A;;FA;;;BA)')
     $state.TaskCreated = $true
     $taskXml = $registered.Xml
     [void](Assert-Lifetime)
+    $phase = 'task-run'
     $before = $registered.LastRunTime
     [void]$registered.Run($null)
+    $phase = 'task-wait'
     $watch = [Diagnostics.Stopwatch]::StartNew()
     do {
         Start-Sleep -Milliseconds 250
@@ -158,15 +171,17 @@ try {
     if ($done) { Write-Output (ConvertTo-Json @{stage='task-result';code=[long]$current.LastTaskResult} -Compress) }
     Assert-Probe $done
     [void](Assert-Lifetime)
+    $phase = 'result-read'
     $result = "$root\result.jsonl"
     Assert-ProbePath $result $root
     Assert-Probe ((Get-Item -LiteralPath $result).Length -le 262144)
     $evidence = [IO.File]::ReadAllText($result)
+    $phase = 'result-validation'
     Write-Output (Get-ProbeDiagnostics $evidence)
     Assert-Probe ($current.LastTaskResult -eq 0)
     Write-Output (Read-ProbeEvidence $evidence $state.Sid)
     $success = $true
-} catch { Write-Output '{"stage":"ci-experiment","ok":false}' }
+} catch { Write-Output (Get-ProbeSetupDiagnostic $phase $_); Write-Output '{"stage":"ci-experiment","ok":false}' }
 finally {
     if ($state.AccountCreated) {
         try { [void](Assert-Lifetime); $steps = @(Get-ProbeCleanupPlan $state $state.Sid) } catch { $steps=@(); $cleanupOk=$false }
