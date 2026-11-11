@@ -79,7 +79,7 @@ impl Listener {
         std::fs::set_permissions(&endpoint.address, std::fs::Permissions::from_mode(0o600))?;
         if service {
             let name = std::ffi::CString::new(endpoint.address.as_str())?;
-            if unsafe { libc::chown(name.as_ptr(), listener.uid, u32::MAX) } != 0 {
+            if unsafe { libc::chown(name.as_ptr(), listener.uid, 0) } != 0 {
                 bail!("endpoint ownership unavailable");
             }
             listener.owner = listener.uid;
@@ -140,4 +140,12 @@ pub async fn connect(config: &ClientConfig) -> Result<UnixStream> {
         bail!("endpoint identity mismatch");
     }
     Ok(stream)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod adr15_tests {
+    #[test]
+    fn old_runtime_address_refuses() {
+        assert!(super::validate_address("/private/var/run/arxcovo/arxd.sock").is_err());
+    }
 }
