@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#35](https://github.com/Dytschgo/arxcovo/pull/35), `cd464b253368f7dadd71cc40038dc03b09508992`, 19:26:39 UTC, through all five gates. The SCM library is merged; native owner activation and installed/dedicated-account acceptance remain open.
-- Main includes lifecycle, fixed configuration, native observation, Application, owner provenance, protected owner storage and SCM libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; M2 stays unchecked.
-- Queue priority: finish independent review of refreshed Unix owner #29, then full executor/MCP #36 review and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
-- Main push CI after #37 passed on its first attempt, run 43082880556: **578 seconds**, below 15 minutes. The new #35 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Last merged PR: [#29](https://github.com/Dytschgo/arxcovo/pull/29), `aafaa3ccfa6aaf190fbc0a97cc28a3f5d4579511`, 19:37:53 UTC, through all five gates. Unix owner lifecycle and macOS namespace libraries are merged; macOS manager parsing still refuses Unknown.
+- Main includes service, configuration, native observation, inventory/activity, owner provenance/storage, SCM and Unix owner libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; installed/dedicated M2 acceptance stays unchecked.
+- Queue priority: finish Unix executor #14 and full service executor/MCP #36 review, then remaining existing evidence/test PRs. No new feature PRs while the queue drains; #31 remains closed as folded into #29.
+- Main push CI after #35 passed on its first attempt, run 43087250975: **596 seconds**, below 15 minutes. The new #29 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## PR36 bounded integration refresh — Sol high, 2026-11-11
 
@@ -1604,3 +1604,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol / medium incorporated actual #35 squash `cd464b2` while preserving published #29 history. Typed Unix gates and Windows provenance remain intact; shared error variants and owner modules merged without a source conflict. Independent exact-head review and hosted gates remain required. Native installed/service/dedicated M2 acceptance remains **unverified on real hardware**.
 
 - Final SCM/Unix combined verification at `63af692` passed formatting, locked workspace/all-target Clippy and **184/184 normal nextest**, two subprocess fixtures exercised through parents; run `dc2e7bef-7883-46db-a3ef-2fb74bb6b122`, 10.435-second test phase. Existing helper/artifact bytes are unchanged from the preceding 26-helper and 3-artifact pass. Corrected the SCM brief to distinguish malformed single-NUL input from a valid double-NUL empty privilege list, matching the independent review. No production code changed for that wording correction.
+
+## Executor interface alignment after Unix owner merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #29 squash `aafaa3c`, whose complete tree equals the already included and independently reviewed `e13e25f`. Duplicate-history conflict resolutions retained the existing executor additions. Complete runtime, Cargo, workflows and tools remain byte-identical to tested `08e7096`; its 197-test and helper results apply without claiming another run. Current state records the new merge and completed 596-second main CI. Full independent executor/MCP review and hosted gates remain pending; no native backend or acceptance is established.
