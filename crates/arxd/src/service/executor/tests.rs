@@ -383,3 +383,257 @@ fn unsafe_service_executable_paths_refuse_lexically() {
         assert!(!absolute_executable(path));
     }
 }
+
+pub(crate) fn backend_fixture(backend: Arc<dyn Executor>) -> Arc<Execution> {
+    let (e, _) = fake(false, true);
+    let mut e = Arc::try_unwrap(e).ok().unwrap();
+    e.backend = backend;
+    Arc::new(e)
+}
+struct OnceReport(Mutex<Option<Report>>);
+impl Executor for OnceReport {
+    fn preflight(&self) -> Result<(), Unavailable> {
+        Ok(())
+    }
+    fn run(&self, _: Option<&Request>, _: &Cancellation, _: &Cancellation) -> Report {
+        self.0.lock().unwrap().take().unwrap()
+    }
+}
+fn tools() -> Vec<ToolVersion> {
+    crate::development::TOOLS
+        .iter()
+        .map(|n| ToolVersion {
+            name: (*n).into(),
+            found: false,
+            version: None,
+        })
+        .collect()
+}
+async fn report_boundary_case(case: usize) {
+    let dir = private_temp();
+    let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    let mut m = Metadata {
+        stop_reason: Some(StopReason::Exited),
+        exit_code: Some(0),
+        cleanup_confirmed: Some(true),
+        identity_mode: Some(crate::store::IdentityMode::DevelopmentCurrentUser),
+        ..Default::default()
+    };
+    let (report, reason, quarantine) = match case {
+        0 => {
+            m.cleanup_confirmed = Some(false);
+            (
+                Report::Discovered {
+                    metadata: m,
+                    tools: vec![],
+                },
+                Some(Reason::CleanupUnconfirmed),
+                true,
+            )
+        }
+        1 => {
+            m.stop_reason = Some(StopReason::Failed);
+            (
+                Report::Discovered {
+                    metadata: m,
+                    tools: tools(),
+                },
+                Some(Reason::ExecutionFailed),
+                true,
+            )
+        }
+        2 => (
+            Report::Discovered {
+                metadata: m,
+                tools: vec![],
+            },
+            Some(Reason::ExecutionFailed),
+            true,
+        ),
+        3 => {
+            m.reason = Some(Reason::Busy);
+            (
+                Report::Discovered {
+                    metadata: m,
+                    tools: tools(),
+                },
+                None,
+                false,
+            )
+        }
+        4 => (
+            Report::Failed { after_spawn: false },
+            Some(Reason::ExecutionFailed),
+            false,
+        ),
+        5 => (
+            Report::Failed { after_spawn: true },
+            Some(Reason::CleanupUnconfirmed),
+            true,
+        ),
+        6 => {
+            m.identity_matches_pin = Some(false);
+            (
+                Report::Discovered {
+                    metadata: m,
+                    tools: vec![],
+                },
+                Some(Reason::IdentityMismatch),
+                true,
+            )
+        }
+        _ => (
+            Report::Completed {
+                metadata: m,
+                stdout: CapturedOutput {
+                    head: vec![],
+                    tail: vec![],
+                    dropped_bytes: 0,
+                },
+                stderr: CapturedOutput {
+                    head: vec![],
+                    tail: vec![],
+                    dropped_bytes: 0,
+                },
+            },
+            None,
+            false,
+        ),
+    };
+    let e = backend_fixture(Arc::new(OnceReport(Mutex::new(Some(report)))));
+    let id = a.start("alpha", "discover_tools").unwrap();
+    let v = e.dispatch(None, a.clone(), id).await.ok().unwrap();
+    assert_eq!(v["reason"], json!(reason), "case {case}");
+    if case == 7 {
+        assert_eq!(v["metadata"]["identity_mode"], "dedicated_account");
+    }
+    if case == 0 {
+        assert_eq!(v["metadata"]["cleanup_confirmed"], false);
+        assert_eq!(v["metadata"]["stop_reason"], "exited");
+    }
+    assert_eq!(
+        e.quarantined.load(Ordering::Acquire),
+        quarantine,
+        "case {case}"
+    );
+    assert!(a.finish(id, "failed").is_err());
+}
+
+pub(crate) struct Gate {
+    pub entered: tokio::sync::Notify,
+    open: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            open: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+    pub fn wait(&self) {
+        self.entered.notify_one();
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.cv.wait(open).unwrap();
+        }
+    }
+    pub fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+pub(crate) struct GatedBackend {
+    pub gate: Arc<Gate>,
+    pub preflight_gate: bool,
+    pub calls: Arc<AtomicUsize>,
+}
+impl Executor for GatedBackend {
+    fn preflight(&self) -> Result<(), Unavailable> {
+        if self.preflight_gate {
+            self.gate.wait();
+        }
+        Ok(())
+    }
+    fn run(&self, _: Option<&Request>, _: &Cancellation, shutdown: &Cancellation) -> Report {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.preflight_gate {
+            self.gate.wait();
+        }
+        Report::FakeForTest {
+            stop: if shutdown.is_cancelled() {
+                StopReason::Shutdown
+            } else {
+                StopReason::Exited
+            },
+            cleanup: true,
+        }
+    }
+}
+#[tokio::test]
+async fn cancellation_after_gated_preflight_never_enters_backend() {
+    let dir = private_temp();
+    let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    let gate = Gate::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let e = backend_fixture(Arc::new(GatedBackend {
+        gate: gate.clone(),
+        preflight_gate: true,
+        calls: calls.clone(),
+    }));
+    let id = a.start("alpha", "run_command").unwrap();
+    let work = e.dispatch(Some(request()), a.clone(), id);
+    gate.entered.notified().await;
+    drop(work);
+    gate.release();
+    let mut workers = std::mem::take(&mut *e.workers.lock().unwrap());
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    e.drain().await.unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    let row: (String, Option<String>, i64) = db
+        .query_row(
+            "SELECT outcome,stop_reason,count(*) FROM activity WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("failed".into(), Some("cancelled".into()), 1));
+    assert!(a.finish(id, "failed").is_err());
+}
+
+#[tokio::test]
+async fn report_boundary_case_0() {
+    report_boundary_case(0).await;
+}
+#[tokio::test]
+async fn report_boundary_case_1() {
+    report_boundary_case(1).await;
+}
+#[tokio::test]
+async fn report_boundary_case_2() {
+    report_boundary_case(2).await;
+}
+#[tokio::test]
+async fn report_boundary_case_3() {
+    report_boundary_case(3).await;
+}
+#[tokio::test]
+async fn report_boundary_case_4() {
+    report_boundary_case(4).await;
+}
+#[tokio::test]
+async fn report_boundary_case_5() {
+    report_boundary_case(5).await;
+}
+#[tokio::test]
+async fn report_boundary_case_6() {
+    report_boundary_case(6).await;
+}
+#[tokio::test]
+async fn report_boundary_case_7() {
+    report_boundary_case(7).await;
+}

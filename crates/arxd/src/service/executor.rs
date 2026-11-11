@@ -85,6 +85,8 @@ pub fn schema() -> Value {
 }
 /// Cancellation is cooperative, including shutdown. Implementations must bound
 /// cleanup and return a terminal report; drain joins every dispatch worker.
+/// Recheck request cancellation and shutdown immediately before actual spawn;
+/// cancellation before spawn must start no child.
 pub trait Executor: Send + Sync + 'static {
     fn preflight(&self) -> Result<(), Unavailable>;
     fn run(
@@ -256,7 +258,9 @@ impl Execution {
                 this.active.fetch_sub(1, Ordering::AcqRel);
                 Report::Unavailable(Unavailable::Busy)
             } else {
-                let r = if this.shutdown.is_cancelled() {
+                let r = if cancel.is_cancelled() {
+                    Report::Completed { metadata: Metadata { stop_reason: Some(StopReason::Cancelled), ..Default::default() }, stdout: CapturedOutput {head:vec![],tail:vec![],dropped_bytes:0}, stderr: CapturedOutput {head:vec![],tail:vec![],dropped_bytes:0} }
+                } else if this.shutdown.is_cancelled() {
                     Report::Unavailable(Unavailable::Stopping)
                 } else {
                     this.backend.run(request.as_ref(), &cancel, &this.shutdown)
@@ -264,7 +268,8 @@ impl Execution {
                 this.active.fetch_sub(1, Ordering::AcqRel);
                 r
             };
-            let post_spawn_error = matches!(&report, Report::Failed { after_spawn:true } | Report::Completed { metadata:Metadata { stop_reason:Some(StopReason::Failed), .. }, .. });
+            let invalid_discovery = matches!(&report, Report::Discovered { tools, .. } if !valid_tools(tools));
+            let post_spawn_error = invalid_discovery || matches!(&report, Report::Failed { after_spawn:true } | Report::Completed { metadata:Metadata { stop_reason:Some(StopReason::Failed), .. }, .. } | Report::Discovered { metadata:Metadata { stop_reason:Some(StopReason::Failed), .. }, .. });
             let (mut outcome, mut metadata, mut value, refusal) = match report {
                 Report::Unavailable(r) => (
                     Outcome::Refused,
@@ -276,7 +281,6 @@ impl Execution {
                     Some(r),
                 ),
                 Report::Failed { after_spawn } => {
-                    if after_spawn { this.quarantined.store(true, Ordering::Release); }
                     (Outcome::Failed, Metadata { reason:Some(if after_spawn {Reason::CleanupUnconfirmed} else {Reason::ExecutionFailed}), stop_reason:Some(StopReason::Failed), cleanup_confirmed:after_spawn.then_some(false), ..Default::default() }, json!({}), None)
                 }
                 Report::Discovered { metadata, tools } => {
@@ -284,15 +288,7 @@ impl Execution {
                     if valid {
                         (terminal(&metadata), metadata, json!({"tools":tools}), None)
                     } else {
-                        (
-                            Outcome::Failed,
-                            Metadata {
-                                reason: Some(Reason::ExecutionFailed),
-                                ..Default::default()
-                            },
-                            json!({}),
-                            None,
-                        )
+                        (Outcome::Failed, metadata, json!({}), None)
                     }
                 }
                 Report::Completed {
@@ -316,12 +312,11 @@ impl Execution {
                     None,
                 ),
             };
+            metadata.identity_mode = Some(crate::store::IdentityMode::DedicatedAccount);
             normalize(&mut metadata);
+            if invalid_discovery && metadata.reason.is_none() { metadata.reason = Some(Reason::ExecutionFailed); }
             if outcome != Outcome::Refused { outcome=terminal(&metadata); }
-            if metadata.cleanup_confirmed == Some(false) {
-                metadata.reason = Some(Reason::CleanupUnconfirmed);
-                this.quarantined.store(true, Ordering::Release);
-            } else if post_spawn_error {
+            if metadata.cleanup_confirmed == Some(false) || post_spawn_error {
                 this.quarantined.store(true, Ordering::Release);
             }
             if let Some(r) = &request {
