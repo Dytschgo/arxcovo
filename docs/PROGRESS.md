@@ -19,10 +19,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#27](https://github.com/Dytschgo/arxcovo/pull/27), `3f7c51567e4e2cb19bd02f7457a7720ea431f363`, 18:13:01 UTC, through all five required gates. The fixed-layout Application and sharing correction are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#30](https://github.com/Dytschgo/arxcovo/pull/30), `4f2b0c7177c8b7370d34484e4739082364859f4a`, 18:24:31 UTC, through all five required gates. Pure owner provenance is merged; native owner activation and installed/dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land owner provenance #30, then protected owner store #33 and SCM #35; refresh the existing Unix owner/executor dependencies afterward. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
-- Main push CI after native validation #25 passed on its first attempt, run 43073378419 at `63b6555`: **414 seconds**, below 15 minutes. The new Application main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land protected owner store #33, then SCM #35; refresh the existing Unix owner/executor dependencies afterward. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after Application #27 passed on its first attempt, run 43075630346 at `3f7c515`: **571 seconds**, below 15 minutes. The new provenance main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -972,3 +972,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium integrated reviewed Application head `0232a80` and actual squash `3f7c515` into existing #30 without rewriting published history. The squash tree equals that reviewed head; duplicate-history conflicts retained the already combined tree. Owner transactions/tests, owner plan and service config remain byte-identical to independently reviewed `4b2b769`; the parent contributes the sharing correction and regression. Workflows/helpers match merged main. Both provider tables and historical evidence are retained, with Current state first.
 - Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **132/132 normal nextest** (two subprocess-only fixtures exercised through parents), and **26/26 CI-helper tests**. Nextest run `a7b71b17-8b59-43e2-8ac5-ef74ec38095e`, 8.445-second test phase. No native owner session, LSA/SCM, account/rights/admin/service or VM operation. #27 merged through all gates at 18:13:01 UTC. Fresh exact-head independent review and hosted checks remain required; native/installed dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Unix manager diagnostic queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #34 locally on merged provenance main `4f2b0c7`. The read-only diagnostic, its test file, README and historical macOS evidence remain byte-identical to published `738a2c9`; runtime crate/packaging/Cargo/toolchain/scripts match main. Workflow conflict resolution retains the existing Unix diagnostic step and both merged Linux CI-unblock steps, with no original check or timeout removed. Current state is first and provider/evidence history is preserved.
+- All **39 CI-helper tests** completed: **36 passed, 3 Unix child-fixture tests skipped on Windows**. No service-manager query, root/admin/service/account/rights operation, resolver change or VM action ran locally. Native capture remains hosted-only. No push/new PR; fresh exact-head recheck and hosted gates remain required, and ADR0014 references must land with the Unix owner stack before this diagnostic is claimed self-contained. This evidence collection does not enable macOS lifecycle parsing or establish installed/dedicated-account M2 acceptance.
