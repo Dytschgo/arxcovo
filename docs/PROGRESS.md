@@ -1,12 +1,33 @@
 # Arxcovo progress
 
-## Current state — 2026-11-11
+## Current state â€” 2026-11-11
 
-- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#27](https://github.com/Dytschgo/arxcovo/pull/27), `3f7c51567e4e2cb19bd02f7457a7720ea431f363`, 18:13:01 UTC, through all five required gates. The fixed-layout Application and sharing correction are merged; installed-service and dedicated-account acceptance remain open.
-- Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land owner provenance #30, then protected owner store #33 and SCM #35; refresh the existing Unix owner/executor dependencies afterward. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
-- Main push CI after native validation #25 passed on its first attempt, run 43073378419 at `63b6555`: **414 seconds**, below 15 minutes. The new Application main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3â€“6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#35](https://github.com/Dytschgo/arxcovo/pull/35), `cd464b253368f7dadd71cc40038dc03b09508992`, 19:26:39 UTC, through all five gates. The SCM library is merged; native owner activation and installed/dedicated-account acceptance remain open.
+- Main includes lifecycle, fixed configuration, native observation, Application, owner provenance, protected owner storage and SCM libraries, plus accepted opt-in Windows development execution. Owner provisioning/CLI and native dedicated execution remain incomplete; M2 stays unchecked.
+- Queue priority: finish independent review of refreshed Unix owner #29, then full executor/MCP #36 review and remaining evidence PRs. No new feature PRs while the queue drains. #31 remains closed as folded into #29.
+- Main push CI after #37 passed on its first attempt, run 43082880556: **578 seconds**, below 15 minutes. The new #35 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+
+## PR36 bounded integration refresh — Sol high, 2026-11-11
+
+- OpenAI / gpt-6.1-sol / high, implementation sub-agent, integration only. Prepared base `241dfa77fe865686c41e81a780415e8967d6dfff`; required local parent `e13e25f750f846b9c4742716aa7079177ab624a7` includes actual #35 main `cd464b253368f7dadd71cc40038dc03b09508992` and merged test-only #37. Both histories are preserved. No parent/public branch modification, push, PR operation or activation.
+- Resolved module declarations by retaining executor, owner transactions, owner store and SCM modules. Documentation conflicts retain both task histories and provider tables. Executor/MCP/store/Application implementation remains unchanged from the prepared executor base; parent source is retained exactly except the combined module declarations. No new behavior, backend or architectural deviation.
+- Production execution still refuses MechanismUnavailable; development/schema 3, immutable principal, durable start/completion, cancellation/shutdown joins, withholding/quarantine, bounded output, no service workspace/PATH access and corrected Application ancestor sharing remain intact. Windows opaque BatchObservation and record-only uninstall authority remain; Unix uses None and retains lifecycle/macOS namespace policy.
+- Verification in progress; local completion does not approve PR36. Public source `12aa968ea7ddb01a214bf435c4be3b35c9406f69` and the integrated candidate require FULL independent Opus high review later; parent e13e25f is under separate independent review. Prior 184-test parent and 149-test executor passes are historical, not current evidence. Existing intermittent ExecutionFailed remains unresolved; PR37 corrects only the handle marker.
+- Installed/native/dedicated M2 paths remain **unverified on real hardware**. No production owner/native constructor, SCM/LSA/privilege/account/admin/service/VM or old Lab Manager action was performed.
+
+## PR29 compatibility integration â€” Sol high, 2026-11-11
+
+- Integrated implementation commit: `79959a33a0422cf9bd594cb99d1323d85051740d`, parents exactly `06c7f6b646b64adf615c98353b9a5a9111636b5d` and `4f2b0c7177c8b7370d34484e4739082364859f4a`. Following documentation-only evidence commits do not alter tested code.
+- Files changed relative to prepared base: `crates/arxd/src/service/config.rs`, `mod.rs`, `owner_plan.rs`, `owner_transactions.rs`, `owner_transactions_tests.rs`; `docs/PROGRESS.md`, `docs/adr/0009-service-lifecycle-and-dedicated-execution.md`, `docs/adr/0012-windows-owner-transaction-and-right-provenance.md`, `docs/reviews/0012-owner-contract-review.md`, `docs/service-foundation.md`, `docs/service-install.md`. The provenance module/contract/review come from actual main; the shared plan resolves compatibility, Unix call sites use None, and the cross-platform test is strengthened. No new ADR was needed.
+- Provider/effort: OpenAI / gpt-6.1-sol / high, implementation sub-agent. Prepared base `06c7f6b646b64adf615c98353b9a5a9111636b5d`; merged actual main `4f2b0c7177c8b7370d34484e4739082364859f4a` locally, preserving both histories. No force, push, PR mutation, GitHub access, watch, merge-to-main, subagent or CLI activation. This is compatibility only; no new runtime capability or acceptance.
+- Windows keeps `Option<BatchObservation>`, the opaque matching observation contract, transaction-only configure/uninstall activation refusal, record-only revoke authority, no compensation, and uninstall independent of config/account/workspace with no emitted BatchRight removal. Unix passes None and retains typed lifecycle plans, gates/status, exact manager allowlist, optional endpoint preflight, retained-state provisioning, macOS namespace/creation-only chown and fail-closed Unknown parsing. Application/sharing, native adapters, Unix query, layout and packaging bytes match the prepared base. Existing stale-plan tests cover both directions and direct unresolved Intent uninstall still refuses before observation.
+- Compatibility coverage strengthens the existing Linux/macOS shared-API test: configure and uninstall reach an injected recording manager (all operations counted), carry no Windows SCM/right operations, and uninstall retains the Unloaded proof. Existing Windows tests prove no manager call occurs on direct activation and no resolver is consulted on uninstall. No production constructor or native owner path was invoked.
+- Executed: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` passed. `cargo nextest run --workspace --locked --no-fail-fast`, run `ea9ab473-0c0b-4bc8-ac6b-f253a0ee0edd`, finished in 10.302 s with **149 passed, 1 failed, 2 skipped**. Failure: `development::windows::tests::actual_job_tree_timeout_cancel_shutdown_overflow_and_handles`, `crates/arxd/src/development/windows.rs:818:69`, `overflow: ExecutionFailed` (3.512 s). The two direct-only fixtures were exercised by their existing normal parents. No ignored fixture was run directly.
+- This is a recurrence of the unresolved ExecutionFailed error family from the prior 133/136 run (cancel/junction/SDK positive control), now at overflow. The junction and SDK controls passed this time. It is distinct from the old ETW/handle-marker issue; root cause remains unknown. No retry, attempted fix, timeout/limit change, serialization, weakened test/policy or unrelated patch was applied. The full workspace check is **not green** and blocks publication readiness.
+- Focused command: `cargo nextest run -p arxd --lib --locked -E 'test(service::owner_) | test(service::layout::tests::unix_) | test(service::layout::tests::mac_) | test(service::config::tests::macos_admin)' --no-fail-fast`: **37/37 passed**, run `7ec9660b-26c9-4f2c-bc60-a5915f3f66ac`, 2.313 s. Includes depth-6 provenance/mutation models and typed Unix gates. Portable checks: `node --test scripts/*.test.mjs` **18 passed**; `python -m unittest discover -s tools/ci -p 'test_*.py'` **26 passed**; `python scripts/test-service-artifacts.py -v` **3 passed, 2 native Unix skips**. Whitespace check passed. Initial fmt check requested ordinary formatting changes; formatting was applied before the passing check.
+- Remaining: coordinator dependency integration, fresh independent Opus high exact-head review and required hosted gates. Existing advisories remain open: case-sensitive Windows pipe comparison, SYSTEM-guard test coverage, state-protection exit mapping and unrelated historical docs; macOS endpoint creation is preserved from PR29 but native evidence remains absent. macOS launchd absence/state fixture constants remain unpinned and Unknown stays fail-closed. Native Unix compilation/link/runtime and native systemd/plutil were not exercised here; no metadata-only or native-runtime pass is claimed. Installed/dedicated/native M2 acceptance remains **unverified on real hardware**. No actual owner/root/manager/SCM/LSA/privilege/account/service/provisioning/VM/LabManager operation ran.
+- Main push CI after #33 passed on its first attempt, run 43079116241 at `7c150f0`: **532 seconds**, below 15 minutes. The new #37 main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -113,7 +134,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Task | Provider/model | Effort | Task-time outcome |
 | --- | --- | --- | --- |
-| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1–2 merged; full protection read back; first baseline verified |
+| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1â€“2 merged; full protection read back; first baseline verified |
 | Initial scaffold/CI builder | Codex / gpt-6.1-sol | medium | PR #1 built and locally verified |
 | CI gate architecture | Claude / claude-opus-5-5 | high | App-free workflow_run design and staged installation advised |
 | PR #1 review round 1 | Claude / claude-opus-5-5 | high | Failure on 835d06c: history deadlock, error handling, labels and extra approval requirements |
@@ -174,6 +195,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
+| Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
@@ -228,7 +250,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   `t3/native-service-adapters`; implementation commit `678287d`.
   Added service/native.rs, native_windows.rs, native_unix.rs plus necessary
   module/Cargo wiring. No other task branch or development/store/MCP file edited.
-  This task changes no acceptance status: M1 is accepted and M2–6 remain unchecked.
+  This task changes no acceptance status: M1 is accepted and M2â€“6 remain unchecked.
 - Unchanged Windows baseline: `cargo test --workspace` passed 61 tests, one
   directly ignored subprocess fixture exercised by its parent. Added nine
   native/policy tests: real current-token/local-SAM observations (positive
@@ -295,7 +317,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
 
-## Windows development execution candidate — implementation handoff (2026-11-11)
+## Windows development execution candidate â€” implementation handoff (2026-11-11)
 
 - Provider/effort: GPT-6.1 Sol, high. Outcome: incomplete candidate; stopped under
   the task's three-different-failed-fixes rule. Independent other-provider review
@@ -308,7 +330,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   unnamed Job memory/process/UI limits; token comparison before resume;
   cancellation/shutdown/output/time bounds; cleanup confirmation and quarantine;
   MCP execution/discovery/capability wiring; worker-owned audit completion;
-  transactional explicit v2→v3 identity_mode migration and development-row CHECKs.
+  transactional explicit v2â†’v3 identity_mode migration and development-row CHECKs.
 - Actual validation: `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed after final code
   edits. The last full `cargo test --workspace --no-fail-fast` failed: 12/13
@@ -345,7 +367,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   coordinator's post-review private acceptance are in
   `docs/windows-development-execution.md`.
 
-## Windows development execution — Opus continuation (2026-11-11)
+## Windows development execution â€” Opus continuation (2026-11-11)
 
 - Provider/effort: Anthropic claude-opus-5-5, high (other-provider continuation
   under the three-failed-fixes rule). Outcome: candidate complete locally and
@@ -776,6 +798,98 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium integrated candidate41bfaa7 by fast-forward. The native normal-user hot-journal regression passed locally with the same Windows pin/sharing path; formatting passed. Builder full117 nextest/fmt/Clippy evidence is recorded above; coordinator did not repeat that entire unchanged suite. A verified hot journal previously caused SQLITE_IOERR_DELETE2570; temporary exclusive SQLite locking during recovery avoids deletion while retaining protected pins, and the mutation without it reproduces failure. This is process-crash evidence, not installed SYSTEM/root or power-loss acceptance. Fresh independent review and hosted checks remain pending.
 
+## Superseded owner transaction coordinator integration
+
+- Codex / gpt-6.1-sol, medium preserved candidatea8628c6 on feat/windows-owner-transactions above the integrated service Application. Formatting and all-target Clippy with warnings denied passed; all nine focused owner-transaction tests passed. This delivers only a pure transaction prerequisite, not the requested native Windows installer adapter. Native ConfigurationIo, SCM/LSA operations and durable uninstall provenance remain absent. A crash between right grant and durable receipt remains RecoveryRequired; presence never proves ownership. Cross-provider architecture guidance is required before native activation. No owner or privileged operation occurred.
+
+## Windows owner recovery architecture review
+
+- Anthropic / claude-opus-5-5, high delivered docs-only ADR0012 at784fb16, superseding the old pure Journal/ConfigurationIo design. Codex / gpt-6.1-sol, medium independently read all four changed docs and found changes required: P1 arbitrary record-rollback safety claim has a pure-model counterexample, and P2 missing-account reason contradicts ADR0009. Strict UTF-8, balanced fences and scoped whitespace checks passed; no runtime/privileged check ran. See docs/reviews/0012-owner-contract-review.md. Native owner implementation remains blocked on contract correction and the ancestor-policy fix.
+
+## Corrected Windows owner contract recheck
+
+- Anthropic / claude-opus-5-5, high corrected ADR0012 atb522125. Codex / gpt-6.1-sol, medium independently rechecked all three changed docs and accepts the bounded documentation contract: P1 unconditional power-loss claim removed, record rollback explicitly outside guarantee, P2 reason split preserved. UTF-8/fence/whitespace checks and depth6 bounded scratch model passed the stated characterization. No native behavior is proven; the old Journal implementation must be replaced before activation. See docs/reviews/0012-owner-contract-review.md.
+
+
+## ADR 0012 PR-A pure owner provenance candidate
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol, high, implementation sub-agent
+  working alone from pinned prepared base
+  `7e7d3bfd49b558f2e5057260694a099540534906` on
+  `t3/implement-owner-provenance-engine`. Replaced obsolete Journal,
+  ConfigurationIo and compensating configure/recovery with strict 512-byte
+  OwnerRecord, OwnerStore/BatchRight, opaque observe_batch, recover, configure
+  and uninstall_right. Intent resolves only to None/Unproven; configure/recover
+  never revoke; only Granted authorizes uninstall using the record's explicit
+  SID. Last merged PR and M2 acceptance are unchanged.
+- Completed tasks: P1-P17 plus P6b/P6c; config mirror/old canonical expected-byte
+  paths, stale presence and record-only observations, cross-SID states, record
+  decoding, CAS, receipt/publication and other store failures with/without
+  effects, fixed errors/reports, explicit old-SID uninstall, unavailable
+  account/workspace and no-config uninstall path. Windows Plan::execute fails
+  closed for configure/uninstall and uninstall plans contain no BatchRight.
+  Former reserved-SID/group coverage is retained alongside new provenance tests.
+- API integration: configure_plan takes Option<BatchObservation>: Windows
+  requires Some from the locked private store; Linux/macOS require None and
+  retain their owner planning/validation behavior without LSA/provenance.
+  Configure::from_plan takes the same opaque observation after resolver.
+  Unix adapter candidate 7e12abf / PR29 needs the coordinator's argument update;
+  no candidate files or unrelated Windows handle-flake fixes were copied.
+  See docs/service-foundation.md for precise session ordering, API and limits.
+- Actual Windows checks: cargo fmt --all -- --check; cargo clippy --workspace
+  --all-targets -- -D warnings; cargo check --workspace; cargo build --workspace;
+  cargo test -p arxd service::owner --lib -- --nocapture (19 passed);
+  cargo test -p arxd service::config --lib (7 passed);
+  cargo test -p arxd service::layout --lib (2 passed); git diff --check.
+  Final focused owner suite took 1.93 seconds after compilation. No complete
+  workspace runtime suite or hosted CI was run; the inherited intermittent
+  Windows handle test remains unresolved and unclaimed by these local passes.
+- Model bounds/results: depth 6, every adapter call prefix (0..15 plus complete),
+  both commands with recovery, both external toggles, three grant/revoke outcomes,
+  and equivalent-state merging. Completed record writes persist in P6/P6b.
+  P6: 11,544 transitions, zero unsafe revokes. P6b LSA-only earlier-value loss:
+  15,365 transitions, zero unsafe revokes. P6c record rollback to any previously
+  seen value: 47,281 transitions, 312 unsafe revokes, all characterized by stale
+  Granted restored over a later non-Granted write; exact decision 6 trace pinned.
+  Independent ghost attribution detects both seeded receipt mutations: taking a
+  pre-existing right (52 unsafe witnesses / 12,064 transitions) and recovery
+  promoting to Granted (376 / 12,168). These mutations fail the P6 safety
+  predicate; the harness requires witnesses. No physical NTFS/LSA proof is claimed.
+- Corrections during verification: a fixture initially asserted only the primary
+  SID on a valid cross-SID None replacement; another injected read-error fixture
+  failed to return Err when its effect flag was set. Both fixture issues were
+  corrected and the focused suite rerun. One Clippy let-and-return diagnostic
+  was corrected. No symptom reached three distinct failed fixes.
+- Remaining blockers/tasks: fresh independent Opus implementation review, native
+  store/locking/publication and LSA (PR-B), SCM (PR-C), checked CLI session wiring
+  (PR-D), corrected native ancestor authority, service workspace boundary,
+  protected state provisioning, dedicated-account execution and installed M2
+  cargo/Claude Code/activity acceptance. Native and installed paths remain
+  **unverified on real hardware**. The accepted architecture does not accept
+  this implementation automatically.
+- No subagents, push, PR creation, merge, watch, admin/account/right/task/service/
+  install/provision/dispatch/settings operation or old Lab Manager/VM access.
+  Record rollback remains explicitly outside the safety guarantee. No new
+  infrastructure, approval flow, acknowledgement flag or architectural deviation.
+
+## Windows owner provenance integration checkpoint
+
+- Codex / gpt-6.1-sol, medium integrated candidate 120752c onto the current
+  service Application, preserving the Windows namespace policy, typed preflight
+  reasons and protected SQLite hot-journal recovery. Both modules remain exported.
+  The service-boundary owner-plan fixture now passes the Unix `None` observation.
+- Formatting, workspace/all-target Clippy with warnings denied, and all 129
+  runnable Windows nextest tests passed. Two subprocess-only fixtures were skipped
+  directly and exercised by their parents. The bounded owner model and actual
+  normal-user hot-journal regression both passed in this combined run.
+- This is pure owner-provenance logic; no native OwnerStore/LSA/SCM implementation
+  or CLI activation is delivered. Independent Opus review and hosted checks remain
+  required. Installed services and dedicated execution remain **unverified on real hardware**.
+- PR20 attempt 2 Ubuntu job 130573258883 failed at Playwright dependency installation
+  with DNS resolution failures for Ubuntu mirrors, as attempt 1 did. Windows,
+  macOS and independent review passed; the Ubuntu gate remains required. No second
+  automatic retry or check bypass was performed.
+
 ## Hosted hot-journal fixture owner correction
 
 - Codex / gpt-6.1-sol, medium inspected completed Windows job 130585845956
@@ -810,7 +924,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   Clippy with warnings denied, and all three portable owner_unix tests. Native
   Unix manager behavior was not exercised by these Windows checks.
 
-## ADR0014 implementation foundation — incomplete
+## ADR0014 implementation foundation â€” incomplete
 
 - Provider/effort: OpenAI / gpt-6.1-sol / medium. Prepared base verified as
   `d1e2425e8b37c038b65076b799bcbddc332dc597`; initial worktree clean.
@@ -1031,7 +1145,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   **unverified on real hardware**. PR29 remains a work in progress.
 
 
-### ADR0014 phase 3b — bounded local implementation (2026-11-11)
+### ADR0014 phase 3b â€” bounded local implementation (2026-11-11)
 
 - Provider/effort/outcome: OpenAI gpt-6.1-sol / medium; implemented locally,
   independent review pending. Prepared base verified exactly as
@@ -1206,6 +1320,30 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Executor stack gate-test integration
 
 - Codex / gpt-6.1-sol, medium merged reviewed Unix parent follow-up `40ab2f1` into the executor branch, retaining both progress histories. Formatting and locked all-target Clippy passed; six portable Unix-owner tests and ten executor tests passed. No new production behavior is introduced by the parent test delta. The earlier full-suite marker failure remains a separately diagnosed test-fixture defect, with its verified main-based correction preserved on `test/windows-unduplicable-handle-slot`; no full integrated pass is claimed at this checkpoint. Independent executor review and normal hosted gates remain required.
+## PR30 independent safety-guard coverage correction
+
+- Anthropic / claude-opus-5-5, high reviewed a9327cf and found the pure engine
+  correct but requested coverage for two backup safety guards. Codex /
+  gpt-6.1-sol, medium added fresh-observation/stale-plan extraction checks in
+  both presence directions, and direct unresolved-Intent uninstall refusals
+  with and without the right present. Neither test runs recovery first.
+- Both tests passed, then independently removing each production guard made
+  its corresponding test fail at an assertion. Mutations were restored.
+  Production engine bytes remain unchanged. The inherited parent hot-journal
+  owner-fixture correction was integrated without loosening any policy.
+- Corrected the guide: owner-record protection is checked by owner operations,
+  not service startup. The old Journal integration heading is now explicitly
+  superseded. Record-write errors after effect and the model's attribution
+  wording remain a tracked review advisory; existing bounded model counts do
+  not claim to cover every such write outcome.
+- Fresh exact-head independent review and hosted Windows/Ubuntu gates remain
+  required. No native store, LSA/SCM operation, owner activation or M2 acceptance
+  is supplied by these test corrections.
+
+- Combined correction validation: formatting and workspace/all-target Clippy
+  passed, followed by 131/131 Windows nextest tests. Two subprocess-only fixtures
+  were skipped directly and exercised by their parents. Both newly covered
+  guards and the restored-production hot-journal regression passed.
 ## Service lifecycle refresh after merged CI unblock
 
 - Codex / gpt-6.1-sol, medium refreshed #20 from reviewed head `4ead112` against actual main `3b6170b` (#32). The squash tree matches reviewed CI head `d6d3b31`. Only PROGRESS conflicted; both parents' provider tables and evidence were retained, Current state stays first, and last merged PR is #32. #31 is recorded closed as folded into #29.
@@ -1261,6 +1399,111 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared existing #36 locally on refreshed Unix owner branch `9c25864`. Crate, packaging, Cargo/toolchain and script trees remain identical to published `12aa968`; CI workflows/helpers match the parent. Only PROGRESS conflicted; both historical provider tables and task evidence are retained, with Current state first and #21 recorded merged. Formatting and 26/26 helper tests passed. No Rust suites were repeated for unchanged source, no push/new PR and no privileged operation.
 - Full independent interface/MCP review remains required after parent integration. Production dedicated execution still reports MechanismUnavailable; no current-user fallback, actual identity switch or dedicated-account acceptance is added by this history/CI refresh. Known test-only ETW handle fixture correction is retained separately and is not silently folded in. Installed/native M2 execution remains **unverified on real hardware**.
+## Windows owner adapter prerequisite handoff â€” 2026-11-11
+
+- Provider/effort: Codex / gpt-6.1-sol high, implementation sub-agent working
+  alone from `1a45ba15640b608ee4c953a104c06e451a85d07b`, branch
+  `t3/windows-service-owner-adapter`. Outcome: partial transaction prerequisite,
+  **native adapter task incomplete**. Last merged PR and milestone acceptance
+  remain unchanged. No push, PR, merge, watch or delegation.
+  Implementation commit: `e919c4d`.
+- Added an opaque Windows configure-plan extractor and injected durable-intent/
+  grant-receipt/publication recovery engine. Tests cover operation ordering,
+  stale observations, ambiguous LSA/receipt errors, compensation and retry,
+  publish-then-error, foreign-config conflict, existing-right preservation and
+  bounded strict journal parsing. Native `Plan::execute` remains unsafe for
+  configure: do not activate it.
+- Concrete handoff obstacle: a crash between LSA grant and durable receipt leaves
+  ownership ambiguous. Presence of the right cannot prove who granted it. The
+  candidate refuses that state and preserves evidence; native recovery policy
+  and durable uninstall provenance need other-provider architecture/security
+  review. Exact API, integration requirements and all unimplemented native work
+  are documented in service-foundation.md. This is not an ADR amendment.
+- Actual checks: nine new tests passed; 16 combined owner-plan/transaction tests
+  passed; four config and two layout tests passed. `cargo fmt --all -- --check`,
+  `cargo test --workspace --no-run`, and workspace/all-target Clippy with
+  `-D warnings` passed. Two safely
+  restored guard mutations failed assertions. Full workspace runtime tests are
+  excluded because existing tests invoke service dispatch/owner arguments.
+  No privileged, service, dispatch, installation, account/right mutation, settings,
+  provisioning, owner admin step or old Lab Manager/VM operation ran.
+- Pending: native owner_windows adapter, protected file publication and journal
+  storage, SCM/LSA calls and uninstall provenance, independent Opus review and
+  installed-service acceptance. All native paths are **unverified on real hardware**.
+
+- Codex / gpt-6.1-sol, medium closed the fresh-target identity test gap from the independent PR33 review. The new native owned-temp test stages an update, renames the old target, creates a distinct protected file with identical bytes, and asserts that stale publication conflicts before replacement. It covers both owner-record and config targets, preserved target identities/bytes, staging cleanup and a fresh successful transaction as positive control.
+- Removing only the production fresh-target identity comparison made the test fail at its intended conflict assertion. The original production bytes were restored exactly. All 14 owner-store tests, formatting and workspace/all-target Clippy with warnings denied passed. Production behavior is unchanged; hosted checks and a fresh independent exact-head recheck remain required.
+- Production ancestor pins exclude write sharing as well as delete sharing for the duration of an owner command; this can temporarily interfere with other writers to shared ancestors. Native production constructor, actual LSA/SCM, installed ownership and M2 acceptance remain **unverified on real hardware**. Raw session parts must still be narrowed before CLI activation.
+
+## Windows SCM contract alignment
+
+- Anthropic / claude-opus-5-5 / requested high authored `7e4cf06a`: ADR0012 SCM amendment and PR-C brief align demand-start install and last-command boot intent with accepted ADR0014. OpenAI / gpt-6.1-sol / medium independently reviewed both changed documents and recorded `docs/reviews/windows-scm-contract-review.md`. No blockers remain after clarifying native-call deadline limits, accepted stop-control handling, failure-test exceptions and fresh-install ordering.
+- The adapter is not implemented yet. Pure/fake and synthetic-buffer implementation tests are specified; no actual SCM call, service, LSA, account, privilege, elevation or owner setup ran. Installed behavior and M2 acceptance remain **unverified on real hardware**.
+
+## ADR0012 PR-C Windows SCM library implementation (local)
+
+- Provider/effort/outcome: OpenAI / gpt-6.1-sol / high, implementation alone from
+  verified `24d97e16c10a14d4686c6aa6b5b50964916d2eab`. Implementation commit
+  `1c91ed9900cd40726c99c783eedc15787038971b`. Last merged PR is unchanged;
+  this task made no push, PR, GitHub write, merge or watch.
+- Complete: generic lifecycle/classification/status engine; opaque consuming
+  deregistration proof; narrow Windows FFI with RAII handles and checked fixed
+  aligned 8 KiB queries; portable stateful fake SCM/clock and synthetic native
+  structure tests. Install/start/stop persistence follows the revised contract.
+  layout::Error additions match object `1e1e48b` exactly; no Unix implementation
+  source, session/parts, provenance engine, CLI/MCP or Plan::execute changed.
+- Routine API visibility adjustment: WindowsScm is `pub(super)` to respect its
+  private ScmCalls/Clock bounds. This narrows visibility without adding authority;
+  the later wiring slice can export a concrete facade. No architectural deviation.
+- Passed locally on Windows (exact commands):
+  - `cargo build --workspace --all-targets --locked`
+  - `cargo fmt --check`
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  - `cargo nextest run -p arxd service::owner_scm --locked`: 18 passed.
+  - `cargo nextest run --workspace --locked`: final implementation 163 passed,
+    two existing subprocess fixtures skipped directly and exercised by parents;
+    nextest test execution 9.097 s. This is local evidence, not hosted CI timing.
+- Ten actual implementation-source mutations compiled and failed assertions:
+  auto creation, missing auto write, early demand stop, disabled identity,
+  1077 mapping, two recovery actions, case-folded image, ignored delete error,
+  removed deadline, and allowed start-pending registration. Originals restored.
+  Full failure-test names: `docs/reviews/windows-scm-mutation-evidence.md`.
+- The first targeted run exposed two harness errors (proof declaration counted
+  as construction, accepted 1056 incorrectly treated as an immediate halt); both
+  corrected. The mutation driver initially doubled CRLF and rejected its second
+  mutation at compilation; line handling corrected, then all ten compiled and
+  failed tests. Initial Clippy collapsible-if warning corrected. No guard weakened.
+- Blocked check: `cargo check -p arxd --tests --target
+  x86_64-unknown-linux-gnu --locked` failed in bundled SQLite's C build because
+  `x86_64-linux-gnu-gcc` is unavailable. No Unix metadata compilation pass or Unix
+  runtime test is claimed. Unix-host pure tests remain required.
+- No adapter test constructed the native adapter or made any real SCM call,
+  including manager-open/read-only queries. No owner/admin/LSA/account/privilege
+  operation, installation, dispatch or old Lab Manager/VM work was performed.
+  Normal workspace tests retain the existing safe entry-refusal and parent-owned
+  current-user fixtures; ignored fixtures were never run directly.
+- Remaining: independent Opus implementation review and hosted required checks;
+  PR-D proof consumption/session-parts narrowing, fresh protected-state
+  provisioning and CLI wiring; separately reviewed disposable native experiments.
+  LocalSystem/image readback, demand delayed-flag support/preservation, 1077,
+  recovery/delete races, marked-for-delete semantics, privilege ordering/buffer
+  sufficiency, real reboot persistence and privilege sufficiency remain
+  **unverified on real hardware**. Poll deadlines cannot interrupt a blocking RPC.
+  No installed acceptance is established; M2 remains open.
+
+## Windows SCM coordinator checkpoint
+
+- Codex / gpt-6.1-sol, medium verified candidate `6786a6f` on the Windows owner-store stack. Formatting, workspace/all-target locked Clippy and all 18 focused SCM tests passed. Native source is library-only; main/CLI routing is unchanged and no real SCM API call ran. The builder separately reported 163 normal workspace passes and ten restored source mutations caught by assertions. The coordinator did not repeat that full suite in this checkpoint.
+- Architecture has the separate Sol cross-provider review in `docs/reviews/windows-scm-contract-review.md`. Implementation still requires independent Opus review and hosted checks. The distinct-handle marker failure observed on the separate executor-interface branch remains under diagnosis; no fix or global full-suite reliability claim is made here. Installed behavior, root provisioning, real SCM readback/boot semantics and M2 acceptance remain **unverified on real hardware**.
+## Windows provenance queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #30 locally on refreshed Application head `4f29ecf`. Provenance/config/plan source, packaging, Cargo/toolchain and scripts remain byte-identical to independently reviewed `4b2b769`, including both stale-plan directions and direct unresolved-Intent uninstall tests. CI helpers/workflows match the prepared Application. Only PROGRESS conflicted; historical task evidence and all provider rows are preserved. The older prerequisite-handoff section was moved below Current state, restoring the required first section.
+- Formatting and 26/26 CI-helper tests passed. Rust suites were not repeated for a source-identical history/CI update. No push, new feature PR or native owner/admin operation. Publish only after the Application parent lands, then refresh metadata and obtain a fresh exact-head independent recheck. Native provenance/LSA and installed dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Windows owner store and SCM queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #33 on the refreshed #30 branch, then existing #35 on that owner-store branch. Neither head was pushed and no new PR was opened. Source/packaging/Cargo/toolchain/script equivalence is exact against published owner-store `d6df821` and SCM `54c43fb` respectively; CI helpers/workflows match their refreshed parents. Only PROGRESS conflicted; provider rows and historical task evidence are preserved and Current state is first.
+- Formatting and 26/26 CI-helper tests passed on the combined SCM tree. Rust/SCM suites were not repeated for unchanged source. Full SCM independent review remains required; the owner-store fresh identity-test follow-up requires its own exact-head recheck after its parents land. Publication stays in dependency order after #25/#27/#30. No actual SCM/LSA, production owner session, privilege or admin operation. Native installed-service/dedicated-account M2 acceptance remains **unverified on real hardware**.
 ## Native validation refresh after configuration merge
 
 - Codex / gpt-6.1-sol, medium aligned existing #25 with actual configuration squash `2bdcb20`, whose tree is identical to reviewed `9f74919`. Duplicate-history conflicts retained the already validated native-validation tree; the crate, packaging, Cargo/toolchain and script trees remain byte-identical to independently reviewed `d045cc4`, and CI workflows/helpers match merged main. All published history is preserved. No Rust implementation changed. The local preparation passed formatting, 26 helper tests and three portable artifact checks (two native Unix skips); source-equivalent prior Rust verification remains applicable, without claiming it was rerun now.
@@ -1277,7 +1520,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium verified #25 merged as `63b6555` at 17:59:09 UTC through all five gates. Its tree equals independently reviewed `7af3eac`. The local Application already contained that exact parent; duplicate-history squash conflicts retained the current Application tree. Crate/packaging/Cargo/toolchain/script bytes remain identical to public `a08187c` pending the separate sharing fix. No source fix or new acceptance is claimed by this alignment.
 - Main configuration run 43071362527 was independently read from its first-attempt API, success, 2026-11-11T17:46:22Z to 2026-11-11T17:54:32Z = 490 seconds. Current state records the actual latest merge first. PR27 remains blocked by its review finding until the sharing fix, fresh independent review and hosted gates pass. No push/new feature PR or privileged operation; installed-service/dedicated-account paths remain **unverified on real hardware**.
 
-## PR27 blocking ancestor-sharing correction — local candidate
+## PR27 blocking ancestor-sharing correction â€” local candidate
 
 - Provider/effort/task/outcome: OpenAI / gpt-6.1-sol / high; implement only the confirmed retained-ancestor sharing blocker from the [Opus review](https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091). Prepared base `4f29ecf843c01d82fe38da16e8ef42e0b53a7611` on parentpreparedApplication (crate source identical to public `a08187c1e14a5722d4c37bfc9f2690d273d62eb3`). Local implementation complete; independent review/hosted gates pending. Current state and last merged PR above are unchanged; no acceptance claim.
 - Only production change: service `native_windows::open_impl` adds FILE_SHARE_WRITE for non-leaf ancestors, preserving FILE_READ_DATA, retained handles and no FILE_SHARE_DELETE. Immutable final leaves still exclude writers; mutable DB/journal/lock leaves still share read/write without delete sharing. Structural, owner, DACL and namespace checks are unchanged. Owner Windows and development executor source/policies, other protected source and the separate handle-marker patch are untouched. ADR0013 and service-foundation now describe ACL namespace authority and retained nondelete handles accurately, without claiming pins freeze all modification.
@@ -1302,3 +1545,59 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared existing #36 on local Unix owner `06c7f6b`, carrying the corrected Application ancestor-sharing policy. The executor interface/tests, MCP/local transport execution code and store remain byte-identical to published `12aa968`; only inherited parent source and integration history changed. Only PROGRESS conflicted; both provider tables/task histories remain and Current state is first. No push/new PR.
 - Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **149/149 normal nextest** and **26/26 CI-helper tests**. Two subprocess-only fixtures were skipped directly and exercised through parents. Run `275d4aa0-d798-426d-8e77-b6bea179ff77`, 8.020-second test phase. The earlier intermittent #29 run is retained as unresolved rather than declared fixed by this pass. No native owner/SCM/LSA/account/rights/admin/service/VM operation. Full independent interface review and hosted gates remain required; production dedicated execution still refuses MechanismUnavailable and native installed M2 paths remain **unverified on real hardware**.
+## Owner provenance refresh after Application merge
+
+- Codex / gpt-6.1-sol, medium integrated reviewed Application head `0232a80` and actual squash `3f7c515` into existing #30 without rewriting published history. The squash tree equals that reviewed head; duplicate-history conflicts retained the already combined tree. Owner transactions/tests, owner plan and service config remain byte-identical to independently reviewed `4b2b769`; the parent contributes the sharing correction and regression. Workflows/helpers match merged main. Both provider tables and historical evidence are retained, with Current state first.
+- Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **132/132 normal nextest** (two subprocess-only fixtures exercised through parents), and **26/26 CI-helper tests**. Nextest run `a7b71b17-8b59-43e2-8ac5-ef74ec38095e`, 8.445-second test phase. No native owner session, LSA/SCM, account/rights/admin/service or VM operation. #27 merged through all gates at 18:13:01 UTC. Fresh exact-head independent review and hosted checks remain required; native/installed dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Intermittent development execution diagnostic checkpoint
+
+- Anthropic / claude-opus-5-5 / requested high could not reproduce `ExecutionFailed` in 124 isolated runs and three reduced-concurrency arxd suites; CPU-starvation timeout failures were kept separate. No cause or fix was established.
+- Codex / gpt-6.1-sol / medium then ran ten bounded default-concurrency full-workspace diagnostic passes at `f15a271`: nine passed 150/150; one failed only the older handle-slot reuse test. Zero `ExecutionFailed` occurrences or diagnostic error-stage lines. Original source bytes were restored; no instrumentation is committed. Details are in `docs/reviews/development-execution-failure-observations.md`. Passing reruns are not a repair or acceptance claim. Current-parent integration, independent review and hosted gates remain required; installed/dedicated M2 paths are **unverified on real hardware**.
+## Owner store integration with refreshed provenance
+
+- Codex / gpt-6.1-sol, medium prepared existing #33 locally on published provenance `bc3443f`, preserving published history and the Application sharing correction. The owner store, its tests and Cargo dependencies remain byte-identical to `d6df821`; native parsing exports and the new parent sharing test merged cleanly. Current state remains first and provider/task evidence is retained. No push or new feature PR while #30 runs normal gates.
+- Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **146/146 normal nextest** and **26/26 CI-helper tests**. Two subprocess-only fixtures were skipped directly and exercised through parents. Run `f820eda1-f85a-4d0e-9d33-d677b5cb35a6`, 14.628-second test phase. The earlier intermittent #29 combination failures are not claimed fixed by this separate passing run. No production owner session, SYSTEM layout, LSA/SCM/account/rights/admin/service or VM operation. Fresh exact-head independent recheck and hosted gates remain required after the parent merges; production installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## SCM integration with validated owner storage
+
+- Codex / gpt-6.1-sol, medium prepared existing #35 on local owner-store `34a8f92`, carrying the reviewed Application sharing correction and current provenance parent without altering the SCM implementation or its tests. Published history is retained; only PROGRESS conflicted and both provider/evidence histories remain. No push or new feature PR.
+- Actual Windows verification passed: formatting, locked workspace/all-target Clippy with warnings denied, **164/164 normal nextest** and **26/26 CI-helper tests**. Two subprocess-only fixtures were skipped directly and exercised through parents. Run `ecd8ad22-26be-48f4-b5ea-22ff223d3007`, 10.406-second test phase. SCM tests use fake calls and synthetic buffers; no production SCM constructor or actual SCM/LSA/account/rights/admin/service/VM operation ran. Full independent SCM review, publication after #33, hosted gates and installed evidence remain required. Real service registration, delayed start, reboot and dedicated-account M2 acceptance remain **unverified on real hardware**.
+## Protected owner store refresh after provenance merge
+
+- Codex / gpt-6.1-sol, medium aligned existing #33 with actual provenance squash `4f2b0c7`, whose tree equals independently reviewed `bc3443f`. The local store already contained that exact parent; duplicate-history conflicts retained the validated combined tree. Complete crate/packaging/Cargo/toolchain/script trees are identical to tested `34a8f92`; owner_windows source/tests and dependencies remain unchanged from `d6df821`. Workflows/helpers match merged main. All published history and provider/task evidence remain, with Current state first.
+- Existing refreshed-tree verification applies: formatting, locked all-target Clippy, **146/146 normal nextest** (two subprocess fixtures through parents) and **26/26 CI helpers** passed. No test rerun is claimed for this identical-tree metadata refresh. Fresh exact-head independent recheck, including the d6df821 same-content identity-swap test follow-up, and hosted gates remain required. #30 merged at 18:24:31 UTC through all five gates; first-attempt Application main CI passed in 571 seconds. No native owner constructor, LSA/SCM/privilege/account/admin/service/VM operation. Installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## SCM alignment after protected owner-store merge
+
+- Codex / gpt-6.1-sol, medium aligned local #35 with published store `6eb4b9e` and actual squash `7c150f0`, whose trees match. The SCM branch already contained the exact reviewed store source; duplicate-history conflicts retained the validated combination. Crate/packaging/Cargo/toolchain/script trees remain byte-identical to tested `ebe081e` (164 normal tests passed); workflows/helpers match main. No repeated tests are claimed for this metadata-only alignment.
+- #33 merged at 18:34:47 UTC through all five gates, including independent identity-swap mutation coverage. Main provenance run 43077489596 passed on its first attempt in 535 seconds. Current state records the actual merge first. The public SCM head stays frozen at `54c43fb` during its full independent Opus review; no push/new PR or privileged action. A final refresh/recheck and hosted gates remain mandatory. Real SCM readback/registration/reboot and installed/dedicated-account M2 acceptance remain **unverified on real hardware**.
+## Test-only occupied-handle CI correction publication
+
+- Codex / gpt-6.1-sol, medium integrated previously reviewed local `5b2e865` onto actual main `7c150f0`. Anthropic / claude-opus-5-5, requested high authored the diagnosis/patch; the independent Sol patch review is retained in `docs/reviews/windows-unduplicable-slot-review.md`. A valid child ETW registration can refuse duplication with error 50; treating that occupied slot as absent skips the distinct-object marker. The independent SCM review observed this known failure on its old hosted head, so the correction is a CI unblock, not a new feature PR. It does not claim to fix the separate intermittent ExecutionFailed symptoms.
+- All source changes are inside the existing test module and byte-identical to reviewed `5b2e865`. Production code, three-handle inheritance, Job/token checks, dependencies, workflows and timeouts are unchanged. The deterministic unsupported-slot fixture and real-leak countercontrols remain. Actual refreshed Windows verification passed formatting, locked all-target Clippy and **147/147 normal nextest**, with two subprocess-only fixtures exercised through parents; run `df181cad-0001-46ae-b0f8-bb99b0a31198`, 11.024-second test phase.
+- This separate one-concern test PR is the narrow CI exception to the feature-PR pause; it does not resume feature publication and keeps the open queue below the original 16-PR cap. Fresh published-head integration review and all hosted gates remain required. No production owner/SCM/LSA/privilege/account/admin/service/VM operation; installed/dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Windows ETW handle-slot fixture correction
+### Earlier local preparation
+
+- Anthropic / claude-opus-5-5 / requested high diagnosed the missing marker: valid child ETW-registration slots can reject duplication with error 50; the fixture treated that as absent. The deterministic new seam failed 50/50 without the correction and passed 100/100 with it. The author reports 1000 parallel plus 300 sequential original-test passes and real-leak mutation detection; records are retained in `docs/reviews/windows-handle-reuse-marker-failure.md`.
+- OpenAI / gpt-6.1-sol / medium independently reviewed and applied the test-only patch on main `0ceb174`. Personally reproduced the fallback-disabled failure and real handle-list-removal leak failure, restored all bytes, and passed formatting, locked all-target Clippy and **61/61 nextest tests** with zero skipped. See `docs/reviews/windows-unduplicable-slot-review.md`. Production behavior is unchanged; hosted checks and normal merge gates remain required. No installed-service or dedicated-account acceptance is claimed.
+
+## Unix owner integration with merged protected storage and CI fixture
+
+- Codex / gpt-6.1-sol / medium merged actual main `f06e9a2` into the local Unix owner candidate after recording the bounded diagnostic result. Preserved both typed Unix lifecycle modules and the Windows protected owner-store module; foundation and provider history retained. The merged PR37 test-only handle correction is included. No native authority or CLI activation is added. Combined checks and independent review remain required before publication; installed/dedicated M2 paths remain **unverified on real hardware**.
+
+- Combined-tree validation at `06e8f68` passed formatting, locked workspace/all-target Clippy, **165/165 normal nextest**, **26/26 CI helpers** and artifact checks (**3 passed, 2 native Unix skips**). Two subprocess-only fixtures were exercised through their parents. Nextest run `b33a8813-53b7-48ec-897f-feea93182ccd`, 10.474-second test phase. No recurrence is claimed repaired by this passing combination. Fresh independent exact-head review and hosted gates remain mandatory; no native owner, SCM/LSA or privileged acceptance ran.
+## SCM full review and readback-test correction
+
+- Anthropic / claude-opus-5-5, high completed the full public SCM review at `54c43fb`: no blocking findings, 18 focused tests passed, six of seven mutations caught. The surviving mutation removed install demand-start readback; evidence is https://github.com/Dytschgo/arxcovo/pull/35#issuecomment-6804334081. The public head was frozen throughout that review. Architecture credit remains the independent Sol contract review, not Opus self-review.
+- Codex / gpt-6.1-sol, medium added a fake manager that can report success without applying a start-type write. The new case requires registration to refuse the still-auto readback, then succeed on the same stopped registration once writes apply. Disabling only the real readback guard compiled and failed that exact new assertion (Ok versus expected Manager); production source was restored byte-for-byte. All 19 focused SCM tests pass. No production SCM behavior changed.
+- Integrated merged test-only #37 into the validated parent stack and corrected the inherited progress-ordering regression: Current state is first, with exactly one queue-priority row; the earlier local handle preparation is grouped under its publication record. Main #33 run is now recorded completed at 532 seconds. ADR0012/SCM brief status is current; empty-privilege and exact-deadline native assumptions are explicit, not claimed fixed.
+- Actual final validation passed formatting, locked workspace/all-target Clippy and **166/166 normal nextest**, with two subprocess-only fixtures exercised through parents; run `3cd2ff71-c6f1-4e4a-95b3-4d48702b3e62`, 10.155-second test phase. Existing ExecutionFailed diagnosis remains separate and unresolved. Fresh exact-head recheck of the strengthened test/integration and all hosted gates remain required. No real SCM/LSA/privilege/account/admin/service/VM operation. Installed/native dedicated-account M2 paths remain **unverified on real hardware**.
+
+## Unix owner refresh after SCM merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #35 squash `cd464b2` while preserving published #29 history. Typed Unix gates and Windows provenance remain intact; shared error variants and owner modules merged without a source conflict. Independent exact-head review and hosted gates remain required. Native installed/service/dedicated M2 acceptance remains **unverified on real hardware**.
+
+- Final SCM/Unix combined verification at `63af692` passed formatting, locked workspace/all-target Clippy and **184/184 normal nextest**, two subprocess fixtures exercised through parents; run `dc2e7bef-7883-46db-a3ef-2fb74bb6b122`, 10.435-second test phase. Existing helper/artifact bytes are unchanged from the preceding 26-helper and 3-artifact pass. Corrected the SCM brief to distinguish malformed single-NUL input from a valid double-NUL empty privilege list, matching the independent review. No production code changed for that wording correction.

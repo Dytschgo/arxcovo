@@ -1,5 +1,85 @@
 # Service config and owner-plan foundation
 
+## Windows owner transaction prerequisite: incomplete adapter handoff
+
+Superseded design note: ADR 0012 settles the native Windows contract. It defines
+the owner record, the lock, compare-and-replace, recovery and uninstall
+provenance, and it replaces the `Journal`/`ConfigurationIo` shape and the
+compensation path described below. The API text below records the `a8628c6`
+candidate only.
+
+Sol / gpt-6.1-sol high, implementation sub-agent, base
+`1a45ba15640b608ee4c953a104c06e451a85d07b`. This change implements only an
+injected configure transaction prerequisite. It does **not** implement the
+requested native owner install/configure/uninstall adapter. No
+`owner_windows.rs`, native mutation, CLI/MCP route or auto-install is supplied.
+The existing `Plan::execute` remains nontransactional: do not use it for native
+Windows configure. Other-provider review remains pending. This candidate does
+not amend ADR0009 or establish M2 acceptance.
+
+Recovery obstacle: `configure_plan` orders `BatchRight(add)` before
+`AtomicConfig`. The LSA grant and filesystem publication have no common atomic
+commit. A process can die after changing the right and before durably recording
+success. Neither durable intent nor subsequent right presence proves who added
+the right. Automatically revoking in that state violates the ownership fence.
+The new engine preserves ambiguous evidence and refuses further mutation.
+Native recovery and durable uninstall ownership evidence still need architecture/
+security review and implementation; no product approval flow is introduced.
+
+Exact callable API in `service::owner_transactions`:
+
+- `Configure::from_plan(&Layout, &Plan, &impl Resolver) -> Result<Configure, Failure>`:
+  Windows configure shapes only; fresh new/expected config validation, build-pin
+  equality and grant-record consistency. Read-only `bytes()`, `expected()`,
+  `sid()`, `adds_right()` contain private data.
+- `configure(&Configure, &mut impl ConfigurationIo) -> Result<(), Failure>`:
+  refuse outstanding journal; prepare/flushed staging; durable intent; exact SID
+  grant; durable success receipt; publish. Grant/receipt errors preserve intent.
+  Publication errors invoke receipt-backed recovery. Pre-existing rights create
+  no new receipt and are never compensated.
+- `recover(&mut impl ConfigurationIo) -> Result<Recovery, Failure>`:
+  `Clean`, `Published` or `Compensated`. Intent always refuses regardless of
+  right presence. A granted receipt plus matching new config retains the right;
+  matching old config permits compensation. Other bytes refuse; failed
+  compensation/cleanup retains the receipt for retry.
+- `Journal::{encode, decode}`: bounded (1024 bytes), strict, versioned encoding.
+  Parsing is not provenance. Journal/Configure omit Debug; errors are fixed.
+- `ConfigurationIo`: `journal`, `prepare`, `write_journal`, `grant_batch`,
+  `revoke_batch`, `publish`, `config_hash`, `clear_journal`. Only the recording
+  test model implements this trait here.
+
+Coordinator requirements before activation: authenticate a native session,
+acquire the fixed transaction lock and validate elevation/current-binary file
+identity/layout protections **before any I/O method**, including recovery.
+Retain that authority and source/ancestor handles through use. `prepare` must
+revalidate accounts, actual right observations and exact expected config bytes.
+Implement exclusive protected SYSTEM-owner staging and atomic journal/config
+publication, strict ACL/inheritance/owner policy and reparse/hardlink refusal;
+never repair foreign objects. Resolve target-handle sharing for atomic replacement
+without losing target identity. Define the fixed private journal path, abandoned
+staging cleanup, and grant provenance retained after successful configure,
+including uninstall/reconfigure/reinstall semantics. Do not use right presence
+or `granted_batch_right` alone as a native uninstall receipt. Ambiguous intent
+must never invent ownership. Hashes compare config bytes, not filesystem identity,
+ACLs, journal origin or durability. Concurrent privileged account/right writers
+require explicit treatment; the model does not serialize them.
+
+Still absent: genuine native owner preconditions/file writes, SCM registration
+and identical-only verification, fixed service-state mapping, bounded stop/remove,
+LSA mutation, uninstall receipt storage and non-Windows native refusal entry.
+Do not wire CLI/Application to this candidate until implementation and independent
+review. Installed/native paths remain **unverified on real hardware**.
+
+Actual Windows evidence: nine new recording/parser/plan tests and all 16
+owner-plan/transaction tests passed. Two restored source mutations were killed
+by assertions: bypass intent refusal; bypass old-config hash check before revoke.
+Four config and two layout tests also passed. `cargo fmt --all -- --check`,
+`cargo test --workspace --no-run` and
+`cargo clippy --workspace --all-targets -- -D warnings` passed. These do not
+establish native ACL/atomic rename/LSA/SCM behavior. Full workspace runtime
+execution is excluded because existing tests launch `service run` (SCM dispatch)
+and owner-command arguments, explicitly prohibited on this PC even for tests.
+
 This M2 slice is library-only. It does not install, configure or start a service.
 No agent-facing API or CLI selects these plans. The lifecycle production entry
 continues to fail closed. No current-user execution config was added.
@@ -586,3 +666,153 @@ tools and timestamp in memory; preserve unavailable status until genuine backend
 preflight succeeds. Installed-manager, identity-switch, cross-user isolation,
 containment and dedicated-account cargo/Claude Code/activity acceptance remain
 **unverified on real hardware**. M2 stays open.
+
+## ADR 0012 pure owner provenance candidate (PR-A)
+
+This replaces the obsolete Journal/ConfigurationIo compensation engine. The
+Windows-only engine uses OwnerRecord (strict serde version 1, canonical ordinary
+SID, lowercase RightState, deny unknown/duplicate fields and trailing data,
+512-byte decode cap). The record and Configure have no Debug output. Errors and
+RightReport display fixed tokens, never private owner data. Decoding bytes does
+not establish authority: only the future SYSTEM-private OwnerStore under the
+owner lock does. OwnerStore supplies exact-byte hashes for compare-and-replace;
+BatchRight observes only the explicit SID's direct SeBatchLogonRight assignment.
+
+API sequence for a future Windows session, all under one lock: recover(store,
+right), observe_batch(build_sid, store, right), configure_plan(layout, context,
+config, previous, Some(batch), resolver), Configure::from_plan(layout, plan,
+resolver, batch), configure(request, store, right). BatchObservation is opaque,
+Copy, and obtainable publicly only through observe_batch; neither MCP booleans
+nor config mirrors can construct it. configure rereads the record and observation
+before staging; pending Intent refuses, protected cross-SID provenance refuses,
+and stale presence or recorded-grant evidence conflicts. A successful absent
+observation plus successful grant can produce Granted. Intent recovery produces
+None or Unproven, never Granted. Neither configure nor recover calls revoke.
+Publication errors retain the record and never compensate.
+
+Windows uninstall uses owner_plan(layout, context, Uninstall) without config or
+resolver, then the future checked SCM stop/delete, then uninstall_right(store,
+right), with recovery first. uninstall_right accepts no config, account name or
+workspace; only a Granted record authorizes revoke, using its exact SID. The
+compatibility uninstall_plan wrapper ignores previous/resolver on Windows and
+emits no BatchRight operations. Plan::execute refuses Windows configure and
+uninstall before applying any operation; future wiring must use the session.
+
+Unix configure_plan uses the same position with None instead of the old ignored
+batch-present bool. Some is rejected on Unix; None is rejected on Windows. Unix
+config validation, rights/drop-in planning, previous-identity checks, uninstall
+revalidation and direct Plan::execute semantics remain intact. This deliberately
+requires a call-site adjustment to Unix candidate 7e12abf / PR29 by the coordinator;
+it does not require Unix LSA or owner provenance. No legacy boolean Windows
+configure route remains. The old granted_batch_right config field is used only
+as a mirror and to reproduce canonical expected old bytes, never as authority.
+This optional typed parameter is an implementation choice within ADR 0012.
+
+The depth-6 model runs the real engine across every call prefix (cutoffs 0..15
+plus completion), configure/uninstall with recovery, Ok/Err-with-effect/Err-
+without-effect right mutations and external add/remove between commands. The
+cutoff stops all subsequent adapter effects, making it equivalent to termination
+at that boundary; all completed record publications remain visible. It merges
+identical future-relevant states, including ghost history, rather than launching
+redundant test processes. Independent ghost attribution records the last
+acknowledged record write and whether the latest external add occurred outside
+Granted authority; it does not reproduce engine branch decisions. P6b permits
+membership rollback to either previously seen value with records retained. P6c
+also permits record rollback to any previously seen record value (no lookback
+cutoff), reproduces decision 6's exact counterexample and requires every unsafe
+revoke to follow a restored Granted over a later non-Granted write. P6c is a
+characterization outside the guarantee. Seeded receipt-boundary mutations that
+take a pre-existing right or promote recovery to Granted must each produce unsafe
+revoke witnesses under P6. These are bounded abstract state results, not physical
+NTFS, LSA, power-loss or registry ordering evidence.
+
+No native store, LSA, SCM, filesystem mutation adapter, CLI or MCP activation is
+supplied here. D1 ancestor authority, D2 service workspace boundary, native
+publication/locking/LSA/SCM tests, installed wiring/provisioning, dedicated-account
+execution and installed M2 acceptance remain open. All native/installed paths
+are **unverified on real hardware**. Accepted architecture is not implementation
+acceptance; a fresh independent Opus review is required.
+
+## PR29 shared owner-plan compatibility integration
+
+The Unix candidate now incorporates merged ADR 0012 provenance main. Unix
+configure call sites pass None, Windows supplies Some(BatchObservation), and
+Windows uninstall never derives authority from the retained config mirror.
+The typed Unix Operation variants and lifecycle gates remain unchanged. The
+existing direct Windows configure/uninstall execution refusal remains in force;
+Unix injected-manager execution remains available. This reconciliation adds no
+CLI activation, native authority or architecture deviation. Verification and
+the unresolved normal Windows ExecutionFailed recurrence are in PROGRESS.md.
+
+## ADR0012 PR-B callable native candidate
+
+The local PR-B candidate adds `service::owner_windows` on Windows. Public API:
+`WindowsOwnerSession::open() -> Result<Self, OpenError>` validates production
+owner authority and fixed layout/binary identity, enables restore privilege,
+acquires the existing owner lock, cleans checked staging leftovers and invokes
+engine recovery. It takes no path, SID, descriptor, resolver or policy argument.
+`parts(&mut self) -> (&mut WindowsOwnerStore, &mut WindowsBatchRight)` lends the
+locked adapters together to the pure engine; neither adapter has a public
+constructor. `WindowsOwnerStore::read_config()` returns optional bounded exact
+protected bytes; the store implements OwnerStore and the right adapter implements
+BatchRight. None of these types Debug-print private payloads. OpenError displays
+only existing layout/Failure tokens.
+
+The session owns the staging and target handles, strict ancestor/binary pins and
+exclusive lock, dropping the lock last. Publication uses create-new staging,
+explicit SYSTEM owner/private descriptor, same-handle protection/bytes, exact
+SHA256 comparisons and handle-based rename with final file-ID/byte verification.
+A rename-attempt error has unknown publication outcome; callers must reread on
+the next session. Pre-rename cleanup is checked and acts on the retained source
+handle only. Unsafe leftovers are preserved and refused. Config parsing performs
+fresh native account validation and owner-only metadata inspection; it grants
+no provenance authority. No service workspace access is added.
+
+Twelve normal-user tests cover ADR N1-N10 and source/target race controls. N9
+checks the exact production descriptor in memory and rejects altered owner,
+inheritance and foreign grants. N10 exercises synthetic LSA buffers/statuses;
+no actual LSA policy is opened by tests. Test-only current-user policy cannot
+be selected in production. See PROGRESS for executed commands and mutation
+controls. Production privileged layout/identity/LSA behavior remains **unverified
+on real hardware**. This candidate adds no SCM executor, CLI/MCP route, install
+activation or Plan::execute path, and confers no installed/M2 acceptance. The
+PR-A engine remains under independent review coordinated by the coordinator.
+
+## ADR0012 PR-C library candidate
+
+`service::owner_scm` contains a generic SCM lifecycle engine with observe,
+register, start, stop, status and deregister methods. Its seam and concrete
+facade currently have service-module visibility to respect private trait bounds;
+PR-D may expose a concrete facade. Status, Boot and Observation carry only fixed
+values. The non-Clone/non-Copy/non-Default opaque Deregistered proof records an
+absent service or successful deletion request followed by a stopped/gone
+observation; it does not promise physical database-entry disappearance.
+
+Registration consumes owner_plan::Registration and uses the exact quoted UTF-16
+image. Identity requires exact own-process type, LocalSystem, and demand or auto
+start. Config2 requires the exact four-privilege set, delayed flag, unrestricted
+SID, preshutdown, restart 5s/30s/explicit-none recovery and non-crash flag. Install
+converges only while stopped, writes demand before config2, then reads everything
+back. Start selects auto and reasserts delayed before activation. Stop selects
+demand only after stopped. A successful STOP is never repeated while polling.
+Marked-for-delete is accepted only at deregistration's demand/delete writes.
+
+The Windows seam uses RAII handles, operation-specific access, one aligned fixed
+8 KiB buffer per query and safe checked-slice parsing of embedded pointer values.
+No embedded pointer is dereferenced. The injected 30s/35s deadlines bound polling;
+they cannot interrupt an in-flight synchronous native RPC. Fake SCM boot/crash
+models are explicit models, not Windows reboot or recovery evidence. Synthetic
+native structures require no SCM constructor or native service query.
+
+This slice changes no session, raw parts, provenance engine, right-removal path,
+Plan::execute, CLI or MCP route. PR-D must consume the proof before right removal,
+narrow session parts, implement safe fresh-install provisioning and run start
+preflight. Owner-store and service-state provisioning remain separate work.
+
+All installed/native SCM behavior remains **unverified on real hardware**:
+LocalSystem/image readback; demand-start delayed flag support and preservation;
+1077 on never-started/rebooted demand services; crash recovery during deletion;
+marked-for-delete handle/API behavior; privilege ordering and buffer sufficiency;
+real reboot persistence; and sufficiency of the four privileges. These require a
+separately reviewed disposable hosted-runner experiment. Independent Opus review
+and hosted required checks remain required; M2 is open.

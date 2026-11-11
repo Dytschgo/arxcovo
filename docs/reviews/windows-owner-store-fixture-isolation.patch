@@ -1,0 +1,112 @@
+diff --git a/crates/arxd/src/service/owner_windows_tests.rs b/crates/arxd/src/service/owner_windows_tests.rs
+index cbc27f9..03f68b4 100644
+--- a/crates/arxd/src/service/owner_windows_tests.rs
++++ b/crates/arxd/src/service/owner_windows_tests.rs
+@@ -1,17 +1,34 @@
+ use super::*;
+ static FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
++// A directory rename opens its target parent for write. Concurrent native
++// fixtures pin the shared temporary directory without write sharing (ancestor
++// rule), so renamed fixture parents live under a test-owned outer directory.
+ struct Fixture {
+-    dir: tempfile::TempDir,
++    dir: PathBuf,
++    _outer: tempfile::TempDir,
+     _serial: std::sync::MutexGuard<'static, ()>,
+ }
+ impl Fixture {
+     fn path(&self) -> &Path {
+-        self.dir.path()
++        &self.dir
+     }
+ }
+ fn fixture() -> (Fixture, ProtectionPolicy) {
+     let serial = FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+-    let dir = tempfile::tempdir().unwrap();
++    let outer = tempfile::tempdir().unwrap();
++    let dir = outer.path().join("owner");
++    let policy = prepare(&dir);
++    (
++        Fixture {
++            dir,
++            _outer: outer,
++            _serial: serial,
++        },
++        policy,
++    )
++}
++fn prepare(dir: &Path) -> ProtectionPolicy {
++    std::fs::create_dir(dir).unwrap();
+     let who = crate::local::current_identity().unwrap();
+     let policy = ProtectionPolicy {
+         fixture_owner: Some(who.clone()),
+@@ -28,12 +45,7 @@ fn fixture() -> (Fixture, ProtectionPolicy) {
+             GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted),
+             0
+         );
+-        let mut path: Vec<u16> = dir
+-            .path()
+-            .as_os_str()
+-            .encode_wide()
+-            .chain(Some(0))
+-            .collect();
++        let mut path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+         assert_eq!(
+             SetNamedSecurityInfoW(
+                 path.as_mut_ptr(),
+@@ -52,7 +64,7 @@ fn fixture() -> (Fixture, ProtectionPolicy) {
+     let sd = descriptor(&policy.creation_descriptor()).unwrap();
+     drop(
+         raw_open(
+-            &dir.path().join("owner.lock"),
++            &dir.join("owner.lock"),
+             GENERIC_WRITE,
+             FILE_SHARE_READ,
+             CREATE_NEW,
+@@ -60,13 +72,7 @@ fn fixture() -> (Fixture, ProtectionPolicy) {
+         )
+         .unwrap(),
+     );
+-    (
+-        Fixture {
+-            dir,
+-            _serial: serial,
+-        },
+-        policy,
+-    )
++    policy
+ }
+ fn session(root: &Path, policy: ProtectionPolicy) -> Result<WindowsOwnerStore, Failure> {
+     // Fixture authority is only this test's private parent. Validate the
+@@ -488,19 +494,18 @@ fn create_new_race_and_staged_source_substitution_refuse() {
+ 
+ #[test]
+ fn sibling_fixture_sessions_release_only_their_own_parent() {
+-    let (first, policy) = fixture();
+-    let Fixture {
+-        dir: first,
+-        _serial,
+-    } = first;
+-    drop(_serial);
+-    let (second, other_policy) = fixture();
+-    let store = session(first.path(), policy).unwrap();
+-    let other = session(second.path(), other_policy).unwrap();
++    // Both parents share one owned directory, so a session that retained an
++    // ancestor pin would still block its sibling's rename.
++    let _serial = FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
++    let outer = tempfile::tempdir().unwrap();
++    let (first, second) = (outer.path().join("first"), outer.path().join("second"));
++    let (policy, other_policy) = (prepare(&first), prepare(&second));
++    let store = session(&first, policy).unwrap();
++    let other = session(&second, other_policy).unwrap();
+     drop(store);
+-    let moved = first.path().with_extension("moved");
+-    std::fs::rename(first.path(), &moved).expect("dropped fixture parent is released");
+-    std::fs::rename(&moved, first.path()).unwrap();
+-    assert!(std::fs::rename(second.path(), second.path().with_extension("moved")).is_err());
++    let moved = first.with_extension("moved");
++    std::fs::rename(&first, &moved).expect("dropped fixture parent is released");
++    std::fs::rename(&moved, &first).unwrap();
++    assert!(std::fs::rename(&second, second.with_extension("moved")).is_err());
+     drop(other);
+ }
