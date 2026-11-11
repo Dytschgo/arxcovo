@@ -55,15 +55,34 @@ impl Listener {
         std::fs::set_permissions(&endpoint.address, std::fs::Permissions::from_mode(0o600))?;
         Ok(listener)
     }
-    pub async fn accept(&mut self) -> Result<UnixStream> {
-        loop {
-            let (stream, _) = self.listener.accept().await?;
-            if stream.peer_cred()?.uid() == self.uid {
-                return Ok(stream);
+}
+impl super::Acceptor for Listener {
+    type Stream = UnixStream;
+    async fn accept(&mut self) -> Result<Option<UnixStream>> {
+        let (stream, _) = match self.listener.accept().await {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(None);
             }
-        }
+            Err(error) => return Err(error.into()),
+        };
+        // Credential lookup can fail after an early disconnect (notably macOS
+        // LOCAL_PEEREPID). Never admit that peer or tear down the listener.
+        let identity_matches = stream
+            .peer_cred()
+            .map(|cred| cred.uid() == self.uid)
+            .map_err(Into::into);
+        Ok(super::verified_peer(stream, identity_matches))
     }
 }
+
 impl Drop for Listener {
     fn drop(&mut self) {
         // Never remove a replacement, symlink or foreign object. Foreground-owner

@@ -153,28 +153,64 @@ impl Listener {
             endpoint: endpoint.clone(),
         })
     }
-    pub async fn accept(&mut self) -> Result<NamedPipeServer> {
-        self.next.connect().await?;
-        let next = create(&self.endpoint, false)?;
-        Ok(std::mem::replace(&mut self.next, next))
+}
+impl super::Acceptor for Listener {
+    type Stream = NamedPipeServer;
+    async fn accept(&mut self) -> Result<Option<NamedPipeServer>> {
+        if let Err(error) = self.next.connect().await {
+            if !matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
+                return Err(error.into());
+            }
+            // Reuse the reserved instance after a disconnected client. Failure
+            // to reset it is a listener failure, never a tight retry loop.
+            if let Err(reset) = self.next.disconnect()
+                && !matches!(reset.raw_os_error(), Some(109 | 232 | 233))
+            {
+                return Err(reset.into());
+            }
+            return Ok(None);
+        }
+        // Keep the existing instance reserved while replenishing. Retry transient
+        // creation failures at most three times; persistent failure is fatal.
+        for attempt in 0..3 {
+            match create(&self.endpoint, false) {
+                Ok(next) => {
+                    return Ok(super::verified_peer(
+                        std::mem::replace(&mut self.next, next),
+                        Ok(true),
+                    ));
+                }
+                Err(error) if attempt == 2 => return Err(error),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        unreachable!()
     }
 }
+
 pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
     unsafe {
         let wide: Vec<u16> = config.address.encode_utf16().chain(Some(0)).collect();
         // Specific rights match the DACL, and anonymous SQOS prevents impersonation.
-        let handle = CreateFileW(
-            wide.as_ptr(),
-            0x12019b,
-            0,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
-            ptr::null_mut(),
-        );
-        if handle == INVALID_HANDLE_VALUE {
-            bail!("endpoint unavailable");
-        }
+        let handle = loop {
+            let handle = CreateFileW(
+                wide.as_ptr(),
+                0x12019b,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+                ptr::null_mut(),
+            );
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
+            if GetLastError() != ERROR_PIPE_BUSY {
+                bail!("endpoint unavailable");
+            }
+            // Caller bounds the whole connect/identity stage to AUTH_TIMEOUT.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         let stream = NamedPipeClient::from_raw_handle(handle.cast())?;
         let mut owner = ptr::null_mut();
         let mut sd = ptr::null_mut();

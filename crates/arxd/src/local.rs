@@ -1,9 +1,9 @@
 //! Opt-in local inventory transport. No execution or service authority.
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rmcp::{ServiceExt, transport::async_rw::AsyncRwTransport};
 use serde::Deserialize;
 use std::{io::Read, path::Path, sync::Arc, time::Duration};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 #[cfg(windows)]
 #[path = "local_windows.rs"]
@@ -13,7 +13,7 @@ mod platform;
 mod platform;
 
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
-pub const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(300);
 pub const FRAME_LIMIT: usize = 8192;
 
 #[derive(Clone, Deserialize)]
@@ -77,7 +77,20 @@ impl ClientConfig {
     }
 }
 
+// Credential-query failure is a rejected peer, never an authenticated fallback.
+fn verified_peer<S>(stream: S, identity_matches: Result<bool>) -> Option<S> {
+    match identity_matches {
+        Ok(true) => Some(stream),
+        _ => None,
+    }
+}
+
 /// Exposed for the daemon and tests; construction reserves the endpoint exclusively.
+// None is a rejected/disconnected peer; Err is a listener failure.
+trait Acceptor {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    fn accept(&mut self) -> impl std::future::Future<Output = Result<Option<Self::Stream>>> + Send;
+}
 pub struct Listener(platform::Listener);
 impl Listener {
     pub fn bind(endpoint: &Endpoint) -> Result<Self> {
@@ -85,29 +98,50 @@ impl Listener {
         Ok(Self(platform::Listener::bind(endpoint)?))
     }
     pub async fn run(
-        mut self,
+        self,
         config: Arc<crate::config::Config>,
         activity: Arc<crate::store::Activity>,
     ) -> Result<()> {
-        let capacity = Arc::new(tokio::sync::Semaphore::new(8));
-        let mut tasks = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                stream = self.0.accept() => {
-                    let stream = stream?;
-                    let Ok(permit) = capacity.clone().try_acquire_owned() else { continue; };
-                    let config = config.clone();
-                    let activity = activity.clone();
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        let _ = tokio::time::timeout(SESSION_TIMEOUT, connection(stream, config, activity)).await;
-                    });
-                }
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
-            }
-        }
-        // JoinSet aborts all connections when the listener future is dropped.
+        run_listener(self.0, config, activity).await
     }
+}
+async fn run_listener(
+    mut listener: impl Acceptor,
+    config: Arc<crate::config::Config>,
+    activity: Arc<crate::store::Activity>,
+) -> Result<()> {
+    let capacity = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut reported_rejection = false;
+    loop {
+        while tasks.try_join_next().is_some() {}
+        tokio::select! {
+            stream = listener.accept() => {
+                let Some(stream) = stream? else {
+                    if !reported_rejection {
+                        eprintln!("arxd: server-peer-rejected");
+                        reported_rejection = true;
+                    }
+                    // Rate-limit rejection work, including credential lookup failures.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+                let Ok(permit) = capacity.clone().try_acquire_owned() else {
+                    drop(stream);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                };
+                let config = config.clone();
+                let activity = activity.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let _ = connection(stream, config, activity).await;
+                });
+            }
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+        }
+    }
+    // JoinSet aborts all connections when the listener future is dropped.
 }
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
@@ -126,22 +160,42 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .ok_or_else(|| anyhow::anyhow!("authentication failed"))
     })
     .await??;
-    stream.write_all(b"OK\n").await?;
+    tokio::time::timeout(AUTH_TIMEOUT, stream.write_all(b"OK\n")).await??;
     let (read, write) = tokio::io::split(stream);
     let handler = crate::mcp::Inventory {
         activity,
         principal: Some(crate::mcp::Principal(principal)),
     };
-    let service = handler
-        .serve(AsyncRwTransport::new_server(read, write).with_max_line_length(FRAME_LIMIT))
-        .await?;
-    service.waiting().await?;
+    // Apply identical bounded framing to SDK input and output. Idle authenticated
+    // sessions may retain one of eight slots; partial frames and writes time out.
+    let (sdk, pump) = tokio::io::duplex(FRAME_LIMIT);
+    let (sdk_read, sdk_write) = tokio::io::split(sdk);
+    let (pump_read, pump_write) = tokio::io::split(pump);
+    let protocol = async {
+        let service = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            handler.serve(
+                AsyncRwTransport::new_server(sdk_read, sdk_write).with_max_line_length(FRAME_LIMIT),
+            ),
+        )
+        .await??;
+        service.waiting().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::select! {
+        result = protocol => result?,
+        result = forward(read, pump_write) => result?,
+        result = forward(pump_read, write) => result?,
+    }
     Ok(())
 }
 
 /// No credential bytes are written until connect() has verified kernel identity.
 pub async fn bridge(config: ClientConfig) -> Result<()> {
-    let mut stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config)).await??;
+    let mut stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config))
+        .await
+        .context("peer-connect-timeout")?
+        .context("peer-connect-or-identity")?;
     tokio::time::timeout(AUTH_TIMEOUT, async {
         stream.write_all(b"ARX1 ").await?;
         stream.write_all(config.token.as_bytes()).await?;
@@ -153,7 +207,9 @@ pub async fn bridge(config: ClientConfig) -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await??;
+    .await
+    .context("peer-auth-timeout")?
+    .context("peer-auth-rejected")?;
     drop(config);
     let (read, write) = tokio::io::split(stream);
     // MCP's official newline-delimited stdio wire format, unchanged end to end.
@@ -163,13 +219,18 @@ pub async fn bridge(config: ClientConfig) -> Result<()> {
         result = forward(read, tokio::io::stdout()) => result,
     }
 }
-async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut read: R,
-    mut write: W,
-) -> Result<()> {
+async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, mut write: W) -> Result<()> {
+    let mut read = BufReader::with_capacity(FRAME_LIMIT, read);
     loop {
-        let mut line = Vec::new();
-        let present = tokio::time::timeout(SESSION_TIMEOUT, async {
+        let mut first = [0];
+        if read.read(&mut first).await? == 0 {
+            return Ok(());
+        }
+        let mut line = vec![first[0]];
+        let present = tokio::time::timeout(FRAME_TIMEOUT, async {
+            if first[0] == b'\n' {
+                return Ok(true);
+            }
             loop {
                 let mut byte = [0];
                 if read.read(&mut byte).await? == 0 {
@@ -202,6 +263,162 @@ async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Scripted(std::collections::VecDeque<Result<Option<tokio::io::DuplexStream>>>);
+    impl Acceptor for Scripted {
+        type Stream = tokio::io::DuplexStream;
+        async fn accept(&mut self) -> Result<Option<Self::Stream>> {
+            match self.0.pop_front() {
+                Some(value) => value,
+                None => std::future::pending().await,
+            }
+        }
+    }
+    #[tokio::test]
+    async fn rejected_peer_then_sdk_initialize_and_fatal_listener_error() {
+        use sha2::{Digest, Sha256};
+        #[cfg(target_os = "macos")]
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        unsafe {
+            use std::{os::windows::ffi::OsStrExt, ptr};
+            use windows_sys::Win32::{
+                Foundation::LocalFree,
+                Security::{Authorization::*, *},
+            };
+            let identity = platform::current_identity().unwrap();
+            let text: Vec<u16> = format!("D:P(A;OICI;FA;;;{identity})")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut sd = ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    1,
+                    &mut sd,
+                    ptr::null_mut()
+                ),
+                0
+            );
+            let (mut present, mut defaulted) = (0, 0);
+            let mut acl = ptr::null_mut();
+            assert_ne!(
+                GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted),
+                0
+            );
+            let path: Vec<u16> = dir
+                .path()
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    acl,
+                    ptr::null_mut()
+                ),
+                0
+            );
+            LocalFree(sd);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The test seam injects the same rejected-peer outcome used by failed
+        // kernel credential lookups; subsequent traffic uses the real SDK.
+        let token = "a".repeat(64);
+        let cfg = Arc::new(crate::config::Config {
+            local: None,
+            listen: None,
+            state_dir: dir.path().into(),
+            agents: vec![crate::config::Agent {
+                principal: "fixture".into(),
+                token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+            }],
+        });
+        let activity = Arc::new(crate::store::Activity::open(dir.path()).unwrap());
+        let (mut client, server) = tokio::io::duplex(FRAME_LIMIT);
+        let (rejected, _other) = tokio::io::duplex(128);
+        let rejected = verified_peer(
+            rejected,
+            Err(std::io::Error::from(std::io::ErrorKind::NotConnected).into()),
+        );
+        let task = tokio::spawn(run_listener(
+            Scripted([Ok(rejected), Ok(Some(server))].into()),
+            cfg.clone(),
+            activity.clone(),
+        ));
+        client
+            .write_all(format!("ARX1 {token}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut ack = [0; 3];
+        tokio::time::timeout(AUTH_TIMEOUT, client.read_exact(&mut ack))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ack, b"OK\n");
+        let (read, write) = tokio::io::split(client);
+        let peer = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            ().serve(AsyncRwTransport::new_client(read, write)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(peer.list_tools(None).await.is_ok());
+        tokio::time::pause();
+        tokio::time::advance(FRAME_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(
+            peer.list_tools(None).await.is_ok(),
+            "initialized SDK session must survive idle beyond the old total lease"
+        );
+        peer.cancel().await.unwrap();
+        assert!(!task.is_finished());
+        task.abort();
+        let _ = task.await;
+        let result = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            run_listener(
+                Scripted([Err(anyhow::anyhow!("injected listener failure"))].into()),
+                cfg,
+                activity,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "unrecoverable listener errors must terminate, never spin"
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn idle_frames_survive_but_partial_frames_expire() {
+        let (mut input, reader) = tokio::io::duplex(128);
+        let (writer, mut output) = tokio::io::duplex(128);
+        let task = tokio::spawn(forward(reader, writer));
+        tokio::task::yield_now().await;
+        tokio::time::advance(FRAME_TIMEOUT * 2).await;
+        assert!(!task.is_finished());
+        input.write_all(b"ok\n").await.unwrap();
+        let mut frame = [0; 3];
+        output.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"ok\n");
+        input.write_all(b"partial").await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(FRAME_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(task.await.unwrap().is_err());
+    }
     #[tokio::test]
     async fn bridge_frames_are_bounded_and_partial_frames_are_withheld() {
         for payload in [vec![b'x'; FRAME_LIMIT + 1], b"partial".to_vec()] {
