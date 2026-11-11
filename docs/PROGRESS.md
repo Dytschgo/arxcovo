@@ -744,3 +744,22 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   native hot-journal regression passed locally. Hosted full-admin-token evidence
   is still pending; this correction does not establish installed SYSTEM/root
   or physical-power-loss recovery. Those paths remain **unverified on real hardware**.
+
+## Unix lifecycle contract accepted for implementation
+
+- Anthropic / claude-opus-5-5, high authored ADR0014 and corrected the independent
+  Sol finding about reinstall boot intent. Codex / gpt-6.1-sol, medium rechecked
+  all four corrected documents at d1ef91b and accepted the contract, with the
+  upgrade guide clarified to use the old installed binary for uninstall.
+- The contract now puts Installable before any mutation, refuses active or
+  foreign/unknown registrations, preserves retained activity history, and
+  explicitly disables boot intent on a successful inactive install. The known
+  stale-enable reboot window and macOS unpinned query results remain explicit.
+- The PR29 branch now includes the current parent preflight, protected SQLite
+  recovery and explicit fixture-owner correction, plus the accepted docs. No
+  lifecycle code correction has been implemented by this integration. No manager,
+  owner or privileged operation ran; installed paths remain **unverified on real hardware**.
+
+- Coordinator preparation checks passed: formatting, workspace/all-target
+  Clippy with warnings denied, and all three portable owner_unix tests. Native
+  Unix manager behavior was not exercised by these Windows checks.
