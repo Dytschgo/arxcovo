@@ -21,7 +21,15 @@ class DnsObservationTests(unittest.TestCase):
         self.assertEqual(value["schemaVersion"], 1)
         self.assertEqual([r["target"] for r in value["observations"]],
                          [label for label, _ in diagnostic.TARGETS])
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(diagnostic.TARGETS, (
+            ("ubuntu_azure", "azure.archive.ubuntu.com"),
+            ("ubuntu_archive", "archive.ubuntu.com"),
+            ("ubuntu_security", "security.ubuntu.com"),
+            ("kernel_mirror_control", "mirrors.edge.kernel.org"),
+            ("github_control", "github.com"),
+            ("microsoft_control", "packages.microsoft.com"),
+        ))
         self.assertLessEqual(len(encoded), 1024)
         self.assertNotIn("private", encoded)
         self.assertEqual({tuple(args) for args, _ in calls},

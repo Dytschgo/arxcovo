@@ -8,6 +8,7 @@ TARGETS = (
     ("ubuntu_azure", "azure.archive.ubuntu.com"),
     ("ubuntu_archive", "archive.ubuntu.com"),
     ("ubuntu_security", "security.ubuntu.com"),
+    ("kernel_mirror_control", "mirrors.edge.kernel.org"),
     ("github_control", "github.com"),
     ("microsoft_control", "packages.microsoft.com"),
 )
