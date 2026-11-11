@@ -9,8 +9,9 @@ or removes anything. The only manager command vectors are:
 - Linux: `/usr/bin/systemctl show` for `arxd.service`, requesting only
   `LoadState`, `ActiveState`, `FragmentPath` and `DropInPaths`.
 
-ADR 0014 is currently on [PR29's pinned contract](https://github.com/Dytschgo/arxcovo/blob/1e1e48b5636eb1d171affa8784fee6dc1a48534e/docs/adr/0014-unix-owner-lifecycle-corrections.md),
-not on main. This diagnostic does not require that branch at runtime.
+[ADR 0014](../../docs/adr/0014-unix-owner-lifecycle-corrections.md) is now on
+main through merged PR #29 (`aafaa3c`). This diagnostic collects evidence without
+enabling the production parser.
 
 Each child has a six-second polling deadline after process creation, a combined
 16 KiB stdout/stderr cap, then a kill and bounded one-second reap if needed.
@@ -36,8 +37,10 @@ The initial source `533ec14` macOS observation is retained separately in
 `docs/evidence/macos-manager-observations.json`: the absent job returned 113;
 the Apple control returned zero, but a broad state scan reported duplicate
 fields. The current diagnostic limits launchd state/path/PID fields to the
-one-tab outer job level, excluding nested dictionaries. That refinement still
-needs hosted confirmation; the original record is never rewritten to match it.
+one-tab outer job level, excluding nested dictionaries. The refinement passed
+hosted macOS at historical source `50a5303` (run 43056868647); the current parent
+integration still needs its own hosted checks. The original record is never
+rewritten to match a later diagnostic.
 
 Run `python -m unittest discover -s tools/ci -p test_observe_manager.py`.
 Three tests use ordinary Python child processes on Unix to verify output caps,

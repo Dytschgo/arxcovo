@@ -1550,3 +1550,5 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Unix manager observations after lifecycle merge
 
 - Codex / gpt-6.1-sol / medium refreshed existing #34 on actual main `aafaa3c`. ADR0014 now exists on its base; historical observations remain unchanged and are not represented as fresh native captures. The workflow retains both the main macOS directory observation and the separate read-only manager diagnostic. No production parser, owner command or activation changes. Fresh independent exact-head review and required hosted checks remain pending.
+
+- Refreshed #34 helper suite: **36 passed, 3 Unix-only child tests skipped on Windows**. A mutation leaking an unknown outer field value failed the privacy test, then the helper was restored byte-for-byte. Historical manager JSON still equals published `738a2c9`. Updated README to link ADR0014 now on main and distinguish historical hosted refinement evidence from current pending integration checks. No manager query or native acceptance ran.
