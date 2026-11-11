@@ -16,17 +16,24 @@ pub fn execute(plan: &Plan) -> Result<(), Error> {
     #[cfg(unix)]
     {
         let mut manager = imp::Manager::new()?;
-        for op in plan.operations() {
-            allowed(&manager.layout, op)?;
-        }
-        for op in plan.operations() {
-            executable(op)?;
-        }
-        plan.execute(&mut manager)
+        manager.execute(plan.operations())
     }
     #[cfg(not(unix))]
     {
         let _ = plan;
+        Err(Error::NativeAdapterMissing)
+    }
+}
+
+/// Fixed read-only status. Production requires the same root identity and
+/// installed-binary integrity boundary as execute; no caller-selected paths.
+pub fn status() -> Result<super::owner_query::Status, Error> {
+    #[cfg(unix)]
+    {
+        imp::Manager::new()?.status()
+    }
+    #[cfg(not(unix))]
+    {
         Err(Error::NativeAdapterMissing)
     }
 }
@@ -82,21 +89,11 @@ fn command(platform: Platform, program: &str, args: &[&str], when: Gate) -> bool
         _ => false,
     }
 }
-/// Phase 3 must implement these semantics before native lifecycle execution.
+/// Phase 3b operations refuse during whole-plan validation before any mutation.
 #[cfg(any(unix, test))]
 fn executable(op: &Operation) -> Result<(), Error> {
     match op {
-        Operation::Expect(_)
-        | Operation::StartPreflight
-        | Operation::ProvisionState
-        | Operation::Constant {
-            when: ConstantGate::UnitAbsent,
-            ..
-        }
-        | Operation::Command {
-            when: Gate::Loaded | Gate::NotLoaded | Gate::ArtifactPresent,
-            ..
-        } => Err(Error::Manager),
+        Operation::StartPreflight | Operation::ProvisionState => Err(Error::Manager),
         _ => Ok(()),
     }
 }
@@ -157,6 +154,8 @@ mod imp {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
+
+    use super::super::owner_query::{self, Artifact, Query, Status};
 
     // Only tests can choose a different root or expected identity. Production
     // always starts at / and requires native root:root, including real IDs.
@@ -427,6 +426,8 @@ mod imp {
     pub(super) struct Manager {
         pub(super) layout: Layout,
         fs: Fs,
+        runner: Runner,
+        skipped: usize,
     }
     impl Manager {
         pub(super) fn new() -> Result<Self, Error> {
@@ -446,7 +447,55 @@ mod imp {
                 gid: 0,
             };
             fs.verify(layout.binary(), Policy::BinaryIntegrity, true)?;
-            Ok(Self { layout, fs })
+            Ok(Self {
+                layout,
+                fs,
+                runner: Runner::Native,
+                skipped: 0,
+            })
+        }
+        pub(super) fn execute(&mut self, operations: &[Operation]) -> Result<(), Error> {
+            for op in operations {
+                allowed(&self.layout, op)?;
+                executable(op)?;
+            }
+            for op in operations {
+                self.apply(op)?;
+            }
+            Ok(())
+        }
+        fn observe(&mut self) -> Result<(Query, Artifact), Error> {
+            let primary = self.fs.artifact(
+                self.layout.artifact(),
+                if self.layout.platform() == Platform::Linux {
+                    UNIT
+                } else {
+                    PLIST
+                },
+            )?;
+            if self.layout.platform() == Platform::Linux
+                && self.fs.artifact(Path::new(DROPIN_PATH), DROPIN)? == Artifact::Foreign
+            {
+                return Err(Error::Foreign);
+            }
+            if primary == Artifact::Foreign {
+                return Err(Error::Foreign);
+            }
+            let query = self.runner.query(&self.fs, self.layout.platform());
+            query.gate(Gate::Always, primary)?;
+            Ok((query, primary))
+        }
+        pub(super) fn status(&mut self) -> Result<Status, Error> {
+            let (q, a) = self.observe()?;
+            if self.layout.platform() == Platform::Linux {
+                q.linux_status(a)
+            } else {
+                match (a, q) {
+                    (Artifact::Absent, Query::Absent) => Ok(Status::NotInstalled),
+                    (Artifact::Identical, Query::Absent) => Ok(Status::Stopped),
+                    _ => Err(Error::Manager),
+                }
+            }
         }
         pub(super) fn provision(&self) -> Result<(), Error> {
             identity()?;
@@ -454,6 +503,18 @@ mod imp {
         }
     }
     impl Fs {
+        fn artifact(&self, path: &Path, expected: &[u8]) -> Result<Artifact, Error> {
+            let Some((p, n)) = self.parent(path)? else {
+                return Ok(Artifact::Absent);
+            };
+            let Some(mut f) = self.open_at(&p, &n, false)? else {
+                return Ok(Artifact::Absent);
+            };
+            match self.bytes(&mut f, 0o644, expected.len()) {
+                Ok(bytes) if bytes == expected => Ok(Artifact::Identical),
+                _ => Ok(Artifact::Foreign),
+            }
+        }
         fn provision(&self, state: &Path) -> Result<(), Error> {
             self.verify(state, Policy::PrivateDirectory, true)?;
             let (p, _) = self
@@ -506,10 +567,16 @@ mod imp {
     }
     impl OsManager for Manager {
         fn apply(&mut self, op: &Operation) -> Result<(), Error> {
-            identity()?;
+            if matches!(self.runner, Runner::Native) {
+                identity()?;
+            }
             allowed(&self.layout, op)?;
             executable(op)?;
             match op {
+                Operation::Expect(expect) => {
+                    let (q, a) = self.observe()?;
+                    q.expect(*expect, a, self.layout.platform())
+                }
                 Operation::Verify {
                     path,
                     policy,
@@ -523,7 +590,15 @@ mod imp {
                         0o755
                     },
                 ),
-                Operation::Constant { path, bytes, .. } => {
+                Operation::Constant { path, bytes, when } => {
+                    if *when == ConstantGate::UnitAbsent {
+                        let (q, a) = self.observe()?;
+                        q.gate(Gate::Always, a)?;
+                        if a != Artifact::Absent {
+                            self.skipped += 1;
+                            return Ok(());
+                        }
+                    }
                     if path == Path::new(DROPIN_PATH) {
                         self.fs
                             .directory(path.parent().ok_or(Error::Layout)?, 0o755)?;
@@ -544,16 +619,75 @@ mod imp {
                     ServiceConfig::parse(bytes, &self.layout, &NativeResolver)?;
                     self.fs.config(path, bytes, expected)
                 }
-                Operation::Command { program, args, .. } => {
-                    self.fs
-                        .verify(Path::new(program), Policy::BinaryIntegrity, true)?;
-                    run(program, args)
+                Operation::Command {
+                    program,
+                    args,
+                    when,
+                } => {
+                    if *when != Gate::Always {
+                        let (q, a) = self.observe()?;
+                        if !q.gate(*when, a)? {
+                            self.skipped += 1;
+                            return Ok(());
+                        }
+                    }
+                    self.runner.command(&self.fs, program, args)
                 }
                 _ => Err(Error::NativeAdapterMissing),
             }
         }
     }
-    fn run(program: &str, args: &[&str]) -> Result<(), Error> {
+    enum Runner {
+        Native,
+        #[cfg(test)]
+        Script {
+            queries: std::collections::VecDeque<Query>,
+            results: std::collections::VecDeque<Result<(), Error>>,
+            calls: Vec<Vec<String>>,
+        },
+    }
+    impl Runner {
+        fn query(&mut self, fs: &Fs, platform: Platform) -> Query {
+            #[cfg(test)]
+            if let Self::Script { queries, calls, .. } = self {
+                calls.push(vec!["query".into()]);
+                return queries.pop_front().expect("unexpected query");
+            }
+            let (program, args, cap) = match platform {
+                Platform::Linux => ("/usr/bin/systemctl", owner_query::SYSTEMD_QUERY, 4096),
+                Platform::Macos => ("/bin/launchctl", owner_query::LAUNCHD_QUERY, 65536),
+                _ => return Query::Unknown,
+            };
+            if fs
+                .verify(Path::new(program), Policy::BinaryIntegrity, true)
+                .is_err()
+            {
+                return Query::Unknown;
+            }
+            match bounded(program, args, Some(cap), Duration::from_secs(10)) {
+                Ok(bytes) if platform == Platform::Linux => owner_query::systemd(true, &bytes),
+                Ok(bytes) => owner_query::launchd(true, &bytes),
+                Err(_) => Query::Unknown,
+            }
+        }
+        fn command(&mut self, fs: &Fs, program: &str, args: &[&str]) -> Result<(), Error> {
+            #[cfg(test)]
+            if let Self::Script { results, calls, .. } = self {
+                calls.push(args.iter().map(|s| (*s).to_owned()).collect());
+                return results.pop_front().expect("unexpected command");
+            }
+            fs.verify(Path::new(program), Policy::BinaryIntegrity, true)?;
+            bounded(program, args, None, Duration::from_secs(35)).map(|_| ())
+        }
+    }
+    // Nonblocking pipe reads keep timeout/reaping independent of inherited pipe
+    // handles. Retained output is capped, and no child output escapes this module.
+    fn bounded(
+        program: &str,
+        args: &[&str],
+        cap: Option<usize>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, Error> {
         let mut child = Command::new(program)
             .args(args)
             .env_clear()
@@ -564,36 +698,73 @@ mod imp {
             .env("SYSTEMD_COLORS", "0")
             .current_dir("/")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(if cap.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| Error::Manager)?;
-        let deadline = Instant::now() + Duration::from_secs(35);
-        loop {
-            match child.try_wait() {
-                Ok(Some(s)) => {
-                    return if s.success() {
-                        Ok(())
-                    } else {
-                        Err(Error::Manager)
-                    };
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                _ => {
-                    let _ = child.kill();
-                    let reap_deadline = Instant::now() + Duration::from_secs(1);
-                    while Instant::now() < reap_deadline {
-                        if matches!(child.try_wait(), Ok(Some(_))) {
-                            break;
+        let result = (|| {
+            if let Some(pipe) = &child.stdout
+                && unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
+            {
+                return Err(Error::Manager);
+            }
+            let deadline = Instant::now() + timeout;
+            let mut output = Vec::new();
+            let mut exited = None;
+            loop {
+                let mut eof = cap.is_none();
+                if let Some(pipe) = child.stdout.as_mut() {
+                    let mut buf = [0; 1024];
+                    // Bound each pass too: a noisy child cannot starve the deadline.
+                    for _ in 0..65 {
+                        match pipe.read(&mut buf) {
+                            Ok(0) => {
+                                eof = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                if output.len() + n > cap.unwrap_or(0) {
+                                    return Err(Error::Manager);
+                                }
+                                output.extend_from_slice(&buf[..n]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => return Err(Error::Manager),
                         }
-                        std::thread::sleep(Duration::from_millis(20));
                     }
+                }
+                if exited.is_none() {
+                    exited = child.try_wait().map_err(|_| Error::Manager)?;
+                }
+                if let Some(status) = exited {
+                    if !status.success() {
+                        return Err(Error::Manager);
+                    }
+                    if eof {
+                        return Ok(output);
+                    }
+                }
+                if Instant::now() >= deadline {
                     return Err(Error::Manager);
                 }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
+        result
     }
     #[cfg(test)]
     mod fixtures {
@@ -609,6 +780,245 @@ mod imp {
                 gid: unsafe { libc::getegid() },
             };
             (dir, fs)
+        }
+        fn manager(
+            platform: Platform,
+            queries: Vec<Query>,
+            results: Vec<Result<(), Error>>,
+        ) -> (tempfile::TempDir, Manager) {
+            let (dir, fs) = fixture();
+            let layout = Layout::for_test(platform);
+            let mut paths = vec![layout.artifact().parent().unwrap().to_path_buf()];
+            if platform == Platform::Linux {
+                paths.push(Path::new(DROPIN_PATH).parent().unwrap().to_path_buf());
+            }
+            for path in paths {
+                let mut current = std::path::PathBuf::from("/");
+                for part in parts(&path).unwrap() {
+                    current.push(part);
+                    fs.directory(&current, 0o755).unwrap();
+                }
+            }
+            (
+                dir,
+                Manager {
+                    layout,
+                    fs,
+                    skipped: 0,
+                    runner: Runner::Script {
+                        queries: queries.into(),
+                        results: results.into(),
+                        calls: vec![],
+                    },
+                },
+            )
+        }
+        fn cmd(platform: Platform, verb: &'static str, when: Gate) -> Operation {
+            Operation::Command {
+                program: if platform == Platform::Linux {
+                    "/usr/bin/systemctl"
+                } else {
+                    "/bin/launchctl"
+                },
+                args: if verb == "bootstrap" {
+                    vec![verb, "system", owner_query::PLIST_PATH]
+                } else if platform == Platform::Linux {
+                    vec![verb, "arxd.service"]
+                } else {
+                    vec![verb, owner_query::LAUNCHD_TARGET]
+                },
+                when,
+            }
+        }
+        fn calls(m: &Manager) -> Vec<Vec<String>> {
+            match &m.runner {
+                Runner::Script { calls, .. } => calls.clone(),
+                _ => panic!("script only"),
+            }
+        }
+        #[test]
+        fn scripted_whole_uninstall_orders_commands_and_removes_only_after_proof() {
+            use super::super::super::owner_plan::{Action, OwnerContext, owner_plan};
+            for platform in [Platform::Linux, Platform::Macos] {
+                let q = Query::Ours(if platform == Platform::Linux {
+                    owner_query::State::Stopped
+                } else {
+                    owner_query::State::Loaded
+                });
+                let queries = if platform == Platform::Linux {
+                    vec![q, q, q, Query::Absent]
+                } else {
+                    vec![q, q, Query::Absent]
+                };
+                let (_dir, mut m) = manager(platform, queries, vec![Ok(()), Ok(()), Ok(())]);
+                let mut current = std::path::PathBuf::from("/");
+                for part in parts(m.layout.binary().parent().unwrap()).unwrap() {
+                    current.push(part);
+                    m.fs.directory(&current, 0o755).unwrap();
+                }
+                m.fs.constant(m.layout.binary(), b"fixture binary", false)
+                    .unwrap();
+                for path in m.layout.private_dirs() {
+                    let local = _dir.path().join(path.strip_prefix("/").unwrap());
+                    if local.exists() {
+                        std::fs::set_permissions(local, std::fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                    }
+                }
+
+                let bytes = if platform == Platform::Linux {
+                    UNIT
+                } else {
+                    PLIST
+                };
+                m.fs.constant(m.layout.artifact(), bytes, false).unwrap();
+                let plan = owner_plan(
+                    &m.layout,
+                    &OwnerContext {
+                        admin: true,
+                        running_binary: m.layout.binary(),
+                    },
+                    Action::Uninstall,
+                )
+                .unwrap();
+                m.execute(plan.operations()).unwrap();
+                assert_eq!(
+                    m.fs.artifact(m.layout.artifact(), bytes).unwrap(),
+                    Artifact::Absent
+                );
+                let observed = calls(&m);
+                let verbs: Vec<_> = observed.iter().map(|v| v[0].as_str()).collect();
+                assert_eq!(
+                    verbs,
+                    if platform == Platform::Linux {
+                        vec![
+                            "query",
+                            "query",
+                            "disable",
+                            "query",
+                            "stop",
+                            "query",
+                            "daemon-reload",
+                        ]
+                    } else {
+                        vec!["query", "disable", "query", "bootout", "query"]
+                    }
+                );
+            }
+        }
+        #[test]
+        fn scripted_fresh_gates_skip_and_bootstrap_once() {
+            let (_dir, mut m) = manager(
+                Platform::Macos,
+                vec![Query::Absent, Query::Ours(owner_query::State::Loaded)],
+                vec![Ok(())],
+            );
+            let op = cmd(Platform::Macos, "bootstrap", Gate::NotLoaded);
+            m.execute(&[op.clone(), op]).unwrap();
+            assert_eq!(m.skipped, 1);
+            assert_eq!(
+                calls(&m),
+                vec![
+                    vec!["query"],
+                    vec!["bootstrap", "system", owner_query::PLIST_PATH],
+                    vec!["query"]
+                ]
+            );
+        }
+        #[test]
+        fn scripted_halts_on_unknown_foreign_active_and_stop_proof() {
+            for (q, error) in [
+                (Query::Unknown, Error::Manager),
+                (Query::Foreign, Error::Foreign),
+                (Query::Ours(owner_query::State::Running), Error::Active),
+            ] {
+                let (_dir, mut m) = manager(Platform::Linux, vec![q], vec![]);
+                assert_eq!(
+                    m.execute(&[
+                        Operation::Expect(owner_query::Expect::Installable),
+                        cmd(Platform::Linux, "disable", Gate::Always)
+                    ]),
+                    Err(error)
+                );
+                assert_eq!(calls(&m), vec![vec!["query"]]);
+            }
+            for q in [Query::Unknown, Query::Ours(owner_query::State::Running)] {
+                let (_dir, mut m) = manager(Platform::Linux, vec![q], vec![Ok(())]);
+                m.fs.constant(m.layout.artifact(), UNIT, false).unwrap();
+                let ops = [
+                    cmd(Platform::Linux, "stop", Gate::Always),
+                    Operation::Expect(owner_query::Expect::Unloaded),
+                    Operation::RemoveConstant {
+                        path: m.layout.artifact().into(),
+                        expected: UNIT,
+                    },
+                ];
+                assert_eq!(m.execute(&ops), Err(Error::Manager));
+                assert_eq!(
+                    m.fs.artifact(m.layout.artifact(), UNIT).unwrap(),
+                    Artifact::Identical
+                );
+                assert_eq!(calls(&m), vec![vec!["stop", "arxd.service"], vec!["query"]]);
+            }
+        }
+        #[test]
+        fn scripted_command_failure_halts_suffix_and_unsupported_scanned_first() {
+            let (_dir, mut m) = manager(Platform::Linux, vec![], vec![Err(Error::Manager)]);
+            let stop = cmd(Platform::Linux, "stop", Gate::Always);
+            assert_eq!(
+                m.execute(&[stop.clone(), stop.clone()]),
+                Err(Error::Manager)
+            );
+            assert_eq!(calls(&m).len(), 1);
+            for unsupported in [Operation::StartPreflight, Operation::ProvisionState] {
+                let (_dir, mut m) = manager(Platform::Linux, vec![], vec![]);
+                assert_eq!(m.execute(&[stop.clone(), unsupported]), Err(Error::Manager));
+                assert!(calls(&m).is_empty());
+            }
+        }
+        #[test]
+        fn scripted_constants_check_all_artifacts_and_preserve_installed_choice() {
+            let (_dir, mut m) = manager(
+                Platform::Linux,
+                vec![Query::Ours(owner_query::State::Stopped)],
+                vec![],
+            );
+            m.fs.constant(m.layout.artifact(), UNIT, false).unwrap();
+            m.execute(&[Operation::Constant {
+                path: DROPIN_PATH.into(),
+                bytes: DROPIN,
+                when: ConstantGate::UnitAbsent,
+            }])
+            .unwrap();
+            assert_eq!(
+                m.fs.artifact(Path::new(DROPIN_PATH), DROPIN).unwrap(),
+                Artifact::Absent
+            );
+            m.fs.constant(Path::new(DROPIN_PATH), b"foreign", false)
+                .unwrap();
+            assert_eq!(m.status(), Err(Error::Foreign));
+        }
+        #[test]
+        fn ordinary_process_timeout_and_output_bounds() {
+            assert_ne!(unsafe { libc::geteuid() }, 0);
+            let start = Instant::now();
+            assert_eq!(
+                bounded("/bin/sleep", &["5"], None, Duration::from_millis(100)),
+                Err(Error::Manager)
+            );
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert_eq!(
+                bounded("/bin/echo", &["1234"], Some(4), Duration::from_secs(1)),
+                Err(Error::Manager)
+            );
+            assert_eq!(
+                bounded("/bin/echo", &["1234"], Some(5), Duration::from_secs(1)).unwrap(),
+                b"1234\n"
+            );
+            assert_eq!(
+                bounded("/bin/false", &[], None, Duration::from_secs(1)),
+                Err(Error::Manager)
+            );
         }
         #[test]
         fn cas_refuses_stale_missing_and_unsafe_existing_objects() {
@@ -745,6 +1155,7 @@ mod imp {
             )
             .unwrap();
             assert_eq!(super::super::execute(&p), Err(Error::OwnerRequired));
+            assert_eq!(super::super::status(), Err(Error::OwnerRequired));
         }
         #[test]
         fn unsafe_lexical_paths_and_optional_symlinks_refuse() {
@@ -784,10 +1195,13 @@ mod tests {
             ] {
                 let plan = super::super::owner_plan::owner_plan(&l, &c, action).unwrap();
                 assert!(plan.operations().iter().all(|op| allowed(&l, op).is_ok()));
-                assert!(
-                    plan.operations()
-                        .iter()
-                        .any(|op| executable(op) == Err(Error::Manager))
+                assert_eq!(
+                    plan.operations().iter().any(|op| executable(op).is_err()),
+                    matches!(
+                        action,
+                        super::super::owner_plan::Action::Install
+                            | super::super::owner_plan::Action::Start
+                    )
                 );
             }
             assert_eq!(
