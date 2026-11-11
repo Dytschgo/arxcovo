@@ -353,3 +353,49 @@ mod tests {
         assert!(r.account("secret-marker\0").is_err());
     }
 }
+
+// Diagnostic evidence only: these reads never relax an ancestor policy or
+// establish installed-service acceptance. Keep output to public fixed labels.
+#[cfg(all(test, target_os = "macos"))]
+mod stock_directory_observations {
+    use super::*;
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+    #[test]
+    fn fixed_system_directory_observations() {
+        let mut rows = Vec::new();
+        for (label, path) in [
+            ("library", "/Library"),
+            ("application_support", "/Library/Application Support"),
+            ("private", "/private"),
+            ("var", "/private/var"),
+            ("runtime_parent", "/private/var/run"),
+        ] {
+            // Descriptor-relative no-follow traversal; no privileged operation.
+            // trusted=false permits observation of a policy refusal, not use of
+            // the object as protected service state.
+            let observed = os::open(Path::new(path), true, false, false)
+                .expect("fixed system directory read-only observation");
+            let metadata = observed.file.metadata().unwrap();
+            assert!(metadata.is_dir());
+            let empty_acl = macos::empty_acl(observed.file.as_raw_fd()).is_ok();
+            let protection = os::protection(&observed.file);
+            let policy_accepts = protection.as_ref().is_ok_and(|p| {
+                check_protection(os::PLATFORM, Policy::BinaryIntegrity, true, p).is_ok()
+            });
+            rows.push(serde_json::json!({
+                "target": label,
+                "root_owner": metadata.uid() == 0,
+                "group_zero": metadata.gid() == 0,
+                "mode": metadata.mode() & 0o7777,
+                "empty_acl_confirmed": empty_acl,
+                "current_integrity_policy_accepts": policy_accepts,
+            }));
+        }
+        let encoded = serde_json::to_string(&rows).unwrap();
+        assert!(encoded.len() <= 2048);
+        assert_eq!(rows.len(), 5);
+        // No account names, raw IDs, paths, directory listings or file contents.
+        println!("ARXCOVO_STOCK_DIRECTORY_OBSERVATIONS={encoded}");
+    }
+}

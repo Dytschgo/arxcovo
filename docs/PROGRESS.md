@@ -521,3 +521,22 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Native ancestor correction coordinator integration
 
 - Codex / gpt-6.1-sol, medium integrated candidate12081f2 with reviewed configuration parentaadfa05 and merged main28 handle regression. Renumbered the Windows namespace ADR to0013 to reserve0012 for the separate owner-recovery contract. Combined formatting, workspace/all-target Clippy with warnings denied and all103 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Builder evidence reports eleven caught/restored mutations and native AccessCheck controls. Fresh exact-head independent review and hosted checks remain pending. PR27 sharing corrections must be preserved when the parent is integrated there; macOS ancestry and installed-service acceptance remain open.
+
+## macOS stock-directory observation preparation
+
+- Codex / gpt-6.1-sol, medium added a read-only macOS fixture and a targeted
+  hosted CI invocation to retain its bounded output. It opens five fixed system
+  directories with descriptor-relative no-follow traversal and reports fixed
+  labels, root-owner/group-zero booleans, mode bits, ACL-check success and the
+  existing integrity-policy result. No raw IDs, account names, paths, directory
+  listings or contents are emitted. It changes no owner, permission or policy.
+- This is diagnostic evidence collection, not a passing startup/containment
+  assertion. A diagnostic pass means the observations were captured, even when
+  the policy rejects a stock folder. Native macOS execution remains pending;
+  Windows-only checks cannot establish these facts. Architecture/security review
+  is required before any rule is relaxed. Installed services remain
+  **unverified on real hardware**.
+
+- Windows formatting and all-target Clippy passed for this diagnostic candidate.
+  They do not compile or execute the macOS-only fixture. Hosted macOS collection
+  and independent review are pending; no startup-policy result is claimed.
