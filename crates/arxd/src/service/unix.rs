@@ -92,13 +92,25 @@ impl Reporter for Notify {
     }
 }
 pub fn run() -> ExitCode {
-    // Slice 3 owns Layout::system and slice 4 owns fixed config validation.
-    // Until the real adapter is supplied there is nothing safe to start, even
-    // if fixed files happen to exist. No environment/argv layout override.
-    ExitCode::Layout
+    // Service-only process: ensure no temporary socket/journal is exposed.
+    unsafe {
+        libc::umask(0o077);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return ExitCode::Layout,
+    };
+    let code = runtime.block_on(run_application(
+        &mut super::application::ServiceApplication::native(),
+    ));
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    code
 }
 
-/// Injection seam for the later real fixed-layout adapter. Signals are installed
+/// Lifecycle seam used by the fixed-layout adapter. Signals are installed
 /// before startup and remain active through bounded cleanup.
 pub async fn run_application<A: super::Application>(app: &mut A) -> ExitCode {
     let signals = match Signals::install() {

@@ -28,7 +28,13 @@ async fn service_run_requires_exact_arguments() {
     }
 }
 #[tokio::test]
-async fn service_entry_fails_closed_without_manager_or_integration() {
+async fn service_entry_refuses_unmanaged_or_unprivileged_startup() {
+    #[cfg(unix)]
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this fixture must run unprivileged"
+    );
     let output = binary(&["service", "run"]).await;
     assert!(output.stdout.is_empty());
     #[cfg(windows)]
@@ -38,10 +44,7 @@ async fn service_entry_fails_closed_without_manager_or_integration() {
     }
     #[cfg(unix)]
     {
-        assert_eq!(output.status.code(), Some(7));
-        assert_eq!(
-            output.stderr,
-            b"arxd: service-layout-or-integration-unavailable\n"
-        );
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(output.stderr, b"arxd: service-permissions\n");
     }
 }
