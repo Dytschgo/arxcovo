@@ -637,3 +637,55 @@ async fn report_boundary_case_6() {
 async fn report_boundary_case_7() {
     report_boundary_case(7).await;
 }
+
+#[test]
+#[cfg(windows)]
+fn windows_console_device_names_refuse_lexically() {
+    for name in ["CONIN$", "conout$", "CONIN$.other"] {
+        assert!(
+            !absolute_executable(&format!(r"C:\synthetic\{name}.exe")),
+            "{name}"
+        );
+        assert!(
+            !absolute_executable(&format!(r"C:\{name}\tool.exe")),
+            "{name}"
+        );
+    }
+}
+#[test]
+#[cfg(windows)]
+fn windows_superscript_port_names_refuse_lexically() {
+    for prefix in ["COM", "lpt"] {
+        for digit in ['¹', '²', '³'] {
+            let name = format!("{prefix}{digit}");
+            assert!(
+                !absolute_executable(&format!(r"C:\synthetic\{name}.exe")),
+                "{name}"
+            );
+            assert!(
+                !absolute_executable(&format!(r"C:\{name}\tool.exe")),
+                "{name}"
+            );
+        }
+    }
+}
+#[test]
+#[cfg(windows)]
+fn windows_spaced_reserved_bases_refuse_lexically() {
+    for name in ["CON ", "AUX  ", "NUL ", "COM1 ", "LPT³ ", "CONOUT$ "] {
+        assert!(
+            !absolute_executable(&format!(r"C:\synthetic\{name}.exe")),
+            "{name}"
+        );
+    }
+}
+#[test]
+#[cfg(windows)]
+fn ordinary_device_like_filenames_remain_lexically_valid() {
+    for name in ["CONSOLE", "CONIN$tool", "COM10", "LPT0", "COM¹tool", "café"] {
+        assert!(
+            absolute_executable(&format!(r"C:\synthetic\{name}.exe")),
+            "{name}"
+        );
+    }
+}

@@ -68,11 +68,20 @@ fn absolute_executable(p: &str) -> bool {
         && !p[2..].contains(':')
         && p.to_ascii_lowercase().ends_with(".exe")
         && p[3..].split(['/', '\\']).all(|part| {
-            let base = part.split('.').next().unwrap_or("").to_ascii_uppercase();
-            !["CON", "PRN", "AUX", "NUL"].contains(&base.as_str())
-                && !(base.len() == 4
-                    && (base.starts_with("COM") || base.starts_with("LPT"))
-                    && matches!(base.as_bytes()[3], b'1'..=b'9'))
+            let base = part
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(' ')
+                .to_ascii_uppercase();
+            let port = base
+                .strip_prefix("COM")
+                .or_else(|| base.strip_prefix("LPT"));
+            !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str())
+                && !matches!(
+                    port,
+                    Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+                )
         });
     #[cfg(not(windows))]
     let absolute = p.starts_with('/') && !p.starts_with("//") && !p.contains(['\\', ':']);
