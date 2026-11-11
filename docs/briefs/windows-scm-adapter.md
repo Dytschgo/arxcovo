@@ -5,8 +5,9 @@ brief and the matching ADR 0012 SCM amendment. Independent Sol review is
 recorded in `docs/reviews/windows-scm-contract-review.md`. Prepared by Opus 5.5 high
 (architecture) from base `feat/windows-owner-store` at
 `d6df821dcd2ec827bcf2cd3c86bea32a2c639ca4`. The PR-C implementation is then
-reviewed by Opus, a different provider. This document describes no
-implementation. Every native SCM behaviour named here is **unverified on real
+reviewed by Opus, a different provider. This is the implementation contract; PR35 now contains the library and a
+full Opus review of `54c43fb`, followed by a strengthened readback test. It
+does not establish installed/native acceptance. Every native SCM behaviour named here is **unverified on real
 hardware**.
 
 ## 1. Goal
@@ -428,6 +429,10 @@ All of these are unprivileged and make no real SCM call.
 
 CI must stay under the 15-minute budget, and these tests are pure.
 
+The polling code rejects a state observed at or after the deadline even if it
+is already stopped. A failed stop can therefore leave it stopped with its
+previous boot intent; rerunning stop can complete the demand-start change.
+
 ## 12. Remaining evidence (all **unverified on real hardware**)
 
 PR-C cannot establish any of these. They need the separately reviewed
@@ -445,6 +450,10 @@ disposable hosted-runner experiment in ADR 0012, never the owner PC.
   assumes.
 - The SCM preserves the privilege multi-string order, and the 8 KiB buffers
   are sufficient.
+- Whether a default or partly installed service returns a non-NULL empty
+  privilege multi-string. The current parser refuses that shape as `Manager`,
+  rather than classifying it as not installed; observe-before-install retry
+  behavior must be verified before CLI activation.
 - Auto-start versus demand behaviour across a real reboot.
 - The sufficiency of the four required privileges (ADR 0009).
 

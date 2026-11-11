@@ -26,6 +26,7 @@ struct FakeScm {
     states: VecDeque<u32>,
     sticky: bool,
     race: bool,
+    ignore_start_write: bool,
 }
 impl FakeScm {
     fn new() -> Self {
@@ -51,6 +52,7 @@ impl FakeScm {
             states: VecDeque::new(),
             sticky: false,
             race: false,
+            ignore_start_write: false,
         }
     }
     fn call(&mut self, s: impl Into<String>) -> Result<(), Win32> {
@@ -118,10 +120,12 @@ impl ScmCalls for FakeScm {
         if self.marked {
             return Err(Win32(MARKED));
         }
-        self.base.start_type = match b {
-            Boot::Auto => START_AUTO,
-            Boot::Demand => START_DEMAND,
-        };
+        if !self.ignore_start_write {
+            self.base.start_type = match b {
+                Boot::Auto => START_AUTO,
+                Boot::Demand => START_DEMAND,
+            };
+        }
         Ok(())
     }
     fn set_config2(&mut self, v: &Config2) -> Result<(), Win32> {
@@ -176,6 +180,21 @@ fn seq(prefix: &[&str], middle: Vec<String>, suffix: &[&str]) -> Vec<String> {
         .chain(suffix.iter().map(|s| s.to_string()))
         .collect()
 }
+#[test]
+fn register_requires_demand_readback_after_successful_write() {
+    let mut e = engine(true, STOPPED);
+    e.calls.base.start_type = START_AUTO;
+    e.calls.ignore_start_write = true;
+    assert_eq!(e.register(), Err(Error::Manager));
+    assert_eq!(e.calls.base.start_type, START_AUTO);
+    assert!(e.calls.calls.iter().any(|call| call == "boot:Demand"));
+
+    // The same stopped registration converges once the manager applies writes.
+    e.calls.ignore_start_write = false;
+    assert_eq!(e.register(), Ok(()));
+    assert_eq!(e.calls.base.start_type, START_DEMAND);
+}
+
 #[test]
 fn transition_matrix_exact_calls() {
     for present in [false, true] {

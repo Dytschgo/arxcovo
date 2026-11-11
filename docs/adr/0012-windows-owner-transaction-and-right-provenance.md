@@ -5,14 +5,16 @@ Status: settled architecture contract (Opus 5.5 high, design sub-agent),
 Corrected the same day from base `68614bcdf7281f161c1d5ed339340685200b0f8c`
 after independent Sol review finding P1
 (docs/reviews/0012-owner-contract-review.md): the safety guarantee is
-narrowed to an explicit fault model (decision 6). It needs a fresh independent
-Sol recheck before implementation is merged. Amended the same day from base
+narrowed to an explicit fault model (decision 6). Its independent Sol recheck of `b522125` is retained in the same review report.
+Acceptance is limited to that stated fault model, not physical durability. Amended the same day from base
 `d6df821dcd2ec827bcf2cd3c86bea32a2c639ca4` in the **SCM** part of "Native
 adapter contract" only, to apply the Windows boot-intent rule of ADR 0014
-decision 1. The amendment needs independent Sol review before PR-C is
-implemented. The pure engine and protected store have separate implementation
-and review records; the SCM adapter described by this amendment is not yet
-implemented, installed or exercised. Every production native path is **unverified
+decision 1. The amendment has the independent Sol review retained in
+`docs/reviews/windows-scm-contract-review.md`. The pure engine and protected
+store have separate implementation/review records. The SCM library is
+implemented in PR35; its full Opus implementation review at `54c43fb` found no
+blocking issue, and the final refresh needs its own exact-head recheck. No SCM
+installation or real-manager exercise is established. Every production native path is **unverified
 on real hardware**. This ADR establishes no milestone 2 acceptance.
 
 Amends ADR 0009 "Owner subcommands" (`service configure` and `service
