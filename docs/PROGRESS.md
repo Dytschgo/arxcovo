@@ -3,8 +3,8 @@
 ## Current state
 
 - Milestone 1: setup acceptance in progress. Milestones 2–6 have not started.
-- Current task: confirm fast main CI after recovery, update/re-review the probe, then finish setup follow-ups.
-- Last merged PR: [#6](https://github.com/Dytschgo/arxcovo/pull/6), merge `e692b2023703d21652683c3ec024bac5cd63a043`, 2026-11-11 08:05:25 UTC. All three platform checks and both required statuses passed before merge.
+- Current task: merge reviewed setup acceptance evidence, then continue single-host implementation. Electron and policy-test follow-ups remain open.
+- Last merged PR: [#5](https://github.com/Dytschgo/arxcovo/pull/5), merge `416259fee4fd0644d0adbfd3e366b4b3479fe7d1`, 2026-11-11 08:12:14 UTC. All five required gates passed and GitHub auto-merged without another coordinator merge command after recovery.
 - [#1](https://github.com/Dytschgo/arxcovo/pull/1) installed the workspace/CI at `708afbd` after all three platform checks and an independent Opus review passed. Budget enforcement followed its first real main CI baseline.
 - No milestone is declared complete. All VM/hypervisor paths remain **unverified on real hardware**.
 
@@ -19,7 +19,7 @@
 - The owner selected `Dytschgo` for the trusted agent-author allowlist. The guarded command rejects outsiders, forks, stale heads, unready PRs and weakened protection. Repository auto-merge is enabled. PR #3 proves the trivial-PR acceptance: auto-merge enabled at 03:00:12 UTC before review/CI completion, independent Opus review passed at 03:02:08, final Windows CI passed at 03:04:03, and GitHub merged at 03:06:17 without a subsequent coordinator merge command. Reviewed head was f432908; all five required gates passed.
 - Default Actions tokens are read-only, Actions PR approvals are disabled, and fork workflows require approval for all external contributors. Only the owner approves fork workflows and merges outsider PRs.
 - Policy uses trusted default-branch workflow_run code, a label-change signal and periodic retry. It reads candidate measurements through the API, measures attempt 1, deduplicates statuses and isolates failing heads. History is a record, not an additional gate. API unavailability and the 100-open-PR bound remain documented limitations.
-- Live slow-main rejection passed, and measured ci-speed recovery merged. Remaining: confirm a fast main baseline and normal probe merging resumes, then retain the resulting CI history. The second main baseline, run 42949562343 at 861db0b, succeeded in 241 seconds and is also recorded in history.
+- Live slow-main rejection, measured ci-speed recovery, fast main baseline and resumed normal auto-merging all passed. The slow and recovered main durations are retained in this PR's history. Setup acceptance is proven; its final evidence PR still needs independent review and merge. The second main baseline, run 42949562343 at 861db0b, succeeded in 241 seconds and is also recorded in history.
 
 ## Slow-main acceptance experiment
 
@@ -27,12 +27,12 @@
 - Main [run 42952698370](https://github.com/Dytschgo/arxcovo/actions/runs/42952698370), attempt 1 at 5c82988, succeeded from 03:25:47 to 03:42:43 UTC: **1016 seconds**. The Actions evaluator failed the probe's budget status at 03:43:02, naming this run and duration.
 - Probe [#5](https://github.com/Dytschgo/arxcovo/pull/5), head 690bf5d, has no ci-speed label. Its three platform checks and independent Opus review passed; Ubuntu finished at 03:52:59 UTC. At 08:05:19 UTC the guarded command enabled auto-merge. GitHub still reported OPEN/BLOCKED with ci-time-budget as the sole failing required gate. This proves live rejection of an otherwise green PR.
 - Recovery [#6](https://github.com/Dytschgo/arxcovo/pull/6), reviewed head 1da52c2, removed only the delay and restored the 12-minute timeout. Its attempt-1 [run 42953952528](https://github.com/Dytschgo/arxcovo/actions/runs/42953952528) succeeded from 03:37:12 to 03:41:47 UTC: **275 seconds**. The ci-speed budget exception passed against the slow main baseline. After recording the blocked probe, the coordinator invoked the guarded merge command; GitHub merged at 08:05:25 UTC.
-- Recovery main [run 42984281226](https://github.com/Dytschgo/arxcovo/actions/runs/42984281226), attempt 1 at e692b20, succeeded from 08:05:27 to 08:09:38 UTC: **251 seconds**. The evaluator restored probe #5's budget success at 08:10:01. Probe head aaaf52c passed fresh independent review; Windows CI is still running, so normal merging remains pending.
+- Recovery main [run 42984281226](https://github.com/Dytschgo/arxcovo/actions/runs/42984281226), attempt 1 at e692b20, succeeded from 08:05:27 to 08:09:38 UTC: **251 seconds**. The evaluator restored probe #5's budget success at 08:10:01. Probe head aaaf52c passed fresh independent review, final Windows CI passed at 08:11:52, and GitHub auto-merged at 08:12:14. No subsequent coordinator merge command was issued for the probe; normal merging resumed through all five gates.
 - Electron tests are committed in [#7](https://github.com/Dytschgo/arxcovo/pull/7), now based on main at head b8c2187. Local lint and the real Windows smoke test passed. The earlier head passed hosted Ubuntu/macOS CI; the updated head's hosted results and final review remain pending. Auto-merge is off.
 
 ## Milestones
 
-- [ ] 1. Setup: remaining end-to-end acceptance above.
+- [ ] 1. Setup: end-to-end acceptance passed; final evidence review/merge pending.
 - [ ] 2. Single host: per-OS service, inventory MCP, dedicated-account commands and persisted activity; Claude Code MCP acceptance.
 - [ ] 3. Multiple hosts: join codes, CA/mTLS, Raft and remote commands; three-node failure and invalid-code acceptance.
 - [ ] 4. Test VMs: QEMU/WHPX, unattended Windows/Linux templates, guest agent, snapshot/expiry/caps/reserves; real lifecycle acceptance.
