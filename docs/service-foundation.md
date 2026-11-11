@@ -2,6 +2,12 @@
 
 ## Windows owner transaction prerequisite: incomplete adapter handoff
 
+Superseded design note: ADR 0012 settles the native Windows contract. It defines
+the owner record, the lock, compare-and-replace, recovery and uninstall
+provenance, and it replaces the `Journal`/`ConfigurationIo` shape and the
+compensation path described below. The API text below records the `a8628c6`
+candidate only.
+
 Sol / gpt-6.1-sol high, implementation sub-agent, base
 `1a45ba15640b608ee4c953a104c06e451a85d07b`. This change implements only an
 injected configure transaction prerequisite. It does **not** implement the
