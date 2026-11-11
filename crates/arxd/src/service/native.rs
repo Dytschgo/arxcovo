@@ -34,7 +34,7 @@ impl Resolver for NativeResolver {
     }
 }
 
-/// A handle and its pinned ancestry are kept alive together. Observations apply
+/// A handle and its retained ancestry are kept alive together. Observations apply
 /// to this opened object; they are not authority for a later path-based open.
 pub struct Observed {
     file: File,
@@ -232,7 +232,7 @@ mod tests {
                 true,
                 vec![Ace::Allow {
                     sid: "S-1-1-0".into(),
-                    writes: false,
+                    mask: 0,
                     inherit_only: true,
                 }],
             ),
@@ -312,8 +312,28 @@ mod tests {
             std::env::var_os("SystemRoot").expect("Windows fixture requires SystemRoot"),
         )
         .join("System32");
-        let _opened = checked(&path, true, Policy::BinaryIntegrity, false)
+        // System32 is a shared ancestor, not an Arxcovo final directory.
+        let opened = os::open(&path, true, false, true)
             .unwrap_or_else(|error| panic!("stock system directory refused: {error:?}"));
+        super::super::layout::check_windows_ancestor(opened.protection())
+            .expect("System32 itself must be safe as a namespace ancestor");
+        let layout = Layout::system().unwrap();
+        for shared in [
+            layout.binary().parent().unwrap().parent().unwrap(),
+            layout
+                .config()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        ] {
+            let opened = os::open(shared, true, false, true)
+                .expect("stock known-folder ancestor must open read-only");
+            super::super::layout::check_windows_ancestor(opened.protection())
+                .expect("stock known-folder namespace policy");
+        }
     }
     #[test]
     fn native_workspace_rejects_missing_and_aliases() {

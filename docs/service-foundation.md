@@ -107,11 +107,22 @@ GetSecurityInfo allocate their documented native response before application
 validation; no caller-supplied unbounded allocation length is used. Administrators
 is recognized by SID rather than a localized name. Files use CreateFileW with
 OPEN_REPARSE_POINT, metadata rights, READ_CONTROL, and read-only sharing. Every
-ancestor stays open without write/delete sharing through observation/read.
+ancestor stays open with that sharing request through observation/read. Metadata-only
+parent handles do not exclude all writers; PR27 separately adds read-data access.
+This PR25 fix must not overwrite PR27 access-mask changes during integration.
 GetDriveTypeW requires a fixed local drive. GetSecurityInfo supplies exact owner,
 protected/present DACL and bounded ACE observations; unknown ACE types refuse.
-Generic and specific write/delete/owner/DACL grants count as writes, including
-inherit-only ACEs. Hard-linked config/binary files refuse.
+Native allow ACE observations retain the full access mask. Final binary-integrity
+checks still reject foreign write/delete/owner/DACL grants, including inherit-only
+ACEs. Final private-object policy is unchanged. For shared ancestors only,
+namespace policy rejects effective foreign DELETE_CHILD, DELETE, WRITE_DAC,
+WRITE_OWNER and GENERIC_ALL, while permitting sibling creation and directory
+EA/attributes, and ignoring inherit-only grants on that parent. Each existing
+next component has its own owner/DACL and reparse observation; every successful
+ancestor is nonempty. No stock path or ordinary group is allowlisted. Unknown
+ACEs and untrusted owners refuse. Hard-linked config/binary files refuse.
+See ADR 0012 for semantics and evidence. These are point-in-time observations;
+no concurrent ACL freeze or race-free future symbolic reopen is claimed.
 
 Unix uses descriptor-relative openat/O_NOFOLLOW, fstatfs, fstat metadata, and
 retained ancestor descriptors. Linux accepts only ext-family, XFS, Btrfs, tmpfs
