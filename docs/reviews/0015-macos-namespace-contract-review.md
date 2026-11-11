@@ -10,7 +10,9 @@ amendments inspected. Later PR31 image metadata was integrated separately.
 No blocking findings. The change is bounded, the new rule is Mac-only and only
 for pass-through directories, and all leaf/Linux/Windows rules remain strict.
 The brief supplies explicit positive/negative controls and mutations. UTF-8,
-Markdown structure and whitespace checks passed. No Rust/runtime suite ran.
+New ADR/brief tables, UTF-8 and whitespace checks passed. A whole-file raw-pipe
+counter flagged older ADR0009 mapping tables outside this amendment; those were
+not changed or represented as validated by this review. No Rust/runtime suite ran.
 
 ## Spec
 
