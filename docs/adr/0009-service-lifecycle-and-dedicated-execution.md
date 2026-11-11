@@ -5,6 +5,12 @@ Status: settled implementation contract (Opus 5.5 high, architecture), revised
 claimed. Every privileged path below is **unverified on real hardware** until a
 disposable experiment or the owner's install exercises it.
 
+Amended by [ADR 0014](0014-unix-owner-lifecycle-corrections.md), which changes
+boot intent (start/stop enable or disable), endpoint runtime-directory ownership,
+typed manager queries, status mapping, the `Disabled` plist key,
+`enable`/`disable` vectors and the `ProvisionState` install step. Where the two
+conflict, ADR 0014 wins.
+
 Owner steps: docs/service-install.md. Builds on: proposed ADR 0006
 (`docs/early-hardware-and-raft-spikes`) and these states:
 
@@ -80,7 +86,7 @@ particular commit.
 | binary | `{ProgramFiles}\Arxcovo\arxd.exe` | `/usr/local/libexec/arxcovo/arxd` | `/Library/Application Support/Arxcovo/libexec/arxd` |
 | config | `{ProgramData}\Arxcovo\config\arxd.json` | `/etc/arxcovo/arxd.json` | `/Library/Application Support/Arxcovo/config/arxd.json` |
 | state | `{ProgramData}\Arxcovo\state\` | `/var/lib/arxcovo/` | `/Library/Application Support/Arxcovo/state/` |
-| endpoint | `\\.\pipe\arxcovo-arxd` | `/run/arxcovo/arxd.sock` | `/private/var/run/arxcovo/arxd.sock` |
+| endpoint | `\\.\pipe\arxcovo-arxd` | `/run/arxcovo/arxd.sock` | `/Library/Application Support/Arxcovo/run/arxd.sock` (ADR 0015; formerly `/private/var/run/arxcovo/arxd.sock`) |
 | manager artifact | SCM service `arxd` | `/etc/systemd/system/arxd.service` (+ standard-rights drop-in) | `/Library/LaunchDaemons/com.arxcovo.arxd.plist` |
 
 Windows resolves `{ProgramFiles}`/`{ProgramData}` only through
@@ -98,6 +104,11 @@ Protection rules, checked by install and again on every service start:
 - **Binary directory** is integrity-only. Only SYSTEM, Administrators or root
   (and TrustedInstaller on Windows) may write it. Read and execute stay open
   because the build account executes `arxd exec-child` and `arxd tool-probe`.
+- **macOS ancestry (ADR 0015).** A directory that a trusted walk passes
+  through needs UID 0, no group or other write, no setuid, setgid or sticky
+  bit, and an empty ACL. Its GID is not compared. Final objects keep the exact
+  rules on this list. Linux and Windows ancestry is unchanged. On macOS, a
+  newly created object is `fchown`ed to 0:0 before its check.
 - **Endpoint directory** (Unix) is root-owned with mode `0755`. The socket is
   `chown`ed to the configured client UID with mode `0600`. Windows pipe security
   follows ADR 0008: the client SID gets specific rights, and NETWORK and remote
@@ -277,7 +288,8 @@ The plist sets:
 
 There is no `UserName` key (root) and no shell. Shutdown is on SIGTERM. The
 service creates its endpoint directory itself and refuses an existing one with
-the wrong owner or mode.
+the wrong owner or mode. Since ADR 0015 that directory is
+`/Library/Application Support/Arxcovo/run`, and it persists across reboot.
 
 ### Unix signals
 
