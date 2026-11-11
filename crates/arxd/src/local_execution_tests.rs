@@ -450,4 +450,13 @@ async fn dispatch_dropped_before_first_poll_still_completes_audit() {
         "a request cancelled before its worker ran starts nothing"
     );
     assert!(!execution.is_busy() && execution.capability()["available"] == true);
+    // No spawn means no execution facts: a started-then-killed child would record them.
+    let facts: (Option<bool>, Option<bool>) = conn
+        .query_row(
+            "SELECT cleanup_confirmed,identity_matches_pin FROM activity WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(facts, (None, None));
 }

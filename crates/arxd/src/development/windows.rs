@@ -168,24 +168,29 @@ fn pin(path: &Path) -> std::result::Result<Vec<std::fs::File>, Reason> {
         if matches!(part, std::path::Component::Prefix(_)) {
             continue;
         }
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&prefix)
-            .map_err(|_| Reason::InvalidArguments)?;
-        use std::os::windows::fs::MetadataExt;
-        if f.metadata()
-            .map_err(|_| Reason::InvalidArguments)?
-            .file_attributes()
-            & FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(Reason::InvalidArguments);
-        }
-        pins.push(f);
+        pins.push(open_pinned(&prefix)?);
     }
     Ok(pins)
+}
+/// The handle-based check is the backstop for a component replaced by a
+/// reparse point after `checked_path` inspected it by name.
+fn open_pinned(path: &Path) -> std::result::Result<std::fs::File, Reason> {
+    use std::os::windows::fs::MetadataExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|_| Reason::InvalidArguments)?;
+    if f.metadata()
+        .map_err(|_| Reason::InvalidArguments)?
+        .file_attributes()
+        & FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return Err(Reason::InvalidArguments);
+    }
+    Ok(f)
 }
 fn resolve(
     settings: &Settings,
@@ -886,6 +891,12 @@ pub(crate) mod tests {
             ));
         }
         assert!(pin(&root.join("junction")).is_err());
+        // The handle backstop alone (no name-based pre-check) refuses the junction.
+        assert!(open_pinned(&root.join("junction")).is_err());
+        assert!(
+            open_pinned(&root.join("outside")).is_ok(),
+            "positive control"
+        );
         // Executable reparse: the configured PATH directory is reached via a junction.
         let tools = root.join("tools");
         std::fs::create_dir(&tools).unwrap();
