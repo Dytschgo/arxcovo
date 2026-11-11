@@ -123,7 +123,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 ## Service lifecycle integration checkpoint
 
-- The coordinator merged current main 3a7edc8 into the lifecycle branch. Its Rust source is unchanged from the revision that passed all 40 Windows tests, formatting and Clippy. Fixed service artifacts are prepared for this branch. Production entry still fails closed until configuration/store/inventory hooks are connected; no installed-service acceptance is claimed.
+- Lifecycle PR #20 is updated against main d7f3ebd at 9b02fe2. Formatting, Clippy and all 50 runnable Windows tests passed on that revision. This dependent configuration branch preserves those source changes and adds configuration/owner-plan behavior. No installed-service acceptance is claimed.
 
 ## Fixed config and owner-plan foundation checkpoint
 
@@ -152,3 +152,5 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 - Codex / gpt-6.1-sol, medium: merged main `d7f3ebd` into the local configuration candidate, preserving the service foundation and current activity implementation. Formatting, workspace Clippy with warnings denied and all 61 runnable nextest tests passed (one direct-only fixture skipped; its parent exercised it). Package parser checks passed three tests; systemd/plutil native checks were skipped on Windows. These supersede the earlier 51-test builder-base evidence for this integrated revision. No installation or account/right/manager operations were performed.
 - Next service work: replace injected identity and permission observations with native read-only adapters and bounded configuration reads. Owner mutation adapters and service application wiring remain incomplete; native checks will receive their own independent security review before activation.
+
+- Publishing boundary: fixed service configuration and typed owner plans are a separate PR stacked on lifecycle #20. Native read-only observations are being implemented separately by Codex / gpt-6.1-sol, high; owner mutations and installed-service acceptance remain pending.
