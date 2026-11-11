@@ -354,6 +354,32 @@ fn cli_does_not_echo_configuration_secrets() {
 }
 
 #[cfg(windows)]
+#[test]
+fn windows_rooted_paths_validate_plain_and_verbatim_without_drive_relative_lookup() {
+    let dir = private_dir();
+    let verbatim = dir.path().canonicalize().unwrap();
+    assert!(verbatim.to_str().unwrap().starts_with(r"\\?\"));
+    arxd::config::checked_path(&verbatim).unwrap();
+    let (cfg, _) = config(&verbatim);
+    cfg.validate().unwrap();
+    arxd::config::checked_path(dir.path()).unwrap();
+    for unsafe_path in [
+        r"C:",
+        r"C:relative",
+        r"\\server\share\file",
+        r"\\?\UNC\server\share\file",
+        r"\\.\pipe\arxcovo-test",
+    ] {
+        assert!(arxd::config::checked_path(Path::new(unsafe_path)).is_err());
+    }
+    assert!(arxd::config::checked_path(&verbatim.join("activity:stream")).is_err());
+    // PathBuf::push normalizes parent segments for verbatim paths; preserve
+    // the supplied spelling here so this exercises rejection rather than join.
+    let parent = std::path::PathBuf::from(format!(r"{}\..", verbatim.display()));
+    assert!(arxd::config::checked_path(&parent).is_err());
+}
+
+#[cfg(windows)]
 fn protect(path: &Path) {
     protect_with_extra(path, "");
 }

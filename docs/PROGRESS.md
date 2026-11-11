@@ -106,3 +106,8 @@
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
+
+## Windows rooted-path correction
+
+- Coordinator correction on 2026-11-11: the new Windows regression failed with Incorrect function on the old bare-drive-prefix lookup. The validator now waits for RootDir before inspecting disk-root metadata; each root and descendant still receives link/reparse checks. Plain and verbatim local paths pass; drive-relative, UNC, device, alternate-stream and explicit parent traversal inputs are rejected.
+- Windows formatting, Clippy with warnings denied and all 17 workspace tests passed. Independent review and hosted checks remain pending. Provider: Codex / gpt-6.1-sol, medium effort. No account, service or privileged operation was performed.
