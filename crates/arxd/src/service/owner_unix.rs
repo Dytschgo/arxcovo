@@ -188,6 +188,18 @@ mod imp {
     }
     impl Fs {
         fn check(&self, f: &File, directory: bool, mode: Option<u32>) -> Result<(), Error> {
+            self.check_role(f, directory, mode, false)
+        }
+        fn ancestor(&self, f: &File) -> Result<(), Error> {
+            self.check_role(f, true, None, true)
+        }
+        fn check_role(
+            &self,
+            f: &File,
+            directory: bool,
+            mode: Option<u32>,
+            ancestor: bool,
+        ) -> Result<(), Error> {
             native::os::local(f)?;
             let m = f.metadata().map_err(|_| Error::Permissions)?;
             let p = native::os::protection(f)?; // Reject ACLs on the opened object.
@@ -213,8 +225,25 @@ mod imp {
             else {
                 return Err(Error::Permissions);
             };
-            if uid != self.uid
-                || gid != self.gid
+            let ancestor_ok = if ancestor {
+                #[cfg(not(test))]
+                let facts = crate::service::layout::Protection::Unix {
+                    uid,
+                    gid,
+                    mode: bits,
+                };
+                // Only unit tests normalize identities in their private owned root.
+                #[cfg(test)]
+                let facts = crate::service::layout::Protection::Unix {
+                    uid: if uid == self.uid { 0 } else { 1 },
+                    gid: if gid == self.gid { 0 } else { 1 },
+                    mode: bits,
+                };
+                crate::service::layout::check_unix_ancestor(native::os::PLATFORM, &facts).is_ok()
+            } else {
+                uid == self.uid && gid == self.gid
+            };
+            if !ancestor_ok
                 || if directory {
                     !m.is_dir()
                 } else {
@@ -247,12 +276,12 @@ mod imp {
             let mut parts = parts(path)?;
             let leaf = name(parts.pop().ok_or(Error::Layout)?)?;
             let mut parent = self.root.try_clone().map_err(|_| Error::Permissions)?;
-            self.check(&parent, true, None)?;
+            self.ancestor(&parent)?;
             for part in parts {
                 let Some(next) = self.open_at(&parent, &name(part)?, true)? else {
                     return Ok(None);
                 };
-                self.check(&next, true, None)?;
+                self.ancestor(&next)?;
                 parent = next;
             }
             Ok(Some((parent, leaf)))
@@ -288,6 +317,7 @@ mod imp {
                     }
                     let f = self.open_at(&p, &n, true)?.ok_or(Error::Permissions)?;
                     native::os::protection(&f)?;
+                    self.new_owner(&f)?;
                     if unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) } != 0 {
                         return Err(Error::Permissions);
                     }
@@ -296,6 +326,17 @@ mod imp {
                     p.sync_all().map_err(|_| Error::Permissions)
                 }
             }
+        }
+        fn new_owner(&self, f: &File) -> Result<(), Error> {
+            // This is called only after exclusive creation, never on EEXIST.
+            #[cfg(not(test))]
+            let owner = (0, 0);
+            #[cfg(test)]
+            let owner = (self.uid, self.gid);
+            if unsafe { libc::fchown(f.as_raw_fd(), owner.0, owner.1) } != 0 {
+                return Err(Error::Permissions);
+            }
+            Ok(())
         }
         fn bytes(&self, f: &mut File, mode: u32, bound: usize) -> Result<Vec<u8>, Error> {
             self.check(f, false, Some(mode))?;
@@ -325,6 +366,7 @@ mod imp {
             })?;
             // Change protection only on this exclusively created handle.
             native::os::protection(&f)?;
+            self.new_owner(&f)?;
             if unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) } != 0 {
                 return Err(Error::Permissions);
             }
@@ -780,6 +822,93 @@ mod imp {
                 gid: unsafe { libc::getegid() },
             };
             (dir, fs)
+        }
+        fn another_member_group() -> u32 {
+            let mut groups = [0 as libc::gid_t; 1024];
+            let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+            assert!(n >= 0, "fixture groups available");
+            groups[..n as usize]
+                .iter()
+                .copied()
+                .find(|g| *g != unsafe { libc::getegid() })
+                .expect("fixture requires another own member group")
+        }
+        #[test]
+        fn ancestor_group_role_and_new_object_ownership() {
+            let (dir, fs) = fixture();
+            let other = another_member_group();
+            let traversal = dir.path().join("traversal");
+            std::fs::create_dir(&traversal).unwrap();
+            std::fs::set_permissions(&traversal, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let parent = File::open(&traversal).unwrap();
+            assert!(unsafe { libc::fchown(parent.as_raw_fd(), fs.uid, other) } == 0);
+            assert!(fs.check(&parent, true, None).is_err()); // binary leaf stays strict
+            assert!(fs.check(&parent, true, Some(0o700)).is_err());
+            assert!(fs.check(&parent, true, Some(0o755)).is_err());
+            let accepted = fs.parent(Path::new("/traversal/child")).is_ok();
+            assert_eq!(accepted, native::os::PLATFORM == Platform::Macos);
+            for bits in [0o775, 0o757, 0o1755, 0o2755, 0o4755] {
+                std::fs::set_permissions(&traversal, std::fs::Permissions::from_mode(bits))
+                    .unwrap();
+                assert!(fs.parent(Path::new("/traversal/child")).is_err());
+            }
+            std::fs::set_permissions(&traversal, std::fs::Permissions::from_mode(0o755)).unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                fs.directory(Path::new("/traversal/child"), 0o755).unwrap();
+                let child = traversal.join("child");
+                let before = std::fs::metadata(&child).unwrap();
+                assert!(
+                    before.uid() == fs.uid
+                        && before.gid() == fs.gid
+                        && before.mode() & 0o7777 == 0o755
+                );
+                fs.directory(Path::new("/traversal/child"), 0o755).unwrap();
+                assert!(std::fs::metadata(&child).unwrap().ino() == before.ino());
+                fs.create(&parent, &name("new-file").unwrap(), b"fixed", 0o600)
+                    .unwrap();
+                let m = std::fs::metadata(traversal.join("new-file")).unwrap();
+                assert!(m.uid() == fs.uid && m.gid() == fs.gid && m.mode() & 0o7777 == 0o600);
+                assert!(
+                    Command::new("/bin/chmod")
+                        .args(["+a", "everyone allow read"])
+                        .arg(&traversal)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                assert!(fs.parent(Path::new("/traversal/child")).is_err());
+                assert!(
+                    Command::new("/bin/chmod")
+                        .arg("-N")
+                        .arg(&traversal)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            // Existing mismatched child is refused without changing ownership or mode.
+            fs.directory(Path::new("/existing"), 0o755).unwrap();
+            let child = File::open(dir.path().join("existing")).unwrap();
+            assert!(unsafe { libc::fchown(child.as_raw_fd(), fs.uid, other) } == 0);
+            let before = child.metadata().unwrap();
+            assert!(fs.directory(Path::new("/existing"), 0o755).is_err());
+            let after = child.metadata().unwrap();
+            assert!(
+                before.ino() == after.ino()
+                    && before.gid() == after.gid()
+                    && before.mode() == after.mode()
+            );
+            symlink("traversal", dir.path().join("alias")).unwrap();
+            assert!(fs.parent(Path::new("/alias/child")).is_err());
+            std::fs::write(dir.path().join("regular"), b"fixed").unwrap();
+            assert!(fs.parent(Path::new("/regular/child")).is_err());
         }
         fn manager(
             platform: Platform,

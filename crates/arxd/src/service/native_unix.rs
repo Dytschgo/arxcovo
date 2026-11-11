@@ -70,7 +70,7 @@ pub fn open(path: &Path, directory: bool, _read: bool, trusted: bool) -> Result<
     for (i, part) in parts.iter().enumerate() {
         local(&file)?;
         if trusted {
-            check_protection(PLATFORM, Policy::BinaryIntegrity, true, &protection(&file)?)?;
+            super::super::layout::check_unix_ancestor(PLATFORM, &protection(&file)?)?;
         }
         let name = CString::new(part.as_str()).map_err(|_| Error::Layout)?;
         let dir = i + 1 < parts.len() || directory;
@@ -110,6 +110,83 @@ pub fn open(path: &Path, directory: bool, _read: bool, trusted: bool) -> Result<
         _ancestors: ancestors,
         protection: p,
     })
+}
+
+// The parent is already protected and pinned. Only the final missing directory
+// is created. A racing EEXIST follows the exact same no-repair check.
+#[cfg(any(target_os = "macos", test))]
+fn endpoint_child(
+    mut parent: Observed,
+    name: &std::ffi::CStr,
+    #[cfg(test)] owner: (u32, u32),
+) -> Result<Observed, Error> {
+    let created = unsafe { libc::mkdirat(parent.file.as_raw_fd(), name.as_ptr(), 0o755) } == 0;
+    if !created && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        return Err(Error::Permissions);
+    }
+    let raw = unsafe {
+        libc::openat(
+            parent.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(Error::Permissions);
+    }
+    let file = unsafe { File::from_raw_fd(raw) };
+    local(&file)?;
+    protection(&file)?; // ACL must be known empty before any mode/owner operation.
+    #[cfg(not(test))]
+    let owner = (0, 0);
+    if created {
+        if unsafe { libc::fchown(file.as_raw_fd(), owner.0, owner.1) } != 0
+            || unsafe { libc::fchmod(file.as_raw_fd(), 0o755) } != 0
+        {
+            return Err(Error::Permissions);
+        }
+        file.sync_all().map_err(|_| Error::Permissions)?;
+        parent.file.sync_all().map_err(|_| Error::Permissions)?;
+    }
+    let facts = protection(&file)?;
+    #[cfg(test)]
+    let facts = match facts {
+        Protection::Unix { uid, gid, mode } => Protection::Unix {
+            uid: if uid == owner.0 { 0 } else { 1 },
+            gid: if gid == owner.1 { 0 } else { 1 },
+            mode,
+        },
+        other => other,
+    };
+    check_protection(PLATFORM, Policy::EndpointDirectory, true, &facts)?;
+    parent._ancestors.push(parent.file);
+    Ok(Observed {
+        file,
+        _ancestors: parent._ancestors,
+        protection: facts,
+    })
+}
+#[cfg(target_os = "macos")]
+pub(super) fn ensure_endpoint_directory(layout: &Layout) -> Result<Observed, Error> {
+    if layout.platform() != PLATFORM {
+        return Err(Error::Layout);
+    }
+    let directory = layout.endpoint().parent().ok_or(Error::Layout)?;
+    let parent = open(directory.parent().ok_or(Error::Layout)?, true, false, true)?;
+    super::super::layout::check_unix_ancestor(PLATFORM, parent.protection())?;
+    let name = CString::new(
+        directory
+            .file_name()
+            .ok_or(Error::Layout)?
+            .as_encoded_bytes(),
+    )
+    .map_err(|_| Error::Layout)?;
+    endpoint_child(
+        parent,
+        &name,
+        #[cfg(test)]
+        (0, 0),
+    )
 }
 
 // Linux retains the conservative protected local-files database requirement.
@@ -228,6 +305,57 @@ pub use super::macos::account;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn owned_parent(path: &Path) -> Observed {
+        let file = File::open(path).unwrap();
+        let facts = protection(&file).unwrap();
+        Observed {
+            file,
+            _ancestors: vec![],
+            protection: facts,
+        }
+    }
+    #[test]
+    fn endpoint_creation_is_exclusive_and_never_repairs() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        assert!(
+            unsafe { libc::geteuid() } != 0,
+            "ordinary-user fixtures only"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let owner = unsafe { (libc::geteuid(), libc::getegid()) };
+        let mut groups = [0 as libc::gid_t; 1024];
+        let count = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+        assert!(count >= 0, "fixture groups available");
+        let other = groups[..count as usize]
+            .iter()
+            .copied()
+            .find(|g| *g != owner.1)
+            .expect("fixture requires another own member group");
+        let parent = owned_parent(dir.path());
+        assert!(unsafe { libc::fchown(parent.file.as_raw_fd(), owner.0, other) } == 0);
+        let first = endpoint_child(owned_parent(dir.path()), c"run", owner).unwrap();
+        let before = first.file.metadata().unwrap();
+        assert!(
+            before.uid() == owner.0 && before.gid() == owner.1 && before.mode() & 0o7777 == 0o755
+        );
+        let again = endpoint_child(owned_parent(dir.path()), c"run", owner).unwrap();
+        assert!(again.file.metadata().unwrap().ino() == before.ino());
+        assert!(unsafe { libc::fchown(first.file.as_raw_fd(), owner.0, other) } == 0);
+        assert!(endpoint_child(owned_parent(dir.path()), c"run", owner).is_err());
+        assert!(first.file.metadata().unwrap().gid() == other);
+        assert!(unsafe { libc::fchown(first.file.as_raw_fd(), owner.0, owner.1) } == 0);
+        std::fs::set_permissions(
+            dir.path().join("run"),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        assert!(endpoint_child(owned_parent(dir.path()), c"run", owner).is_err());
+        assert!(first.file.metadata().unwrap().mode() & 0o7777 == 0o775);
+        std::fs::write(dir.path().join("file"), b"fixed").unwrap();
+        assert!(endpoint_child(owned_parent(dir.path()), c"file", owner).is_err());
+        symlink("run", dir.path().join("link")).unwrap();
+        assert!(endpoint_child(owned_parent(dir.path()), c"link", owner).is_err());
+    }
     #[test]
     fn root_and_unknown_local_accounts_refuse() {
         assert!(account("0").is_err());

@@ -1,4 +1,4 @@
-//! Read-only native observations. No owner operations or service entry wiring.
+//! Protected native observations and fixed macOS service endpoint creation.
 use super::{
     config::{Account, MAX_CONFIG_BYTES, Resolver, ServiceConfig},
     layout::{Error, Layout, Policy, Protection, check_protection},
@@ -114,6 +114,12 @@ pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
         Policy::EndpointDirectory,
         false,
     )
+}
+/// Service-only macOS creation; Linux continues requiring the manager directory.
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_endpoint_directory(layout: &Layout) -> Result<Observed, Error> {
+    require_service_identity()?;
+    os::ensure_endpoint_directory(layout)
 }
 /// Service state is provisioned by the owner, never repaired or ACL-relaxed here.
 /// SQLite uses a persistent TRUNCATE journal, so every mutable file can be
@@ -476,43 +482,69 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod stock_directory_observations {
     use super::*;
-    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn fixed_system_directory_observations() {
         let mut rows = Vec::new();
-        for (label, path) in [
-            ("library", "/Library"),
-            ("application_support", "/Library/Application Support"),
-            ("private", "/private"),
-            ("var", "/private/var"),
-            ("runtime_parent", "/private/var/run"),
+        let mut controls = Vec::new();
+        for (label, path, directory, expected) in [
+            ("root", "/", true, true),
+            ("library", "/Library", true, true),
+            (
+                "application_support",
+                "/Library/Application Support",
+                true,
+                true,
+            ),
+            ("private", "/private", true, true),
+            ("var", "/private/var", true, true),
+            ("runtime_parent", "/private/var/run", true, false),
+            ("logs", "/Library/Logs", true, true),
+            ("launch_daemons", "/Library/LaunchDaemons", true, true),
+            ("bin", "/bin", true, true),
+            ("launchctl", "/bin/launchctl", false, true),
         ] {
-            // Descriptor-relative no-follow traversal; no privileged operation.
-            // trusted=false permits observation of a policy refusal, not use of
-            // the object as protected service state.
-            let observed = os::open(Path::new(path), true, false, false)
-                .expect("fixed system directory read-only observation");
-            let metadata = observed.file.metadata().unwrap();
-            assert!(metadata.is_dir());
+            let observed = os::open(Path::new(path), directory, false, false)
+                .unwrap_or_else(|_| panic!("fixed read-only observation required"));
             let empty_acl = macos::empty_acl(observed.file.as_raw_fd()).is_ok();
             let protection = os::protection(&observed.file);
-            let policy_accepts = protection.as_ref().is_ok_and(|p| {
+            let ancestor = directory
+                && protection.as_ref().is_ok_and(|p| {
+                    super::super::layout::check_unix_ancestor(os::PLATFORM, p).is_ok()
+                });
+            let leaf = protection.as_ref().is_ok_and(|p| {
                 check_protection(os::PLATFORM, Policy::BinaryIntegrity, true, p).is_ok()
             });
-            rows.push(serde_json::json!({
-                "target": label,
-                "root_owner": metadata.uid() == 0,
-                "group_zero": metadata.gid() == 0,
-                "mode": metadata.mode() & 0o7777,
+            rows.push(serde_json::json!({ "target": label,
                 "empty_acl_confirmed": empty_acl,
-                "current_integrity_policy_accepts": policy_accepts,
-            }));
+                "per_directory_ancestor_accepts": ancestor,
+                "leaf_binary_integrity_accepts": leaf }));
+            controls.push((
+                label,
+                if directory {
+                    ancestor == expected
+                } else {
+                    leaf == expected
+                },
+            ));
+            if label == "application_support" {
+                controls.push(("application_support leaf", !leaf));
+            }
         }
+        controls.push((
+            "old runtime protected walk",
+            matches!(
+                os::open(Path::new("/private/var/run/arxcovo"), true, false, true),
+                Err(Error::Permissions)
+            ),
+        ));
         let encoded = serde_json::to_string(&rows).unwrap();
-        assert!(encoded.len() <= 2048);
-        assert_eq!(rows.len(), 5);
-        // No account names, raw IDs, paths, directory listings or file contents.
+        assert!(encoded.len() <= 4096);
+        assert_eq!(rows.len(), 10);
         println!("ARXCOVO_STOCK_DIRECTORY_OBSERVATIONS={encoded}");
+        for (label, accepted) in controls {
+            assert!(accepted, "{label}");
+        }
     }
 }
