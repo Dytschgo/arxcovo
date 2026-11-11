@@ -325,8 +325,9 @@ fn open_impl(
         let name: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
         // FILE_READ_DATA (FILE_LIST_DIRECTORY on directories) makes the
         // share restrictions effective: metadata-only access does not prevent
-        // rename. Mutable DB leaves permit writes, but never delete sharing.
-        // An existing conflicting writer causes refusal on immutable objects.
+        // rename. Ancestors share writes so unrelated sibling renames work;
+        // owner/DACL checks supply namespace authority. No handle shares delete.
+        // Only immutable final leaves exclude conflicting writers.
         let access = READ_CONTROL
             | FILE_READ_ATTRIBUTES
             | FILE_READ_DATA
@@ -336,7 +337,7 @@ fn open_impl(
                 name.as_ptr(),
                 access,
                 FILE_SHARE_READ
-                    | if leaf && mutable_leaf {
+                    | if !leaf || mutable_leaf {
                         FILE_SHARE_WRITE
                     } else {
                         0
@@ -574,13 +575,16 @@ mod tests {
     #[test]
     fn opened_objects_exclude_writers_and_rename_until_released() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test");
+        let owned = tmp.path().join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        let path = owned.join("test");
         std::fs::write(&path, b"fixture").unwrap();
         let opened = open(&path, false, true, false).unwrap();
         assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
-        assert!(std::fs::rename(&path, tmp.path().join("renamed")).is_err());
+        assert!(std::fs::rename(&path, owned.join("renamed")).is_err());
         drop(opened);
-        std::fs::rename(&path, tmp.path().join("renamed")).unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        std::fs::rename(&path, owned.join("renamed")).unwrap();
     }
     #[test]
     fn hardlinked_file_refuses() {
@@ -597,6 +601,58 @@ mod tests {
 #[cfg(test)]
 mod mutable_pin_tests {
     use super::*;
+    #[test]
+    fn ancestor_pins_allow_unrelated_renames_but_prevent_replacement() {
+        // Never rename a direct child of TEMP: development executor tests may
+        // independently pin TEMP. All rename targets belong to this outer dir.
+        let outer = tempfile::tempdir().unwrap();
+        let ancestor = outer.path().join("ancestor");
+        let protected = ancestor.join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        let path = protected.join("db");
+        std::fs::write(&path, []).unwrap();
+        std::fs::write(ancestor.join("sibling-file"), []).unwrap();
+        std::fs::create_dir(ancestor.join("sibling-dir")).unwrap();
+        std::fs::write(outer.path().join("incoming-file"), []).unwrap();
+        std::fs::create_dir(outer.path().join("incoming-dir")).unwrap();
+
+        let pin = open_state_fixture(&path, false).unwrap();
+        std::fs::rename(ancestor.join("sibling-file"), ancestor.join("renamed-file"))
+            .expect("unrelated file rename within a pinned ancestor must succeed");
+        std::fs::rename(ancestor.join("sibling-dir"), ancestor.join("renamed-dir"))
+            .expect("unrelated directory rename within a pinned ancestor must succeed");
+        for name in ["incoming-file", "incoming-dir"] {
+            std::fs::rename(outer.path().join(name), ancestor.join(name))
+                .expect("unrelated move into a pinned ancestor must succeed");
+        }
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+        assert!(std::fs::rename(&protected, ancestor.join("replaced")).is_err());
+        // Request DELETE on the nonempty directory itself: remove_dir alone
+        // could fail just because it is nonempty, masking missing delete pins.
+        use std::os::windows::fs::OpenOptionsExt;
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&protected)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32), // ERROR_SHARING_VIOLATION
+        );
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(pin);
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&protected)
+            .expect("directory delete access must be released after drop");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&protected, ancestor.join("replaced")).unwrap();
+        std::fs::remove_dir(ancestor.join("replaced")).unwrap();
+    }
+
     #[test]
     fn mutable_leaf_allows_database_writes_but_blocks_namespace_replacement() {
         let dir = tempfile::tempdir().unwrap();
