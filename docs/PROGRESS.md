@@ -540,3 +540,65 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Corrected Windows owner contract recheck
 
 - Anthropic / claude-opus-5-5, high corrected ADR0012 atb522125. Codex / gpt-6.1-sol, medium independently rechecked all three changed docs and accepts the bounded documentation contract: P1 unconditional power-loss claim removed, record rollback explicitly outside guarantee, P2 reason split preserved. UTF-8/fence/whitespace checks and depth6 bounded scratch model passed the stated characterization. No native behavior is proven; the old Journal implementation must be replaced before activation. See docs/reviews/0012-owner-contract-review.md.
+
+
+## ADR 0012 PR-A pure owner provenance candidate
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol, high, implementation sub-agent
+  working alone from pinned prepared base
+  `7e7d3bfd49b558f2e5057260694a099540534906` on
+  `t3/implement-owner-provenance-engine`. Replaced obsolete Journal,
+  ConfigurationIo and compensating configure/recovery with strict 512-byte
+  OwnerRecord, OwnerStore/BatchRight, opaque observe_batch, recover, configure
+  and uninstall_right. Intent resolves only to None/Unproven; configure/recover
+  never revoke; only Granted authorizes uninstall using the record's explicit
+  SID. Last merged PR and M2 acceptance are unchanged.
+- Completed tasks: P1-P17 plus P6b/P6c; config mirror/old canonical expected-byte
+  paths, stale presence and record-only observations, cross-SID states, record
+  decoding, CAS, receipt/publication and other store failures with/without
+  effects, fixed errors/reports, explicit old-SID uninstall, unavailable
+  account/workspace and no-config uninstall path. Windows Plan::execute fails
+  closed for configure/uninstall and uninstall plans contain no BatchRight.
+  Former reserved-SID/group coverage is retained alongside new provenance tests.
+- API integration: configure_plan takes Option<BatchObservation>: Windows
+  requires Some from the locked private store; Linux/macOS require None and
+  retain their owner planning/validation behavior without LSA/provenance.
+  Configure::from_plan takes the same opaque observation after resolver.
+  Unix adapter candidate 7e12abf / PR29 needs the coordinator's argument update;
+  no candidate files or unrelated Windows handle-flake fixes were copied.
+  See docs/service-foundation.md for precise session ordering, API and limits.
+- Actual Windows checks: cargo fmt --all -- --check; cargo clippy --workspace
+  --all-targets -- -D warnings; cargo check --workspace; cargo build --workspace;
+  cargo test -p arxd service::owner --lib -- --nocapture (19 passed);
+  cargo test -p arxd service::config --lib (7 passed);
+  cargo test -p arxd service::layout --lib (2 passed); git diff --check.
+  Final focused owner suite took 1.93 seconds after compilation. No complete
+  workspace runtime suite or hosted CI was run; the inherited intermittent
+  Windows handle test remains unresolved and unclaimed by these local passes.
+- Model bounds/results: depth 6, every adapter call prefix (0..15 plus complete),
+  both commands with recovery, both external toggles, three grant/revoke outcomes,
+  and equivalent-state merging. Completed record writes persist in P6/P6b.
+  P6: 11,544 transitions, zero unsafe revokes. P6b LSA-only earlier-value loss:
+  15,365 transitions, zero unsafe revokes. P6c record rollback to any previously
+  seen value: 47,281 transitions, 312 unsafe revokes, all characterized by stale
+  Granted restored over a later non-Granted write; exact decision 6 trace pinned.
+  Independent ghost attribution detects both seeded receipt mutations: taking a
+  pre-existing right (52 unsafe witnesses / 12,064 transitions) and recovery
+  promoting to Granted (376 / 12,168). These mutations fail the P6 safety
+  predicate; the harness requires witnesses. No physical NTFS/LSA proof is claimed.
+- Corrections during verification: a fixture initially asserted only the primary
+  SID on a valid cross-SID None replacement; another injected read-error fixture
+  failed to return Err when its effect flag was set. Both fixture issues were
+  corrected and the focused suite rerun. One Clippy let-and-return diagnostic
+  was corrected. No symptom reached three distinct failed fixes.
+- Remaining blockers/tasks: fresh independent Opus implementation review, native
+  store/locking/publication and LSA (PR-B), SCM (PR-C), checked CLI session wiring
+  (PR-D), corrected native ancestor authority, service workspace boundary,
+  protected state provisioning, dedicated-account execution and installed M2
+  cargo/Claude Code/activity acceptance. Native and installed paths remain
+  **unverified on real hardware**. The accepted architecture does not accept
+  this implementation automatically.
+- No subagents, push, PR creation, merge, watch, admin/account/right/task/service/
+  install/provision/dispatch/settings operation or old Lab Manager/VM access.
+  Record rollback remains explicitly outside the safety guarantee. No new
+  infrastructure, approval flow, acknowledgement flag or architectural deviation.

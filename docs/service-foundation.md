@@ -385,3 +385,70 @@ the separate dedicated-account executor and account-scoped tool probe. All
 installed-manager/privileged paths remain **unverified on real hardware**. Full
 M2 dedicated-account cargo/Claude Code/activity acceptance remains open. No new
 architecture decision or owner-PC privileged operation is claimed.
+
+
+## ADR 0012 pure owner provenance candidate (PR-A)
+
+This replaces the obsolete Journal/ConfigurationIo compensation engine. The
+Windows-only engine uses OwnerRecord (strict serde version 1, canonical ordinary
+SID, lowercase RightState, deny unknown/duplicate fields and trailing data,
+512-byte decode cap). The record and Configure have no Debug output. Errors and
+RightReport display fixed tokens, never private owner data. Decoding bytes does
+not establish authority: only the future SYSTEM-private OwnerStore under the
+owner lock does. OwnerStore supplies exact-byte hashes for compare-and-replace;
+BatchRight observes only the explicit SID's direct SeBatchLogonRight assignment.
+
+API sequence for a future Windows session, all under one lock: recover(store,
+right), observe_batch(build_sid, store, right), configure_plan(layout, context,
+config, previous, Some(batch), resolver), Configure::from_plan(layout, plan,
+resolver, batch), configure(request, store, right). BatchObservation is opaque,
+Copy, and obtainable publicly only through observe_batch; neither MCP booleans
+nor config mirrors can construct it. configure rereads the record and observation
+before staging; pending Intent refuses, protected cross-SID provenance refuses,
+and stale presence or recorded-grant evidence conflicts. A successful absent
+observation plus successful grant can produce Granted. Intent recovery produces
+None or Unproven, never Granted. Neither configure nor recover calls revoke.
+Publication errors retain the record and never compensate.
+
+Windows uninstall uses owner_plan(layout, context, Uninstall) without config or
+resolver, then the future checked SCM stop/delete, then uninstall_right(store,
+right), with recovery first. uninstall_right accepts no config, account name or
+workspace; only a Granted record authorizes revoke, using its exact SID. The
+compatibility uninstall_plan wrapper ignores previous/resolver on Windows and
+emits no BatchRight operations. Plan::execute refuses Windows configure and
+uninstall before applying any operation; future wiring must use the session.
+
+Unix configure_plan uses the same position with None instead of the old ignored
+batch-present bool. Some is rejected on Unix; None is rejected on Windows. Unix
+config validation, rights/drop-in planning, previous-identity checks, uninstall
+revalidation and direct Plan::execute semantics remain intact. This deliberately
+requires a call-site adjustment to Unix candidate 7e12abf / PR29 by the coordinator;
+it does not require Unix LSA or owner provenance. No legacy boolean Windows
+configure route remains. The old granted_batch_right config field is used only
+as a mirror and to reproduce canonical expected old bytes, never as authority.
+This optional typed parameter is an implementation choice within ADR 0012.
+
+The depth-6 model runs the real engine across every call prefix (cutoffs 0..15
+plus completion), configure/uninstall with recovery, Ok/Err-with-effect/Err-
+without-effect right mutations and external add/remove between commands. The
+cutoff stops all subsequent adapter effects, making it equivalent to termination
+at that boundary; all completed record publications remain visible. It merges
+identical future-relevant states, including ghost history, rather than launching
+redundant test processes. Independent ghost attribution records the last
+acknowledged record write and whether the latest external add occurred outside
+Granted authority; it does not reproduce engine branch decisions. P6b permits
+membership rollback to either previously seen value with records retained. P6c
+also permits record rollback to any previously seen record value (no lookback
+cutoff), reproduces decision 6's exact counterexample and requires every unsafe
+revoke to follow a restored Granted over a later non-Granted write. P6c is a
+characterization outside the guarantee. Seeded receipt-boundary mutations that
+take a pre-existing right or promote recovery to Granted must each produce unsafe
+revoke witnesses under P6. These are bounded abstract state results, not physical
+NTFS, LSA, power-loss or registry ordering evidence.
+
+No native store, LSA, SCM, filesystem mutation adapter, CLI or MCP activation is
+supplied here. D1 ancestor authority, D2 service workspace boundary, native
+publication/locking/LSA/SCM tests, installed wiring/provisioning, dedicated-account
+execution and installed M2 acceptance remain open. All native/installed paths
+are **unverified on real hardware**. Accepted architecture is not implementation
+acceptance; a fresh independent Opus review is required.
