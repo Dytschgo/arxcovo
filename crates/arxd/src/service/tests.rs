@@ -14,6 +14,10 @@ struct FakeApp {
     delay_start: bool,
     wait_signal: bool,
     delay_drain: bool,
+    drain_duration: Option<Duration>,
+    audit_duration: Option<Duration>,
+    stuck_start: bool,
+    unexpected_serve_end: bool,
 }
 impl FakeApp {
     fn event(&self, name: &'static str) -> Result<(), ExitCode> {
@@ -51,12 +55,18 @@ impl Application for FakeApp {
         if self.delay_start {
             tokio::time::sleep(Duration::from_millis(2500)).await;
         }
+        if self.stuck_start {
+            std::future::pending::<()>().await;
+        }
     }
     fn start_discovery(&mut self) {
         self.event("discovery").unwrap();
     }
     async fn serve(&mut self) -> Result<(), ExitCode> {
         self.event("serve")?;
+        if self.unexpected_serve_end {
+            return Ok(());
+        }
         if !self.wait_signal {
             self.request.cancel();
         }
@@ -76,13 +86,21 @@ impl Application for FakeApp {
         if self.delay_drain {
             tokio::time::sleep(Duration::from_millis(2500)).await;
         }
+        if let Some(duration) = self.drain_duration {
+            tokio::time::sleep(duration).await;
+        }
         if self.stuck {
             std::future::pending::<()>().await;
         }
         Ok(())
     }
     async fn service_stop(&mut self) -> Result<(), ExitCode> {
-        self.event("stop-audit")
+        self.event("stop-audit")?;
+        if let Some(duration) = self.audit_duration {
+            tokio::time::sleep(duration).await;
+            self.event("stop-audit-complete")?;
+        }
+        Ok(())
     }
     fn release(&mut self) -> Result<(), ExitCode> {
         self.event("release")
@@ -205,6 +223,66 @@ async fn stuck_drain_is_bounded_and_never_claims_stop_audit() {
             .count()
             >= 10
     );
+}
+#[tokio::test(start_paused = true)]
+async fn late_successful_drain_leaves_a_separate_stop_audit_budget() {
+    let mut app = FakeApp {
+        drain_duration: Some(Duration::from_millis(9950)),
+        audit_duration: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let before = tokio::time::Instant::now();
+    let (code, reports) = execute(&mut app).await;
+    assert_eq!(code, ExitCode::Clean);
+    assert_eq!(before.elapsed(), Duration::from_millis(10050));
+    assert!(app.events.lock().unwrap().contains(&"stop-audit-complete"));
+    assert_eq!(reports.0.last(), Some(&(State::Stopped, ExitCode::Clean)));
+}
+#[tokio::test(start_paused = true)]
+async fn stop_audit_timeout_is_bounded_and_never_reports_clean() {
+    let mut app = FakeApp {
+        audit_duration: Some(Duration::from_secs(60)),
+        ..Default::default()
+    };
+    let before = tokio::time::Instant::now();
+    let (code, reports) = execute(&mut app).await;
+    assert_eq!(code, ExitCode::Store);
+    assert_eq!(before.elapsed(), Duration::from_secs(5));
+    assert!(app.events.lock().unwrap().contains(&"stop-audit"));
+    assert!(!app.events.lock().unwrap().contains(&"stop-audit-complete"));
+    assert_eq!(app.events.lock().unwrap().last(), Some(&"release"));
+    assert_eq!(reports.0.last(), Some(&(State::Stopped, ExitCode::Store)));
+}
+#[tokio::test(start_paused = true)]
+async fn startup_heartbeats_do_not_extend_the_startup_deadline() {
+    let mut app = FakeApp {
+        stuck_start: true,
+        ..Default::default()
+    };
+    let before = tokio::time::Instant::now();
+    let (code, reports) = tokio::time::timeout(Duration::from_secs(31), execute(&mut app))
+        .await
+        .expect("startup must finish within its own deadline");
+    assert_eq!(code, ExitCode::Layout);
+    assert_eq!(before.elapsed(), Duration::from_secs(30));
+    assert!(!reports.0.iter().any(|(state, _)| *state == State::Running));
+    assert!(app.events.lock().unwrap().contains(&"stop-audit"));
+    assert_eq!(app.events.lock().unwrap().last(), Some(&"release"));
+}
+#[tokio::test]
+async fn an_unrequested_server_exit_is_not_a_clean_service_stop() {
+    let mut app = FakeApp {
+        unexpected_serve_end: true,
+        ..Default::default()
+    };
+    let (code, reports) = execute(&mut app).await;
+    assert_eq!(code, ExitCode::Endpoint);
+    assert_eq!(
+        reports.0.last(),
+        Some(&(State::Stopped, ExitCode::Endpoint))
+    );
+    assert!(app.events.lock().unwrap().contains(&"stop-audit"));
+    assert_eq!(app.events.lock().unwrap().last(), Some(&"release"));
 }
 #[tokio::test(start_paused = true)]
 async fn startup_heartbeats_and_late_cancellation_subscribers() {
