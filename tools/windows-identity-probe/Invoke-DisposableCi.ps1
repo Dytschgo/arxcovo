@@ -25,12 +25,8 @@ function Assert-Lifetime {
 }
 function Set-PrivateAcl([string]$Path, [string]$TestRights='') {
     Assert-ProbePath $Path 'C:\arxcovo-probe'
-    $acl = [Security.AccessControl.DirectorySecurity]::new()
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
-        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
-    }
-    if ($TestRights) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($state.Sid), $TestRights, 'ContainerInherit,ObjectInherit', 'None', 'Allow')) }
+    $inheritance = if ($TestRights -eq 'ReadAttributes,Traverse') { 'None' } else { 'ContainerInherit,ObjectInherit' }
+    $acl = Get-ProbeDirectoryAcl $state.Sid $TestRights $inheritance
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 $script:cleanupEntries = 0
@@ -51,7 +47,7 @@ try {
     Assert-ProbePath $root $root
     Assert-Probe (!(Test-Path -LiteralPath $root))
     Assert-Probe (!(Test-Path -LiteralPath 'C:\arxcovo-probe'))
-    [void][IO.Directory]::CreateDirectory('C:\arxcovo-probe')
+    [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new('C:\arxcovo-probe'), (Get-ProbeDirectoryAcl))
     $state.ParentCreated = $true
     Set-PrivateAcl 'C:\arxcovo-probe'
     [void][IO.Directory]::CreateDirectory($root)
@@ -76,6 +72,8 @@ try {
         $members = @(Get-LocalGroupMember -Group $group | ForEach-Object { $_.SID.Value })
         if ($state.Sid -cin $members) { Assert-Probe ($group.SID.Value -ceq 'S-1-5-32-545') }
     }
+    Set-PrivateAcl 'C:\arxcovo-probe' 'ReadAttributes,Traverse'
+    Set-PrivateAcl $root 'ReadAttributes,Traverse'
     foreach ($dir in @('bin','work')) { [void][IO.Directory]::CreateDirectory("$root\$dir") }
     $publish = "$PSScriptRoot\bin\Release\net10.0-windows\win-x64\publish"
     Assert-ProbePath $publish $publish
@@ -111,12 +109,17 @@ try {
     try {
         $buffer = [char[]]::new(131073)
         $count = 0
+        $deadline = [Diagnostics.Stopwatch]::StartNew()
         while ($count -lt $buffer.Length) {
-            $n = $p.StandardOutput.Read($buffer, $count, $buffer.Length - $count)
+            $remaining = 20000 - [int]$deadline.ElapsedMilliseconds
+            if ($remaining -le 0) { throw 'output-timeout' }
+            $read = $p.StandardOutput.ReadAsync($buffer, $count, $buffer.Length - $count)
+            if (!$read.Wait($remaining)) { throw 'output-timeout' }
+            $n = $read.Result
             if ($n -eq 0) { break }
             $count += $n
         }
-        if ($count -gt 131072 -or !$p.WaitForExit(20000)) { throw 'bounded-output-or-time' }
+        if ($count -gt 131072 -or !$p.WaitForExit([Math]::Max(0, 20000 - [int]$deadline.ElapsedMilliseconds))) { throw 'bounded-output-or-time' }
         [IO.File]::WriteAllText('__ROOT__\result.jsonl', [string]::new($buffer, 0, $count))
         exit $p.ExitCode
     } finally { if (!$p.HasExited) { $p.Kill($true); [void]$p.WaitForExit(5000) }; $p.Dispose() }
@@ -153,12 +156,15 @@ try {
         $done = $current.LastRunTime -gt $before -and $current.State -ne 4 -and $current.State -ne 2
     } while (!$done -and $watch.Elapsed.TotalSeconds -lt 75)
     if ($done) { Write-Output (ConvertTo-Json @{stage='task-result';code=[long]$current.LastTaskResult} -Compress) }
-    Assert-Probe ($done -and $current.LastTaskResult -eq 0)
+    Assert-Probe $done
     [void](Assert-Lifetime)
     $result = "$root\result.jsonl"
     Assert-ProbePath $result $root
     Assert-Probe ((Get-Item -LiteralPath $result).Length -le 262144)
-    Write-Output (Read-ProbeEvidence ([IO.File]::ReadAllText($result)) $state.Sid)
+    $evidence = [IO.File]::ReadAllText($result)
+    Write-Output (Get-ProbeDiagnostics $evidence)
+    Assert-Probe ($current.LastTaskResult -eq 0)
+    Write-Output (Read-ProbeEvidence $evidence $state.Sid)
     $success = $true
 } catch { Write-Output '{"stage":"ci-experiment","ok":false}' }
 finally {

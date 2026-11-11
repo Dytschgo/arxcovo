@@ -38,6 +38,18 @@ function Assert-ProbePath([string]$Path, [string]$Root) {
         $part = $part.Parent
     }
 }
+function Get-ProbeDirectoryAcl([string]$Sid='', [string]$Rights='', [string]$Inheritance='None') {
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($admin in @('S-1-5-18','S-1-5-32-544')) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($admin), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
+    if ($Rights) {
+        Assert-Probe ($Sid -cmatch '\AS-1-5-21-(?:[0-9]+-){3}[0-9]+\z')
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Sid), $Rights, $Inheritance, 'None', 'Allow'))
+    }
+    return $acl
+}
 function Get-ProbeCleanupPlan($State, [string]$ObservedSid) {
     Assert-Probe ($State.Sid -cmatch '\AS-1-5-21-(?:[0-9]+-){3}[0-9]+\z')
     Assert-Probe ($ObservedSid -ceq $State.Sid)
@@ -48,6 +60,33 @@ function Get-ProbeCleanupPlan($State, [string]$ObservedSid) {
     $steps += 'account'
     if ($State.PathCreated) { $steps += 'path' }
     return $steps
+}
+function Get-ProbeDiagnostics([string]$Text) {
+    Assert-Probe ([Text.Encoding]::UTF8.GetByteCount($Text) -le 262144)
+    $lines=@($Text.TrimEnd("`r","`n") -split '\r?\n')
+    Assert-Probe ($lines.Count -le 128)
+    $apis=@('NetUserGetInfo','NetUserGetLocalGroups','LsaRegisterLogonProcess','LsaLookupAuthenticationPackage','LsaLogonUser-MSV1_0-S4U-Batch','CreateProcessW-leaf','CreateProcessAsUserW-suspended','QueryInformationJobObject','GetTokenInformation','OpenProcessToken','AllocateLocallyUniqueId','CreateJobObjectW','SetInformationJobObject','AssignProcessToJobObject','ResumeThread','ResumeThread-leaf','WaitForSingleObject-child','GetExitCodeProcess','OpenProcess-descendant','IsProcessInJob','TerminateJobObject','GetExitCodeProcess-descendant','cleanup-TerminateJobObject','cleanup-TerminateProcess','LookupPrivilegeValueW','PrivilegeCheck','LookupPrivilegeNameW')
+    # Validate the complete bounded JSON stream before publishing any sanitized row.
+    $out=@()
+    foreach ($line in $lines) {
+        Assert-Probe ($line.Length -le 2048)
+        $row=ConvertFrom-Json -InputObject $line -AsHashtable -ErrorAction Stop
+        Assert-Probe ($row -is [hashtable] -and $row.stage -is [string])
+        if ($row.stage -cnotin @('win32','lsa','account','child-exit')) { continue }
+        $safe=@{stage='probe-diagnostic';sourceStage=$row.stage}
+        if ($row.stage -cne 'child-exit') {
+            Assert-Probe ($row.api -cin $apis)
+            $safe.api=$row.api
+        }
+        foreach ($key in @('status','subStatus','win32','subWin32','error','exitCode','payloadNativeError')) {
+            if ($row.ContainsKey($key) -and $null -ne $row[$key]) {
+                Assert-Probe (($row[$key] -is [int] -or $row[$key] -is [long]) -and $row[$key] -ge 0 -and $row[$key] -le 4294967295)
+                $safe[$key]=$row[$key]
+            }
+        }
+        $out+=ConvertTo-Json $safe -Compress
+    }
+    return $out
 }
 function Read-ProbeEvidence([string]$Text, [string]$Sid) {
     Assert-Probe ([Text.Encoding]::UTF8.GetByteCount($Text) -le 262144)

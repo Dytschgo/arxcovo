@@ -23,12 +23,21 @@ dotnet run --project tools/windows-identity-probe/IdentityProbe.csproj -c Releas
 dotnet publish tools/windows-identity-probe/IdentityProbe.csproj -c Release -r win-x64 --self-contained true --nologo
 ```
 
-Only the pure helper tests and probe `--self-test` may run on the owner PC. It does not query tokens, create
-processes, mutate accounts, or call LSA. It tests account rejection, each CI
-precondition independently, workspace rejection, missing-path rejection, JSON
-serialization, environment construction, and native structure sizes. Build and
-publish do not execute privileged operations. The self-contained publish is
-needed so a child has no SDK/PATH dependency. Keep the publish directory intact.
+The helper tests and probe `--self-test` may run under the existing unprivileged
+identity. They create only fixed ordinary diagnostic children, temporary junctions
+and an empty unnamed Job; they read the current token without changing it. No LSA,
+S4U, account/right/task operations, elevation or SYSTEM execution is performed.
+The probe compares hidden-console versus detached standard handles and reads raw
+TokenGroups; when the current token is a filtered administrator, it proves the
+actual deny-only Administrators entry is omitted by WindowsIdentity.Groups and
+rejected by the raw-group policy. A boolean reports whether that case was present;
+absence must not be claimed as a pass for the actual filtered-token case.
+The helper exercises the exact nested output-read block with fixed ordinary
+children (success, oversize and stalled output), using a shortened test deadline.
+`Test-GuardMutations.ps1` removes each of the five reviewed evidence guards on
+temporary copies and requires the full suite to fail with an expected-refusal error.
+Build and publish do not execute privileged operations. Keep the self-contained
+publish directory intact so children need no SDK/PATH dependency.
 
 ## What a future disposable CI run measures
 
@@ -59,7 +68,9 @@ to run without the CI guards and refuse SYSTEM identity.
    profile/token contents. A missing batch right or denied logon should be
    distinguishable here. The actual local-account S4U result remains unknown.
 5. Require the returned SID and exactly Medium integrity RID 8192; reject
-   unexpected builtin/privileged domain groups, including deny-only groups,
+   unexpected builtin/privileged domain groups and S-1-5-114, including deny-only
+   groups, by reading every raw TokenGroups entry with count, stride and SID-buffer
+   bounds (WindowsIdentity.Groups is not used for this decision),
    and token privileges outside a small normal-user allowlist (even disabled).
    CreateProcessAsUser receives that token directly. No password logon,
    DuplicateToken fallback, owner token, interactive desktop ACL edit or
@@ -67,7 +78,9 @@ to run without the CI guards and refuse SYSTEM identity.
 6. Create a private unnamed Job with KILL_ON_JOB_CLOSE and an active-process
    limit of three. Create the published probe executable suspended with an
    absolute application path, writable command line, no handle inheritance,
-   no window and a fresh seven-key Unicode environment. No PATH, owner home,
+   DETACHED_PROCESS (0x8), and a fresh seven-key Unicode environment.
+   Combined creation flags are 0x0000040c, replacing CREATE_NO_WINDOW, which
+   creates live hidden-console standard handles. No PATH, owner home,
    GitHub token, credentials, arbitrary environment or standard handles are
    passed. No user profile is loaded. Leave desktop/session selection to the
    API; desktop failures must be evidence, not permission changes.
@@ -126,8 +139,16 @@ Do not run this helper locally, even with spoofed environment variables.
 Setup refuses an existing C:\arxcovo-probe parent, run tree, generated account or
 task. It creates a protected parent and exact run-attempt control tree. SYSTEM
 and Administrators alone have full control; generated SID gets bin RX and work
-Modify only. Code, task script and result stay private. Only fresh user group
-memberships are checked; existing profiles and account rights are not enumerated.
+Modify. The parent and run root grant only noninheriting ReadAttributes/Traverse
+(plus the .NET-added Synchronize bit), allowing ancestor checks without directory
+listing, file reads or writes. These ACEs do not reach the task script or result;
+parent directory data remains private. The top parent is created with its protected
+DACL atomically; the run root initially inherits that private DACL. Existence
+checks and later path checks still assume a fresh trusted hosted runner without
+an adversarial local writer; these are not race-proof handle-relative operations.
+Only fresh user group memberships are checked; existing profiles are not enumerated.
+Existing explicit account rights ARE enumerated and refused before granting the
+batch right.
 The password is generated directly into a SecureString, with random bytes cleared
 and SecureString disposed; it is never converted to a plaintext string, logged,
 written, exported or sent through command arguments. S4U never receives it.
@@ -137,12 +158,16 @@ account SYSTEM, highest run level, protected SYSTEM/admin DACL, fixed absolute
 hosted pwsh path, no profile, no triggers/retries and a one-minute execution limit.
 The protected script starts only the self-contained probe, with a cleared fresh
 seven-key environment including SystemRoot from Windows. Output reads have a
-131072-character cap, followed by a 256-KiB file cap and 128-line/2048-character
+131072-character cap and a shared 20-second asynchronous read/exit deadline, followed by a 256-KiB file cap and 128-line/2048-character
 JSON limits. Polling lasts at most 75 seconds and requires a changed LastRunTime,
 nonrunning/nonqueued state and LastTaskResult 0. Parsed evidence must contain
 pinned SID/Medium observations, managed root exit 42, descendant exit 124 and
-zero live Job processes. Only a fixed allowlisted numeric/boolean summary is
-published; raw task output and setup exceptions are not printed or uploaded.
+zero live Job processes. Native diagnostic rows are published before the task
+exit/result-success check, even for failure evidence: fixed stage/API names and
+bounded unsigned numeric status/subStatus/win32/subWin32/error/exitCode/payloadNativeError
+fields only. The complete bounded JSON stream is parsed before diagnostics publish.
+Job drain queries emit only on API failure, so polling cannot exhaust the line cap.
+Only fixed allowlisted summaries and numeric diagnostics are published; raw task output and setup exceptions are not printed or uploaded.
 An API creation success or empty result cannot pass.
 
 Cleanup compares current SID and task XML with captured identities, stops only
@@ -207,9 +232,9 @@ Run each fixture in a separate fresh workspace/task (no parallel cases):
 | --- | --- | --- |
 | CI marker only / each missing guard | refusal before native operations | self-tests |
 | Invalid account/path/traversal | refusal | self-tests |
-| Missing path / reparse ancestor | refusal | missing path tested; reparse CI pending |
+| Missing path / reparse ancestor | refusal | missing path and unprivileged junction ancestor tested |
 | Generated nonexistent account | NetUserGetInfo status (normally 2221), no logon | CI pending |
-| Generated user in Administrators | reject even filtered/deny-only membership | CI pending |
+| Generated user in Administrators | reject even filtered/deny-only membership | actual existing filtered token tested locally; generated-account CI pending |
 | Standard user with explicit SeDenyBatchLogonRight | LSA status/substatus (normally logon-type-not-granted), no child | CI pending; grant deny only to fresh test SID |
 | Standard task identity / no SYSTEM | refuse LocalSystem precondition, no owner fallback | CI pending |
 | SYSTEM token lacking effective SeTcbPrivilege | preflight refusal | CI pending; requires separately reviewed token-restriction fixture |
@@ -253,19 +278,35 @@ when integrating; this bounded builder only owns probe-specific documentation.
 
 ## Implementation verification record
 
-Provider/effort: GPT-6.1 Sol, high; base 24d3c7e. Scope stayed within probe
-files, this document and the new manual workflow; coordinator owns PROGRESS.md
-updates and independent review. No subagents, push, PR, dispatch or GitHub writes.
-Release build passed with zero warnings/errors; probe self-test passed 21
-assertions; helper pure tests passed 82 assertions; self-contained win-x64
-publish passed. No account/right/task/service/privilege/VM mutation ran locally.
-The native LSA helper compiled but was never invoked. All privileged APIs, ACLs,
-task execution, negative native fixtures and cleanup are **unverified on real
-hardware** until independently reviewed disposable CI. Source parsing and pure
-refusal tests do not establish native behavior or hosted provenance.
+Original PR implementation: base `9c623449f8341359283190f96d8222acfc7e5769`,
+reviewed head `d42c33ece6ec20acebf5a4958b8b6c4a7943534e`; CI helper commit
+`a237256`. Earlier references to 24d3c7e/852f6f0 were source-identical builder
+checkpoints outside this PR history and are superseded by these PR commits.
 
-Pure mutation testing on temporary copies removed, separately, the SID match,
-reviewed source SHA match and descendant-exit requirement. Each caused an expected
-test failure; the intact helper suite passed afterward. YAML parsing and assertions
-for manual-only triggers, windows-2022, contents-read and eight-minute budget passed.
-These tests establish validation sensitivity, not privileged/native correctness.
+Review-fix provider/effort: GPT-6.1 Sol, high. Local parent `d42c33e`.
+Read the full Opus review comment 6791552363 via read-only GH API. No agents,
+push, PR writes, dispatch, settings, account/right/task changes or admin actions.
+
+Before/after evidence: the old CREATE_NO_WINDOW flags produce standard-handle
+mask 7 in a real ordinary child; the shared corrected DETACHED_PROCESS flags
+produce mask 0. Current filtered administrator token has raw deny-only
+Administrators membership, absent from WindowsIdentity.Groups; the new policy
+rejects that actual token and synthetic enabled/deny-only privileged entries.
+The parent ACL is tested as a descriptor only; cross-account ancestor access
+and private-data isolation remain **unverified on real hardware**.
+
+Release build: zero warnings/errors. Self-contained win-x64 publish: passed.
+Safe probe self-test: 33 assertions, actual filtered-token case observed; 300
+empty-Job PID queries produce no poll output. Helper suite: 114 assertions,
+including each wrong-stage SID, Low/High/System integrity, false Medium flag,
+child exit 1/44, real junction ancestor, ACL descriptor restrictions, sanitized
+failure diagnostics, and actual ordinary-process output success/oversize/stall.
+All five reviewed single-guard removals (stage SID, integrity RID, Medium flag,
+child exit, ancestor reparse) are killed by the full parser/evidence suite.
+The source parser also checks every helper and the protected task template.
+
+All S4U, CreateProcessAsUser, cross-account ACLs, task execution, privileged
+negative fixtures and cleanup remain **unverified on real hardware**. No milestone
+acceptance is claimed. Fresh different-provider independent review on the final
+integrated head and green required gates are required before any future dispatch.
+Get-LocalGroupMember unresolved-SID enumeration still fails closed (N6).
