@@ -567,3 +567,49 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Service Application ancestor integration
 
 - Codex / gpt-6.1-sol, medium integrated natived045cc4 into PR27, retaining Application FILE_READ_DATA ancestry pins and mutable-state write-sharing/no-delete-sharing behavior while adopting raw ACL masks and namespace authority checks. Formatting, workspace/all-target Clippy with warnings denied and all112 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Fresh security review and hosted checks remain pending. Privileged workspace metadata and detailed preflight-reason findings remain open, as do macOS ancestry and installed-service acceptance.
+
+## M2 independent Unix owner operations candidate
+
+- Provider/effort/outcome: Codex / gpt-6.1-sol, high; implementation sub-agent
+  working alone on `t3/unix-owner-operations`, prepared base
+  `4e66c555686d8ee9084d700ebf4dc60ce926ea74` (Application PR27 stack).
+  Implemented callable fixed-layout Unix owner executor and separate protected
+  empty state provisioning. No main CLI, Application, transport or store change.
+  Code commit: `90948f6` (feat(service): execute protected Unix owner plans).
+  Last merged PR and M2 dedicated-account acceptance remain unchanged.
+- Done: fresh native root/current-binary gates, descriptor-relative no-follow
+  operations, ACL/owner/mode/link/type/ancestor refusal, exclusive creation,
+  identical-artifact/no-takeover handling, parent-locked atomic config publish
+  with file/parent fsync, bounded fixed manager commands with explicit environment,
+  conservative stop/unregister, disabled-by-default macOS installation and
+  explicit start enable/bootstrap. Provisioning initializes only empty protected
+  DB/journal/lock prerequisites; existing Activity performs schema initialization.
+- Checks actually run: Windows fmt check and workspace/all-target Clippy with
+  warnings denied; service library suite 47 passed/one ignored direct fixture
+  exercised by its existing ordinary-user parent; three new portable adapter
+  tests passed; artifact script three passed/two native skips. Three restored
+  allowlist mutations each killed by assertion; baseline rerun passed. Isolated
+  actual-source Linux/macOS test metadata Clippy passed with warnings denied.
+  Six ordinary-user Unix fixture tests compiled, not executed. Full Unix link
+  and runtime were not attempted on Windows. Details/API/limitations in
+  docs/service-foundation.md.
+- Corrections during validation: Windows-only unused imports/dead helpers were
+  cfg-gated; cross-check exposed helper visibility and Darwin mode_t width;
+  isolated Clippy found test placement/collapsible branch. Each was corrected;
+  no symptom reached three failed fixes. No fence was weakened.
+- Open: independent other-provider review; native ordinary-user fixture runs;
+  disposable root installation/config CAS/protected SQLite first-start/restart;
+  native ACL/default ACL and manager timeout/stop/unregister semantics; macOS
+  first reboot stays disabled and explicit start enables/bootstrap; dedicated
+  executor and full Claude Code/cargo/activity acceptance. Manager nonzero
+  statuses stop uninstall (including possibly already absent launchd jobs);
+  no successful cleanup is claimed then. All privileged paths remain
+  **unverified on real hardware**. No new architectural deviation is claimed.
+- No privileged operation, OS-path owner-adapter invocation, elevation,
+  account/right/task/service/dispatch/settings mutation, old Lab Manager/VM
+  access, push, PR, merge, watch, GitHub write or subagent occurred. Actual local
+  mutations were repository/ignored build output and ordinary-user test fixtures.
+
+## Unix owner adapter coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate7e12abf above the service Application ancestor/handle corrections. Formatting, workspace/all-target Clippy with warnings denied, three portable owner-adapter tests and artifact checks (three passed, two native platform checks skipped) passed. Linux/macOS native fixture/link/runtime and independent review remain pending. No privileged installation, manager command, account or owner operation ran; installed-service M2 acceptance remains open.

@@ -6,7 +6,7 @@ use super::{
 use std::{fs::File, io::Read, path::Path};
 #[cfg(unix)]
 #[path = "native_unix.rs"]
-mod os;
+pub(super) mod os;
 #[cfg(windows)]
 #[path = "native_windows.rs"]
 mod os;

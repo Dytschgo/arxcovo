@@ -306,6 +306,81 @@ missing/mismatched build-account separation and fixed bridge identity refusal.
 The application fixture uses an explicit current-user storage policy and injected
 bindings; it is not a production-readiness or SYSTEM-layout acceptance test.
 
+### Independent Unix owner adapter (Sol high, 2026-11-11)
+
+Callable integration is `service::owner_unix::execute(&owner_plan::Plan)` and
+`service::owner_unix::provision_state()`. Neither is wired into the CLI or
+Application. Windows/non-Unix calls return `NativeAdapterMissing`. No public
+manager constructor, fixture identity switch or arbitrary provisioning path exists.
+The only native-reader visibility change makes its existing Unix observations
+available inside `service`; its protection checks remain intact.
+
+Execution freshly requires real/effective UID and GID zero, exact `current_exe`
+equality with the system layout's binary, and protected no-follow binary/ancestry.
+The plan's `OwnerContext.admin` is never native authority. Every operation is
+allowlisted again by fixed path, policy, artifact bytes and command vector.
+Descriptor-relative traversal checks local filesystem, owner/group, type, link
+count, access ACL and (Linux directories) default ACL. Missing optional guards
+are accepted only after checking existing ancestry. Existing objects are never
+chmodded, chowned or taken over. New objects use exclusive creation; only their
+new handles get exact modes, so a restrictive caller umask is supported.
+
+Config publication locks the pinned private parent without waiting, compares
+expected bytes, writes a random exclusive 0600 sibling, fsyncs it, checks old
+inode identity, and publishes with rename (or exclusive link for first create).
+The temporary link is removed and the parent fsynced before success. Conflicting
+owner publishers refuse; noncooperating root writes, root namespace replacement
+and mount changes are outside this guarantee, as in the Application's native
+pins. This is not a kernel CAS against a hostile root process. Failures retain
+partial artifacts and do not attempt repair; a failed write may retain a private
+temporary file. No secret-bearing payload is included in errors.
+
+`provision_state()` checks the fixed 0700 state directory, refuses WAL/SHM and
+nonempty or unsafe existing prerequisites, then exclusively creates missing
+0600 `activity.lock`, `activity.sqlite3` and `activity.sqlite3-journal`. It takes
+the same native file lock used by Activity and rechecks companions under that
+lock. Empty existing prerequisites allow recovery from a partial provisioning;
+nonempty state is never overwritten. Activity still initializes schema and host
+identity transactionally on first service startup. Its existing persistent
+TRUNCATE journal contract is retained (no store API change or SQLite invocation
+in provisioning); “persistent” here does not change SQLite to PERSIST mode.
+
+Only absolute constant systemctl/launchctl vectors run, with a cleared explicit
+environment, null stdio, fixed cwd and no shell. The child gets 35 seconds, then
+kill and at most one second of reap polling. A timeout does not undo a request
+already delivered to the manager and does not prove the daemon stopped. Any
+nonzero manager result refuses subsequent steps, including unregister; already
+absent launchd jobs may therefore require owner reconciliation before retry.
+Uninstall removes only identical protected unit/drop-in/plist files, preserving
+config, state, credentials, accounts and directories. Install never enables or
+starts systemd. The plist is disabled by default to prevent first reboot startup;
+install also disables the fixed launchd label before publishing the plist, after
+refusing a conflicting existing plist, so a prior start override cannot enable a
+reinstall. Only explicit start enables and bootstraps launchd after
+config/layout/state checks. macOS admin refusal
+before account/revision lookup and Linux admin policy remain in shared config.
+
+Executed evidence: Windows workspace/all-target Clippy with warnings denied;
+formatting check; 47 service library tests passed (one direct current-token
+fixture ignored, exercised by its existing normal-user parent); three new
+portable adapter tests passed; artifact script three passed/two native skips.
+Three restored mutations (arbitrary manager program, changed artifact bytes,
+arbitrary config path) each failed the intended assertion, then baseline passed.
+An ignored `target/owner-native-check` manifest imported the actual service
+sources and passed isolated `cargo clippy --tests -- -D warnings` metadata checks
+for Linux x86_64 and macOS arm64, without lint suppression or native execution.
+Its reference to `endpoint_guard` replaces Application's absent caller only.
+
+Six Unix ordinary-user fixture tests compile but have not run: real helper CAS,
+hardlink/symlink/wrong-mode/wrong-identity refusal, lexical paths, protected empty
+store provisioning, publisher/store lock contention and caller-bool refusal.
+They use private current-user temp roots; no public fixture selector exists.
+Native fixture execution, filesystem/ACL/fsync semantics, full native workspace
+linking, launchd disabled/enable behavior, systemd reload and bounded stop,
+protected SQLite initialization/restart and installed service acceptance remain
+**unverified on real hardware**. Independent other-provider security review is
+required before integration. No privileged owner adapter was invoked locally.
+
 Integration obligations: merge the coordinator's independent credential-hash
 uniqueness fix (this branch intentionally does not duplicate it); reconcile the
 parent lifecycle/docs refresh; independent other-provider security review; native
