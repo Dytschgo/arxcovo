@@ -311,6 +311,37 @@ fn activity_retention_and_interrupted_restart() {
     );
     drop(store);
 }
+
+#[test]
+fn activity_completion_requires_one_started_record_and_preserves_final_outcome() {
+    let dir = private_dir();
+    let store = Activity::open(dir.path()).unwrap();
+    assert!(store.finish(987654, "succeeded").is_err());
+    let id = store.start("test-agent", "list_hosts").unwrap();
+    store.finish(id, "succeeded").unwrap();
+    assert!(store.finish(id, "rejected").is_err());
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    let outcome: String = db
+        .query_row("SELECT outcome FROM activity WHERE id=?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(outcome, "succeeded");
+    // Corrupt private storage must not allow several records to be completed.
+    db.execute_batch("DROP TABLE activity; CREATE TABLE activity(id INTEGER, principal TEXT, tool TEXT, outcome TEXT); INSERT INTO activity VALUES(1,'test-agent','list_hosts','started'),(1,'test-agent','list_hosts','started');").unwrap();
+    assert!(store.finish(1, "succeeded").is_err());
+    let pending: i64 = db
+        .query_row(
+            "SELECT count(*) FROM activity WHERE outcome='started'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending, 2,
+        "failed completion must roll back every changed row"
+    );
+}
 #[tokio::test]
 async fn configuration_validation_and_disabled_default() {
     let dir = private_dir();

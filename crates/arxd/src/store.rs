@@ -119,13 +119,19 @@ impl Activity {
         if !["succeeded", "rejected"].contains(&outcome) {
             anyhow::bail!("invalid outcome");
         }
-        self.db
+        let mut db = self
+            .db
             .lock()
-            .map_err(|_| anyhow::anyhow!("activity unavailable"))?
-            .execute(
-                "UPDATE activity SET outcome=?1 WHERE id=?2",
-                params![outcome, id],
-            )?;
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction()?;
+        let changed = tx.execute(
+            "UPDATE activity SET outcome=?1 WHERE id=?2 AND outcome='started'",
+            params![outcome, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("activity completion unavailable");
+        }
+        tx.commit()?;
         Ok(())
     }
 }

@@ -106,3 +106,8 @@
 | Oversight | Claude / claude-opus-5-5 | medium | Initial check-in on track; recurring schedule active |
 
 Exact provider allowances and per-task cost are not exposed; no percentages or costs are invented.
+
+## Activity completion integrity correction
+
+- A regression reproduced the unchecked-update finding from PR #11: completing a nonexistent record returned success. Completion now requires exactly one started row in a transaction; repeated completion cannot rewrite a final outcome, and duplicate IDs in corrupt private storage cause rollback.
+- Coordinator verification: all 17 Windows workspace tests, formatting and Clippy passed. Provider Codex / gpt-6.1-sol, medium effort. Independent review and hosted checks remain pending. This prepares reliable execution auditing; command execution and M2 acceptance remain incomplete.
