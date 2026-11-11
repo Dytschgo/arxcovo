@@ -38,9 +38,9 @@ pub fn status() -> Result<super::owner_query::Status, Error> {
     }
 }
 
-/// Prepare only empty, protected SQLite prerequisites. Existing files are never
+/// Prepare missing protected SQLite prerequisites. Existing files are never
 /// overwritten; schema/host identity initialization remains Activity's transaction.
-/// This is separate from install and may be retried after a partial failure.
+/// Install uses the same operation; it may be retried after a partial failure.
 pub fn provision_state() -> Result<(), Error> {
     #[cfg(unix)]
     {
@@ -87,14 +87,6 @@ fn command(platform: Platform, program: &str, args: &[&str], when: Gate) -> bool
                         && when == Gate::Always))
         }
         _ => false,
-    }
-}
-/// Phase 3b operations refuse during whole-plan validation before any mutation.
-#[cfg(any(unix, test))]
-fn executable(op: &Operation) -> Result<(), Error> {
-    match op {
-        Operation::StartPreflight | Operation::ProvisionState => Err(Error::Manager),
-        _ => Ok(()),
     }
 }
 #[cfg(any(unix, test))]
@@ -457,7 +449,6 @@ mod imp {
         pub(super) fn execute(&mut self, operations: &[Operation]) -> Result<(), Error> {
             for op in operations {
                 allowed(&self.layout, op)?;
-                executable(op)?;
             }
             for op in operations {
                 self.apply(op)?;
@@ -515,15 +506,10 @@ mod imp {
                 _ => Ok(Artifact::Foreign),
             }
         }
-        fn provision(&self, state: &Path) -> Result<(), Error> {
-            self.verify(state, Policy::PrivateDirectory, true)?;
-            let (p, _) = self
-                .parent(&state.join("activity.lock"))?
-                .ok_or(Error::Layout)?;
-            // Refuse any existing state, including companions, before creating
-            // anything. Provisioning is idempotent only for the empty triplet.
+        fn state_members(&self, p: &File, required: bool) -> Result<(), Error> {
+            self.check(p, true, Some(0o700))?;
             for n in ["activity.sqlite3-wal", "activity.sqlite3-shm"] {
-                if self.open_at(&p, &name(n)?, false)?.is_some() {
+                if self.open_at(p, &name(n)?, false)?.is_some() {
                     return Err(Error::Permissions);
                 }
             }
@@ -532,24 +518,78 @@ mod imp {
                 "activity.sqlite3",
                 "activity.sqlite3-journal",
             ] {
-                if let Some(mut f) = self.open_at(&p, &name(n)?, false)? {
-                    self.bytes(&mut f, 0o600, 0)?;
+                let Some(mut f) = self.open_at(p, &name(n)?, false)? else {
+                    if required {
+                        return Err(Error::Permissions);
+                    }
+                    continue;
+                };
+                self.check(&f, false, Some(0o600))?;
+                if n == "activity.lock" && f.metadata().map_err(|_| Error::Permissions)?.len() != 0
+                {
+                    return Err(Error::Permissions);
                 }
+                if n == "activity.sqlite3" {
+                    let mut header = Vec::new();
+                    (&mut f)
+                        .take(20)
+                        .read_to_end(&mut header)
+                        .map_err(|_| Error::Permissions)?;
+                    native::rollback_database_header(&header)?;
+                }
+                self.check(&f, false, Some(0o600))?;
+                self.same(p, &name(n)?, &f)?;
             }
+            Ok(())
+        }
+        fn preflight(
+            &self,
+            layout: &Layout,
+            resolver: &impl crate::service::config::Resolver,
+        ) -> Result<(), Error> {
+            self.verify(layout.binary(), Policy::BinaryIntegrity, true)?;
+            for path in layout.private_dirs() {
+                self.verify(path, Policy::PrivateDirectory, true)?;
+            }
+            self.verify(
+                layout.endpoint().parent().ok_or(Error::Layout)?,
+                Policy::EndpointDirectory,
+                false,
+            )?;
+            let (p, n) = self.parent(layout.config())?.ok_or(Error::Layout)?;
+            let mut f = self.open_at(&p, &n, false)?.ok_or(Error::Layout)?;
+            let bytes = self.bytes(&mut f, 0o600, crate::service::config::MAX_CONFIG_BYTES)?;
+            self.same(&p, &n, &f)?;
+            ServiceConfig::parse_inventory(&bytes, layout, resolver)?;
+            self.verify(layout.state(), Policy::PrivateDirectory, true)?;
+            let (p, _) = self
+                .parent(&layout.state().join("activity.lock"))?
+                .ok_or(Error::Layout)?;
+            self.state_members(&p, true)
+        }
+        fn provision(&self, state: &Path) -> Result<(), Error> {
+            self.verify(state, Policy::PrivateDirectory, true)?;
+            let (p, _) = self
+                .parent(&state.join("activity.lock"))?
+                .ok_or(Error::Layout)?;
+            self.state_members(&p, false)?;
             let lock_name = name("activity.lock")?;
             let lock = match self.open_at(&p, &lock_name, false)? {
                 Some(f) => f,
                 None => self.create(&p, &lock_name, &[], 0o600)?,
             };
-            lock.try_lock().map_err(|_| Error::Permissions)?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(Error::Permissions);
+            }
+            self.same(&p, &lock_name, &lock)?;
+            self.state_members(&p, false)?;
             for n in ["activity.sqlite3", "activity.sqlite3-journal"] {
                 let n = name(n)?;
-                if let Some(mut f) = self.open_at(&p, &n, false)? {
-                    self.bytes(&mut f, 0o600, 0)?;
-                } else {
+                if self.open_at(&p, &n, false)?.is_none() {
                     self.create(&p, &n, &[], 0o600)?;
                 }
             }
+            self.state_members(&p, true)?;
             p.sync_all().map_err(|_| Error::Permissions)
         }
     }
@@ -571,8 +611,9 @@ mod imp {
                 identity()?;
             }
             allowed(&self.layout, op)?;
-            executable(op)?;
             match op {
+                Operation::StartPreflight => self.fs.preflight(&self.layout, &NativeResolver),
+                Operation::ProvisionState => self.fs.provision(self.layout.state()),
                 Operation::Expect(expect) => {
                     let (q, a) = self.observe()?;
                     q.expect(*expect, a, self.layout.platform())
@@ -962,7 +1003,7 @@ mod imp {
             }
         }
         #[test]
-        fn scripted_command_failure_halts_suffix_and_unsupported_scanned_first() {
+        fn scripted_command_failure_halts_suffix_and_allowlist_scanned_first() {
             let (_dir, mut m) = manager(Platform::Linux, vec![], vec![Err(Error::Manager)]);
             let stop = cmd(Platform::Linux, "stop", Gate::Always);
             assert_eq!(
@@ -970,11 +1011,13 @@ mod imp {
                 Err(Error::Manager)
             );
             assert_eq!(calls(&m).len(), 1);
-            for unsupported in [Operation::StartPreflight, Operation::ProvisionState] {
-                let (_dir, mut m) = manager(Platform::Linux, vec![], vec![]);
-                assert_eq!(m.execute(&[stop.clone(), unsupported]), Err(Error::Manager));
-                assert!(calls(&m).is_empty());
-            }
+            let (_dir, mut m) = manager(Platform::Linux, vec![], vec![]);
+            let forbidden = Operation::EnsureDirectory {
+                path: "/outside".into(),
+                policy: Policy::PrivateDirectory,
+            };
+            assert_eq!(m.execute(&[stop, forbidden]), Err(Error::Layout));
+            assert!(calls(&m).is_empty());
         }
         #[test]
         fn scripted_constants_check_all_artifacts_and_preserve_installed_choice() {
@@ -1115,6 +1158,189 @@ mod imp {
                 b"existing state"
             );
         }
+        fn header() -> Vec<u8> {
+            let mut h = b"SQLite format 3\0".to_vec();
+            h.extend_from_slice(&[0, 0, 1, 1]);
+            h
+        }
+        #[test]
+        fn retained_and_partial_state_preserve_existing_objects() {
+            for retained in [false, true] {
+                for missing in [
+                    "activity.lock",
+                    "activity.sqlite3",
+                    "activity.sqlite3-journal",
+                ] {
+                    let (dir, fs) = fixture();
+                    fs.directory(Path::new("/state"), 0o700).unwrap();
+                    let mut before = Vec::new();
+                    for n in [
+                        "activity.lock",
+                        "activity.sqlite3",
+                        "activity.sqlite3-journal",
+                    ] {
+                        if n == missing {
+                            continue;
+                        }
+                        let bytes = if retained && n == "activity.sqlite3" {
+                            header()
+                        } else if retained && n.ends_with("journal") {
+                            b"retained recovery journal".to_vec()
+                        } else {
+                            vec![]
+                        };
+                        let (p, leaf) = fs.parent(&Path::new("/state").join(n)).unwrap().unwrap();
+                        fs.create(&p, &leaf, &bytes, 0o600).unwrap();
+                        let path = dir.path().join("state").join(n);
+                        before.push((path.clone(), bytes, std::fs::metadata(path).unwrap()));
+                    }
+                    fs.provision(Path::new("/state")).unwrap();
+                    for (path, bytes, old) in before {
+                        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                        let new = std::fs::metadata(path).unwrap();
+                        assert_eq!(
+                            (new.ino(), new.mode(), new.uid(), new.gid()),
+                            (old.ino(), old.mode(), old.uid(), old.gid())
+                        );
+                    }
+                    assert!(dir.path().join("state").join(missing).exists());
+                }
+            }
+        }
+        #[test]
+        fn unsafe_state_refuses_before_creating_missing_members() {
+            for bad in [
+                "wal", "shm", "header", "mode", "symlink", "hardlink", "lock", "held",
+            ] {
+                let (dir, fs) = fixture();
+                fs.directory(Path::new("/state"), 0o700).unwrap();
+                let base = dir.path().join("state");
+                let n = match bad {
+                    "wal" => "activity.sqlite3-wal",
+                    "shm" => "activity.sqlite3-shm",
+                    "lock" | "held" => "activity.lock",
+                    _ => "activity.sqlite3",
+                };
+                let (p, leaf) = fs.parent(&Path::new("/state").join(n)).unwrap().unwrap();
+                let f = fs
+                    .create(
+                        &p,
+                        &leaf,
+                        if matches!(bad, "header" | "lock") {
+                            b"bad"
+                        } else {
+                            b""
+                        },
+                        0o600,
+                    )
+                    .unwrap();
+                if bad == "mode" {
+                    std::fs::set_permissions(base.join(n), std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                if bad == "hardlink" {
+                    std::fs::hard_link(base.join(n), base.join("alias")).unwrap();
+                }
+                if bad == "symlink" {
+                    std::fs::remove_file(base.join(n)).unwrap();
+                    symlink("absent", base.join(n)).unwrap();
+                }
+                if bad == "held" {
+                    assert_eq!(
+                        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                        0
+                    );
+                }
+                assert!(fs.provision(Path::new("/state")).is_err(), "{bad}");
+                assert!(!base.join("activity.sqlite3-journal").exists());
+                if n != "activity.lock" {
+                    assert!(!base.join("activity.lock").exists());
+                }
+            }
+        }
+        struct FakeResolver;
+        impl crate::service::config::Resolver for FakeResolver {
+            fn account(&self, value: &str) -> Result<crate::service::config::Account, Error> {
+                if value != "1001" {
+                    return Err(Error::AccountMissing);
+                }
+                Ok(crate::service::config::Account {
+                    identity: value.into(),
+                    gid: Some(1001),
+                    kind: crate::service::config::AccountKind::User,
+                    administrative: false,
+                })
+            }
+            fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+                panic!("preflight must not observe workspace")
+            }
+        }
+        #[test]
+        fn preflight_optional_endpoint_and_static_inventory() {
+            let (dir, fs) = fixture();
+            let layout = Layout::for_test(Platform::Linux);
+            for path in [
+                layout.binary().parent().unwrap(),
+                layout.config().parent().unwrap(),
+                layout.state(),
+                layout.endpoint().parent().unwrap().parent().unwrap(),
+            ] {
+                let mut current = std::path::PathBuf::from("/");
+                for part in parts(path).unwrap() {
+                    current.push(part);
+                    let mode = if layout.private_dirs().contains(&current) {
+                        0o700
+                    } else {
+                        0o755
+                    };
+                    fs.directory(&current, mode).unwrap();
+                }
+            }
+            let config = serde_json::json!({"schema":"arxd-service/1","client":{"identity":"1001"},"build_account":{"name":"missing-builder","identity":"1002","gid":1002},"rights":"standard","workspace":"/work","environment":{"PATH":"/usr/bin"},"limits":{"max_concurrent_runs":1,"memory_bytes":1024,"pids":32},"agents":[{"principal":"test","token_sha256":"a".repeat(64)}],"granted_batch_right":false});
+            for (path, bytes, mode) in [
+                (layout.config(), serde_json::to_vec(&config).unwrap(), 0o600),
+                (layout.binary(), b"binary".to_vec(), 0o755),
+            ] {
+                let (p, n) = fs.parent(path).unwrap().unwrap();
+                fs.create(&p, &n, &bytes, mode).unwrap();
+            }
+            fs.provision(layout.state()).unwrap();
+            assert_eq!(fs.preflight(&layout, &FakeResolver), Ok(()));
+            // Each protected prerequisite is required, independently of endpoint absence.
+            for path in [
+                layout.binary(),
+                layout.config(),
+                &layout.state().join("activity.lock"),
+            ] {
+                let actual = dir.path().join(path.strip_prefix("/").unwrap());
+                let held = actual.with_extension("fixture-held");
+                std::fs::rename(&actual, &held).unwrap();
+                assert!(fs.preflight(&layout, &FakeResolver).is_err());
+                std::fs::rename(held, actual).unwrap();
+            }
+            let endpoint = layout.endpoint().parent().unwrap();
+            fs.directory(endpoint, 0o755).unwrap();
+            assert_eq!(fs.preflight(&layout, &FakeResolver), Ok(()));
+            let actual = dir.path().join(endpoint.strip_prefix("/").unwrap());
+            std::fs::set_permissions(&actual, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(fs.preflight(&layout, &FakeResolver).is_err());
+            assert_eq!(std::fs::metadata(&actual).unwrap().mode() & 0o777, 0o777);
+            std::fs::remove_dir(&actual).unwrap();
+            symlink("missing", &actual).unwrap();
+            assert!(fs.preflight(&layout, &FakeResolver).is_err());
+            std::fs::remove_file(&actual).unwrap();
+            std::fs::write(&actual, b"file").unwrap();
+            assert!(fs.preflight(&layout, &FakeResolver).is_err());
+            std::fs::remove_file(&actual).unwrap();
+            std::fs::write(
+                dir.path()
+                    .join(layout.state().strip_prefix("/").unwrap())
+                    .join("activity.sqlite3"),
+                b"invalid",
+            )
+            .unwrap();
+            assert!(fs.preflight(&layout, &FakeResolver).is_err());
+        }
         #[test]
         fn publisher_and_state_locks_refuse_concurrent_writers() {
             let (dir, fs) = fixture();
@@ -1195,14 +1421,6 @@ mod tests {
             ] {
                 let plan = super::super::owner_plan::owner_plan(&l, &c, action).unwrap();
                 assert!(plan.operations().iter().all(|op| allowed(&l, op).is_ok()));
-                assert_eq!(
-                    plan.operations().iter().any(|op| executable(op).is_err()),
-                    matches!(
-                        action,
-                        super::super::owner_plan::Action::Install
-                            | super::super::owner_plan::Action::Start
-                    )
-                );
             }
             assert_eq!(
                 allowed(

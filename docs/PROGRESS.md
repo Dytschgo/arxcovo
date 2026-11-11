@@ -983,3 +983,56 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   provisioning and runtime-directory creation remain incomplete. No actual
   manager, owner or privileged operation ran; installed paths remain
   **unverified on real hardware**. PR29 remains a work in progress.
+
+
+### ADR0014 phase 3b — bounded local implementation (2026-11-11)
+
+- Provider/effort/outcome: OpenAI gpt-6.1-sol / medium; implemented locally,
+  independent review pending. Prepared base verified exactly as
+  `a24926310410239116b0bba0c888457d4c38109e`; no push/PR/merge or tracker write.
+  Last merged PR remains as previously recorded; this slice merges nothing.
+- `StartPreflight` now checks binary/private directories/config/state, accepts a
+  missing endpoint directory, and validates any existing endpoint with the strict
+  existing policy. Config bytes are bounded and parsed from the checked handle
+  using `parse_inventory`; no workspace walk or PATH resolution is performed.
+  Missing build execution facts remain Application execution-unavailable reasons.
+  Service `observe_layout` still requires its endpoint directory.
+- `ProvisionState` now accepts retained rollback databases and journals. All
+  present members and WAL/SHM absence are validated before creation; lock must be
+  empty. Only the shared native rollback-header predicate judges the first 20 DB
+  bytes. Nonblocking flock, pinned lock identity and under-lock revalidation
+  precede exclusive missing DB/journal creation. Created files and directory are
+  synced. Existing files are never repaired, truncated, renamed or SQLite-opened;
+  failures retain only fail-closed partial prerequisites for retry.
+- Removed the unsupported-operation rejection for these implemented operations;
+  the entire plan allowlist still runs before mutation. Runner gates, fixed
+  vectors, identity requirements and strict ancestry are unchanged. No Windows,
+  owner engine, SCM, CLI, namespace or endpoint-creator changes.
+- Added three ordinary-user Unix owned-temp fixtures: retained/empty partial
+  combinations preserve bytes/inodes/mode/ownership; WAL/SHM, malformed header,
+  mode, symlink, hardlink, nonempty lock and held lock refuse without unexpected
+  companion creation; preflight accepts missing/valid endpoints, refuses unsafe
+  mode/symlink/file, requires binary/config/lock and uses a poison workspace
+  resolver with a missing build account. Updated scripted whole-plan allowlist
+  refusal. These NativeFs fixtures compiled but were NOT RUN on Windows.
+- Actual checks passed: cargo fmt --all -- --check; workspace all-target Clippy
+  with -D warnings; cargo test --workspace --no-run; portable owner tests (18),
+  config tests (9), Application tests (5), shared header test (1); git diff --check.
+  Linux x86_64 and macOS arm64 cargo check --tests and target Clippy --tests
+  passed using LIBSQLITE3_SYS_USE_PKG_CONFIG=1 and checkout SQLITE3_LIB_DIR only
+  as link hints. This is actual-source metadata compilation, NOT native linking,
+  SQLite cross-build or execution proof.
+- Actual mutation: shared header predicate changed to accept every header;
+  service_refuses_wal_before_sqlite_can_create_unprotected_companions failed
+  (exit 101). Source restored, same test passed. Unix-only mutations (reject
+  missing endpoint, overwrite retained data, omit flock, privileged workspace
+  observation) remain NOT RUN; their fixtures require an ordinary Unix runner.
+  Phase 3a native ignored-timeout/nonzero mutations likewise remain outstanding;
+  existing scripted command-failure halting and native ordinary-process tests
+  compile, but scripted outcomes cannot prove native process effects.
+- Remaining: execute owned-temp Unix fixtures/mutations; different-provider
+  independent review; ADR0015 Mac ancestor/new-path/new-only-fchown endpoint
+  creator slice; captured native launchd fixtures; installed-service acceptance.
+  Mac startup stays blocked by the old strict ancestor/endpoint policy.
+  All native manager/root-owned/installed paths are **unverified on real hardware**.
+  No real manager, privileged harness, admin action, old Lab Manager or VM work ran.

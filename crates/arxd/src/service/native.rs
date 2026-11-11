@@ -179,7 +179,7 @@ pub(crate) fn state_fixture_pins(dir: &Path) -> anyhow::Result<Vec<Observed>> {
     }
     Ok(pins)
 }
-fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
+pub(super) fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
     if header.is_empty()
         || (header.len() == 20 && &header[..16] == b"SQLite format 3\0" && header[18..20] == [1, 1])
     {
