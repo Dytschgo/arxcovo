@@ -76,7 +76,7 @@ async fn sdk_initialize_inventory_activity_restart_and_secrets() {
     let peer = client(&url, &token).await;
     assert!(peer.peer_info().is_some());
     let tools = peer.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 1);
+    assert_eq!(tools.tools.len(), 2);
     assert_eq!(tools.tools[0].name, "list_hosts");
     let response = peer
         .call_tool(CallToolRequestParams::new("list_hosts"))
@@ -302,7 +302,7 @@ fn activity_retention_and_interrupted_restart() {
             |r| r.get::<_, u32>(0)
         )
         .unwrap(),
-        1000
+        200
     );
     assert!(
         std::fs::metadata(dir.path().join("activity.sqlite3"))
@@ -624,7 +624,7 @@ fn corrupt_identity_fails_closed_without_replacement() {
         "UPDATE local_host_identity SET host_id=printf('%0100000d',0)",
         "DELETE FROM local_host_identity",
         "DROP TABLE local_host_identity",
-        "PRAGMA user_version=2",
+        "PRAGMA user_version=3",
         "PRAGMA user_version=0",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,NULL)",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(2,printf('%064d',0))",
@@ -657,7 +657,7 @@ fn identity_migration_and_activity_recovery_commit_atomically() {
     drop(store);
     let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
     // Reproduce the pre-identity schema, preserving an actual started activity.
-    db.execute_batch("DROP TABLE local_host_identity; PRAGMA user_version=0; CREATE TRIGGER fail_recovery BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'storage unavailable'); END;").unwrap();
+    db.execute_batch("DROP TABLE local_host_identity; ALTER TABLE activity RENAME TO activity_v2; CREATE TABLE activity(id INTEGER PRIMARY KEY AUTOINCREMENT,principal TEXT NOT NULL,tool TEXT NOT NULL,outcome TEXT NOT NULL); INSERT INTO activity(id,principal,tool,outcome) SELECT id,principal,tool,outcome FROM activity_v2; DROP TABLE activity_v2; PRAGMA user_version=0; CREATE TRIGGER fail_recovery BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'storage unavailable'); END;").unwrap();
     assert!(Activity::open(dir.path()).is_err());
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
@@ -838,7 +838,7 @@ async fn stdio_peer(path: &Path) -> rmcp::service::RunningService<rmcp::RoleClie
         std::time::Duration::from_secs(10),
         ().serve(
             rmcp::transport::async_rw::AsyncRwTransport::new_client(read, write)
-                .with_max_line_length(8192),
+                .with_max_line_length(arxd::local::RESPONSE_LIMIT),
         ),
     )
     .await;
@@ -1424,3 +1424,6 @@ async fn configured_daemon_binary_serves_local_only() {
     std::fs::write(&path, value.to_string()).unwrap();
     assert!(Config::load(&path).is_err());
 }
+
+#[path = "inventory/activity_v2.rs"]
+mod activity_v2;

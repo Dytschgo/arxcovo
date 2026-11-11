@@ -15,6 +15,7 @@ mod platform;
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(300);
 pub const FRAME_LIMIT: usize = 8192;
+pub const RESPONSE_LIMIT: usize = 65536;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,7 +167,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         activity,
         principal: Some(crate::mcp::Principal(principal)),
     };
-    // Apply identical bounded framing to SDK input and output. Idle authenticated
+    // Bound SDK requests at 8 KiB and response frames at 64 KiB. Idle authenticated
     // sessions may retain one of eight slots; partial frames and writes time out.
     let (sdk, pump) = tokio::io::duplex(FRAME_LIMIT);
     let (sdk_read, sdk_write) = tokio::io::split(sdk);
@@ -185,7 +186,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tokio::select! {
         result = protocol => result?,
         result = forward(read, pump_write) => result?,
-        result = forward(pump_read, write) => result?,
+        result = forward_bounded(pump_read, write, RESPONSE_LIMIT) => result?,
     }
     Ok(())
 }
@@ -216,11 +217,18 @@ pub async fn bridge(config: ClientConfig) -> Result<()> {
     // The SDK owns initialize/tool dispatch on the daemon; the bridge owns no state.
     tokio::select! {
         result = forward(tokio::io::stdin(), write) => result,
-        result = forward(read, tokio::io::stdout()) => result,
+        result = forward_bounded(read, tokio::io::stdout(), RESPONSE_LIMIT) => result,
     }
 }
-async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, mut write: W) -> Result<()> {
-    let mut read = BufReader::with_capacity(FRAME_LIMIT, read);
+async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, write: W) -> Result<()> {
+    forward_bounded(read, write, FRAME_LIMIT).await
+}
+async fn forward_bounded<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    read: R,
+    mut write: W,
+    limit: usize,
+) -> Result<()> {
+    let mut read = BufReader::with_capacity(limit, read);
     loop {
         let mut first = [0];
         if read.read(&mut first).await? == 0 {
@@ -239,7 +247,7 @@ async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(read: R, mut write
                     }
                     return Ok(false);
                 }
-                if line.len() >= FRAME_LIMIT {
+                if line.len() >= limit {
                     bail!("frame too large");
                 }
                 line.push(byte[0]);
@@ -401,6 +409,27 @@ mod tests {
             result.is_err(),
             "unrecoverable listener errors must terminate, never spin"
         );
+    }
+    #[tokio::test]
+    async fn response_frame_limit_includes_newline_and_withholds_oversize() {
+        for size in [RESPONSE_LIMIT, RESPONSE_LIMIT + 1] {
+            let mut payload = vec![b'x'; size];
+            payload[size - 1] = b'\n';
+            let (mut input, reader) = tokio::io::duplex(RESPONSE_LIMIT * 2);
+            let (writer, mut output) = tokio::io::duplex(RESPONSE_LIMIT * 2);
+            input.write_all(&payload).await.unwrap();
+            drop(input);
+            let result = forward_bounded(reader, writer, RESPONSE_LIMIT).await;
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).await.unwrap();
+            if size == RESPONSE_LIMIT {
+                assert!(result.is_ok());
+                assert_eq!(bytes, payload);
+            } else {
+                assert!(result.is_err());
+                assert!(bytes.is_empty());
+            }
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn idle_frames_survive_but_partial_frames_expire() {
