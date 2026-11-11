@@ -155,11 +155,11 @@ pub struct ResultData {
     pub stderr_dropped_bytes: u64,
 }
 pub struct Execution {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     policy_fixture: bool,
     /// Test-only fault: perturbs the in-memory daemon TokenUser copy so the
     /// pre-resume child comparison must fail.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     tamper_identity: AtomicBool,
     settings: Settings,
     busy: AtomicBool,
@@ -191,12 +191,12 @@ impl Execution {
             Ok(Arc::new(Self::build(settings, false)))
         }
     }
-    #[cfg_attr(not(test), allow(unused_variables))]
-    fn build(settings: Settings, fixture: bool) -> Self {
+    #[cfg(any(windows, test))]
+    fn build(settings: Settings, _fixture: bool) -> Self {
         Self {
-            #[cfg(test)]
-            policy_fixture: fixture,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
+            policy_fixture: _fixture,
+            #[cfg(all(test, windows))]
             tamper_identity: AtomicBool::new(false),
             settings,
             busy: AtomicBool::new(false),
@@ -211,11 +211,11 @@ impl Execution {
     pub(crate) fn policy_fixture(settings: Settings) -> Self {
         Self::build(settings, true)
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn tamper_identity(&self, on: bool) {
         self.tamper_identity.store(on, Ordering::Release);
     }
@@ -425,6 +425,7 @@ pub fn environment(settings: &Settings) -> Vec<u16> {
     v.push(0);
     v
 }
+#[cfg(windows)]
 fn redact(text: String, settings: &Settings) -> String {
     let mut pairs = vec![(
         settings.workspace.to_string_lossy().into_owned(),
@@ -455,6 +456,7 @@ fn redact(text: String, settings: &Settings) -> String {
 /// Longest needle first; ASCII case-insensitive with either slash. A single
 /// forward scan per needle, so a label that contains its needle (a user named
 /// `user`) can never be matched again or loop.
+#[cfg(any(windows, test))]
 fn redact_with(text: &str, mut pairs: Vec<(String, &str)>) -> String {
     let normal = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
     pairs.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
@@ -481,6 +483,7 @@ fn redact_with(text: &str, mut pairs: Vec<(String, &str)>) -> String {
 }
 /// Replace every SID-shaped run (`S-1-` followed by digits and dashes),
 /// anywhere in the text, keeping the surrounding characters.
+#[cfg(any(windows, test))]
 fn redact_sids(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let b = lower.as_bytes();
@@ -506,6 +509,7 @@ fn redact_sids(text: &str) -> String {
 mod tests;
 
 // Budget the inner JSON string, so the SDK's outer text JSON still fits 64 KiB.
+#[cfg(any(windows, test))]
 fn bounded_text(text: String, budget: usize) -> String {
     let mut used = 0;
     text.chars()
