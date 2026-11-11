@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#32](https://github.com/Dytschgo/arxcovo/pull/32), `3b6170bbd07e38873deecbd7750432b74fa4cb87`, 17:15:21 UTC, through all five required gates. Its first signed-mirror Ubuntu job passed in 130 seconds; no DNS root-cause fix is claimed.
+- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: refresh and land service lifecycle #20, then configuration #21 and the existing dependencies. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` is tracked by run 43066365961; its completed result and duration must be verified before claiming a main pass. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. #21 has independent review plus Ubuntu/Windows/budget success; macOS remains the last running gate. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -396,3 +396,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium prepared existing #26 locally on merged lifecycle main `64b50e9`; code, workflow and helper trees match main. Both historical duration sections and all provider table rows are preserved, with Current state first. No push or new feature PR.
 - Added first-attempt main push CI run 43066365961 at `3b6170b`, success, using a fresh attempt API read: 2026-11-11T17:15:24Z to 2026-11-11T17:24:33Z = **549 seconds**. Earlier integration notes observed `updated_at` at 17:24:32 and recorded 548 seconds; the completed attempt API now ends at 17:24:33, so this history uses 549 seconds. Both are below 15 minutes. The 130-second signed-mirror Ubuntu job is a platform job duration, not the complete main CI duration.
 - New lifecycle main run 43069045513 is not yet included because it is live. History remains evidence only, not an input to ci-time-budget. JSON/encoding and whitespace checks passed; independent review and hosted gates remain required. No policy, timeout, native/hardware or milestone-acceptance claim changed.
+
+## Main CI after merged lifecycle
+
+- Codex / gpt-6.1-sol, medium verified the completed first-attempt API for main CI run 43069045513, source `64b50e9187fd469bc886373230e324ace6dd4449`, success. Its run-start/update timestamps are 2026-11-11T17:31:49Z and 2026-11-11T17:41:00Z (**551 seconds**, below 15 minutes). Added this source-bound record without changing prior rows, policies or gates. The earlier queued/live entries are historical; this is the completion checkpoint. No installed-service, dedicated-account or M2 acceptance is established by CI. Existing #26 remains unpublished locally pending queue priority and independent review.
