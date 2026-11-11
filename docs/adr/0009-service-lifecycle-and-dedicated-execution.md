@@ -314,7 +314,9 @@ Each one validates first and then performs fixed OS calls. Tests inject an
   here, and the result is pinned. On Windows, configure grants
   `SeBatchLogonRight` to the pinned build SID only, using `LsaAddAccountRights`
   (as in the probe's `ProbeBatchRight`). If configure added the right, it
-  records that in the config, and uninstall removes it. On Linux, configure adds
+  records that in the config, and uninstall removes it. (Amended for Windows by
+  ADR 0012: provenance lives in a separate owner record, and an interrupted
+  grant whose origin cannot be proven is never revoked.) On Linux, configure adds
   or removes the standard-rights drop-in according to the configured rights,
   then runs `systemctl daemon-reload`.
 - `service start|stop|status|uninstall`: Windows uses the SCM API. Unix runs
