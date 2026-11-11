@@ -336,8 +336,10 @@ Consequences:
   refuses on the lock, and an active one already refused as `Active`.
 - **Upgrade with changed artifacts.** If a newer binary embeds different unit,
   drop-in or plist bytes, install refuses with `Foreign` against the old
-  artifact. The owner runs `uninstall`, then `install`, then `configure` if
-  the drop-in choice must change, then `start`. Config and state are retained
+  artifact. Before replacing the installed binary, the owner runs `uninstall`
+  with that old binary, whose embedded artifact bytes still match. The new
+  binary then runs `install`, `configure` if the drop-in choice must change,
+  and `start`. Config and state are retained
   across that sequence.
 - **Known window (model only).** On Linux, `disable` needs the unit file, so it
   runs after publication. If a stale enable link exists, and the host crashes

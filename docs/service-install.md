@@ -177,7 +177,8 @@ token into chat, an issue, a command line or a log.
   changes nothing. Run `service stop` first, or `service uninstall` if stop
   reports `service-not-installed`.
 - After an upgrade whose service files differ, install refuses with
-  `service-foreign-registration`. Run `service uninstall`, then
+  `service-foreign-registration`. Before replacing the installed binary, use
+  that old binary to run `service uninstall`. Then use the new binary to run
   `service install`, then `service configure` again if you use admin rights on
   Linux, then `service start`. Your config and activity history are kept.
 - On macOS, install currently always refuses with `service-manager`, until the

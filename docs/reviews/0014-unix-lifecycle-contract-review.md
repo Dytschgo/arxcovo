@@ -77,3 +77,28 @@ All systemd, launchd, protected-layout and installed-service behaviour remains
 **unverified on real hardware**. A fresh independent Sol recheck of the
 corrected four documents is required before this contract is treated as
 settled for implementation.
+
+## Independent Sol correction recheck
+
+Reviewer: OpenAI / gpt-6.1-sol / medium, 2026-11-11.
+Pinned range: 33f753a0fd6e55c992ebca1e6327cfd1406dfbb1 through
+ d1ef91b (resolved in Git). All four corrected docs were inspected.
+
+Standards: no blocking findings. Spec: the reinstall contradiction is resolved.
+Installable now gates all mutation, refuses active/foreign/unknown state, and
+successful inactive install explicitly disables boot intent and checks unloaded.
+The Linux drop-in gate preserves an installed admin choice. Retained database
+and journal handling preserves existing bytes and leaves recovery to SQLite.
+Partial publication, failure points and the Linux stale-enable reboot window
+are explicitly model limits rather than native evidence.
+
+One minor guide clarification was applied during integration: artifact-changing
+upgrades must uninstall with the still-installed old binary before replacement;
+the new binary would correctly refuse its predecessor's differing artifacts.
+This clarification changes no authority or takeover policy.
+
+Whitespace, UTF-8 and table structure checks passed. No Rust or native manager
+suite ran for this docs-only recheck. P3 remains open: until captured macOS
+query evidence exists, Unknown must refuse. This accepts the contract for
+implementation; it does not clear PR29's functional blocker, authorize CLI
+activation or establish installed-service/M2 acceptance.
