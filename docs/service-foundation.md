@@ -355,7 +355,10 @@ nonempty or unsafe existing prerequisites, then exclusively creates missing
 the same native file lock used by Activity and rechecks the database and journal
 under that lock. WAL/SHM are checked only before the lock; the root-only state
 directory makes that acceptable (ADR 0014 section 6). Empty existing prerequisites allow recovery from a partial provisioning;
-nonempty state is never overwritten. Activity still initializes schema and host
+nonempty state is never overwritten. At this base a nonempty database refuses.
+The corrected ADR 0014 decision 6 replaces that refusal: a database that passes
+the existing rollback-header check, and a nonempty journal, are kept untouched
+(Retained). That change is not implemented yet. Activity still initializes schema and host
 identity transactionally on first service startup. Its existing persistent
 TRUNCATE journal contract is retained (no store API change or SQLite invocation
 in provisioning); “persistent” here does not change SQLite to PERSIST mode.
@@ -416,12 +419,23 @@ The PR29 review found two blocking defects and an unsettled boot rule. ADR 0014
 is the contract for the follow-up commit on that branch. It records no
 implementation, so nothing in this section has been executed. Summary:
 
-- **Boot intent.** Install never starts the service and leaves it off at boot.
-  Start runs enable then start (launchd: enable, then bootstrap if not loaded),
-  so the service also runs at every boot. Stop runs disable then stop
-  (launchd: disable, then bootout if loaded) and is followed by a typed proof
-  that the service stopped. The Windows auto-start (delayed) registration is a
-  recorded divergence for the Windows adapter, not part of this fix.
+- **Boot intent.** The last explicit command that succeeded decides it.
+  Install never starts or stops the service and leaves it off at boot: Linux
+  runs `daemon-reload` then `disable` after publication, and macOS runs
+  `disable` before the plist is published. Start runs enable then start
+  (launchd: enable, then bootstrap if not loaded), so the service also runs at
+  every boot. Stop runs disable then stop (launchd: disable, then bootout if
+  loaded) and is followed by a typed proof that the service stopped. The
+  Windows auto-start (delayed) registration is a recorded divergence for the
+  Windows adapter, not part of this fix.
+- **Reinstall and retry (decision 7).** Install first runs a read-only
+  `Expect(Installable)`. It refuses an active job with `service-active`, and a
+  foreign or non-identical registration with `service-foreign-registration`,
+  before any change. Otherwise every step accepts its own completed result.
+  Rerunning install after a failure therefore resumes, and reinstalling over a
+  stopped registration changes no file but turns boot off. The Linux drop-in is
+  published before the unit and only while the unit is absent, so an
+  admin-mode host keeps its configure choice.
 - **Endpoint directory.** Install no longer creates it. The owner start
   preflight accepts a missing endpoint directory, but an existing one must
   pass the full check. systemd creates the Linux directory. The macOS service
@@ -439,7 +453,13 @@ implementation, so nothing in this section has been executed. Summary:
   every enable and disable call. `Constant` no longer runs manager commands.
 - **Provisioning.** `ProvisionState` is an install step that runs before any
   artifact is published. It creates only empty, fsynced files and performs no
-  SQLite initialization.
+  SQLite initialization. It keeps a nonempty database (after the existing
+  header check) and journal untouched, so `uninstall` then `install` keeps the
+  activity history. WAL/SHM files, unsafe members, a nonempty lock and a held
+  lock still refuse.
+- **macOS absence.** Until the absent exit status of `launchctl print` is
+  pinned from captured evidence, every macOS install halts with
+  `service-manager`. The PR29 unloaded-job blocker stays open.
 
 Every launchd and systemd behaviour these rules rely on remains **unverified on
 real hardware**. The evidence still needed is listed in ADR 0014.

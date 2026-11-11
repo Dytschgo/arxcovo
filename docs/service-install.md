@@ -164,6 +164,24 @@ token into chat, an issue, a command line or a log.
 - `service start` starts the service now and keeps it starting at every boot.
 - `service stop` stops it now, and it stays stopped after a reboot until you
   run `service start` again.
+- If `service start` fails part way, the service can be left stopped but set to
+  start at the next boot. `service status` then shows `stopped` or `failed`.
+  Run `service start` or `service stop` again to settle it.
+- Running `service install` again is safe while the service is not running:
+  - it changes no file;
+  - it keeps your config, activity history and drop-in choice;
+  - it leaves the service stopped and off at boot.
+
+  If an earlier install was interrupted, running it again finishes the job.
+  While the service is running, install refuses with `service-active` and
+  changes nothing. Run `service stop` first, or `service uninstall` if stop
+  reports `service-not-installed`.
+- After an upgrade whose service files differ, install refuses with
+  `service-foreign-registration`. Run `service uninstall`, then
+  `service install`, then `service configure` again if you use admin rights on
+  Linux, then `service start`. Your config and activity history are kept.
+- On macOS, install currently always refuses with `service-manager`, until the
+  launchd behaviour it relies on has been captured from a real system.
 - You do not create `/run/arxcovo` or `/private/var/run/arxcovo` yourself.
   systemd creates the Linux directory at each start, and the service creates
   the macOS one. If either path already exists with the wrong owner or mode,
@@ -217,4 +235,5 @@ service and confirms it stopped, then removes the unit or plist. It also removes
 the batch-logon right if `configure` granted it. If the manager reports an
 unexpected error, a timeout, or a service with the same name that Arxcovo did
 not install, uninstall stops and leaves the files in place. It deliberately leaves the config, the activity state, the workspace
-and the build account. Delete those yourself if you no longer want them.
+and the build account. A later `service install` keeps and reuses them. Delete
+those yourself if you no longer want them.
