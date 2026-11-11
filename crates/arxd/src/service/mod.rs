@@ -6,6 +6,8 @@ pub mod layout;
 pub mod native;
 pub mod owner_plan;
 pub mod owner_unix;
+
+pub mod preflight;
 use std::{future::Future, time::Duration};
 use tokio::sync::watch;
 

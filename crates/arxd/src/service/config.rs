@@ -1,5 +1,6 @@
 //! Strict, bounded service-only schema. No foreground or CLI config overrides.
 use super::layout::{Error, Layout, Platform};
+use super::preflight::ExecutionUnavailable;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -72,7 +73,8 @@ pub trait Resolver {
         Ok(None)
     }
     fn account(&self, name_or_identity: &str) -> Result<Account, Error>;
-    /// Metadata-only: existing directory, local disk, no symlinks/reparse ancestors.
+    /// Owner configure only: existing directory, local disk, no symlinks/reparse ancestors.
+    /// Service inventory/preflight must never call this method.
     fn workspace_safe(&self, path: &str) -> Result<bool, Error>;
 }
 fn validate_platform_rights(platform: Platform, rights: Rights) -> Result<(), Error> {
@@ -116,6 +118,18 @@ impl ServiceConfig {
     fn validate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
         self.validate_inventory(layout, resolver)?;
         self.execution_preflight(layout, resolver)
+            .map_err(|reason| match reason {
+                ExecutionUnavailable::RightsMismatch
+                | ExecutionUnavailable::AdminUnsupportedOnPlatform => Error::Rights,
+                _ => Error::Identity,
+            })?;
+        if !resolver
+            .workspace_safe(&self.wire.workspace)
+            .map_err(|_| Error::Workspace)?
+        {
+            return Err(Error::Workspace);
+        }
+        Ok(())
     }
     /// Startup validation deliberately makes no build-account observations.
     pub fn parse_inventory(
@@ -235,27 +249,32 @@ impl ServiceConfig {
         &self,
         layout: &Layout,
         resolver: &impl Resolver,
-    ) -> Result<(), Error> {
-        validate_platform_rights(self.platform, self.wire.rights)?;
-        let build = resolver
-            .account(&self.wire.build_account.name)
-            .map_err(|_| Error::Identity)?;
-        if build.kind != AccountKind::User
-            || build.identity != self.wire.build_account.identity
+    ) -> Result<(), ExecutionUnavailable> {
+        validate_platform_rights(self.platform, self.wire.rights)
+            .map_err(|_| ExecutionUnavailable::AdminUnsupportedOnPlatform)?;
+        let build =
+            resolver
+                .account(&self.wire.build_account.name)
+                .map_err(|error| match error {
+                    Error::AccountMissing => ExecutionUnavailable::AccountMissing,
+                    _ => ExecutionUnavailable::PreflightFailed,
+                })?;
+        if build.kind != AccountKind::User {
+            return Err(ExecutionUnavailable::PreflightFailed);
+        }
+        if build.identity != self.wire.build_account.identity
             || build.gid != self.wire.build_account.gid
         {
-            return Err(Error::Identity);
+            return Err(ExecutionUnavailable::AccountIdentityChanged);
         }
         if build.administrative != (self.wire.rights == Rights::Admin) {
-            return Err(Error::Rights);
+            return Err(ExecutionUnavailable::RightsMismatch);
         }
-        if !layout.workspace_disjoint(&self.wire.workspace)
-            || !resolver
-                .workspace_safe(&self.wire.workspace)
-                .map_err(|_| Error::Workspace)?
-        {
-            return Err(Error::Workspace);
+        if !layout.workspace_disjoint(&self.wire.workspace) {
+            return Err(ExecutionUnavailable::PreflightFailed);
         }
+        // Workspace/PATH observation belongs after switching identity. Until
+        // that backend exists, the caller always reports execution unavailable.
         Ok(())
     }
     pub fn client_identity(&self) -> &str {
@@ -687,7 +706,7 @@ mod inventory_tests {
         assert_eq!(*r.0.lock().unwrap(), ["1001"]);
         assert_eq!(
             config.execution_preflight(&layout, &r),
-            Err(Error::Identity)
+            Err(ExecutionUnavailable::PreflightFailed)
         );
         let changed = tests::FakeResolver {
             changed: true,
@@ -696,7 +715,7 @@ mod inventory_tests {
         let mismatched = ServiceConfig::parse_inventory(&bytes, &layout, &changed).unwrap();
         assert_eq!(
             mismatched.execution_preflight(&layout, &changed),
-            Err(Error::Identity)
+            Err(ExecutionUnavailable::AccountIdentityChanged)
         );
         r.0.lock().unwrap().clear();
         let mut v = tests::fixture();
@@ -733,6 +752,139 @@ mod inventory_tests {
         v["agents"][0]["token_sha256"] = "invalid".into();
         assert!(
             ServiceConfig::parse_inventory(&serde_json::to_vec(&v).unwrap(), &layout, &r).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_boundary_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Observe {
+        workspace: Cell<usize>,
+        safe: bool,
+        failure: Option<Error>,
+        changed: bool,
+        admin: bool,
+    }
+    impl Resolver for Observe {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            if value == "builder"
+                && let Some(error) = self.failure
+            {
+                return Err(error);
+            }
+            tests::FakeResolver {
+                changed: self.changed,
+                admin: self.admin,
+                ..Default::default()
+            }
+            .account(value)
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            self.workspace.set(self.workspace.get() + 1);
+            assert!(self.safe, "service must not observe workspace");
+            Ok(true)
+        }
+    }
+    #[test]
+    fn service_never_observes_workspace_and_owner_configure_still_does() {
+        let layout = Layout::for_test(Platform::Linux);
+        let bytes = serde_json::to_vec(&tests::fixture()).unwrap();
+        let mut r = Observe {
+            workspace: Cell::new(0),
+            safe: false,
+            failure: None,
+            changed: false,
+            admin: false,
+        };
+        let config = ServiceConfig::parse_inventory(&bytes, &layout, &r).unwrap();
+        for _ in 0..3 {
+            assert_eq!(config.execution_preflight(&layout, &r), Ok(()));
+        }
+        assert_eq!(r.workspace.get(), 0);
+        for (failure, changed, admin, expected) in [
+            (
+                Some(Error::AccountMissing),
+                false,
+                false,
+                ExecutionUnavailable::AccountMissing,
+            ),
+            (
+                Some(Error::Identity),
+                false,
+                false,
+                ExecutionUnavailable::PreflightFailed,
+            ),
+            (
+                Some(Error::Permissions),
+                false,
+                false,
+                ExecutionUnavailable::PreflightFailed,
+            ),
+            (
+                None,
+                true,
+                false,
+                ExecutionUnavailable::AccountIdentityChanged,
+            ),
+            (None, false, true, ExecutionUnavailable::RightsMismatch),
+        ] {
+            r.failure = failure;
+            r.changed = changed;
+            r.admin = admin;
+            assert_eq!(config.execution_preflight(&layout, &r), Err(expected));
+            assert_eq!(r.workspace.get(), 0);
+        }
+        r.failure = None;
+        r.changed = false;
+        r.admin = false;
+        r.safe = true;
+        let owner = ServiceConfig::parse(&bytes, &layout, &r).unwrap();
+        assert_eq!(r.workspace.get(), 1);
+        let context = super::super::owner_plan::OwnerContext {
+            admin: true,
+            running_binary: layout.binary(),
+        };
+        assert!(
+            super::super::owner_plan::configure_plan(&layout, &context, &owner, None, false, &r)
+                .is_ok()
+        );
+        assert_eq!(r.workspace.get(), 2);
+        assert!(
+            ServiceConfig::parse(
+                &bytes,
+                &layout,
+                &tests::FakeResolver {
+                    safe: false,
+                    ..Default::default()
+                }
+            )
+            .err()
+                == Some(Error::Workspace)
+        );
+    }
+    #[test]
+    fn macos_legacy_admin_preflight_observes_no_accounts_or_workspace() {
+        struct Poison;
+        impl Resolver for Poison {
+            fn account(&self, _: &str) -> Result<Account, Error> {
+                panic!("no account observation")
+            }
+            fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+                panic!("no workspace observation")
+            }
+        }
+        let mut wire: Wire = serde_json::from_value(tests::fixture()).unwrap();
+        wire.rights = Rights::Admin;
+        let config = ServiceConfig {
+            wire,
+            platform: Platform::Macos,
+            revisions: [None, None],
+        };
+        assert_eq!(
+            config.execution_preflight(&Layout::for_test(Platform::Macos), &Poison),
+            Err(ExecutionUnavailable::AdminUnsupportedOnPlatform)
         );
     }
 }
