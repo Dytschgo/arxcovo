@@ -1162,3 +1162,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   to supply SQLite link hints. No Unix C compilation, linking, runtime, native
   manager check or real dedicated identity execution is claimed. Local build/
   mutation logs remain under ignored target/. No CI run or CI duration claim.
+
+## Unix allowlist review regression coverage
+
+- Codex / gpt-6.1-sol, medium closed the four allowlist-gate coverage gaps from the independent `1e1e48b` review. New portable tests enumerate every gate for Linux stop/disable and macOS bootout, reject foreign enable/disable targets, and allow conditional constants only for the Linux rights drop-in. Plan checks require conditional publication to appear only during install.
+- All six focused portable owner tests, formatting and locked workspace/all-target Clippy passed. Each formerly surviving mutation now fails assertions: unrestricted stop gate, unrestricted disable gate, unrestricted bootout gate and conditional publication for another artifact. Source bytes were restored after every mutation. Production code before the test module is byte-identical to `1e1e48b`; no owner or service operation ran. Fresh exact-head recheck and hosted checks remain pending. This adds no macOS parser or installed-service/M2 acceptance.
