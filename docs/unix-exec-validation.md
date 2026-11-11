@@ -4,7 +4,7 @@ No privileged test was run on the owner's PC. No service/account was installed,
 no VM was touched, and no execution surface was added to MCP/CLI. All Unix
 execution paths are **unverified on real hardware**.
 
-Local Windows evidence: `cargo clippy --workspace --all-targets --locked -- -D
+Original library-only Windows evidence (historical): `cargo clippy --workspace --all-targets --locked -- -D
 warnings` and `cargo nextest run --workspace --locked`: 19 tests passed. Six new
 portable exec tests cover argument/path/environment/output bounds, timeout
 decision logic, cancellation signalling and Windows refusal. These tests do not
@@ -18,7 +18,8 @@ clippy-driver. This covers platform API types and test code, without linking or
 running Unix binaries. It is **not** a full workspace Unix Cargo build or a hosted
 CI result. No second Cargo workspace or lockfile was created.
 
-Future ordinary hosted three-OS checks (no workflow changes in this branch):
+Ordinary hosted three-OS checks (the current branch also adds the manual
+workflow and the required pure-Python guard step described below):
 
 ```text
 cargo fmt --all --check
@@ -125,7 +126,7 @@ snippet. ShellCheck and actionlint were not available; neither was run. The
 required Cargo/three-OS suites were not run for this CI/docs-only change.
 
 
-## First security-review corrections (base c508de0)
+## Historical first security-review corrections (base c508de0)
 
 Builder: Codex / gpt-6.1-sol, high effort. The first Opus review failed B1–B3;
 no privileged run is authorized by these changes. Global cgroup checks retain
@@ -171,7 +172,19 @@ Local evidence on Windows after changes:
 The safe Python output-cap test also proves oversize output is truncated/refused
 without imposing any process-wide artifact limit. Descriptor race, cleanup identity,
 missing capture, orphan group and runner collision checks have pure regressions.
-The cgroup removal-failure regression is Linux-only and metadata-checked, unrun.
+The cgroup removal-failure regression is Linux-only. Hosted run 43000972816
+at 4383b56 passed it, the positive-control mode test and the nofollow test on
+Ubuntu; macOS passed nofollow. The ignored root runtime did not run.
 No new hosted CI run, workflow dispatch, repository setting change, push or PR
 was made by this correction task. Review, integration and any privileged run
 remain coordinator work. ShellCheck/actionlint remain unrun.
+
+## Current integrated candidate evidence
+
+At b3b808c, independent Opus review passed formatting, Clippy, all 44 Windows
+nextest tests, 29 pure Python tests and ten guard mutations (assertion failures,
+zero errors). Those counts supersede the historical 19/22/28/nine counts above.
+The newer head incorporates path-main b29f531 and needs fresh hosted checks and
+exact-head review. The executor, driver and manual workflow remain unchanged.
+No privileged cross-account test, runtime symlink mutation or controller-cap
+experiment has run. These paths remain **unverified on real hardware**.

@@ -99,6 +99,7 @@ impl Config {
 }
 pub fn checked_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
+        || !path.components().any(|c| matches!(c, Component::RootDir))
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
@@ -123,6 +124,13 @@ pub fn checked_path(path: &Path) -> Result<()> {
             }
         }
         prefix.push(part);
+        // A disk prefix alone is drive-relative (C:) or not a filesystem
+        // object (\\?\C:). Inspect it only after RootDir forms the absolute
+        // root; every root and descendant still receives the checks below.
+        #[cfg(windows)]
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         let m = std::fs::symlink_metadata(&prefix)?;
         if m.file_type().is_symlink() {
             bail!("links forbidden");

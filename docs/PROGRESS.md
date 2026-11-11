@@ -3,7 +3,7 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress. Milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#19](https://github.com/Dytschgo/arxcovo/pull/19), `d7f3ebd26e69438abb41ff5d671959e576832803`, 11:00:14 UTC. Exact-head independent Opus review passed on `9e7a603`; all three hosted platforms and both status gates passed. Caller-scoped activity v2 is merged.
+- Last merged PR: [#16](https://github.com/Dytschgo/arxcovo/pull/16), `b29f5317e94e03d033fcc1596a3e84c4d1d4d485`, 11:34:19 UTC. Exact-head independent Opus review passed on 8c3856a and gated squash auto-merge completed. Activity v2 remains merged through #19.
 - Main now has authenticated HTTP and local IPC/stdio host inventory, persistent host identity and durable activity. It has no command-execution surface, account-scoped tool discovery or installed service.
 - Current work: integrate corrected Unix execution with current main; current-user Windows execution and native service observations are being built separately, and the service contract is under independent review. No third privileged Windows probe is planned.
 
@@ -27,7 +27,7 @@
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
 - Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
-- Windows rooted-path fix #16 remains open; its bare-prefix correction `8c3856a` passed 39 local tests and awaits fresh review. Activity-integrity #18 is closed as superseded by merged #19, including its completion and fixed unknown-tool-label regressions.
+- Windows rooted-path fix #16 merged after independent re-review; its bare-prefix correction passed 39 local tests. Activity-integrity #18 is closed as superseded by merged #19, including its completion and fixed unknown-tool-label regressions.
 - Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
 - Constant systemd/launchd artifacts are committed on feat/service-install-artifacts. INI/plist syntax, fixed argv and absence of interpolation were checked; no manager or installation was invoked. Full ADR 0009 and the owner service guide remain on the service branch.
@@ -119,7 +119,6 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Current-user development contract | Claude / claude-opus-5-5 | high | ADR 0010 candidate d4725f1; docs only, user-authorized deviation; implementation pending |
 | Coordination and integration | Codex / gpt-6.1-sol | medium | Merged #15/#17 through gates; cancelled S4U diagnosis request, reconciled this record, integrated local candidates without claiming acceptance |
 
-| Task | Provider/model | Effort | Outcome |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
@@ -136,3 +135,9 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 ## Unix executor integration with current main
 
 - Codex / gpt-6.1-sol, medium: integrated main d7f3ebd with the corrected Unix backend. The accessible positive controls and fixture-check forwarding remain present. Formatting, Clippy with warnings denied and all 44 Windows workspace nextest tests passed. The 29 pure Python tests passed and all ten driver guard mutations were killed with assertion failures and zero errors. Fresh independent review and hosted native checks are pending; no root experiment or owner administration has run.
+
+## Unix path-main update and review checkpoint
+
+- Opus 5.5 high independently passed b3b808c: 44 Windows nextest tests, 29 Python tests and all ten assertion-failing mutations. Comment: https://github.com/Dytschgo/arxcovo/pull/14#issuecomment-6794916805. Main then contained #16, so the prior head conflicted only in progress and hosted checks did not run.
+- Codex / gpt-6.1-sol, medium: resolved progress against merged path main b29f531, retained all provider rows, removed the duplicate table header, and updated historical validation notes. Executor/tooling/workflow source is unchanged from the reviewed head; main adds its path helper/regression and README encoding fix. New-head verification and independent recheck are pending.
+- Advisory A3 remains open: the positive-control unit test checks explicit final mode but does not set a restrictive process umask. The actual privileged harness uses UMask0077, remains unrun, and no elevated/runtime containment acceptance is claimed.
