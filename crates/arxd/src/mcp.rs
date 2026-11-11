@@ -189,7 +189,7 @@ impl ServerHandler for Inventory {
             .execution
             .as_ref()
             .map(|e| e.capability())
-            .unwrap_or_else(|| json!({"available":false,"reason":"not_configured"}));
+            .unwrap_or_else(|| json!({"available":false,"reason":self.activity.service_reason().unwrap_or("not_configured")}));
         value["hosts"][0]["execution_available"] = execution["available"].clone();
         value["hosts"][0]["execution_unavailable_reason"] = execution["reason"].clone();
         value["hosts"][0]["execution"] = execution;

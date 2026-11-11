@@ -104,7 +104,105 @@ pub fn read_config(layout: &Layout) -> Result<ServiceConfig, Error> {
         true,
         &os::protection(&opened.file)?,
     )?;
-    ServiceConfig::parse(&bytes, layout, &NativeResolver)
+    ServiceConfig::parse_inventory(&bytes, layout, &NativeResolver)
+}
+#[cfg(unix)]
+pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
+    checked(
+        layout.endpoint().parent().ok_or(Error::Layout)?,
+        true,
+        Policy::EndpointDirectory,
+        false,
+    )
+}
+/// Service state is provisioned by the owner, never repaired or ACL-relaxed here.
+/// SQLite uses a persistent TRUNCATE journal, so every mutable file can be
+/// checked before the first write. Retain namespace pins for its entire life.
+pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
+    require_service_identity()?;
+    let mut pins = vec![checked(
+        layout.state(),
+        true,
+        Policy::PrivateDirectory,
+        false,
+    )?];
+    for name in [
+        "activity.lock",
+        "activity.sqlite3",
+        "activity.sqlite3-journal",
+    ] {
+        let path = layout.state().join(name);
+        #[cfg(windows)]
+        let observed = os::open_state_file(&path)?;
+        #[cfg(unix)]
+        let observed = os::open(&path, false, false, true)?;
+        check_protection(
+            os::PLATFORM,
+            Policy::PrivateFile,
+            true,
+            observed.protection(),
+        )?;
+        if name == "activity.sqlite3" {
+            // SQLite may create WAL/SHM as soon as it opens a WAL-mode DB,
+            // before our TRUNCATE pragma. Refuse that header before SQLite.
+            let mut header = [0u8; 20];
+            let mut file = &observed.file;
+            let length = file.read(&mut header).map_err(|_| Error::Permissions)?;
+            rollback_database_header(&header[..length])?;
+        }
+        pins.push(observed);
+    }
+    for name in ["activity.sqlite3-wal", "activity.sqlite3-shm"] {
+        match std::fs::symlink_metadata(layout.state().join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(Error::Permissions),
+        }
+    }
+    Ok(pins)
+}
+fn rollback_database_header(header: &[u8]) -> Result<(), Error> {
+    if header.is_empty()
+        || (header.len() == 20 && &header[..16] == b"SQLite format 3\0" && header[18..20] == [1, 1])
+    {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
+    }
+}
+#[cfg(test)]
+mod database_header_tests {
+    use super::*;
+    #[test]
+    fn service_refuses_wal_before_sqlite_can_create_unprotected_companions() {
+        assert_eq!(rollback_database_header(&[]), Ok(()));
+        let mut header = [0u8; 20];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[18] = 1;
+        header[19] = 1;
+        assert_eq!(rollback_database_header(&header), Ok(()));
+        for index in [18, 19] {
+            header[index] = 2;
+            assert_eq!(rollback_database_header(&header), Err(Error::Permissions));
+            header[index] = 1;
+        }
+        assert_eq!(
+            rollback_database_header(&header[..19]),
+            Err(Error::Permissions)
+        );
+        header[0] = 0;
+        assert_eq!(rollback_database_header(&header), Err(Error::Permissions));
+    }
+}
+pub(crate) fn require_service_identity() -> Result<(), Error> {
+    #[cfg(windows)]
+    let valid = crate::local::current_identity().map_err(|_| Error::Permissions)? == "S-1-5-18";
+    #[cfg(unix)]
+    let valid = unsafe { libc::geteuid() == 0 && libc::getegid() == 0 };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
+    }
 }
 fn bounded_read(file: &mut impl Read) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();

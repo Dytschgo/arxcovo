@@ -159,9 +159,15 @@ unsafe extern "system" fn service_main(_: u32, _: *mut *mut u16) {
             .enable_all()
             .build()
             .map_err(|_| ExitCode::Layout)?;
-        // Real fixed service config/store/inventory adapter is a later slice.
-        // Never send RUNNING through a substitute production implementation.
-        runtime.block_on(async { Err::<(), _>(ExitCode::Layout) })
+        let code = runtime.block_on(run_application(
+            &mut super::application::ServiceApplication::native(),
+        ));
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        if code == ExitCode::Clean {
+            Ok(())
+        } else {
+            Err(code)
+        }
     })();
     let mut code = result.err().unwrap_or(ExitCode::Clean);
     if reporter.report(State::Stopping, ExitCode::Clean).is_err() {
@@ -197,7 +203,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Called on ServiceMain's runtime once the real application adapter exists.
+/// Called on ServiceMain's runtime with the fixed application adapter.
 /// Calling outside the dispatcher cannot start an application.
 pub async fn run_application<A: super::Application>(app: &mut A) -> ExitCode {
     let Some(context) = CONTEXT.get() else {

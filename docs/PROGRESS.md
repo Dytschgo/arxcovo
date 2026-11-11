@@ -458,3 +458,41 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Service credential uniqueness correction
 
 - Codex / gpt-6.1-sol, medium found service config allowed the same decoded token hash for distinct principals, unlike foreground Config. The new regression first failed because the duplicate was accepted. Service parsing now rejects duplicate hashes regardless of hex casing while retaining a positive distinct-credential control. Formatting, workspace/all-target Clippy with warnings denied and all 88 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. Independent review and hosted checks are pending. This enables no service or owner operation.
+
+## M2 fixed service Application candidate
+
+- Implementation sub-agent: Codex / gpt-6.1-sol, high, working alone on prepared
+  branch t3/m2-service-application (initially t3/46c79625) from verified clean pinned base
+  `7606c71b35ab906607c00efa96b99a76bca2409f`. Implemented native service
+  Application composition, separate static/client validation and dynamic build
+  preflight, protected pre-provisioned store with persistent journal, durable
+  lifecycle audit, local authenticated inventory/activity endpoint and tracked
+  bounded shutdown. Dedicated execution remains unavailable; no development
+  executor fallback. Last merged PR and milestone acceptance remain unchanged.
+- Windows checks executed: formatting check, workspace/all-target Clippy with
+  warnings denied, full workspace tests: 106 passed, one direct-only fixture
+  ignored and exercised by its passing parent. Artifact script: three passed,
+  two native Unix checks skipped. Actual normal-user pipe/SDK and durable
+  fixture-store evidence is in docs/service-foundation.md. No privileged
+  service/runtime acceptance or hosted Linux/macOS evidence is claimed.
+- Failure evidence: first Application pipe fixture used a dot in its generated
+  name and correctly failed endpoint validation; corrected the fixture name.
+  The new mutable-handle regression exposed metadata-only Windows handles
+  allowing rename despite share flags; adding read-data access made writes
+  succeed while rename/deletion refuse. Two test compile corrections addressed
+  typed ActivityRow fields. No symptom reached three distinct failed fixes.
+- Open integration: coordinator merges its case-insensitive token-hash
+  uniqueness guard and parent docs/lifecycle refresh; this slice retains its
+  assigned base and deliberately does not duplicate that guard. Independent
+  other-provider review and native Unix hosted checks remain required. Owner
+  adapter must prepare protected DB/journal/lock files; service refuses unsafe
+  or missing prerequisites. Privileged service manager/layout/endpoint/SQLite
+  paths are **unverified on real hardware**. Dedicated-account backend, scoped
+  tool discovery and full M2 cargo/Claude Code acceptance remain open.
+- No admin, provisioning, account/right/task/service/install/dispatch/settings,
+  old Lab Manager/state/VM operation, push, PR, merge, watch or branch switch
+  occurred. No new architecture deviation was introduced.
+
+## Service Application coordinator integration
+
+- Codex / gpt-6.1-sol, medium integrated candidate16d3788 with current native/config/lifecycle parents. Credential uniqueness is enforced in shared validate_inventory and tested through both parse and parse_inventory (duplicate/case variants refused, distinct credentials accepted). Formatting, workspace/all-target Clippy with warnings denied and all 107 runnable Windows nextest tests passed; one direct-only fixture is exercised by its parent. The shared intermittent Windows hosted handle-test failure is separately under diagnosis; this local pass is not a claimed resolution. Fresh independent review and native hosted checks remain pending. No installation or privileged service acceptance occurred.

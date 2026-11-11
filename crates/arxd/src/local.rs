@@ -12,6 +12,9 @@ mod platform;
 #[path = "local_unix.rs"]
 mod platform;
 
+#[cfg(windows)]
+pub(crate) use platform::current_identity;
+
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(300);
 pub const FRAME_LIMIT: usize = 8192;
@@ -92,11 +95,40 @@ trait Acceptor {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     fn accept(&mut self) -> impl std::future::Future<Output = Result<Option<Self::Stream>>> + Send;
 }
-pub struct Listener(platform::Listener);
+pub struct Listener(platform::Listener, Vec<crate::service::native::Observed>);
 impl Listener {
     pub fn bind(endpoint: &Endpoint) -> Result<Self> {
         endpoint.validate()?;
-        Ok(Self(platform::Listener::bind(endpoint)?))
+        Ok(Self(platform::Listener::bind(endpoint)?, Vec::new()))
+    }
+    pub(crate) fn bind_service(
+        layout: &crate::service::layout::Layout,
+        client: String,
+    ) -> Result<Self> {
+        crate::service::native::require_service_identity()?;
+        let endpoint = Endpoint {
+            address: layout
+                .endpoint()
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("endpoint"))?
+                .into(),
+            client_identity: client,
+        };
+        platform::validate_identity(&endpoint.client_identity)?;
+        #[cfg(unix)]
+        let pins = vec![crate::service::native::endpoint_guard(layout)?];
+        #[cfg(windows)]
+        let pins = Vec::new();
+        Ok(Self(platform::Listener::bind_service(&endpoint)?, pins))
+    }
+    pub(crate) async fn run_service(
+        self,
+        config: Arc<crate::config::Config>,
+        activity: Arc<crate::store::Activity>,
+        stop: crate::service::Shutdown,
+    ) -> Result<()> {
+        let _pins = self.1;
+        run_listener_until(self.0, config, activity, stop).await
     }
     pub async fn run(
         self,
@@ -107,9 +139,23 @@ impl Listener {
     }
 }
 async fn run_listener(
+    listener: impl Acceptor,
+    config: Arc<crate::config::Config>,
+    activity: Arc<crate::store::Activity>,
+) -> Result<()> {
+    run_listener_until(
+        listener,
+        config,
+        activity,
+        crate::service::Shutdown::default(),
+    )
+    .await
+}
+async fn run_listener_until(
     mut listener: impl Acceptor,
     config: Arc<crate::config::Config>,
     activity: Arc<crate::store::Activity>,
+    stop: crate::service::Shutdown,
 ) -> Result<()> {
     let capacity = Arc::new(tokio::sync::Semaphore::new(8));
     let mut tasks = tokio::task::JoinSet::new();
@@ -117,6 +163,8 @@ async fn run_listener(
     loop {
         while tasks.try_join_next().is_some() {}
         tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
             stream = listener.accept() => {
                 let Some(stream) = stream? else {
                     if !reported_rejection {
@@ -142,7 +190,11 @@ async fn run_listener(
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
-    // JoinSet aborts all connections when the listener future is dropped.
+    drop(listener);
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+    // Dedicated execution is absent; all connection tasks are read/audit only.
 }
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
@@ -484,3 +536,42 @@ mod tests {
 #[cfg(all(test, windows))]
 #[path = "local_execution_tests.rs"]
 mod execution_tests;
+
+#[cfg(test)]
+pub(crate) async fn fixture_connect(endpoint: Endpoint) -> impl AsyncRead + AsyncWrite + Unpin {
+    #[cfg(windows)]
+    let identity = platform::current_identity().unwrap();
+    #[cfg(unix)]
+    let identity = unsafe { libc::geteuid() }.to_string();
+    platform::connect(&ClientConfig {
+        address: endpoint.address,
+        expected_server_identity: identity,
+        token: "a".repeat(64),
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(test)]
+mod service_bridge_tests {
+    #[tokio::test]
+    async fn fixed_service_endpoint_requires_privileged_server_identity_before_connect() {
+        #[cfg(windows)]
+        let identity = "S-1-5-32-544";
+        #[cfg(unix)]
+        let identity = "1001";
+        let config = super::ClientConfig {
+            address: crate::service::layout::Layout::system()
+                .unwrap()
+                .endpoint()
+                .to_str()
+                .unwrap()
+                .into(),
+            expected_server_identity: identity.into(),
+            token: "a".repeat(64),
+        };
+        // The fixed category is returned before touching a real pipe/socket.
+        let error = super::platform::connect(&config).await.err().unwrap();
+        assert_eq!(error.to_string(), "service identity required");
+    }
+}

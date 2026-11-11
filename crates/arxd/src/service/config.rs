@@ -114,6 +114,29 @@ impl ServiceConfig {
         Ok(())
     }
     fn validate(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
+        self.validate_inventory(layout, resolver)?;
+        self.execution_preflight(layout, resolver)
+    }
+    /// Startup validation deliberately makes no build-account observations.
+    pub fn parse_inventory(
+        bytes: &[u8],
+        layout: &Layout,
+        resolver: &impl Resolver,
+    ) -> Result<Self, Error> {
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(Error::Config);
+        }
+        let wire: Wire = serde_json::from_slice(bytes).map_err(|_| Error::Config)?;
+        validate_platform_rights(layout.platform(), wire.rights)?;
+        let config = Self {
+            wire,
+            platform: layout.platform(),
+            revisions: [None, None],
+        };
+        config.validate_inventory(layout, resolver)?;
+        Ok(config)
+    }
+    fn validate_inventory(&self, layout: &Layout, resolver: &impl Resolver) -> Result<(), Error> {
         let w = &self.wire;
         if self.platform != layout.platform()
             || w.schema != "arxd-service/1"
@@ -134,29 +157,16 @@ impl ServiceConfig {
         {
             return Err(Error::Identity);
         }
-        let build = resolver
-            .account(&w.build_account.name)
-            .map_err(|_| Error::Identity)?;
         let client = resolver
             .account(&w.client.identity)
             .map_err(|_| Error::Identity)?;
-        if build.kind != AccountKind::User
-            || client.kind != AccountKind::User
-            || build.identity != w.build_account.identity
+        if client.kind != AccountKind::User
             || client.identity != w.client.identity
-            || build.gid != w.build_account.gid
-            || (self.platform == Platform::Windows && build.gid.is_some())
+            || (self.platform == Platform::Windows && w.build_account.gid.is_some())
         {
             return Err(Error::Identity);
         }
-        if build.administrative != (w.rights == Rights::Admin) {
-            return Err(Error::Rights);
-        }
-        if !layout.workspace_disjoint(&w.workspace)
-            || !resolver
-                .workspace_safe(&w.workspace)
-                .map_err(|_| Error::Workspace)?
-        {
+        if !layout.workspace_disjoint(&w.workspace) {
             return Err(Error::Workspace);
         }
         let allowed: &[&str] = if self.platform == Platform::Windows {
@@ -217,6 +227,34 @@ impl ServiceConfig {
                 || !hashes.insert(a.token_sha256.to_ascii_lowercase())
         }) {
             return Err(Error::Config);
+        }
+        Ok(())
+    }
+    /// Dynamic execution facts are independent of inventory availability.
+    pub fn execution_preflight(
+        &self,
+        layout: &Layout,
+        resolver: &impl Resolver,
+    ) -> Result<(), Error> {
+        validate_platform_rights(self.platform, self.wire.rights)?;
+        let build = resolver
+            .account(&self.wire.build_account.name)
+            .map_err(|_| Error::Identity)?;
+        if build.kind != AccountKind::User
+            || build.identity != self.wire.build_account.identity
+            || build.gid != self.wire.build_account.gid
+        {
+            return Err(Error::Identity);
+        }
+        if build.administrative != (self.wire.rights == Rights::Admin) {
+            return Err(Error::Rights);
+        }
+        if !layout.workspace_disjoint(&self.wire.workspace)
+            || !resolver
+                .workspace_safe(&self.wire.workspace)
+                .map_err(|_| Error::Workspace)?
+        {
+            return Err(Error::Workspace);
         }
         Ok(())
     }
@@ -452,8 +490,17 @@ pub(crate) mod tests {
                     "token_sha256": hash,
                 }));
             assert_eq!(
-                parse(value, &FakeResolver::default()).err(),
+                parse(value.clone(), &FakeResolver::default()).err(),
                 Some(Error::Config)
+            );
+            assert_eq!(
+                ServiceConfig::parse_inventory(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &Layout::for_test(Platform::Linux),
+                    &FakeResolver::default(),
+                )
+                .err(),
+                Some(Error::Config),
             );
         }
         let mut value = fixture();
@@ -464,7 +511,15 @@ pub(crate) mod tests {
                 "principal": "second",
                 "token_sha256": "b".repeat(64),
             }));
-        assert!(parse(value, &FakeResolver::default()).is_ok());
+        assert!(parse(value.clone(), &FakeResolver::default()).is_ok());
+        assert!(
+            ServiceConfig::parse_inventory(
+                &serde_json::to_vec(&value).unwrap(),
+                &Layout::for_test(Platform::Linux),
+                &FakeResolver::default(),
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn strict_schema_and_redacted_errors() {
@@ -596,5 +651,88 @@ mod revision_tests {
         assert!(c.revalidate(&layout, &r).is_ok());
         r.revision.set(1);
         assert!(c.revalidate(&layout, &r) == Err(Error::Identity));
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    struct Observe(std::sync::Mutex<Vec<String>>);
+    impl Resolver for Observe {
+        fn account(&self, value: &str) -> Result<Account, Error> {
+            self.0.lock().unwrap().push(value.into());
+            if value == "builder" {
+                return Err(Error::Identity);
+            }
+            Ok(Account {
+                identity: value.into(),
+                gid: Some(1001),
+                kind: AccountKind::User,
+                administrative: false,
+            })
+        }
+        fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+            panic!("no startup incarnation lookup")
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            panic!("no startup workspace lookup")
+        }
+    }
+    #[test]
+    fn missing_build_account_is_dynamic_and_macos_admin_refuses_before_observation() {
+        let r = Observe(Default::default());
+        let layout = Layout::for_test(Platform::Linux);
+        let bytes = serde_json::to_vec(&tests::fixture()).unwrap();
+        let config = ServiceConfig::parse_inventory(&bytes, &layout, &r).unwrap();
+        assert_eq!(*r.0.lock().unwrap(), ["1001"]);
+        assert_eq!(
+            config.execution_preflight(&layout, &r),
+            Err(Error::Identity)
+        );
+        let changed = tests::FakeResolver {
+            changed: true,
+            ..Default::default()
+        };
+        let mismatched = ServiceConfig::parse_inventory(&bytes, &layout, &changed).unwrap();
+        assert_eq!(
+            mismatched.execution_preflight(&layout, &changed),
+            Err(Error::Identity)
+        );
+        r.0.lock().unwrap().clear();
+        let mut v = tests::fixture();
+        v["rights"] = "admin".into();
+        assert!(matches!(
+            ServiceConfig::parse_inventory(
+                &serde_json::to_vec(&v).unwrap(),
+                &Layout::for_test(Platform::Macos),
+                &r
+            ),
+            Err(Error::Rights)
+        ));
+        assert!(r.0.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn inventory_schema_still_refuses_http_development_and_bad_static_values() {
+        let r = tests::FakeResolver::default();
+        let layout = Layout::for_test(Platform::Linux);
+        for key in [
+            "listen",
+            "development_execution",
+            "config",
+            "state_dir",
+            "local",
+        ] {
+            let mut v = tests::fixture();
+            v[key] = serde_json::json!({});
+            assert!(
+                ServiceConfig::parse_inventory(&serde_json::to_vec(&v).unwrap(), &layout, &r)
+                    .is_err()
+            );
+        }
+        let mut v = tests::fixture();
+        v["agents"][0]["token_sha256"] = "invalid".into();
+        assert!(
+            ServiceConfig::parse_inventory(&serde_json::to_vec(&v).unwrap(), &layout, &r).is_err()
+        );
     }
 }
