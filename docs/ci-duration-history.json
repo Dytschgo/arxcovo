@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "runId": 42948900419,
+    "sha": "708afbd3f7a5a262a0f21ca9cb11bce991c41aff",
+    "seconds": 189,
+    "conclusion": "success"
+  }
+]
