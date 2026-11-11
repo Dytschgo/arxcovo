@@ -240,3 +240,5 @@ Exact provider allowances and per-task cost are not exposed; no percentages or c
 
 - The preceding builder report describes its base snapshot; the current merged main is 2299ad4 (PR #17), as recorded above. Source integration includes the latest PR #15 transport and explicit Unix endpoint-collision refusal. Independent review and hosted validation of this combined candidate remain required.
 - Owner steering: the current unelevated Windows user is authorized for the development command test to avoid further dedicated-account blocking. ADR 0010 is preserved on docs/windows-current-user-development; S4U diagnosis cancellation was requested and no third privileged dispatch is planned. Production dedicated-account isolation remains unproven.
+
+- Activity candidate scope is separated from service installation: full ADR 0009 and the owner guide remain committed on feat/service-lifecycle. ADR 0011 records the activity-only contract. Coordinator integration passed all 38 Windows workspace tests, formatting and Clippy; native hosted checks and independent review remain pending.
