@@ -3,10 +3,10 @@
 ## Current state — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#20](https://github.com/Dytschgo/arxcovo/pull/20), `64b50e9187fd469bc886373230e324ace6dd4449`, 17:31:46 UTC, through all five required gates. Service lifecycle foundations are merged; installed-service and dedicated-account acceptance remain open.
+- Last merged PR: [#21](https://github.com/Dytschgo/arxcovo/pull/21), `2bdcb2002165d2128015ca41df66cf9f7ba47eb0`, 17:46:19 UTC, through all five required gates. Lifecycle and validated configuration foundations are merged; installed-service and dedicated-account acceptance remain open.
 - Main includes authenticated inventory/activity, persistent host identity and accepted Windows current-user development execution. Dedicated-account execution and installed per-OS services remain incomplete; M2 acceptance stays unchecked.
-- Queue priority: land configuration #21 next, then native validation #25 and Application #27 in dependency order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
-- Main push CI for `3b6170b` passed on its first attempt in run 43066365961: 17:15:24–17:24:32 UTC, **548 seconds**, below 15 minutes. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
+- Queue priority: land native validation #25 next, then Application #27 and existing owner/executor dependencies in order. No new feature PRs while the queue drains. #31 is closed as fully folded into #29, with its commit history and original evidence preserved.
+- Main push CI after lifecycle #20 passed on its first attempt, run 43069045513 at `64b50e9`: **551 seconds (9m11s)**, below 15 minutes. The new configuration main push is not yet claimed green. No third S4U probe, owner-PC administration, old Lab Manager or protected VM work is authorized.
 
 ## Queue-drain oversight
 
@@ -1256,3 +1256,8 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium inspected completed macOS job [130636095317](https://github.com/Dytschgo/arxcovo/actions/runs/43053335906/job/130636095317), source `b052d940`, image `macos-26-arm64` version `20261102.0473.1`. Root, Library, Application Support, private, var, Logs, LaunchDaemons and bin passed ancestor policy; launchctl passed binary-leaf policy. The old group-writable runtime parent and Application Support as a strict leaf remained rejected. Exact source-bound rows are retained separately in `docs/evidence/macos-namespace-controls.json`; the earlier stock-directory evidence remains unchanged.
 - Hosted macOS nextest passed **132/132**, one direct-only fixture skipped. Ordinary-user native fixtures exercised manager scripting/gates, bounded ordinary-process timeout/output, start preflight, retained-state preservation, private publication, locking and new-object group ownership. No real service-manager mutation was invoked by these fixture tests. This is native ordinary-user evidence, not installed-root/service or cross-user acceptance.
 - Remaining: independent full PR29 review, Linux hosted result, native ownership/timeout mutations, captured launchd manager-output parsing, installed protected SQLite and service lifecycle acceptance. The latter paths remain **unverified on real hardware**.
+
+## Dedicated executor interface queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #36 locally on refreshed Unix owner branch `9c25864`. Crate, packaging, Cargo/toolchain and script trees remain identical to published `12aa968`; CI workflows/helpers match the parent. Only PROGRESS conflicted; both historical provider tables and task evidence are retained, with Current state first and #21 recorded merged. Formatting and 26/26 helper tests passed. No Rust suites were repeated for unchanged source, no push/new PR and no privileged operation.
+- Full independent interface/MCP review remains required after parent integration. Production dedicated execution still reports MechanismUnavailable; no current-user fallback, actual identity switch or dedicated-account acceptance is added by this history/CI refresh. Known test-only ETW handle fixture correction is retained separately and is not silently folded in. Installed/native M2 execution remains **unverified on real hardware**.
