@@ -1,7 +1,8 @@
 # Disposable Ubuntu runner mirror mitigation candidate
 
-The workflow activation is prepared locally but has not been pushed or run.
-It must receive independent review before publication. Never run
+Source `400903d` received independent review before publication and its first
+hosted execution passed. Exact evidence is retained in
+`docs/evidence/ubuntu-signed-mirror-run.json`. Never run
 `ubuntu_mirror.py` on an owner machine. Its environment
 checks express intent and are spoofable; they are not provenance or authority.
 
@@ -36,8 +37,8 @@ source identity and bytes are checked before replacement. A failure leaves CI
 red; a partial successful rewrite is not rolled back. Noncooperating root
 writers are outside this ephemeral helper's guarantee.
 
-Activation, after review, would preserve only the four non-secret intent fields
-through sudo and run isolated Python (`-I -B`) in the disposable Ubuntu job before the
+The reviewed activation preserves only four non-secret intent fields
+through sudo and runs isolated Python (`-I -B`) in the disposable Ubuntu job before the
 unchanged `npx playwright install --with-deps chromium`. APT update, signature
 verification, dependency installation and smoke tests must still pass. Do not
 change resolver configuration, hardcode IP addresses, disable checks, retry
@@ -45,11 +46,19 @@ blindly or increase the CI timeout. Current required checks remain enforced.
 
 Portable tests use synthetic native file facts for root ownership, regular-file,
 link-count, mode, read-size and no-follow guards. They do not open owner-machine
-APT files. Actual root publication and package installation have not run and
-remain unverified; no workflow has executed this candidate yet.
+APT files. Real root publication and package installation were exercised only
+in the disposable hosted Ubuntu job at `400903d`, not on an owner host.
 
 The complete plan/recheck/publication loop is also tested against owned temporary
 trees using injected root facts and a recorded fchmod request. Real staging,
 byte replacement and cleanup run there; this provides no root-owner or Unix
 permission proof. Tests cover the observed 144-byte priority mirror list,
 preservation, all-plan refusal, stale bytes/identity and publication failure.
+
+The first hosted Ubuntu job updated one source, fetched InRelease metadata for
+all four suites from the HTTPS mirror with no signature/fetch warning, and
+passed dependency installation plus browser and Electron smoke in 130 seconds.
+All three Ubuntu-domain DNS controls also resolved in that run. It therefore
+proves the signed-mirror path works, not that it reproduced or fixed the earlier
+DNS failure. The root cause remains unknown. Product installed-service and
+dedicated-account acceptance remain open.

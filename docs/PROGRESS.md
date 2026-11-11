@@ -1,5 +1,11 @@
 # Arxcovo progress
 
+## Signed Ubuntu mirror first hosted execution
+
+- Codex / gpt-6.1-sol, medium verified completed [Ubuntu job 130669921798](https://github.com/Dytschgo/arxcovo/actions/runs/43062892241/job/130669921798) at independently reviewed source `400903d`. The helper updated one source. All four resolute suites fetched InRelease metadata from the Kernel Archives HTTPS mirror; no signature/insecure/unsigned/failed-fetch warning appeared. Playwright dependency installation, browser smoke and Linux Electron smoke passed. The complete job took **130 seconds**, below the unchanged 12-minute limit.
+- All six DNS controls, including all three original Ubuntu-domain names, resolved on this run. The original DNS timeout did not reproduce. This establishes the reviewed signed-mirror execution path, not a proven DNS fix or root cause. Exact sanitized results are retained in `docs/evidence/ubuntu-signed-mirror-run.json`.
+- Independent Anthropic / claude-opus-5-5 / requested high published-head review passed at `400903d` ([evidence](https://github.com/Dytschgo/arxcovo/pull/32#issuecomment-6802018766)). Earlier preparation/unactivated notes below are historical. This documentation-only follow-up requires its own exact-head recheck and green required checks before merge. No owner-machine APT/admin change occurred; no installed-service or dedicated-account M2 acceptance is established.
+
 ## Mirror mitigation review correction
 
 - Independent Anthropic / claude-opus-5-5 / requested high review at `a97fd74` found B1: the actual Ubuntu image uses `mirror+file:/etc/apt/apt-mirrors.txt`, so the original direct-URI candidate would refuse unchanged. Its report is retained in `docs/reviews/ubuntu-mirror-mitigation-review.md`; nothing had been published or executed. Root cause of the DNS failure remains unknown.
