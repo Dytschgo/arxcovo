@@ -7,7 +7,7 @@ No independent review or hosted acceptance is claimed here.
 
 ## Pins and scope
 
-- Authoritative prepared worktree/top level: `C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-8366903c-dcbb09d972636f18`;
+- Authoritative prepared worktree/top level: `<prepared-worktree>`;
   pwd matched top level, initial status clean, outside canonical `D:/Code/Arxcovo`.
 - Prepared base: `caf8e3abc8e31e7edfe5ff5c398cfbdc11c89ebf`.
   Merge base with actual main: `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`.
@@ -79,7 +79,7 @@ No new public lookup occurred here.
 ## Bounds and safe output schema
 
 Bounds: 32 source files; 65,536-byte input/output source; 4,096-byte input/output
-mirror list; shared parser 1–16 entries. Additional caps: 128 total directory
+mirror list; shared parser 1â€“16 entries. Additional caps: 128 total directory
 entries across both enumerated directories (including unrelated entries),
 2,200,000 total bytes read including rechecks, 10 seconds and 16,384 report bytes.
 One source/mirror over-read byte detects growth; the aggregate budget is checked
@@ -94,7 +94,7 @@ Version-1 JSON has only `version` and `events`. Each event is
 Categories: 0=context/parent, 1=legacy source, 2=source-directory child,
 3=fixed mirror list. Parent index follows the fixed parent chain; source index
 follows internal sorted names; indices never reveal names. Values are booleans
-or integers 0–2,200,000. Report overflow replaces the report with a fixed bounded
+or integers 0â€“2,200,000. Report overflow replaces the report with a fixed bounded
 `internal/report-bound/false` report. IDs are pinned to this version/source.
 
 Stages: 0=arguments, 1=context, 2=done, 3=enumeration, 4=internal, 5=mirror-parser, 6=parents, 7=parser, 8=plan, 9=read, 10=recheck.
