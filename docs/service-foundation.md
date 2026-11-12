@@ -841,3 +841,43 @@ review, hosted gates, PR-D proof consumption and session-parts narrowing, safe
 fresh-state provisioning, and separately reviewed native execution adapters.
 Development/schema 3 and service no-workspace/PATH boundaries remain unchanged.
 Installed/native/dedicated-account M2 remains **unverified on real hardware**.
+
+## Local ADR0016 E2 provisioning candidate (current API)
+
+The local Windows library adds `owner_install_windows::install(OwnerGuard) ->
+Result<(), OpenError>`. It consumes the binary-only guard, rechecks the binary
+folder, observes SCM, pins the fixed known-folder namespace, enables restore,
+creates or verifies private directories, and holds owner.lock exclusively before
+state classification or member creation. Existing objects are opened through an
+installer-only read-access fence. Creation supplies the descriptor immediately;
+there is no ACL repair. All existing members are classified before missing empty
+files are created and flushed; retained rollback database/journal contents are
+preserved. WAL/SHM refuse. Registration is last and never starts the service.
+
+The current E1 API is `OwnerGuard::acquire()`,
+`WindowsOwnerSession::open(guard)`, `read_config`, `observe_batch`, `configure`,
+and `WindowsOwnerSession::uninstall(guard, Deregistered)`. The raw store/right
+remain private. No parts(), CLI wiring, runtime path/policy selector, account
+creation or new authority is provided. Earlier callable API sections are
+historical. Test namespaces use owned temporary directories only.
+
+Prior independent Opus security review and authority correction recheck are retained
+at their original heads. The original b3e1d13 integration was held pending fresh
+independent Opus assessment of the integrated head and unresolved ExecutionFailed
+evidence, coordinator publication disposition and required hosted gates. CLI wiring
+remains outside this slice. SYSTEM-owned creation with restore, installed SCM,
+fixed known-folder behavior, dedicated execution and the binary ACL recipe are
+**unverified on real hardware**. M2 stays open. Local evidence is in
+[the E2 report](reviews/0016-e2-local-implementation-evidence.md).
+
+
+### E2 draft verification candidate after PR45
+
+The coordinator permits draft publication after the independent
+[assessment](reviews/0016-e2-current-parent-assessment.md), preserving the
+open ExecutionFailed record. The actual parent is main after PR45, 2b805c4;
+all six provisioning files equal the corrected reviewed implementation.
+Exact-head independent review, all hosted gates and a separate explicit
+coordinator merge decision remain required. This is library-only; the owner
+commands are still unwired and were not executed. Installed/native/dedicated
+paths remain **unverified on real hardware**; M2 is incomplete.

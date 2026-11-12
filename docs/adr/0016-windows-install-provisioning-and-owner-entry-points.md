@@ -3,9 +3,9 @@
 Status: accepted contract within the settled independent review dispositions;
 E1 library implemented locally and independently reviewed (full report
 [42c923d](../reviews/0016-e1-independent-review.md), follow-up
-[fa6f297](../reviews/0016-e1-followup-recheck.md)); hosted gates pending.
+[fa6f297](../reviews/0016-e1-followup-recheck.md)); E1 hosted gates subsequently passed in PR40.
 This port was prepared on main `0937cac` and refreshed onto `79b7879`.
-Opus high integration review at `b79786c` passed; published-head hosted gates remain pending. E2 provisioning and CLI wiring are not part of this E1 boundary.
+Opus high integration review at `b79786c` passed; E1 published-head gates subsequently passed in PR40. That E1 boundary excluded E2 provisioning and CLI wiring.
 The original contract base was `54c43fbcc9b9a6050f067a3e437e58a018b96b00`;
 [Sol contract review](../reviews/0016-windows-install-contract-review.md)
 and [correction review](../reviews/0016-provisioning-correction-review.md)
@@ -17,6 +17,31 @@ Amends ADR 0009 (Windows install, "identical-only" idempotency) and ADR 0012
 0014 decision 6 (pinned `1e1e48b:docs/adr/0014-unix-owner-lifecycle-corrections.md`,
 not in this base). ADR 0012's configure/recovery/uninstall fault model
 (decision 6) is unchanged. ADR 0015 is macOS-only.
+
+
+Publication candidate checkpoint (2026-11-12): actual base is
+`2b805c450880fd12b9f0cd9771974e4fa1337a55` after PR45. The six provisioning
+files still equal reviewed `1103a66` and tested `000835d`; inherited E1,
+N3/N2, artifact CI, SYSTEM test and state-exit changes are preserved. The
+[independent assessment](../reviews/0016-e2-current-parent-assessment.md)
+permits only a draft/candidate publication recommendation. The coordinator
+accepts that limited disposition; merging remains held for exact-head review,
+all hosted gates and a separate explicit decision about the unresolved
+ExecutionFailed. No pass is a fix or waiver. See
+[publication evidence](../evidence/e2-publication-refresh.md). No CLI/native
+activation or M2 acceptance; paths remain **unverified on real hardware**.
+
+Historical E2 verification checkpoint (2026-11-12): E1 merged through PR40; PR41 N3,
+PR42 N2 and PR43 artifact CI are inherited on base `fbb1813`. E2 provisioning
+is now ported locally from reviewed `1103a66`, with private authority fields and
+ordering unchanged. Prior [full security review](../reviews/0016-e2-independent-security-review.md)
+at `42718df` and [authority correction recheck](../reviews/0016-e2-authority-correction-recheck.md)
+at `1103a66` remain historical evidence. Architecture credit stays with the prior
+Sol review of the Opus design. E2 remains **HELD** for fresh independent Opus
+assessment and coordinator publication disposition: the unexplained uninstrumented
+`ExecutionFailed` is unresolved; instrumented passes are neither fix nor waiver.
+No CLI wiring or activation. Native/installed/dedicated paths remain
+**unverified on real hardware**; M2 incomplete.
 
 ## Problem
 

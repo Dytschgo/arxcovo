@@ -77,8 +77,27 @@ token into chat, an issue, a command line or a log.
    - Give `Arxcovo` read and execute access on `C:\ArxcovoTools`.
    - Builds that link need the MSVC build tools, which `cargo --version` does
      not.
-4. **(admin)** Copy the release binary to exactly
-   `C:\Program Files\Arxcovo\arxd.exe`. Then, from an elevated terminal, run:
+4. **(owner only, admin; DOCUMENT ONLY, unverified on real hardware)** Create
+   `C:\Program Files\Arxcovo` and replace its inherited directory ACL before
+   copying the binary. The required protected ACL grants inheritable full
+   control to SYSTEM and Administrators, and read/execute to Users. Use fixed
+   SIDs so the recipe does not depend on localized group names:
+
+   ```powershell
+   New-Item -ItemType Directory -Path 'C:\Program Files\Arxcovo'
+   icacls 'C:\Program Files\Arxcovo' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+   ```
+
+   This recipe assumes a new directory; `/grant:r` does not remove unrelated
+   explicit ACEs on an existing directory. The final directory policy must
+   reject those grants, including inherit-only CREATOR OWNER full control.
+   The owner must inspect any existing directory rather than treating this as
+   an ACL repair command. Agents must not execute these commands.
+   **Copy, do not move**, the release binary to exactly
+   `C:\Program Files\Arxcovo\arxd.exe` so it inherits the destination ACL;
+   moving can retain the source descriptor. The install library checks the
+   pinned binary directory before restore or creation and refuses unsafe ACLs.
+   Owner CLI wiring remains pending. The future elevated invocation is:
 
    ```powershell
    & "C:\Program Files\Arxcovo\arxd.exe" service install

@@ -1,0 +1,16 @@
+diff --git a/crates/arxd/src/service/owner_install_windows_tests.rs b/crates/arxd/src/service/owner_install_windows_tests.rs
+index 66791b3..b1a3655 100644
+--- a/crates/arxd/src/service/owner_install_windows_tests.rs
++++ b/crates/arxd/src/service/owner_install_windows_tests.rs
+@@ -556,7 +556,10 @@ fn i5_junction_state_and_member_refuse() {
+         };
+         let target = f.temp.path().join("target");
+         directory(&target, &f.policy, FILE_SHARE_READ).unwrap();
+-        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
++        // A `/` in cmd.exe's own image path is parsed as `/c` (running `md`).
++        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
++            .join("System32")
++            .join("cmd.exe");
+         let output = std::process::Command::new(cmd)
+             .current_dir(link.parent().unwrap())
+             .raw_arg(format!(

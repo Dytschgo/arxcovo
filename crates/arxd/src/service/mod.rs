@@ -231,3 +231,6 @@ mod tests;
 pub(crate) mod owner_scm;
 #[cfg(windows)]
 mod owner_scm_windows;
+
+#[cfg(windows)]
+pub mod owner_install_windows;
