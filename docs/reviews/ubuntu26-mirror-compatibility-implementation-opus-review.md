@@ -224,3 +224,147 @@ Standards: 0 findings (2 judgement-call smells). Spec: 1 blocking (B1, retained
 interior-CR serialization regression) and 4 advisories, the worst being A2
 (CRLF untested). Push readiness: **NOT READY** until B1 is fixed, its tests
 are added and the delta is independently rechecked.
+
+## B1 recheck - 2026-11-12
+
+Reviewer: Anthropic / claude-opus-5-5 / high, review sub-agent, single agent,
+no subagents. Local only: no push, PR, label, GitHub write, CI, rerun,
+optional precheck or owner/admin action. No source, proposal or PROGRESS edit.
+The prior report above is kept verbatim.
+
+Verdict: **B1 CLOSED. PASS for the source delta. No new blocker.** The
+correction is exactly the guard recommended above, and every B1-required test
+is present. My own guard-removal mutant is killed.
+
+### Target and independence
+
+- Correction `4b9695257a57d187d55cdf7ca94d5551d6acdde3` (parent `ebe535b`)
+  touches only `tools/ci/ubuntu_mirror.py` (+2) and
+  `tools/ci/test_ubuntu_mirror.py` (+12). Evidence
+  `8c2ea110505ba21a54750b533797742e9e0f3c59` touches only `docs/PROGRESS.md`
+  and `docs/evidence/ubuntu26-mirror-compatibility-fix.md`. `git diff --check
+  ebe535b 8c2ea11` is clean.
+- Between `e9d63df` and `4b96952`, the only source paths that differ are the
+  two helper files. The contract `tools/ci/ubuntu-mirror.md` blob is unchanged
+  (`e800270f...`), and so is `ci.yml`. The helper and contract blobs at the
+  base are still identical at `1ac1aa1` and the PR54 pin `344c406` (helper
+  `adea3432...`).
+- Helper blob `79b583e5...` (SHA-256 `2c861c8b...`), test blob `1521cb29...`.
+- Runtime: an isolated T3 worktree, clean at `8c2ea11`, with its top level
+  different from the canonical checkout. Targets were read via `git archive`
+  into the session scratchpad.
+- **Cross-provider (independent):** the coordinator Sol medium correction and
+  evidence. Not independent: the guard text itself, which this report
+  recommended. Sol keeps credit for implementing and testing it.
+
+### Verification actually run
+
+Windows 11, Python 3.12.10. All runs used `-I -B` on owned archive copies.
+There were no actual APT, `/etc/apt`, production `apply`, sudo/root, native,
+network or hosted operations.
+
+1. Suites: `4b96952` ran 32/32 OK. `e9d63df` ran 31/31 OK, and `1ac1aa1` ran
+   23/23 OK.
+2. Red check: the `4b96952` tests against the `e9d63df` helper ran 32 tests
+   with **14 failures**, matching the builder's claim.
+3. Diff: the guard sits after `removesuffix("\r")` and before the
+   blank/comment classification and tokenization. Its class
+   `[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]` is exactly
+   the set of `str.splitlines` separators other than LF, so none of the old
+   `splitlines` boundaries can reach the output again. `urlsplit` deletes only
+   `\t\r\n` inside a token. Tab is a token separator, and LF ends the
+   line. CR is now refused, so the interior normalization differential is
+   closed.
+4. Independent mutants (15, mine). Each ran in its own owned copy against all
+   32 tests. The production copy hash was unchanged afterwards.
+
+| Mutant | Result |
+| --- | --- |
+| Guard removed | killed (14) |
+| `removesuffix("\r")` removed | killed (1); closes prior A2 |
+| Guard moved before `removesuffix` | killed (1, CRLF case) |
+| `re.search` -> `re.match` (line start only) | killed (2) |
+| Class reduced to CR only | killed (10) |
+| Drop CR / VT / FF from class | killed (4 / 2 / 2) |
+| FS-RS narrowed to FS-GS or GS-RS | killed (2 each) |
+| Drop NEL / LS / PS from class | survives: equivalent on active lines (see 5) |
+| Guard moved after blank/comment check | survives: differs only on comment/blank lines |
+| Guard applied to `tokens[0]` only | survives: differs only on comment/blank lines |
+
+5. Differential probe: base, `e9d63df` and `4b96952`, plus a combined
+   no-NEL/LS/PS mutant. It covered 37 characters (C0 except LF, DEL, NBSP,
+   U+0085, U+2028, U+2029, U+3000) in prefix, inner-host, inner-path, suffix,
+   comment-prefix and blank-line positions, tagged and untagged, on the
+   canonical list.
+   - The correction closes all 34 separator leaks that `e9d63df` had, on both
+     active and comment/blank lines.
+   - CRLF canonical input gives 195 bytes, byte-identical to the LF output.
+     `\r\r\n` refuses.
+   - On active lines, the no-NEL/LS/PS mutant behaves exactly like the
+     correction. Those three characters never pass the existing HOSTS,
+     `replacement()` or raw checks in any position. In the guard they only
+     affect comment and blank lines.
+   - Exactly one fix-vs-base difference remains: a `\x1f` prefix on a
+     **tagged** HOSTS entry is serialized (A5 below). It is not a `splitlines`
+     separator, so it is outside B1.
+
+### Standards
+
+- No documented-standard breach. The commits are conventional and
+  one-concern, the change stays in the approved helper paths, and the tests
+  are meaningful.
+- Possible Mysterious Name (judgement call): the class literal has no name or
+  comment tying it to `str.splitlines`. A short comment, or a constant such as
+  `_SPLITLINES_NON_LF`, would make audits easier.
+- No other smell in this delta.
+
+### Spec
+
+- B1 required tests are met. Tagged and untagged inner-CR HOSTS entries
+  refuse. Prefixes of every separator, including `\x0b` and `\x1c`,
+  refuse tagged and untagged. The guard-removal mutant is killed (builder's
+  and mine). The fix only adds refusals, and every existing assertion still
+  passes.
+- The prior A2 gap (untested CRLF) is now covered and its mutant is killed.
+- Nothing outside B1 was added. The production guards are intact and no
+  check was weakened.
+- Advisory **A1** (partly addressed, still open). Because the guard runs
+  before the comment check, `\x0b`/`\x0c`/FS-RS/NEL/LS/PS comment and
+  blank forms now refuse. No test pins this, which is why three mutants
+  survive. A one-line case such as `"\x0b# note"` and `"\u2028"`
+  expecting `Refusal` would kill them. The NBSP, U+3000 and `\x1f` comment
+  forms are as before. Non-blocking.
+- Advisory **A5** (new, non-blocking). A tagged HOSTS entry with a leading
+  `\x1f` is written with that byte. Base dropped it, because `str.split()`
+  treats `\x1f` as whitespace. Base already wrote the same untagged bytes
+  (`\x1fhttps://archive.ubuntu.com/ubuntu`) verbatim, so this is not a new
+  output class. It belongs to the existing leading-C0 class (`\x01-\x08`,
+  `\x0e-\x1f`) noted above as present in base and out of scope. The junk
+  stays in the scheme, so no foreign host results; that APT effect is
+  **unverified here**. A later hardening could refuse
+  `[\x00-\x08\x0a-\x1f\x7f]` on active lines.
+- **A3** and **A4** remain advisories without a concrete regression. The
+  contract doc still does not say that active lines are ASCII-tokenized and
+  that line separators refuse.
+- Residual risk: if a real hosted mirror list contained one of these
+  separators, the step would now fail closed. Its real content remains
+  UNKNOWN.
+
+### Ledgers, boundaries and push readiness
+
+- Performance: 2 of 3 failed; attempt 3 is UNUSED. Fetch path: 2 failed
+  hosted invocations and 0 failed hosted fixes. This was one local
+  correction, with no hosted attempt, reset, threshold change or optional
+  precheck. This recheck adds no hosted invocation.
+- Native, installed and dedicated paths remain **unverified on real
+  hardware**. M2 is incomplete. E_PROTECTION and ExecutionFailed stay separate
+  and unknown, with no retry.
+- Push readiness: **READY from source review.** The coordinator may integrate
+  `e9d63df` + `4b96952` (the approved three helper paths and named docs, as
+  the separate #54 compatibility commit) once root integration passes. That
+  integration still needs its own unchanged required checks and measured
+  acceptance. This review does not grant merge permission.
+
+Standards: 0 findings (1 judgement-call smell). Spec: B1 closed, 0 blockers.
+The worst open advisory is A1 (comment-line separator refusal untested; three
+equivalent-on-active-line mutants survive).
