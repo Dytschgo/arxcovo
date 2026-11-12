@@ -11,6 +11,17 @@ typed manager queries, status mapping, the `Disabled` plist key,
 `enable`/`disable` vectors and the `ProvisionState` install step. Where the two
 conflict, ADR 0014 wins.
 
+Locally accepted [ADR 0017](0017-dedicated-report-validation.md) refines backend
+report validation for the post-preflight execution table (N2). It also amends
+two rows of that table. The pre-observation spawn-error row is keyed to child
+creation, not to the observation. On an identity mismatch, an observed SID, UID
+or GID that differs from the pin is withheld (NULL) in rows and responses. It
+is accepted for local implementation; review and hosted gates remain pending.
+Amendment 3 adds an output release condition: only a full identity match releases
+both streams. Otherwise each stream is `{"head":"","tail":"","dropped_bytes":null}`.
+See [ADR 0017 output release](0017-dedicated-report-validation.md#output-release-privacy-normative-output-release-amendment-accepted).
+The tables below retain their original layout.
+
 Owner steps: docs/service-install.md. Builds on: proposed ADR 0006
 (`docs/early-hardware-and-raft-spikes`) and these states:
 

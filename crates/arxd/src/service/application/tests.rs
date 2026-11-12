@@ -459,7 +459,7 @@ async fn response_only_reason_table_completes_and_reads_back_without_private_dat
 
 #[tokio::test]
 async fn endpoint_failure_still_drains_dedicated_worker_before_stop_audit() {
-    use crate::service::executor::tests::{Gate, GatedBackend, backend_fixture};
+    use crate::service::executor::tests::{Gate, GatedBackend, default_fixture as backend_fixture};
     use std::sync::atomic::AtomicUsize;
     let dir = private_temp();
     let mut app = ServiceApplication::new(injected(dir.path(), None));
@@ -690,5 +690,139 @@ async fn dedicated_started_row_is_authoritative_even_on_refusal() {
         .unwrap();
         assert_eq!(read(), ("refused".into(), "dedicated_account".into()));
         assert!(a.finish(id, "failed").is_err());
+    }
+}
+
+#[tokio::test]
+async fn dedicated_report_mcp_privacy_in_memory() {
+    use crate::service::executor::{
+        self,
+        tests::{
+            OUTPUT_MARKER, OnceReport, SID_A, SID_B, assert_output_release, assert_private,
+            backend_fixture, completed, good,
+        },
+    };
+    use crate::store::Rights;
+    use rmcp::ServiceExt;
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    // A matching positive control uses the same real MCP path.
+    for case in [
+        "out_sid_b",
+        "out_no_observation",
+        "out_ok",
+        "out_sid_a_cleanup_null",
+    ] {
+        let released = ["out_ok", "out_sid_a_cleanup_null"].contains(&case);
+        let sid = if case == "out_sid_b" { SID_B } else { SID_A };
+        let dir = private_temp();
+        let mut evidence = good(super::super::layout::Platform::Windows, Rights::Standard);
+        if let Some(executor::Observation::Windows { sid: observed, .. }) =
+            &mut evidence.observation
+        {
+            *observed = sid.into();
+        }
+        if case == "out_no_observation" {
+            evidence.observation = None;
+            evidence.point = None;
+        }
+        if case == "out_sid_a_cleanup_null" {
+            evidence.cleanup_confirmed = None;
+        }
+        let e = backend_fixture(
+            Arc::new(OnceReport(Mutex::new(Some(completed(evidence))))),
+            Ok(executor::Pin::for_test(
+                super::super::layout::Platform::Windows,
+                SID_A,
+                None,
+                Rights::Standard,
+            )),
+        );
+        let mut activity = Activity::open_service_fixture(dir.path()).unwrap();
+        activity.dedicated = Some(e.clone());
+        let inventory = crate::mcp::Inventory {
+            execution: None,
+            activity: Arc::new(activity),
+            principal: Some(crate::mcp::Principal("fixture-agent".into())),
+        };
+        let (s, c) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+        let client = ().serve(c).await.unwrap();
+        for tool in ["run_command", "list_activity", "list_hosts"] {
+            let args = if tool == "run_command" {
+                json!({"tool":"cargo"})
+            } else {
+                json!({})
+            };
+            let response = client
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.content.len(), 1, "{case} {tool} one text envelope");
+            assert!(response.content[0].as_text().is_some());
+            for content in &response.content {
+                if let Some(text) = content.as_text() {
+                    if !released || tool != "run_command" {
+                        assert!(!text.text.contains(SID_B), "{case} {tool} raw SID privacy");
+                        assert!(
+                            !text.text.contains(OUTPUT_MARKER),
+                            "{case} {tool} raw marker privacy"
+                        );
+                    }
+                    let value: Value = serde_json::from_str(&text.text).unwrap();
+                    if tool == "run_command" {
+                        assert_output_release(&value, released, case);
+                    } else {
+                        assert!(!text.text.contains(SID_B));
+                        assert!(!text.text.contains(OUTPUT_MARKER));
+                        assert_private(&value);
+                    }
+                    match tool {
+                        "run_command" => {
+                            assert_eq!(
+                                value["reason"],
+                                match case {
+                                    "out_sid_b" => json!("identity_mismatch"),
+                                    "out_no_observation" => json!("execution_failed"),
+                                    "out_sid_a_cleanup_null" => json!("cleanup_unconfirmed"),
+                                    "out_ok" => Value::Null,
+                                    _ => unreachable!(),
+                                }
+                            );
+                            assert_eq!(
+                                value["observed_identity"]["id"],
+                                if released { json!(SID_A) } else { Value::Null }
+                            );
+                            assert_eq!(
+                                value["metadata"]["observed_id"],
+                                if released { json!(SID_A) } else { Value::Null }
+                            );
+                            assert_eq!(
+                                value["outcome"],
+                                if case == "out_ok" {
+                                    "succeeded"
+                                } else {
+                                    "failed"
+                                }
+                            );
+                        }
+                        "list_activity" => assert_eq!(
+                            value["activities"][0]["observed_id"],
+                            if released { json!(SID_A) } else { Value::Null }
+                        ),
+                        "list_hosts" => {
+                            assert_eq!(value["hosts"][0]["last_observed_identity"], Value::Null)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        client.cancel().await.unwrap();
+        server.await.unwrap().unwrap();
+        e.drain().await.unwrap();
     }
 }
