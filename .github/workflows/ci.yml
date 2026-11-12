@@ -33,6 +33,11 @@ jobs:
           tool: cargo-nextest@0.9.151
       - name: Pure Unix experiment guards (no provisioning)
         run: python -I -m unittest discover -s tools/unix-exec-validation -p test_driver.py
+      - name: Bounded read-only Unix manager observations
+        if: runner.os != 'Windows'
+        run: |
+          python3 -m unittest discover -s tools/ci -p 'test_observe_manager.py'
+          python3 tools/ci/observe_manager.py
       - name: Bounded read-only Ubuntu DNS observations
         if: runner.os == 'Linux'
         run: |

@@ -2,11 +2,21 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
+- Last merged PR: [#34](https://github.com/Dytschgo/arxcovo/pull/34), `3b418cd2254c05b90de460e2d78101b31a76f944`, 05:57:07 UTC, through all five gates.
+- Queue priority: finish #36 and #26 through independent review and every required check. No new feature PRs or gate bypasses. #36's fake SDK cancellation test failed hosted Windows; a Sol high diagnosis is active, with Opus review required before publication.
+- Main push CI after #9 passed on attempt 1: run 43163250474 at6f18686, 05:43:16–05:52:43 UTC,567s. The new main push after #34 is pending, not claimed green.
+- PR26 refresh retains published history and both parents' provider/evidence rows. Only PROGRESS conflicted; the read-only manager observer step and helper tests are inherited unchanged from reviewed #34. Product crates/Cargo/UI/packaging are unchanged.
+- No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work. Historical checkpoints below retain their task-time claims.
+
+## Historical checkpoint before PR9 queue refresh — 2026-11-12
+
 - Milestone1 accepted; Milestone2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#9](https://github.com/Dytschgo/arxcovo/pull/9), `6f18686af7a8498bf887f833f278f43d152867f2`, 05:43:13 UTC, through all five gates.
 - Queue priority: finish #36, #26 and #34 through fresh independent reviews and all required checks. No new feature PRs or bypasses.
 - Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57–05:40:57 UTC,600s. The new main push after #9 is pending, not claimed green.
 - PR26 refresh preserves both parents' provider/evidence rows and published history; only PROGRESS conflicted. Product behavior is unchanged; the inherited #9 policy test correction is already reviewed and merged.
+- PR34 refresh preserves both parents' provider/evidence rows and published history; only PROGRESS conflicted. Product behavior is unchanged; the inherited #9 policy test correction is already reviewed and merged.
 - No owner-PC administration, old Lab Manager/VM work, native experiment retry or third S4U probe. Historical checkpoints below retain their task-time claims.
 
 ## Historical checkpoint before PR9 queue refresh — 2026-11-12
@@ -19,6 +29,7 @@
 - Reviewed local owner provisioning/report-validation followups remain separate, unpublished and unactivated. Installed/native/dedicated M2 remains **unverified on real hardware**. No third S4U probe, owner-PC administration, old Lab Manager or VM work.
 
 ## PR26 refresh after merged CI unblock — 2026-11-12
+## PR34 refresh after merged CI unblock — 2026-11-12
 ## PR9 refresh after merged CI unblock — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium coordinator merged actual main441978d without rewriting published history. No product source change is introduced by the refresh; PR-specific code remains as independently reviewed at its previous head. Main's reviewed helper/concurrency/lint correction is inherited intact. Current state is first, with one queue row; all provider/history table rows from both parents are retained.
@@ -1636,6 +1647,10 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium integrated reviewed Application head `0232a80` and actual squash `3f7c515` into existing #30 without rewriting published history. The squash tree equals that reviewed head; duplicate-history conflicts retained the already combined tree. Owner transactions/tests, owner plan and service config remain byte-identical to independently reviewed `4b2b769`; the parent contributes the sharing correction and regression. Workflows/helpers match merged main. Both provider tables and historical evidence are retained, with Current state first.
 - Actual Windows validation passed: formatting, locked workspace/all-target Clippy with warnings denied, **132/132 normal nextest** (two subprocess-only fixtures exercised through parents), and **26/26 CI-helper tests**. Nextest run `a7b71b17-8b59-43e2-8ac5-ef74ec38095e`, 8.445-second test phase. No native owner session, LSA/SCM, account/rights/admin/service or VM operation. #27 merged through all gates at 18:13:01 UTC. Fresh exact-head independent review and hosted checks remain required; native/installed dedicated-account M2 paths remain **unverified on real hardware**.
 
+## Unix manager diagnostic queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #34 locally on merged provenance main `4f2b0c7`. The read-only diagnostic, its test file, README and historical macOS evidence remain byte-identical to published `738a2c9`; runtime crate/packaging/Cargo/toolchain/scripts match main. Workflow conflict resolution retains the existing Unix diagnostic step and both merged Linux CI-unblock steps, with no original check or timeout removed. Current state is first and provider/evidence history is preserved.
+- All **39 CI-helper tests** completed: **36 passed, 3 Unix child-fixture tests skipped on Windows**. No service-manager query, root/admin/service/account/rights operation, resolver change or VM action ran locally. Native capture remains hosted-only. No push/new PR; fresh exact-head recheck and hosted gates remain required, and ADR0014 references must land with the Unix owner stack before this diagnostic is claimed self-contained. This evidence collection does not enable macOS lifecycle parsing or establish installed/dedicated-account M2 acceptance.
 ## Early feasibility and owner-checklist queue preparation
 
 - Codex / gpt-6.1-sol, medium prepared existing #10 locally on main `4f2b0c7`, retaining its unique proposed WHPX, Windows template, Raft and execution research plus the required pre-M4 owner setup guide. ADR0006 is explicitly historical and points to settled ADR0009 and the separate authorized ADR0010 development mode; the guide no longer suggests a password prompt absent from the current S4U contract. No research proposal is adopted or hardware result claimed by this metadata update.
@@ -1690,6 +1705,27 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol / medium refreshed existing #26 onto actual main `cd464b2` and retained every historical duration row. Added completed first-attempt main push CI evidence from the Actions attempt API: run 43075630346 at `3f7c515` = **571 seconds** (success), run 43077489596 at `4f2b0c7` = **535 seconds** (success), run 43079116241 at `7c150f0` = **532 seconds** (success), run 43082880556 at `f06e9a2` = **578 seconds** (success). The new #35 main run is still pending and is not added as completed.
 - This JSON remains historical evidence, not a budget-policy input. No workflow, timeout, status gate, runtime or DNS behavior changes; no failures or earlier over-budget runs are removed. Independent exact-head review and required checks remain pending.
+## Manager diagnostic review follow-up
+
+- Codex / gpt-6.1-sol, medium fixed PR34 review advisories A1/A4. The privacy fixture now supplies one-tab outer macOS fields, and the system-domain boolean matches the specific `in domain for system` phrase. A new negative regression failed before that predicate correction. The outer-field raw-value leak mutation now fails the privacy assertion.
+- Current local suite: ten portable tests passed, three Unix tests skipped on Windows. The previous head `50a5303` separately passed all twelve tests on hosted macOS and Ubuntu; that native evidence does not claim the new predicate has run. The older `533ec14` artifact remains unchanged. ADR0014 is explicitly linked to its unmerged PR29 contract, not described as present on main. Fresh exact-head review and hosted checks remain required. No production parser, service or owner operation changed.
+
+## First native macOS manager observation
+
+- Codex / gpt-6.1-sol, medium inspected completed [macOS job 130643624743](https://github.com/Dytschgo/arxcovo/actions/runs/43055469150/job/130643624743), source `533ec14`, image `macos-26-arm64` version `20261102.0473.1`. All 11 diagnostic tests passed, including the three real ordinary-child Unix tests. The absent Arxcovo job returned 113 with all expected fixed absence-phrase booleans; the Apple control returned zero with matching target/path/PID shapes. Exact sanitized rows are retained in `docs/evidence/macos-manager-observations.json`.
+- The initial broad state scan reported duplicate fields on the nested Apple job output. The diagnostic now separates one-tab outer job fields from nested dictionaries; positive and negative synthetic controls cover that distinction. Nine portable tests pass locally, three native Unix tests await rerun. The refinement is not claimed as hosted evidence yet and the historical record retains its original duplicate classification. Production launchd parsing still returns Unknown; no service lifecycle or M2 acceptance is claimed.
+
+## Read-only Unix manager evidence preparation
+
+- Codex / gpt-6.1-sol, medium prepared bounded fixed queries for the absent Arxcovo service on Linux/macOS and a read-only Apple system-service control. Numeric exit codes and fixed output-shape classifications will supply evidence for ADR0014's missing native launchd parser; no error code is guessed as absence and no production parser changes.
+- Each child uses a fixed environment, no shell, a six-second polling deadline after creation and combined 16 KiB pipe cap. Only fixed labels/booleans/classifications and numeric exit codes are emitted, at most 2048 bytes. No retries, manager mutations, package-source changes, owner values or gate exemptions. The one added Unix CI step leaves all existing checks/platforms/timeouts unchanged.
+- Eight pure tests passed locally; three ordinary-child Unix tests skipped on Windows and await hosted execution. Three actual-source mutations (shell enabled, JSON cap raised and raw stderr exposed) each failed assertions; original bytes were restored. YAML structural comparison confirms only the single diagnostic step was added. No manager query ran locally. Native observation, independent review and hosted checks remain pending. Installed lifecycle and M2 acceptance remain **unverified on real hardware**.
+
+## Read-only Unix manager diagnostic refresh
+
+- Codex / gpt-6.1-sol / medium refreshed existing #34 locally onto actual main `cd464b2`. The diagnostic helper, refined privacy tests and retained historical evidence are unchanged from the earlier prepared candidate; no production manager parser or owner command is activated. ADR0014 still arrives through pending #29, so publication/re-review waits for that dependency. No manager query or owner action runs on this machine.
+
+- The refreshed helper suite ran 39 tests: **36 passed, 3 Unix child-process tests skipped on Windows**. Diagnostic/tool bytes remain unchanged; no Rust build, native manager capture, or hosted revalidation is claimed for this local refresh. No push while the ADR0014 parent remains pending.
 ## Awaited policy-failure regression refresh
 
 - Codex / gpt-6.1-sol / medium refreshed existing test-only #9 onto actual main `cd464b2`, preserving published history and the awaited policy-failure regression. Only its existing regression test and progress notes distinguish it from main; no workflow/runtime/budget behavior changes. Current state stays first. Focused test evidence and independent re-review remain required before merge.
@@ -1714,6 +1750,11 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## CI history alignment after Unix owner merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #26 and retained all earlier duration rows. Appended completed first-attempt Actions API records: run 43087250975 at `cd464b2` = **596 seconds** (success), run 43088994955 at `aafaa3c` = **461 seconds** (success). In-progress runs are not transcribed as completed. This is historical evidence only; budget logic, workflows and runtime remain main-identical. No application rerun is claimed for the documentation-only refresh.
+## Unix manager observations after lifecycle merge
+
+- Codex / gpt-6.1-sol / medium refreshed existing #34 on actual main `aafaa3c`. ADR0014 now exists on its base; historical observations remain unchanged and are not represented as fresh native captures. The workflow retains both the main macOS directory observation and the separate read-only manager diagnostic. No production parser, owner command or activation changes. Fresh independent exact-head review and required hosted checks remain pending.
+
+- Refreshed #34 helper suite: **36 passed, 3 Unix-only child tests skipped on Windows**. A mutation leaking an unknown outer field value failed the privacy test, then the helper was restored byte-for-byte. Historical manager JSON still equals published `738a2c9`. Updated README to link ADR0014 now on main and distinguish historical hosted refinement evidence from current pending integration checks. No manager query or native acceptance ran.
 ## Policy regression refresh after Unix owner merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #9, retaining only the awaited-publication regression above main. Policy/test script bytes remain identical to verified `234b934`, so its 18-test pass and await-removal mutation evidence apply without a repeat claim. Main runtime and workflows are preserved; fresh independent exact-head review and hosted gates remain required.
@@ -1737,6 +1778,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - OpenAI / gpt-6.1-sol / high implemented only the reviewed local E1 scope on base `ce30060`, final `ff5a198`. Added guard/session wrappers, proof-gated uninstall and shared private pinning; removed raw parts and public concrete adapters. Reported formatting, locked workspace/all-target Clippy, 20 focused U/N/S tests, 190 normal nextest (two parent-driven direct fixtures) and four pin-call/checker mutations caught. Coordinator has not independently reproduced those checks. E2, publication and activation remain absent; fresh independent Opus review is required before publication/merge.
 
 - Main #14 first-attempt push run 43091130349 completed successfully in **549 seconds**, verified against the Actions attempt API. Appended this as row 30 while preserving the prior 29 rows. The separately failed disposable Linux experiment is not a main-CI timing row. PR36 full review found three latent execution/audit blockers; Sol high is fixing them locally before any re-review or merge. No gate bypass or privileged probe retry.
+## Unix manager diagnostic alignment with Unix library main
+
+- Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` with published history preserved. The workflow conflict retains both main pure Unix guards and the bounded read-only manager observation step. Diagnostic source, tests and historical evidence remain unchanged from c0a6200; no production parser or owner operation is enabled. Current state is first, with one queue priority; independent exact-head review and hosted gates remain required. No native activation, privileged experiment retry or new feature PR.
 ## Policy regression alignment with Unix library main
 
 - Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` with published history preserved. The six Node policy/budget/auto-merge source and test files remain byte-identical to verified 234b934; prior 18-test and await-removal mutation evidence applies without another run. Current state is first, with one queue priority; independent exact-head review and hosted gates remain required. No native activation, privileged experiment retry or new feature PR.
@@ -1747,6 +1791,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## CI evidence after feasibility merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. All 30 timing rows and the separate failed Linux experiment record remain byte-identical to independently reviewed 31dc149. No evidence value, runtime, workflow, timeout or budget-policy change is introduced; earlier API and privacy verification applies. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
+## Manager evidence after feasibility merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. Manager diagnostic source, tests, five-line CI step and historical JSON remain byte-identical to independently reviewed 2439acf. Existing Unix guard and macOS observation steps remain; no production manager parser or command is activated. Earlier pure/mutation and hosted evidence applies without another local run. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
 ## Policy regression after feasibility merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. Node policy/budget/auto-merge source and tests remain byte-identical to independently reviewed 23d839e. This parent adds research/setup documentation only; the prior 18-test and await-removal mutation evidence applies without a repeated run. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
