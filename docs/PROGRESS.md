@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-12
 
+- Queue priority: correct proposed ADR 0020 Stage E after the independent Sol high design review, then obtain a fresh cross-provider recheck. No Stage E implementation or privileged acceptance is authorized by this proposal.
+- Stage E proposal `e3928f5` (Anthropic / Opus 5.5 / high) is retained as `54032bf`; independent review `8ff4196` (OpenAI / gpt-6.1-sol / high) is retained as `8ff3a54`. Outcome: changes required, five blockers covering sudo executable trust, directory-list offsets, orphan/admission claims, cleanup postconditions and test precedence. [Review](reviews/0020-sol-independent-design-review.md).
+- Stage D PR55 head `fdea1c6` passed exact-head Opus review; hosted Ubuntu and macOS passed. The existing 906-second main baseline keeps ci-time-budget red. Stage C PR53 remains an unmerged dependency. No merge gate is waived; CI performance and diagnostic investigations remain parked while product design continues.
+- Last merged PR52, main `1604db1`. M1 accepted; M2 incomplete. Production native execution remains inactive. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry. No owner/admin/service/VM operation is authorized.
+
+## Historical checkpoint before Stage E design review
+
 - Stage D local product review is complete: full review85da90f plus test rechecks7569728 and056327a close T1/T3/T8/T10 and distinct request-limit R1. Coordinator Sol medium retains the final report and queues a one-concern bridge PR on explicit unmerged Stage C PR53; production remains inactive and all merge gates remain. Next product work is separate Stage E architecture for cgroup setup/cleanup and discovery ordering, design only with no native/owner/experiment execution. CI investigations remain parked.
 
 - Stage D R1: distinguish request7s/333bytes from probe60s/4096. Hard-coded-limit mutant is caught (ac960a28), fmt and focused15 pass (a052ca8f). Production remains unchanged; the narrow independent two-line recheck is next. Product work continues locally; CI investigations stay parked.
