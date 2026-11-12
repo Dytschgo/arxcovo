@@ -19,3 +19,8 @@ npm start -w desktop
 ```
 
 The binaries print their scaffold identity and exit. Electron loads built UI in a sandboxed renderer. No host administration or VM operations exist yet. See [progress](docs/PROGRESS.md) and [CI setup](docs/ci-administration.md). Hardware paths are **unverified on real hardware**.
+
+Owner service commands and `client-config new` are wired in source (ADR 0018).
+The latter creates private credentials and prints only a principal/hash line.
+Independent review and hosted gates remain required; installation and dedicated
+execution are **unverified on real hardware**. See the [owner guide](docs/service-install.md).

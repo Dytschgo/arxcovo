@@ -1,31 +1,29 @@
 # Installing and verifying the arxd service (owner guide)
 
-Current owner-library checkpoint (2026-11-12): ADR0016 E1 is implemented
-locally: binary-only private `OwnerGuard`, `open(guard)`, private-chain pins
-before privilege, session wrappers, and proof-gated uninstall. Raw `parts()`
-and concrete store/right access are removed. Prior independent E1 reviews
-passed; this main0937cac port awaits coordinator review and hosted gates.
-Older API/status statements below describe their historical slices. Owner CLI
-and runtime activation remain absent. Installed paths are **unverified on real
-hardware**; M2 is incomplete. See [ADR0016](adr/0016-windows-install-provisioning-and-owner-entry-points.md).
+Current S3 checkpoint (2026-11-12): owner service install, configure, start,
+stop, status and uninstall, and unelevated `client-config new`, are wired in
+source under ADR 0018. Independent Opus review and all five hosted gates are
+still required before publication. Native, installed and dedicated paths are
+**unverified on real hardware**; M2 is incomplete. Agents never execute these
+owner steps. The historical status below records earlier slices.
 
-Status: this is the **contract** for the owner-only install flow in ADR 0009.
-Only the exact `arxd service run` entry and lifecycle plumbing are implemented
-in the slices 1–2 candidate. Outside Windows SCM it exits 10; Unix exits 7
-because the real fixed-layout application integration is unavailable. It cannot
-report ready or serve inventory yet. Owner commands and `arxd client-config …`
-are not implemented. Do not run anything here until a merged release contains
-the complete installation and application integration.
-The config/owner-plan foundation adds library-only validated types and recording
-fake tests. It does not implement owner commands or an installer. See
-[foundation API and limits](service-foundation.md) before wiring native adapters.
+Configure fully revalidates the existing config before replacement. A missing
+old workspace refuses with `service-workspace` (exit 3), even if the new
+workspace is valid. Restore the old workspace, or uninstall, delete the config
+by hand, install and configure. Changing the pinned build account also requires
+uninstall, manual config deletion, install and configure (ADR 0009/0018).
+
+On `client-config-partial`, no registration hash was supplied. The private file
+and any newly created private parent remain; the file may contain credentials.
+Delete that private file by hand and rerun. No automatic rollback or deletion
+occurs. A success prints only `principal=sha256`, never the token.
 
 Every step is **unverified on real hardware** until someone performs it and
 records the result in docs/PROGRESS.md. Agents never perform these steps. Leave
 the old Lab Manager installation, its state and the `agent-windows-test` VM
 untouched.
 
-Current status (2026-11-11):
+Historical status (2026-11-11):
 
 - Main (`d7f3ebd`, #19) has inventory, host identity, the local IPC/stdio
   bridge and activity v2. The lifecycle plumbing in the PR20 candidate
@@ -97,7 +95,7 @@ token into chat, an issue, a command line or a log.
    `C:\Program Files\Arxcovo\arxd.exe` so it inherits the destination ACL;
    moving can retain the source descriptor. The install library checks the
    pinned binary directory before restore or creation and refuses unsafe ACLs.
-   Owner CLI wiring remains pending. The future elevated invocation is:
+   Owner CLI wiring is present in source, unverified on real hardware. The owner invocation is:
 
    ```powershell
    & "C:\Program Files\Arxcovo\arxd.exe" service install

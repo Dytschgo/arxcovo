@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No acceptance or activation claimed.
+- Last merged PR remains #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`; all five gates and independent review are inherited coordinator evidence. Main after #49 remains pending, not claimed green.
+- OpenAI / gpt-6.1-sol / high S3 local implementation candidate source `edcadff70d20c6a5f6847679b9dea3b468ef1802`, prepared base `46f3a9f`. Parser, dispatch, production compositions and fake tests are implemented. FIRST guard fixture commit `5c57208` is preserved. [Evidence](evidence/owner-cli-s3.md).
+- Queue: resolve existing missing-old-build AccountMissing versus Identity discrepancy and residual test/mutation coverage; fresh Anthropic / Opus 5.5 / high security/source review BEFORE publication; then all five hosted gates. No subagents or public GitHub operations were used by the implementation sub-agent.
+- Local fmt/locked workspace all-target Clippy pass; focused12 pass and 13 compiled mutation assertion kills restored. Exactly ONE final normal default-concurrency full workspace nextest: 295 passed, 2 skipped, run `e2e5f587-88a4-4103-a8b6-74e41f98a857`, 10.243s. No Unix compile/execution or S3 hosted pass claimed. S1/S2 review limits remain inherited.
+- Windows start uses a deferred SCM start closure to keep construction after preflight and image-guard drop; this private seam refinement needs review. Native wiring selection outside the safe seams remains source-only.
+- ExecutionFailed remains unexplained; no local pass is a fix or waiver. No owner/admin/service operation, old Lab Manager/VM change, ignored fixture, third S4U probe or babysitter change.
+
+## Historical checkpoint before S3 implementation
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No installed-service or dedicated-account acceptance is claimed.
 - Last merged PR: #49 at `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC, all five gates on `d330a96` plus independent Opus published-head review. Its squash tree equals the reviewed head. Main CI after #49 is pending and not claimed green.
 - S2 hosted Unix condition is met: run `43219803330` succeeded on all three platforms. Linux nextest 226 passed / 3 skipped; macOS 227 passed / 1 skipped. These are hosted job-log observations, not local Unix runs. Residual native Mode and intermediate-pin test limitations remain disclosed; no Mode mutation kill is claimed.
