@@ -192,10 +192,16 @@ impl super::Acceptor for Listener {
     }
 }
 
-pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
-    if config.address == r"\\.\pipe\arxcovo-arxd" && config.expected_server_identity != "S-1-5-18" {
+fn validate_client_endpoint(address: &str, expected_identity: &str) -> Result<()> {
+    validate_address(address)?;
+    if address.eq_ignore_ascii_case(r"\\.\pipe\arxcovo-arxd") && expected_identity != "S-1-5-18" {
         bail!("service identity required");
     }
+    Ok(())
+}
+
+pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
+    validate_client_endpoint(&config.address, &config.expected_server_identity)?;
     unsafe {
         let wide: Vec<u16> = config.address.encode_utf16().chain(Some(0)).collect();
         // Specific rights match the DACL, and anonymous SQOS prevents impersonation.
@@ -240,5 +246,44 @@ pub async fn connect(config: &ClientConfig) -> Result<NamedPipeClient> {
             bail!("endpoint identity mismatch");
         }
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_client_endpoint_policy_refuses_nonlocal_or_invalid_addresses() {
+        for address in [
+            "",
+            r"\\remote\pipe\arxcovo-arxd",
+            r"\\.\PIPE\arxcovo-arxd",
+            r"\\.\pipe\other-service",
+            r"\\.\pipe\arxcovo-",
+            r"\\.\pipe\arxcovo-arxd\extra",
+        ] {
+            assert!(validate_client_endpoint(address, "S-1-5-18").is_err());
+        }
+    }
+
+    #[test]
+    fn service_pipe_casing_requires_system_without_pipe_io() {
+        for address in [
+            r"\\.\pipe\arxcovo-arxd",
+            r"\\.\pipe\arxcovo-ARXD",
+            r"\\.\pipe\arxcovo-ArXd",
+        ] {
+            validate_address(address).unwrap();
+            assert!(validate_client_endpoint(address, "S-1-5-21-100-200-300-1001").is_err());
+            assert!(validate_client_endpoint(address, "S-1-5-18").is_ok());
+        }
+        for address in [
+            r"\\.\pipe\arxcovo-arxd-extra",
+            r"\\.\pipe\arxcovo-development",
+        ] {
+            validate_address(address).unwrap();
+            assert!(validate_client_endpoint(address, "S-1-5-21-100-200-300-1001").is_ok());
+        }
     }
 }

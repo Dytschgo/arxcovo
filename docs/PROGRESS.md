@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native/installed/dedicated paths remain **unverified on real hardware**; no owner CLI or native execution is activated.
+- Last merged PR: #39, `79b7879e7330e2f8de408723f15ddfac399dd75f`, 08:19:48 UTC, through all five gates and independent Opus review.
+- Queue priority: publish one-concern owner E1/E2 and shutdown/report-validation library slices after independent integration review, then complete their hosted gates. Independent Sol review of proposed ADR0018/0019 is active. No implementation before accepted contracts or gate bypass.
+- Main push run43168305535 at0937cac succeeded on attempt1 in580s (06:27:48–06:37:28 UTC). New main39 CI43182044209 is pending, not claimed green.
+- This E1 port retains reviewed source and both parents' evidence/provider rows. Only PROGRESS conflicted. The latest client endpoint correction is inherited intact; no unrelated local candidate is activated. Prior focused/full tests are attributed to their exact source boundaries; fresh review and hosted checks remain mandatory.
+- N3 1976afb and N2 95f06d3 are ready locally (27/32 focused and231 full tests passed); owner E1 c4c010a/E2 c73e5c7 passed41/59 focused and247 full tests before this main refresh. Publication waits for Opus integration review.
+- No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager/VM operation or babysitter schedule change. Review/delegate completions provide pending wakes.
+
+## Historical checkpoint before current-main M2 port — 2026-11-12
+
 - Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), actual main `0937cacfcdb5be036edcd1a126ba0f65521599df`, merged 06:27:45 UTC. Main CI run43168305535 succeeded attempt 1, 06:27:48–06:37:28 UTC, 580s. This is inherited coordinator evidence, not a run executed by this builder.
 - M1 accepted; M2 incomplete. E1 owner library port is local only; hosted gates and fresh coordinator Opus high review pending. E2 is the next separate stack layer. No GitHub writes or runtime activation.
 - Retained E1 source `4a5919e` and full/follow-up independent PASS reports are historical review evidence, not approval of this port. Production owner/SCM/LSA paths remain **unverified on real hardware**.
@@ -11,6 +21,32 @@
 | E1 port onto actual main0937cac | OpenAI / gpt-6.1-sol | high | Four owner/SCM files copied byte-equivalent to reviewed4a5919e; 41 focused owner/SCM tests passed; fmt and locked workspace/all-target Clippy passed; retained reviews and contract status reconciled. |
 
 ## Historical checkpoint before owner-library port — 2026-11-12
+- Milestone 1 accepted; Milestone 2 remains incomplete. Installed/native/dedicated M2 is **unverified on real hardware**; no native executor or owner CLI is activated.
+- Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), `0937cacfcdb5be036edcd1a126ba0f65521599df`, 06:27:45 UTC, after all five required gates passed on `1f6a42f` and independent review succeeded.
+- Queue priority: publish the reviewed Windows client endpoint correction, then the owner E1/E2, shutdown/report-validation and service followups as one-concern PRs. Independent Sol review of proposed ADR0018/0019 designs is assigned next. Every merge needs exact-head independent review and green checks; M2 is not accepted.
+- Main push CI after #26 passed on attempt 1: run43166128223 atffe502f, 06:09:14–06:18:58 UTC,584s. Main after #36 passed on attempt1: run43168305535 at0937cac, 06:27:48–06:37:28 UTC,580s (9m40s). Earlier main runs after #38/#9/#34 passed in600/567/562s respectively.
+- Hosted Ubuntu package installation and browser/Electron smoke now pass with the retained mirror-list configuration. The original network cause and fallback under a Kernel outage remain unproven. Old stuck queue records were not successfully cancelled; no account-level cause is established.
+- PR36 fixture correction passed hosted Windows on its published head. Its controlled counterexample explains a possible invalid test assumption; the original failure's scheduling history remains unknown. No claim that unrelated ExecutionFailed intermittency is fixed.
+- No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager or VM work. Proposed ADR0018/0019 and full M2 acceptance remain open. Babysitter unchanged.
+
+## Windows client endpoint correction publication — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium coordinator ports the already implemented and independently reviewed file from `bd22e05` onto actual main0937cac; no new implementation choice. Windows connect validates the strict local endpoint before any pipe I/O and requires SYSTEM for the fixed service name under all suffix casing. Development names keep their configured server pin. Two pure tests cover malformed/remote addresses, casing, SYSTEM pins and legitimate development names.
+- Retained independent Opus high reviews: [case guard](reviews/service-pipe-case-independent-review.md) and [direct endpoint validation](reviews/service-client-endpoint-followup-review.md). Their safety deviation/limits are historical and are not repeated. No mutation may run the fixed production-pipe parent test. Product source is byte-identical to reviewedbd22e05; fresh published-head review and hosted checks remain required.
+- Coordinator validation on the integrated client candidate: `cargo fmt --all -- --check`, locked workspace/all-target Clippy with warnings denied, and normal workspace nextest **223/223**, two parent-exercised fixture skips, passed; run `9eaa11d0-3acd-446e-8e74-13985f31c231`,10.423s test phase. No source mutation or fixed production pipe operation was run during this port.
+- Main push run43168305535 is independently confirmed green in580s. Babysitter08:03 resume steering applied: no idle handback while M2 work is listed; bounded owner integration and design-review delegates will provide pending wakes. No owner admin/native experiment/third S4U operation.
+
+### M2 active delivery assignments — coordinator record revision 1
+
+| Work | Provider / effort | State and next wake |
+| --- | --- | --- |
+| Windows client endpoint port | Sol medium coordinator; Opus high review | Published-head review/CI next; equivalent prior code review retained |
+| Windows owner E1/E2 stack | Sol high builder | Isolated integration task next; coordinator publishes one-concern E1 then E2 after review |
+| ADR0018 owner CLI and ADR0019 Unix bridge | Sol high independent reviewer | Queued for the reviewer slot after client review; no implementation before acceptance |
+| Shutdown/report validation and small service followups | Sol high integration / Opus high review | Retained local reviewed candidates; prepare after owner integration begins, no native activation |
+
+
+## Historical checkpoint before PR36 merged — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#26](https://github.com/Dytschgo/arxcovo/pull/26), `ffe502fa7c43594bef1f2c8cf60b6f69ef43481b`, 06:09:12 UTC, through all five gates.
@@ -18,6 +54,7 @@
 - Main push CI after #34 passed on attempt 1: run43164763220 at3b418cd, 05:57:09–06:06:31 UTC,562s. New main after #26 is pending, not claimed green.
 - PR36's test-only cancellation-fixture correction passed independent Opus high review at6ccfce9: focused2/2, five stress iterations, cancellation guard/early-timer mutations caught, full221/221 passed with two parent-only skips. The actual hosted failure's cause remains unproven. Source is retained unchanged; merged main adds only reviewed docs/history.
 - Native execution and owner CLI remain unactivated. No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work.
+
 
 ## PR36 reviewed fixture publication — 2026-11-12
 
