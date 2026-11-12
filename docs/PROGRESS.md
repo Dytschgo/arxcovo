@@ -4,11 +4,18 @@
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native/installed/dedicated paths remain **unverified on real hardware**; no owner CLI or native execution is activated.
 - Last merged PR: #39, `79b7879e7330e2f8de408723f15ddfac399dd75f`, 08:19:48 UTC, through all five gates and independent Opus review.
-- Queue priority: publish one-concern owner E1/E2 and shutdown/report-validation library slices after independent integration review, then complete their hosted gates. Independent Sol review of proposed ADR0018/0019 is active. No implementation before accepted contracts or gate bypass.
-- Main push run43168305535 at0937cac succeeded on attempt1 in580s (06:27:48–06:37:28 UTC). New main39 CI43182044209 is pending, not claimed green.
+- Queue priority: publish one-concern owner E1/E2 and shutdown/report-validation library slices after independent integration review, then complete their hosted gates. Sol review passes ADR0019 for inactive design; ADR0018 corrections are active with Opus. No implementation before accepted contracts or gate bypass.
+- Main push run43168305535 at0937cac succeeded on attempt1 in580s (06:27:48–06:37:28 UTC). Main39 CI43182044209 passed on attempt1 in559s (08:19:51–08:29:10 UTC).
 - This E1 port retains reviewed source and both parents' evidence/provider rows. Only PROGRESS conflicted. The latest client endpoint correction is inherited intact; no unrelated local candidate is activated. Prior focused/full tests are attributed to their exact source boundaries; fresh review and hosted checks remain mandatory.
-- N3 1976afb and N2 95f06d3 are ready locally (27/32 focused and231 full tests passed); owner E1 c4c010a/E2 c73e5c7 passed41/59 focused and247 full tests before this main refresh. Publication waits for Opus integration review.
+- N3 1976afb and N2 95f06d3 are ready locally (27/32 focused and231 full tests passed); owner E1 c4c010a/E2 c73e5c7 passed41/59 focused and247 full tests before this main refresh. E1 integration review now passes; publish E1 for hosted gates. E2 publication is held after its refreshed full test run failed ExecutionFailed; bounded diagnosis is active.
 - No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager/VM operation or babysitter schedule change. Review/delegate completions provide pending wakes.
+
+## E1 owner authority narrowing publication — 2026-11-12
+
+- Opus high integration review `1128a1e` passes E1 Standards/Spec atb79786c againstmain79b7879; [retained report](reviews/0016-e1-e2-current-main-integration-review.md). Source matches independently reviewed4a5919e. The report separately holds E2 because its refreshed full run is red; this E1 PR does not include E2 provisioning.
+- E1's current-main focused owner/SCM tests passed41/41 (run23277874-8835-4ddd-961f-34a4fd36e376); builder fmt/Clippy and earlier byte-equivalent source reviews are attributed to their original boundaries. Hosted CI will provide the first full-suite signal for this E1 head. No full-suite pass is invented and no waived check is requested.
+- OwnerGuard acquisition/narrow wrappers, proof-first uninstall_flow and private store/right adapters remain library-only, without CLI/MCP/Plan activation. Privilege/pin/lock ordering is unchanged. No production constructor, owner/admin or SCM/LSA operation was run. Native/installed/dedicated M2 stays **unverified on real hardware**.
+- Independent design correction and ExecutionFailed diagnosis are active pending wakes. Root runs no competing process tests during diagnosis. All required hosted checks and exact-head review remain necessary before merge.
 
 ## Historical checkpoint before current-main M2 port — 2026-11-12
 

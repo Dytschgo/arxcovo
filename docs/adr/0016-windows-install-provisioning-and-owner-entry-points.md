@@ -4,8 +4,8 @@ Status: accepted contract within the settled independent review dispositions;
 E1 library implemented locally and independently reviewed (full report
 [42c923d](../reviews/0016-e1-independent-review.md), follow-up
 [fa6f297](../reviews/0016-e1-followup-recheck.md)); hosted gates pending.
-This port onto main `0937cac` requires coordinator Opus high review before
-publication. E2 provisioning and CLI wiring are not part of this E1 boundary.
+This port was prepared on main `0937cac` and refreshed onto `79b7879`.
+Opus high integration review at `b79786c` passed; published-head hosted gates remain pending. E2 provisioning and CLI wiring are not part of this E1 boundary.
 The original contract base was `54c43fbcc9b9a6050f067a3e437e58a018b96b00`;
 [Sol contract review](../reviews/0016-windows-install-contract-review.md)
 and [correction review](../reviews/0016-provisioning-correction-review.md)
