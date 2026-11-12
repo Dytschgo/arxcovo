@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native execution backend is activated and no owner operation has been performed by agents.
+- Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC. All five gates passed on f627075 plus independent Opus integration review; squash tree equals reviewed head. Main CI after #51 is pending, not claimed green.
+- Main after #50 passed run `43231164086` in 577s (13:50:32 to 14:00:09 UTC). S3 is merged through all hosted gates; native guard/session/SCM behavior retains source-only evidence limits. ExecutionFailed remains unexplained, with no fix, rate claim or waiver.
+- Queue priority: ADR 0019 Stage B runner phases and compatibility-preserving core, independent Opus security review, then hosted gates. Stages C/D follow as separate concerns. E cgroup setup/cleanup, F E_PROTECTION diagnosis/disposable experiment and G activation remain separate gated work; no experiment retry is authorized.
+- Stage B re-pins on actual main after #51. Runner exec sources remain unchanged since the reviewed 1d828ca contract source. Surrounding main now includes owner CLI routing; config includes ConfigureRequest and executor has the shared Windows path predicate. Stage B must preserve those accepted changes, Report/Creation semantics, Execution::native composition and production MechanismUnavailable behavior.
+- Provider assignment: OpenAI / gpt-6.1-sol / high implements Stage B in an isolated worktree; Anthropic / Opus 5.5 / high independently reviews. Scope is run_phased/NotStarted, explicit RunFailure/run_core preserving legacy errors, exact-prefix phased argv bounds, shared Cancellation/external shutdown, retained early plus final pre-spawn check, fixed panic payloads and R/L/P-SCAN tests. No shim, bridge constructor, owner CLI or cgroup hierarchy wiring is added.
+- All tests remain pure or ordinary non-root refusal paths; privileged Unix sites are not exercised. Root Unix entry-point mutation tests skip before invoking the runner. No service account, owner/admin/SCM/LSA, fixed system path/pipe, Lab Manager/VM, third S4U probe or babysitter change.
+
+## Historical checkpoint before inactive contract merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Owner CLI source is wired, but agents have performed no real owner or installed-service acceptance steps.
 - Last merged PR: #50, `4f01fca70794d60aa3c4752c9a44b083635e13c9`, 13:50:29 UTC. All five gates passed on `134c851` plus independent Opus review; squash tree equals the reviewed head. Main CI after #50 is pending, not claimed green.
 - S3 hosted Unix condition is met: run `43229689940` passed all platforms. Ubuntu nextest 235 passed / 3 skipped; macOS 236 passed / 1 skipped. These are job-log observations, not local Unix runs. Native guard release, SCM/session callbacks and production adapter selection retain their source-only review limits. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver.
