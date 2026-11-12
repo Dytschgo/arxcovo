@@ -4,7 +4,7 @@
 
 - Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
-- Queue priority: Opus high takes the Ubuntu CI package-fetch fix under the three-failure handoff; review and land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
+- Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Next: independent Sol review, ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
 - User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. All five fresh Ubuntu jobs have failed; all macOS jobs passed. Fresh main, PR9 and PR34 Windows passed; PR36 and PR26 Windows were still running at this snapshot. The original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
 - Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; Opus high recheck at `f646589` passes with no blockers. Hosted verification of the patch remains pending. No measured speedup is claimed.
 - E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
@@ -18,6 +18,23 @@
 - Failure evidence 3: after the signed-mirror mitigation, fresh main [43152187271](https://github.com/Dytschgo/arxcovo/actions/runs/43152187271), source `b5e6556`, Ubuntu job `130963746682`, failed with Kernel mirror IPv6 network-unreachable101 and APT100 after ubuntu-mirror-updated:1. All four sibling fresh dispatches also failed Ubuntu: 43152254254, 43152257543, 43152261583, 43152265161; their detailed causes need individual verification.
 - These are three hosted failure milestones of the unresolved package-fetch problem, not a claim that three distinct corrective patches were deployed. The #32 diagnostic head predates the mirror helper. The intervening signed-mirror run 43062892241 at `400903d` genuinely passed Ubuntu in130s; it proved that path, not a DNS root-cause fix.
 - Handoff scope: smallest tested CI correction; retain Ubuntu, every check, signature validation and the12-minute job timeout. No blind retry loop or continuing DNS investigation. The reviewed local concurrency correction at47b4f47 may accompany the fix. Coordinator publishes only after Sol reviews Opus changes, then obtains hosted gates and exact-head review before merging. Re-dispatch/drain existing36/9/26/34 afterward. No native experiment, third S4U probe or owner-PC administration.
+- Anthropic / claude-opus-5-5 / high handoff implementer (single agent, no subagents) verified the prepared head `1361864` on base `b5e6556`. It read the detailed logs of all five fresh Ubuntu jobs, PR32 job 130635247058 and the green job 130669921798.
+  - In every fresh job, all six DNS controls resolved and there were zero requests to Ubuntu hosts.
+  - In every fresh job, the Kernel mirror connection failed on both IPv6 (unreachable, error 101) and IPv4 (connect timed out).
+  - Main, PR9: the indexes were fetched, then all nine `.deb` downloads failed.
+  - PR36, PR26, PR34: InRelease failed, leaving "no installation candidate".
+  - So the helper had turned a transient Ubuntu-name failure into a dependency on a single Kernel host. An IPv4-only change was rejected because IPv4 also timed out.
+- Correction `821d496` keeps the mirror+file source URI unchanged. Instead, the validated `apt-mirrors.txt` gains the Kernel mirror as `priority:1`, and the original Ubuntu entries are kept with their priorities shifted by one.
+  - The official apt-transport-mirror manual says the lowest priority is tried first, and that a mirror which is inaccessible falls through to the next entry.
+  - PR32 showed this fallback on the image, at about 20 s per file and entry on name failure. That is why the Kernel mirror comes first and Ubuntu is the fallback, rather than the reverse.
+  - Workflow, matrix, timeouts, pinned actions, permissions, the concurrency grouping, signature/trust validation and every check are unchanged.
+- Local evidence:
+  - Before the fix, the new regression tests failed: four failures and two errors out of 23.
+  - After the fix, `python -B -m unittest discover -s tools/ci -p test_ubuntu_mirror.py` passed 23/23 (Windows Python 3.12.10), the `test_observe_dns.py` suite passed, and `node --test scripts/*.test.mjs` passed 19/19.
+  - A scratch harness made nine source mutations on copies, and all nine were killed: Kernel entry last, priority tie, Kernel-only redirect, skipped indirect trust check, output bound removed, list not published, fresh recheck skipped, foreign entry accepted, comments dropped.
+  - Sanitized facts are in `docs/evidence/ubuntu-kernel-mirror-failures.json`.
+- Not run: real APT, root publication, sudo and any hosted run. Fallback timing, cross-mirror sync and a green Ubuntu job are **pending hosted confirmation**. The root cause of both network failures is unknown.
+- This counts as one corrective patch toward the three-failure rule. If the coordinator's single hosted validation fails, record it with logs instead of retrying blindly. Sol must independently review before publication; the implementer does not self-approve.
 
 ## Historical checkpoint from main before the Actions reset — 2026-11-11
 
@@ -213,6 +230,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
 | Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
+| Ubuntu package-fetch handoff implementation | Anthropic / claude-opus-5-5 | high | Local candidate `821d496`: Kernel mirror preferred, Ubuntu mirror-list entries retained as APT fallbacks; 23/23 helper tests, 9/9 mutations killed; Sol review and hosted confirmation pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 

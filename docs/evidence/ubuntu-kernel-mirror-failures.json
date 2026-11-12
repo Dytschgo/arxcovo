@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "kind": "disposable_runner_kernel_mirror_connect_failures",
+  "observedOn": "2026-11-12",
+  "runnerImage": "ubuntu-26.04 20261101.186.1",
+  "helperOutput": "ubuntu-mirror-updated:1",
+  "jobs": [
+    {"runId": 43152187271, "jobId": 130963746682, "sourceCommit": "b5e6556", "target": "main", "failedStage": "deb_download", "indexFetch": "success"},
+    {"runId": 43152254254, "jobId": 130963967208, "sourceCommit": "5c3c01e", "target": "PR36", "failedStage": "inrelease", "indexFetch": "failure"},
+    {"runId": 43152257543, "jobId": 130963976166, "sourceCommit": "05ce734", "target": "PR9", "failedStage": "deb_download", "indexFetch": "success"},
+    {"runId": 43152261583, "jobId": 130963989605, "sourceCommit": "81594be", "target": "PR26", "failedStage": "inrelease", "indexFetch": "failure"},
+    {"runId": 43152265161, "jobId": 130964000879, "sourceCommit": "f71e774", "target": "PR34", "failedStage": "inrelease", "indexFetch": "failure"}
+  ],
+  "everyJob": {
+    "allSixDnsControlsResolved": true,
+    "kernelMirrorIpv6": "network_unreachable_101",
+    "kernelMirrorIpv4": "connect_timed_out",
+    "ubuntuHostRequests": 0,
+    "aptExit": 100
+  },
+  "comparison": {
+    "pr32Job": 130635247058,
+    "pr32Mode": "ubuntu_names_temporary_resolution_failure",
+    "pr32MirrorMethodFellBackAcrossAllUbuntuEntries": true,
+    "pr32SecondsPerFailedEntryApprox": 20,
+    "freshKernelConnectFailureSecondsApprox": 16,
+    "freshKernelFailuresBatchedPerHost": true
+  },
+  "rootCauseEstablished": false,
+  "fallbackCorrectionHostedConfirmation": "pending",
+  "ownerMachineAptChanges": false
+}
