@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-12
 
+- Stage D local product review is complete: full review85da90f plus test rechecks7569728 and056327a close T1/T3/T8/T10 and distinct request-limit R1. Coordinator Sol medium retains the final report and queues a one-concern bridge PR on explicit unmerged Stage C PR53; production remains inactive and all merge gates remain. Next product work is separate Stage E architecture for cgroup setup/cleanup and discovery ordering, design only with no native/owner/experiment execution. CI investigations remain parked.
+
 - Stage D R1: distinguish request7s/333bytes from probe60s/4096. Hard-coded-limit mutant is caught (ac960a28), fmt and focused15 pass (a052ca8f). Production remains unchanged; the narrow independent two-line recheck is next. Product work continues locally; CI investigations stay parked.
 
 - Stage D production passed Opus contract review; test corrections close swallowed fake assertions, skipped derivation cases and missing numeric marker check. Coordinator Sol medium keeps production unchanged, builds an independent expected spec and records four compiled assertion kills. Final fmt/locked workspace Clippy/focused24 passed (4dffa45b). [Evidence](evidence/unix-bridge-stage-d-review-followup.md). Fresh test-delta recheck is next; CI investigations remain parked and Stage C remains an unmerged dependency.
