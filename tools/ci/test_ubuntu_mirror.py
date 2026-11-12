@@ -16,6 +16,26 @@ INDIRECT_SOURCE = (b"Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
                    b"Suites: resolute resolute-updates resolute-backports resolute-security\n"
                    b"Components: main restricted universe multiverse\n"
                    b"Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+FALLBACK_MIRRORS = (b"https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n"
+                    b"http://azure.archive.ubuntu.com/ubuntu/\tpriority:2\n"
+                    b"https://archive.ubuntu.com/ubuntu/\tpriority:3\n"
+                    b"https://security.ubuntu.com/ubuntu/\tpriority:4\n")
+
+
+def apt_mirror_order(data):
+    # Documented apt-transport-mirror order only: lowest priority first and
+    # untagged entries last. Equal priorities are random in APT, so a tie is
+    # rejected instead of being resolved by file order.
+    entries = []
+    for line in data.decode().splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            tokens = line.split()
+            tag = [int(t.split(":", 1)[1]) for t in tokens[1:] if t.startswith("priority:")]
+            entries.append((tag[0] if tag else float("inf"), tokens[0]))
+    priorities = [priority for priority, _ in entries]
+    if len(set(priorities)) != len(priorities):
+        raise AssertionError("APT would choose randomly between equal priorities")
+    return [uri for _, uri in sorted(entries)]
 
 
 def fixture_reader(path):
@@ -64,15 +84,65 @@ class UbuntuMirrorTests(unittest.TestCase):
 
             with patch.object(mirror.os, "fchmod", create=True) as mode:
                 self.assertEqual(mirror._apply(root, read, fixture_directory), 2)
-            self.assertEqual(source.read_bytes(), INDIRECT_SOURCE.replace(mirror.MIRROR_LIST.encode(),
-                                                                          mirror.MIRROR.encode()))
-            self.assertEqual((root / "apt-mirrors.txt").read_bytes(), MIRRORS)
+            # The indirect source keeps its mirror-list URI; only the list gains
+            # the preferred Kernel entry while every Ubuntu entry stays a fallback.
+            self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+            self.assertEqual((root / "apt-mirrors.txt").read_bytes(), FALLBACK_MIRRORS)
+            self.assertEqual(legacy.read_bytes(),
+                             b"deb https://mirrors.edge.kernel.org/ubuntu resolute-security main\n")
             self.assertEqual(unrelated.read_bytes(), b"deb https://packages.microsoft.com/repos/code stable main\n")
-            self.assertEqual(reads.count("ubuntu.sources"), 2)
+            self.assertEqual(reads.count("ubuntu.sources"), 1)
             self.assertEqual(reads.count("sources.list"), 2)
-            self.assertEqual(reads.count("apt-mirrors.txt"), 1)
+            self.assertEqual(reads.count("apt-mirrors.txt"), 2)
             self.assertEqual([call.args[1] for call in mode.call_args_list], [0o644, 0o644])
             self.assertFalse(any(root.rglob(".arxcovo-mirror-*")))
+
+    def test_observed_failure_modes_each_keep_a_reachable_first_choice(self):
+        ordered = apt_mirror_order(mirror.rewrite_mirror_list(MIRRORS))
+        self.assertEqual(ordered, ["https://mirrors.edge.kernel.org/ubuntu/",
+                                   "http://azure.archive.ubuntu.com/ubuntu/",
+                                   "https://archive.ubuntu.com/ubuntu/",
+                                   "https://security.ubuntu.com/ubuntu/"])
+        # PR32 job 130635247058: every Ubuntu name timed out at about 20 s per
+        # file and entry, so the mirror reachable there must be tried first.
+        ubuntu_dns_down = [uri for uri in ordered if "ubuntu.com" not in uri]
+        self.assertEqual(ordered[0], ubuntu_dns_down[0])
+        # Fresh main job 130963746682 and four siblings: the Kernel mirror's IPv6
+        # and IPv4 connects failed while Ubuntu names resolved; Ubuntu remains.
+        kernel_down = [uri for uri in ordered if "kernel.org" not in uri]
+        self.assertEqual(kernel_down[0], "http://azure.archive.ubuntu.com/ubuntu/")
+
+    def test_mirror_list_rewrite_preserves_comments_and_untagged_entries(self):
+        before = (b"# fixed comment\n\nhttps://archive.ubuntu.com/ubuntu/\tpriority:7\n"
+                  b"http://security.ubuntu.com/ubuntu\n")
+        after = mirror.rewrite_mirror_list(before)
+        self.assertEqual(after, b"https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n# fixed comment\n\n"
+                                b"https://archive.ubuntu.com/ubuntu/\tpriority:8\n"
+                                b"http://security.ubuntu.com/ubuntu\n")
+        self.assertEqual(apt_mirror_order(after)[0], "https://mirrors.edge.kernel.org/ubuntu/")
+        # A second run sees a non-Ubuntu entry and refuses instead of stacking.
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite_mirror_list(mirror.rewrite_mirror_list(MIRRORS))
+        line = b"https://archive.ubuntu.com/ubuntu/\tpriority:999999\n"
+        self.assertLessEqual(len(line * 16), 4096)
+        self.assertIn(b"\tpriority:1000000\n", mirror.rewrite_mirror_list(line * 16))
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite_mirror_list(b"# " + b"x" * 4040 + b"\n" + line)
+
+    def test_insecure_options_on_indirect_sources_still_refuse(self):
+        for data, suffix in [(b"deb [trusted=yes] mirror+file:/etc/apt/apt-mirrors.txt resolute main\n", ".list"),
+                             (INDIRECT_SOURCE.replace(b"Signed-By:", b"Allow-Insecure: yes\nSigned-By:"),
+                              ".sources"),
+                             (INDIRECT_SOURCE.replace(b"/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+                                                      b"/private-keyring"), ".sources")]:
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                root, _ = make_tree(directory)
+                (root / "sources.list.d" / f"z{suffix}").write_bytes(data)
+                with patch.object(mirror.os, "replace") as publish:
+                    with self.assertRaises(mirror.Refusal):
+                        mirror._apply(root, fixture_reader, fixture_directory)
+                publish.assert_not_called()
+                self.assertEqual((root / "apt-mirrors.txt").read_bytes(), MIRRORS)
 
     def test_entire_plan_validation_precedes_any_publication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,12 +171,13 @@ class UbuntuMirrorTests(unittest.TestCase):
         for change in ("bytes", "identity"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 root, source = make_tree(directory)
+                listing = root / "apt-mirrors.txt"
                 calls = 0
 
                 def read(path):
                     nonlocal calls
                     data, facts = fixture_reader(path)
-                    if path == source:
+                    if path == listing:
                         calls += 1
                         if calls == 2:
                             if change == "bytes":
@@ -120,6 +191,7 @@ class UbuntuMirrorTests(unittest.TestCase):
                         mirror._apply(root, read, fixture_directory)
                 publish.assert_not_called()
                 self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+                self.assertEqual(listing.read_bytes(), MIRRORS)
 
     def test_publication_error_cleans_only_its_stage_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,6 +201,7 @@ class UbuntuMirrorTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     mirror._apply(root, fixture_reader, fixture_directory)
             self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+            self.assertEqual((root / "apt-mirrors.txt").read_bytes(), MIRRORS)
             self.assertFalse(any(root.rglob(".arxcovo-mirror-*")))
 
     def test_parent_guards_file_count_and_empty_plan_refuse_before_writes(self):
@@ -153,8 +226,10 @@ class UbuntuMirrorTests(unittest.TestCase):
 
     def test_lowercase_deb822_uri_is_recognized(self):
         before = INDIRECT_SOURCE.replace(b"URIs:", b"uris:")
-        self.assertEqual(mirror.rewrite(before, ".sources", indirect=True),
-                         before.replace(mirror.MIRROR_LIST.encode(), mirror.MIRROR.encode()))
+        self.assertEqual(mirror.rewrite(before, ".sources", indirect=True), before)
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite(before.replace(b"Signed-By:", b"Trusted: yes\nSigned-By:"), ".sources",
+                           indirect=True)
 
     def test_uri_expansion_cannot_exceed_output_bound(self):
         prefix = b"deb http://archive.ubuntu.com/ubuntu resolute main\n#"
