@@ -1,24 +1,32 @@
 # 0020: Linux execution hierarchy, janitor, startup discovery and rights checks
 
-Status: **proposed** (Anthropic / claude-opus-5-5 / high, design sub-agent,
-2026-11-12). Not accepted. A fresh independent Sol high review must pass before
-acceptance, and implementation additionally waits for ADR 0019 stages C (PR53)
-and D (PR55) to merge through all required gates.
+Status: **proposed, correction 1 of 3** (Anthropic / claude-opus-5-5 / high,
+design sub-agent, 2026-11-12). Not accepted. The original proposal
+(`e3928f5`, retained as `54032bf`) received an independent Sol high review
+with **changes required** ([review](../reviews/0020-sol-independent-design-review.md),
+`8ff4196`, retained as `8ff3a54`). This revision corrects blockers S1 and
+P1–P4 and applies the review's U1–U9, A1–A4, S2 and P5 decisions. The
+[correction disposition](../reviews/0020-correction1-disposition.md) maps
+every finding to its change. A fresh independent Sol high recheck must pass
+before acceptance. Implementation additionally waits for ADR 0019 stages C
+(PR53) and D (PR55) to merge through all required gates.
 
-Runtime base `fdea1c6` (PR55 Stage D on the **unmerged** PR53 Stage C, on main
-after #52 `1604db1`). Stage C and Stage D stay unmerged by this document. This
-ADR grants no production constructor, native execution, cgroup or account
-operation, owner step, experiment or retry. Production stays
-`MechanismUnavailable` on every OS. Native, installed and dedicated M2 paths
-remain **unverified on real hardware**, and M2 remains incomplete. The Stage F
-`E_PROTECTION` diagnosis stays separate and Stage G activation keeps every gate.
+Correction base `d44035d`. Its code is unchanged from the original runtime
+base `fdea1c6` (PR55 Stage D on the **unmerged** PR53 Stage C, on main after
+#52 `1604db1`); the commits in between are docs only. Stage C and Stage D
+stay unmerged by this document. This ADR grants no production constructor,
+native execution, cgroup or account operation, owner step, experiment or
+retry. Production stays `MechanismUnavailable` on every OS. Native, installed
+and dedicated M2 paths remain **unverified on real hardware**, and M2 remains
+incomplete. The Stage F `E_PROTECTION` diagnosis stays separate and Stage G
+activation keeps every gate.
 
 The implementation brief is
 [0020-linux-hierarchy-implementation.md](../briefs/0020-linux-hierarchy-implementation.md).
 Design evidence, sources and the disposition of the ADR 0019 open items are in
 [0020-design-evidence.md](../reviews/0020-design-evidence.md). Nothing here was
-built, run or tested. Statements about the kernel or systemd are either quoted
-from the primary documents listed there or labelled *source inference*.
+built, run or tested. Statements about the kernel, libc or systemd are either
+taken from the primary documents listed there or labelled *source inference*.
 
 ## Scope
 
@@ -27,12 +35,17 @@ and `runs/` controllers, creating `runs/`), the janitor, startup discovery
 wiring, and the ADR 0009 slice 9 rights checks for Linux standard (with pure
 classification for the other cells).
 
-Out of scope: any runner (`exec/`) behaviour change, any ADR 0017 `Report`,
-`Creation`, row or output-release change, the macOS sweep, Linux admin
-execution, Windows, the owner CLI, packaging changes, the Stage F experiment,
-Stage G activation and `PROGRESS.md`.
+This correction also proposes one **narrow ADR 0019 runner-contract delta**
+(A5, D6): a payload-free cleanup-residue signal. It changes no `RunError`,
+`NotStarted`, `RunResult`, legacy `run` result, ADR 0017 `Report`,
+`Creation`, row or output.
 
-## Context (from source at `fdea1c6`)
+Out of scope: any other runner (`exec/`) behaviour change, any ADR 0017
+change, the macOS sweep, Linux admin execution, Windows, the owner CLI,
+packaging changes, the Stage F experiment, Stage G activation and
+`PROGRESS.md`.
+
+## Context (from source at `d44035d`, identical to `fdea1c6`)
 
 1. **The runner needs a prepared parent and never prepares it.**
    `Group::create` (`exec/cgroup.rs:34-115`) requires `cgroup_parent` to be a
@@ -51,50 +64,65 @@ Stage G activation and `PROGRESS.md`.
    live in leaves, not in `runs/`. `Group::create` would therefore start new
    runs next to a leftover populated leaf. Only a janitor that runs before
    execution becomes available closes this.
-4. **Orphan empty leaves exist.** `Group::create` ignores a failed `unlinkat`
-   after `mkdirat` succeeded (`cgroup.rs:84-89`, `:108-113`), and `Group`'s
-   `Drop` discards removal failure (`:147-153`). Leaf names are
-   `arx-<pid>-<serial>` (`:67-73`), so a later instance that reuses a PID can
-   collide with a leftover name.
-5. **Readiness is a constant today.** `UnixBridge` holds `ready: bool`
+4. **Leaves can outlive their `Group` without a report.** `Group::create`
+   ignores a failed `unlinkat` after `mkdirat` succeeded (`cgroup.rs:84-89`,
+   `:108-113`). `Group`'s `Drop` calls `kill_and_confirm` and discards its
+   result (`:147-153`); that result is `false` when the kill write, an events
+   read, the 2 s wait or the `unlinkat` fails (`:117-145`). A `Group` is
+   dropped this way after a `socketpair` failure (`unix.rs:223-224`), at the
+   final cancel/shutdown recheck (`:344-352`) and after a spawn error
+   (`:353-355`). Leaf names are `arx-<pid>-<serial>` (`:67-73`), so a later
+   instance that reuses a PID can collide with a leftover name.
+5. **Admission is checked before the concurrency slot.** `dispatch`
+   (`service/executor.rs:337-352`) calls `preflight` and only then
+   increments `active`. A worker can pass preflight, pause, and take a slot
+   later. The slot counter bounds simultaneous runner calls, not the set of
+   workers that passed an earlier readiness check.
+6. **Readiness is a constant today.** `UnixBridge` holds `ready: bool`
    (`service/unix_bridge.rs:42`), checked last in `preflight` (`:105-112`).
    Its `cgroup_parent` parser (`:178-198`) is pure and has no caller that
    reads `/proc/self/cgroup`.
-6. **Startup discovery is a no-op.** `ServiceApplication::start_discovery`
+7. **Startup discovery is a no-op.** `ServiceApplication::start_discovery`
    does nothing (`service/application.rs:225-227`). `Host::run` calls it after
    reporting running (`service/mod.rs:147`). There is no daemon
    `discover_tools` row helper; the schema already allows one (daemon actor,
    principal `arxd`; `store.rs:859-861`). `list_hosts` prints constant `tools`,
    `tools_observed_at` and `last_observed_identity` (`mcp.rs:255-257`).
-7. **Rights checks are partial.** Static admin-group membership is checked in
+8. **Rights checks are partial.** Static admin-group membership is checked in
    `execution_preflight` (`service/config.rs:337`, groups at
-   `native_unix.rs:268`). The runner refuses supplementary groups and sets
-   no-new-privileges and clears capabilities per run (`exec/unix.rs:67-157`,
-   pre_exec). `service_hardening` is a constant `null`
+   `native_unix.rs:268`). The runner refuses supplementary groups and, in
+   `pre_exec`, sets no-new-privileges and clears capabilities on every run
+   (`exec/unix.rs:242-310`). `service_hardening` is a constant `null`
    (`service/executor.rs:289`). No `sudo -n true` observation exists; ADR 0019
    brief §5 left it to ADR 0009 slice 9.
-8. **The bounding set has no `CAP_KILL`, `CAP_DAC_OVERRIDE` or
+9. **The bounding set has no `CAP_KILL`, `CAP_DAC_OVERRIDE` or
    `CAP_SYS_ADMIN`** (`50-arxcovo-standard-rights.conf`). By kill(2), signals
    to build-UID processes therefore fail for the service. `cgroup.kill` is a
    file write and is the only kill primitive available (*source inference*
    for the absence of extra capability checks on cgroupfs writes).
+10. **The shim executes by path today.** `tool-probe` and `exec-child` spawn
+    resolved paths with `Command` (`unix_shim.rs:60-70`, `:210-218`). The
+    shim inherits the runner's no-new-privileges, cleared capabilities, leaf
+    and owner environment (ADR 0019 D2).
 
 ## Decision
 
 ### D1. Placement and inertness
 
-- A new Linux-only module `exec/hierarchy.rs` holds the setup and janitor
-  state machine over a `CgroupFs` port, plus its descriptor-relative Linux
+- A new Linux-only module tree `exec/hierarchy.rs` with
+  `exec/hierarchy/{parse,setup,linux}.rs` holds the setup and janitor state
+  machine over a `CgroupFs` port, plus its descriptor-relative Linux
   implementation. It reuses the exec helpers `walk`, `control`, `put` and
   `trusted_root`. Pure parsers and classifiers compile on every OS.
-- A bridge-side `Readiness` replaces `ready: bool`. A wiring seam drives setup
-  and startup discovery.
+- A bridge-side `Readiness` (`service/unix_bridge/readiness.rs`) replaces
+  `ready: bool`. A wiring seam drives setup and startup discovery.
 - Everything is reachable only from `#[cfg(test)]` constructors and a
   `#[cfg(test)]` `Hooks` implementation. `Execution::configured` keeps
   `Native`, `Hooks::Native::start_discovery` stays a no-op, and
   `capability()` stays `available: false`. Source-pinning tests (D10) fail if
   any of these changes.
-- `exec/cgroup.rs`, `exec/unix.rs`, `RunError` and `NotStarted` are unchanged.
+- `exec/unix.rs`, `RunError` and `NotStarted` are unchanged. `exec/cgroup.rs`
+  changes only by the A5 residue signal (D6).
 
 ### D2. Trust anchors (all checked before any write)
 
@@ -109,11 +137,17 @@ Stage G activation and `PROGRESS.md`.
 | T7 | unit state | `cgroup.type` is exactly `domain`; `cgroup.procs` empty; `cgroup.controllers` tokens include `memory` and `pids` | `UnitState` |
 | T8 | own placement | `supervisor/` opens as T5; its `cgroup.procs` (≤ 4,096 bytes) is exactly one canonical decimal line equal to `getpid()` | `Supervisor` |
 
-- T6 is documented by systemd (kernel ≥ 5.6 with systemd ≥ 251; the unit
-  already requires systemd ≥ 254). `trusted.delegate` is not an alternative:
-  reading `trusted.*` needs `CAP_SYS_ADMIN`, which the bounding set lacks.
-- T8 proves that the parsed path is this process's cgroup on this mount, not
-  a lookalike. It runs once, before any child exists.
+- T6 is mandatory (U2). The marker, root ownership, cgroup2 type and exact
+  `arxd.service/supervisor` placement are cumulative checks. systemd
+  documents the marker (kernel ≥ 5.6 with systemd ≥ 251; the unit already
+  requires systemd ≥ 254). There is no fallback to `trusted.delegate`:
+  reading `trusted.*` needs `CAP_SYS_ADMIN`, which the bounding set lacks. A
+  missing marker disables execution; inventory stays available.
+- T8 is **consistency evidence** on the trusted mounted hierarchy: the parsed
+  path holds exactly this process on this mount. It is not proof against a
+  privileged namespace or mount adversary. No unprivileged build can mount a
+  substitute; privileged mounts and privileged writers are a stated trust
+  assumption (A1). It runs once, before any child exists.
 - Setup never resolves accounts (no NSS), never reads `/proc/<pid>` of other
   processes and never signals by PID or UID.
 
@@ -121,9 +155,10 @@ Stage G activation and `PROGRESS.md`.
 
 One blocking task runs these steps in order. Each step either passes or
 returns one fixed `SetupFailure` (D5). The shutdown token is checked between
-steps and inside every wait.
+steps and inside every wait, including immediately before S10.
 
-1. **S0 hardening** (D8 R4). Read-only.
+1. **S0 hardening** (D8 R4). Read-only. It runs before T1, so an unhardened
+   process reports `Hardening` even when it is also not root.
 2. **S1–S3** T1–T4.
 3. **S4** T5–T8.
 4. **S5 enable on the unit.** One write of `+memory +pids` to the unit's
@@ -143,47 +178,86 @@ steps and inside every wait.
    `memory.swap.max` and `pids.max` open `O_RDONLY|O_NOFOLLOW`. These files
    exist only because S5 enabled the controllers, and `memory.swap.max`
    proves swap accounting before any run needs it (`cgroup.rs:95`).
-   `cgroup.events` is exactly `populated 0`; `cgroup.procs` is empty; there
-   are zero child directories. → `Postcondition`.
-9. **S10 Ready.** `Readiness` moves `Pending → Ready` with a release store.
-   The typed `SetupEvidence` (counts only) is returned to the caller.
+   `cgroup.events` passes the strict `events` parser (D4.2) with populated
+   `false`; extra well-formed keys such as `frozen` are allowed.
+   `cgroup.procs` is empty. One fresh listing (D4.3) classifies zero child
+   directories and no refused entry. → `Postcondition`.
+9. **S10 Ready.** If shutdown has not been requested, `Readiness` moves
+   `Pending → Ready` by `compare_exchange` (release). Otherwise the result is
+   `Stopped`. The typed `SetupEvidence` (counts only) is returned to the
+   caller.
 
 Steps are idempotent. A crash at any point is repaired by the next start.
+
+Parent enablement (S5) exposes the controller interface files in `runs/`;
+`runs/` enablement (S8) exposes them in leaves. systemd delegation makes the
+controllers available without enabling them. The `supervisor/` placement
+keeps the unit's internal node empty, so S5 cannot meet resident processes.
 
 ### D4. Janitor
 
 The janitor runs only inside S7, once per process, before `Ready`. At that
 point this process has created no leaf, so everything under `runs/` is a
-leftover of an earlier instance.
+leftover of an earlier instance. The trust boundary is the verified,
+exclusive `runs/` subtree, not the leaf-name grammar.
 
 1. **Kill the whole subtree.** Write `1` to `runs/cgroup.kill`. The kernel
-   kills every process in `runs/` and all descendants with SIGKILL and handles
-   concurrent forks and migrations. The write also proves the kill interface
-   exists. Failure → `KillInterface`.
-2. **Wait.** Poll `runs/cgroup.events` every 5 ms for at most 5 s. A strict
-   parser requires every line to be `<lowercase key> <decimal>`, no duplicate
-   key, and exactly one `populated` line with value `0` or `1`. Other
-   well-formed keys (such as `frozen`, or keys a newer kernel adds) are
-   ignored. Any other shape is `Postcondition`. Deadline expiry →
-   `KillTimeout`. Shutdown → `Stopped`.
-3. **List.** Read the entries of `runs/` descriptor-relatively (at most 512
-   entries, at most 64 child directories). Only `d_type == DT_DIR` entries are
-   children; `DT_UNKNOWN` falls back to `fstatat(AT_SYMLINK_NOFOLLOW)`.
-   Exceeding a bound → `LeafStructure`.
+   kills every process in `runs/` and all descendants with SIGKILL, including
+   processes in children with unknown or nested names, and handles concurrent
+   forks and migrations. Failure → `KillInterface`. A failed kill write
+   proves nothing about live processes; it only proves that this janitor
+   cannot confirm cleanup. Execution stays refused until restart, which is
+   safe, but no "no live process" claim follows.
+2. **Wait.** Poll `runs/cgroup.events` every 5 ms against a 5 s logical
+   deadline from the injected clock. The strict `events` parser requires
+   every line to be `<key> <decimal>` with a lowercase `[a-z_]` key, no
+   duplicate key, and exactly one `populated` line with value `0` or `1`.
+   Other well-formed keys (`frozen`, or keys a newer kernel adds) are
+   ignored. It returns the populated value. Any other shape is
+   `Postcondition`. Deadline expiry → `KillTimeout`. Shutdown → `Stopped`.
+3. **List.** Every listing call opens a **fresh open file description** of
+   the already-verified directory with
+   `openat(dir, ".", O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` and reads it
+   from offset 0 to end (`fdopendir`/`readdir` or raw `getdents64` on that
+   new descriptor, then close). `dup`, `dup2`, `F_DUPFD` and reuse of a
+   previous stream are forbidden for listing: a duplicate shares the
+   original's file offset, and `dup` clears close-on-exec. A listing reads
+   at most 512 raw records; `.` and `..` count toward that budget and are
+   then excluded from classification. Each other record is classified by
+   `d_type`, with `DT_UNKNOWN` resolved by
+   `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`:
+
+   | Kind | Classification |
+   | --- | --- |
+   | directory | child cgroup (at most 64 per listing) |
+   | regular file whose name matches `[a-z0-9_]+(\.[a-z0-9_]+)+`, at most 64 bytes | kernel control file; ignored |
+   | regular file with any other name | refused |
+   | symlink, character, block, FIFO, socket, any other type | refused |
+   | `DT_UNKNOWN` whose `fstatat` fails (including `ENOENT`) | refused |
+
+   Exceeding a bound or any refused entry → `LeafStructure`. Nothing is
+   removed. (cgroupfs offers no user file or symlink creation; the refusal
+   rows are fail-closed classification, not a claim that such entries occur
+   on a normal host.)
 4. **Check each child.** Its name must match the leaf grammar
    `arx-<pid>-<serial>`: canonical unsigned decimals without leading zeros,
    `pid` ≤ 10 digits and `serial` ≤ 20 digits. It opens with T5 flags and is
-   cgroup2, UID 0, with no group/other write. Its own listing (≤ 512 entries)
-   has no child directory. Its `cgroup.events` reads `populated 0`. Any
-   mismatch → `LeafStructure`. **Unknown names are never removed.**
+   cgroup2, UID 0, with no group/other write. Its own fresh listing (same
+   rules and bounds) classifies **zero** child directories and no refused
+   entry. Its `cgroup.events` parses with populated `false`. Any mismatch →
+   `LeafStructure`. **All children are checked before the first removal, and
+   unknown or nested names are never removed** (their processes were killed
+   in step 1; only removal is withheld).
 5. **Remove.** `unlinkat(runs, name, AT_REMOVEDIR)` per child. Failure →
    `LeafRemoval`.
-6. **Verify.** Re-list `runs/`: zero child directories, and `cgroup.events`
-   reads `populated 0`.
+6. **Verify.** A fresh listing of `runs/` classifies zero child directories
+   and no refused entry, and `cgroup.events` parses with populated `false`.
+   Any failure, including a child that reappeared → `VerifyFailed`.
 
-The janitor removes leaves of every PID, including a name that equals this
-process's PID. That resolves the D4 context item: after `Ready`, a fresh
-`mkdirat` cannot collide with a leftover.
+Populated `false` and successful removal are confirmed separately; neither
+alone proves complete cleanup. The janitor removes leaves of every PID,
+including a name that equals this process's PID, so a fresh `mkdirat` after
+`Ready` cannot collide with a leftover.
 
 ### D5. Readiness, typed outcomes and latches
 
@@ -196,72 +270,131 @@ pub(crate) struct SetupEvidence {
 pub(crate) enum SetupFailure {
     Hardening, Identity, Locate, Root, Unit, Delegation, UnitState, Supervisor,
     EnableUnit, Runs, KillInterface, KillTimeout, LeafStructure, LeafRemoval,
-    EnableRuns, Postcondition, Stopped, Panicked,
+    VerifyFailed, EnableRuns, Postcondition, Stopped, Panicked,
 }
 enum State { Pending, Ready, Unavailable(Cause) }   // one AtomicU8
 enum Cause { Setup, Hardening, Janitor, Containment, Rights, Stopped }
 ```
 
-- All three enums are fixed variants deriving `Debug, Clone, Copy, PartialEq,
-  Eq`. No variant carries a string, path, errno, name, PID, UID or GID.
+- All enums are fixed variants deriving `Debug, Clone, Copy, PartialEq, Eq`.
+  No variant carries a string, path, errno, name, PID, UID or GID.
   `SetupEvidence` holds counts and flags only. None of these values reaches a
   response, a row, a log, stderr or a panic message.
 - **Transitions are monotone.** `Pending → Ready`, `Pending →
   Unavailable(c)` and `Ready → Unavailable(Containment | Rights)` happen by
   `compare_exchange`. The first writer wins. Nothing returns to `Ready` in the
   same process. Only a restart resets readiness, and the next janitor is what
-  makes that reset honest.
+  makes that reset honest. There is no agent-reachable reset.
 
-| `SetupFailure` | `Cause` | Bridge preflight (`ExecutionUnavailable`) | Stored reason |
+| `SetupFailure` | `Cause` | Bridge refusal (`ExecutionUnavailable`) | Stored reason |
 | --- | --- | --- | --- |
 | `Hardening` | `Hardening` | `mechanism_unavailable` | `preflight_failed` |
 | `Identity` … `Runs`, `KillInterface`, `LeafStructure`, `EnableRuns`, `Postcondition` | `Setup` | `mechanism_unavailable` | `preflight_failed` |
-| `KillTimeout`, `LeafRemoval`, `Panicked` | `Janitor` | `quarantined` | `quarantined` |
+| `KillTimeout`, `LeafRemoval`, `VerifyFailed`, `Panicked` | `Janitor` | `quarantined` | `quarantined` |
 | `Stopped` | `Stopped` | `stopping` | `shutdown` |
 | (state `Pending`) | — | `mechanism_unavailable` | `preflight_failed` |
 | run latch, D6 | `Containment` | `mechanism_unavailable` | `preflight_failed` |
 | discovery latch, D8 | `Rights` | `rights_mismatch` | `preflight_failed` |
 
-- `quarantined` matches the ADR 0009 meaning "an earlier cleanup is
-  unconfirmed". `LeafStructure` is not a quarantine: by then `runs/` reported
-  `populated 0`, so no process is alive. Only unexpected directories remain.
+- `quarantined` keeps the ADR 0009 meaning "an earlier cleanup is
+  unconfirmed". `LeafStructure` is not a quarantine: at that point `runs/`
+  reported populated `false`, so no process was alive then; only unexpected
+  entries remain. `KillInterface` is a missing or failing mechanism: it maps
+  to `mechanism_unavailable` (A3), and D4.1 states what it does not prove.
+- Pending maps to the existing `mechanism_unavailable` (U5). Setup failure is
+  never fatal to inventory.
 - The setup body runs under `catch_unwind(AssertUnwindSafe(..))`. The payload
   is dropped unread and the result is `Panicked`, treated as `Janitor`
-  because a panic after the kill write leaves the state unknown.
+  because a panic after the kill write leaves the state unknown. An aborting
+  panic is not caught; ADR 0019 G-P2 (unwinding release profile) stays an
+  activation gate.
 - Bridge preflight order stays as Stage D has it: config check, then stored
   construction result, then readiness. No new `ExecutionUnavailable` variant
-  is added.
+  is added. The in-slot gate (D6) repeats the readiness and residue checks.
 
-### D6. Orphan leaves and the containment latch
+### D6. Cleanup residue, admission and the containment latch
 
-| Source | Processes? | Bridge sees | Disposition |
+**Residue model.** A *residue* is a leaf this process created that may still
+exist after its `Group` was released without a confirmed `unlinkat`. Every
+residue is empty of live processes at release except where an existing
+quarantine already applies.
+
+| Source (`d44035d`) | Live processes possible? | Report today | Disposition |
 | --- | --- | --- | --- |
-| `Group::create` openat or setup write fails, then `unlinkat` fails (`cgroup.rs:84-89`, `:108-113`) | never joined | `NotStarted::Containment` → row D | **latch** `Containment`; next-start janitor removes |
-| `Group` dropped after `socketpair` failure, removal fails | never joined | `NotStarted::Resource` → row F | **latch** `Containment` |
-| `Group` dropped at the final recheck (cancel), removal fails | never joined | `NotStarted::Cancelled` → row E | no latch (agent-triggerable); residual; next-start janitor |
-| same, at shutdown | never joined | `NotStarted::Shutdown` | process is stopping; next-start janitor |
-| `kill_and_confirm` removal fails after `populated 0` | none left | cleanup `false` → row H | existing quarantine |
-| spawn or post-spawn error | possible | rows G | existing quarantine |
+| `Group::create`: `openat` or limit write fails, `unlinkat` fails (`cgroup.rs:84-89`, `:108-113`) | no (never joined) | `NotStarted::Containment` → refused `mechanism_unavailable` | residue signal + latch |
+| `Group` dropped after `socketpair` failure, cleanup unconfirmed | no | `NotStarted::Resource` → row F | residue signal + latch |
+| `Group` dropped at the final recheck (cancel), cleanup unconfirmed | no | `NotStarted::Cancelled` → row E, **unchanged** | residue signal + latch |
+| same, at shutdown | no | `NotStarted::Shutdown` → refused `stopping` | residue signal + latch; process is stopping |
+| `Group` dropped after `SpawnFailed`, cleanup unconfirmed | possible | row G | existing quarantine; residue signal |
+| `kill_and_confirm` false after a run | possible before kill | cleanup `false` → row H | existing quarantine; residue signal |
 | service crash or SIGKILL | possible | — | systemd `KillMode=mixed` SIGKILL; next-start janitor |
 
-- **The latch.** On any `NotStarted::Containment` or `NotStarted::Resource`
-  from the runner port, the bridge moves readiness to
-  `Unavailable(Containment)` **before** returning the unchanged ADR 0019
-  report. Later requests are refused at preflight as `mechanism_unavailable`.
-  So at most `max_concurrent_runs` (≤ 4 on Linux) orphans can exist until the
-  next start. The report for the triggering run is unchanged: row D or F, no
-  quarantine.
-- **Why an orphan is inert** (*source inference* for kernfs ownership): it is
-  a root-owned `0700` directory with no processes. Only a writer with write
-  access to its `cgroup.procs` (root) can populate it. The delegated subtree
-  has one writer (systemd's single-writer rule), and the runner never reuses
-  a leaf name. `Group::create` does not look at siblings, so an orphan
-  neither blocks nor weakens later runs. It counts toward
-  `cgroup.max.descendants` (default `max`).
-- The cancel residual needs `rmdir` of an empty, never-populated cgroup to
-  fail. The kernel documentation allows removing a cgroup with no children and
-  no live processes, so no failure mode is expected. It stays an unverified
-  residual: a runner-level residue signal would reopen ADR 0019 D1 (U3).
+"Cleanup unconfirmed" covers every `false` from `kill_and_confirm`: a failed
+kill write, a failed events read, the 2 s wait, or a failed `unlinkat`. The
+original proposal's claim that only an `rmdir` failure matters, and its
+global "at most four orphans" claim, are **withdrawn**.
+
+**A5: runner cleanup-residue signal (proposed ADR 0019 delta).** `Runner`
+owns one `Arc<AtomicBool>` residue flag. `Group::create` receives a clone. A
+leaf released without a confirmed `unlinkat == 0` stores `true` (release):
+in both create-path unlink sites and in `Drop` when `kill_and_confirm`
+returns `false`. `Runner::cleanup_residue(&self) -> bool` loads it (acquire).
+The flag is per runner (not a process static, so parallel tests cannot share
+it), monotone, payload-free and never reset in-process. Nothing else
+changes: no `RunError`, `NotStarted`, `RunResult`, `Outcome`, legacy `run`
+result or `ExecError` text; no `Report`, `Creation`, row, quarantine rule or
+output. A cancelled run still produces the unchanged row E. The bridge's
+`RunnerPort` gains `cleanup_residue()`; the test fake controls it.
+
+**Admission: the in-slot gate (A3).** `UnixBridge::run` executes inside the
+executor's concurrency slot (after `active.fetch_add`, before
+`active.fetch_sub`, `executor.rs:340-351`). Its body begins with a gate:
+
+1. If `runner.cleanup_residue()` is set, `latch(Containment)`.
+2. If readiness is not `Ready`, return `Report::Unavailable` with the D5
+   token, **without calling the runner**. This is the existing report shape
+   the body already returns for a refused runner (`unix_bridge.rs:74`).
+
+After the runner returns, and before the body returns, the bridge latches
+`Containment` if `cleanup_residue()` is set **or** the error was
+`NotStarted::Containment` or `NotStarted::Resource` (the review-accepted
+conservative U3 latch, including transient `ENOMEM`). The triggering run's
+report is unchanged. Preflight remains an early refusal; the gate is the
+binding check.
+
+**Bound (with stated assumptions).** Let `L` be `max_concurrent_runs`
+(at most 4 on Linux). Then at most `L` runner calls in one process lifetime
+can leave a residue. Sketch: every residue-producing call stores the flag,
+then latches, before its slot release (both in the same thread, sequenced
+before `fetch_sub`). Let C₁ be the residue-producing call whose slot release
+is earliest in the modification order of `active`. Every `fetch_add` after
+that release synchronizes with it (all operations on `active` are `AcqRel`
+read-modify-writes, so they extend its release sequence), so any call taking
+a slot later sees the latch at its gate and never calls the runner. Every
+other residue-producing call therefore took its slot before C₁'s release and
+released after it, so it held a slot at that point together with C₁: at most
+`L - 1` calls. The bound assumes: the gate runs inside the slot; the latch
+precedes slot release; `active` keeps `AcqRel` read-modify-writes; one
+`Group` per runner call; and an unwinding (not aborting) panic. It bounds
+empty leaves, not live processes; live-process sources keep their existing
+quarantine.
+
+**Already admitted work continues.** A latch does not cancel runs that have
+already passed the gate. They finish with their own ordinary reports and
+are counted in the bound. An empty residue leaf is not a live-process escape
+(*source inference* for kernfs ownership: it is a root-owned `0700`
+directory, and only a writer with write access to its `cgroup.procs`, i.e.
+root, can populate it; the single-writer rule is a systemd convention, not a
+kernel lock). The runner never reuses a leaf name. `Group::create` does not
+look at siblings, so a residue neither blocks nor weakens later runs. It
+counts toward `cgroup.max.descendants` (default `max`).
+
+**Availability.** Cancellation alone never latches: a cancel whose cleanup
+was confirmed leaves the flag clear, so the next request reaches the runner
+(T13). An agent can cancel, but whether cleanup fails is a host or kernel
+fault, not an agent choice (*source inference*). The latch therefore trades
+availability only on a real fault, and the next-start janitor removes every
+residue.
 
 ### D7. Startup ordering and discovery wiring
 
@@ -276,30 +409,56 @@ enum Cause { Setup, Hardening, Janitor, Containment, Rights, Stopped }
 - `start_discovery` (after `Running`) starts **one tracked background
   sequence**:
   1. setup and janitor (D3/D4) on the blocking pool;
-  2. **only if readiness is `Ready`**, a daemon `discover_tools` row through
-     a new store helper `start_daemon_discovery()` (`actor_kind = daemon`,
-     principal `arxd`, `identity_mode = dedicated_account`; no schema change);
+  2. **only if readiness is `Ready` and shutdown is not requested**, a daemon
+     `discover_tools` row through a new store helper
+     `start_daemon_discovery()` (`actor_kind = daemon`, principal `arxd`,
+     `identity_mode = dedicated_account`; no schema change);
   3. `Execution::dispatch(None, activity, id)`. That is the ordinary path:
-     bridge preflight, busy check, ADR 0017 `assess`, quarantine and drain.
-- **Janitor before discovery is strict.** It settles the ADR 0019 open item.
-  Discovery never runs, and no daemon row is written, unless the janitor has
-  confirmed an empty `runs/`. A setup failure writes no row, because no action
-  was attempted. A discovery failure follows ADR 0017 rows D–M for the daemon
-  row, including quarantine for G–K. It is never retried at startup.
-- **Tool cache.** Only an outcome of `succeeded` (row N) updates it, and the
-  update replaces the whole value. It holds the response's `tools`, the
-  response's `observed_identity` (ADR 0017 rule 5: built from the redacted
-  `Metadata`, never from `Evidence`) and `tools_observed_at` (milliseconds).
-  It lives in memory only and is never persisted or logged. Agent
-  `discover_tools` row N refreshes it too. `list_hosts` reads it. When no
-  cache exists, the current constants stay byte-identical.
-- **Drain.** `stop_accepting` already sets the execution shutdown token. The
-  setup sequence observes it between steps and inside the janitor wait, and
-  returns `Stopped` with no discovery. `drain` awaits `Execution::drain`, then
-  the sequence's handle, then `Blocking::drain`. The existing
-  stopping/JoinSet serialization in `dispatch` covers a dispatch that races
-  shutdown. A synchronous cgroupfs call that stalls has no deadline. The 10 s
-  drain budget then fails, as ADR 0009 describes (exit 5).
+     bridge preflight, busy check, in-slot gate, ADR 0017 `assess`,
+     quarantine and drain.
+- **Janitor before discovery is strict.** Discovery never runs, and no daemon
+  row is written, unless the janitor confirmed an empty `runs/`. A setup
+  failure writes no row, because no action was attempted. A discovery
+  failure follows ADR 0017 rows D–M for the daemon row, including quarantine
+  for G–K. It is never retried at startup (U7); agent `discover_tools` can
+  refresh later only while readiness permits it. A terminal latch still
+  needs a restart.
+- **Discovery is not the security gate** (U1). No-new-privileges and
+  capability clearing apply to every run in `pre_exec`. `Ready` before the
+  first discovery is acceptable only on that basis. A previous discovery
+  cannot prove the current sudo policy.
+- **Tool cache.** Only an outcome of `succeeded` (row N) updates it. It holds
+  the response's `tools`, the response's `observed_identity` (ADR 0017 rule
+  5: built from the redacted `Metadata`, never from `Evidence`) and
+  `tools_observed_at`. Ordering: the caller takes a process-local monotone
+  ticket (an `AtomicU64`) and a wall-clock millisecond timestamp immediately
+  before the start helper. Under the cache mutex an update replaces the
+  whole value only if its ticket is greater than the cached ticket, so a
+  slower, earlier-started discovery never overwrites a later one.
+  `tools_observed_at` therefore means "the observing run started at or after
+  this time", not a stronger freshness claim. The cache lives in memory only
+  and is never persisted or logged; it never holds Evidence-derived
+  identifiers, rights facts or raw stdout. Agent `discover_tools` row N
+  refreshes it too. `list_hosts` reads it. When no cache exists, the current
+  constants stay byte-identical.
+- **Shutdown.** `stop_accepting` already sets the execution shutdown token,
+  an execution cancellation gate independent of readiness. The setup
+  sequence checks it between steps, inside the janitor wait, immediately
+  before S10, after `Ready` and before the row insert. A late `Ready`
+  therefore never dispatches a child: before the row insert it returns with
+  no row; after the row insert, `dispatch` makes the existing synchronous
+  `stopping` refusal under its workers lock (an honest terminal row, no
+  runner call); after spawn, the worker's preflight, the in-slot gate and the
+  runner's rechecks refuse with `stopping`. `drain` awaits `Execution::drain`,
+  then the sequence's handle, then `Blocking::drain`, so drain owns all
+  spawned work.
+- **Deadlines are logical.** The janitor wait (5 s) and the sudo probe (5 s,
+  D8) are polling deadlines checked between non-blocking steps. One cgroupfs
+  `open`, `read` or `write`, a `fork`, or a reap after SIGKILL can block past
+  them. Nothing claims that every syscall or task is interrupted. The
+  backstops are unchanged: the shim runs inside the runner's 60 s discovery
+  timeout and leaf `cgroup.kill`; the service keeps ADR 0009's 10 s drain
+  failure (exit 5) and systemd's stop timeout and `KillMode=mixed`.
 
 ### D8. Rights checks (ADR 0009 slice 9, Linux standard)
 
@@ -307,77 +466,161 @@ enum Cause { Setup, Hardening, Janitor, Containment, Rights, Stopped }
 | --- | --- | --- | --- |
 | R1 static membership (`sudo`/`wheel`/GID 0) | every preflight | `rights_mismatch` | yes |
 | R2 no supplementary groups, account-named primary group | every run, runner | `PreflightFailed` | yes |
-| R3 `PR_SET_NO_NEW_PRIVS`, capabilities cleared | every run, pre_exec | spawn error | yes |
+| R3 `PR_SET_NO_NEW_PRIVS`, capabilities cleared | every run, `pre_exec` | spawn error | yes |
 | R4 service hardening | setup S0 | `Hardening` → `mechanism_unavailable` | **new** |
-| R5 child-side rights line | every tool probe (startup and agent `discover_tools`) | `Rights` latch → `rights_mismatch` | **new** |
+| R5 in-fence rights observation | every tool probe (startup and agent `discover_tools`) | `Rights` latch → `rights_mismatch` | **new** |
+
+**What these layers establish, and what they do not (P5).** R1 is the only
+account-level policy observation, and only of group membership. R5 is an
+observation **inside the fence**: what the shim saw while running as the
+build account under R2/R3. It observes an exit status, not a root identity
+and not a sudoers policy. The kernel's no-new-privileges document says that
+with the bit set, `execve` "promises not to grant the privilege to do
+anything that could not have been done without the execve call", and that
+"the setuid and setgid bits will no longer change the uid or gid". So under
+R3 a setuid `sudo` cannot elevate, and its refusal is identical with and
+without a NOPASSWD rule (brief A7). The same document says NNP "does not
+prevent privilege changes that do not involve `execve()`". Slice 9
+therefore does **not** detect sudoers grants by user name, polkit rules, or
+other non-exec privilege channels, and nothing here claims to. R2 removes
+group-based channels; the remaining ones are a documented limitation. No
+check removes NNP or runs an unfenced privileged probe to obtain a policy
+proof.
 
 **R4.** Read `/proc/self/status` (procfs magic, `O_NOFOLLOW`, at most 8,193
 bytes read, refuse > 8,192). The file must have exactly one `NoNewPrivs:`
 line with value `1` and exactly one `CapBnd:` line with 16 hex digits equal
 to `00000000000000c1` (`CAP_CHOWN | CAP_SETGID | CAP_SETUID`, the constant
 drop-in). The result is `service_hardening = standard`; anything else is
-`none`. Linux standard requires `standard`. The value is rendered in
-`list_hosts` only at Stage G; until then `capability()` keeps `null`.
+`none`. Exact equality is the packaged profile (U4): a subset is not
+equivalent, because missing `SETUID`/`SETGID` can prevent the identity drop.
+R4 does not establish the effective or permitted sets or that cgroup writes
+succeed; Stage F keeps those checks. The value is rendered in `list_hosts`
+only at Stage G; until then `capability()` keeps `null`.
 
-**R5.** `tool-probe` appends exactly one line after the `TOOLS` lines:
-`{"rights":{"no_new_privs":<true|false|null>,"sudo":"absent"|"refused"|"effective"|"unknown"}}`
+**R5 line.** `tool-probe` appends exactly one line after the `TOOLS` lines:
+`{"rights":{"no_new_privs":<true|false|null>,"sudo":"absent"|"untrusted"|"exit_nonzero"|"exit_zero"|"unknown"}}`
 (≤ 96 bytes; total output stays below 4,096).
 
 - `no_new_privs` is read by the shim, as the build account, from its own
   `/proc/self/status` with R4's bounds. It is `null` on macOS or on any parse
   failure.
-- `sudo` is computed from the fixed candidates `/usr/bin/sudo`, `/bin/sudo`
-  and `/usr/local/bin/sudo`, in that order. The shim never searches `PATH`, so
-  an agent-planted `sudo` cannot hide the real one. A candidate is accepted
-  only if `lstat` shows a regular file with UID 0 and no group/other write.
-  The first accepted candidate runs `-n true` with stdin, stdout and stderr
-  null, cwd `/`, the inherited environment and a 5 s deadline (kill and reap).
-  - exit 0 → `effective`
-  - other exit → `refused`
-  - signal, timeout or spawn error → `unknown`
-  - no accepted candidate → `absent`
-- The bridge parses the line only as part of a valid table. If it is missing,
-  malformed or extra, the table is invalid: no tools, row K, as today. The
-  line is never released, persisted or logged. `tools` keep their ADR 0017
-  release rule.
-- Classification is a pure `classify_rights` over (rights, hardening,
-  `no_new_privs`, `sudo`):
+- `sudo` comes from the **bound-executable probe** below. Values:
+  `absent` (no candidate exists), `untrusted` (some candidate exists but
+  fails a trust check; nothing is executed), `exit_nonzero`, `exit_zero`,
+  and `unknown` (signal, deadline, spawn or exec error, or any other error).
+  On macOS no probe runs and the value is `unknown`; macOS execution stays
+  `mechanism_unavailable` before classification.
+
+**R5 bound-executable probe (S1).** The trust boundary is the validated
+executable **object**, reached only through protected system ancestors. It
+rests on a stated **privileged-writer assumption**: a writer with UID 0 or
+`CAP_DAC_OVERRIDE`/`CAP_FOWNER` (the package manager, the owner as root) is
+trusted. Such a writer could equally change sudoers, the `arxd` binary or
+the unit, so the probe adds no claim against it.
+
+1. *Anchor.* Open `/` (`O_RDONLY|O_DIRECTORY|O_CLOEXEC`); `fstat` must show
+   UID 0 and no group/other write.
+2. *Candidates.* Fixed component lists, never `PATH`: C1 `usr/bin/sudo`,
+   C2 `usr/local/bin/sudo`, C3 `bin/sudo`.
+3. *Ancestors.* Each directory component is opened descriptor-relatively
+   with `openat(parent, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`
+   and `fstat`ed: UID 0 and no group/other write. `ENOENT` at any component
+   makes the candidate *missing*. A symlink or non-directory component makes
+   it *untrusted*, except the alias rule. Any other error makes the result
+   `unknown`.
+4. *Normal `/bin` alias.* Only C3's first component has an alias rule. If
+   `bin` is a symlink (`fstatat(anchor, "bin", AT_SYMLINK_NOFOLLOW)`) owned
+   by UID 0 whose `readlinkat` value (at most 16 bytes) is exactly `usr/bin`
+   or `/usr/bin`, then C3 is the merged-`/usr` alias of C1 and is dropped:
+   neither opened nor executed. The link is classified, **never followed**.
+   Any other symlink at `bin`, or any symlink elsewhere, is untrusted.
+5. *Final object.* `openat(dir, "sudo", O_PATH|O_NOFOLLOW|O_CLOEXEC)`.
+   `O_PATH` needs no read permission (some distributions ship `sudo` without
+   it); with `O_NOFOLLOW` a symlink yields a descriptor of the link itself.
+   `fstat` on that descriptor must show a regular file, UID 0 and no
+   group/other write; otherwise the candidate is untrusted.
+6. *Decision.* All three candidates are classified first. Any untrusted
+   candidate → `untrusted`, and **no candidate is executed**. Otherwise the
+   first trusted candidate in C1, C2, C3 order runs; none → `absent`.
+7. *Execution bound to the object.* A forked child executes the validated
+   descriptor with `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`, never a
+   path: argv `["sudo", "-n", "true"]`, an **empty environment**, stdin,
+   stdout and stderr on `/dev/null`, cwd `/`. All argv, envp and descriptors
+   are prepared before `fork`; the child uses only async-signal-safe calls
+   and reports an exec failure through a close-on-exec error pipe, so an
+   exec failure (→ `unknown`) is distinguishable from an exit status. The
+   shim is single-threaded at this point (it dispatches in `main` before any
+   runtime). A rename of any path entry after validation cannot redirect the
+   exec; an in-place change of the validated inode is within the
+   privileged-writer assumption. Because the descriptor is close-on-exec,
+   an interpreter script fails with `ENOENT` (execveat(2)) and yields
+   `unknown`; `sudo` is an ELF executable.
+8. *Deadline.* The parent polls `waitpid(WNOHANG)` every 5 ms up to 5 s,
+   then sends SIGKILL to its own child (same UID) and reaps it. Exit 0 →
+   `exit_zero`; another exit → `exit_nonzero`; signal, deadline or
+   spawn/exec error → `unknown`.
+
+The dynamic loader and shared libraries of the validated executable are
+resolved by path from system directories. They are covered by the same
+privileged-writer assumption and are not validated individually. The empty
+environment removes `LD_*` influence, which matters because under NNP the
+setuid bit is not applied, so the loader does not treat `sudo` as a secure
+exec (*source inference* from the NNP document's loader remark).
+
+**Bridge parsing.** The bridge parses the line only as part of a valid
+table. If it is missing, malformed, duplicated or extra, the table is
+invalid: no tools, row K, quarantine and zero released tools, as today. The
+line is never released, persisted or logged. A **valid** table with a
+failing classification is deliberate (A2): the report stays ADR 0017 row N
+with its tools, and readiness latches `Unavailable(Rights)` before the
+report returns. Tools are released only after ADR 0017 assessment and full
+pinned-identity match, never directly from bridge output.
+
+**Classification** is a pure `classify_rights` over (rights, hardening,
+`no_new_privs`, `sudo`):
 
 | rights | hardening | `no_new_privs` | `sudo` | result |
 | --- | --- | --- | --- | --- |
-| standard | `standard` | `true` | `absent`/`refused` | ok |
-| standard | `standard` | `true` | `effective`/`unknown` | `rights_mismatch` |
+| standard | `standard` | `true` | `absent`/`exit_nonzero` | ok |
+| standard | `standard` | `true` | `exit_zero`/`untrusted`/`unknown` | `rights_mismatch` |
 | standard | `standard` | `false`/`null` | any | `rights_mismatch` |
 | standard | `none` | any | any | `mechanism_unavailable` (R4) |
 | admin | `standard` | any | any | `service_reconfiguration_required` |
-| admin | `none` | `false` | `effective` | ok (pure table only) |
+| admin | `none` | `false` | `exit_zero` | ok (pure table only) |
 | admin | `none` | otherwise | otherwise | `rights_mismatch` |
 
-  Linux admin stays refused before this table, by ADR 0019 D6 and
+- "ok" means only: R4 matched, the shim had NNP, and no trusted `sudo`
+  candidate exited zero inside the fence. It is not a sudoers or root-identity
+  statement.
+- `unknown` and `untrusted` fail closed (U8). A hung `sudo` (for example a
+  slow directory service) or an unprotected system path costs availability,
+  never safety, and proves no sudo policy fact.
+- Linux admin stays refused before this table, by ADR 0019 D6 and
   `Runner::new`. macOS stays `mechanism_unavailable`. The admin rows are
   tested as pure logic only and stay **unverified**.
-- A failing R5 result moves readiness to `Unavailable(Rights)` before the
-  discovery report returns. The report itself stays as ADR 0017 classifies it.
-  Execution then stays unavailable until restart.
-- `unknown` fails closed: a hung `sudo` (for example a slow directory
-  service) costs availability, never safety.
+- A failing R5 result moves readiness to `Unavailable(Rights)`. Execution
+  then stays unavailable until restart.
 
 ### D9. Restart, crash and shutdown recovery
 
-- **Crash during a run.** `KillMode=mixed` makes systemd SIGKILL the processes
-  remaining in the unit cgroup after the main process exits (systemd.kill).
+- **Crash during a run.** `KillMode=mixed` makes systemd send SIGTERM to the
+  main process and SIGKILL to the remaining unit processes (systemd.kill).
   `started` rows reconcile to `interrupted` (existing). Whether systemd also
-  removes the delegated subdirectories at unit stop is not stated in the
-  documents consulted. The janitor handles both outcomes: `runs/` absent
-  means create it; `runs/` present means kill, remove, verify.
+  removes the delegated subdirectories at unit stop stays **unresolved** for
+  the installed versions (U9); the upstream text documents process
+  termination, not directory removal. The janitor handles both outcomes:
+  `runs/` absent means create it; `runs/` present means kill, remove, verify.
+  Stage F must verify the actual package.
 - **Crash during setup or janitor.** Every step is idempotent. Enabling an
   enabled controller is a no-op, `EEXIST` is handled, and the janitor reruns.
-- **Clean stop.** Drain cancels runs, the runner kills and removes its leaves,
-  and the setup sequence returns `Stopped` with no discovery.
-- **Quarantine** (any source) lasts until restart. A janitor failure at the
-  next start quarantines again. There is no agent-reachable reset, and no
-  owner command is added. The owner restarts the service with existing
-  owner tooling.
+- **Clean stop.** Drain cancels runs, the runner kills and removes its leaves
+  (a failure raises the residue signal), and the setup sequence returns
+  `Stopped` with no discovery.
+- **Quarantine and latches** (any source) last until restart. A janitor
+  failure at the next start quarantines again. There is no agent-reachable
+  reset, and no owner command is added. The owner restarts the service with
+  existing owner tooling.
 
 ### D10. Staging and pins
 
@@ -386,9 +629,18 @@ drop-in). The result is `service_hardening = standard`; anything else is
   `capability()` still has `"available":false` and `"service_hardening":null`.
   `list_hosts` output without a cache is unchanged. No production module
   calls `hierarchy::` or `start_daemon_discovery`.
-- The P-SCAN panic-payload set grows by `exec/hierarchy.rs` and the readiness
-  module. It also requires them to contain no `kill(`, `killpg(` or
-  `setpriority(`, so cgroup.kill stays the only kill path.
+- **One panic-scan inventory (S2, A4).** The P-SCAN payload set grows by
+  every production file of the new code: `exec/hierarchy.rs`,
+  `exec/hierarchy/parse.rs`, `exec/hierarchy/setup.rs`,
+  `exec/hierarchy/linux.rs`, `service/unix_bridge/readiness.rs`, and the
+  changed `unix_shim.rs` and `exec/cgroup.rs` (already scanned). `fake.rs` is
+  `cfg(test)` and excluded by name, which the inventory test asserts. The
+  hierarchy files also must contain no `kill(`, `killpg(` or `setpriority(`,
+  so `cgroup.kill` stays the only kill path there; the sudo probe's
+  own-child SIGKILL lives in `unix_shim.rs`. A mutant self-test covers each
+  new denylist token. Payload privacy rests on fixed payloads and the H15
+  subprocess hook evidence, never on `catch_unwind` alone (ADR 0019
+  C2/P1–P7); no service hook changes.
 - Stage G (activation) additionally requires the ADR 0020 implementation
   reviews, the Stage F acceptance evidence for the privileged items in the
   brief, and rendering of readiness and hardening in `capability()`.
@@ -401,15 +653,20 @@ drop-in). The result is `service_hardening = standard`; anything else is
 | `/proc/self/status` (service and shim) | 8,192 bytes | `Hardening` / `null` |
 | any cgroup control file | 4,096 bytes (`text`, `cgroup.rs:23-32`) | step failure |
 | `user.delegate` | 2-byte buffer, exactly 1 byte `1` | `Delegation` |
-| entries per directory listing | 512 | `LeafStructure` |
-| child directories in `runs/` | 64 | `LeafStructure` |
-| janitor kill wait | 5 s, 5 ms poll, shutdown-aware | `KillTimeout` / `Stopped` |
-| rights `sudo` probe | 5 s, kill and reap | `unknown` |
+| raw records per listing (including `.` and `..`) | 512 | `LeafStructure` (S9: `Postcondition`) |
+| child directories in one listing | 64 | `LeafStructure` |
+| control-file name | 64 bytes | refused entry |
+| janitor kill wait | 5 s logical, 5 ms poll, shutdown-aware | `KillTimeout` / `Stopped` |
+| `bin` alias `readlinkat` | 16 bytes | untrusted |
+| rights `sudo` probe | 5 s logical, kill and reap | `unknown` |
 | rights line | 96 bytes | invalid table |
+| residue-producing runner calls per process | `max_concurrent_runs` (D6 assumptions) | latched before |
 
-Every open is descriptor-relative with `O_NOFOLLOW|O_CLOEXEC` (directories
-also `O_DIRECTORY`). Nothing is path-based after the trusted root, and nothing
-is canonicalized.
+Every cgroupfs open is descriptor-relative with `O_NOFOLLOW|O_CLOEXEC`
+(directories also `O_DIRECTORY`; listings use a fresh description). Nothing
+is path-based after the trusted root, and nothing is canonicalized. The
+worst-case probe time is 9 tools × 5 s + 5 s = 50 s, inside the runner's
+60 s discovery timeout; exceeding it is the runner's existing timeout path.
 
 ## Consequences
 
@@ -419,19 +676,23 @@ is canonicalized.
 - Execution becomes available only after a confirmed-empty `runs/`, and
   startup discovery only after that. Agents see `mechanism_unavailable` while
   setup is pending (U5).
-- A host fault on the containment path latches execution off until restart.
-  This replaces repeated row-D refusals with a stable refusal, with no report
-  change.
-- `sudo -n true` runs as the build account at each discovery. On many
-  distributions that writes an authentication log entry.
-- A false `rights_mismatch` is possible (a slow `sudo`). A false pass from a
-  planted `sudo` is not, because candidates are fixed root-owned paths.
+- A containment fault or an unconfirmed leaf cleanup latches execution off
+  until restart, with no report change. At most `max_concurrent_runs` runner
+  calls can leave a residue leaf per process (D6).
+- `sudo -n true` runs as the build account, bound to a validated root-owned
+  executable, at each discovery. On many distributions that writes an
+  authentication log entry.
+- A false `rights_mismatch` is possible (a slow `sudo`, an unprotected
+  candidate). A false pass from an agent-planted `sudo` needs a write to a
+  root-owned, not group/other-writable system ancestor, or to the validated
+  inode, which is outside the build account's reach under the
+  privileged-writer assumption. A pass is never a sudoers-policy proof.
 
 ## Relation to other ADRs
 
-- **ADR 0007.** No change. The runner, `cgroup.rs`, its precondition checks and
-  its cleanup stay as they are. The janitor adds a second kill site that uses
-  the same primitive (`cgroup.kill`).
+- **ADR 0007.** The runner, its precondition checks and its cleanup are
+  unchanged except for the A5 residue signal. The janitor adds a second kill
+  site that uses the same primitive (`cgroup.kill`).
 - **ADR 0009.**
   - *Clarification:* the hierarchy setup sentence is made exact (unit and
     `runs/`, S5/S8).
@@ -439,24 +700,29 @@ is canonicalized.
     before execution becomes available.
   - *Extension:* Linux standard requires `service_hardening = standard`.
   - *Deviation:* the `sudo -n true` effect is observed at each discovery, not
-    before every run. R1–R3 still apply to every run, and R3 is the kernel
-    fence that makes a setuid `sudo` ineffective. Running `sudo` per run would
-    log per run and add a child per request.
+    before every run, and its meaning is narrowed to an in-fence observation
+    (D8). R1–R3 still apply to every run, and R3 is the kernel fence that
+    makes a setuid `sudo` ineffective. Running `sudo` per run would log per
+    run and add a child per request.
   - The janitor failure maps to `quarantined`, its existing meaning.
 - **ADR 0017.** No change to `Report`, `Creation`, rows, quarantine or output
   release. The daemon discovery row uses the same rows. The tool cache follows
   rules 5 and 6 (redacted `Metadata` only; no protected identifier in any
   cache).
 - **ADR 0019 amendments** (to its accepted inactive contract; each needs the
-  Sol review):
+  Sol recheck):
   - A1: one `locate` parser shared by the bridge and setup. It additionally
-    requires `arxd.service` as the unit component (T3).
+    requires `arxd.service` as the unit component (T3). This intentionally
+    refuses inputs that Stage D accepted with another unit component; the
+    T2 fixtures are amended to assert the new refusals (brief P1).
   - A2: the discovery table is `TOOLS.len()` lines plus one rights line
     (brief §4 discovery and S6 output shape). Tools still come only from the
-    `TOOLS` lines.
+    `TOOLS` lines. The shim's sudo probe executes by descriptor (D8).
   - A3: the bridge's `ready: bool` becomes `Readiness` with the D6 and D8
-    latches.
+    latches and the in-slot gate.
   - A4: the P-SCAN set and denylist are extended (D10).
+  - A5: the runner cleanup-residue signal (D6). It is the only runner change
+    and leaves every runner result, report, row and output as it is.
 
 ## Alternatives rejected
 
@@ -470,36 +736,48 @@ is canonicalized.
   code did not create. Refusal is fail-closed.
 - **A new `execution_starting` token.** It would change the response
   vocabulary for a transient state (U5).
-- **A runner-level orphan signal.** It would reopen ADR 0019 D1 and the
-  Stage B review. The latch covers the observable sources (U3).
+- **Latching on every cancellation.** It would let an agent switch execution
+  off at will. The residue signal latches only on unconfirmed cleanup.
+- **Documenting the cancel residue as unbounded.** Rejected: the narrow A5
+  signal plus the in-slot gate bounds it without changing any report.
+- **Moving the executor's preflight inside the slot.** It would change the
+  busy-versus-refusal precedence for every backend; the bridge-local in-slot
+  gate achieves the bound without it.
+- **Executing `sudo` by path after `lstat`.** A replaceable ancestor or a
+  check-to-exec rename could run a different object (S1).
 - **Resolving `sudo` through the owner `PATH`.** That allows an agent-planted
   false pass.
+- **Removing NNP or adding an unfenced privileged probe** to prove sudoers
+  policy. It would weaken the fence the check exists to observe.
 - **Signals for cleanup.** They are impossible without `CAP_KILL`, and
   UID-scoped signals are not a tree boundary.
 
-## Unresolved decisions for the independent review
+## Review decisions applied (from the Sol review)
 
-- U1: rights cadence (discovery-time, not per run) and the window between
-  `Ready` and the first rights line. The alternative is a `HierarchyReady`
-  state that admits only the daemon discovery, which needs an actor-aware
-  preflight.
-- U2: making `user.delegate` mandatory.
-- U3: latching on every `Containment`/`Resource` (including a transient
-  `ENOMEM`) versus a runner residue signal.
-- U4: requiring CapBnd to be exactly equal versus a subset of the three
-  capabilities.
-- U5: no distinct pending token.
-- U6: refusing, rather than removing, unknown or nested children.
-- U7: no startup discovery retry.
-- U8: `sudo` `unknown` → `rights_mismatch`.
-- U9: systemd's handling of delegated children at unit stop (unknown; both
-  cases handled).
+U1 discovery-time diagnostics with narrowed meaning (D7, D8). U2 mandatory
+exact `user.delegate` (D2). U3 conservative `Containment`/`Resource` latch,
+with the bound now carried by A5 and the in-slot gate (D6). U4 exact `CapBnd`
+(D8). U5 Pending → `mechanism_unavailable` (D5). U6 kill the whole subtree,
+refuse unknown names without removing them (D4). U7 no startup retry (D7).
+U8 `unknown` → `rights_mismatch`, with `untrusted` distinct from `absent`
+(D8). U9 systemd directory removal stays unresolved for Stage F (D9).
+
+## Residual decisions for the recheck
+
+- R-1: accept A5 as the only runner change, or prefer documenting an
+  unbounded empty-leaf residual (rejected above).
+- R-2: accept dropping C3 as an alias of C1 when `bin` is the exact
+  merged-`/usr` link, and treating every other link as `untrusted`
+  (availability cost on unusual layouts).
+- R-3: accept the control-file name grammar in D4.3 as fail-closed
+  classification (a future kernel file outside it would refuse setup).
+- R-4: accept `VerifyFailed` as a quarantine (cleanup unconfirmed).
 
 ## Sources and inference
 
 See [0020-design-evidence.md](../reviews/0020-design-evidence.md) for the
-file list at `fdea1c6`, the primary documents (kernel cgroup-v2, systemd
-delegation, `systemd.resource-control`, `systemd.exec`, `systemd.kill`,
-kill(2)) with fetch details, and the full inference list. Hardware, kernel
-and systemd behaviour on the owner's machine is **unverified on real
-hardware**.
+file list, the primary documents (kernel cgroup-v2 and no-new-privileges,
+systemd delegation, `systemd.resource-control`, `systemd.exec`,
+`systemd.kill`, kill(2), open(2), dup(2), opendir(3), execveat(2)) with fetch
+details, and the full inference list. Hardware, kernel and systemd behaviour
+on the owner's machine is **unverified on real hardware**.

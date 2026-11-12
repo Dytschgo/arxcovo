@@ -1,6 +1,8 @@
 # ADR 0020 design evidence and disposition
 
 Author: Anthropic / claude-opus-5-5 / high, design sub-agent, 2026-11-12.
+Sections up to "Review limits" are the original proposal's evidence at
+`fdea1c6`; the final section adds the correction 1 evidence at `d44035d`.
 This is **design evidence, not a review**. The same provider wrote
 [ADR 0020](../adr/0020-linux-execution-hierarchy-and-janitor.md) and the
 [brief](../briefs/0020-linux-hierarchy-implementation.md). A fresh
@@ -105,9 +107,10 @@ fetched bytes.
   outcomes are designed for.
 - That `rmdir` of an empty, never-populated leaf does not fail in practice
   (the D6 cancel residual).
-- That `sudo` under `PR_SET_NO_NEW_PRIVS` cannot elevate. The kernel no-new-
-  privileges semantics were not fetched for this ADR, and A7 is the
-  acceptance item.
+- *Superseded by correction 1:* that `sudo` under `PR_SET_NO_NEW_PRIVS`
+  cannot elevate. The kernel no-new-privileges document is now fetched (see
+  below); what `sudo` itself prints or returns when it starts without root
+  remains inference, and A7 is the acceptance item.
 - Kernel version facts (`cgroup.kill` in 5.14, `NoNewPrivs` status line in
   4.10) are from memory, not from fetched documents.
 
@@ -138,3 +141,87 @@ fetched bytes.
     stages merge.
 - Native, installed and dedicated paths remain **unverified on real
   hardware**. M2 remains incomplete.
+
+## Correction 1 evidence (2026-11-12)
+
+Author: Anthropic / claude-opus-5-5 / high, design sub-agent. Still design
+evidence, not a review; same-provider authorship. Docs only: no code, build,
+test, mutation, CI run, push, GitHub write, native/root/owner/account/
+service/cgroup/VM operation, experiment, Lab Manager access or private-state
+read. No `E_PROTECTION` or S4U retry.
+
+### Base and isolation
+
+- Runtime-prepared isolated T3 worktree; `git rev-parse --show-toplevel`
+  named the worktree, distinct from the canonical checkout. HEAD
+  `d44035dee79403b6386215d4aa8ca5254f37dc35`, tree clean before any write.
+  No checkout was created or switched.
+- `git diff --stat fdea1c6 d44035d` lists only docs (the proposal, the Sol
+  review and `PROGRESS.md`), so every code citation at `fdea1c6` still holds.
+- Retention check by blob id: the three proposal files are identical in
+  `e3928f5` and `54032bf`; the review file is identical in `8ff4196` and
+  `8ff3a54`. The review file was not edited by this correction.
+
+### Additional repository sources (blob ids at `d44035d`)
+
+| Blob | File | Used for |
+| --- | --- | --- |
+| `f6c65008a7bb` | `crates/arxd/src/exec/cgroup.rs` | every residue site: create-path `unlinkat`, `kill_and_confirm` false paths, `Drop`; owned-temp test pattern for E5 |
+| `d3ec3e7e26a0` | `crates/arxd/src/exec/unix.rs` | `socketpair` (`:223-224`), final recheck (`:344-352`), spawn (`:353-355`), NNP and capability clearing (`:242-310`), `walk`, `trusted_root` |
+| `9c538ee25bf0` | `crates/arxd/src/service/executor.rs` | preflight before `active.fetch_add` (`:337-352`), `AcqRel` slot operations, stopping serialization |
+| `00f8f2c0aae6` | `crates/arxd/src/service/unix_bridge.rs` | body refusal shape (`:74`), failure mapping, `cgroup_parent` |
+| `05d052e1650e` | `crates/arxd/src/service/unix_bridge/tests.rs` | Stage D T2 fixtures (one accepted, all others refused) |
+| `ca4a7729992d` | `crates/arxd/src/unix_shim.rs` | path-based `Command` spawns, single-threaded entry, probe timing |
+| `91ed14c574ca` | `crates/arxd/src/development/mod.rs` | `TOOLS` has 9 entries (probe time budget) |
+| `c875ccab1d97` | `crates/arxd/src/exec/stage_b_tests.rs` | current P-SCAN inventory and negative controls |
+| `05dafc6752e5` | `crates/arxd/src/service/application.rs` | `stop_accepting`, drain order |
+| `c0488d356ca7` | `crates/arxd/src/service/mod.rs` | `start_discovery` after `Running` |
+
+ADR 0009 (packaged drop-in, `rights_mismatch` row, slice 9 text) and ADR 0019
+(D1–D7, C2/G-P1–G-P3) were re-read for the narrowed rights meaning and the
+A5 delta.
+
+### Primary documents fetched for the correction
+
+Fetched with plain `curl` into a session scratch directory; no repository,
+owner or account data was sent. Current public heads, not the target
+distribution's versions.
+
+| SHA-256 prefix | Source | Facts used |
+| --- | --- | --- |
+| `73cd16bb37fab267` | kernel `Documentation/userspace-api/no_new_privs.rst` (raw GitHub) | NNP is inherited across fork, clone and execve and cannot be unset; with it, setuid/setgid bits no longer change the uid or gid and file capabilities do not add to the permitted set; NNP "does not prevent privilege changes that do not involve `execve()`"; the loader treats `LD_*` differently for setuid programs |
+| `6e15f3808cc32bae` | docs.kernel.org `admin-guide/cgroup-v2.html` | `cgroup.events` is flat-keyed with `populated` and `frozen`; `cgroup.kill` kills the cgroup and all descendants with SIGKILL, handles concurrent forks and is migration-protected, `EOPNOTSUPP` in threaded cgroups; a cgroup with no children or live processes can be removed; frozen tasks die from fatal signals; `cgroup.pressure` is a control file name |
+| `d665489cadb85624` | man7.org open(2) | each `open()` creates a new open file description that records the file offset |
+| `f0b886340b0471a1` | man7.org dup(2) | duplicates share offset and status flags; the duplicate's close-on-exec flag is off |
+| `ec26d14cd175c865` | man7.org opendir(3) | after `fdopendir`, the descriptor is used internally and should not otherwise be used |
+| `130e3c72c4f84ddf` | man7.org execveat(2) | `AT_EMPTY_PATH` executes the file referred to by the descriptor, which may come from `O_PATH`; with close-on-exec set, an interpreter script fails with `ENOENT` |
+
+The raw GitHub fetch of `cgroup-v2.rst` was rate-limited (HTTP 429 body);
+the rendered docs.kernel.org page was used instead. A `getdents(2)` page was
+also fetched but is not relied on.
+
+### Inference added or retained by the correction
+
+- The release-sequence argument in ADR 0020 D6 (every `AcqRel`
+  read-modify-write on `active` after a release synchronizes with it) is
+  reasoning from the Rust/C++ atomics model, not a fetched document.
+- That an agent cannot cause cleanup to fail at will (the residue latch is
+  a host or kernel fault signal).
+- That the dynamic loader does not use secure-exec handling for a setuid
+  binary started under NNP, so `LD_*` would apply; the probe uses an empty
+  environment regardless.
+- That cgroupfs offers no user creation of regular files or symlinks; the
+  D4.3 refusal rows are fail-closed classification either way.
+- That kernel control-file names fit `[a-z0-9_]+(\.[a-z0-9_]+)+` within 64
+  bytes (from the documented names; a future name outside it would refuse
+  setup, residual decision R-3).
+- What `sudo` returns when executed without root under NNP (A7).
+- That `execveat` on an `O_PATH` descriptor of the installed ELF `sudo`
+  works for the build account (A11).
+
+### Limits
+
+Nothing was executed beyond read-only git inspection, file reads and the
+public fetches above. Future tests are requirements, not passes. Native,
+installed and dedicated paths remain **unverified on real hardware**; M2
+remains incomplete.
