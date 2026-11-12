@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Production native execution is inactive; no experiment retry is authorized.
+- Last merged PR: #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`, 14:47:06 UTC, all five gates on c6eb700 plus independent Opus review. Squash tree equals reviewed head. Main CI after #52 is pending, not claimed green.
+- Stage B hosted Unix condition is met: run `43238092776` passed all platforms. Linux nextest 243 passed / 3 skipped; macOS 244 passed / 1 skipped. Both logs show r1_l1_marker_never_executes passed. These are hosted job-log observations, not local Unix runs. Root-only phase sites and real shutdown propagation remain source-reviewed, not native acceptance.
+- Queue priority: Stage C fixed Unix exec-child shim and tool-probe, independent Opus security review, then hosted gates; Stage D bridge follows separately. Cgroup setup/cleanup, E_PROTECTION diagnosis/disposable experiment and activation retain separate gates. No runner root-only path or production caller is enabled.
+- Provider assignment: OpenAI / gpt-6.1-sol / high builds Stage C in an isolated worktree. Anthropic / Opus 5.5 / high independently reviews. The shim routes before runtime/config access, refuses euid 0, resolves only fixed tools or absolute targets, opens cwd without links, bounds probe output/time and uses a silent panic hook only in its separate shim process. All valid execution fixtures must be ordinary-user owned synthetic paths, never service/build accounts or installed state.
+- Before adding the shim to P-SCAN, audit the disclosed alternate forms (UFCS/function-value/raw unwrap, renamed logging macro, RunFailure type alias From and stderr writeln). A green lexical scan alone is not a privacy proof. Preserve owner CLI routing and every Stage B legacy/phase/cancellation guarantee.
+- Main after #51 passed run 43233144276 in 596s. ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe or babysitter change.
+
+## Historical checkpoint before Stage B merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
 - Queue priority: Stage B publication for hosted Unix compilation/tests and exact-head independent review, then merge only after all five gates. Stages C/D follow separately; cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain gated. No experiment retry is authorized.
