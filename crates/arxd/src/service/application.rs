@@ -52,7 +52,7 @@ impl Hooks for Native {
         Ok(pins)
     }
     fn store(&self, layout: &Layout) -> Result<Activity, ExitCode> {
-        Activity::open_service(layout).map_err(|_| ExitCode::Store)
+        Activity::open_service(layout).map_err(|error| store_category(&error))
     }
     fn bind(&self, layout: &Layout, client: String) -> Result<Listener, ExitCode> {
         Listener::bind_service(layout, client).map_err(|_| ExitCode::Endpoint)
@@ -62,6 +62,12 @@ impl Hooks for Native {
             Ok(()) => ExecutionUnavailable::MechanismUnavailable,
             Err(reason) => reason,
         }
+    }
+}
+fn store_category(error: &anyhow::Error) -> ExitCode {
+    match error.downcast_ref::<Error>() {
+        Some(Error::Permissions | Error::OwnerRequired) => ExitCode::Permissions,
+        _ => ExitCode::Store,
     }
 }
 fn category(error: Error) -> ExitCode {

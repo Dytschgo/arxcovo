@@ -826,3 +826,36 @@ async fn dedicated_report_mcp_privacy_in_memory() {
         e.drain().await.unwrap();
     }
 }
+
+#[test]
+fn state_store_errors_keep_permissions_separate_from_storage_failures() {
+    for error in [Error::Permissions, Error::OwnerRequired] {
+        let error = anyhow::Error::new(error).context("fixed test context");
+        assert_eq!(store_category(&error), ExitCode::Permissions);
+    }
+    for error in [
+        Error::Config,
+        Error::Identity,
+        Error::AccountMissing,
+        Error::Rights,
+        Error::Workspace,
+        Error::Layout,
+        Error::Manager,
+        Error::NativeAdapterMissing,
+        Error::NotInstalled,
+        Error::Foreign,
+        Error::Active,
+    ] {
+        assert_eq!(store_category(&anyhow::Error::new(error)), ExitCode::Store);
+    }
+    assert_eq!(
+        store_category(&anyhow::anyhow!("synthetic store failure")),
+        ExitCode::Store
+    );
+    assert_eq!(
+        store_category(&anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))),
+        ExitCode::Store
+    );
+}
