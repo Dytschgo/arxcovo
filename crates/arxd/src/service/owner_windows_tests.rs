@@ -1131,3 +1131,29 @@ fn s1_owner_authority_cannot_be_forged_by_sibling_modules() {
         }
     }
 }
+
+#[test]
+fn configure_session_fake_can_refuse_without_native_calls() {
+    struct Refusal;
+    impl ConfigureSession for Refusal {
+        fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure> {
+            Err(Failure::Busy)
+        }
+        fn observe_batch(&mut self, _: &str) -> Result<BatchObservation, Failure> {
+            Err(Failure::Busy)
+        }
+        fn configure(&mut self, _: &Configure) -> Result<(), Failure> {
+            Err(Failure::Busy)
+        }
+    }
+    let _configure: fn(&mut Refusal, &Configure) -> Result<(), Failure> =
+        <Refusal as ConfigureSession>::configure;
+    fn read(s: &mut impl ConfigureSession) -> Result<Option<Vec<u8>>, Failure> {
+        s.read_config()
+    }
+    assert!(matches!(read(&mut Refusal), Err(Failure::Busy)));
+    assert!(matches!(
+        Refusal.observe_batch("synthetic"),
+        Err(Failure::Busy)
+    ));
+}

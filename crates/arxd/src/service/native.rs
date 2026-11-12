@@ -113,7 +113,15 @@ pub fn read_config(layout: &Layout) -> Result<ServiceConfig, Error> {
         true,
         &os::protection(&opened.file)?,
     )?;
-    ServiceConfig::parse_inventory(&bytes, layout, &NativeResolver)
+    inventory_config(&bytes, layout, &NativeResolver)
+}
+// Shared with safe resolver fixtures; native reads always pass NativeResolver.
+fn inventory_config(
+    bytes: &[u8],
+    layout: &Layout,
+    resolver: &impl Resolver,
+) -> Result<ServiceConfig, Error> {
+    ServiceConfig::parse_inventory(bytes, layout, resolver)
 }
 #[cfg(unix)]
 pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
@@ -135,6 +143,9 @@ pub(crate) fn ensure_endpoint_directory(layout: &Layout) -> Result<Observed, Err
 /// checked before the first write. Retain namespace pins for its entire life.
 pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
     require_service_identity()?;
+    state_members(layout)
+}
+fn state_members(layout: &Layout) -> Result<Vec<Observed>, Error> {
     let mut pins = vec![checked(
         layout.state(),
         true,
@@ -174,6 +185,27 @@ pub(crate) fn state_guard(layout: &Layout) -> Result<Vec<Observed>, Error> {
         }
     }
     Ok(pins)
+}
+// S3 consumes this hook; state policies remain SYSTEM-private.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn owner_start_preflight(layout: &Layout) -> Result<(), Error> {
+    start_preflight_with(
+        || observe_layout(layout),
+        || read_config(layout),
+        || state_members(layout),
+    )
+}
+#[cfg(any(windows, test))]
+fn start_preflight_with<L, C, S>(
+    layout: impl FnOnce() -> Result<L, Error>,
+    config: impl FnOnce() -> Result<C, Error>,
+    state: impl FnOnce() -> Result<S, Error>,
+) -> Result<(), Error> {
+    let _layout = layout()?;
+    let _config = config()?;
+    let _state = state()?;
+    Ok(())
 }
 #[cfg(all(test, windows))]
 pub(crate) fn state_fixture_pins(dir: &Path) -> anyhow::Result<Vec<Observed>> {
@@ -567,6 +599,92 @@ mod stock_directory_observations {
         println!("ARXCOVO_STOCK_DIRECTORY_OBSERVATIONS={encoded}");
         for (label, accepted) in controls {
             assert!(accepted, "{label}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_preflight_tests {
+    use super::*;
+    use std::cell::RefCell;
+    #[test]
+    fn native_read_parser_makes_only_client_observations() {
+        use super::super::config::{AccountKind, tests::fixture};
+        struct InventoryOnly(std::cell::Cell<usize>);
+        impl Resolver for InventoryOnly {
+            fn account(&self, value: &str) -> Result<Account, Error> {
+                assert_eq!(value, "1001");
+                self.0.set(self.0.get() + 1);
+                Ok(Account {
+                    identity: value.into(),
+                    gid: Some(1001),
+                    kind: AccountKind::User,
+                    administrative: false,
+                })
+            }
+            fn revision(&self, _: &str) -> Result<Option<String>, Error> {
+                panic!("inventory revision observation");
+            }
+            fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+                panic!("inventory workspace observation");
+            }
+        }
+        let resolver = InventoryOnly(std::cell::Cell::new(0));
+        inventory_config(
+            &serde_json::to_vec(&fixture()).unwrap(),
+            &Layout::for_test(super::super::layout::Platform::Linux),
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(resolver.0.get(), 1);
+    }
+    #[test]
+    fn owner_preflight_order_errors_and_pins() {
+        #[cfg(windows)]
+        let _hook: fn(&Layout) -> Result<(), Error> = owner_start_preflight;
+        struct Pin<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+        impl Drop for Pin<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(self.1);
+            }
+        }
+        for fail in 0..=3 {
+            let events = RefCell::new(vec![]);
+            let op = |i, name, dropped| {
+                events.borrow_mut().push(name);
+                if fail == i {
+                    Err(Error::Permissions)
+                } else {
+                    Ok(Pin(&events, dropped))
+                }
+            };
+            let result = start_preflight_with(
+                || op(1, "layout", "drop-layout"),
+                || op(2, "config", "drop-config"),
+                || op(3, "state", "drop-state"),
+            );
+            assert_eq!(
+                result,
+                if fail == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Permissions)
+                }
+            );
+            let expected = match fail {
+                1 => vec!["layout"],
+                2 => vec!["layout", "config", "drop-layout"],
+                3 => vec!["layout", "config", "state", "drop-config", "drop-layout"],
+                _ => vec![
+                    "layout",
+                    "config",
+                    "state",
+                    "drop-state",
+                    "drop-config",
+                    "drop-layout",
+                ],
+            };
+            assert_eq!(*events.borrow(), expected);
         }
     }
 }

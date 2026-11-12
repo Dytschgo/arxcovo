@@ -3,6 +3,25 @@ use super::layout::{Error, Layout, Platform};
 use super::preflight::ExecutionUnavailable;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+pub const DEFAULT_LIMITS: (u8, u64, u32) = (1, 8_589_934_592, 512);
+/// Owner input; deliberately neither Debug nor Clone.
+// S3 consumes this library hook.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ConfigureRequest<'a> {
+    pub build_account: &'a str,
+    pub client_account: &'a str,
+    pub rights: Rights,
+    pub workspace: &'a str,
+    pub environment: &'a [(String, String)],
+    pub agents: &'a [(String, String)],
+}
+pub(crate) fn valid_principal(p: &str) -> bool {
+    p != "arxd"
+        && !p.is_empty()
+        && p.len() <= 64
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +103,63 @@ fn validate_platform_rights(platform: Platform, rights: Rights) -> Result<(), Er
     Ok(())
 }
 impl ServiceConfig {
+    // S3 consumes this library hook.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_request(
+        r: &ConfigureRequest<'_>,
+        l: &Layout,
+        res: &impl Resolver,
+    ) -> Result<Self, Error> {
+        validate_platform_rights(l.platform(), r.rights)?;
+        let mut environment = BTreeMap::new();
+        for (key, value) in r.environment {
+            if environment.insert(key.clone(), value.clone()).is_some() {
+                return Err(Error::Config);
+            }
+        }
+        let build = res.account(r.build_account)?;
+        if build.kind != AccountKind::User {
+            return Err(Error::Identity);
+        }
+        let client = res.account(r.client_account)?;
+        if client.kind != AccountKind::User {
+            return Err(Error::Identity);
+        }
+        let wire = Wire {
+            schema: "arxd-service/1".into(),
+            client: Client {
+                identity: client.identity,
+            },
+            build_account: BuildAccount {
+                name: r.build_account.into(),
+                identity: build.identity,
+                gid: build.gid,
+            },
+            rights: r.rights,
+            workspace: r.workspace.into(),
+            environment,
+            limits: Limits {
+                max_concurrent_runs: DEFAULT_LIMITS.0,
+                memory_bytes: DEFAULT_LIMITS.1,
+                pids: DEFAULT_LIMITS.2,
+            },
+            agents: r
+                .agents
+                .iter()
+                .map(|(p, h)| Agent {
+                    principal: p.clone(),
+                    token_sha256: h.clone(),
+                })
+                .collect(),
+            granted_batch_right: false,
+        };
+        Self::parse(
+            &serde_json::to_vec(&wire).map_err(|_| Error::Config)?,
+            l,
+            res,
+        )
+    }
+
     pub fn parse(bytes: &[u8], layout: &Layout, resolver: &impl Resolver) -> Result<Self, Error> {
         if bytes.len() > MAX_CONFIG_BYTES {
             return Err(Error::Config);
@@ -228,13 +304,7 @@ impl ServiceConfig {
         let mut names = BTreeSet::new();
         let mut hashes = BTreeSet::new();
         if w.agents.iter().any(|a| {
-            a.principal == "arxd"
-                || a.principal.is_empty()
-                || a.principal.len() > 64
-                || !a
-                    .principal
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            !valid_principal(&a.principal)
                 || !names.insert(&a.principal)
                 || a.token_sha256.len() != 64
                 || !a.token_sha256.bytes().all(|b| b.is_ascii_hexdigit())
@@ -886,5 +956,288 @@ mod service_boundary_tests {
             config.execution_preflight(&Layout::for_test(Platform::Macos), &Poison),
             Err(ExecutionUnavailable::AdminUnsupportedOnPlatform)
         );
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use std::cell::RefCell;
+    struct Counting {
+        platform: Platform,
+        calls: RefCell<Vec<String>>,
+        group: Option<&'static str>,
+        missing: Option<&'static str>,
+        safe: bool,
+        admin: bool,
+        unsafe_workspace: Option<&'static str>,
+    }
+    impl Counting {
+        fn new(platform: Platform) -> Self {
+            Self {
+                platform,
+                calls: RefCell::new(vec![]),
+                group: None,
+                missing: None,
+                safe: true,
+                admin: false,
+                unsafe_workspace: None,
+            }
+        }
+        fn id(&self, name: &str) -> String {
+            let n = if name == "builder" { "1002" } else { "1001" };
+            if self.platform == Platform::Windows {
+                format!("S-1-5-21-100-200-300-{n}")
+            } else {
+                n.into()
+            }
+        }
+    }
+    impl Resolver for Counting {
+        fn revision(&self, n: &str) -> Result<Option<String>, Error> {
+            self.calls.borrow_mut().push(format!("revision:{n}"));
+            Ok(None)
+        }
+        fn account(&self, n: &str) -> Result<Account, Error> {
+            self.calls.borrow_mut().push(format!("account:{n}"));
+            if self.missing == Some(n) {
+                return Err(Error::AccountMissing);
+            }
+            Ok(Account {
+                identity: if n == "builder" || n == "client" {
+                    self.id(n)
+                } else {
+                    n.into()
+                },
+                gid: (self.platform != Platform::Windows).then_some(1002),
+                kind: if self.group == Some(n) {
+                    AccountKind::Group
+                } else {
+                    AccountKind::User
+                },
+                administrative: self.admin,
+            })
+        }
+        fn workspace_safe(&self, p: &str) -> Result<bool, Error> {
+            self.calls.borrow_mut().push(format!("workspace:{p}"));
+            Ok(self.safe && self.unsafe_workspace != Some(p))
+        }
+    }
+    fn request<'a>(
+        env: &'a [(String, String)],
+        agents: &'a [(String, String)],
+        windows: bool,
+    ) -> ConfigureRequest<'a> {
+        ConfigureRequest {
+            build_account: "builder",
+            client_account: "client",
+            rights: Rights::Standard,
+            workspace: if windows { r"C:\work" } else { "/work" },
+            environment: env,
+            agents,
+        }
+    }
+    #[test]
+    fn request_canonical_json_and_full_parse_on_all_platforms() {
+        for platform in [Platform::Windows, Platform::Linux, Platform::Macos] {
+            let l = Layout::for_test(platform);
+            let r = Counting::new(platform);
+            let env = vec![("TZ".into(), "UTC".into()), ("PATH".into(), "tools".into())];
+            let agents = vec![
+                ("second".into(), "b".repeat(64)),
+                ("first".into(), "a".repeat(64)),
+            ];
+            let req = request(&env, &agents, platform == Platform::Windows);
+            let c = ServiceConfig::from_request(&req, &l, &r).unwrap();
+            let expected = serde_json::json!({"schema":"arxd-service/1", "client":{"identity":r.id("client")}, "build_account":{"name":"builder","identity":r.id("builder"),"gid":if platform == Platform::Windows {None} else {Some(1002)}}, "rights":"standard", "workspace":req.workspace, "environment":{"TZ":"UTC","PATH":"tools"}, "limits":{"max_concurrent_runs":1,"memory_bytes":8589934592_u64,"pids":512}, "agents":[{"principal":"second","token_sha256":"b".repeat(64)},{"principal":"first","token_sha256":"a".repeat(64)}],"granted_batch_right":false});
+            let bytes = c.serialized(false).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                expected
+            );
+            assert_eq!(bytes, serde_json::to_vec(&c.wire).unwrap());
+            assert_eq!(
+                ServiceConfig::parse(&bytes, &l, &r)
+                    .unwrap()
+                    .serialized(false)
+                    .unwrap(),
+                bytes
+            );
+            assert_eq!(c.limits(), DEFAULT_LIMITS);
+            assert_eq!(
+                &r.calls.borrow()[..2],
+                ["account:builder", "account:client"]
+            );
+            assert!(r.calls.borrow().iter().any(|s| s.starts_with("workspace:")));
+        }
+    }
+    #[test]
+    fn request_guards_precede_all_resolver_observation() {
+        let env = vec![("PATH".into(), "a".into()), ("PATH".into(), "b".into())];
+        let r = Counting::new(Platform::Macos);
+        let mut req = request(&env, &[], false);
+        req.rights = Rights::Admin;
+        assert!(matches!(
+            ServiceConfig::from_request(&req, &Layout::for_test(Platform::Macos), &r),
+            Err(Error::Rights)
+        ));
+        assert!(r.calls.borrow().is_empty());
+        req.rights = Rights::Standard;
+        assert!(matches!(
+            ServiceConfig::from_request(&req, &Layout::for_test(Platform::Macos), &r),
+            Err(Error::Config)
+        ));
+        assert!(r.calls.borrow().is_empty());
+    }
+    #[test]
+    fn request_group_missing_and_full_validation_refusals() {
+        let l = Layout::for_test(Platform::Linux);
+        let agents = vec![("test".into(), "a".repeat(64))];
+        let req = request(&[], &agents, false);
+        for name in ["builder", "client"] {
+            let mut r = Counting::new(Platform::Linux);
+            r.group = Some(name);
+            assert!(matches!(
+                ServiceConfig::from_request(&req, &l, &r),
+                Err(Error::Identity)
+            ));
+            assert_eq!(
+                r.calls.borrow().len(),
+                if name == "builder" { 1 } else { 2 }
+            );
+            r.group = None;
+            r.missing = Some(name);
+            assert!(matches!(
+                ServiceConfig::from_request(&req, &l, &r),
+                Err(Error::AccountMissing)
+            ));
+        }
+        let mut r = Counting::new(Platform::Linux);
+        r.safe = false;
+        assert!(matches!(
+            ServiceConfig::from_request(&req, &l, &r),
+            Err(Error::Workspace)
+        ));
+        r.safe = true;
+        r.admin = true;
+        assert!(matches!(
+            ServiceConfig::from_request(&req, &l, &r),
+            Err(Error::Rights)
+        ));
+        r.admin = false;
+        for bad in [
+            vec![],
+            vec![("arxd".into(), "a".repeat(64))],
+            vec![("test".into(), "bad".into())],
+            vec![("a".into(), "a".repeat(64)), ("b".into(), "a".repeat(64))],
+        ] {
+            assert!(matches!(
+                ServiceConfig::from_request(&request(&[], &bad, false), &l, &r),
+                Err(Error::Config)
+            ));
+        }
+        let env = vec![("UNSAFE".into(), "x".into())];
+        assert!(matches!(
+            ServiceConfig::from_request(&request(&env, &agents, false), &l, &r),
+            Err(Error::Config)
+        ));
+    }
+    #[test]
+    fn previous_config_full_validation_and_inventory_boundary_are_preserved() {
+        for platform in [Platform::Linux, Platform::Windows, Platform::Macos] {
+            let l = Layout::for_test(platform);
+            let mut r = Counting::new(platform);
+            let agents = vec![("old".into(), "a".repeat(64))];
+            let old = ServiceConfig::from_request(
+                &request(&[], &agents, platform == Platform::Windows),
+                &l,
+                &r,
+            )
+            .unwrap();
+            let bytes = old.serialized(false).unwrap();
+            r.safe = false;
+            assert!(matches!(
+                ServiceConfig::parse(&bytes, &l, &r),
+                Err(Error::Workspace)
+            ));
+            assert_eq!(old.revalidate(&l, &r), Err(Error::Workspace));
+            r.calls.borrow_mut().clear();
+            ServiceConfig::parse_inventory(&bytes, &l, &r).unwrap();
+            assert_eq!(*r.calls.borrow(), [format!("account:{}", r.id("client"))]);
+            r.safe = true;
+            let fresh = vec![("new".into(), "b".repeat(64))];
+            let new = ServiceConfig::from_request(
+                &request(&[], &fresh, platform == Platform::Windows),
+                &l,
+                &r,
+            )
+            .unwrap();
+            assert_eq!(
+                new.agents().collect::<Vec<_>>(),
+                [("new", "b".repeat(64).as_str())]
+            );
+            r.missing = Some("builder");
+            assert!(ServiceConfig::parse(&bytes, &l, &r).is_err());
+            assert!(old.revalidate(&l, &r).is_err());
+        }
+    }
+    #[test]
+    fn configure_plan_revalidates_old_workspace_and_preserves_exact_previous_bytes() {
+        use super::super::owner_plan::{Operation, OwnerContext, configure_plan};
+        for platform in [Platform::Linux, Platform::Macos] {
+            let layout = Layout::for_test(platform);
+            let context = OwnerContext {
+                admin: true,
+                running_binary: layout.binary(),
+            };
+            let mut resolver = Counting::new(platform);
+            let old_agents = vec![("old".into(), "a".repeat(64))];
+            let new_agents = vec![("new".into(), "b".repeat(64))];
+            let old =
+                ServiceConfig::from_request(&request(&[], &old_agents, false), &layout, &resolver)
+                    .unwrap();
+            let mut req = request(&[], &new_agents, false);
+            req.workspace = "/new-work";
+            let new = ServiceConfig::from_request(&req, &layout, &resolver).unwrap();
+            resolver.unsafe_workspace = Some("/work");
+            resolver.calls.borrow_mut().clear();
+            assert!(matches!(
+                configure_plan(&layout, &context, &new, Some(&old), None, &resolver),
+                Err(Error::Workspace)
+            ));
+            assert!(resolver.calls.borrow().contains(&"workspace:/work".into()));
+            resolver.unsafe_workspace = None;
+            let plan =
+                configure_plan(&layout, &context, &new, Some(&old), None, &resolver).unwrap();
+            let (bytes, expected) = plan
+                .operations()
+                .iter()
+                .find_map(|op| match op {
+                    Operation::AtomicConfig {
+                        bytes, expected, ..
+                    } => Some((bytes, expected)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(expected.as_ref().unwrap(), &old.serialized(false).unwrap());
+            assert_eq!(bytes, &new.serialized(false).unwrap());
+            assert_eq!(
+                ServiceConfig::parse(bytes, &layout, &resolver)
+                    .unwrap()
+                    .agents()
+                    .map(|(p, _)| p.to_owned())
+                    .collect::<Vec<_>>(),
+                ["new"]
+            );
+        }
+    }
+    #[test]
+    fn principal_rule_boundaries() {
+        for p in ["a", "A09-_", &"a".repeat(64)] {
+            assert!(valid_principal(p));
+        }
+        for p in ["", "arxd", "a.b", "ä", &"a".repeat(65)] {
+            assert!(!valid_principal(p));
+        }
     }
 }

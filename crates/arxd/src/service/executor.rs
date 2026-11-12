@@ -69,27 +69,32 @@ fn absolute_executable(p: &str) -> bool {
         && p.as_bytes()[2] == b'\\'
         && !p[2..].contains(':')
         && p.to_ascii_lowercase().ends_with(".exe")
-        && p[3..].split(['/', '\\']).all(|part| {
-            let base = part
-                .split('.')
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(' ')
-                .to_ascii_uppercase();
-            let port = base
-                .strip_prefix("COM")
-                .or_else(|| base.strip_prefix("LPT"));
-            !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str())
-                && !matches!(
-                    port,
-                    Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
-                )
-        });
+        && p[3..].split(['/', '\\']).all(windows_component_safe);
     #[cfg(not(windows))]
     let absolute = p.starts_with('/') && !p.starts_with("//") && !p.contains(['\\', ':']);
     absolute
         && p.split(['/', '\\'])
             .all(|c| c != "." && c != ".." && !c.ends_with([' ', '.']))
+}
+/// Shared lexical Windows component rule; COM0/LPT0/COM10 remain ordinary names.
+// S2/S3 consume this hook on all platforms.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn windows_component_safe(part: &str) -> bool {
+    let base = part
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let port = base
+        .strip_prefix("COM")
+        .or_else(|| base.strip_prefix("LPT"));
+    !part.ends_with([' ', '.'])
+        && !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str())
+        && !matches!(
+            port,
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        )
 }
 pub fn schema() -> Value {
     json!({"type":"object","oneOf":[{"required":["tool"]},{"required":["executable"]}],"properties":{"tool":{"type":"string","enum":crate::development::TOOLS},"executable":{"type":"string","maxLength":4096},"args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},"cwd":{"type":"string","maxLength":4096},"timeout_s":{"type":"integer","minimum":1,"maximum":3600},"output_bytes":{"type":"integer","minimum":2,"maximum":8192}},"additionalProperties":false})
