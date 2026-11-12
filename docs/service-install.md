@@ -13,6 +13,12 @@ workspace is valid. Restore the old workspace, or uninstall, delete the config
 by hand, install and configure. Changing the pinned build account also requires
 uninstall, manual config deletion, install and configure (ADR 0009/0018).
 
+A missing account in the existing config refuses with `service-identity`
+(exit 3), before checking its old workspace. Restore the old account facts,
+or uninstall, delete the config by hand, install and configure. The separate
+`service-account-missing` token can come from a new-account lookup on Windows;
+full validation of the previous config retains the library's Identity mapping.
+
 On `client-config-partial`, no registration hash was supplied. The private file
 and any newly created private parent remain; the file may contain credentials.
 Delete that private file by hand and rerun. No automatic rollback or deletion

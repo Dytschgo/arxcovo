@@ -2,6 +2,8 @@
 
 ## Current state — 2026-11-12
 
+- S3 review at `7f70852` is CHANGES REQUIRED on both axes, retained in [the independent report](reviews/0018-s3-independent-review.md). Coordinator Sol medium corrects the brief to preserve the existing Identity mapping for missing old accounts and records the accepted deferred-start shape; both clarifications require cross-provider recheck. Correction attempt 1 will add exact resolver ordering, changed-pin/missing-account/new-SID/recorded-grant wiring cases, accepted parser boundaries, all uninstall tokens and full marker argument forwarding. S3 stays unpublished; no library error mapping change or native owner operation is authorized.
+
 - Coordinator review checkpoint: main after #49, run `43221533019` on `c4ef8ad`, completed successfully (12:50:01 to 12:57:20 UTC, 439s). S3 candidate `558b948` / source `edcadff` is integrated locally for independent Opus high review. The old-build-account token discrepancy is open: existing full config validation maps execution preflight AccountMissing to Identity, both exit 3, while the brief requires AccountMissing. No library or contract change is accepted yet. The deferred Windows start closure and acknowledged recording-matrix gaps also require review. No publication or activation is accepted by the 295-pass local result.
 
 - Milestone 1 accepted; M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No acceptance or activation claimed.
