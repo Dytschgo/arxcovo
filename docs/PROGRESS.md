@@ -6,8 +6,17 @@
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
 - Queue priority: finish existing #36/#9/#26/#34 through independent review and every required platform check. No new feature PRs or gate bypass.
 - User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. Completion remains pending, and the original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
-- Prepared a local per-PR concurrency improvement to retire superseded builds without cancelling main measurements. Node policy/workflow tests pass 19/19; independent review and hosted verification are pending. No measured speedup is claimed.
+- Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; independent recheck remains pending. No measured speedup is claimed.
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
+
+## Historical checkpoint from main before the Actions reset — 2026-11-11
+
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#14](https://github.com/Dytschgo/arxcovo/pull/14), `5b4f6b20796d599a015ca048dc4edaeb72546387`, 19:51:48 UTC, through all five gates. The Unix executor is library-only; no Unix MCP execution route is activated.
+- Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. The macOS owner parser still refuses Unknown.
+- Queue priority: fix the three #36 execution/audit review blockers and finish existing evidence/test PRs through independent reviews. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
+- Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
+
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -91,7 +100,7 @@
 - First manual Windows run 42995659949 failed without locating its setup failure; cleanup reported true. Second run [43003724132](https://github.com/Dytschgo/arxcovo/actions/runs/43003724132), at reviewed immutable `2299ad4`, returned task code 2 after successful privilege and account API diagnostics. Setup reported result-validation failure and cleanup true. No S4U success is established. The dispatch variable was deleted and read back absent.
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
-- Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
+- Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. At this historical checkpoint, no privileged Linux experiment had run (superseded by the first reviewed experiment failure recorded above).
 - Windows rooted-path fix #16 is merged after fresh independent review; its bare-prefix correction passed 39 local tests. Activity-integrity #18 is closed as superseded by merged #19, including completion and fixed unknown-tool-label regressions.
 - Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
@@ -108,6 +117,8 @@
 - [ ] 6. Authenticated browser/Electron dashboard with hosts, VMs, activity, terminal and console; Playwright and screenshots.
 
 ## Blockers and owner actions
+
+- Fresh main Ubuntu CI fails in Playwright dependency installation after the mirror rewrite; job `130963746682` reports network-unreachable on the Kernel mirror IPv6 address (APT exit 100). This is not a green recovery and does not establish a DNS cause. Concurrency cannot repair runner network connectivity; no workaround or retry has been applied.
 
 - Actions reset follow-up (2026-11-12): fresh dispatches now start, but the 12 old queued records reject even force cancellation with 409. Their cleanup still needs GitHub Support; no cause or account restriction is confirmed. New CI results remain pending; the original main push is not green. [Exact reset and local workflow audit](reviews/actions-queue-reset.md).
 
