@@ -75,8 +75,9 @@ class ObservationTests(unittest.TestCase):
 
     def test_success_is_publication_unresolved_and_tree_unchanged_no_writers(self):
         def snapshot():
-            return [(str(p.relative_to(self.root)), p.read_bytes(), p.stat().st_mtime_ns,
-                     p.stat().st_mode, p.stat().st_nlink) for p in self.root.rglob("*") if p.is_file()]
+            return sorted((str(p.relative_to(self.root)), p.read_bytes() if p.is_file() else None,
+                           p.stat().st_mtime_ns, p.stat().st_mode, p.stat().st_nlink)
+                          for p in self.root.rglob("*"))
         before = snapshot()
         # Module-local pure-helper entry spies; no process-wide OS/socket patch.
         with patch.object(diag.mirror, "apply") as apply, patch.object(diag.mirror, "_apply") as write:
