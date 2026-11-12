@@ -155,3 +155,30 @@ execution. No broad Rust run was appropriate for this helper-only change.
 - Coordinator must obtain fresh Opus high independent security/source review
   before pushing the cherry-picked source; final candidate still needs its own
   unchanged required checks and measured acceptance. This source is not merged.
+
+## B1 correction - coordinator Sol medium
+
+Opus source review `57f3ab12` found URL-normalization/retained-byte mismatch.
+After CRLF terminator removal, the helper now refuses embedded CR, VT, FF,
+FS/GS/RS, NEL and Unicode line/paragraph separators before tokenization.
+New regression cases cover inner/prefix separators, tagged and untagged,
+and canonical CRLF -> exact 195-byte output.
+
+Before the fix the new 32-test suite failed 14 assertions; after the fix all
+32 passed (0.243 seconds, Windows Python). Two temporary compiled Python
+mutants (separator guard removed, CRLF handling removed) each failed assertions;
+original helper bytes were restored and checked. git diff --check passed.
+No actual APT, root, network or hosted invocation. These are local correction
+checks, not native acceptance or independent recheck. No extra source scope,
+speed threshold or attempt-count change. Source-review B1 recheck is pending.
+
+## Final PR54 root integration
+
+Integrated onto published PR54 head `344c406`, preserving its existing
+headless-shell and dev-debuginfo changes. Helper/test/contract bytes exactly
+match B1-reviewed `8c2ea11`. Delta paths match the owner-approved scope.
+Root ran Python32/32 and all Node script tests21/21 on this integrated base;
+no full Rust repeat (no Rust source changed by this delta). Policy, workflow,
+Cargo and existing speed changes are unchanged from `344c406`. Independent
+source review remains at its own pins, not credited as new hosted evidence.
+Push starts final performance attempt 3; all performance thresholds remain.
