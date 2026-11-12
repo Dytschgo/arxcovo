@@ -19,7 +19,22 @@ fn stat(fd: ClientHandle<'_>) -> io::Result<libc::stat> {
     Ok(unsafe { s.assume_init() })
 }
 pub(super) fn elevated() -> Result<bool, ClientError> {
-    Ok(unsafe { libc::getuid() == 0 || libc::geteuid() == 0 || libc::getuid() != libc::geteuid() })
+    Ok(unsafe {
+        elevated_ids(
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getgid(),
+            libc::getegid(),
+        )
+    })
+}
+pub(super) fn elevated_ids(
+    uid: libc::uid_t,
+    euid: libc::uid_t,
+    gid: libc::gid_t,
+    egid: libc::gid_t,
+) -> bool {
+    uid == 0 || euid == 0 || uid != euid || gid != egid
 }
 fn open_at(
     fd: ClientHandle<'_>,
@@ -32,7 +47,7 @@ fn open_at(
             fd.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
+            libc::c_uint::from(mode),
         )
     };
     if raw == -1 {
@@ -132,11 +147,6 @@ impl NativeFileOps {
             uid: unsafe { libc::geteuid() },
         })
     }
-    // Syscall results and fixture results meet here, before the shared Partial classifier.
-    pub(super) fn result_with(call: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        call()?;
-        Ok(())
-    }
     pub(super) fn verify_with(
         &self,
         facts: impl FnOnce() -> io::Result<libc::stat>,
@@ -157,21 +167,26 @@ impl NativeFileOps {
 }
 impl PostCreateOps for NativeFileOps {
     fn mode(&mut self, f: ClientHandle<'_>) -> io::Result<()> {
-        Self::result_with(|| cv(unsafe { libc::fchmod(f.as_raw_fd(), 0o600) }))
+        cv(unsafe { libc::fchmod(f.as_raw_fd(), 0o600) })
     }
     fn write(&mut self, f: ClientHandle<'_>, json: &[u8]) -> io::Result<()> {
-        Self::result_with(|| {
-            let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(f.as_raw_fd()) });
-            file.write_all(json)
-        })
+        let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(f.as_raw_fd()) });
+        file.write_all(json)
     }
     fn flush(&mut self, f: ClientHandle<'_>) -> io::Result<()> {
-        Self::result_with(|| cv(unsafe { libc::fsync(f.as_raw_fd()) }))
+        cv(unsafe { libc::fsync(f.as_raw_fd()) })
     }
     fn sync_parent(&mut self, f: ClientHandle<'_>) -> io::Result<()> {
-        Self::result_with(|| cv(unsafe { libc::fsync(f.as_raw_fd()) }))
+        cv(unsafe { libc::fsync(f.as_raw_fd()) })
     }
     fn verify(&mut self, f: ClientHandle<'_>, expected: u64) -> io::Result<()> {
         self.verify_with(|| stat(f), expected)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn native_mode_sync_conversion() {
+    assert!(cv(-1).is_err(), "failed native return");
+    assert!(cv(0).is_ok(), "successful native return");
 }

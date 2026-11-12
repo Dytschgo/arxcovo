@@ -185,7 +185,7 @@ impl Ops {
     fn result(&mut self, step: Step) -> io::Result<()> {
         self.calls.push(step);
         if self.fail == Some(step) {
-            platform::NativeFileOps::result_with(|| Err(error()))
+            Err(error())
         } else {
             Ok(())
         }
@@ -201,7 +201,7 @@ impl PostCreateOps for Ops {
         self.result(Step::Write)?;
         if self.prefix {
             self.native.write(f, &b[..13])?;
-            platform::NativeFileOps::result_with(|| Err(error()))
+            Err(error())
         } else {
             self.native.write(f, b)
         }
@@ -393,6 +393,11 @@ fn post_create_native_result_matrix_retains_exact_prefix() {
     {
         let observer = AllocationObserver::register();
         let f = Fixture::new();
+        drop(platform::Parent::open(&f.out).unwrap_or_else(|_| panic!("matrix private parent")));
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let parent_before = fs::metadata(&f.parent).unwrap();
         let mut ops = Ops::new();
         ops.fail = fail;
         ops.prefix = prefix;
@@ -424,6 +429,21 @@ fn post_create_native_result_matrix_retains_exact_prefix() {
             );
         }
         f.private();
+        #[cfg(unix)]
+        {
+            let m = fs::metadata(&f.out).unwrap();
+            assert!(m.mode() & 0o077 == 0, "private before Mode");
+            if last != Step::Mode {
+                assert!(m.mode() & 0o777 == 0o600, "exact mode after Mode");
+            }
+            let after = fs::metadata(&f.parent).unwrap();
+            assert!(
+                parent_before.mode() == after.mode()
+                    && parent_before.uid() == after.uid()
+                    && parent_before.gid() == after.gid(),
+                "parent mode/owner unchanged"
+            );
+        }
         assert!(
             fs::read_dir(&f.parent).unwrap().count() == 1,
             "no rollback or extra entry"
@@ -873,5 +893,197 @@ fn preflight_failures_preserve_existing_target_and_parent() {
             );
         }
         observer.check(usize::from(kind == 2), 0);
+    }
+}
+
+#[test]
+fn native_readonly_handle_errors_reach_partial() {
+    let f = Fixture::new();
+    f.run(&mut Ops::new()).unwrap();
+    let before = f.bytes();
+    let readonly = fs::File::open(&f.out).unwrap_or_else(|_| panic!("readonly fixture"));
+    #[cfg(unix)]
+    use std::os::fd::AsFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsHandle;
+    #[cfg(windows)]
+    let handle = readonly.as_handle();
+    #[cfg(unix)]
+    let handle = readonly.as_fd();
+    let mut native = platform::NativeFileOps::new().unwrap();
+    assert!(
+        matches!(
+            partial(native.write(handle, b"synthetic")),
+            Err(ClientError::Partial)
+        ),
+        "native Write failure"
+    );
+    #[cfg(windows)]
+    assert!(
+        matches!(partial(native.flush(handle)), Err(ClientError::Partial)),
+        "native Flush failure"
+    );
+    #[cfg(unix)]
+    {
+        // A pipe is a genuine descriptor on which fsync is invalid; no invalid
+        // BorrowedFd or process identity change is needed.
+        let (reader, _writer) = std::io::pipe().unwrap();
+        assert!(
+            matches!(
+                partial(native.flush(reader.as_fd())),
+                Err(ClientError::Partial)
+            ),
+            "native Flush failure"
+        );
+        assert!(
+            matches!(
+                partial(native.sync_parent(reader.as_fd())),
+                Err(ClientError::Partial)
+            ),
+            "native SyncParent failure"
+        );
+    }
+    drop(readonly);
+    assert!(before == f.bytes(), "readonly failure changed bytes");
+    f.private();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pinned_parent_and_intermediate_refuse_rename_until_release() {
+    let f = Fixture::new();
+    // Make both components private through the real Parent walker.
+    drop(platform::Parent::open(&f.out).unwrap_or_else(|_| panic!("private ancestor")));
+    let immediate = f.parent.join("inner");
+    let out = immediate.join("credential.json");
+    let pins =
+        platform::Parent::open(out.to_str().unwrap()).unwrap_or_else(|_| panic!("pinned chain"));
+    for path in [&immediate, &f.parent] {
+        let moved = path.with_file_name("moved");
+        assert!(
+            fs::rename(path, &moved).is_err(),
+            "pinned directory rename refused"
+        );
+    }
+    assert!(!out.exists(), "pinning created credential");
+    drop(pins);
+    for path in [&immediate, &f.parent] {
+        let moved = path.with_file_name("moved");
+        assert!(
+            fs::rename(path, &moved).is_ok(),
+            "released directory rename succeeds"
+        );
+        assert!(fs::rename(&moved, path).is_ok(), "owned directory restored");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_real_deny_and_null_dacl_parent_refused_without_mutation() {
+    for null_dacl in [false, true] {
+        let f = Fixture::new();
+        assert!(
+            platform::fixture_negative_parent(f.parent.to_str().unwrap(), null_dacl).is_ok(),
+            "negative ACL fixture"
+        );
+        let before = platform::fixture_snapshot(f.parent.to_str().unwrap()).unwrap();
+        let time = fs::metadata(&f.parent).unwrap().modified().unwrap();
+        let observer = AllocationObserver::register();
+        let mut ops = Ops::new();
+        assert!(
+            matches!(f.run(&mut ops), Err(ClientError::Parent)),
+            "real ACL refused/no hash"
+        );
+        assert!(
+            ops.calls.is_empty() && !std::path::Path::new(&f.out).exists(),
+            "no post-create or target"
+        );
+        assert!(
+            fs::read_dir(&f.parent).unwrap().count() == 0,
+            "no directory mutation"
+        );
+        assert!(
+            before == platform::fixture_snapshot(f.parent.to_str().unwrap()).unwrap(),
+            "ACL facts unchanged"
+        );
+        assert!(
+            time == fs::metadata(&f.parent).unwrap().modified().unwrap(),
+            "parent time unchanged"
+        );
+        observer.check(1, 1);
+    }
+}
+
+#[test]
+fn intermediate_link_ancestor_refused_without_mutation() {
+    let f = Fixture::new();
+    let target = f.parent.with_file_name("target");
+    fs::create_dir(&target).unwrap();
+    let inner = target.join("inner");
+    fs::create_dir(&inner).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, &f.parent).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // Give the final parent the real private descriptor so only the
+        // intermediate reparse check can refuse this chain.
+        fs::remove_dir(&inner).unwrap();
+        let dummy = inner.join("unused.json");
+        drop(
+            platform::Parent::open(dummy.to_str().unwrap())
+                .unwrap_or_else(|_| panic!("private final parent")),
+        );
+        assert!(
+            platform::fixture_junction(f.parent.to_str().unwrap(), target.to_str().unwrap())
+                .is_ok(),
+            "intermediate junction fixture"
+        );
+    }
+    let out = f.parent.join("inner").join("credential.json");
+    let observer = AllocationObserver::register();
+    let mut ops = Ops::new();
+    assert!(
+        matches!(
+            create_with(
+                "agent",
+                out.to_str().unwrap(),
+                UNIX,
+                "0",
+                || Ok(false),
+                random,
+                &mut ops
+            ),
+            Err(ClientError::Parent)
+        ),
+        "intermediate link refused/no hash"
+    );
+    assert!(
+        ops.calls.is_empty() && fs::read_dir(&inner).unwrap().count() == 0,
+        "link target unchanged"
+    );
+    observer.check(1, 1);
+    #[cfg(windows)]
+    fs::remove_dir(&f.parent).unwrap_or_else(|_| panic!("owned junction cleanup"));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_identity_mismatch_is_pure() {
+    for (uid, euid, gid, egid, expected) in [
+        (1000, 1000, 1000, 1000, false),
+        (0, 0, 1000, 1000, true),
+        (0, 1000, 1000, 1000, true),
+        (1000, 0, 1000, 1000, true),
+        (1000, 1001, 1000, 1000, true),
+        (1000, 1000, 1000, 1001, true),
+    ] {
+        assert!(
+            platform::elevated_ids(uid, euid, gid, egid) == expected,
+            "UID/GID refusal"
+        );
     }
 }

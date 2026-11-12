@@ -129,7 +129,7 @@ fn open_dir(path: &str) -> io::Result<OwnedHandle> {
     let h = unsafe {
         CreateFileW(
             wide(path).as_ptr(),
-            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null(),
             OPEN_EXISTING,
@@ -294,9 +294,6 @@ impl Parent {
             if !f.directory || !f.disk || f.reparse {
                 return Err(ClientError::Parent);
             }
-            if final_parent {
-                check(&f, &user, true, 0).map_err(|_| ClientError::Parent)?;
-            }
             pins.push(handle);
         }
         check(
@@ -347,10 +344,6 @@ impl NativeFileOps {
             user: user(&token()?)?,
         })
     }
-    pub(super) fn result_with(call: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        call()?;
-        Ok(())
-    }
     pub(super) fn verify_with(
         &self,
         acquire: impl FnOnce() -> io::Result<Facts>,
@@ -362,14 +355,12 @@ impl NativeFileOps {
 }
 impl PostCreateOps for NativeFileOps {
     fn write(&mut self, f: ClientHandle<'_>, json: &[u8]) -> io::Result<()> {
-        Self::result_with(|| {
-            let mut file =
-                std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(f.as_raw_handle()) });
-            file.write_all(json)
-        })
+        let mut file =
+            std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(f.as_raw_handle()) });
+        file.write_all(json)
     }
     fn flush(&mut self, f: ClientHandle<'_>) -> io::Result<()> {
-        Self::result_with(|| bool_result(unsafe { FlushFileBuffers(f.as_raw_handle()) }))
+        bool_result(unsafe { FlushFileBuffers(f.as_raw_handle()) })
     }
     fn verify(&mut self, f: ClientHandle<'_>, expected: u64) -> io::Result<()> {
         self.verify_with(|| facts(f), expected)
@@ -485,4 +476,25 @@ pub(super) fn fixture_junction(path: &str, target: &str) -> io::Result<()> {
 #[cfg(test)]
 pub(super) fn fixture_snapshot(path: &str) -> io::Result<Facts> {
     facts(open_dir(path)?.as_handle())
+}
+
+#[cfg(test)]
+pub(super) fn fixture_negative_parent(path: &str, null_dacl: bool) -> io::Result<()> {
+    let u = user(&token()?)?;
+    let dacl = if null_dacl {
+        "D:NO_ACCESS_CONTROL".to_owned()
+    } else {
+        format!("D:P(A;OICI;FA;;;{u})(D;OICI;FA;;;S-1-5-21-100-200-300-999)")
+    };
+    let mut raw = ptr::null_mut();
+    bool_result(unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(&format!("O:{u}{dacl}")).as_ptr(),
+            1,
+            &mut raw,
+            ptr::null_mut(),
+        )
+    })?;
+    let sd = Descriptor(Local(raw));
+    bool_result(unsafe { CreateDirectoryW(wide(path).as_ptr(), &sd.attributes()) })
 }
