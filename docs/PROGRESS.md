@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: #48, `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC. All five gates and independent review passed on `21638d9`; squash tree equals the reviewed head. Main run `43213333692` succeeded in 637s (11:55:40 to 12:06:17 UTC).
+- Queue priority: publish S2 for hosted Linux/macOS/Windows verification and exact-head recheck, then S3 wiring (invalid install test first). The inactive Unix bridge contract remains separately prepared at `22ca777` and unimplemented.
+- S2 source at `3a4ef95` passes independent Anthropic / Opus 5.5 / high review through the retained full review and two rechecks. SP-3R is closed by real NativeFileOps::verify valid, wrong-length and failed-fact-acquisition cases. [Final recheck](reviews/0018-s2-native-verify-opus-recheck.md). Coordinator OpenAI / gpt-6.1-sol / medium integrates the report and refreshes these status lines only; source remains byte-identical to `3a4ef95`.
+- Coordinator Windows validation at the correction-2 source: fmt, locked workspace/all-target Clippy, focused 1, two compiled assertion-kill mutants restored, and one normal workspace nextest run `3dfa9110-e373-4a8b-9a7b-863ae7c707f6`, 287 passed / 2 skipped. These checks are credited to that source, not rerun for docs. [Evidence](evidence/owner-cli-s2-correction2.md). Reviewer independently ran focused 16/16 and three Verify mutations; no reviewer full suite is claimed.
+- Real hosted Unix build/tests remain required. Local Windows passes and stub type checks do not satisfy that condition. Publication is for hosted verification; merge requires all five gates and a different-provider exact-head review. No S2 acceptance yet. Residual Mode and intermediate-pin test limitations remain disclosed.
+- ExecutionFailed remains unexplained; no pass is a fix, failure-rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, experiment retry, third S4U probe or babysitter change.
+
+## Historical checkpoint before S2 publication
+
+
 - Coordinator OpenAI / gpt-6.1-sol / medium correction attempt 2: Opus recheck `a873c2a` closed SP-1 through SP-8 except SP-3R, a missing native Verify adapter error test. Added a valid control, wrong-length rejection and real attributes-only-handle GetSecurityInfo failure through NativeFileOps::verify and the Partial classifier. Production source is unchanged. Independent recheck and hosted gates remain required before publication.
 
 - Coordinator checkpoint: main after #48, run `43213333692` at `77dcce64f097ecbf5c66601920a60fb03436c57b`, completed successfully (11:55:40 to 12:06:17 UTC, 637s). Prior pending observations below are historical. S2 correction source `fd57bbd` and evidence `753e9cf` are integrated without changes to S1/lib.rs; independent Opus recheck is next, and hosted Unix verification is still pending. No new test run is claimed. The coordinator repaired legacy CP1252 dash bytes in this file to valid UTF-8 without removing history.
