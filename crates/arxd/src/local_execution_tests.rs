@@ -577,11 +577,79 @@ async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
     }
 }
 
+// Owned only by this fixture. Dropping the sender releases both preflight and
+// the backend even when a cancellation assertion panics (including mutations).
+struct CancellationProbe {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    preflight_entered: tokio::sync::Notify,
+    backend_entered: tokio::sync::Notify,
+}
+impl crate::service::executor::Executor for CancellationProbe {
+    fn preflight(&self) -> Result<(), crate::service::preflight::ExecutionUnavailable> {
+        self.preflight_entered.notify_one();
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3));
+        Ok(())
+    }
+    fn run(
+        &self,
+        _: Option<&crate::service::executor::Request>,
+        cancel: &crate::development::Cancellation,
+        shutdown: &crate::development::Cancellation,
+    ) -> crate::service::executor::Report {
+        self.backend_entered.notify_one();
+        while !cancel.is_cancelled() && !shutdown.is_cancelled() {
+            // Test failure drops the sender; no worker survives a broken guard.
+            if matches!(
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(2)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ) {
+                break;
+            }
+        }
+        crate::service::executor::Report::FakeForTest {
+            stop: if shutdown.is_cancelled() {
+                crate::store::StopReason::Shutdown
+            } else if cancel.is_cancelled() {
+                crate::store::StopReason::Cancelled
+            } else {
+                crate::store::StopReason::Exited
+            },
+            cleanup: true,
+        }
+    }
+}
+async fn cancellation_stage<T>(stage: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), future)
+        .await
+        .unwrap_or_else(|_| panic!("cancellation stage timed out: {stage}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_fake_sdk_cancellation_propagates_without_shutdown() {
-    use std::sync::atomic::Ordering;
+    dedicated_sdk_cancellation(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_sdk_cancellation_explicit_without_shutdown() {
+    dedicated_sdk_cancellation(false).await;
+}
+
+async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
     let state = private_dir();
-    let (execution, calls) = crate::service::executor::tests::fake(true, true);
+    let (release, receive) = std::sync::mpsc::channel();
+    let probe = Arc::new(CancellationProbe {
+        release: std::sync::Mutex::new(receive),
+        preflight_entered: tokio::sync::Notify::new(),
+        backend_entered: tokio::sync::Notify::new(),
+    });
+    let execution = crate::service::executor::tests::backend_fixture(probe.clone());
     let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
     store.dedicated = Some(execution.clone());
     let activity = Arc::new(store);
@@ -618,15 +686,43 @@ async fn dedicated_fake_sdk_cancellation_propagates_without_shutdown() {
         )
         .await
         .unwrap();
-    let pending = tokio::spawn(handle.await_response());
-    until(|| calls.load(Ordering::SeqCst) == 1).await;
-    assert!(pending.await.unwrap().is_err());
+    cancellation_stage("preflight entry", probe.preflight_entered.notified()).await;
+    // Deliberately hold the real dispatch beyond the old 200ms startup budget.
+    // rmcp 3.9 starts its response timer when await_response is polled, so keep
+    // the handle unpolled until backend entry. This retains automatic timeout
+    // coverage without requiring Windows to finish preflight inside 200ms.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    release.send(()).expect("preflight release");
+    cancellation_stage("backend entry", probe.backend_entered.notified()).await;
+    if automatic_timeout {
+        let response = cancellation_stage("SDK automatic timeout", handle.await_response()).await;
+        assert!(
+            matches!(response, Err(rmcp::ServiceError::Timeout { .. })),
+            "stage: expected SDK timeout"
+        );
+    } else {
+        cancellation_stage(
+            "SDK explicit cancellation",
+            handle.cancel(Some("fixture cancellation".into())),
+        )
+        .await
+        .unwrap();
+    }
     let conn = db(state.path());
     let state = || {
         conn.query_row::<(String,Option<String>),_,_>("SELECT outcome,stop_reason FROM activity WHERE tool='run_command' ORDER BY id DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap()
     };
-    until(|| state().0 != "started").await;
-    assert_eq!(state(), ("failed".into(), Some("cancelled".into())));
+    cancellation_stage("durable audit completion without shutdown", async {
+        while state().0 == "started" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        state(),
+        ("failed".into(), Some("cancelled".into())),
+        "stage: durable cancellation before shutdown"
+    );
     a.cancel().await.unwrap();
     execution.shutdown();
     stop.cancel();
