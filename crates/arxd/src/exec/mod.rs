@@ -7,10 +7,6 @@
 use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
@@ -104,15 +100,59 @@ impl From<std::io::Error> for ExecError {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
-impl Cancellation {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+// ADR 0019 C1: additive shared type identity; public API is preserved.
+pub use crate::development::Cancellation;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotStarted {
+    Invalid,
+    Unsupported,
+    ServiceIdentity,
+    AccountPolicy,
+    AccountChanged,
+    PrivateRoots,
+    Containment,
+    Resource,
+    Shutdown,
+    Cancelled,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    NotStarted(NotStarted),
+    SpawnFailed,
+    AfterSpawn,
+}
+// Never format this value or reconstruct legacy errors from the phase.
+struct RunFailure {
+    phase: RunError,
+    legacy: ExecError,
+}
+impl RunFailure {
+    fn new(phase: RunError, legacy: ExecError) -> Self {
+        Self { phase, legacy }
     }
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn os(phase: RunError, error: std::io::Error) -> Self {
+        Self::new(phase, ExecError::from(error))
     }
+}
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn shutdown_requested(runner: bool, caller: bool) -> bool {
+    runner || caller
+}
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn recheck(cancel: bool, shutdown: bool) -> Option<RunFailure> {
+    let class = if shutdown {
+        NotStarted::Shutdown
+    } else if cancel {
+        NotStarted::Cancelled
+    } else {
+        return None;
+    };
+    Some(RunFailure::new(
+        RunError::NotStarted(class),
+        ExecError::Unavailable("run already cancelled or shutting down"),
+    ))
 }
 
 pub struct Runner {
@@ -134,15 +174,41 @@ impl Runner {
     }
     pub fn run(&self, spec: &RunSpec, cancellation: &Cancellation) -> Result<RunResult, ExecError> {
         validate_spec(spec)?;
+        self.run_core(spec, cancellation, None)
+            .map_err(|f| f.legacy)
+    }
+    pub fn run_phased(
+        &self,
+        spec: &RunSpec,
+        cancellation: &Cancellation,
+        shutdown: &Cancellation,
+    ) -> Result<RunResult, RunError> {
+        validate_phased_spec(spec).map_err(|_| RunError::NotStarted(NotStarted::Invalid))?;
+        self.run_core(spec, cancellation, Some(shutdown))
+            .map_err(|f| f.phase)
+    }
+    fn run_core(
+        &self,
+        spec: &RunSpec,
+        cancellation: &Cancellation,
+        caller_shutdown: Option<&Cancellation>,
+    ) -> Result<RunResult, RunFailure> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            unix::run(&self.config, spec, cancellation, &self.shutdown)
+            unix::run(
+                &self.config,
+                spec,
+                cancellation,
+                &self.shutdown,
+                caller_shutdown,
+            )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (&self.config, cancellation);
-            Err(ExecError::Unavailable(
-                "execution backend unavailable on this OS",
+            let _ = (&self.config, spec, cancellation, caller_shutdown);
+            Err(RunFailure::new(
+                RunError::NotStarted(NotStarted::Unsupported),
+                ExecError::Unavailable("execution backend unavailable on this OS"),
             ))
         }
     }
@@ -242,6 +308,28 @@ fn validate_spec(s: &RunSpec) -> Result<(), ExecError> {
     }
     Ok(())
 }
+// Only the exact shim prefix earns overhead; the agent tail retains legacy bounds.
+fn validate_phased_spec(s: &RunSpec) -> Result<(), ExecError> {
+    if s.arguments.first().is_none_or(|a| a != "exec-child") {
+        return validate_spec(s);
+    }
+    let a = &s.arguments;
+    if a.len() < 4
+        || !matches!(a[1].as_str(), "path" | "tool")
+        || a[2].is_empty()
+        || a[2].len() > 4096
+        || a[3].len() > 4096
+        || a[..4].iter().any(|v| v.contains('\0'))
+    {
+        return Err(ExecError::Invalid("argv bounds"));
+    }
+    let tail = RunSpec {
+        arguments: a[4..].to_vec(),
+        ..s.clone()
+    };
+    validate_spec(&tail)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn stop_reason(
     elapsed: Duration,
@@ -264,3 +352,6 @@ fn stop_reason(
 mod disposable;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stage_b_tests;

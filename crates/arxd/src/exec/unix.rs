@@ -19,7 +19,12 @@ fn errno() -> std::io::Error {
 fn components(p: &Path) -> Vec<CString> {
     p.components()
         .filter_map(|c| match c {
-            Component::Normal(s) => Some(CString::new(s.as_bytes()).expect("validated path")),
+            Component::Normal(s) => {
+                let Ok(name) = CString::new(s.as_bytes()) else {
+                    unreachable!("validated path")
+                };
+                Some(name)
+            }
             _ => None,
         })
         .collect()
@@ -59,10 +64,15 @@ pub(super) fn walk(names: &[CString]) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn account(c: &OwnerConfig) -> Result<Vec<OwnedFd>, ExecError> {
+fn account(c: &OwnerConfig) -> Result<Vec<OwnedFd>, RunFailure> {
     // NSS lookup/group expansion is deliberately outside pre_exec. Bound both
     // buffers and refuse ERANGE instead of retrying with unbounded allocations.
-    let name = CString::new(c.account.as_str()).map_err(|_| ExecError::Invalid("account"))?;
+    let name = CString::new(c.account.as_str()).map_err(|_| {
+        RunFailure::new(
+            RunError::NotStarted(NotStarted::AccountPolicy),
+            ExecError::Invalid("account"),
+        )
+    })?;
     let mut buffer = vec![0u8; 65536];
     let mut pw = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut result = std::ptr::null_mut();
@@ -76,13 +86,17 @@ fn account(c: &OwnerConfig) -> Result<Vec<OwnedFd>, ExecError> {
         )
     };
     if rc != 0 || result.is_null() {
-        return Err(ExecError::Unavailable(
-            "pinned account missing or lookup failed",
+        return Err(RunFailure::new(
+            RunError::NotStarted(NotStarted::AccountPolicy),
+            ExecError::Unavailable("pinned account missing or lookup failed"),
         ));
     }
     let pw = unsafe { pw.assume_init() };
     if pw.pw_uid != c.uid || pw.pw_gid != c.gid {
-        return Err(ExecError::Unavailable("pinned identity changed"));
+        return Err(RunFailure::new(
+            RunError::NotStarted(NotStarted::AccountChanged),
+            ExecError::Unavailable("pinned identity changed"),
+        ));
     }
     let mut groups = [0; 64];
     let mut count = groups.len() as libc::c_int;
@@ -95,8 +109,9 @@ fn account(c: &OwnerConfig) -> Result<Vec<OwnedFd>, ExecError> {
             .iter()
             .any(|g| i64::from(*g) != i64::from(c.gid))
     {
-        return Err(ExecError::Unavailable(
-            "supplementary group membership forbidden",
+        return Err(RunFailure::new(
+            RunError::NotStarted(NotStarted::AccountPolicy),
+            ExecError::Unavailable("supplementary group membership forbidden"),
         ));
     }
     let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
@@ -111,22 +126,30 @@ fn account(c: &OwnerConfig) -> Result<Vec<OwnedFd>, ExecError> {
         )
     };
     if rc != 0 || found.is_null() || unsafe { group.assume_init() }.gr_gid != c.gid {
-        return Err(ExecError::Unavailable(
-            "dedicated account-named primary group required",
+        return Err(RunFailure::new(
+            RunError::NotStarted(NotStarted::AccountPolicy),
+            ExecError::Unavailable("dedicated account-named primary group required"),
         ));
     }
     // Private roots must be actual root-owned no-follow directories, inaccessible
     // to group/other. Owner configuration must enumerate all private roots.
     let mut private_roots = Vec::new();
     for p in &c.protected_directories {
-        let fd = trusted_root(p)?;
+        let fd = trusted_root(p)
+            .map_err(|e| RunFailure::os(RunError::NotStarted(NotStarted::PrivateRoots), e))?;
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-            return Err(errno().into());
+            return Err(RunFailure::os(
+                RunError::NotStarted(NotStarted::PrivateRoots),
+                errno(),
+            ));
         }
         let st = unsafe { st.assume_init() };
         if st.st_uid != 0 || st.st_mode & 0o077 != 0 {
-            return Err(ExecError::Unavailable("private directory is not root-only"));
+            return Err(RunFailure::new(
+                RunError::NotStarted(NotStarted::PrivateRoots),
+                ExecError::Unavailable("private directory is not root-only"),
+            ));
         }
         private_roots.push(fd);
     }
@@ -138,17 +161,23 @@ pub(super) fn run(
     s: &RunSpec,
     cancel: &Cancellation,
     shutdown: &Cancellation,
-) -> Result<RunResult, ExecError> {
+    caller_shutdown: Option<&Cancellation>,
+) -> Result<RunResult, RunFailure> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
-        return Err(ExecError::Unavailable(
-            "root service identity required; no owner fallback",
+        return Err(RunFailure::new(
+            RunError::NotStarted(NotStarted::ServiceIdentity),
+            ExecError::Unavailable("root service identity required; no owner fallback"),
         ));
     }
     let private_roots = account(c)?;
-    if cancel.is_cancelled() || shutdown.is_cancelled() {
-        return Err(ExecError::Unavailable(
-            "run already cancelled or shutting down",
-        ));
+    if let Some(failure) = recheck(
+        cancel.is_cancelled(),
+        shutdown_requested(
+            shutdown.is_cancelled(),
+            caller_shutdown.is_some_and(Cancellation::is_cancelled),
+        ),
+    ) {
+        return Err(failure);
     }
     #[cfg(target_os = "macos")]
     let cwd = {
@@ -157,33 +186,42 @@ pub(super) fn run(
         names
     };
     #[cfg(target_os = "linux")]
-    let workspace_path = CString::new(c.workspace.as_os_str().as_bytes()).expect("validated path");
+    let Ok(workspace_path) = CString::new(c.workspace.as_os_str().as_bytes()) else {
+        unreachable!("validated path")
+    };
     #[cfg(target_os = "linux")]
-    let relative_cwd = CString::new(if s.cwd.as_os_str().is_empty() {
+    let Ok(relative_cwd) = CString::new(if s.cwd.as_os_str().is_empty() {
         b".".as_slice()
     } else {
         s.cwd.as_os_str().as_bytes()
-    })
-    .expect("validated cwd");
+    }) else {
+        unreachable!("validated cwd")
+    };
     #[cfg(target_os = "macos")]
     let fd_limit = {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-            return Err(errno().into());
+            return Err(RunFailure::os(
+                RunError::NotStarted(NotStarted::Containment),
+                errno(),
+            ));
         }
         let max = unsafe { limit.assume_init() }.rlim_max;
         if max > 1_048_576 {
-            return Err(ExecError::Unavailable(
-                "descriptor limit exceeds safe inheritance closure",
+            return Err(RunFailure::new(
+                RunError::NotStarted(NotStarted::Containment),
+                ExecError::Unavailable("descriptor limit exceeds safe inheritance closure"),
             ));
         }
         max as i32
     };
     #[cfg(target_os = "linux")]
-    let group = super::cgroup::Group::create(c)?;
+    let group = super::cgroup::Group::create(c)
+        .map_err(|e| RunFailure::new(RunError::NotStarted(NotStarted::Containment), e))?;
     #[cfg(target_os = "linux")]
     let procs_fd = group.procs.as_raw_fd();
-    let (mut observer, reporter) = UnixStream::pair()?;
+    let (mut observer, reporter) = UnixStream::pair()
+        .map_err(|e| RunFailure::os(RunError::NotStarted(NotStarted::Resource), e))?;
     let report_fd = reporter.as_raw_fd();
     let (uid, gid) = (c.uid, c.gid);
     let mut command = Command::new(&s.executable);
@@ -302,7 +340,19 @@ pub(super) fn run(
         });
     }
     let started = Instant::now();
-    let child = command.spawn()?;
+    // ADR 0019 C3: retain the early check and close the final race window.
+    if let Some(failure) = recheck(
+        cancel.is_cancelled(),
+        shutdown_requested(
+            shutdown.is_cancelled(),
+            caller_shutdown.is_some_and(Cancellation::is_cancelled),
+        ),
+    ) {
+        return Err(failure);
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| RunFailure::os(RunError::SpawnFailed, e))?;
     drop(command);
     drop(reporter);
     #[cfg(target_os = "linux")]
@@ -316,40 +366,54 @@ pub(super) fn run(
         group,
     };
     let mut observation = [0u8; 8];
-    observer.read_exact(&mut observation)?;
-    let observed_uid = u32::from_ne_bytes(observation[..4].try_into().expect("four bytes"));
-    let observed_gid = u32::from_ne_bytes(observation[4..].try_into().expect("four bytes"));
+    observer
+        .read_exact(&mut observation)
+        .map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
+    let observed_uid = u32::from_ne_bytes([
+        observation[0],
+        observation[1],
+        observation[2],
+        observation[3],
+    ]);
+    let observed_gid = u32::from_ne_bytes([
+        observation[4],
+        observation[5],
+        observation[6],
+        observation[7],
+    ]);
     if observed_uid != uid || observed_gid != gid {
-        return Err(ExecError::Unavailable(
-            "child identity attestation mismatch",
+        return Err(RunFailure::new(
+            RunError::AfterSpawn,
+            ExecError::Unavailable("child identity attestation mismatch"),
         ));
     }
-    let out = guard
-        .child
-        .stdout
-        .take()
-        .ok_or(ExecError::Unavailable("stdout pipe"))?;
-    let err = guard
-        .child
-        .stderr
-        .take()
-        .ok_or(ExecError::Unavailable("stderr pipe"))?;
-    nonblocking(out.as_raw_fd())?;
-    nonblocking(err.as_raw_fd())?;
+    let out = guard.child.stdout.take().ok_or_else(|| {
+        RunFailure::new(RunError::AfterSpawn, ExecError::Unavailable("stdout pipe"))
+    })?;
+    let err = guard.child.stderr.take().ok_or_else(|| {
+        RunFailure::new(RunError::AfterSpawn, ExecError::Unavailable("stderr pipe"))
+    })?;
+    nonblocking(out.as_raw_fd()).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
+    nonblocking(err.as_raw_fd()).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
     let (mut out, mut err) = (out, err);
     let (mut stdout, mut stderr) = (Capture::new(s.output_bytes), Capture::new(s.output_bytes));
     let outcome = loop {
-        drain(&mut out, &mut stdout)?;
-        drain(&mut err, &mut stderr)?;
+        drain(&mut out, &mut stdout).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
+        drain(&mut err, &mut stderr).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
         if let Some(reason) = stop_reason(
             started.elapsed(),
             s.timeout,
             cancel.is_cancelled(),
-            shutdown.is_cancelled(),
+            shutdown_requested(
+                shutdown.is_cancelled(),
+                caller_shutdown.is_some_and(Cancellation::is_cancelled),
+            ),
         ) {
             break reason;
         }
-        if exited_without_reaping(guard.child.id())? {
+        if exited_without_reaping(guard.child.id())
+            .map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?
+        {
             break Outcome::Exited;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -360,13 +424,16 @@ pub(super) fn run(
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut status = None;
     while status.is_none() && Instant::now() < deadline {
-        status = guard.child.try_wait()?;
+        status = guard
+            .child
+            .try_wait()
+            .map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
         if status.is_none() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    drain(&mut out, &mut stdout)?;
-    drain(&mut err, &mut stderr)?;
+    drain(&mut out, &mut stdout).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
+    drain(&mut err, &mut stderr).map_err(|e| RunFailure::os(RunError::AfterSpawn, e))?;
     Ok(RunResult {
         outcome,
         exit_code: status.and_then(|x| x.code()),

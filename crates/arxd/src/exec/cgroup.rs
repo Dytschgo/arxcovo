@@ -64,12 +64,13 @@ impl Group {
                 "empty delegated subtree with pids+memory required",
             ));
         }
-        let name = CString::new(format!(
+        let Ok(name) = CString::new(format!(
             "arx-{}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
-        ))
-        .expect("numeric name");
+        )) else {
+            unreachable!("numeric name")
+        };
         if unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }

@@ -2,6 +2,43 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
+- Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
+- Queue priority: Stage B publication for hosted Unix compilation/tests and exact-head independent review, then merge only after all five gates. Stages C/D follow separately; cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain gated. No experiment retry is authorized.
+- Stage B source 4fe2bde passed independent Opus high Spec review; the F1 test correction at c60b1cc passed Standards and Spec in recheck 4e3959c. [Full review](reviews/0019-stage-b-independent-review.md) and [F1 recheck](reviews/0019-stage-b-tool-acceptance-opus-recheck.md) are retained. Coordinator Sol medium integrates the report and updates status only; production source is unchanged.
+- Validation credits: builder Sol high fmt/locked workspace Clippy, nine compiled mutation kills and one full 306 passed / 2 skipped run fc80b434 at 4fe2bde; coordinator Sol medium final fmt/Clippy, focused 8/8 (6591f720) and tool-mode mutant kill 504dd130 at the test follow-up; reviewer independently reproduced tool-mode kill and focused 8/8. No full suite is repeated or recredited for the test-only follow-up.
+- Unix-native code has not compiled locally. Hosted Linux/macOS must compile and pass; real shutdown propagation, phase sites and check placement remain source-reviewed. F2 lexical-scan alternate-form limits remain disclosed and must be audited before adding shim/bridge files. No semantic log-privacy proof is claimed.
+- ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage B publication
+
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native backend is activated or native experiment retry authorized.
+- Last merged PR: #51 at `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
+- Queue priority: Stage B test-only F1 correction independent Opus recheck, publication for hosted Unix compilation, then all five gates. Stages C/D follow separately. Cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain independently gated.
+- Stage B source 4fe2bde / candidate 454beb6 passed independent Opus high Spec review; Standards requested tool-mode acceptance coverage. Coordinator Sol medium adds 128-item and wide tool cases; path-only mutant compiles and fails, and production source is restored. Final fmt/locked workspace Clippy and focused 8/8 passed (6591f720). [Follow-up evidence](evidence/unix-runner-stage-b-review-followup.md). Builder's full 306 passed / 2 skipped remains credited to 4fe2bde, not rerun for this test-only change.
+- F2 lexical scanner limits are disclosed before Stage C/D extension; indirect unwrap calls, renamed logging macros, type aliases and stderr writeln are source-audit obligations. Existing reviewed production has none of these forms. No semantic privacy proof is claimed. Unix-native branches, phase sites and real shutdown pass-through remain source-reviewed pending hosted or separately authorized native evidence.
+- Main after #50 passed run 43231164086 in 577s. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage B review follow-up
+
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native execution backend is activated and no owner operation has been performed by agents.
+- Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC. All five gates passed on f627075 plus independent Opus integration review; squash tree equals reviewed head. Main CI after #51 is pending, not claimed green.
+- Main after #50 passed run `43231164086` in 577s (13:50:32 to 14:00:09 UTC). S3 is merged through all hosted gates; native guard/session/SCM behavior retains source-only evidence limits. ExecutionFailed remains unexplained, with no fix, rate claim or waiver.
+- Queue priority: fresh independent Opus 5.5 high review of the local ADR 0019 Stage B candidate, then coordinator publication and all five hosted gates. Stages C/D follow as separate concerns. E cgroup setup/cleanup, F E_PROTECTION diagnosis/disposable experiment and G activation remain separate gated work; no experiment retry is authorized.
+- Stage B re-pins on actual main after #51. Before implementation, runner exec sources were unchanged since the reviewed 1d828ca contract source. Surrounding main now includes owner CLI routing; config includes ConfigureRequest and executor has the shared Windows path predicate. Stage B must preserve those accepted changes, Report/Creation semantics, Execution::native composition and production MechanismUnavailable behavior.
+- Provider assignment: OpenAI / gpt-6.1-sol / high implements Stage B in an isolated worktree; Anthropic / Opus 5.5 / high independently reviews. Scope is run_phased/NotStarted, explicit RunFailure/run_core preserving legacy errors, exact-prefix phased argv bounds, shared Cancellation/external shutdown, retained early plus final pre-spawn check, fixed panic payloads and R/L/P-SCAN tests. No shim, bridge constructor, owner CLI or cgroup hierarchy wiring is added.
+- All tests remain pure or ordinary non-root refusal paths; privileged Unix sites are not exercised. Root Unix entry-point mutation tests skip before invoking the runner. No service account, owner/admin/SCM/LSA, fixed system path/pipe, Lab Manager/VM, third S4U probe or babysitter change.
+
+
+- Stage B local source candidate: `4fe2bde4fddef381fc54dab5688f7300ad9e354e`, base `6d474b56ad88e90aff8441bf3bf64d27e65c8078`. OpenAI / gpt-6.1-sol / high implemented only runner phases/private compatibility core, shared cancellation/external shutdown, exact shim-prefix validator and fixed payload/source-scan tests. [Evidence](evidence/unix-runner-stage-b.md) includes all failure-site classes, the three accepted legacy deviations, commands/failures, source manifest and restoration hashes.
+- Stage B local validation: final fmt/whitespace and locked workspace all-target Clippy pass. Nine compiled assertion-kill mutants restored byte-for-byte; one initial From mutant did not compile and receives no kill credit. ONE final normal default-concurrency workspace nextest after final source/restores: **306 passed, 2 skipped**, `fc80b434-d0e7-45ef-a419-a2b5d65a229c`, 11.318s. Provider OpenAI / gpt-6.1-sol / high; outcome local implementation complete, review/hosted acceptance pending.
+- Stage B blocker/limit: Linux cross-check failed before arxd at libsqlite3-sys because `x86_64-linux-gnu-gcc` is unavailable; no install or stub compile. Unix compilation, R1/L1 marker refusal and root-only sites remain unexecuted locally. Root EUID skips before runner calls; native/installed/dedicated remain **unverified on real hardware**. No source activation, C/D implementation, E/F/G work, owner operation or new experiment. Fresh Opus high independent review before publication remains required.
+
+## Historical checkpoint before inactive contract merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Owner CLI source is wired, but agents have performed no real owner or installed-service acceptance steps.
 - Last merged PR: #50, `4f01fca70794d60aa3c4752c9a44b083635e13c9`, 13:50:29 UTC. All five gates passed on `134c851` plus independent Opus review; squash tree equals the reviewed head. Main CI after #50 is pending, not claimed green.
 - S3 hosted Unix condition is met: run `43229689940` passed all platforms. Ubuntu nextest 235 passed / 3 skipped; macOS 236 passed / 1 skipped. These are job-log observations, not local Unix runs. Native guard release, SCM/session callbacks and production adapter selection retain their source-only review limits. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver.
