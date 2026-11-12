@@ -39,3 +39,13 @@ run remains held. Independent Opus integration review is required before
 publication. All hosted required checks remain mandatory before merge.
 Native, installed and dedicated paths remain **unverified on real hardware**;
 M2 is incomplete.
+
+## Publication refresh after PR41 merged
+
+PR41 merged at 09:18:02 UTC as a10751af5a6b4c4c0f642daff034e6544980e7bf.
+Its complete tree is identical to reviewed597d962. Reapplying the single N2
+commit onto that squash base produces the same product tree as df60b22.
+The [Opus integration review](../reviews/0017-current-main-integration-review.md)
+is retained unchanged from a2229adc. Fresh status/evidence edits are docs only;
+no unchanged test repeat is claimed. The two integration checks above remain
+credited to their actual heads. Main run43190243712 is pending.

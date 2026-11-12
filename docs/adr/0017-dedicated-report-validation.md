@@ -618,3 +618,13 @@ Inference, not verified:
   std reaps the child.
 - No creation primitive is classified `ProvenNone` here. A later adapter ADR
   must cite the normative text.
+
+## Current publication checkpoint — 2026-11-12
+
+The reviewed contract/implementation is ported unchanged onto main after
+PR41 (a10751a). Earlier base/status notes above remain historical. See the
+[current integration evidence](../evidence/n2-current-main-integration.md)
+and [independent Opus review](../reviews/0017-current-main-integration-review.md).
+Hosted gates and an exact published-head recheck remain required. No native
+adapter is activated; installed/native/dedicated paths remain
+**unverified on real hardware**, and M2 is incomplete.

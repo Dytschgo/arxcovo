@@ -3,6 +3,17 @@
 ## Current state — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: [#41](https://github.com/Dytschgo/arxcovo/pull/41), `a10751af5a6b4c4c0f642daff034e6544980e7bf`, 09:18:02 UTC, all five gates on `597d962` and independent Opus review. Its squash tree equals the reviewed head exactly.
+- Main after #40 passed in 428s (run 43187047371). Main after #41 is in progress: run 43190243712 at a10751a; not claimed green.
+- Queue priority: publish N2 report validation/output privacy as its own PR; then remaining small service corrections. E2 stays held by unexplained ExecutionFailed run bdbf032b, with no fix or waiver from instrumented passes.
+- Provider/outcome: coordinator OpenAI / gpt-6.1-sol / medium ports reviewed Sol high N2 source unchanged; Anthropic / Opus 5.5 / high integration review passed at df60b22. Full local nextest passed 241/241, 2 skipped (ce6a9bc3); reviewer focused36 passed. Fresh published-head recheck and hosted gates remain required.
+- [Current integration evidence](evidence/n2-current-main-integration.md) and [independent review](reviews/0017-current-main-integration-review.md) retain exact pins and limits. Refresh onto #41 changes only ancestry/docs; no new full test run is claimed.
+- ADR0018 accepted-contract disposition remains local on docs/owner-cli-final-contract-corrections (29068df); N1–N5 must be settled before S2 and all prerequisite gates remain. ADR0019 passed for inactive design. Neither is runtime activation.
+- No experiment retry, third S4U probe, owner administration, old Lab Manager/VM operation or babysitter change.
+
+## Historical checkpoint before N3 merged
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main884a301, 08:56:09 UTC, through all five gates and independent review. Main CI run43187047371 passed in428s.
 - Queue priority: PR41 shutdown fix awaits Windows CI (Opus review, Ubuntu, macOS and budget pass); N2 report validation is a separate local child candidate, awaiting fresh Opus integration review before publication. E2 stays held by unexplained ExecutionFailed runbdbf032b.
 - N2 runtime/tests match reviewed local port95f06d3 byte-for-byte; E1 owner and client changes stay inherited. Coordinator fmt/locked all-target Clippy and one full nextest run passed241/241 with2 skipped (ce6a9bc3). No new mutation or native acceptance is claimed.
