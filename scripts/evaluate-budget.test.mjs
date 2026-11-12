@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { setImmediate } from 'node:timers/promises';
 import { decideBudget, evaluatePullRequests, evaluateEvent, statusPublisher } from './evaluate-budget.mjs';
 
 function fixture() {
@@ -65,8 +66,9 @@ test('aggregate failure never overwrites the triggering good PR with a discovery
 test('discovery failure awaits the triggering-head failure status', async () => {
   const { io, posts, pr } = fixture();
   io.listPullRequests = () => { throw Error('discovery unavailable'); };
-  io.postStatus = async (sha, state, description) => { await Promise.resolve(); posts.push({ sha, state, description }); };
+  io.postStatus = async (sha, state, description) => { await setImmediate(); posts.push({ sha, state, description }); };
   await assert.rejects(evaluateEvent(io, pr.head.sha));
+  assert.equal(posts.length, 1, 'failure status must finish before evaluation rejects');
   assert.equal(posts.at(-1).state, 'failure');
   assert.match(posts.at(-1).description, /discovery failed/);
 });
