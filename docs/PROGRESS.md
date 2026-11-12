@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
+- Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
+- Queue priority: Stage B publication for hosted Unix compilation/tests and exact-head independent review, then merge only after all five gates. Stages C/D follow separately; cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain gated. No experiment retry is authorized.
+- Stage B source 4fe2bde passed independent Opus high Spec review; the F1 test correction at c60b1cc passed Standards and Spec in recheck 4e3959c. [Full review](reviews/0019-stage-b-independent-review.md) and [F1 recheck](reviews/0019-stage-b-tool-acceptance-opus-recheck.md) are retained. Coordinator Sol medium integrates the report and updates status only; production source is unchanged.
+- Validation credits: builder Sol high fmt/locked workspace Clippy, nine compiled mutation kills and one full 306 passed / 2 skipped run fc80b434 at 4fe2bde; coordinator Sol medium final fmt/Clippy, focused 8/8 (6591f720) and tool-mode mutant kill 504dd130 at the test follow-up; reviewer independently reproduced tool-mode kill and focused 8/8. No full suite is repeated or recredited for the test-only follow-up.
+- Unix-native code has not compiled locally. Hosted Linux/macOS must compile and pass; real shutdown propagation, phase sites and check placement remain source-reviewed. F2 lexical-scan alternate-form limits remain disclosed and must be audited before adding shim/bridge files. No semantic log-privacy proof is claimed.
+- ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage B publication
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native backend is activated or native experiment retry authorized.
 - Last merged PR: #51 at `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
 - Queue priority: Stage B test-only F1 correction independent Opus recheck, publication for hosted Unix compilation, then all five gates. Stages C/D follow separately. Cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain independently gated.
