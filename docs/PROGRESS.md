@@ -2,6 +2,15 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
+- Last merged PR: [#42](https://github.com/Dytschgo/arxcovo/pull/42), `4c2264d6c3caee9507e11870ad361daea6c1dfdf`, 09:32:22 UTC, all five gates on be4d41c and independent Opus review. The squash tree equals the reviewed head exactly.
+- Main after #41 passed in 481s (run 43190243712). Main after #42 is in progress: run 43192357855 at 4c2264d; not claimed green.
+- Queue priority: artifact CI step, then remaining SYSTEM-refusal test and state-permission exit corrections as one-concern PRs. E2 remains held on unexplained ExecutionFailed run bdbf032b; no fix or waiver is claimed.
+- Artifact CI: OpenAI / gpt-6.1-sol / medium coordinator ports the exact reviewed two-line workflow step onto main after #42. Anthropic / Opus 5.5 / high integration PASS at 57b0f71 is retained; published-head recheck and hosted gates remain required. Fresh artifact script: 3 portable pass / 2 native skips; workflow guard 1/1 pass. [Evidence](evidence/service-artifact-ci-port.md).
+- ADR0018 accepted-contract disposition remains local at 29068df with pre-S2 advisories and implementation gates retained. ADR0019 passed for inactive design only. No native experiment retry, third S4U probe, owner admin, old Lab Manager/VM or babysitter change.
+
+## Historical checkpoint before report validation merged
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#41](https://github.com/Dytschgo/arxcovo/pull/41), `a10751af5a6b4c4c0f642daff034e6544980e7bf`, 09:18:02 UTC, all five gates on `597d962` and independent Opus review. Its squash tree equals the reviewed head exactly.
 - Main after #40 passed in 428s (run 43187047371). Main after #41 is in progress: run 43190243712 at a10751a; not claimed green.
