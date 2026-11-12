@@ -1,12 +1,13 @@
 # Arxcovo progress
 
-## Current state — 2026-11-11
+## Current state — 2026-11-12
 
-- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
-- Last merged PR: [#14](https://github.com/Dytschgo/arxcovo/pull/14), `5b4f6b20796d599a015ca048dc4edaeb72546387`, 19:51:48 UTC, through all five gates. The Unix executor is library-only; no Unix MCP execution route is activated.
-- Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. The macOS owner parser still refuses Unknown.
-- Queue priority: fix the three #36 execution/audit review blockers and finish existing evidence/test PRs through independent reviews. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
-- Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
+- Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
+- Queue priority: finish existing #36/#9/#26/#34 through independent review and every required platform check. No new feature PRs or gate bypass.
+- User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. Completion remains pending, and the original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
+- Prepared a local per-PR concurrency improvement to retire superseded builds without cancelling main measurements. Node policy/workflow tests pass 19/19; independent review and hosted verification are pending. No measured speedup is claimed.
+- Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -107,6 +108,8 @@
 - [ ] 6. Authenticated browser/Electron dashboard with hosts, VMs, activity, terminal and console; Playwright and screenshots.
 
 ## Blockers and owner actions
+
+- Actions reset follow-up (2026-11-12): fresh dispatches now start, but the 12 old queued records reject even force cancellation with 409. Their cleanup still needs GitHub Support; no cause or account restriction is confirmed. New CI results remain pending; the original main push is not green. [Exact reset and local workflow audit](reviews/actions-queue-reset.md).
 
 - Dedicated local Arxcovo account and QEMU were absent at preflight. Owner account/service installation and later WHPX/QEMU/media/disk-cap/CPU-RAM reserve setup remain owner actions. The current-user development authorization permits the development test without doing those administrative steps.
 - docs/dev-host-setup.md and early feasibility ADRs are preserved in open PR #10. Policy regression PR #9 is also open. These have not been accepted or merged.
