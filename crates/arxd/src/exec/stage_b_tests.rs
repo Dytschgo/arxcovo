@@ -113,10 +113,19 @@ fn l2_exact_prefix_and_tail_bounds() {
         assert_eq!(validate_spec(&s), Err(ExecError::Invalid("argv bounds")));
         assert!(validate_phased_spec(&s).is_ok());
     }
+    let mut tool = shim(vec!["a".into(); 128]);
+    tool.arguments[1] = "tool".into();
+    assert_eq!(validate_spec(&tool), Err(ExecError::Invalid("argv bounds")));
+    assert!(validate_phased_spec(&tool).is_ok(), "tool prefix accepted");
     let mut wide = shim(vec!["a".repeat(512); 128]);
     wide.arguments[2] = "a".repeat(4096);
     wide.arguments[3] = "b".repeat(4096);
     assert!(validate_phased_spec(&wide).is_ok());
+    wide.arguments[1] = "tool".into();
+    assert!(
+        validate_phased_spec(&wide).is_ok(),
+        "wide tool prefix accepted"
+    );
     let mut cases = vec![
         shim(vec!["a".into(); 129]),
         shim(vec!["a".repeat(8192); 9]),

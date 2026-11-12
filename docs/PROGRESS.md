@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native backend is activated or native experiment retry authorized.
+- Last merged PR: #51 at `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
+- Queue priority: Stage B test-only F1 correction independent Opus recheck, publication for hosted Unix compilation, then all five gates. Stages C/D follow separately. Cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain independently gated.
+- Stage B source 4fe2bde / candidate 454beb6 passed independent Opus high Spec review; Standards requested tool-mode acceptance coverage. Coordinator Sol medium adds 128-item and wide tool cases; path-only mutant compiles and fails, and production source is restored. Final fmt/locked workspace Clippy and focused 8/8 passed (6591f720). [Follow-up evidence](evidence/unix-runner-stage-b-review-followup.md). Builder's full 306 passed / 2 skipped remains credited to 4fe2bde, not rerun for this test-only change.
+- F2 lexical scanner limits are disclosed before Stage C/D extension; indirect unwrap calls, renamed logging macros, type aliases and stderr writeln are source-audit obligations. Existing reviewed production has none of these forms. No semantic privacy proof is claimed. Unix-native branches, phase sites and real shutdown pass-through remain source-reviewed pending hosted or separately authorized native evidence.
+- Main after #50 passed run 43231164086 in 577s. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage B review follow-up
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No native execution backend is activated and no owner operation has been performed by agents.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC. All five gates passed on f627075 plus independent Opus integration review; squash tree equals reviewed head. Main CI after #51 is pending, not claimed green.
 - Main after #50 passed run `43231164086` in 577s (13:50:32 to 14:00:09 UTC). S3 is merged through all hosted gates; native guard/session/SCM behavior retains source-only evidence limits. ExecutionFailed remains unexplained, with no fix, rate claim or waiver.
