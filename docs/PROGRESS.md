@@ -2,6 +2,14 @@
 
 ## Current state - 2026-11-12
 
+- ADR0019 Stage D local implementation: inactive UnixBridge, pure config/spec/report mappings, fake runner port, test-only Execution wiring, whole-body panic catch, strict discovery parsing and extended P-SCAN. OpenAI / gpt-6.1-sol / high. Final local validation/evidence is being completed; this is readying for review, not acceptance.
+- Queue: final local checks, then fresh independent Anthropic / Opus 5.5 / high product/security review BEFORE publication. This implementation child creates no delegates and performs no publication. Stage C PR53 source `2ce79caf9ded55976e3e83b2c49b41d54160f2da` remains an explicit unmerged dependency; base `7b2cfa1cd00d0f3dc657513dd07bc684739cc1e1`. No gate waiver.
+- User priority: product work continues; CI optimization/diagnostics and hosted-capacity investigation remain parked. No workflow/policy/dependency/schema/native-composition change, GitHub action, experiment retry or owner operation in this slice.
+- M1 accepted; M2 incomplete. Last merged PR52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`. Native, installed and dedicated paths remain **unverified on real hardware**. Production remains MechanismUnavailable. Stage E setup/janitor, F diagnosis/experiment and G activation retain all gates.
+- ExecutionFailed / E_PROTECTION remain unknown and unresolved: no fix, waiver or retry. No old Lab Manager/VM or babysitter change. All earlier pins, failure credits, provider rows and queue history remain below.
+
+## Historical checkpoint before Stage D implementation
+
 - User priority: continue product features while hosted macOS capacity is slow. CI speed/diagnostic investigations are parked; preserve their local commits and failed measurements. No more CI trials or diagnostics are scheduled. Existing merge checks remain enforced, but pending hosted CI does not stop local implementation.
 - M1 accepted; M2 incomplete. Last merged PR52 at1604db1. Stage C PR53 source2ce79ca is independently reviewed with hosted shim tests passed; it remains unmerged due to budget policy. Stage D is prepared locally on that explicit unmerged dependency, without claiming its merge gate cleared.
 - Queue priority: implement ADR0019 Stage D pure Unix runner/report bridge with a test-only constructor, independent review and meaningful fake tests. Then address remaining M2 features under their existing authority limits. No production native activation, cgroup setup or experiment is authorized by the priority change.

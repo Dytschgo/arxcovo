@@ -235,3 +235,5 @@ mod owner_scm_windows;
 
 #[cfg(windows)]
 pub mod owner_install_windows;
+
+mod unix_bridge;
