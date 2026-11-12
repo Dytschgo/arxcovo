@@ -2,6 +2,8 @@
 
 ## Current state — 2026-11-12
 
+- S1 active locally: OpenAI / gpt-6.1-sol / high on clean prepared base b1663060452f8fed25bf64986bc3892bc37c7313. Library-only config/request, Unix read/owner gate, Windows start/session and shared lexical predicate. Fresh Opus review and hosted gates remain required; S2/S3 and ADR0019 unchanged.
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), `d70e80818569491238656255ee415669f04a731d`, 10:51:46 UTC, all five gates on d9b6fa3 and exact-head Opus review. Its squash tree equals the reviewed head.
 - Main after #46 passed in 614s (run 43200970512, 10:30:28–10:40:42 UTC). Main after #47 is pending, not claimed green.

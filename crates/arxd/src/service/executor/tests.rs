@@ -2120,3 +2120,25 @@ async fn adr0017_backend_preflight_refusal_precedes_invalid_pin() {
     assert!(!e.quarantined.load(Ordering::Acquire));
     e.drain().await.unwrap();
 }
+
+#[test]
+fn shared_windows_component_rule_preserves_device_controls() {
+    for p in [
+        "CON", "con.txt", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1.exe", "lpt9", "COM¹",
+        "LPT²", "COM³", "plain.", "plain ", "CON .txt",
+    ] {
+        assert!(!super::windows_component_safe(p));
+    }
+    for p in [
+        "COM0",
+        "LPT0",
+        "COM10",
+        "COM0.exe",
+        "LPT10.txt",
+        "console",
+        "com1x",
+        "ordinary.txt",
+    ] {
+        assert!(super::windows_component_safe(p));
+    }
+}

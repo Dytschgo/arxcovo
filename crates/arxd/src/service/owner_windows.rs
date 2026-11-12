@@ -916,3 +916,22 @@ mod tests;
 
 #[cfg(test)]
 pub(super) use tests::unprotect_install_fixture;
+
+// S3 consumes this hook; no new session or batch authority is exposed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) trait ConfigureSession {
+    fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure>;
+    fn observe_batch(&mut self, sid: &str) -> Result<BatchObservation, Failure>;
+    fn configure(&mut self, req: &Configure) -> Result<(), Failure>;
+}
+impl ConfigureSession for WindowsOwnerSession {
+    fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure> {
+        WindowsOwnerSession::read_config(self)
+    }
+    fn observe_batch(&mut self, sid: &str) -> Result<BatchObservation, Failure> {
+        WindowsOwnerSession::observe_batch(self, sid)
+    }
+    fn configure(&mut self, req: &Configure) -> Result<(), Failure> {
+        WindowsOwnerSession::configure(self, req)
+    }
+}

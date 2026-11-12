@@ -2,6 +2,19 @@
 #[cfg(unix)]
 use super::owner_plan::OsManager;
 use super::{layout::Error, owner_plan::Plan};
+/// S3 owner gate; the existing native identity rule is unchanged.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn require_owner() -> Result<(), Error> {
+    imp::identity()
+}
+/// S3 reads previous bytes for full configure validation.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn read_config() -> Result<Option<Vec<u8>>, Error> {
+    imp::Manager::new()?.read_config()
+}
+
 #[cfg(any(unix, test))]
 use super::{
     layout::{Layout, Platform, Policy},
@@ -488,6 +501,20 @@ mod imp {
                 skipped: 0,
             })
         }
+        pub(super) fn read_config(&self) -> Result<Option<Vec<u8>>, Error> {
+            let Some((parent, name)) = self.fs.parent(self.layout.config())? else {
+                return Ok(None);
+            };
+            self.fs.check(&parent, true, Some(0o700))?;
+            let Some(mut file) = self.fs.open_at(&parent, &name, false)? else {
+                return Ok(None);
+            };
+            let bytes = self
+                .fs
+                .bytes(&mut file, 0o600, super::super::config::MAX_CONFIG_BYTES)?;
+            self.fs.same(&parent, &name, &file)?;
+            Ok(Some(bytes))
+        }
         pub(super) fn execute(&mut self, operations: &[Operation]) -> Result<(), Error> {
             for op in operations {
                 allowed(&self.layout, op)?;
@@ -635,18 +662,24 @@ mod imp {
             p.sync_all().map_err(|_| Error::Permissions)
         }
     }
-    fn identity() -> Result<(), Error> {
-        if unsafe {
-            libc::getuid() == 0
-                && libc::geteuid() == 0
-                && libc::getgid() == 0
-                && libc::getegid() == 0
-        } {
+    pub(super) fn identity() -> Result<(), Error> {
+        owner_identity(unsafe {
+            [
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            ]
+        })
+    }
+    fn owner_identity(ids: [u32; 4]) -> Result<(), Error> {
+        if ids == [0; 4] {
             Ok(())
         } else {
             Err(Error::OwnerRequired)
         }
     }
+
     impl OsManager for Manager {
         fn apply(&mut self, op: &Operation) -> Result<(), Error> {
             if matches!(self.runner, Runner::Native) {
@@ -863,6 +896,51 @@ mod imp {
                 gid: unsafe { libc::getegid() },
             };
             (dir, fs)
+        }
+        #[test]
+        fn owner_gate_requires_all_real_and_effective_ids() {
+            let _gate: fn() -> Result<(), Error> = require_owner;
+            let _read: fn() -> Result<Option<Vec<u8>>, Error> = super::super::read_config;
+            assert_eq!(owner_identity([0; 4]), Ok(()));
+            for i in 0..4 {
+                let mut ids = [0; 4];
+                ids[i] = 1;
+                assert_eq!(owner_identity(ids), Err(Error::OwnerRequired));
+            }
+        }
+        #[test]
+        fn previous_read_is_bounded_private_no_follow_and_optional() {
+            for platform in [Platform::Linux, Platform::Macos] {
+                let (dir, m) = manager(platform, vec![], vec![]);
+                assert_eq!(m.read_config(), Ok(None));
+                for path in m.layout.private_dirs() {
+                    let mut current = std::path::PathBuf::from("/");
+                    for part in parts(path).unwrap() {
+                        current.push(part);
+                        m.fs.directory(&current, 0o700).unwrap();
+                    }
+                }
+                assert_eq!(m.read_config(), Ok(None));
+                let target = dir
+                    .path()
+                    .join(m.layout.config().strip_prefix("/").unwrap());
+                std::fs::write(&target, b"previous bytes").unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(m.read_config(), Ok(Some(b"previous bytes".to_vec())));
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+                assert_eq!(m.read_config(), Err(Error::Permissions));
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(
+                    &target,
+                    vec![b'x'; super::super::super::config::MAX_CONFIG_BYTES + 1],
+                )
+                .unwrap();
+                assert_eq!(m.read_config(), Err(Error::Config));
+                std::fs::remove_file(&target).unwrap();
+                symlink("missing", &target).unwrap();
+                assert_eq!(m.read_config(), Err(Error::Permissions));
+                assert!(calls(&m).is_empty());
+            }
         }
         fn another_member_group() -> u32 {
             let mut groups = [0 as libc::gid_t; 1024];
