@@ -3,6 +3,16 @@
 ## Current state — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
+- Last merged PR: [#43](https://github.com/Dytschgo/arxcovo/pull/43), `b3e1d13888ae5967b095d4151144aa240169ed77`, 09:45:08 UTC, all five gates on c7cb551 plus independent Opus review. The squash tree equals the reviewed head exactly.
+- Main after #42 passed in 596s, run 43192357855 (09:32:25–09:42:21 UTC). Main after #43 run 43194236390 is queued at the last observation, not claimed green.
+- Queue priority: publish the SYSTEM-refusal regression, then the state-permission exit correction. The state-exit local candidate 8c6f69c passed one full nextest run (242/242, 2 skips) and is under Opus high review. E2 remains held on unexplained ExecutionFailed run bdbf032b.
+- SYSTEM test provider/outcome: OpenAI / gpt-6.1-sol / medium coordinator refreshes the exact reviewed test onto main after #43; product base is unchanged. Anthropic / Opus 5.5 / high integration review passed at a1ce4cf and is retained. Formatting/Clippy/exact test passed at that boundary; no repeat is claimed for ancestry/docs-only refresh. Fresh published-head recheck and all hosted gates remain required. [Evidence](evidence/system-refusal-current-main-port.md).
+- Coverage is limited to non-SYSTEM refusal; real SYSTEM acceptance, exact SID constant and every startup guard call are unverified. No SID is printed. ADR0018 accepted-contract disposition remains local at 29068df with all prerequisite gates retained.
+- No E2 waiver, experiment retry, third S4U probe, owner administration, old Lab Manager/VM operation or babysitter change.
+
+## Historical checkpoint before artifact CI merged
+
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#42](https://github.com/Dytschgo/arxcovo/pull/42), `4c2264d6c3caee9507e11870ad361daea6c1dfdf`, 09:32:22 UTC, all five gates on be4d41c and independent Opus review. The squash tree equals the reviewed head exactly.
 - Main after #41 passed in 481s (run 43190243712). Main after #42 is in progress: run 43192357855 at 4c2264d; not claimed green.
 - Queue priority: artifact CI step, then remaining SYSTEM-refusal test and state-permission exit corrections as one-concern PRs. E2 remains held on unexplained ExecutionFailed run bdbf032b; no fix or waiver is claimed.

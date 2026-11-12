@@ -310,6 +310,19 @@ pub(crate) fn components(path: &Path, windows: bool) -> Result<Vec<String>, Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn service_identity_guard_matches_process_identity_without_startup() {
+        // Read-only observation. Never format the current user's identifier.
+        let system = crate::local::current_identity().unwrap() == "S-1-5-18";
+        let expected = if system {
+            Ok(())
+        } else {
+            Err(Error::Permissions)
+        };
+        assert_eq!(require_service_identity(), expected);
+    }
     #[test]
     fn lexical_aliases_refuse_before_open() {
         for p in [
