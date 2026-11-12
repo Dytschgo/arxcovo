@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No installed-service or dedicated-account acceptance is claimed.
+- Last merged PR: #49 at `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC, all five gates on `d330a96` plus independent Opus published-head review. Its squash tree equals the reviewed head. Main CI after #49 is pending and not claimed green.
+- S2 hosted Unix condition is met: run `43219803330` succeeded on all three platforms. Linux nextest 226 passed / 3 skipped; macOS 227 passed / 1 skipped. These are hosted job-log observations, not local Unix runs. Residual native Mode and intermediate-pin test limitations remain disclosed; no Mode mutation kill is claimed.
+- Queue priority: S3 parser, dispatch and CLI wiring through fakes, independent Opus review and hosted gates. S1 #48 and S2 #49 are merged; ADR 0019 remains separately prepared and inactive. No native bridge implementation or experiment retry starts.
+- S3 FIRST commit `5c57208` changes the existing install fixture to invalid `service install extra` before routing. Coordinator OpenAI / gpt-6.1-sol / medium ran the unchanged usage test: 1 passed, 1 filtered, run `f703573a-da6d-49ff-bb56-8eb861578dd8`. Old usage stderr remains exact at this guard boundary. All valid owner-command composition tests must use RecordingOps/fakes; no test may construct production NativeOps, call production credential create, or spawn a valid owner command.
+- Provider assignment: OpenAI / gpt-6.1-sol / high implements S3 in a verified isolated worktree; Anthropic / Opus 5.5 / high independently reviews before publication/merge. Preserve S1/S2 source and security tests; only minimal visibility changes necessary for sibling wiring are allowed and must be recorded. The accepted ADR 0018 grammar, per-command ordering and fixed error/output table govern this slice.
+- Main after #48 passed run `43213333692` in 637s. ExecutionFailed remains unexplained; local/hosted passes are no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe or babysitter change.
+
+## Historical checkpoint before S2 merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: #48, `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC. All five gates and independent review passed on `21638d9`; squash tree equals the reviewed head. Main run `43213333692` succeeded in 637s (11:55:40 to 12:06:17 UTC).
 - Queue priority: publish S2 for hosted Linux/macOS/Windows verification and exact-head recheck, then S3 wiring (invalid install test first). The inactive Unix bridge contract remains separately prepared at `22ca777` and unimplemented.
