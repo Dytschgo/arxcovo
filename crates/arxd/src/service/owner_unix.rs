@@ -917,7 +917,8 @@ mod imp {
                     let mut current = std::path::PathBuf::from("/");
                     for part in parts(path).unwrap() {
                         current.push(part);
-                        m.fs.directory(&current, 0o700).unwrap();
+                        m.fs.directory(&current, if &current == path { 0o700 } else { 0o755 })
+                            .unwrap();
                     }
                 }
                 assert_eq!(m.read_config(), Ok(None));
