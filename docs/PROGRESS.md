@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Owner CLI source is wired, but agents have performed no real owner or installed-service acceptance steps.
+- Last merged PR: #50, `4f01fca70794d60aa3c4752c9a44b083635e13c9`, 13:50:29 UTC. All five gates passed on `134c851` plus independent Opus review; squash tree equals the reviewed head. Main CI after #50 is pending, not claimed green.
+- S3 hosted Unix condition is met: run `43229689940` passed all platforms. Ubuntu nextest 235 passed / 3 skipped; macOS 236 passed / 1 skipped. These are job-log observations, not local Unix runs. Native guard release, SCM/session callbacks and production adapter selection retain their source-only review limits. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver.
+- Queue priority: publish the separately reviewed inactive ADR 0019 contract, independent exact-head recheck and all hosted gates, then staged runner/shim/bridge implementation under that contract. No cgroup or native experiment is started; diagnose E_PROTECTION before any future separately authorized experiment, with no retry authorized now.
+- Coordinator OpenAI / gpt-6.1-sol / medium imports the seven reviewed contract/review files from 22ca777 onto actual main and records the inactive acceptance disposition. Opus-authored architecture retains independent Sol high review; the Sol B1 validator-test correction retains independent Opus high review. The contract text and planned tests remain unchanged apart from current-status/historical labels. No build or behavior test is claimed for these docs.
+- Implementation waits for this docs PR's exact-head independent review and green hosted gates, then merge. All staged implementation and activation gates remain mandatory; test-only bridge construction stays. No production execution backend is activated by accepting the design.
+- Main after #49 passed run `43221533019` in 439s. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before S3 merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner operation or installed-service acceptance is claimed.
 - Last merged PR: #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC. All five gates and independent review passed on d330a96; squash tree equals the reviewed head. Main run `43221533019` succeeded in 439s (12:50:01 to 12:57:20 UTC).
 - Queue priority: S3 publication for hosted Linux/macOS/Windows verification and a published-head independent recheck, then merge only after all five gates. The Unix bridge contract remains separately prepared at 22ca777 and inactive; no native experiment retry is authorized.
