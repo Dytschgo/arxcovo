@@ -38,6 +38,8 @@ corrections, not executed tests. Fresh Opus review of this Sol delta is
 required; the retained Sol reviews supply cross-provider review of the
 unchanged Opus architecture. No implementation gate is waived.
 
+## Scope
+
 It settles only the wiring choices that ADR 0009, 0012, 0014, 0015 and 0016 leave
 open for the `arxd service install|configure|start|stop|status|uninstall` and
 `arxd client-config new` commands. The implementation brief is
@@ -235,7 +237,7 @@ retry or development fallback. Installed SCM, LSA, systemd and launchd
 behaviour stays **unverified on real hardware**. macOS owner operations still
 stop on the `Unknown` launchd query before they mutate anything.
 
-## Coordinator disposition — 2026-11-12
+## Historical coordinator disposition — 2026-11-12
 
 Accepted as a documentation contract after independent Sol review of the Opus
 proposal/correction and independent Opus review of the Sol correction at
@@ -277,3 +279,10 @@ state, maps bound overflow to Io before RNG and fixes historical reviewer
 labels. A fresh published-head review covers those follow-ups. Publication
 and review do not themselves begin S1–S3; every brief §0 gate still applies.
 The unresolved ExecutionFailed remains tracked; no fix or waiver is claimed.
+
+
+Implementation-gate checkpoint: PR47 merged as d70e808 after all five gates
+on d9b6fa3 and independent exact-head Opus review. The brief now names that
+publication gate explicitly and states that all unaffected safety assertions
+still apply to deliberately invalid Verify fixtures. These wording follow-ups
+implement the final non-blocking review notes, with no new authority.

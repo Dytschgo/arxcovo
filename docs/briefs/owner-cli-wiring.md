@@ -33,6 +33,9 @@ Implementation starts only when all of these hold:
    code-4 rule in section 5. No duplicate classifier is required.
 4. The core contract reviews and the advisory clarification recheck are
    accepted, with their cross-provider scope attributed correctly.
+5. This contract PR47 is merged after its exact-head independent review and
+   all five required checks (d9b6fa3 -> d70e808). Every implementation slice
+   still needs its own independent review and green hosted gates.
 
 E2's original ExecutionFailed remains open. Publication and local
 passes are not a fix, waiver or implementation permission. No valid owner
@@ -213,8 +216,7 @@ Native `GetFileInformationByHandle`/`GetSecurityInfo` results feed that checker;
 synthetic facts use the same checker, and its Err traverses the same Verify
 method/result classifier. Facts include owner, type, reparse status, link
 count, length, DACL presence and every ACE's type and recipient.
-Both acquisition errors and
-checker rejections are required negative cases. No NativeOps, OwnerGuard,
+Both acquisition errors and checker rejections are required negative cases. No NativeOps, OwnerGuard,
 session, elevation or service path is used by these tests. Unix retains a
 real owned-temp hard-link fixture. `create_with` runs in this order, with no
 filesystem call before step 4:
@@ -545,15 +547,17 @@ the two owner prefixes, then calls `std::process::exit`.
      fixtures. Before forwarding native Verify, (a) create a hard link (link
      count 2), (b) fchmod the held file to 0640, or (c) append one extra byte
      through the held handle. Each returns Partial, no hash, and retains the
-     file/names without repair or rollback. The deliberately wrong-mode
+     file/names without repair or rollback. These deliberately invalid Verify
      fixtures use synthetic credentials under a private 0700 parent. Their
      explicit retained states are: (a) complete JSON, two names/two links,
      current owner and mode0600; (b) complete JSON, one link and mode0640,
      deliberately failing the strict file-privacy/mode assertions; (c) JSON
      followed by one fixed `x` byte, one link, mode0600 and expected length
      json.len()+1, deliberately failing the generic complete-JSON assertion.
-     All three return Partial with no hash and the fixed stderr/exit; no
-     file is repaired or removed. Real owner/type negatives
+     All three retain every unaffected assertion: no later operation, no
+     reopen, empty stdout, no hash, fixed stderr/exit and wipe observer true.
+     No file is repaired or removed; only the intentionally invalid mode,
+     link or payload expectations differ. Real owner/type negatives
      remain hardware limitations; do not add privilege or foreign-account
      operations. Windows: require independent negative fact fixtures for foreign owner,
      wrong type, reparse, link count 2, wrong length, absent DACL, deny ACE,

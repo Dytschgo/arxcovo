@@ -3,6 +3,16 @@
 ## Current state — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), `d70e80818569491238656255ee415669f04a731d`, 10:51:46 UTC, all five gates on d9b6fa3 and exact-head Opus review. Its squash tree equals the reviewed head.
+- Main after #46 passed in 614s (run 43200970512, 10:30:28–10:40:42 UTC). Main after #47 is pending, not claimed green.
+- Queue priority: owner CLI S1 library prerequisites, then S2 private credential writer and S3 wiring; inactive Unix bridge architecture work continues separately. S1 starts only after the merged contract gate; no valid owner command, production NativeOps or production credential create is permitted in tests.
+- Provider assignment: OpenAI / gpt-6.1-sol / high implements S1 in an isolated worktree; Anthropic / Opus 5.5 / high independently reviews its source before publication/merge. A separate Opus high architect is active on Unix legacy-error/panic contracts. At most two builders and one reviewer; S2 awaits S1's shared path predicate and a builder slot.
+- Coordinator OpenAI / gpt-6.1-sol / medium directly clarifies the remaining non-blocking contract wording: own-PR gate, current scope outside historical headings and inherited no-later-operation/no-reopen/empty-stdout/wipe assertions for invalid fixtures. No behavior or code changes in this preparation commit.
+- E2's known baseline ExecutionFailed remains open; its accepted merge risk is recorded, no fix or failure-rate claim. No owner/admin/service operation, experiment retry, third S4U probe, old Lab Manager/VM or babysitter change.
+
+## Historical checkpoint before owner CLI contract merged
+
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#46](https://github.com/Dytschgo/arxcovo/pull/46), `1d828ca7f4cddc74495f2d8eeca36bb4553a7ad9`, 10:30:26 UTC, all five gates on exact head `ddd698e2bbef4dd9a730ae52a2c2c9f94aa42a15` and independent Opus review. Its squash tree equals the reviewed head.
 - Main after #46 run 43200970512 is in_progress, not claimed green.
 - Queue priority: owner CLI contract publication, then inactive Unix native bridge contract. S1–S3 implementation remains gated until this contract's published-head review and required checks; no valid owner command may be invoked by tests.
