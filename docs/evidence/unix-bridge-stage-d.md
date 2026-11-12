@@ -18,8 +18,8 @@ unexplained; no fix, waiver, frequency claim or retry is inferred from passes.
   Stage B PR52 `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`.
   Dependency review/hosted credits belong to those heads, not Stage D.
 - Final source commit `d3615be3b9820cf72a40b321a3dcf6c746a9e7bd`.
-  Evidence is committed separately after validation; PROGRESS records that
-  evidence head, preserving this source pin.
+  Evidence commit `a318c437d01082676fee3a5b0a5f9a5025e24bcf` follows validation;
+  final handoff changes only documentation pins/clarification, preserving this source pin.
 - Only new bridge/tests, executor test seams, module declaration, Stage B
   scanner extension and progress/evidence changed. Removing the added
   cfg(test) executor methods yields the exact base executor text. In
@@ -114,6 +114,11 @@ All commands run in `<prepared-worktree>`, with no instrumentation/stress/retry 
 | `cargo check --locked --workspace --all-targets --target x86_64-unknown-linux-gnu` | Failed before arxd at libsqlite3-sys: missing x86_64-linux-gnu-gcc. No install/stub, no Unix compilation or execution credit. Compiler emitted local environment paths in tool output; those were not copied into repository evidence. |
 | `cargo nextest run --locked --workspace` | Exactly ONE final normal full workspace run, after final source/restores, source d3615be: **323 passed, 3 skipped**, run `8195e507-b3d3-4306-9fe6-72b89fce5a3f`, 11.307s. Additional skip is the new parent-only fixture. |
 | `git diff --check` | Passed before source commit and final evidence. |
+
+The focused Stage B portion used its existing pure config/validator tests and
+non-Unix legacy/phased refusal entry points; no Unix backend or child was reached.
+No new bridge test invokes Runner::new/run/run_phased. The full workspace also
+retains its normal benign fixture baseline, without new native fixtures.
 
 No ExecutionFailed recurrence in this final run; that does not resolve the historic
 natural failure. Linux/macOS real compilation and execution are pending. Windows
