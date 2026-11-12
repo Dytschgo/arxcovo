@@ -18,7 +18,7 @@ async fn service_run_requires_exact_arguments() {
     for args in [
         vec!["service"],
         vec!["service", "run", "--config", "private-marker"],
-        vec!["service", "install"],
+        vec!["service", "install", "extra"],
         vec!["service", "run", "extra"],
     ] {
         let output = binary(&args).await;
