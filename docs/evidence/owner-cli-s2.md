@@ -1,7 +1,12 @@
-# Owner CLI S2 local implementation evidence
+# Owner CLI S2 historical implementation evidence
 
 OpenAI / gpt-6.1-sol / high, 2026-11-12. Implementation sub-agent; no
 subagents, publication, GitHub operations or owner operations.
+
+This records original source `6c452ec` / evidence `fe8e9a7`, not correction
+attempt 1. The [correction evidence](owner-cli-s2-correction1.md) supersedes
+current claims. S1 is now merged in #48 with its reviewed follow-up inherited.
+Original run results below remain credited only to their original source.
 
 ## Isolation and dependency
 
@@ -10,9 +15,9 @@ Authoritative prepared workspace:
 Initial pwd/Git top-level matched this binding and differed from the forbidden
 canonical checkout. Initial HEAD/base:
 `813dd1e575e1f1cbfe50237c43d115a6134b39bd`, clean. Every shell command used
-that explicit workdir. No checkout or worktree creation. S1 is an unreviewed
-local dependency on b166306/main after PR47; its independent Opus review is
-owned by the coordinator. S2 must not publish past an unresolved S1 finding.
+that explicit workdir. No checkout or worktree creation. At that historical
+boundary S1 was a local dependency on b166306/main after PR47. S1 subsequently merged as #48 with
+independent review and follow-up tests; correction attempt 1 inherits those bytes.
 S1 sources were read only; shared valid_principal/windows_component_safe are
 consumed without modification.
 
@@ -38,13 +43,18 @@ report allocation pointer/capacity internally and wipe boolean only; assertions
 never print pointers, token bytes, SIDs or fixture paths. Best effort excludes
 aborts and compiler/allocator/OS copies.
 
-Ancestors remain pinned; Unix uses no-follow/CLOEXEC relative descriptors,
-Windows fixed drives and no delete sharing. Only the immediate parent may be
-created. Existing objects are neither repaired nor overwritten. Creation is
+The original source retains ancestor handles: Unix uses no-follow/CLOEXEC
+relative descriptors; Windows uses fixed drives and omits delete sharing.
+The original Windows metadata-only handles did NOT enforce rename refusal
+(SP-1); correction evidence records the data-right fix and actual rename tests.
+Only the immediate parent may be created. Existing objects are neither repaired nor overwritten. Creation is
 exclusive with private creation modes/owner/DACL. The native adapters take
-borrowed handles and no paths. Operation errors and injected syscall-shaped
-results meet at NativeFileOps::result_with; handle-fact acquisition meets at
-verify_with. The shared classifier immediately returns Partial without hash,
+borrowed handles and no paths. The original injected operation errors ran
+before native methods through
+a trivial result_with wrapper; they did NOT prove native error propagation
+(SP-3). Handle-fact acquisition meets at verify_with; original synthetic facts
+do not prove real negative ACL acquisition (SP-4). The shared classifier
+immediately returns Partial without hash,
 rollback, deletion, rename or reopen. Prefix-write failures retain the prefix.
 Windows facts reject every unsupported ACE (including an actual deny entry in
 synthetic facts); production acquisition and fixture facts feed the same
@@ -163,7 +173,6 @@ Source blobs at this tested head (Git object IDs):
 
 | Path | Blob |
 | --- | --- |
-
 | crates/arxd/src/client_config.rs | 0b96530b0fd6737657d62a3749b9a771c1e6f09d |
 | crates/arxd/src/client_config/tests.rs | 671f432e9cb4d76288f1e26a81123a9d92322b31 |
 | crates/arxd/src/client_config/unix.rs | 9da582031e7fe18c9ee87868295edb63c4135cc9 |
@@ -172,8 +181,9 @@ Source blobs at this tested head (Git object IDs):
 
 ## Remaining gates and rollback
 
-Independent Opus exact-head review, S1 dependency disposition and all hosted
-required gates remain mandatory. Unix compile/test/mutations require Linux/macOS.
+For correction attempt 1, fresh independent Opus exact-head review and all
+hosted required gates remain mandatory; S1 has merged with its follow-up.
+Unix compile/test/mutations require Linux/macOS.
 The single final normal full workspace run is complete. A future natural
 ExecutionFailed must stay red, with no retry-to-green or weakened assertion/timeout. The existing baseline ExecutionFailed remains unresolved.
 Native/installed/dedicated paths are **unverified on real hardware**. M2 is

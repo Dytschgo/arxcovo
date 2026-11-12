@@ -1,5 +1,15 @@
 # Arxcovo progress
 
+## Current state — 2026-11-12
+
+- Last merged PR: #48 at `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC, all five gates on `21638d9` and independent Opus review; squash tree equals reviewed head. Main CI after #48 is not yet claimed green.
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor activation.
+- Queue priority: fresh independent Opus exact-head recheck of S2 correction attempt 1, then hosted gates including real Unix build/tests/mutations, then S3 (invalid install test first).
+- Provider/effort/outcome: OpenAI / gpt-6.1-sol / high correction attempt 1 at `fd57bbd20181c807df296a623fb43f8e7f63cda7` on prepared `0890dc1`: SP-1–SP-8 implemented within S2 scope; Windows fmt/locked workspace all-target Clippy/focused15 passed; seven compiled assertion-kill mutations restored; exactly one final normal workspace run **286 passed, 2 skipped** (`b51167a4-e3aa-4305-9673-b5a423869e12`). [Correction evidence](evidence/owner-cli-s2-correction1.md). Unix-only coverage remains pending hosted; no local Unix pass claimed.
+- ST-1 evidence is corrected while retaining historical source results. Trivial result wrapper and duplicate final-parent check removed (ST-2/ST-3); optional ST-4/ST-5 deferred. Fresh independent Opus recheck is REQUIRED before publication. No publication/acceptance is authorized by these local passes.
+- S1 is merged/reviewed with follow-up; ALL S1 follow-up source/test bytes and lib.rs private module declaration remain inherited unchanged. Main history/provider rows below are retained.
+- ExecutionFailed remains unexplained; no pass is a fix or waiver. No production create, valid owner argv, owner/admin/service, old Lab Manager/VM, experiment retry, third S4U probe, public GitHub operation or babysitter change. Inactive Unix bridge remains separately prepared, unimplemented.
+
 ## Current state â€” 2026-11-12
 
 - Last merged PR: #48 at `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC, all five gates on `21638d9` and independent Opus review; squash tree equals reviewed head. Main CI after #48 is not yet claimed green.
