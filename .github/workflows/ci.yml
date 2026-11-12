@@ -49,6 +49,8 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture
       - run: cargo nextest run --workspace --locked
+      - name: Read-only service artifact checks
+        run: python -I scripts/test-service-artifacts.py
       - name: Pure Windows probe guards (no provisioning)
         if: runner.os == 'Windows'
         shell: pwsh
