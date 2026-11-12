@@ -1,6 +1,14 @@
 # Arxcovo progress
 
-## Current state — 2026-11-12
+## Current state - 2026-11-12
+
+- OpenAI / gpt-6.1-sol / high implements accepted CI performance attempt 2 on clean prepared base d3bc3aa0c2d15b8661543f401b100fc853b4079d, published source48d4916, actual main1604db1. S1/S2/SP1/SP2 were accepted before implementation; all numerical A1-A4/A6 gates remain frozen. Three-file source c3285a8d6fd76c3a3ebcf311ac2c2529d6cfd732 is committed. Node21/UI1, lint/build, fmt, locked workspace all-target Clippy and guest2/2 pass under DEV_DEBUG=0 with unoptimized banners. Nine Node assertion mutants and two compiled Rust assertion kills were restored; final guest run eaaf18df-d122-4f87-b6bb-8021e4cd311c passes2/2. Initial missing npm dependencies and Clippy constant-assertion failure were corrected. [Full evidence](evidence/ci-headless-shell.md). No hosted measurement or acceptance is claimed.
+- Queue priority: fresh independent Anthropic / Opus 5.5 / high review of actual patch before coordinator push, then measure the substantive head's FIRST hosted attempt against all frozen criteria, then independent measured review before any ci-speed label. Fresh main under15min remains necessary before Stage C PR53 resumes. No subagents/GitHub operations in this local task.
+- Attempt1 remains failed/nonqualifying: run43248592153 at48d4916 took848s but Windows install200s exceeded141s. Design corrections are not new performance attempts. After three failed performance attempts, hand off to the other provider; no empty commit, rebase or rerun resets counts.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, inherited all five gates and independent review. Main first attempt43240797525 failed at906s; recovered attempt2 does not repair the policy baseline. Milestone1 accepted; M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**.
+- ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry. No owner/admin/service/native provisioning, VM/Lab Manager, private-state, ignored-fixture or babysitter operation occurred.
+
+## Historical checkpoint before attempt-2 implementation
 
 - Attempt-2 design review 6b9af143 requested documentation corrections only. Coordinator Sol medium accepts the amended proposal before implementation: three implementation paths plus evidence/PROGRESS/review docs, explicit C frame-pointer effects, direct caller-location smoke limits and comparative (not causal) timing claims. Numerical gates remain unchanged. Sol high implementation and Opus independent patch review are next; no measurement, ci-speed label or merge yet.
 

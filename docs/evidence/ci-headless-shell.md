@@ -88,3 +88,151 @@ portable guarantee about dependency timing. Source review passed, but the
 performance acceptance did not. This is failed performance attempt 1 of 3;
 a materially different proposal needs prior independent review and new
 measurement criteria. No empty commit or rerun resets this failure.
+
+
+## Attempt 2: local implementation, hosted measurement pending
+
+OpenAI / gpt-6.1-sol / high, implementation sub-agent, 2026-11-12.
+Prepared base: `d3bc3aa0c2d15b8661543f401b100fc853b4079d`.
+Published PR54 source: `48d4916e556cdcd78a0a7e58fa25c733bcc2814b`.
+Actual main reference: `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`.
+Source commit: `c3285a8d6fd76c3a3ebcf311ac2c2529d6cfd732`.
+Evidence head is the subsequent docs-only commit containing this section
+(resolve with `git log -1 --format=%H -- docs/evidence/ci-headless-shell.md`);
+no self-referential commit hash is claimed.
+
+Initial pwd and Git top level both matched `<prepared-worktree>`, distinct
+from canonical `D:/Code/Arxcovo`; status was clean at the exact prepared base.
+No checkout/worktree was created and no canonical writes occurred. Commands
+used explicit prepared working directories and checked exits. Local evidence
+uses the prepared placeholder rather than owner account paths.
+
+Read full AGENTS/KICKOFF, complete proposal including current coordinator
+disposition, and independent Sol high design review (6b9af143 retained at
+1afa852). S1/S2/SP1/SP2 were accepted at the prepared base before implementation.
+The disposition supersedes older causal shorthand. Proposal/review documents
+are retained unchanged by this implementation. Fresh independent Opus high
+review of the actual patch is still REQUIRED before any push or measurement.
+No subagent or review was started here.
+
+The source commit changes exactly `.github/workflows/ci.yml`,
+`scripts/ci-workflow.test.mjs`, `crates/arx-guest/tests/cli.rs` against48d4916.
+The job-level block immediately follows timeout12 and precedes steps, with
+sole `CARGO_PROFILE_DEV_DEBUG: '0'`; no TEST_DEBUG is added (test inherits dev).
+One Node guard and one test in the existing guest CLI binary are added.
+The existing scaffold test remains benign. The debug-assertion cfg value goes
+through black_box to retain a runtime check while satisfying Clippy's
+assertions_on_constants lint. No lint override is used.
+
+Direct Location::caller().file()==file!() is a compiled direct-call-site
+smoke only. It does not observe caught panic location/output. catch_unwind
+checks test-harness unwinding, not production-binary panic behavior. No global
+panic hook is installed. cc's DEBUG-dependent frame-pointer default can change
+C code generation/diagnostics as well as symbols; this is not a symbols-only
+claim. No NDEBUG or Rust safety-setting change is introduced.
+
+### Executed local checks (functional, not speed measurements)
+
+All checks below ran in this prepared Windows worktree. Cargo child processes
+used CARGO_PROFILE_DEV_DEBUG=0. No environment setting was persisted to user or
+system scope. No cold speed benchmark, stress test or full workspace nextest
+was run for this CI-only change.
+
+| Command | Exit and observation |
+| --- | --- |
+| Initial `npm test` | 1: Node21 passed; UI could not find vitest because worktree dependencies were absent. Lint/build not reached in that sequence. |
+| Initial `cargo fmt --all --check` | 0 |
+| Initial `cargo clippy --workspace --all-targets --locked -- -D warnings` | 101: new constant cfg assertion triggered assertions_on_constants; nextest not reached. Corrected with black_box as described above. |
+| `npm ci` | 0, locked dependencies installed; no lockfile/source change |
+| `npm test` after install | 0: Node21/21, UI1/1, no skipped/dummy tests |
+| `npm run lint` | 0 |
+| `npm run build` | 0 |
+| `cargo fmt --all --check` after correction | 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` after correction | 0: Finished dev profile [unoptimized] |
+| `cargo nextest run -p arx-guest --locked` baseline | 0: Finished test profile [unoptimized]; 2 passed, 0 skipped; run ed429954-3941-4575-9410-60bec8c804ea |
+| Same guest command after all env mutants | 0: Finished test profile [unoptimized]; 2 passed, 0 skipped; run eaaf18df-d122-4f87-b6bb-8021e4cd311c |
+| `git diff --check` | 0 before source commit |
+
+No new local Playwright/Electron smoke is claimed; their existing steps and
+coverage are unchanged. Local Windows checks do not satisfy hosted Unix,
+macOS stock-directory, all-workspace counts or any speed criterion. Build
+banner durations are deliberately not used as performance evidence.
+
+### Restored mutations
+
+Node mutants each ran `node --test scripts/ci-workflow.test.mjs`, exited1,
+and were killed by runtime assertions (ERR_ASSERTION/AssertionError), not
+parse/compile errors. All edited file bytes were saved and restored in finally
+blocks, checked byte-for-byte, and checked again for every file at suite end.
+The restored focused Node baseline exited0, all three workflow tests passed.
+
+| Mutant | Result |
+| --- | --- |
+| M1 remove job env block | Node assertion kill |
+| M2 add CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: 'false' | Node assertion kill |
+| M4 move sole env to nextest step | Node assertion kill |
+| M5 append [profile.dev] / debug=0 to Cargo.toml | Node assertion kill; manifest restored, never used for a build |
+| M6 change value to 'line-tables-only' | Node assertion kill |
+| Old H1 remove --only-shell | Node assertion kill |
+| Old H2 remove macOS matrix member | Node assertion kill |
+| Old H3 add channel property in Playwright config scratch mutation | Node assertion kill |
+| Old H4 add headless:false in Playwright config scratch mutation | Node assertion kill |
+
+M2 local and M3 used the actual compiled test with
+`cargo nextest run -p arx-guest --locked -E test(ci_test_profile_keeps_runtime_checks_when_debuginfo_is_off)`.
+Each inherited a copied child-process environment with DEV_DEBUG=0, and only
+its named additional override=false. Parent environment was compared before
+and after in finally and unchanged; no user/system environment mutation.
+
+- M2 local, CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false: compiled [unoptimized],
+  nextest exit100, 0 passed / 1 failed / 1 filtered; run
+  cb1b5445-3e1d-4d6c-bd69-69e7d4b1db66. The new guard failed the assertion
+  “debug assertions must stay enabled in test builds”.
+- M3 local, CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false: compiled [unoptimized],
+  nextest exit100, 0 passed / 1 failed / 1 filtered; run
+  ca3f6664-8e74-48b0-9d2f-c0ffae9a6185. The new guard failed the assertion
+  “overflow checks and unwinding panics must stay enabled”.
+
+Both are compiled assertion kills, not noncompile results, zero-test passes,
+skips or mere config-guard failures. The final unmutated guest run passed2/2.
+No permanent Cargo/profile/config, dependency or safety-setting edit remains.
+
+### Frozen future hosted acceptance and limits
+
+No attempt-2 hosted run exists from this task; no run ID, duration, measured
+review or speed label is claimed. Attempt1 remains failed: run43248592153,
+848s overall, Windows install200s >141s. Design corrections/local failures do
+not count as new hosted performance attempts. After three failed performance
+attempts, hand off to the other provider.
+
+The accepted proposal remains authoritative with all numerical criteria fixed:
+A1 exact new substantive head FIRST attempt, all OS success <900s (also <906s);
+A2 unoptimized nextest banners on all OS, macOS stock test and Clippy dev;
+A3 Windows nextest compile <108s AND unrounded compile/Clippy ratio <1.12,
+approximate comparative evidence, not causal proof;
+A4 Windows307/2, macOS245/1, Ubuntu244/3 passed/skipped, macOS stock pass,
+UI smoke1/1 and desktop smoke1/1 on every OS, Node21;
+A5 exactly three source paths plus permitted docs;
+A6 independent Opus measured review of A1–A5 before any label.
+No empty commit, rebase, rerun reset, cache, runner architecture change,
+dependency drop, timeout/policy exception or ci-speed label is authorized here.
+All existing steps/order, action pins, names, permissions, concurrency,
+three OS including macOS ARM, 12-minute job/15-minute policy, signed mirror,
+Media Foundation --with-deps and UI/Electron checks remain unchanged.
+
+ExecutionFailed/E_PROTECTION remain unknown with no fix, waiver or retry.
+M2 is incomplete; native, installed and dedicated paths are **unverified on
+real hardware**. No production NativeOps/create/Guard/session/account/service,
+fixed-path pipe, root runner, cgroup/SCM/LSA, VM/Lab Manager, experiment,
+private-state, ignored-fixture, toolchain installation, GitHub/push/PR/watch/
+merge/rerun/dispatch/settings/label or babysitter operation occurred.
+
+Final source-scope invariant check exited0: removing only the two added env
+lines reproduces48d4916 workflow bytes; existing guest scaffold is a byte
+prefix; full diff has exactly seven permitted paths including retained docs.
+Proposal/review bytes equal prepared base, evidence original bytes are an
+unchanged prefix, complete progress history is retained with exactly one
+current heading and one current queue. Final focused Node3/3, fmt and
+whitespace checks exited0 after source commit. No functional source edits
+followed the passing Clippy/guest/npm checks; only a surplus blank line was
+removed before the source commit.
