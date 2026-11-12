@@ -1,6 +1,15 @@
 # Arxcovo progress
 
-## Current state — 2026-11-12
+## Current state - 2026-11-12
+
+- Milestone 1 accepted; M2 incomplete. Last merged PR52 at1604db1. Native/installed/dedicated paths remain **unverified on real hardware**; no backend or experiment activation.
+- Queue priority: prepare a separate bounded read-only mirror diagnostic, independently review it before any hosted execution, then capture the unknown refusal predicate. This diagnostic is not performance attempt3 and must not manufacture a passing mitigation. PR53/54 remain unlabelled and budget-blocked; no rerun or threshold relaxation.
+- Performance attempt1 failed its declared200s/141s step criterion; attempt2 head344c406 run43270363385 fails A1/A4 because Ubuntu job131364954122 refused mirror preparation after23 unit tests passed. Both images are Ubuntu26.04.1, revisions20261101.186.1 and20261111.82.6; exact predicate is unknown. [Diagnosis](reviews/ubuntu26-mirror-refusal-diagnosis.md). Main906s first-attempt baseline remains authoritative despite successful capacity retry.
+- Coordinator Sol medium retains research only on a separate main-based diagnostic branch. Sol high will prepare a read-only report/test seam without changing the mitigation or its refusal; Opus high must review before any CI run. No local production helper, root or owner-host command is permitted.
+- All trust/signature/keyring/ownership/nofollow/bounds/re-read protections remain. ExecutionFailed and E_PROTECTION remain unexplained, no fix/waiver/retry. Babysitter, old Lab Manager/VM and S4U limits remain unchanged.
+
+## Historical checkpoint before mirror diagnostic preparation
+
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
