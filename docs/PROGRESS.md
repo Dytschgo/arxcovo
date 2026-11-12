@@ -4,11 +4,20 @@
 
 - Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
-- Queue priority: finish existing #36/#9/#26/#34 through independent review and every required platform check. No new feature PRs or gate bypass.
+- Queue priority: Opus high takes the Ubuntu CI package-fetch fix under the three-failure handoff; review and land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
 - User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. All five fresh Ubuntu jobs have failed; all macOS jobs passed. Fresh main, PR9 and PR34 Windows passed; PR36 and PR26 Windows were still running at this snapshot. The original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
 - Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; Opus high recheck at `f646589` passes with no blockers. Hosted verification of the patch remains pending. No measured speedup is claimed.
 - E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
+
+## Ubuntu package-fetch three-failure handoff — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium coordinator applies the babysitter's three-attempt handoff steering. Stop coordinator fix attempts; Anthropic / claude-opus-5-5 / high takes the Ubuntu CI fix, followed by independent Sol review. This handoff is active, not an unattended pause; delegate completion resumes this thread.
+- Failure evidence 1: original Ubuntu package retrieval failed with name-resolution errors in run [43032348219](https://github.com/Dytschgo/arxcovo/actions/runs/43032348219), source `4ead112`, jobs `130562335529` / `130573258883`.
+- Failure evidence 2: the #32 diagnostic revision still failed package retrieval with name-resolution errors in run [43053098205](https://github.com/Dytschgo/arxcovo/actions/runs/43053098205), source `b475bf1`, job `130635247058`.
+- Failure evidence 3: after the signed-mirror mitigation, fresh main [43152187271](https://github.com/Dytschgo/arxcovo/actions/runs/43152187271), source `b5e6556`, Ubuntu job `130963746682`, failed with Kernel mirror IPv6 network-unreachable101 and APT100 after ubuntu-mirror-updated:1. All four sibling fresh dispatches also failed Ubuntu: 43152254254, 43152257543, 43152261583, 43152265161; their detailed causes need individual verification.
+- These are three hosted failure milestones of the unresolved package-fetch problem, not a claim that three distinct corrective patches were deployed. The #32 diagnostic head predates the mirror helper. The intervening signed-mirror run 43062892241 at `400903d` genuinely passed Ubuntu in130s; it proved that path, not a DNS root-cause fix.
+- Handoff scope: smallest tested CI correction; retain Ubuntu, every check, signature validation and the12-minute job timeout. No blind retry loop or continuing DNS investigation. The reviewed local concurrency correction at47b4f47 may accompany the fix. Coordinator publishes only after Sol reviews Opus changes, then obtains hosted gates and exact-head review before merging. Re-dispatch/drain existing36/9/26/34 afterward. No native experiment, third S4U probe or owner-PC administration.
 
 ## Historical checkpoint from main before the Actions reset — 2026-11-11
 
