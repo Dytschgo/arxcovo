@@ -1,0 +1,17 @@
+{
+  "runId": 43160541603,
+  "head": "1226c74df361f618d5c2f22d5eb0dd8c24da69ad",
+  "attempt": 1,
+  "conclusion": "success",
+  "durationSeconds": 613,
+  "ubuntuJobId": 130990508941,
+  "ubuntuDurationSeconds": 151,
+  "mirrorUpdated": 1,
+  "kernelMirrorReachable": true,
+  "fallbackOutageExercised": false,
+  "signatureFetchWarnings": false,
+  "browserSmoke": "success",
+  "electronSmoke": "success",
+  "mergeCommit": "441978dd486f5f0299a6968aa4a3104f33996714",
+  "mergedAt": "2026-11-12T05:30:55Z"
+}
