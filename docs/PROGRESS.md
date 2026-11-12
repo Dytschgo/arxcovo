@@ -2,6 +2,8 @@
 
 ## Current state — 2026-11-12
 
+- CI performance attempt 1 is NOT QUALIFYING: #54 head48d4916 first run43248592153 succeeded in848s, but Windows install200s exceeded the declared141s ceiling. No ci-speed label or merge. Windows log spends about193s before Media Foundation completes, then about7s downloading shell/support binaries. The 906s main baseline remains blocking. A revised substantive approach and criteria must be reviewed before another measurement; no empty commit or rerun resets this result. PR watches missed the completed run; future waits need explicit tracked completion as well as PR events.
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates and independent review. Main run 43240797525 attempt 2 recovered after one failed macOS capacity job; attempt 1 remains failed at 906s and is the policy baseline. No claim of first-attempt main green or budget recovery.
 - Queue priority: separate measured CI headless-shell improvement and independent review under the existing policy, then a fresh successful main run under 15 minutes, then refresh Stage C PR53 and require all five gates. Stage C's ci-time-budget remains red and it is not labelled ci-speed.

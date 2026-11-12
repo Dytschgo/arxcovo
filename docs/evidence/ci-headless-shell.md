@@ -73,3 +73,18 @@ dedicated paths remain **unverified on real hardware**; M2 is incomplete.
 No owner/admin/account/service, SCM/LSA, VM/Lab Manager, experiment, private
 state, ignored fixture or babysitter operation occurred. Rollback is the
 one-line workflow revert and its associated guard update; no installed state.
+
+
+## Attempt 1: does not qualify
+
+Head 48d4916, run 43248592153 attempt 1 succeeded on all OS jobs in 848s
+(15:30:50 to 15:44:58 UTC). Windows install took 200s (15:37:51 to 15:41:11),
+which fails the predeclared below-141s criterion. No ci-speed label is applied,
+and no measurement criterion is relaxed after seeing the result.
+The Windows log shows Media Foundation completion at 15:41:04, headless-shell
+download beginning at 15:41:04 and support downloads finishing at 15:41:11.
+This establishes the step's dominant observed phase, not a capacity fix or a
+portable guarantee about dependency timing. Source review passed, but the
+performance acceptance did not. This is failed performance attempt 1 of 3;
+a materially different proposal needs prior independent review and new
+measurement criteria. No empty commit or rerun resets this failure.
