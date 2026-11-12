@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), actual main `0937cacfcdb5be036edcd1a126ba0f65521599df`, merged 06:27:45 UTC. Main CI run43168305535 succeeded attempt 1, 06:27:48–06:37:28 UTC, 580s. This is inherited coordinator evidence, not a run executed by this builder.
+- M1 accepted; M2 incomplete. E1 owner library port is local only; hosted gates and fresh coordinator Opus high review pending. E2 is the next separate stack layer. No GitHub writes or runtime activation.
+- Retained E1 source `4a5919e` and full/follow-up independent PASS reports are historical review evidence, not approval of this port. Production owner/SCM/LSA paths remain **unverified on real hardware**.
+
+| Task | Provider / model | Effort | Outcome |
+| --- | --- | --- | --- |
+| E1 port onto actual main0937cac | OpenAI / gpt-6.1-sol | high | Four owner/SCM files copied byte-equivalent to reviewed4a5919e; 41 focused owner/SCM tests passed; fmt and locked workspace/all-target Clippy passed; retained reviews and contract status reconciled. |
+
+## Historical checkpoint before owner-library port — 2026-11-12
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#26](https://github.com/Dytschgo/arxcovo/pull/26), `ffe502fa7c43594bef1f2c8cf60b6f69ef43481b`, 06:09:12 UTC, through all five gates.
 - Queue priority: finish existing #36 through independent review and every required check. No new feature PRs or bypasses.

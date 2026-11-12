@@ -452,6 +452,20 @@ impl<C: ScmCalls, K: Clock> WindowsScm<C, K> {
         }
     }
 }
+/// No store phase is reachable until deregistration produced its linear proof.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn uninstall_flow<C: ScmCalls, K: Clock, R>(
+    scm: &mut WindowsScm<C, K>,
+    then: impl FnOnce(Deregistered) -> R,
+) -> Result<R, Error> {
+    Ok(then(scm.deregister()?))
+}
+
 #[cfg(test)]
 #[path = "owner_scm_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(super) fn fixture_deregistered() -> Deregistered {
+    tests::absent_proof()
+}

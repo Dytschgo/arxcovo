@@ -3,7 +3,11 @@ use super::{
     config::{MAX_CONFIG_BYTES, ServiceConfig},
     layout::{self, Error, Layout, Platform, Policy},
     native,
-    owner_transactions::{self, BatchRight, Failure, OwnerRecord, OwnerStore},
+    owner_scm::Deregistered,
+    owner_transactions::{
+        self, BatchObservation, BatchRight, Configure, Failure, OwnerRecord, OwnerStore,
+        RightReport,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -239,6 +243,52 @@ fn discard(f: &File) -> Result<(), Failure> {
     }
 }
 fn pin_chain(path: &Path, final_policy: Policy) -> Result<Vec<File>, OpenError> {
+    walk_chain(
+        path,
+        final_policy,
+        &|f| {
+            layout::check_protection(
+                Platform::Windows,
+                final_policy,
+                true,
+                &native::windows_protection(f)?,
+            )
+        },
+        &layout::check_windows_ancestor,
+    )
+}
+
+fn pin_private_dirs<P: AsRef<Path>>(
+    paths: impl IntoIterator<Item = P>,
+    policy: &ProtectionPolicy,
+    check_ancestor: impl Fn(&layout::Protection) -> Result<(), Error>,
+) -> Result<Vec<File>, OpenError> {
+    let mut pins = Vec::new();
+    for path in paths {
+        pins.extend(
+            walk_chain(
+                path.as_ref(),
+                Policy::PrivateDirectory,
+                &|f| policy.check(f, true).map_err(|_| Error::Permissions),
+                &check_ancestor,
+            )
+            .map_err(|error| match error {
+                // The private-directory admission contract uses Permissions; the
+                // binary pin walk retains its original structural store error.
+                OpenError::Store(Failure::RecoveryRequired) => Error::Permissions.into(),
+                other => other,
+            })?,
+        );
+    }
+    Ok(pins)
+}
+
+fn walk_chain(
+    path: &Path,
+    final_policy: Policy,
+    check_leaf: &impl Fn(&File) -> Result<(), Error>,
+    check_ancestor: &impl Fn(&layout::Protection) -> Result<(), Error>,
+) -> Result<Vec<File>, OpenError> {
     native::components(path, true)?;
     let mut paths = path.ancestors().collect::<Vec<_>>();
     paths.reverse();
@@ -275,11 +325,10 @@ fn pin_chain(path: &Path, final_policy: Policy) -> Result<Vec<File>, OpenError> 
             None,
         )?;
         structural(&f, directory)?;
-        let protection = native::windows_protection(&f)?;
         if leaf {
-            layout::check_protection(Platform::Windows, final_policy, true, &protection)?;
+            check_leaf(&f)?;
         } else {
-            layout::check_windows_ancestor(&protection)?;
+            check_ancestor(&native::windows_protection(&f)?)?;
         }
         pins.push(f);
     }
@@ -292,7 +341,7 @@ pub struct WindowsOwnerSession {
     right: WindowsBatchRight,
 }
 /// Constructible only as part of a validated owner session.
-pub struct WindowsOwnerStore {
+struct WindowsOwnerStore {
     staged: Option<Staged>,
     root: PathBuf,
     layout: Layout,
@@ -308,17 +357,16 @@ struct Staged {
     old: Option<File>,
     cap: usize,
 }
-impl WindowsOwnerSession {
-    /// Elevated enabled Administrators, fixed layout and exact running-image ID.
-    /// Does not create the installed lock or repair protection. Recovery runs last.
-    pub fn open() -> Result<Self, OpenError> {
+/// Binary-only authority; construction never enables privilege or opens a store.
+pub struct OwnerGuard {
+    layout: Layout,
+    pins: Vec<File>,
+}
+impl OwnerGuard {
+    pub fn acquire() -> Result<Self, OpenError> {
         owner_required()?;
         let layout = Layout::system()?;
-        let mut pins = Vec::new();
-        for p in layout.private_dirs() {
-            pins.extend(pin_chain(p, Policy::PrivateDirectory)?);
-        }
-        pins.extend(pin_chain(layout.binary(), Policy::BinaryIntegrity)?);
+        let mut pins = pin_chain(layout.binary(), Policy::BinaryIntegrity)?;
         let image = raw_open(
             &std::env::current_exe().map_err(|_| Error::Layout)?,
             READ_CONTROL | FILE_READ_DATA,
@@ -330,13 +378,23 @@ impl WindowsOwnerSession {
             return Err(Error::Layout.into());
         }
         pins.push(image);
+        Ok(Self { layout, pins })
+    }
+}
+impl WindowsOwnerSession {
+    pub fn open(guard: OwnerGuard) -> Result<Self, OpenError> {
+        let OwnerGuard { layout, mut pins } = guard;
+        let policy = ProtectionPolicy::production();
+        pins.extend(pin_private_dirs(
+            layout.private_dirs(),
+            &policy,
+            layout::check_windows_ancestor,
+        )?);
         enable_restore()?;
         let root = layout.config().parent().ok_or(Error::Layout)?.to_owned();
-        // Missing install-created lock is a layout error, never create it here.
         let lock = optional(&root.join("owner.lock"), READ_CONTROL | FILE_READ_DATA, 0)?
             .ok_or(Error::Layout)?;
-        let store =
-            WindowsOwnerStore::with_lock(root, layout, ProtectionPolicy::production(), pins, lock)?;
+        let store = WindowsOwnerStore::with_lock(root, layout, policy, pins, lock)?;
         let mut session = Self {
             store,
             right: WindowsBatchRight { _private: () },
@@ -344,9 +402,42 @@ impl WindowsOwnerSession {
         owner_transactions::recover(&mut session.store, &mut session.right)?;
         Ok(session)
     }
-    pub fn parts(&mut self) -> (&mut WindowsOwnerStore, &mut WindowsBatchRight) {
-        (&mut self.store, &mut self.right)
+    pub fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure> {
+        self.store.read_config()
     }
+    pub fn observe_batch(&mut self, sid: &str) -> Result<BatchObservation, Failure> {
+        owner_transactions::observe_batch(sid, &mut self.store, &mut self.right)
+    }
+    pub fn configure(&mut self, req: &Configure) -> Result<(), Failure> {
+        owner_transactions::configure(req, &mut self.store, &mut self.right)
+    }
+    pub fn uninstall(guard: OwnerGuard, proof: Deregistered) -> Result<RightReport, OpenError> {
+        let OwnerGuard { layout, mut pins } = guard;
+        let policy = ProtectionPolicy::production();
+        pins.extend(pin_private_dirs(
+            layout.private_dirs(),
+            &policy,
+            layout::check_windows_ancestor,
+        )?);
+        enable_restore()?;
+        let root = layout.config().parent().ok_or(Error::Layout)?.to_owned();
+        let lock = optional(&root.join("owner.lock"), READ_CONTROL | FILE_READ_DATA, 0)?
+            .ok_or(Error::Layout)?;
+        let mut store = WindowsOwnerStore::with_lock(root, layout, policy, pins, lock)?;
+        Ok(uninstall_locked(
+            proof,
+            &mut store,
+            &mut WindowsBatchRight { _private: () },
+        )?)
+    }
+}
+fn uninstall_locked(
+    _proof: Deregistered,
+    store: &mut impl OwnerStore,
+    right: &mut impl BatchRight,
+) -> Result<RightReport, Failure> {
+    owner_transactions::recover(store, right)?;
+    owner_transactions::uninstall_right(store, right)
 }
 impl WindowsOwnerStore {
     #[cfg(test)]
@@ -673,7 +764,7 @@ fn enable_restore() -> Result<(), Error> {
 }
 
 /// Narrow direct-right adapter; obtainable only through the locked session.
-pub struct WindowsBatchRight {
+struct WindowsBatchRight {
     _private: (),
 }
 struct Lsa(LSA_HANDLE);
