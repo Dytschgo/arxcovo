@@ -1,6 +1,15 @@
 # Arxcovo progress
 
-## Current state — 2026-11-12
+## Current state - 2026-11-12
+
+- User priority: continue product features while hosted macOS capacity is slow. CI speed/diagnostic investigations are parked; preserve their local commits and failed measurements. No more CI trials or diagnostics are scheduled. Existing merge checks remain enforced, but pending hosted CI does not stop local implementation.
+- M1 accepted; M2 incomplete. Last merged PR52 at1604db1. Stage C PR53 source2ce79ca is independently reviewed with hosted shim tests passed; it remains unmerged due to budget policy. Stage D is prepared locally on that explicit unmerged dependency, without claiming its merge gate cleared.
+- Queue priority: implement ADR0019 Stage D pure Unix runner/report bridge with a test-only constructor, independent review and meaningful fake tests. Then address remaining M2 features under their existing authority limits. No production native activation, cgroup setup or experiment is authorized by the priority change.
+- Provider assignment: Sol high implements in an isolated worktree, Opus high reviews product changes. Preserve all Stage B/C and owner CLI source and assertions. No changes to CI workflow, policy, mirror helper, platform coverage or timeouts in this product slice.
+- Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, no fix/waiver/retry. No owner/admin/service operation, old Lab Manager/VM, third S4U probe or babysitter change.
+
+## Historical checkpoint before product-priority steering
+
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or experiment is activated.
 - Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 recovered on attempt 2: the sole failed macOS job passed (retry 15:13:48 to 15:17:20 UTC). Attempt 1 remains failed due to runner acquisition/capacity, with no macOS steps and successful Ubuntu/Windows jobs.
