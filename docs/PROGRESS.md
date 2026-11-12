@@ -2,6 +2,20 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 is accepted. Milestone 2 remains incomplete; milestones3–6 have no acceptance.
+- Last merged PR: [#38](https://github.com/Dytschgo/arxcovo/pull/38), `441978dd486f5f0299a6968aa4a3104f33996714`, 05:30:55 UTC, through all five required gates.
+- Queue priority: drain existing #36, #9, #26 and #34 with the merged CI fix, independent exact-head reviews and all required checks. No new feature PRs or bypasses.
+- PR38 run43160541603 on `1226c74` passed all platforms on attempt1 in613s; Ubuntu job130990508941 passed in151s, including signed indexes/packages and browser/Electron smoke. Kernel was reachable; this does not prove fallback during an outage or the original network cause. Main push CI after #38 is pending, not claimed green.
+- The old12 queue records rejected cancellation; fresh scheduling works. No repeat unchanged runs or native experiments are authorized by this refresh. Historical unsuccessful attempts are retained below.
+- Reviewed local owner provisioning/report-validation followups remain separate, unpublished and unactivated. Installed/native/dedicated M2 remains **unverified on real hardware**. No third S4U probe, owner-PC administration, old Lab Manager or VM work.
+
+## PR9 refresh after merged CI unblock — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium coordinator merged actual main441978d without rewriting published history. No product source change is introduced by the refresh; PR-specific code remains as independently reviewed at its previous head. Main's reviewed helper/concurrency/lint correction is inherited intact. Current state is first, with one queue row; all provider/history table rows from both parents are retained.
+- Local verification is scoped to unchanged-source equivalence, the CI helper/Node suites and whitespace. Fresh published-head independent recheck, platform CI and required statuses remain mandatory. No acceptance, measured speedup, native experiment or account/service operation.
+
+## Historical checkpoint before merged PR38 refresh — 2026-11-12
+
 - Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
 - Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Independent Sol review now passes (29 Python,19 Node tests; five independently caught mutations). Next: ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
@@ -9,6 +23,7 @@
 - Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; Opus high recheck at `f646589` passes with no blockers. Hosted verification of the patch remains pending. No measured speedup is claimed.
 - E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
+
 
 ## PR38 first hosted validation — lint correction, 2026-11-12
 
