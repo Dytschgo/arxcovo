@@ -822,7 +822,13 @@ fn code_tokens(source: &str) -> Vec<String> {
             continue;
         }
         // Character literals (leave lifetime identifiers as code).
-        if b[i] == 39 && (b.get(i + 2) == Some(&39) || b.get(i + 1) == Some(&92)) {
+        if b[i] == 39
+            && (source[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| b.get(i + 1 + c.len_utf8()) == Some(&39))
+                || b.get(i + 1) == Some(&92))
+        {
             i += 1;
             while i < b.len() {
                 if b[i] == 92 {
@@ -843,7 +849,7 @@ fn code_tokens(source: &str) -> Vec<String> {
                 i += 1;
             }
         } else {
-            i += 1;
+            i += source[i..].chars().next().unwrap().len_utf8();
         }
         out.push(source[start..i].to_owned());
     }
@@ -961,6 +967,10 @@ fn s1_lexer_ignores_decoy_comments_and_literals() {
         code_tokens("/* nested /* fn x() {} */ */ \"fn x() {}\" r#\"fn x() {}\"# fn actual() {}"),
         code_tokens("fn actual() {}")
     );
+    assert_eq!(
+        code_tokens("'¹' 'a' fn actual() {}"),
+        code_tokens("fn actual() {}")
+    );
 }
 
 #[test]
@@ -1015,7 +1025,9 @@ fn shared_walk_preserves_binary_and_private_structural_error_layers() {
     let (d, policy) = fixture();
     let file = d.path().join("not-a-directory");
     std::fs::write(&file, b"fixture").unwrap();
-    let raw = walk_chain(&file, Policy::PrivateDirectory, &|_| Ok(()), &|_| Ok(()));
+    let raw = walk_chain(&file, Some(Policy::PrivateDirectory), &|_| Ok(()), &|_| {
+        Ok(())
+    });
     assert!(matches!(
         raw,
         Err(OpenError::Store(Failure::RecoveryRequired))
@@ -1025,4 +1037,97 @@ fn shared_walk_preserves_binary_and_private_structural_error_layers() {
         private,
         Err(OpenError::Layout(Error::Permissions))
     ));
+}
+#[test]
+fn s1_installer_source_fences() {
+    let source = include_str!("owner_install_windows.rs");
+    let tokens = code_tokens(source);
+    for forbidden in [
+        "BatchRight",
+        "owner_transactions",
+        "grant",
+        "revoke",
+        "SetSecurityInfo",
+        "SetFileSecurityW",
+        "SetNamedSecurityInfoW",
+        "rusqlite",
+    ] {
+        assert!(
+            !tokens.iter().any(|t| t == forbidden),
+            "installer fence: {forbidden}"
+        );
+    }
+    assert!(!tokens.windows(3).any(|w| w == [".", "start", "("]));
+    let existing = function_body(&tokens, "existing");
+    sequence(existing, "if access & !READ_ONLY != 0");
+    sequence(existing, "open(path, access, share, OPEN_EXISTING, None)");
+    let install = function_body(&tokens, "install_with");
+    assert!(sequence(install, "ns.binary_check(policy)?") < sequence(install, "scm.observe()?"));
+    assert!(sequence(install, "scm.observe()?") < sequence(install, "enable()?"));
+    assert!(
+        sequence(install, "sidefiles(&state)?; scm.register()?") > sequence(install, "enable()?")
+    );
+    let tests = code_tokens(include_str!("owner_install_windows_tests.rs"));
+    for forbidden in ["acquire", "system", "NativeScm", "enable_restore"] {
+        assert!(
+            !tests.iter().any(|t| t == forbidden),
+            "fixture authority: {forbidden}"
+        );
+    }
+}
+// Creation can normalize an unprotected explicit DACL. This test-only helper
+// clears protection on one fixed owned-temp object to construct that refusal.
+pub(in crate::service) fn unprotect_install_fixture(temp: &tempfile::TempDir) {
+    let path = temp.path().join("Arxcovo");
+    let mut name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let who = crate::local::current_identity().unwrap();
+    let sd = descriptor(&format!("O:{who}D:(A;;FA;;;{who})")).unwrap();
+    let (mut acl, mut present, mut defaulted) = (null_mut(), 0, 0);
+    assert_ne!(
+        unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut acl, &mut defaulted) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            SetNamedSecurityInfoW(
+                name.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        },
+        0
+    );
+}
+
+#[test]
+fn s1_owner_authority_cannot_be_forged_by_sibling_modules() {
+    let tokens = code_tokens(include_str!("owner_windows.rs"));
+    let at = sequence(&tokens, "pub struct OwnerGuard {") + 4;
+    let fields = &tokens[at..balanced(&tokens, at - 1, "{", "}")];
+    assert_eq!(fields, code_tokens("layout: Layout, pins: Vec<File>,"));
+    sequence(&tokens, "pub(super) struct Local(*mut core::ffi::c_void);");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let defining = root.join("service/owner_windows.rs");
+    let mut pending = vec![root];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            assert!(!kind.is_symlink(), "source fence does not follow links");
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if path != defining && path.extension().is_some_and(|e| e == "rs") {
+                let tokens = code_tokens(&std::fs::read_to_string(path).unwrap());
+                assert!(
+                    !tokens.windows(2).any(|w| w == ["OwnerGuard", "{"]),
+                    "OwnerGuard construction or destructuring outside its defining module"
+                );
+            }
+        }
+    }
 }

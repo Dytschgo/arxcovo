@@ -1,12 +1,12 @@
 //! Callable ADR0012 adapter. No CLI, SCM, installation or dispatch wiring.
+pub(super) use super::owner_transactions::Failure;
 use super::{
     config::{MAX_CONFIG_BYTES, ServiceConfig},
     layout::{self, Error, Layout, Platform, Policy},
     native,
     owner_scm::Deregistered,
     owner_transactions::{
-        self, BatchObservation, BatchRight, Configure, Failure, OwnerRecord, OwnerStore,
-        RightReport,
+        self, BatchObservation, BatchRight, Configure, OwnerRecord, OwnerStore, RightReport,
     },
 };
 use sha2::{Digest, Sha256};
@@ -37,7 +37,12 @@ fn wide(s: &str) -> Vec<u16> {
 fn digest(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
-struct Local(*mut core::ffi::c_void);
+pub(super) struct Local(*mut core::ffi::c_void);
+impl Local {
+    pub(super) fn as_ptr(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+}
 impl Drop for Local {
     fn drop(&mut self) {
         unsafe {
@@ -45,7 +50,7 @@ impl Drop for Local {
         }
     }
 }
-fn descriptor(text: &str) -> Result<Local, Failure> {
+pub(super) fn descriptor(text: &str) -> Result<Local, Failure> {
     let mut sd = null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -87,18 +92,18 @@ impl From<Failure> for OpenError {
 }
 
 // No runtime identity or layout selector. Fixture policy exists only in test builds.
-struct ProtectionPolicy {
+pub(super) struct ProtectionPolicy {
     #[cfg(test)]
-    fixture_owner: Option<String>,
+    pub(super) fixture_owner: Option<String>,
 }
 impl ProtectionPolicy {
-    fn production() -> Self {
+    pub(super) fn production() -> Self {
         Self {
             #[cfg(test)]
             fixture_owner: None,
         }
     }
-    fn check(&self, f: &File, directory: bool) -> Result<(), Failure> {
+    pub(super) fn check(&self, f: &File, directory: bool) -> Result<(), Failure> {
         structural(f, directory)?;
         let p = native::windows_protection(f).map_err(|_| Failure::RecoveryRequired)?;
         #[cfg(test)]
@@ -133,7 +138,7 @@ impl ProtectionPolicy {
         )
         .map_err(|_| Failure::RecoveryRequired)
     }
-    fn creation_descriptor(&self) -> String {
+    pub(super) fn creation_descriptor(&self) -> String {
         #[cfg(test)]
         if let Some(who) = &self.fixture_owner {
             return format!("O:{who}D:P(A;;FA;;;{who})");
@@ -173,7 +178,7 @@ fn raw_open(
     }
     Ok(unsafe { File::from_raw_handle(h) })
 }
-fn structural(f: &File, directory: bool) -> Result<(), Failure> {
+pub(super) fn structural(f: &File, directory: bool) -> Result<(), Failure> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0
         || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -184,7 +189,7 @@ fn structural(f: &File, directory: bool) -> Result<(), Failure> {
     }
     Ok(())
 }
-fn identity(f: &File) -> Result<(u64, [u8; 16]), Failure> {
+pub(super) fn identity(f: &File) -> Result<(u64, [u8; 16]), Failure> {
     let mut id = FILE_ID_INFO::default();
     if unsafe {
         GetFileInformationByHandleEx(
@@ -242,14 +247,14 @@ fn discard(f: &File) -> Result<(), Failure> {
         Ok(())
     }
 }
-fn pin_chain(path: &Path, final_policy: Policy) -> Result<Vec<File>, OpenError> {
+pub(super) fn pin_chain(path: &Path, final_policy: Option<Policy>) -> Result<Vec<File>, OpenError> {
     walk_chain(
         path,
         final_policy,
         &|f| {
             layout::check_protection(
                 Platform::Windows,
-                final_policy,
+                final_policy.ok_or(Error::Layout)?,
                 true,
                 &native::windows_protection(f)?,
             )
@@ -268,7 +273,7 @@ fn pin_private_dirs<P: AsRef<Path>>(
         pins.extend(
             walk_chain(
                 path.as_ref(),
-                Policy::PrivateDirectory,
+                Some(Policy::PrivateDirectory),
                 &|f| policy.check(f, true).map_err(|_| Error::Permissions),
                 &check_ancestor,
             )
@@ -283,9 +288,9 @@ fn pin_private_dirs<P: AsRef<Path>>(
     Ok(pins)
 }
 
-fn walk_chain(
+pub(super) fn walk_chain(
     path: &Path,
-    final_policy: Policy,
+    final_policy: Option<Policy>,
     check_leaf: &impl Fn(&File) -> Result<(), Error>,
     check_ancestor: &impl Fn(&layout::Protection) -> Result<(), Error>,
 ) -> Result<Vec<File>, OpenError> {
@@ -311,12 +316,12 @@ fn walk_chain(
         {
             return Err(Error::Layout.into());
         }
-        let directory = !leaf || final_policy != Policy::BinaryIntegrity;
+        let directory = !leaf || final_policy != Some(Policy::BinaryIntegrity);
         let f = raw_open(
             p,
             READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ
-                | if leaf && directory {
+                | if leaf && directory && final_policy.is_some() {
                     FILE_SHARE_WRITE
                 } else {
                     0
@@ -325,7 +330,7 @@ fn walk_chain(
             None,
         )?;
         structural(&f, directory)?;
-        if leaf {
+        if leaf && final_policy.is_some() {
             check_leaf(&f)?;
         } else {
             check_ancestor(&native::windows_protection(&f)?)?;
@@ -363,10 +368,22 @@ pub struct OwnerGuard {
     pins: Vec<File>,
 }
 impl OwnerGuard {
+    pub(super) fn layout(&self) -> &Layout {
+        &self.layout
+    }
+    pub(super) fn binary_directory(&self) -> Result<&File, OpenError> {
+        // acquire pins the whole image chain, followed by the running image.
+        self.pins
+            .get(self.pins.len().checked_sub(3).ok_or(Error::Layout)?)
+            .ok_or_else(|| Error::Layout.into())
+    }
+    pub(super) fn into_install_pins(self) -> Vec<File> {
+        self.pins
+    }
     pub fn acquire() -> Result<Self, OpenError> {
         owner_required()?;
         let layout = Layout::system()?;
-        let mut pins = pin_chain(layout.binary(), Policy::BinaryIntegrity)?;
+        let mut pins = pin_chain(layout.binary(), Some(Policy::BinaryIntegrity))?;
         let image = raw_open(
             &std::env::current_exe().map_err(|_| Error::Layout)?,
             READ_CONTROL | FILE_READ_DATA,
@@ -731,7 +748,7 @@ fn owner_required() -> Result<(), Error> {
     }
     Ok(())
 }
-fn enable_restore() -> Result<(), Error> {
+pub(super) fn enable_restore() -> Result<(), Error> {
     unsafe {
         let mut t = null_mut();
         if OpenProcessToken(
@@ -896,3 +913,6 @@ fn mutation_status(status: i32) -> Result<(), Failure> {
 #[cfg(test)]
 #[path = "owner_windows_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(super) use tests::unprotect_install_fixture;

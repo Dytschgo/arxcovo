@@ -3,6 +3,17 @@
 ## Current state — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
+- Last merged PR: [#45](https://github.com/Dytschgo/arxcovo/pull/45), `2b805c450880fd12b9f0cd9771974e4fa1337a55`, 10:11:09 UTC, all five gates on 8687ae8 plus independent Opus review. Its squash tree equals the reviewed head exactly.
+- Main after #44 passed in 613s (run 43195912105, 09:56:35–10:06:48 UTC). Main after #45 run 43198102900 is in progress, not claimed green.
+- Queue priority: E2 draft candidate for hosted verification; then accepted owner CLI and inactive Unix bridge design publication. No CLI/native implementation begins before its prerequisite gates.
+- E2 coordinator disposition: permit draft publication only, following the independent Opus assessment at 000835d (report 8e40f5a). Merge remains held pending exact-head independent status, every required hosted gate and a separate explicit coordinator decision addressing the open intermittent failure. Any hosted failure remains held; no blind rerun. [Assessment](reviews/0016-e2-current-parent-assessment.md).
+- Original ExecutionFailed run bdbf032b at 780ca41 remains open, with phase, Win32 code and cause unknown. A prior occurrence also predates E2 on main, as recorded by the assessment. Neither instrumented passes nor new-parent passes are a fix or waiver; no rate or causal claim is made.
+- E2 provider/outcome: Sol high builder port 000835d passed focused54 and one uninstrumented full259 run on its b3e1d13 parent. Coordinator OpenAI / gpt-6.1-sol / medium refresh onto main after #45 keeps all six crate files byte-identical; fmt/Clippy and one required uninstrumented full261 run passed (0a145e0e), 2 skips. Opus high assessment passed source/security/spec checks and recommends candidate-only publication. [Current evidence](evidence/e2-publication-refresh.md).
+- All owner fences and source review credits are retained. No owner command, production install, native experiment retry, third S4U probe, old Lab Manager/VM operation or babysitter change. M2 is not accepted.
+
+## Historical checkpoint before state-exit correction merged
+
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#44](https://github.com/Dytschgo/arxcovo/pull/44), `0fbf8df0b9dbe204a196bc3422c81d12d1bec94c`, 09:56:33 UTC, all five gates on e20036f plus independent Opus review. Its squash tree equals the reviewed head exactly.
 - Main after #43 passed in 623s (run 43194236390, 09:45:11–09:55:34 UTC). Main after #44 run 43195912105 is in progress, not claimed green.
 - Queue priority: state-permission exit correction, then the remaining E2/design work. Sol high E2 current-parent integration is active and remains held on unexplained ExecutionFailed run bdbf032b; no pass alone can release that hold.

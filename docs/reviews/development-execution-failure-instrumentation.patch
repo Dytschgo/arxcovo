@@ -1,0 +1,236 @@
+diff --git a/crates/arxd/src/development/windows.rs b/crates/arxd/src/development/windows.rs
+index 85f0c0e..87e4efa 100644
+--- a/crates/arxd/src/development/windows.rs
++++ b/crates/arxd/src/development/windows.rs
+@@ -20,8 +20,13 @@ impl Drop for Handle {
+         }
+     }
+ }
++thread_local! { static DBG: std::cell::Cell<(&'static str, &'static str)> = const { std::cell::Cell::new(("none", "-")) }; } // [DEBUG-ef7c]
++fn dbg_outer(p: &'static str) { DBG.with(|c| c.set((p, "-"))); } // [DEBUG-ef7c]
++fn dbg_inner(p: &'static str) { DBG.with(|c| { let (o, _) = c.get(); c.set((o, p)) }); } // [DEBUG-ef7c]
++fn dbg_fail(site: &'static str, e: u32) { let (o, i) = DBG.with(|c| c.get()); eprintln!("[DEBUG-ef7c] site={site} outer={o} inner={i} err={e}"); } // [DEBUG-ef7c]
+ fn ok(n: i32) -> std::result::Result<(), Reason> {
+     if n == 0 {
++        dbg_fail("ok", unsafe { GetLastError() }); // [DEBUG-ef7c]
+         Err(Reason::ExecutionFailed)
+     } else {
+         Ok(())
+@@ -86,12 +91,16 @@ unsafe fn sid_bytes(s: PSID) -> std::result::Result<Vec<u8>, Reason> {
+ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
+     unsafe {
+         let mut token = null_mut();
++        dbg_inner("tok_open"); // [DEBUG-ef7c]
+         ok(OpenProcessToken(process, TOKEN_QUERY, &mut token))?;
+         let token = Handle(token);
++        dbg_inner("tok_user"); // [DEBUG-ef7c]
+         let u = info(token.0, TokenUser)?;
+         let user = sid_bytes((*(u.as_ptr().cast::<TOKEN_USER>())).User.Sid)?;
++        dbg_inner("tok_elev"); // [DEBUG-ef7c]
+         let e = info(token.0, TokenElevation)?;
+         let elevated = (*(e.as_ptr().cast::<TOKEN_ELEVATION>())).TokenIsElevated != 0;
++        dbg_inner("tok_integrity"); // [DEBUG-ef7c]
+         let i = info(token.0, TokenIntegrityLevel)?;
+         let sid = (*(i.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())).Label.Sid;
+         if IsValidSid(sid) == 0 {
+@@ -102,6 +111,7 @@ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
+             return Err(Reason::PreflightFailed);
+         }
+         let integrity = *GetSidSubAuthority(sid, (count - 1) as u32);
++        dbg_inner("tok_groups"); // [DEBUG-ef7c]
+         let g = info(token.0, TokenGroups)?;
+         let groups = &*g.as_ptr().cast::<TOKEN_GROUPS>();
+         let count = groups.GroupCount as usize;
+@@ -218,6 +228,7 @@ impl Job {
+         unsafe {
+             let h = CreateJobObjectW(null(), null());
+             if h.is_null() {
++                dbg_fail("job_create", GetLastError()); // [DEBUG-ef7c]
+                 return Err(Reason::ExecutionFailed);
+             }
+             let job = Self(Handle(h));
+@@ -228,6 +239,7 @@ impl Job {
+                 | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+             limits.BasicLimitInformation.ActiveProcessLimit = l.pids;
+             limits.JobMemoryLimit = l.memory_bytes;
++            dbg_inner("job_limits"); // [DEBUG-ef7c]
+             ok(SetInformationJobObject(
+                 h,
+                 JobObjectExtendedLimitInformation,
+@@ -237,6 +249,7 @@ impl Job {
+             let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+                 UIRestrictionsClass: 0xff, /* all eight UI limits */
+             };
++            dbg_inner("job_ui"); // [DEBUG-ef7c]
+             ok(SetInformationJobObject(
+                 h,
+                 JobObjectBasicUIRestrictions,
+@@ -283,9 +296,11 @@ fn pipe() -> std::result::Result<(Handle, Handle), Reason> {
+             bInheritHandle: 1,
+         };
+         let (mut r, mut w) = (null_mut(), null_mut());
++        dbg_inner("create_pipe"); // [DEBUG-ef7c]
+         ok(CreatePipe(&mut r, &mut w, &sa, 0))?;
+         let r = Handle(r);
+         let w = Handle(w);
++        dbg_inner("pipe_noinherit"); // [DEBUG-ef7c]
+         ok(SetHandleInformation(r.0, HANDLE_FLAG_INHERIT, 0))?;
+         Ok((r, w))
+     }
+@@ -318,21 +333,21 @@ fn drain(h: HANDLE, c: &mut Captured, limit: usize) -> std::result::Result<bool,
+     unsafe {
+         let mut available = 0;
+         if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
+-            if GetLastError() == ERROR_BROKEN_PIPE {
++            let dbg_e = GetLastError(); // [DEBUG-ef7c]
++            if dbg_e == ERROR_BROKEN_PIPE {
+                 return Ok(c.total > limit as u64);
+             }
++            dbg_fail("peek", dbg_e); // [DEBUG-ef7c]
++            eprintln!("[DEBUG-ef7c] peek_total={} over={}", c.total, c.total > limit as u64); // [DEBUG-ef7c]
+             return Err(Reason::ExecutionFailed);
+         }
+         if available > 0 {
+             let mut b = [0u8; 4096];
+             let mut n = 0;
+-            ok(ReadFile(
+-                h,
+-                b.as_mut_ptr(),
+-                available.min(4096),
+-                &mut n,
+-                null_mut(),
+-            ))?;
++            dbg_inner("drain_read"); // [DEBUG-ef7c]
++            let dbg_r = ReadFile(h, b.as_mut_ptr(), available.min(4096), &mut n, null_mut()); // [DEBUG-ef7c]
++            if dbg_r == 0 { dbg_fail("read", GetLastError()); eprintln!("[DEBUG-ef7c] read_available={available} read_n={n} total={}", c.total); } // [DEBUG-ef7c]
++            if dbg_r == 0 { return Err(Reason::ExecutionFailed); } // [DEBUG-ef7c]
+             let keep = (limit + REDACTION_MARGIN).saturating_sub(c.bytes.len());
+             c.bytes.extend_from_slice(&b[..(n as usize).min(keep)]);
+             c.total += u64::from(n);
+@@ -362,6 +377,8 @@ fn run_inner(
+     cancel: &Cancellation,
+     fixture: bool,
+ ) -> std::result::Result<ResultData, Reason> {
++    dbg_outer("daemon_facts"); // [DEBUG-ef7c]
++    let dbg_t0 = Instant::now(); // [DEBUG-ef7c]
+     #[cfg_attr(not(test), allow(unused_mut))]
+     let mut daemon = facts(unsafe { GetCurrentProcess() })?;
+     // The only bypass is a unit-test call; no binary/config/CLI can select it.
+@@ -392,8 +409,11 @@ fn run_inner(
+     if command.len() > 32767 {
+         return Err(Reason::InvalidArguments);
+     }
++    dbg_outer("pipe_out"); // [DEBUG-ef7c]
+     let (out_r, out_w) = pipe()?;
++    dbg_outer("pipe_err"); // [DEBUG-ef7c]
+     let (err_r, err_w) = pipe()?;
++    dbg_outer("job_new"); // [DEBUG-ef7c]
+     let job = Job::new(&settings.limits)?;
+     unsafe {
+         let sa = SECURITY_ATTRIBUTES {
+@@ -411,15 +431,18 @@ fn run_inner(
+             null_mut(),
+         ));
+         if nul.0 == INVALID_HANDLE_VALUE {
++            dbg_fail("nul", GetLastError()); // [DEBUG-ef7c]
+             return Err(Reason::ExecutionFailed);
+         }
+         let mut handles = [nul.0, out_w.0, err_w.0];
+         let mut size = 0;
+         InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+         if size == 0 || size > 65536 {
++            dbg_fail("attr_size", GetLastError()); // [DEBUG-ef7c]
+             return Err(Reason::ExecutionFailed);
+         }
+         let mut buf = vec![0usize; size.div_ceil(size_of::<usize>())];
++        dbg_outer("attr_init"); // [DEBUG-ef7c]
+         ok(InitializeProcThreadAttributeList(
+             buf.as_mut_ptr().cast(),
+             1,
+@@ -427,6 +450,7 @@ fn run_inner(
+             &mut size,
+         ))?;
+         let mut attributes = Attributes { buf };
++        dbg_outer("attr_update"); // [DEBUG-ef7c]
+         ok(UpdateProcThreadAttribute(
+             attributes.buf.as_mut_ptr().cast(),
+             0,
+@@ -445,6 +469,7 @@ fn run_inner(
+         startup.lpAttributeList = attributes.buf.as_mut_ptr().cast();
+         let mut pi: PROCESS_INFORMATION = zeroed();
+         let env = environment(settings);
++        dbg_outer("create_process"); // [DEBUG-ef7c]
+         ok(CreateProcessW(
+             wide(exe.as_os_str()).as_ptr(),
+             command.as_mut_ptr(),
+@@ -467,14 +492,17 @@ fn run_inner(
+         drop(nul);
+         let result = (|| {
+             if AssignProcessToJobObject(job.0.0, process.0) == 0 {
++                dbg_fail("assign", GetLastError()); // [DEBUG-ef7c]
+                 TerminateProcess(process.0, 1);
+                 return Err(Reason::ExecutionFailed);
+             }
++            dbg_outer("child_facts"); // [DEBUG-ef7c]
+             let child = facts(process.0)?;
+             if child.user != daemon.user || (!(cfg!(test) && fixture) && policy(&child).is_err()) {
+                 return Err(Reason::IdentityMismatch);
+             }
+             if ResumeThread(thread.0) == u32::MAX {
++                dbg_fail("resume", GetLastError()); // [DEBUG-ef7c]
+                 return Err(Reason::ExecutionFailed);
+             }
+             let start = Instant::now();
+@@ -482,8 +510,8 @@ fn run_inner(
+             let mut stderr = Captured::default();
+             let mut reason = StopReason::Exited;
+             loop {
+-                if drain(out_r.0, &mut stdout, r.output_bytes)?
+-                    || drain(err_r.0, &mut stderr, r.output_bytes)?
++                if { dbg_outer("loop_out"); drain(out_r.0, &mut stdout, r.output_bytes)? } // [DEBUG-ef7c]
++                    || { dbg_outer("loop_err"); drain(err_r.0, &mut stderr, r.output_bytes)? } // [DEBUG-ef7c]
+                 {
+                     reason = StopReason::OutputLimit;
+                     break;
+@@ -505,10 +533,13 @@ fn run_inner(
+                     break;
+                 }
+                 if wait != WAIT_TIMEOUT {
++                    dbg_fail("wait", GetLastError()); // [DEBUG-ef7c]
++                    eprintln!("[DEBUG-ef7c] wait_ret={wait}"); // [DEBUG-ef7c]
+                     return Err(Reason::ExecutionFailed);
+                 }
+             }
+             let mut code = 0;
++            dbg_outer("exit_code"); // [DEBUG-ef7c]
+             ok(GetExitCodeProcess(process.0, &mut code))?;
+             let cleanup = job.stop();
+             if !cleanup {
+@@ -516,8 +547,8 @@ fn run_inner(
+             }
+             // Bounded final read: pipes cannot hold us open, even if a handle escaped.
+             for _ in 0..32 {
+-                let overflow = drain(out_r.0, &mut stdout, r.output_bytes)?
+-                    | drain(err_r.0, &mut stderr, r.output_bytes)?;
++                let overflow = { dbg_outer("final_out"); drain(out_r.0, &mut stdout, r.output_bytes)? } // [DEBUG-ef7c]
++                    | { dbg_outer("final_err"); drain(err_r.0, &mut stderr, r.output_bytes)? }; // [DEBUG-ef7c]
+                 if overflow && reason == StopReason::Exited {
+                     reason = StopReason::OutputLimit;
+                 }
+@@ -552,6 +583,16 @@ fn run_inner(
+                 stderr_dropped_bytes: stderr.dropped(r.output_bytes),
+             })
+         })();
++        if let Err(dbg_reason) = &result { // [DEBUG-ef7c]
++            let dbg_wait = WaitForSingleObject(process.0, 0); // [DEBUG-ef7c]
++            let mut dbg_code = 0u32; // [DEBUG-ef7c]
++            let dbg_code_ok = GetExitCodeProcess(process.0, &mut dbg_code) != 0; // [DEBUG-ef7c]
++            let mut dbg_a: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed(); // [DEBUG-ef7c]
++            let dbg_a_ok = QueryInformationJobObject(job.0.0, JobObjectBasicAccountingInformation, (&mut dbg_a as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(), size_of_val(&dbg_a) as u32, null_mut()) != 0; // [DEBUG-ef7c]
++            let mut dbg_v: JOBOBJECT_LIMIT_VIOLATION_INFORMATION = zeroed(); // [DEBUG-ef7c]
++            let dbg_v_ok = QueryInformationJobObject(job.0.0, JobObjectLimitViolationInformation, (&mut dbg_v as *mut JOBOBJECT_LIMIT_VIOLATION_INFORMATION).cast(), size_of_val(&dbg_v) as u32, null_mut()) != 0; // [DEBUG-ef7c]
++            eprintln!("[DEBUG-ef7c] result_err={dbg_reason:?} elapsed_ms={} child_wait={dbg_wait} code_ok={dbg_code_ok} code={dbg_code:#x} acct_ok={dbg_a_ok} active={} total={} terminated={} viol_ok={dbg_v_ok} viol_flags={:#x}", dbg_t0.elapsed().as_millis(), dbg_a.ActiveProcesses, dbg_a.TotalProcesses, dbg_a.TotalTerminatedProcesses, dbg_v.ViolationLimitFlags); // [DEBUG-ef7c]
++        } // [DEBUG-ef7c]
+         if result.is_err() {
+             TerminateProcess(process.0, 1);
+             job.stop();

@@ -259,7 +259,7 @@ impl WindowsScm {
     }
 }
 impl<C: ScmCalls, K: Clock> WindowsScm<C, K> {
-    fn new(l: &Layout, calls: C, clock: K) -> Result<Self, Error> {
+    pub(super) fn new(l: &Layout, calls: C, clock: K) -> Result<Self, Error> {
         if l.platform() != Platform::Windows {
             return Err(Error::Layout);
         }
@@ -304,6 +304,10 @@ impl<C: ScmCalls, K: Clock> WindowsScm<C, K> {
     }
     fn open(&mut self, a: Access) -> Result<bool, Error> {
         manager(self.calls.open(a))
+    }
+    #[cfg(test)]
+    pub(super) fn test_calls(&mut self) -> &mut C {
+        &mut self.calls
     }
     pub fn observe(&mut self) -> Result<Observation, Error> {
         if !self.open(Access::Status)? {
