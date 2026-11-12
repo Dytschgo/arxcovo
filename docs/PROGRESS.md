@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: [#46](https://github.com/Dytschgo/arxcovo/pull/46), `1d828ca7f4cddc74495f2d8eeca36bb4553a7ad9`, 10:30:26 UTC, all five gates on exact head `ddd698e2bbef4dd9a730ae52a2c2c9f94aa42a15` and independent Opus review. Its squash tree equals the reviewed head.
+- Main after #46 run 43200970512 is in_progress, not claimed green.
+- Queue priority: owner CLI contract publication, then inactive Unix native bridge contract. S1–S3 implementation remains gated until this contract's published-head review and required checks; no valid owner command may be invoked by tests.
+- Contract provider/outcome: original Opus high design and first correction retain independent Sol high reviews; coordinator OpenAI / gpt-6.1-sol / medium correction-2 and advisory clarification retain independent Anthropic / Opus 5.5 / high PASS reviews (48757f0, 1c80075). All N1–N5 and small follow-up advisories are specified in the brief; tests described are future requirements, not executed evidence. Fresh published-head recheck remains required.
+- E2 merge disposition remains explicit in PR46: accept the remaining pre-existing baseline intermittency risk for the reviewed library-only slice after exact-head green checks. The old bdbf032b red remains a failure with unknown cause; no fix, rate claim or current-check waiver. No installed-service/M2 acceptance follows.
+- No Rust source, workflow or runtime behavior changes in this contract PR. No owner/admin/service operation, experiment retry, third S4U probe, old Lab Manager/VM or babysitter change.
+
+## Historical checkpoint before owner CLI contract publication
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#45](https://github.com/Dytschgo/arxcovo/pull/45), `2b805c450880fd12b9f0cd9771974e4fa1337a55`, 10:11:09 UTC, all five gates on 8687ae8 plus independent Opus review. Its squash tree equals the reviewed head exactly.
 - Main after #44 passed in 613s (run 43195912105, 09:56:35–10:06:48 UTC). Main after #45 run 43198102900 is in progress, not claimed green.
