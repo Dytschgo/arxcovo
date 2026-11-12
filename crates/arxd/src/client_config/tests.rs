@@ -751,6 +751,43 @@ fn windows_nonprivate_parent_and_junction_refused_unchanged() {
     observer.check(1, 1);
     fs::remove_dir(&f.parent).unwrap_or_else(|_| panic!("owned junction cleanup"));
 }
+#[cfg(windows)]
+#[test]
+fn windows_native_verify_rejection_and_acquisition_reach_partial() {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsHandle};
+    let f = Fixture::new();
+    f.run(&mut Ops::new()).unwrap();
+    let before = f.bytes();
+    let len = before.len() as u64;
+    let held = fs::File::open(&f.out).unwrap_or_else(|_| panic!("held fixture"));
+    let mut native = platform::NativeFileOps::new().unwrap();
+    assert!(
+        native.verify(held.as_handle(), len).is_ok(),
+        "valid native control"
+    );
+    assert!(
+        matches!(
+            partial(native.verify(held.as_handle(), len + 1)),
+            Err(ClientError::Partial)
+        ),
+        "native checker rejection"
+    );
+    let meta = fs::OpenOptions::new()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES)
+        .open(&f.out)
+        .unwrap_or_else(|_| panic!("attributes-only fixture"));
+    assert!(
+        matches!(
+            partial(native.verify(meta.as_handle(), len)),
+            Err(ClientError::Partial)
+        ),
+        "native acquisition failure"
+    );
+    drop((held, meta));
+    assert!(before == f.bytes(), "verify changed bytes");
+    f.private();
+}
+
 #[test]
 fn held_file_is_noninheritable_and_existing_private_parent_unchanged() {
     struct Inspect {

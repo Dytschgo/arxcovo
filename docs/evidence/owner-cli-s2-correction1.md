@@ -153,9 +153,10 @@ Current source blobs at the tested source head:
 
 Fresh independent Anthropic / Opus 5.5 / high exact-head recheck is REQUIRED
 before publication. All hosted checks remain mandatory, particularly real
-Linux/macOS build/test and Unix compiled assertion-kill mutations (mode,
-write/sync conversion, nofollow, mode/length checks, elevation IDs and parent
-preservation). Stub harnesses, if later used, are type-check evidence only.
+Linux/macOS build/test and relevant Unix compiled assertion-kill mutations
+(write/sync conversion, nofollow, mode/length checks, elevation IDs and parent
+preservation). Native Mode currently has only cv conversion/source coverage;
+normal creation is already 0600, so no no-op Mode mutation kill is claimed. Stub harnesses, if later used, are type-check evidence only.
 Dispatch/output assertions remain S3; no acceptance/activation is claimed.
 
 Correction tests/manual work invoked no production create, ClientConfig::load,
