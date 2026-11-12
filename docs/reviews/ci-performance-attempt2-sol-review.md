@@ -14,7 +14,7 @@ toolchain have no diff from published 48d4916.
 
 The prepared T3 worktree was clean at that exact HEAD. Its working directory
 and Git top level both resolve to
-`C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-036d71ee-902e5c315c6e3ed5`,
+`<prepared-worktree>`,
 distinct from canonical `D:/Code/Arxcovo`. No checkout or worktree was created.
 
 ## Standards
