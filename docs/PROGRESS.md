@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**; no native executor or owner CLI is activated.
+- Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main `884a301eaa1e6dda6d218e439315ecdf3902ae82`, 08:56:09 UTC, all five gates on 190c1c7 plus independent Opus review.
+- Main after #40 passed: run 43187047371 at 884a301, 08:56:12–09:03:20 UTC, 428s. Main after #39 passed in 559s, run 43182044209.
+- Queue priority: N3 late-dispatch drain fix, then N2 typed report validation/privacy, as separate reviewed PRs. E2 remains held by unexplained local ExecutionFailed run bdbf032b; instrumented passes did not fix or waive it.
+- Coordinator Sol medium ports N3's two executor files byte-identically from reviewed boundary 1976afb onto actual main884a301; fmt, locked all-target Clippy and one normal full nextest run passed (235/235, 2 skipped; 1e0fe360). Fresh Opus integration review and hosted gates remain required before merge. E1 owner and #39 client changes stay inherited unchanged.
+- ADR0018 correction-2 independent Opus PASS closes A-SP1/A-ST1; local docs contract disposition 29068df is accepted with all implementation gates retained and N1–N5 advisories due before S2. ADR0019 has inactive-design PASS only. Neither design is activated.
+- No native experiment retry, third S4U probe, owner admin, old Lab Manager/VM operation or babysitter change.
+
+## Historical checkpoint before N3 publication
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native/installed/dedicated paths remain **unverified on real hardware**; no owner CLI or native execution is activated.
 - Last merged PR: #39, `79b7879e7330e2f8de408723f15ddfac399dd75f`, 08:19:48 UTC, through all five gates and independent Opus review.
 - Queue priority: publish one-concern owner E1/E2 and shutdown/report-validation library slices after independent integration review, then complete their hosted gates. Sol review passes ADR0019 for inactive design; ADR0018 corrections are active with Opus. No implementation before accepted contracts or gate bypass.

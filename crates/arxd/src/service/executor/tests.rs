@@ -689,3 +689,187 @@ fn ordinary_device_like_filenames_remain_lexically_valid() {
         );
     }
 }
+#[tokio::test(flavor = "current_thread")]
+async fn late_dispatch_after_drain_finishes_without_worker_or_poll() {
+    for discovery in [false, true] {
+        for storage_failure in [false, true] {
+            let dir = private_temp();
+            let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+            let (e, calls) = fake(false, true);
+            e.drain().await.unwrap();
+            let id = a
+                .start_dedicated(
+                    "alpha",
+                    if discovery {
+                        "discover_tools"
+                    } else {
+                        "run_command"
+                    },
+                )
+                .unwrap();
+            let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            if storage_failure {
+                db.execute_batch("PRAGMA journal_mode=TRUNCATE; CREATE TRIGGER fail_late_finish BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+            }
+            let work = e.dispatch((!discovery).then(request), a.clone(), id);
+            // Snapshot before polling or dropping the caller future. A registered
+            // worker is a bug even if the blocking pool has already run it.
+            let registered = e.workers.lock().unwrap().len();
+            let row: (String, Option<String>, String, Option<String>, Option<i64>) = db
+                .query_row(
+                    "SELECT outcome,reason,identity_mode,program,argc FROM activity WHERE id=?",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            let schema: u32 = db
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            let result = work.await;
+            let drained = e.drain().await;
+            // Always join old-behavior workers before any regression assertion.
+            assert_eq!(schema, 3);
+            assert_eq!(registered, 0, "late dispatch registered an unjoined worker");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let failure = result.err().unwrap();
+            if storage_failure {
+                assert_eq!(failure.reason, Reason::StorageFailed);
+                assert_eq!(failure.execution_reason, None);
+                assert_eq!(drained, Err(Reason::ExecutionFailed));
+                assert_eq!(row.0, "started");
+            } else {
+                assert_eq!(failure.reason, Reason::Shutdown);
+                assert_eq!(failure.execution_reason, Some(Unavailable::Stopping));
+                assert!(drained.is_ok());
+                assert_eq!(
+                    row,
+                    (
+                        "refused".into(),
+                        Some("shutdown".into()),
+                        "dedicated_account".into(),
+                        (!discovery).then(|| "cargo".into()),
+                        (!discovery).then_some(1)
+                    )
+                );
+                assert!(a.finish(id, "succeeded").is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_dispatch_during_drain_preserves_gated_accepted_worker() {
+    let dir = private_temp();
+    let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    let gate = Gate::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let e = backend_fixture(Arc::new(GatedBackend {
+        gate: gate.clone(),
+        preflight_gate: false,
+        calls: calls.clone(),
+    }));
+    let first = a.start_dedicated("alpha", "run_command").unwrap();
+    let work = e.dispatch(Some(request()), a.clone(), first);
+    gate.entered.notified().await;
+    let mut drain = Box::pin(e.drain());
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
+            .await;
+    let late = a.start_dedicated("alpha", "run_command").unwrap();
+    let late_work = e.dispatch(Some(request()), a.clone(), late);
+    let registered = e.workers.lock().unwrap().len();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    let before = db.query_row("SELECT outcome FROM activity WHERE id=?", [first], |r| {
+        r.get::<_, String>(0)
+    });
+    let late_before = db.query_row("SELECT outcome FROM activity WHERE id=?", [late], |r| {
+        r.get::<_, String>(0)
+    });
+    drop(late_work); // Disconnect cannot undo a synchronous refusal.
+    gate.release();
+    let drained = drain.await;
+    let value = work.await;
+    e.drain().await.unwrap(); // Clean up replacement-set workers on old code.
+    assert!(pending, "drain must await accepted backend cleanup");
+    assert_eq!(before.unwrap(), "started");
+    assert_eq!(registered, 0, "late dispatch registered during drain");
+    assert_eq!(late_before.unwrap(), "refused");
+    assert!(drained.is_ok());
+    assert_eq!(value.ok().unwrap()["metadata"]["stop_reason"], "shutdown");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(e.workers.lock().unwrap().is_empty());
+    assert!(a.finish(first, "succeeded").is_err());
+    assert!(a.finish(late, "succeeded").is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_dispatch_after_shutdown_persists_even_when_caller_disconnects() {
+    let dir = private_temp();
+    let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+    let (e, calls) = fake(false, true);
+    e.shutdown();
+    let id = a.start_dedicated("alpha", "run_command").unwrap();
+    let work = e.dispatch(Some(request()), a.clone(), id);
+    let registered = e.workers.lock().unwrap().len();
+    let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+    let row = db.query_row(
+        "SELECT outcome,reason FROM activity WHERE id=?",
+        [id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    );
+    drop(work);
+    let drained = e.drain().await;
+    assert!(drained.is_ok());
+    assert_eq!(registered, 0);
+    assert_eq!(row.unwrap(), ("refused".into(), "shutdown".into()));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(a.finish(id, "succeeded").is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stopping_refusal_preserves_quarantine_precedence() {
+    for discovery in [false, true] {
+        let dir = private_temp();
+        let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+        let (e, calls) = fake(false, true);
+        e.quarantined.store(true, Ordering::Release);
+        e.drain().await.unwrap();
+        let capability = e.capability();
+        let id = a
+            .start_dedicated(
+                "alpha",
+                if discovery {
+                    "discover_tools"
+                } else {
+                    "run_command"
+                },
+            )
+            .unwrap();
+        let work = e.dispatch((!discovery).then(request), a.clone(), id);
+        let registered = e.workers.lock().unwrap().len();
+        let result = work.await;
+        e.drain().await.unwrap();
+        assert_eq!(registered, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(capability["reason"], "quarantined");
+        let failure = result.err().unwrap();
+        assert_eq!(failure.reason, Reason::Quarantined);
+        assert_eq!(failure.execution_reason, Some(Unavailable::Quarantined));
+        let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+        let row: (String, String, String) = db
+            .query_row(
+                "SELECT outcome,reason,identity_mode FROM activity WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "refused".into(),
+                "quarantined".into(),
+                "dedicated_account".into()
+            )
+        );
+    }
+}

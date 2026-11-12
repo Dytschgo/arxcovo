@@ -260,108 +260,55 @@ impl Execution {
                 self.quarantined.store(true, Ordering::Release);
             }
         }
-        workers.spawn_blocking(move || {
-            let report = if let Err(r) = this.preflight() {
-                Report::Unavailable(r)
-            } else if this.active.fetch_add(1, Ordering::AcqRel) >= this.limit {
-                this.active.fetch_sub(1, Ordering::AcqRel);
-                Report::Unavailable(Unavailable::Busy)
-            } else {
-                let r = if cancel.is_cancelled() {
-                    Report::Completed { metadata: Metadata { stop_reason: Some(StopReason::Cancelled), ..Default::default() }, stdout: CapturedOutput {head:vec![],tail:vec![],dropped_bytes:0}, stderr: CapturedOutput {head:vec![],tail:vec![],dropped_bytes:0} }
-                } else if this.shutdown.is_cancelled() {
-                    Report::Unavailable(Unavailable::Stopping)
-                } else {
-                    this.backend.run(request.as_ref(), &cancel, &this.shutdown)
-                };
-                this.active.fetch_sub(1, Ordering::AcqRel);
-                r
-            };
-            let invalid_discovery = matches!(&report, Report::Discovered { tools, .. } if !valid_tools(tools));
-            let post_spawn_error = invalid_discovery || matches!(&report, Report::Failed { after_spawn:true } | Report::Completed { metadata:Metadata { stop_reason:Some(StopReason::Failed), .. }, .. } | Report::Discovered { metadata:Metadata { stop_reason:Some(StopReason::Failed), .. }, .. });
-            let (mut outcome, mut metadata, mut value, refusal) = match report {
-                Report::Unavailable(r) => (
-                    Outcome::Refused,
-                    Metadata {
-                        reason: Some(r.stored_reason()),
-                        ..Default::default()
-                    },
-                    Value::Null,
-                    Some(r),
-                ),
-                Report::Failed { after_spawn } => {
-                    (Outcome::Failed, Metadata { reason:Some(if after_spawn {Reason::CleanupUnconfirmed} else {Reason::ExecutionFailed}), stop_reason:Some(StopReason::Failed), cleanup_confirmed:after_spawn.then_some(false), ..Default::default() }, json!({}), None)
-                }
-                Report::Discovered { metadata, tools } => {
-                    let valid = valid_tools(&tools);
-                    if valid {
-                        (terminal(&metadata), metadata, json!({"tools":tools}), None)
-                    } else {
-                        (Outcome::Failed, metadata, json!({}), None)
-                    }
-                }
-                Report::Completed {
-                    metadata,
-                    stdout,
-                    stderr,
-                } => {
-                    let value =
-                        json!({"stdout":output_value(stdout, request.as_ref().map_or(4096, |r| r.output_bytes)),"stderr":output_value(stderr, request.as_ref().map_or(4096, |r| r.output_bytes))});
-                    (terminal(&metadata), metadata, value, None)
-                }
-                #[cfg(test)]
-                Report::FakeForTest { stop, cleanup } => (
-                    Outcome::Failed,
-                    Metadata {
-                        stop_reason: Some(stop),
-                        cleanup_confirmed: Some(cleanup),
-                        ..Default::default()
-                    },
-                    json!({"test_outcome":"FakeForTest","acceptance":false}),
-                    None,
-                ),
-            };
-            metadata.identity_mode = Some(crate::store::IdentityMode::DedicatedAccount);
-            normalize(&mut metadata);
-            if invalid_discovery && metadata.reason.is_none() { metadata.reason = Some(Reason::ExecutionFailed); }
-            if outcome != Outcome::Refused { outcome=terminal(&metadata); }
-            if metadata.cleanup_confirmed == Some(false) || post_spawn_error {
-                this.quarantined.store(true, Ordering::Release);
-            }
-            if let Some(r) = &request {
-                metadata.program = Some(match &r.tool {
-                    Some(t) => serde_json::from_value(json!(t)).unwrap(),
-                    None => crate::store::Program::Path,
-                });
-                metadata.argc = Some(r.args.len() as u16);
-            }
-            let result = activity
-                .finish_typed(id, outcome, &metadata)
-                .map_err(|_| Failure {
-                    reason: Reason::StorageFailed,
-                    execution_reason: None,
-                })
-                .and_then(|()| {
-                    if let Some(r) = refusal {
-                        return Err(Failure {
-                            reason: r.stored_reason(),
-                            execution_reason: Some(r),
-                        });
-                    }
-                    value["activity_id"] = json!(id);
-                    value["outcome"] = json!(outcome.as_str());
-                    value["reason"] = json!(metadata.reason);
-                value["exit_code"] = json!(metadata.exit_code);
-                value["rights"] = json!(metadata.rights);
-                value["tree_boundary"] = json!(metadata.tree_boundary);
-                value["cleanup_confirmed"] = json!(metadata.cleanup_confirmed);
-                value["observed_identity"] = if metadata.observed_kind.is_some() { json!({"kind":metadata.observed_kind,"id":metadata.observed_id,"gid":metadata.observed_gid,"integrity_rid":metadata.integrity_rid,"elevation":metadata.elevation,"observation_point":metadata.observation_point}) } else { Value::Null };
-                value["metadata"] = serde_json::to_value(metadata).unwrap();
-                    Ok(value)
-                });
-            if result.as_ref().is_err_and(|e| e.reason == Reason::StorageFailed) { this.audit_failed.store(true, Ordering::Release); }
+        // Serialize the stopping decision with drain's JoinSet transfer. A
+        // stopping-only refusal must finish before returning, without a worker
+        // that could land in the replacement set after drain took ownership.
+        if self.shutdown.is_cancelled() {
+            let refusal = self.preflight().err().unwrap_or(Unavailable::Stopping);
+            let result = self.complete(
+                Report::Unavailable(refusal),
+                request.as_ref(),
+                &activity,
+                id,
+            );
             let _ = send.send(result);
-        });
+        } else {
+            workers.spawn_blocking(move || {
+                let report = if let Err(r) = this.preflight() {
+                    Report::Unavailable(r)
+                } else if this.active.fetch_add(1, Ordering::AcqRel) >= this.limit {
+                    this.active.fetch_sub(1, Ordering::AcqRel);
+                    Report::Unavailable(Unavailable::Busy)
+                } else {
+                    let r = if cancel.is_cancelled() {
+                        Report::Completed {
+                            metadata: Metadata {
+                                stop_reason: Some(StopReason::Cancelled),
+                                ..Default::default()
+                            },
+                            stdout: CapturedOutput {
+                                head: vec![],
+                                tail: vec![],
+                                dropped_bytes: 0,
+                            },
+                            stderr: CapturedOutput {
+                                head: vec![],
+                                tail: vec![],
+                                dropped_bytes: 0,
+                            },
+                        }
+                    } else if this.shutdown.is_cancelled() {
+                        Report::Unavailable(Unavailable::Stopping)
+                    } else {
+                        this.backend.run(request.as_ref(), &cancel, &this.shutdown)
+                    };
+                    this.active.fetch_sub(1, Ordering::AcqRel);
+                    r
+                };
+                let result = this.complete(report, request.as_ref(), &activity, id);
+                let _ = send.send(result);
+            });
+        }
         drop(workers);
         async move {
             let _guard = guard;
@@ -370,6 +317,142 @@ impl Execution {
                 execution_reason: None,
             })?
         }
+    }
+    /// Shared terminal persistence for accepted workers and synchronous refusals.
+    fn complete(
+        &self,
+        report: Report,
+        request: Option<&Request>,
+        activity: &Activity,
+        id: i64,
+    ) -> Result<Value, Failure> {
+        let invalid_discovery =
+            matches!(&report, Report::Discovered { tools, .. } if !valid_tools(tools));
+        let post_spawn_error = invalid_discovery
+            || matches!(
+                &report,
+                Report::Failed { after_spawn: true }
+                    | Report::Completed {
+                        metadata: Metadata {
+                            stop_reason: Some(StopReason::Failed),
+                            ..
+                        },
+                        ..
+                    }
+                    | Report::Discovered {
+                        metadata: Metadata {
+                            stop_reason: Some(StopReason::Failed),
+                            ..
+                        },
+                        ..
+                    }
+            );
+        let (mut outcome, mut metadata, mut value, refusal) = match report {
+            Report::Unavailable(r) => (
+                Outcome::Refused,
+                Metadata {
+                    reason: Some(r.stored_reason()),
+                    ..Default::default()
+                },
+                Value::Null,
+                Some(r),
+            ),
+            Report::Failed { after_spawn } => (
+                Outcome::Failed,
+                Metadata {
+                    reason: Some(if after_spawn {
+                        Reason::CleanupUnconfirmed
+                    } else {
+                        Reason::ExecutionFailed
+                    }),
+                    stop_reason: Some(StopReason::Failed),
+                    cleanup_confirmed: after_spawn.then_some(false),
+                    ..Default::default()
+                },
+                json!({}),
+                None,
+            ),
+            Report::Discovered { metadata, tools } => {
+                let valid = valid_tools(&tools);
+                if valid {
+                    (terminal(&metadata), metadata, json!({"tools":tools}), None)
+                } else {
+                    (Outcome::Failed, metadata, json!({}), None)
+                }
+            }
+            Report::Completed {
+                metadata,
+                stdout,
+                stderr,
+            } => {
+                let value = json!({"stdout":output_value(stdout, request.map_or(4096, |r| r.output_bytes)),"stderr":output_value(stderr, request.map_or(4096, |r| r.output_bytes))});
+                (terminal(&metadata), metadata, value, None)
+            }
+            #[cfg(test)]
+            Report::FakeForTest { stop, cleanup } => (
+                Outcome::Failed,
+                Metadata {
+                    stop_reason: Some(stop),
+                    cleanup_confirmed: Some(cleanup),
+                    ..Default::default()
+                },
+                json!({"test_outcome":"FakeForTest","acceptance":false}),
+                None,
+            ),
+        };
+        metadata.identity_mode = Some(crate::store::IdentityMode::DedicatedAccount);
+        normalize(&mut metadata);
+        if invalid_discovery && metadata.reason.is_none() {
+            metadata.reason = Some(Reason::ExecutionFailed);
+        }
+        if outcome != Outcome::Refused {
+            outcome = terminal(&metadata);
+        }
+        if metadata.cleanup_confirmed == Some(false) || post_spawn_error {
+            self.quarantined.store(true, Ordering::Release);
+        }
+        if let Some(r) = request {
+            metadata.program = Some(match &r.tool {
+                Some(t) => serde_json::from_value(json!(t)).unwrap(),
+                None => crate::store::Program::Path,
+            });
+            metadata.argc = Some(r.args.len() as u16);
+        }
+        let result = activity
+            .finish_typed(id, outcome, &metadata)
+            .map_err(|_| Failure {
+                reason: Reason::StorageFailed,
+                execution_reason: None,
+            })
+            .and_then(|()| {
+                if let Some(r) = refusal {
+                    return Err(Failure {
+                        reason: r.stored_reason(),
+                        execution_reason: Some(r),
+                    });
+                }
+                value["activity_id"] = json!(id);
+                value["outcome"] = json!(outcome.as_str());
+                value["reason"] = json!(metadata.reason);
+                value["exit_code"] = json!(metadata.exit_code);
+                value["rights"] = json!(metadata.rights);
+                value["tree_boundary"] = json!(metadata.tree_boundary);
+                value["cleanup_confirmed"] = json!(metadata.cleanup_confirmed);
+                value["observed_identity"] = if metadata.observed_kind.is_some() {
+                    json!({"kind":metadata.observed_kind,"id":metadata.observed_id,"gid":metadata.observed_gid,"integrity_rid":metadata.integrity_rid,"elevation":metadata.elevation,"observation_point":metadata.observation_point})
+                } else {
+                    Value::Null
+                };
+                value["metadata"] = serde_json::to_value(metadata).unwrap();
+                Ok(value)
+            });
+        if result
+            .as_ref()
+            .is_err_and(|e| e.reason == Reason::StorageFailed)
+        {
+            self.audit_failed.store(true, Ordering::Release);
+        }
+        result
     }
 }
 /// Exhaustive stop mapping; response-only preflight details never enter metadata.
