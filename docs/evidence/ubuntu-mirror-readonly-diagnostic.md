@@ -1,3 +1,123 @@
+# Ubuntu mirror diagnostic correction 1
+
+OpenAI / gpt-6.1-sol / high, implementation sub-agent, 2026-11-12. Local only,
+no subagents. **Fresh independent Anthropic Opus 5.5 high DELTA review is mandatory
+before ANY push or hosted execution.** Prior verdict remains changes requested;
+this implementation is not reviewer acceptance. No GitHub action was performed.
+
+## Correction pins
+
+- Worktree: `<prepared-worktree>`, runtime-prepared and authoritative; pwd/top-level
+  matched, initial status clean, outside canonical `D:/Code/Arxcovo`. Explicit workdir
+  used for shell operations; no checkout created or canonical write.
+- Branch: `t3/readonly-mirror-diagnostic`.
+- Exact base: `22a98f61eb4b85e43fab65da0b3ca6939aba1b6d`.
+- Source/test/workflow head: `b1c7a4d9b23302f69adcb59703c9077d977d2d77`.
+- Evidence head: subsequent docs commit containing this correction; resolve with
+  `git log -1 --format=%H -- docs/evidence/ubuntu-mirror-readonly-diagnostic.md`.
+- Review `0689e82` retained at base: [complete independent review](../reviews/ubuntu-mirror-readonly-diagnostic-opus-review.md).
+  Prior diagnosis, candidate evidence and all history below were read and retained.
+- Actual-main ancestor remains `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`.
+  This separate diagnostic is not PR54 or performance attempt 3.
+
+## Review dispositions (implementation, pending independent delta review)
+
+| Finding | Correction / retained limit |
+| --- | --- |
+| S1 required | Innermost traceback frame only; fixed function IDs and line <=251 only when filename exactly matches loaded spec origin and executed helper bytes match the manifest hash. Unexpected identity/origin/function/line emits 0/0. No traceback formatting, source line, filename or arbitrary local value output. |
+| S1 compound sites | Only sources:97 required fields/Signed-By presence and pinned equality; sources:93 continuation/duplicate; replacement:35/39 and mirror-list:166/169 URI boolean comparisons. Only named locals, the exact fixed field regex and fixed comparisons are used. Unknown URI facts are false and refusal remains. |
+| S2 | Kernel-host boolean distinguishes an already-rewritten mirror-list entry from a foreign host without naming either. Post-failure snapshot still cannot establish original state or publication success. |
+| T1 required | New test step follows observation, both independently use explicit `failure() && runner.os == 'Linux' && steps.ubuntu_mirror.outcome == 'failure'`. Test command is normal runner-user python, no sudo, bypass or continue-on-error. Observation cannot be suppressed by tests. |
+| T1 native | Owned Unix entries and regular reads, nonblocking FIFO and directory regular=false, hard-link single-link=false; actual nonroot owner=false is asserted. A test-local policy wrapper substitutes only root ownership to exercise later native read/link facts. Root skips ordinary native tests before filesystem work. These cases are wired but skipped locally on Windows. |
+| T2 required | Injected main always 1 including actual complete fixture plan, extra argv 2 before context/tree, internal error, close error, bounded JSON/no stderr, exact category-to-directory mapping. Context, tree, OS platform, timers and output replaced locally; no production context or process alarm. |
+| T3 recommended | Alarm cancellation before close with nested finally guaranteeing close attempt; outer cleanup catch handles Deadline and close errors into fixed JSON. Deadline remains 10 seconds. Raised cleanup/cancel alarms tested with fakes, no real signals. |
+| T4/T5 info | Existing 2,200,000-byte cap and suffix-format false semantics unchanged. No budget or grammar relaxation. |
+| S3/S4 | Owned snapshots/spies and source fences retain their limited evidence; no system-wide mutation/network proof or faithful failing-image encoder is claimed. No new source/image lookup. |
+
+## Version 2 decoding and identity
+
+Version 2 retains the bounded numeric event shape and stage/category/index meaning.
+The complete stage and predicate ordering is pinned by a literal unit-test list;
+IDs use sorted names. Function IDs: 0 unknown, 1 replacement, 2 trust,
+3 rewrite_list, 4 rewrite_sources, 5 rewrite, 6 rewrite_mirror_list. Line 0 unknown;
+otherwise decode against the unchanged helper SHA below. The helper is compiled
+from the same bounded source bytes hashed before execution (CRLF normalized to LF
+only for manifest comparison); no second source-path read or pycache substitution.
+Only pure rewrite/rewrite_mirror_list are invoked by observation.
+
+Additional predicates: raise-function, raise-line; has-types, has-suites,
+has-components, has-signed-by, signed-by-pinned; continuation, duplicate;
+host-allowed, host-ubuntu, host-kernel, scheme-allowed, path-allowed, netloc-host,
+query-present, fragment-present. Required field booleans mean nonempty value;
+Signed-By presence is separate from equality (an absent field uses the helper's
+pinned default). Unknown comparisons remain false. All output remains fixed
+numeric/boolean JSON; raw source/URLs/filenames/keyring/env/error values and
+private paths never enter reports.
+
+Bounds unchanged: 32 sources, 64 KiB source input/output, 4 KiB mirror input/output,
+16 mirror entries, 128 enumeration entries, 2,200,000 bytes including rechecks,
+10 seconds, 16 KiB report. Descriptor-relative nofollow opens, nonblocking children,
+policy, fresh identity/byte rechecks and failure outcomes unchanged. No writer,
+network, staging, chmod, fsync, replace or apply introduced. Reads may update atime.
+A complete dry plan remains publication-unresolved and main exits 1; original
+helper failure and required gates remain red. No compatibility fix is inferred.
+
+## Personally executed checks (Sol high)
+
+- Baseline: `python -B -m unittest discover -s tools/ci -p 'test*ubuntu_mirror.py'`:
+  42 tests, OK, 1 skipped, exit 0.
+- Final collector: `python -B -m unittest discover -s tools/ci -p 'test_observe_ubuntu_mirror.py'`:
+  30 tests, OK, 2 skipped, exit 0.
+- Final all-mirror: `python -B -m unittest discover -s tools/ci -p 'test*ubuntu_mirror.py'`:
+  53 tests, OK, 2 skipped (51 passed), exit 0. The unchanged 23 helper tests
+  remain owned-temp/pure checks, not production apply execution.
+- Initial expanded suite had one source-fence failure on byte-string replace;
+  corrected normalization to split/join without weakening the fence, then reran.
+- Eleven focused mutation variants executed through compiled in-memory observer
+  modules / one temporary workflow edit; no compile/import failures counted.
+  Results (assertion failures/runtime test errors): site-line 20/0; origin fence
+  1/0; identity fence 1/0; host boolean 5/0; keyring boolean 1/0; redaction 20/5;
+  main return-success 3/0; context-before-tree 1/0; directory swap 1/0; cleanup
+  catch removal 0/2; workflow order 1/0. The origin/identity test facade was refined
+  to report assertion failures rather than missing-local test errors and those two
+  variants rerun. All bindings and workflow bytes restored; observer source bytes
+  never mutated. These are mutation detections, not hosted mitigation attempts.
+- git diff --check exit 0; strict UTF-8/LF checks on changed files; helper/tests
+  compared with exact base committed LF bytes and unchanged. Source fences remain
+  supplemental, not semantic system-wide proof. No Rust/full UI tests needed/run.
+
+No native Unix descriptor/ownership/FIFO/timer execution is claimed on this Windows
+host. Two ordinary-user Unix tests skip here and skip root before fixture work.
+Native/installed/dedicated paths remain **unverified on real hardware**. Tests use
+only owned temporary fixtures and injected dependencies; no actual collector
+context/main/apply, actual /etc, sudo, root runner/service or production operation.
+Only the main function under fully injected context/tree/platform/timer/output was
+exercised. No private state, ignored fixture, toolchain installation, VM/Lab Manager,
+owner/account/service/admin/SCM/LSA, cgroup, experiment or babysitter action.
+
+## Correction manifest (SHA-256, committed LF bytes)
+
+| File | SHA-256 |
+| --- | --- |
+| `.github/workflows/ci.yml` | `228e48c9f1f8322c55e7dea8880339d0d990187d996dd5ac259622b129a4d09c` |
+| `tools/ci/observe_ubuntu_mirror.py` | `45854ef7e0edc416a75686cd9f170f0baf464aa29156ce7439bf16df94bcc198` |
+| `tools/ci/test_observe_ubuntu_mirror.py` | `3a8de42f605f08f7c206cf06413818a30f030ac2b433e0e771c4708ee94e229d` |
+| `tools/ci/ubuntu_mirror.py` unchanged | `a945b3d812f1fc47fa43ac696e3ec52026b657867b3f6c0d4b274a5d409b80ff` |
+| `tools/ci/test_ubuntu_mirror.py` unchanged | `e1a3fe22a2fb7edae51c3bba69f5c3c71f2acc7552a98f251f1f09649f5b370c` |
+
+Only collector/test/workflow plus PROGRESS and this evidence file change. Review,
+helper, helper tests, trust/allowlist/keyring/permissions/parsing/rewrites unchanged.
+Next is coordinator-arranged fresh Opus high delta review, before any publication
+or hosted execution. No review delegated here. M2 incomplete; ExecutionFailed and
+E_PROTECTION unknown with no fix, waiver or retry. Attempt 2 remains nonqualifying;
+main's 906s failed baseline remains authoritative; attempt 3 untouched. No hosted
+CI result, qualifying performance result, public push/PR/watch/dispatch/rerun/merge,
+label/settings operation or manufactured CI success is claimed.
+
+---
+
+## Historical candidate evidence (version 1; superseded by correction above)
+
 # Ubuntu mirror read-only diagnostic candidate
 
 OpenAI / gpt-6.1-sol / high, implementation sub-agent, 2026-11-12.
