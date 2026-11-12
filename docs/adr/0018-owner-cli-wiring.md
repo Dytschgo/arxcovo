@@ -1,6 +1,17 @@
 # 0018: Owner CLI wiring (PR-D): routing, exit classes and client credentials
 
 Status: **accepted contract; implementation remains gated by brief §0**.
+
+S3 review clarification, 2026-11-12 (coordinator OpenAI / gpt-6.1-sol /
+medium; pending independent Opus recheck): a stale previous account surfaces
+as `service-identity`, exit 3. Existing full validation folds execution
+preflight account failures into Identity before workspace checks.
+`service-account-missing` comes from new-account lookup in `from_request`,
+and natively only on Windows. This corrects brief test 5, preserves the fixed
+token set and remedies, and changes neither `parse` nor `revalidate`.
+The Windows start seam uses a deferred start closure so SCM construction
+follows successful preflight and guard/pin release; the production ordering
+is source-reviewed and the fake start sequence must equal a direct PR-C start.
 The Opus proposal and first correction retain their independent Sol reviews;
 the Sol correction-2 and advisory clarification retain their independent Opus
 reviews. The latest clarification passed at dfcb643. Its small follow-up
@@ -286,3 +297,13 @@ on d9b6fa3 and independent exact-head Opus review. The brief now names that
 publication gate explicitly and states that all unaffected safety assertions
 still apply to deliberately invalid Verify fixtures. These wording follow-ups
 implement the final non-blocking review notes, with no new authority.
+
+## S3 clarification review checkpoint, 2026-11-12
+
+Independent Opus high recheck 98a5bb5 accepts the coordinator's c41fbb2
+clarification: old missing accounts give service-identity, with unchanged
+library semantics. On Windows and Linux this occurs through full validation;
+on macOS the earlier account lookup in parse can refuse first. The token,
+exit class and refusal before the old workspace check hold on all platforms.
+The deferred start closure is accepted; native guard release and SCM ordering
+remain source-reviewed. No native or installed acceptance is granted.

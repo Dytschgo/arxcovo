@@ -917,8 +917,7 @@ mod tests;
 #[cfg(test)]
 pub(super) use tests::unprotect_install_fixture;
 
-// S3 consumes this hook; no new session or batch authority is exposed.
-#[cfg_attr(not(test), allow(dead_code))]
+// The CLI borrows this seam without new session or batch authority.
 pub(super) trait ConfigureSession {
     fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure>;
     fn observe_batch(&mut self, sid: &str) -> Result<BatchObservation, Failure>;

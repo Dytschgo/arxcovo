@@ -1,13 +1,14 @@
 # Service config and owner-plan foundation
 
-Current owner-library checkpoint (2026-11-12): ADR0016 E1 is implemented
-locally: binary-only private `OwnerGuard`, `open(guard)`, private-chain pins
-before privilege, session wrappers, and proof-gated uninstall. Raw `parts()`
-and concrete store/right access are removed. Prior independent E1 reviews
-passed; this main0937cac port awaits coordinator review and hosted gates.
-Older API/status statements below describe their historical slices. Owner CLI
-and runtime activation remain absent. Installed paths are **unverified on real
-hardware**; M2 is incomplete. See [ADR0016](adr/0016-windows-install-provisioning-and-owner-entry-points.md).
+Current S3 checkpoint (2026-11-12): owner service commands and client credential
+creation are wired in source through service::owner_cli. Parsing precedes Tokio;
+valid tests use RecordingOps and generic library seams. Windows guard-first
+operations, full old-config revalidation, inventory-only start and proof-consuming
+uninstall retain the existing authority boundaries. Unix uninstall uses
+owner_plan(Uninstall) without reading a config. macOS Unknown still refuses.
+Independent review and all five hosted gates remain outstanding. Native,
+installed and dedicated paths are **unverified on real hardware**; M2 is incomplete.
+See [S3 evidence](evidence/owner-cli-s3.md). Earlier notes below are historical.
 
 ## Windows owner transaction prerequisite: incomplete adapter handoff
 

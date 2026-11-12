@@ -402,7 +402,11 @@ the two owner prefixes, then calls `std::process::exit`.
   else.
 - The compositions are generic over existing seams:
   `windows_configure<S: ConfigureSession>`; `windows_start(preflight: impl
-  FnOnce() -> Result<(), Error>, scm: &mut WindowsScm<C, K>)`; the uninstall
+  FnOnce() -> Result<(), Error>, start: impl FnOnce() -> Result<(), Error>)`;
+  the deferred start closure constructs the SCM only after preflight succeeds
+  and its guard and pins are released. The fake start must record exactly the
+  same call sequence as a direct PR-C start. Native guard release and SCM
+  construction order remain source-reviewed. The uninstall
   closure through `uninstall_flow`; `unix_verb(action, layout, ctx, execute:
   impl FnOnce(&Plan) -> Result<(), Error>)`; `unix_configure(read_previous,
   res, layout, ctx, args, execute)`. `Layout::for_test`, `FakeResolver`, the
@@ -471,8 +475,13 @@ the two owner prefixes, then calls `std::process::exit`.
      Unix makes zero `execute` calls. The same fixture with the old workspace
      valid succeeds, and its compare-and-replace expectation equals the
      previous bytes;
-   - an old account that is now missing returns `AccountMissing` with the same
-     zero-mutation assertions.
+   - a previous config whose build account is now missing returns the library's
+     `Identity` (`service-identity`, exit 3): full validation folds execution
+     preflight `AccountMissing` into `Identity`. Both platform compositions
+     record `account:old-builder` and no `workspace:/old`; Windows session
+     calls equal only `read`, and Unix makes zero execute calls. The same
+     zero-mutation assertions apply. New-account lookup in `from_request`
+     still passes through `AccountMissing`; no parser/revalidation change.
 6. **`windows_start`** (Windows) with fake SCM calls: a preflight `Err` makes
    zero SCM calls, and `Ok` runs exactly the PR-C start sequence. **Inventory
    preflight invariant**, using a counting resolver: `parse_inventory` makes

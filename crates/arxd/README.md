@@ -32,8 +32,10 @@ Supply each client a distinct token: 32 cryptographically random bytes encoded
 as 64 lowercase hex characters. Hash the encoded token text with SHA-256. Never
 use a login/password as a token. Only hashes are retained in server configuration;
 raw request tokens are used transiently for verification. Digest equality uses
-`subtle` constant-time comparison, over every configured agent. No credentials
-are generated or printed by arxd, and token administration has no HTTP endpoint.
+`subtle` constant-time comparison, over every configured agent. The local unelevated `client-config new` command creates private credentials
+and prints only the principal/hash line; it never prints the token. Token
+administration has no HTTP endpoint. Owner wiring remains unverified on real
+hardware and awaits independent review and hosted gates.
 Revocation takes effect by removing a hash and restarting the daemon. Clients
 must protect their token files too. Do not pass tokens in shell command lines.
 

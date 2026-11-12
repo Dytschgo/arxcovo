@@ -2,6 +2,51 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner operation or installed-service acceptance is claimed.
+- Last merged PR: #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC. All five gates and independent review passed on d330a96; squash tree equals the reviewed head. Main run `43221533019` succeeded in 439s (12:50:01 to 12:57:20 UTC).
+- Queue priority: S3 publication for hosted Linux/macOS/Windows verification and a published-head independent recheck, then merge only after all five gates. The Unix bridge contract remains separately prepared at 22ca777 and inactive; no native experiment retry is authorized.
+- S3 correction 1 at 5cbb32a / source 974048e passed Anthropic / Opus 5.5 / high review 98a5bb5 on Standards and Spec, pending hosted compilation. It accepts coordinator Sol medium's c41fbb2 clarification of existing Identity mapping and deferred start composition. [Recheck](reviews/0018-s3-correction1-opus-recheck.md). Native guard/session/SCM composition remains source-reviewed.
+- Coordinator OpenAI / gpt-6.1-sol / medium fixes low SP-4a by placing each abbreviated flag in its own slot. Three compiled prefix-acceptance mutants are caught and restored: build 5eb85aa5, client cb1defdb, rights 3fc8cd12. Final fmt/locked workspace all-target Clippy and focused 14/14 pass, run `c7de2e00-5299-48ef-8142-58829be12c94`. No full suite was repeated for this test-only change; the builder's 298 passed / 2 skipped full run `1dfe22f1` remains credited to 974048e. Source behavior is unchanged.
+- The correction evidence distinguishes CRLF checkout manifests from committed LF bytes. The ADR checkpoint clarifies the earlier macOS account refusal; token, exit code and refusal order are unchanged. These small test/docs follow-ups require the published-head cross-provider check.
+- All valid owner commands are tested only through fakes. No production NativeOps, credential create, valid owner argv, owner/admin/service, SCM/LSA/account, fixed system path/pipe, VM or Lab Manager operation was invoked. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver. No third S4U probe or babysitter change.
+
+## Historical checkpoint before S3 publication
+
+
+- OpenAI / gpt-6.1-sol / high, implementation sub-agent: S3 correction attempt 1 on clean prepared `c41fbb2cd972f19e3af7af81f0f0b06342f42a0d`. No subagents. Exact Identity refusal, resolver order, changed pins, new SID observation, recorded-grant mirror, parser acceptance bounds, complete marker forwarding, shared library Display output and exact fake start sequence implemented. [Correction evidence](evidence/owner-cli-s3-correction1.md) records validation and limits.
+- Correction source `974048e621edc8c468c9f62943a749bfb0218ddb`: fmt/whitespace and locked workspace all-target Clippy pass; focused14 pass; 11 compiled assertion-kill mutants restored byte-for-byte. Exactly one final default-profile/concurrency normal workspace nextest: **298 passed, 2 skipped**, `1dfe22f1-d91c-4062-aa3d-51bae09aa60a`, 10.483s. Function-pointer compile check counts in totals but supplies no behavioral coverage.
+- Queue priority: fresh Anthropic / Opus 5.5 / high independent recheck of correction source AND coordinator Sol medium contract clarification, then all five hosted gates. S3 remains unpublished, pending review; no acceptance or activation.
+- Last merged PR: #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`. Main run `43221533019` succeeded in 439s (inherited coordinator evidence; not rerun). Milestone 1 accepted; M2 incomplete. Native, installed and dedicated paths are **unverified on real hardware**.
+- S1/S2 library/native/executor behavior is unchanged. Actual read_config_with inventory selection and pin retention remain covered by restored mutations; production guard/SCM/session/adapter selection remains source-only. Unix native cfg paths await hosted Linux/macOS compilation; no local stub/toolchain credit.
+- ExecutionFailed remains unexplained; no local pass fixes or waives it. No owner/native/admin/service/VM/Lab Manager operation, valid owner process invocation, public GitHub action or babysitter change.
+
+## Historical checkpoint before S3 correction attempt 1
+
+- S3 review at `7f70852` is CHANGES REQUIRED on both axes, retained in [the independent report](reviews/0018-s3-independent-review.md). Coordinator Sol medium corrects the brief to preserve the existing Identity mapping for missing old accounts and records the accepted deferred-start shape; both clarifications require cross-provider recheck. Correction attempt 1 will add exact resolver ordering, changed-pin/missing-account/new-SID/recorded-grant wiring cases, accepted parser boundaries, all uninstall tokens and full marker argument forwarding. S3 stays unpublished; no library error mapping change or native owner operation is authorized.
+
+- Coordinator review checkpoint: main after #49, run `43221533019` on `c4ef8ad`, completed successfully (12:50:01 to 12:57:20 UTC, 439s). S3 candidate `558b948` / source `edcadff` is integrated locally for independent Opus high review. The old-build-account token discrepancy is open: existing full config validation maps execution preflight AccountMissing to Identity, both exit 3, while the brief requires AccountMissing. No library or contract change is accepted yet. The deferred Windows start closure and acknowledged recording-matrix gaps also require review. No publication or activation is accepted by the 295-pass local result.
+
+- Milestone 1 accepted; M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No acceptance or activation claimed.
+- Last merged PR remains #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`; all five gates and independent review are inherited coordinator evidence. Main after #49 remains pending, not claimed green.
+- OpenAI / gpt-6.1-sol / high S3 local implementation candidate source `edcadff70d20c6a5f6847679b9dea3b468ef1802`, prepared base `46f3a9f`. Parser, dispatch, production compositions and fake tests are implemented. FIRST guard fixture commit `5c57208` is preserved. [Evidence](evidence/owner-cli-s3.md).
+- Queue: resolve existing missing-old-build AccountMissing versus Identity discrepancy and residual test/mutation coverage; fresh Anthropic / Opus 5.5 / high security/source review BEFORE publication; then all five hosted gates. No subagents or public GitHub operations were used by the implementation sub-agent.
+- Local fmt/locked workspace all-target Clippy pass; focused12 pass and 13 compiled mutation assertion kills restored. Exactly ONE final normal default-concurrency full workspace nextest: 295 passed, 2 skipped, run `e2e5f587-88a4-4103-a8b6-74e41f98a857`, 10.243s. No Unix compile/execution or S3 hosted pass claimed. S1/S2 review limits remain inherited.
+- Windows start uses a deferred SCM start closure to keep construction after preflight and image-guard drop; this private seam refinement needs review. Native wiring selection outside the safe seams remains source-only.
+- ExecutionFailed remains unexplained; no local pass is a fix or waiver. No owner/admin/service operation, old Lab Manager/VM change, ignored fixture, third S4U probe or babysitter change.
+
+## Historical checkpoint before S3 implementation
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No installed-service or dedicated-account acceptance is claimed.
+- Last merged PR: #49 at `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC, all five gates on `d330a96` plus independent Opus published-head review. Its squash tree equals the reviewed head. Main CI after #49 is pending and not claimed green.
+- S2 hosted Unix condition is met: run `43219803330` succeeded on all three platforms. Linux nextest 226 passed / 3 skipped; macOS 227 passed / 1 skipped. These are hosted job-log observations, not local Unix runs. Residual native Mode and intermediate-pin test limitations remain disclosed; no Mode mutation kill is claimed.
+- Queue priority: S3 parser, dispatch and CLI wiring through fakes, independent Opus review and hosted gates. S1 #48 and S2 #49 are merged; ADR 0019 remains separately prepared and inactive. No native bridge implementation or experiment retry starts.
+- S3 FIRST commit `5c57208` changes the existing install fixture to invalid `service install extra` before routing. Coordinator OpenAI / gpt-6.1-sol / medium ran the unchanged usage test: 1 passed, 1 filtered, run `f703573a-da6d-49ff-bb56-8eb861578dd8`. Old usage stderr remains exact at this guard boundary. All valid owner-command composition tests must use RecordingOps/fakes; no test may construct production NativeOps, call production credential create, or spawn a valid owner command.
+- Provider assignment: OpenAI / gpt-6.1-sol / high implements S3 in a verified isolated worktree; Anthropic / Opus 5.5 / high independently reviews before publication/merge. Preserve S1/S2 source and security tests; only minimal visibility changes necessary for sibling wiring are allowed and must be recorded. The accepted ADR 0018 grammar, per-command ordering and fixed error/output table govern this slice.
+- Main after #48 passed run `43213333692` in 637s. ExecutionFailed remains unexplained; local/hosted passes are no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe or babysitter change.
+
+## Historical checkpoint before S2 merge
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: #48, `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC. All five gates and independent review passed on `21638d9`; squash tree equals the reviewed head. Main run `43213333692` succeeded in 637s (11:55:40 to 12:06:17 UTC).
 - Queue priority: publish S2 for hosted Linux/macOS/Windows verification and exact-head recheck, then S3 wiring (invalid install test first). The inactive Unix bridge contract remains separately prepared at `22ca777` and unimplemented.
@@ -694,7 +739,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 These task-time records retain the failed Sol handoff and later Opus resolution; the newest checkpoint below governs current status.
 
-## Current-user Windows implementation assignment
+## Historical current-user Windows implementation assignment
 
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
@@ -813,7 +858,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   service schema. Redaction stays best effort, and nothing here isolates the
   owner. M2's dedicated-account criterion remains open.
 
-## Current-user development coordinator integration
+## Historical current-user development coordinator integration
 
 - Codex / gpt-6.1-sol, medium: integrated completed Opus candidate f1541ce with merged main b29f531. Main differed from the candidate activity base only in the already-carried checked_path correction, the committed Windows path regression and README encoding. The candidate source is retained, the main regression is added, and progress is reconciled. The Opus candidate passed 58 tests and 25 mutations. Integrated-revision formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows; executor, audit, MCP and bridge source remain byte-identical to that completed candidate. Fresh independent Sol review and hosted checks are required before any private acceptance run. No production owner execution or administrative operation has occurred.
 
