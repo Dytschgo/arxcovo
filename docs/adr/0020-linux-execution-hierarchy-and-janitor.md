@@ -121,8 +121,11 @@ packaging changes, the Stage F experiment, Stage G activation and
   `Native`, `Hooks::Native::start_discovery` stays a no-op, and
   `capability()` stays `available: false`. Source-pinning tests (D10) fail if
   any of these changes.
-- `exec/unix.rs`, `RunError` and `NotStarted` are unchanged. `exec/cgroup.rs`
-  changes only by the A5 residue signal (D6).
+- `RunError` and `NotStarted` are unchanged. A5 permits only private flag
+  plumbing through `Runner::run_core -> unix::run -> Group::create`
+  (Linux-gated where needed), plus the cgroup cleanup signal (D6).
+  `exec/unix.rs` keeps its behavioral order, cancellation checks, fences,
+  legacy/phased results and original errno capture before cleanup unchanged.
 
 ### D2. Trust anchors (all checked before any write)
 
@@ -346,6 +349,23 @@ result or `ExecError` text; no `Report`, `Creation`, row, quarantine rule or
 output. A cancelled run still produces the unchanged row E. The bridge's
 `RunnerPort` gains `cleanup_residue()`; the test fake controls it.
 
+**One immutable admission domain per subtree.** The bound below belongs to
+one shared admission domain, not automatically to every runner in a process.
+For the exclusive service `runs/` subtree, wiring owns exactly one domain for
+its entire lifetime until service restart. That domain owns one runner/port,
+one executor slot-accounting state, one readiness state and one cache ticket
+allocator. Its runner and these shared states are bound once, are private,
+and have no replacement, reset, rebind or second-runner attachment API.
+Bridge handles and startup/agent discovery share that same domain by `Arc`;
+cloning a handle cannot construct another runner or slot counter. A failed
+runner/domain cannot be rebuilt under the same subtree before restart.
+Independent runners with fresh flags are allowed only in independent test
+domains with distinct owned subtrees; R3 is not permission to replace the
+service runner. No process-global static is required. The still-test-only
+wiring factory must encode this ownership, and future production wiring must
+preserve it before activation. T20 tests shared handles after latching and
+source/visibility pins forbid constructing replacement domains in wiring.
+
 **Admission: the in-slot gate (A3).** `UnixBridge::run` executes inside the
 executor's concurrency slot (after `active.fetch_add`, before
 `active.fetch_sub`, `executor.rs:340-351`). Its body begins with a gate:
@@ -363,8 +383,9 @@ report is unchanged. Preflight remains an early refusal; the gate is the
 binding check.
 
 **Bound (with stated assumptions).** Let `L` be `max_concurrent_runs`
-(at most 4 on Linux). Then at most `L` runner calls in one process lifetime
-can leave a residue. Sketch: every residue-producing call stores the flag,
+(at most 4 on Linux). Then at most `L` runner calls over the lifetime of that one immutable
+shared admission domain can leave a residue. The service-subtree claim relies
+on the one-domain/no-replacement ownership rule above. Sketch: every residue-producing call stores the flag,
 then latches, before its slot release (both in the same thread, sequenced
 before `fetch_sub`). Let C₁ be the residue-producing call whose slot release
 is earliest in the modification order of `active`. Every `fetch_add` after
@@ -660,7 +681,7 @@ pinned-identity match, never directly from bridge output.
 | `bin` alias `readlinkat` | 16 bytes | untrusted |
 | rights `sudo` probe | 5 s logical, kill and reap | `unknown` |
 | rights line | 96 bytes | invalid table |
-| residue-producing runner calls per process | `max_concurrent_runs` (D6 assumptions) | latched before |
+| residue-producing calls per immutable shared admission domain | `max_concurrent_runs` (D6 assumptions) | latched before |
 
 Every cgroupfs open is descriptor-relative with `O_NOFOLLOW|O_CLOEXEC`
 (directories also `O_DIRECTORY`; listings use a fresh description). Nothing
@@ -678,7 +699,9 @@ worst-case probe time is 9 tools × 5 s + 5 s = 50 s, inside the runner's
   setup is pending (U5).
 - A containment fault or an unconfirmed leaf cleanup latches execution off
   until restart, with no report change. At most `max_concurrent_runs` runner
-  calls can leave a residue leaf per process (D6).
+  calls can leave a residue leaf per immutable shared admission domain (D6);
+  service wiring permits exactly one such domain for its exclusive subtree
+  until restart, with no replacement.
 - `sudo -n true` runs as the build account, bound to a validated root-owned
   executable, at each discovery. On many distributions that writes an
   authentication log entry.

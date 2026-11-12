@@ -34,7 +34,7 @@ brief.
 | E2 | setup and janitor state machine over a fake `CgroupFs` | `exec/hierarchy/setup.rs` (new), `exec/hierarchy/fake.rs` (`cfg(test)`) | all |
 | E3 | Linux descriptor-relative `CgroupFs` | `exec/hierarchy/linux.rs` (new, `cfg(target_os = "linux")`) | Linux |
 | E4 | shim rights line with bound-executable `sudo` probe | `unix_shim.rs` (+ its test file) | Linux (macOS: `unknown` only) |
-| E5 | runner cleanup-residue signal (ADR 0020 A5) | `exec/cgroup.rs`, the `Runner` owner of the flag | Linux (pure parts all) |
+| E5 | runner cleanup-residue signal (ADR 0020 A5) | `exec/cgroup.rs`, `exec/mod.rs`, private `exec/unix.rs` flag plumbing | Linux (pure parts all) |
 | E6 | bridge readiness, in-slot gate and latches | `service/unix_bridge.rs`, `service/unix_bridge/readiness.rs` (new), `service/executor.rs` (one `cfg(test)` barrier seam only) | all |
 | E7 | startup wiring, daemon row, tool cache | `service/application.rs`, `store.rs`, `mcp.rs` | all |
 
@@ -369,6 +369,11 @@ hard-coded `true` (S11).
 
 ## Slice E5: runner cleanup-residue signal (ADR 0020 A5)
 
+- Pass only the private flag clone through
+  `Runner::run_core -> unix::run -> Group::create`, Linux-gated as needed.
+  No static or config-carried flag. Preserve all behavioral ordering,
+  cancellation/fence checks, legacy/phased results and original errno capture
+  before create-path cleanup. Include `exec/unix.rs` in this slice's manifest.
 - `Runner` owns `residue: Arc<AtomicBool>` and exposes
   `cleanup_residue(&self) -> bool` (acquire). `Group::create` takes a clone.
   One private helper `release_leaf(parent, name, residue)` does the
@@ -388,7 +393,9 @@ pattern; never a real cgroup or privileged write):
   directory it removes it and leaves the flag clear. A source pin asserts
   that `cgroup.rs` has no `unlinkat` call outside `release_leaf` and
   `kill_and_confirm`.
-- **R3** Two runners have independent flags; a new runner starts `false`.
+- **R3** Two isolated test domains, each with a distinct owned subtree, have
+  independent runner flags; a new runner starts `false`. Service-domain
+  replacement or a second runner for one subtree is forbidden (D6/T20).
 - **R4** Every existing Stage B runner test passes with no edited
   expectation (the diff adds tests only).
 
@@ -455,6 +462,19 @@ Tests, through real `dispatch` with a counting fake runner port:
   After release, six more requests (more than four) each make zero port
   calls. Total port calls is exactly 4; the four rows are the unchanged
   row E; the six are refusals.
+- **T20 single domain / no replacement:** construct the test-only wiring
+  domain once for an owned subtree. Clone two bridge handles; latch residue
+  via one and require zero runner calls through the other, including startup
+  discovery. Both share the same slot counter, readiness and ticket allocator
+  (identity comparisons use boolean assertions only). Dropping/recreating a
+  bridge handle from the retained domain does not clear the latch or allocate
+  another runner. The factory's constructor is private to the one wiring
+  owner; there are no runner/domain replace, reset, rebind or second-runner
+  attach methods. Visibility/source pins cover every wiring construction
+  site and forbid a second domain constructor call or fresh runner in bridge
+  handle creation. Independent-domain R3 uses distinct owned subtrees only.
+  A mutation rebuilding a runner/readiness on handle creation must fail the
+  shared-latch test; a second factory call in service wiring fails the pin.
 - **T9 (extended)** Production selection stays inert (see E7 pins).
 
 Mutations: gate removed, or readiness checked only in preflight (T18);
@@ -498,9 +518,12 @@ Tests:
   port calls.
 - **W3d** Shutdown after the row insert, before dispatch: the daemon row ends
   as the existing refused/`shutdown` row, zero port calls.
-- **W3e** Shutdown after dispatch spawned the worker: refused `stopping`,
-  zero port calls; drain joins the sequence handle and the executor set is
-  empty afterwards.
+- **W3e** Hold the spawned worker immediately before its final
+  shutdown/admission check, request shutdown, then release the barrier:
+  refused `stopping`, zero port calls. Drain joins the sequence handle and
+  leaves the executor set empty. A separate case holds a worker after it
+  passed that check: already-admitted work may call the port and must cancel
+  and drain with its honest report; do not assert zero calls in that case.
 - **W4** The daemon row reads back with actor `daemon` and principal `arxd`,
   and is invisible to an agent's `list_activity`.
 - **W5** The cache changes only on row N. Rows K, M, G and refusals keep the
