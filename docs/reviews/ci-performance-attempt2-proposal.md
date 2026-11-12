@@ -64,8 +64,11 @@ slowest job's queue time plus its run time sets the total.
 
 ## Recommended minimal patch
 
-The patch touches only `.github/workflows/ci.yml`, `scripts/ci-workflow.test.mjs`,
-`crates/arx-guest/tests/cli.rs` and the evidence record. No other workflow,
+The implementation delta against published 48d4916 touches exactly three paths:
+`.github/workflows/ci.yml`, `scripts/ci-workflow.test.mjs`, and
+`crates/arx-guest/tests/cli.rs`. Documentation may additionally change the named
+CI evidence record, docs/PROGRESS.md, and retained attempt-2 proposal/review
+notes. No other product, workflow or policy path is permitted. No other workflow,
 action, permission, matrix, check name, timeout, concurrency setting, policy
 script, cache or step order changes.
 
@@ -84,8 +87,9 @@ Why this patch is safe, from the pinned Cargo 1.95.0 official docs:
   debug-assertions true, overflow-checks true, panic unwind, strip "none") are
   separate keys and stay unchanged. "The test profile inherits the settings
   from the dev profile."
-- The `build-override` for build scripts and proc macros already defaults to
-  `debug = false`, so they are unaffected.
+- Cargo uses `debug = false` for build scripts/proc macros when possible;
+  normal/build dependencies can share compilation units. This is not a
+  guarantee that every build dependency is unaffected.
 - [Config](https://doc.rust-lang.org/1.95.0/cargo/reference/config.html):
   `profile.<name>.debug` maps to the environment variable `CARGO_PROFILE_<name>_DEBUG`.
 
@@ -105,7 +109,11 @@ Assumptions I checked:
   backtraces or `CARGO_PROFILE` settings.
 - `libsqlite3-sys` 0.35.0 `build.rs` does not use `DEBUG` or `NDEBUG`.
 - cc 1.11.1 reads Cargo's `DEBUG` only for debug flags and never defines
-  `NDEBUG`, so SQLite C semantics stay the same. Only `-g`/`/Z7` are omitted.
+  `NDEBUG`. Besides debug-symbol flags, cc defaults frame-pointer forcing to
+  the debug setting, affecting supported GCC/Clang frame-pointer flags. This
+  changes C code generation/diagnostics while preserving SQLite assertion
+  macros and Rust safety-check settings. These are source-based conclusions,
+  not observed cross-platform C builds.
 - Panic messages keep file:line, because `core::panic::Location` is compiled
   in and does not come from DWARF/PDB.
 
@@ -139,11 +147,14 @@ Do not add `CARGO_PROFILE_TEST_DEBUG`: local evidence shows `test` inherits.
        assert!(cfg!(debug_assertions), "debug assertions must stay enabled in test builds");
        let overflowed = std::panic::catch_unwind(|| std::hint::black_box(u8::MAX) + std::hint::black_box(1u8));
        assert!(overflowed.is_err(), "overflow checks and unwinding panics must stay enabled");
-       assert!(std::panic::Location::caller().file().ends_with("cli.rs"), "panic locations do not need debuginfo");
+       assert!(std::panic::Location::caller().file() == file!(), "compiled caller location smoke check");
    }
    ```
 
-   It runs on all three OSes in CI with the new env var.
+   It runs on all three OSes in CI with the new env var. The Location check
+   tests its direct compiled call site, not the caught overflow panic or
+   diagnostic output. catch_unwind checks test-harness unwinding, not a separate
+   production binary panic mode. No global hook is installed in parallel tests.
 3. Run each mutant locally and restore it afterwards. Each must fail:
 
    | # | Mutant | Fails in |
@@ -176,7 +187,7 @@ run only. Do not rerun or push an empty commit.
 - **A2.** On every OS, the nextest banner and the macOS stock-directory banner
   read ``Finished `test` profile [unoptimized]``. Clippy reads
   ``Finished `dev` profile [unoptimized]``.
-- **A3 (new causal metric).** The Windows nextest compile phase (its `Finished
+- **A3 (predeclared comparative compile-time metric).** The Windows nextest compile phase (its `Finished
   test profile ... in` value) must meet both conditions:
   - strictly below **108s**, the median of the seven-sample baseline (89, 113,
     108, 73, 106, 108, 121 from jobs 131260319775, 131233422108, 131226519288,
@@ -186,9 +197,11 @@ run only. Do not rerun or push an empty commit.
     89/76, 113/91, 108/88, 73/65, 106/86, 108/82 and 121/95, so 1.17, 1.24,
     1.23, 1.12, 1.23, 1.32 and 1.27.
 
-  The ratio controls for runner speed. Clippy runs no codegen, so debuginfo
-  does not affect it. If SQLite's build script gets slightly faster, the ratio
-  gets harder to meet, not easier.
+  The ratio is an approximate control only. Clippy still builds dependencies
+  and native SQLite; its denominator can change with debug settings or runner
+  noise. Compare unrounded candidate ratios with 1.12. The exact sample minimum
+  is 73/65 = 1.123076923..., so the strict 1.12 threshold is conservatively
+  stronger. Passing supports an observed phase reduction, not causal isolation.
 - **A4.** Per-OS test counts equal attempt 1 plus the one new guard:
   - Windows 307 passed, 2 skipped;
   - macOS 245 passed, 1 skipped;
@@ -196,7 +209,9 @@ run only. Do not rerun or push an empty commit.
 
   The macOS stock-directory test passes. UI smoke is 1/1 and desktop smoke is
   1/1 on every OS. CI runs 21 Node tests.
-- **A5.** The diff is limited to the four files above. Check names, matrix,
+- **A5.** The implementation diff against 48d4916 is limited to the three
+  implementation paths above, plus the explicitly permitted evidence, PROGRESS
+  and retained proposal/review documentation. Check names, matrix,
   `macos-latest`, timeouts, concurrency, permissions, action pins and policy
   are byte-identical.
 - **A6.** A different-provider independent reviewer verifies A1 to A5 from the
@@ -240,3 +255,15 @@ Failure handling:
   E_PROTECTION remain unknown, with no fix, waiver or retry. Native, installed
   and dedicated paths are **unverified on real hardware**, and M2 is
   incomplete.
+
+## Coordinator disposition before attempt-2 implementation
+
+OpenAI / gpt-6.1-sol / medium, 2026-11-12: accept the design with all four
+documentation corrections required by the independent Sol high review
+ci-performance-attempt2-sol-review.md. Numerical gates A1-A4/A6 remain fixed.
+A5 now includes mandatory progress/evidence/review records and scopes the
+implementation against published 48d4916. C frame-pointer/build-dependency
+effects and the direct caller-location smoke limitation are explicit. A3 is
+comparative evidence, not causal proof. Any older causal shorthand is
+superseded by this disposition. No implementation or hosted measurement has
+occurred under this accepted amendment; actual patch review is still required.

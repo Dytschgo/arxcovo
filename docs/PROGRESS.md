@@ -2,6 +2,8 @@
 
 ## Current state — 2026-11-12
 
+- Attempt-2 design review 6b9af143 requested documentation corrections only. Coordinator Sol medium accepts the amended proposal before implementation: three implementation paths plus evidence/PROGRESS/review docs, explicit C frame-pointer effects, direct caller-location smoke limits and comparative (not causal) timing claims. Numerical gates remain unchanged. Sol high implementation and Opus independent patch review are next; no measurement, ci-speed label or merge yet.
+
 - CI performance attempt 1 is NOT QUALIFYING: #54 head48d4916 first run43248592153 succeeded in848s, but Windows install200s exceeded the declared141s ceiling. No ci-speed label or merge. Windows log spends about193s before Media Foundation completes, then about7s downloading shell/support binaries. The 906s main baseline remains blocking. A revised substantive approach and criteria must be reviewed before another measurement; no empty commit or rerun resets this result. PR watches missed the completed run; future waits need explicit tracked completion as well as PR events.
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
