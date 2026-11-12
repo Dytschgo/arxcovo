@@ -25,10 +25,7 @@ pub fn entry(args: &[OsString]) -> i32 {
 #[cfg(unix)]
 fn silent_entry(body: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
     std::panic::set_hook(Box::new(|_| {}));
-    match std::panic::catch_unwind(body) {
-        Ok(code) => code,
-        Err(_) => 125,
-    }
+    std::panic::catch_unwind(body).unwrap_or(125)
 }
 
 #[cfg(unix)]
@@ -272,10 +269,7 @@ fn probe_version(child: Child) -> Option<String> {
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                ()
-            }
+                ) => {}
             Err(_) => return None,
         }
         if !exited {

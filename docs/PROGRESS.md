@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or native experiment is activated.
+- Last merged PR: #52 at 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 attempt 1 failed: macOS job 131260319040 started no steps, had no runner name, and was cancelled after runner acquisition failed. Its annotation explicitly reports macOS arm64 capacity constraints. Ubuntu and Windows passed. Main is not green.
+- Coordinator requested exactly one failed-job infrastructure rerun of 43240797525, retaining attempt 1 as failed. No source fix, blind retry-to-green, timeout increase, platform removal or policy bypass. A further capacity failure must be recorded before any next action.
+- Queue priority: Stage C two-line Unix Clippy correction independent Opus recheck, then publication for hosted Unix build/execution tests and all five gates. Main capacity recovery must also be verified before merge. Stage D and cgroup setup/experiments/activation remain separately gated.
+- Stage C source 656dde3 / candidate cc876ab passed independent Opus high Spec review; Standards F1 requires catch_unwind(...).unwrap_or(125) and an empty unit arm. Coordinator Sol medium applies only those production changes, retains the review and redacts the local account path in current evidence. Final Windows fmt/locked workspace Clippy and focused scanner/S5 4/4 pass (475526ac). [Follow-up](evidence/unix-shim-stage-c-review-followup.md). No real Unix compile/test or mutation kill is claimed; builder's 308/2 full run remains credited to 656dde3.
+- F2 remaining lexical scan limits are disclosed, including renamed hook aliases, indirect stderr writes and macro-expanded unwrap. Existing shim has none of the unsafe alias/writer/hook forms; no semantic privacy proof. Older evidence paths containing local account names need a separate docs cleanup preserving historical credit.
+- ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, secret exposure or babysitter change.
+
+## Historical checkpoint before Stage C Unix lint follow-up
+
+
 - Stage C local implementation is committed at `656dde3c4c221b0048487a738ede5f0782f078c5`: standalone Unix exec-child/tool-probe, early reserved-prefix routing, one silent shim-only hook/catch, owned-temp S1–S7 tests and extended P-SCAN. [Evidence](evidence/unix-shim-stage-c.md) records the source manifest, commands, failure and coverage limits.
 - Own Windows validation: fmt/whitespace and locked workspace all-target Clippy passed. Focused scanner/identity: 4 passed (`5a120636`). Exactly ONE final default-concurrency workspace nextest after final source: **308 passed, 2 skipped**, `be7440d0-0f61-4a24-8201-90a42bf1f5c5`, 10.608s. No Unix execution or mutation credit: Linux cross-check failed before arxd because the cross C compiler is unavailable. Unix tests/Clippy and compiled shim mutations remain pending hosted verification.
 - Queue: fresh Anthropic / Opus 5.5 / high source/security review BEFORE publication, then all five hosted checks at the actual candidate head before any merge. This implementation sub-agent performs no publication or delegation. Stages D/E/F/G remain unbuilt here; production native execution stays inactive. ExecutionFailed and E_PROTECTION remain unexplained, without a fix, waiver or retry.

@@ -10,7 +10,7 @@ the following docs-only commit containing this report (exact SHA in handoff).
 Prepared base: `c372865f3365ef8d8baf02e32044d607eef9d2b3`, differing from
 supplied merged main `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0` only in
 PROGRESS. The initial status was clean. Runtime cwd and git top-level both
-matched `C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-6255da31-d8e35768d6f5bf64`.
+matched `<prepared-worktree>`.
 No shell-created checkout/worktree or canonical-checkout write occurred.
 
 Read AGENTS/KICKOFF, ADR 0019 and complete implementation brief (including
