@@ -4,11 +4,15 @@
 
 - Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
-- Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Next: independent Sol review, ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
+- Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Independent Sol review now passes (29 Python,19 Node tests; five independently caught mutations). Next: ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
 - User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. All five fresh Ubuntu jobs have failed; all macOS jobs passed. Fresh main, PR9 and PR34 Windows passed; PR36 and PR26 Windows were still running at this snapshot. The original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
 - Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; Opus high recheck at `f646589` passes with no blockers. Hosted verification of the patch remains pending. No measured speedup is claimed.
 - E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
+
+## Ubuntu fallback candidate publication review — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium independently reviewed Opus candidate `1361864..bfa177f`: Standards/Spec pass with no blockers; [report](reviews/ubuntu-fallback-sol-review.md). The earlier Sol concurrency correction retains its independent Opus recheck. Publish this CI unblock as the explicit babysitter queue-recovery exception, without opening a feature PR. Native/M2 acceptance is unchanged; real fallback and all hosted gates remain mandatory.
 
 ## Ubuntu package-fetch three-failure handoff — 2026-11-12
 
