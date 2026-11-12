@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-12
 
+- Stage D R1: distinguish request7s/333bytes from probe60s/4096. Hard-coded-limit mutant is caught (ac960a28), fmt and focused15 pass (a052ca8f). Production remains unchanged; the narrow independent two-line recheck is next. Product work continues locally; CI investigations stay parked.
+
 - Stage D production passed Opus contract review; test corrections close swallowed fake assertions, skipped derivation cases and missing numeric marker check. Coordinator Sol medium keeps production unchanged, builds an independent expected spec and records four compiled assertion kills. Final fmt/locked workspace Clippy/focused24 passed (4dffa45b). [Evidence](evidence/unix-bridge-stage-d-review-followup.md). Fresh test-delta recheck is next; CI investigations remain parked and Stage C remains an unmerged dependency.
 
 - ADR0019 Stage D local implementation: inactive UnixBridge, pure config/spec/report mappings, fake runner port, test-only Execution wiring, whole-body panic catch, strict discovery parsing and extended P-SCAN. OpenAI / gpt-6.1-sol / high. Source `d3615be3b9820cf72a40b321a3dcf6c746a9e7bd` is ready for review, not acceptance. [Evidence](evidence/unix-bridge-stage-d.md).

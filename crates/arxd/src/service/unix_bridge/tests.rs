@@ -766,6 +766,8 @@ async fn t8_private_inputs_all_phases_inner() {
 fn t3_fake_port_receives_exact_request() {
     for mode in ["path", "tool", "probe"] {
         let mut r = request();
+        r.timeout_s = 7;
+        r.output_bytes = 333;
         if mode == "path" {
             r.tool = None;
             r.executable = Some("/synthetic/target".into());

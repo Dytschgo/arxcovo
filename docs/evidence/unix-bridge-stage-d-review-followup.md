@@ -41,3 +41,16 @@ CI investigations remain parked under the user's product-first direction.
 Native, installed and dedicated paths remain **unverified on real hardware**;
 M2 incomplete. ExecutionFailed/E_PROTECTION remain unknown without waiver or
 retry. Fresh independent test-delta review remains required.
+
+
+## R1 distinct request limits
+
+Independent recheck7569728 found that T3 still used the default60s/4096-byte
+request, equal to probe constants. Coordinator Sol medium sets request limits
+to7s/333bytes in both path and tool cases; probe expectations remain60/4096.
+Hard-coding production run limits to60/4096 now compiles and fails, run
+ac960a28-8ca9-4bf4-a5ed-6a1c5d825ad0. Production source was restored exactly.
+Final fmt check passes and bridge-focused tests pass15/15, run
+a052ca8f-c825-4281-9db8-f5bc96f3a877. No new full suite or Clippy run is claimed
+for these two test literals; prior checks retain their pins. Production remains
+byte-identical to d3615be. A narrow cross-provider check is still required.
