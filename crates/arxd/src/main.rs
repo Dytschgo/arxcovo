@@ -6,12 +6,15 @@ fn main() {
         let code = if args.len() == 2 && args[1] == "run" {
             arxd::service::run()
         } else {
-            arxd::service::ExitCode::Usage
+            std::process::exit(arxd::service::owner_cli::main(&args));
         };
         if code != arxd::service::ExitCode::Clean {
             eprintln!("arxd: {}", code.category());
         }
         std::process::exit(code as i32);
+    }
+    if args.first().is_some_and(|arg| arg == "client-config") {
+        std::process::exit(arxd::service::owner_cli::main(&args));
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

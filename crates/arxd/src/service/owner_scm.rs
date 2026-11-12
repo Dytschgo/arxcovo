@@ -457,7 +457,6 @@ impl<C: ScmCalls, K: Clock> WindowsScm<C, K> {
     }
 }
 /// No store phase is reachable until deregistration produced its linear proof.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn uninstall_flow<C: ScmCalls, K: Clock, R>(
     scm: &mut WindowsScm<C, K>,
     then: impl FnOnce(Deregistered) -> R,

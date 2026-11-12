@@ -770,3 +770,28 @@ fn u1_uninstall_flow_blocks_every_deregister_error() {
     assert!(uninstall_flow(&mut foreign, |_| panic!("store reached")).is_err());
     assert!(uninstall_flow(&mut engine(false, STOPPED), |_| ()).is_ok());
 }
+
+#[cfg(windows)]
+#[test]
+fn cli_start_preflight_precedes_all_scm_calls() {
+    let mut scm = engine(true, STOPPED);
+    assert_eq!(
+        super::super::owner_cli::windows_start(|| Err(Error::Permissions), || scm.start()),
+        Err(Error::Permissions)
+    );
+    assert!(scm.test_calls().calls.is_empty());
+    let released = std::cell::Cell::new(false);
+    super::super::owner_cli::windows_start(
+        || {
+            released.set(true);
+            Ok(())
+        },
+        || {
+            assert!(released.get());
+            scm.start()
+        },
+    )
+    .unwrap();
+    assert!(released.get());
+    assert!(scm.test_calls().calls.iter().any(|c| c == "start"));
+}

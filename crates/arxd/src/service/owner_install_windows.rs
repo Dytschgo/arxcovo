@@ -1,5 +1,4 @@
 //! Protected-state provisioning only. Registration is the final operation.
-#![allow(dead_code)] // Owner CLI wiring is a later, independently reviewed slice.
 use super::owner_windows::Failure;
 use super::{
     layout::{self, Error, Platform, Policy},

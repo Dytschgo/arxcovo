@@ -4,13 +4,11 @@ use super::owner_plan::OsManager;
 use super::{layout::Error, owner_plan::Plan};
 /// S3 owner gate; the existing native identity rule is unchanged.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn require_owner() -> Result<(), Error> {
     imp::identity()
 }
 /// S3 reads previous bytes for full configure validation.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_config() -> Result<Option<Vec<u8>>, Error> {
     imp::Manager::new()?.read_config()
 }

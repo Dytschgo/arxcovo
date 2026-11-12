@@ -97,31 +97,34 @@ pub fn observe_layout(layout: &Layout) -> Result<Vec<Observed>, Error> {
 /// Protection and bytes come from the same no-follow handle. Only the fixed
 /// config is read. The existing parser performs fresh identity/pin checks.
 pub fn read_config(layout: &Layout) -> Result<ServiceConfig, Error> {
-    if layout.platform() != os::PLATFORM {
-        return Err(Error::Layout);
-    }
-    let mut parents = Vec::new();
-    for path in layout.private_dirs() {
-        parents.push(checked(path, true, Policy::PrivateDirectory, false)?);
-    }
-    let mut opened = checked(layout.config(), false, Policy::PrivateFile, true)?;
-    let bytes = bounded_read(&mut opened.file)?;
-    // Reobserve the handle after reading, never reopen the symbolic path.
-    check_protection(
-        os::PLATFORM,
-        Policy::PrivateFile,
-        true,
-        &os::protection(&opened.file)?,
-    )?;
-    inventory_config(&bytes, layout, &NativeResolver)
+    read_config_with(layout, &NativeResolver, || {
+        if layout.platform() != os::PLATFORM {
+            return Err(Error::Layout);
+        }
+        let mut parents = Vec::new();
+        for path in layout.private_dirs() {
+            parents.push(checked(path, true, Policy::PrivateDirectory, false)?);
+        }
+        let mut opened = checked(layout.config(), false, Policy::PrivateFile, true)?;
+        let bytes = bounded_read(&mut opened.file)?;
+        // Reobserve the handle after reading, never reopen the symbolic path.
+        check_protection(
+            os::PLATFORM,
+            Policy::PrivateFile,
+            true,
+            &os::protection(&opened.file)?,
+        )?;
+        Ok((bytes, (parents, opened)))
+    })
 }
-// Shared with safe resolver fixtures; native reads always pass NativeResolver.
-fn inventory_config(
-    bytes: &[u8],
+// The actual native read's parser selection shares this acquisition seam.
+fn read_config_with<P>(
     layout: &Layout,
     resolver: &impl Resolver,
+    read: impl FnOnce() -> Result<(Vec<u8>, P), Error>,
 ) -> Result<ServiceConfig, Error> {
-    ServiceConfig::parse_inventory(bytes, layout, resolver)
+    let (bytes, _pins) = read()?;
+    ServiceConfig::parse_inventory(&bytes, layout, resolver)
 }
 #[cfg(unix)]
 pub(crate) fn endpoint_guard(layout: &Layout) -> Result<Observed, Error> {
@@ -186,9 +189,8 @@ fn state_members(layout: &Layout) -> Result<Vec<Observed>, Error> {
     }
     Ok(pins)
 }
-// S3 consumes this hook; state policies remain SYSTEM-private.
+// Owner start keeps state policies SYSTEM-private.
 #[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn owner_start_preflight(layout: &Layout) -> Result<(), Error> {
     start_preflight_with(
         || observe_layout(layout),
@@ -610,10 +612,17 @@ mod owner_preflight_tests {
     #[test]
     fn native_read_parser_makes_only_client_observations() {
         use super::super::config::{AccountKind, tests::fixture};
-        struct InventoryOnly(std::cell::Cell<usize>);
+        struct InventoryOnly(std::cell::Cell<usize>, std::cell::Cell<bool>);
+        struct Pin<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Pin<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
         impl Resolver for InventoryOnly {
             fn account(&self, value: &str) -> Result<Account, Error> {
                 assert_eq!(value, "1001");
+                assert!(self.1.get(), "read pins retained during parser");
                 self.0.set(self.0.get() + 1);
                 Ok(Account {
                     identity: value.into(),
@@ -629,14 +638,15 @@ mod owner_preflight_tests {
                 panic!("inventory workspace observation");
             }
         }
-        let resolver = InventoryOnly(std::cell::Cell::new(0));
-        inventory_config(
-            &serde_json::to_vec(&fixture()).unwrap(),
+        let resolver = InventoryOnly(std::cell::Cell::new(0), std::cell::Cell::new(true));
+        read_config_with(
             &Layout::for_test(super::super::layout::Platform::Linux),
             &resolver,
+            || Ok((serde_json::to_vec(&fixture()).unwrap(), Pin(&resolver.1))),
         )
         .unwrap();
         assert_eq!(resolver.0.get(), 1);
+        assert!(!resolver.1.get(), "read pins released after parser");
     }
     #[test]
     fn owner_preflight_order_errors_and_pins() {

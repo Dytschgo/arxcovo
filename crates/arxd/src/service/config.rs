@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const DEFAULT_LIMITS: (u8, u64, u32) = (1, 8_589_934_592, 512);
 /// Owner input; deliberately neither Debug nor Clone.
-// S3 consumes this library hook.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ConfigureRequest<'a> {
     pub build_account: &'a str,
     pub client_account: &'a str,
@@ -103,8 +101,6 @@ fn validate_platform_rights(platform: Platform, rights: Rights) -> Result<(), Er
     Ok(())
 }
 impl ServiceConfig {
-    // S3 consumes this library hook.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_request(
         r: &ConfigureRequest<'_>,
         l: &Layout,

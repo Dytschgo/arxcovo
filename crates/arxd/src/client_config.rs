@@ -1,5 +1,4 @@
-//! Private credential writer. S3 will wire this module to the owner router.
-#![allow(dead_code)] // Remove when S3 consumes create; no production dispatch yet.
+//! Private credential writer used by the local owner router.
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io;
