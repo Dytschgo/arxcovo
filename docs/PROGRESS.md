@@ -2,6 +2,14 @@
 
 ## Current state — 2026-11-12
 
+- Stage C local implementation is committed at `656dde3c4c221b0048487a738ede5f0782f078c5`: standalone Unix exec-child/tool-probe, early reserved-prefix routing, one silent shim-only hook/catch, owned-temp S1–S7 tests and extended P-SCAN. [Evidence](evidence/unix-shim-stage-c.md) records the source manifest, commands, failure and coverage limits.
+- Own Windows validation: fmt/whitespace and locked workspace all-target Clippy passed. Focused scanner/identity: 4 passed (`5a120636`). Exactly ONE final default-concurrency workspace nextest after final source: **308 passed, 2 skipped**, `be7440d0-0f61-4a24-8201-90a42bf1f5c5`, 10.608s. No Unix execution or mutation credit: Linux cross-check failed before arxd because the cross C compiler is unavailable. Unix tests/Clippy and compiled shim mutations remain pending hosted verification.
+- Queue: fresh Anthropic / Opus 5.5 / high source/security review BEFORE publication, then all five hosted checks at the actual candidate head before any merge. This implementation sub-agent performs no publication or delegation. Stages D/E/F/G remain unbuilt here; production native execution stays inactive. ExecutionFailed and E_PROTECTION remain unexplained, without a fix, waiver or retry.
+- Provider/outcome: OpenAI / gpt-6.1-sol / high — Stage C implemented locally; independent review and Unix acceptance pending. M2 remains incomplete; native, installed and dedicated paths remain **unverified on real hardware**.
+- Last merged PR remains #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`; inherited five-gate/review credit only. Main after #52 is pending, not claimed green. All earlier provider rows and queue history are retained below.
+
+## Historical checkpoint before Stage C implementation
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Production native execution is inactive; no experiment retry is authorized.
 - Last merged PR: #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`, 14:47:06 UTC, all five gates on c6eb700 plus independent Opus review. Squash tree equals reviewed head. Main CI after #52 is pending, not claimed green.
 - Stage B hosted Unix condition is met: run `43238092776` passed all platforms. Linux nextest 243 passed / 3 skipped; macOS 244 passed / 1 skipped. Both logs show r1_l1_marker_never_executes passed. These are hosted job-log observations, not local Unix runs. Root-only phase sites and real shutdown propagation remain source-reviewed, not native acceptance.
