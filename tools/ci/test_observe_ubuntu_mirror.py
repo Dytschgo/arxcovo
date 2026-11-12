@@ -1,4 +1,4 @@
-"""Owned fixtures only. Never call main, context, /etc, sudo, or apply."""
+"""Owned fixtures and injected main only; no production context, /etc or sudo."""
 import ast
 import contextlib
 import errno
@@ -132,13 +132,17 @@ class ObservationTests(unittest.TestCase):
                  b"Types: deb\nURIs: https://archive.ubuntu.com/ubuntu https://private.invalid\nSuites: x\nComponents: main\n",
                  b"Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\n Suites: x\n",
                  b"Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\nSuites: x\nSuites: y\nComponents: main\n"]
-        for data in cases:
+        sites = ((5, 120), (5, 110), (3, 63), (1, 39), (1, 35), (1, 39),
+                 (2, 47), (2, 52), (3, 68), (4, 86), (4, 93), (4, 93))
+        for data, (function, line) in zip(cases, sites):
             with self.subTest(data=data):
                 self.source.unlink(missing_ok=True)
                 self.source = self.source.with_suffix(".sources" if data.startswith(b"Types:") else ".list")
                 self.source.write_bytes(data)
                 report = self.run_observation()
                 self.assert_tag(report, "parser-unknown")
+                self.assert_tag(report, "raise-function", function)
+                self.assert_tag(report, "raise-line", line)
                 self.assertNotIn("private-owner", report.encoded())
                 self.assertNotIn("ubuntu.com", report.encoded())
                 self.assertNotIn(self.source.name, report.encoded())
@@ -196,7 +200,8 @@ class ObservationTests(unittest.TestCase):
         self.assertLessEqual(len(self.run_observation(report=report).encoded().encode()), diag.MAX_REPORT)
 
     def test_closed_report_schema(self):
-        for key, value in (("private", True), ("passed", "secret"), ("size", -1), ("size", 2**40)):
+        for key, value in (("private", True), ("passed", "secret"), ("size", -1), ("size", 2**40),
+                           ("raise-line", 252), ("raise-function", 7)):
             with self.assertRaises(diag.Stop):
                 diag.Report().emit(key, value)
 
@@ -250,6 +255,195 @@ class ObservationTests(unittest.TestCase):
         workflow = (Path(__file__).parents[2] / ".github/workflows/ci.yml").read_text()
         self.assertIn("if: failure() && runner.os == 'Linux' && steps.ubuntu_mirror.outcome == 'failure'", workflow)
         self.assertNotIn("continue-on-error", workflow)
+        observation = workflow.index("      - name: Observe Ubuntu mirror refusal")
+        tests = workflow.index("      - name: Test read-only Ubuntu mirror observer")
+        package = workflow.index("      - run: npx playwright install")
+        self.assertLess(observation, tests)
+        self.assertLess(tests, package)
+        condition = "if: failure() && runner.os == 'Linux' && steps.ubuntu_mirror.outcome == 'failure'"
+        self.assertEqual(workflow[observation:package].count(condition), 2)
+        self.assertIn("run: python3 -B -m unittest discover -s tools/ci -p 'test_observe_ubuntu_mirror.py'",
+                      workflow[tests:package])
+        self.assertNotIn("sudo", workflow[tests:package])
+        self.assertNotIn("||", workflow[tests:package])
+
+
+class ClassificationTests(unittest.TestCase):
+    URI_KEYS = ("host-allowed", "host-ubuntu", "host-kernel", "scheme-allowed",
+                "path-allowed", "netloc-host", "query-present", "fragment-present")
+
+    def test_version_two_numeric_vocabulary_is_pinned(self):
+        self.assertEqual(sorted(diag.PREDICATES), (
+            "actions ci continuation deadline deb822 directory duplicate entries fragment-present "
+            "has-components has-signed-by has-suites has-types host-allowed host-kernel host-ubuntu "
+            "identity-bytes linux netloc-host no-arguments nonempty os-error owner parser-unknown "
+            "passed path-allowed private-write publication-unresolved query-present raise-function "
+            "raise-line read-size regular report-bound repository root runner scheme-allowed "
+            "signed-by-pinned single-link size sources total-read unknown").split())
+        self.assertEqual(sorted(diag.STAGES), ("arguments context done enumeration internal mirror-parser "
+                                              "parents parser plan read recheck").split())
+        self.assertEqual(json.loads(diag.Report().encoded())["version"], 2)
+
+    def classify(self, call, function, line, extra=None):
+        report = diag.Report()
+        report.stage = "parser"
+        try:
+            call()
+        except diag.mirror.Refusal as error:
+            diag.refusal_facts(error, report)
+        else:
+            self.fail("probe must remain refused")
+        expected = {"raise-function": diag.FUNCTIONS.index(function) + 1, "raise-line": line}
+        expected.update(extra or {})
+        self.assertEqual({row[3]: row[4] for row in report.rows}, expected)
+        encoded = report.encoded()
+        for secret in ("ubuntu.com", "kernel.org", "private.invalid", "/ubuntu", "keyring",
+                       "private-owner", "/etc", "Signed-By", "Traceback", "fixture.list"):
+            self.assertNotIn(secret, encoded)
+        self.assertEqual(json.loads(encoded)["version"], 2)
+
+    def test_uri_compound_sites_exact_booleans(self):
+        for uri, line, values in (
+            ("https://ports.ubuntu.com/ubuntu", 35, (0, 1, 0, 1, 1, 1, 0, 0)),
+            ("https://eu-west-1.ec2.archive.ubuntu.com/ubuntu", 35, (0, 1, 0, 1, 1, 1, 0, 0)),
+            ("ftp://archive.ubuntu.com/ubuntu", 39, (1, 1, 0, 0, 1, 1, 0, 0)),
+            ("https://archive.ubuntu.com/private-owner", 39, (1, 1, 0, 1, 0, 1, 0, 0)),
+            ("https://archive.ubuntu.com:443/ubuntu", 39, (1, 1, 0, 1, 1, 0, 0, 0)),
+            ("https://archive.ubuntu.com/ubuntu?q", 39, (1, 1, 0, 1, 1, 1, 1, 0)),
+            ("https://archive.ubuntu.com/ubuntu#f", 39, (1, 1, 0, 1, 1, 1, 0, 1)),
+            ("https://archive.ubuntu.com/ubuntu?q#f", 39, (1, 1, 0, 1, 1, 1, 1, 1))):
+            with self.subTest(line=line, values=values):
+                self.classify(lambda: diag.mirror.rewrite(("deb " + uri + " x main\n").encode(), ".list"),
+                              "replacement", line, dict(zip(self.URI_KEYS, map(bool, values))))
+        for data, line, values in (
+            (b"https://private.invalid/ubuntu\n", 169, (0, 0, 0, 1, 1, 1, 0, 0)),
+            (b"https://mirrors.edge.kernel.org/ubuntu priority:1\n", 169, (0, 0, 1, 1, 1, 1, 0, 0)),
+            (b"https://archive.ubuntu.com/ubuntu priority:1234567\n", 166, (1, 1, 0, 1, 1, 1, 0, 0)),
+            (b"https://archive.ubuntu.com/ubuntu priority:1 extra\n", 166, (1, 1, 0, 1, 1, 1, 0, 0))):
+            self.classify(lambda: diag.mirror.rewrite_mirror_list(data), "rewrite_mirror_list", line,
+                          dict(zip(self.URI_KEYS, map(bool, values))))
+
+    def test_deb822_compound_sites(self):
+        base = "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\nSuites: x\nComponents: main\n"
+        keys = ("has-types", "has-suites", "has-components", "has-signed-by", "signed-by-pinned")
+        for text, values in (
+            (base.replace("Types: deb\n", ""), (0, 1, 1, 0, 1)),
+            (base.replace("Suites: x\n", ""), (1, 0, 1, 0, 1)),
+            (base.replace("Components: main\n", ""), (1, 1, 0, 0, 1)),
+            (base + "Signed-By: /private-owner/keyring\n", (1, 1, 1, 1, 0)),
+            (base.replace("Components: main\n", "") + "Signed-By: " + diag.mirror.KEYRING + "\n",
+             (1, 1, 0, 1, 1))):
+            self.classify(lambda: diag.mirror.rewrite(text.encode(), ".sources"), "rewrite_sources", 97,
+                          dict(zip(keys, map(bool, values))))
+        for text, continuation, duplicate in ((base + " Signed-By: private-owner\n", True, False),
+                                               (base + "Suites: y\n", False, True),
+                                               (base + "private-owner\n", False, False)):
+            self.classify(lambda: diag.mirror.rewrite(text.encode(), ".sources"), "rewrite_sources", 93,
+                          {"continuation": continuation, "duplicate": duplicate})
+
+    def test_simple_sites_and_prior_probe_inventory(self):
+        cases = ((b"\xff", ".list", "rewrite", 120),
+                 (b"\0private-owner", ".list", "rewrite", 110),
+                 (b"private-owner-syntax", ".list", "rewrite_list", 63),
+                 (SOURCE.replace(b"deb ", b"deb [trusted=yes] "), ".list", "trust", 47),
+                 (SOURCE.replace(b"deb ", b"deb [signed-by=/private-owner] "), ".list", "trust", 52),
+                 (SOURCE.replace(b" resolute main", b""), ".list", "rewrite_list", 68),
+                 (b"Types: deb\nURIs: https://archive.ubuntu.com/ubuntu https://private.invalid\nSuites: x\nComponents: main\n",
+                  ".sources", "rewrite_sources", 86),
+                 (SOURCE + b"#" * (65536 - len(SOURCE)), ".list", "rewrite", 123))
+        for data, suffix, function, line in cases:
+            self.classify(lambda: diag.mirror.rewrite(data, suffix), function, line)
+        for data, line in ((b"", 177), (b"\xff", 156), (b"\0", 152),
+                           (MIRRORS * 17, 177), (b"x" * 4097, 152)):
+            self.classify(lambda: diag.mirror.rewrite_mirror_list(data), "rewrite_mirror_list", line)
+
+    def test_unknown_origin_function_line_or_identity_is_zero_only(self):
+        self.assertTrue(diag._HELPER_PINNED)
+        self.assertEqual(diag.FUNCTIONS, ("replacement", "trust", "rewrite_list", "rewrite_sources",
+                                          "rewrite", "rewrite_mirror_list"))
+        for origin, name, line, pinned in (("private-owner", "replacement", 35, True),
+                                           (diag._spec.origin, "unknown", 35, True),
+                                           (diag._spec.origin, "replacement", 252, True),
+                                           (diag._spec.origin, "replacement", 35, False)):
+            trace = NS(tb_next=None, tb_lineno=line,
+                       tb_frame=NS(f_code=NS(co_filename=origin, co_name=name), f_locals={}))
+            report = diag.Report()
+            with patch.object(diag, "_HELPER_PINNED", pinned):
+                diag.refusal_facts(NS(__traceback__=trace), report)
+            self.assertEqual([r[3:] for r in report.rows], [["raise-function", 0], ["raise-line", 0]])
+
+
+class MainTests(unittest.TestCase):
+    def invoke(self, tree, observer=None, argv=None, linux=False, timer=None):
+        output, errors = Mock(), Mock()
+        fake_signal = NS(SIGALRM=14, ITIMER_REAL=0, signal=Mock(), setitimer=timer or Mock())
+        with patch.object(diag, "sys", NS(argv=["observer"] if argv is None else argv,
+                                          platform="linux" if linux else "test")), \
+             patch.object(diag, "signal", fake_signal), \
+             patch.object(diag, "context", return_value=(True,) * 6) as context, \
+             patch.object(diag, "DescriptorTree", return_value=tree) as constructor, \
+             patch.object(diag, "observe", observer or Mock()), \
+             patch.object(diag, "print", output, create=True), \
+             contextlib.redirect_stderr(errors):
+            status = diag.main()
+        output.assert_called_once()
+        errors.write.assert_not_called()
+        return status, json.loads(output.call_args.args[0]), context, constructor, fake_signal
+
+    def test_complete_plan_still_returns_one_and_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sources.list.d").mkdir()
+            (root / "sources.list.d" / "fixture.list").write_bytes(SOURCE)
+            tree = FixtureTree(root)
+            tree.close = Mock()
+            status, payload, _, _, _ = self.invoke(tree, diag.observe)
+            self.assertEqual(status, 1)
+            last = payload["events"][-1]
+            self.assertEqual(last[0], sorted(diag.STAGES).index("done"))
+            self.assertEqual(last[3:], [sorted(diag.PREDICATES).index("publication-unresolved"), True])
+            tree.close.assert_called_once()
+
+    def test_refusal_internal_and_close_errors_stay_red(self):
+        for observer, close, predicate in ((Mock(), None, None),
+                                           (Mock(side_effect=RuntimeError("private-owner")), None, "unknown"),
+                                           (Mock(), OSError("private-owner"), "os-error"),
+                                           (Mock(), diag.Deadline(), "unknown")):
+            tree = NS(close=Mock(side_effect=close))
+            status, payload, _, _, _ = self.invoke(tree, observer)
+            self.assertEqual(status, 1)
+            tree.close.assert_called_once()
+            if predicate:
+                self.assertEqual(payload["events"], [[4, 0, 0, sorted(diag.PREDICATES).index(predicate),
+                                                     0 if predicate == "os-error" else False]])
+            self.assertNotIn("private-owner", json.dumps(payload))
+
+    def test_arguments_return_two_without_context_or_tree(self):
+        tree = NS(close=Mock())
+        status, payload, context, constructor, _ = self.invoke(tree, argv=["observer", "private-owner"])
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["events"], [[0, 0, 0, sorted(diag.PREDICATES).index("no-arguments"), False]])
+        context.assert_not_called()
+        constructor.assert_not_called()
+        tree.close.assert_not_called()
+
+    def test_injected_alarm_cancel_precedes_close_and_cleanup_alarm_is_caught(self):
+        order = []
+        for cancel_alarm in (False, True):
+            order.clear()
+            def timer(_kind, seconds):
+                order.append(seconds)
+                if seconds == 0 and cancel_alarm:
+                    raise diag.Deadline()
+            tree = NS(close=Mock(side_effect=lambda: order.append("close")))
+            status, payload, _, _, signal = self.invoke(tree, linux=True, timer=Mock(side_effect=timer))
+            self.assertEqual(status, 1)
+            self.assertEqual(order, [10, 0, "close"])
+            handler = signal.signal.call_args.args[1]
+            with self.assertRaises(diag.Deadline):
+                handler(None, None)
+            if cancel_alarm:
+                self.assertEqual(payload["events"], [[4, 0, 0, sorted(diag.PREDICATES).index("unknown"), False]])
 
 
 class DescriptorTests(unittest.TestCase):
@@ -275,6 +469,14 @@ class DescriptorTests(unittest.TestCase):
         tree.parents(diag.Report())
         self.assertEqual([call.args[0] for call in ops.open.call_args_list[1:]],
                          ["/", "etc", "apt", "sources.list.d"])
+
+    def test_entries_selects_correct_directory(self):
+        ops = self.make_ops()
+        tree = diag.DescriptorTree(ops)
+        tree.fds = [10, 11, 12, 13]
+        for category, fd in ((1, 12), (2, 13)):
+            self.assertIs(tree.entries(category), ops.scandir.return_value)
+            ops.scandir.assert_called_with(fd)
 
     def test_file_policy_size_actual_read_and_cleanup(self):
         for info, data, tag in ((facts(st_mode=stat.S_IFLNK | 0o644), b"", "regular"),
@@ -321,6 +523,8 @@ class DescriptorTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "Owned Unix symlink/dir_fd coverage pending hosted Linux")
     def test_owned_symlink_and_unsafe_parent_stop_without_child_read(self):
+        if os.geteuid() == 0:
+            self.skipTest("ordinary non-root runner required")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "target").write_bytes(b"fixture")
@@ -334,6 +538,52 @@ class DescriptorTests(unittest.TestCase):
                 self.assertEqual(error.exception.errno, errno.ELOOP)
             finally:
                 os.close(parent)
+
+    @unittest.skipUnless(os.name == "posix", "native Unix owned descriptor coverage")
+    def test_native_owned_entries_regular_fifo_hardlink_directory(self):
+        if os.geteuid() == 0:
+            self.skipTest("ordinary non-root runner required")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sources.list.d").mkdir()
+            (root / "regular").write_bytes(b"fixture")
+            os.mkfifo(root / "fifo")
+            os.link(root / "regular", root / "hardlink")
+            (root / "child").mkdir()
+            apt = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            sources = os.open(root / "sources.list.d", os.O_RDONLY | os.O_DIRECTORY)
+            tree = diag.DescriptorTree()
+            tree.fds = [apt, apt, apt, sources]
+            try:
+                with tree.entries(1) as entries:
+                    self.assertEqual({e.name for e in entries},
+                                     {"sources.list.d", "regular", "hardlink", "fifo", "child"})
+                with tree.entries(2) as entries:
+                    self.assertEqual(list(entries), [])
+                report = diag.Report()
+                with self.assertRaises(diag.Stop):
+                    tree.read(1, "regular", 65536, report)
+                self.assertEqual(report.rows[-1][3:], ["owner", False])
+                # Native owned fixtures cannot satisfy root policy. Skip only that
+                # comparison through a local wrapper; retain native file/link facts.
+                original = diag.policy
+                def owned_policy(info, directory, report):
+                    self.assertNotEqual(info.st_uid, 0)
+                    original(NS(st_mode=info.st_mode, st_uid=0, st_nlink=info.st_nlink), directory, report)
+                with patch.object(diag, "policy", owned_policy):
+                    for name, predicate in (("hardlink", "single-link"), ("fifo", "regular"), ("child", "regular")):
+                        report = diag.Report()
+                        started = diag.time.monotonic()
+                        with self.assertRaises(diag.Stop):
+                            tree.read(1, name, 65536, report)
+                        self.assertLess(diag.time.monotonic() - started, 1)
+                        self.assertEqual(report.rows[-1][3:], [predicate, False])
+                    (root / "hardlink").unlink()
+                    data, _ = tree.read(1, "regular", 65536, diag.Report())
+                    self.assertEqual(data, b"fixture")
+            finally:
+                os.close(sources)
+                os.close(apt)
 
 
 if __name__ == "__main__":

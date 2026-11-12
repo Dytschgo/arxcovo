@@ -1,23 +1,35 @@
 """Read-only, fail-closed predicate observation; never a mitigation entry point.
 
 CLI roots and intent are fixed. Private dependencies exist for owned fixtures only.
-The shared pure parsers intentionally retain their opaque Refusal classification.
+Refusal facts decode only against the pinned helper source.
 """
 import errno
+import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import stat
 import sys
 import time
+from urllib.parse import urlsplit
 
 # -I excludes the script directory. Load only the fixed, reviewed sibling module.
 _spec = importlib.util.spec_from_file_location(
     "_mirror_pure", Path(__file__).with_name("ubuntu_mirror.py"))
 mirror = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(mirror)
+with open(_spec.origin, "rb") as _stream:
+    _source = _stream.read(65537)
+_HELPER_PINNED = hashlib.sha256(b"\n".join(_source.split(b"\r\n"))).hexdigest() == (
+    "a945b3d812f1fc47fa43ac696e3ec52026b657867b3f6c0d4b274a5d409b80ff")
+# Execute exactly the bytes whose identity was checked, not a second path read.
+exec(compile(_source, _spec.origin, "exec"), mirror.__dict__)
+del _source
+
+FUNCTIONS = ("replacement", "trust", "rewrite_list", "rewrite_sources", "rewrite",
+             "rewrite_mirror_list")
 
 MAX_ENTRIES = 128
 MAX_READS = 2_200_000
@@ -33,7 +45,61 @@ PREDICATES = {"linux", "root", "actions", "runner", "ci", "repository",
               "size", "read-size", "entries", "sources", "total-read", "deadline",
               "identity-bytes", "nonempty", "parser-unknown", "os-error",
               "unknown", "passed", "publication-unresolved", "report-bound",
-              "no-arguments", "deb822"}
+              "no-arguments", "deb822", "raise-function", "raise-line",
+              "has-types", "has-suites", "has-components", "has-signed-by",
+              "signed-by-pinned", "continuation", "duplicate", "host-allowed",
+              "host-ubuntu", "host-kernel", "scheme-allowed", "path-allowed",
+              "netloc-host", "query-present", "fragment-present"}
+
+
+def refusal_facts(error, report):
+    """Only the innermost pinned frame and explicitly named locals are inspected."""
+    trace = error.__traceback__
+    while trace is not None and trace.tb_next is not None:
+        trace = trace.tb_next
+    code = trace.tb_frame.f_code if trace is not None else None
+    known = (_HELPER_PINNED and code is not None and code.co_filename == _spec.origin
+             and code.co_name in FUNCTIONS and 1 <= trace.tb_lineno <= 251)
+    report.emit("raise-function", FUNCTIONS.index(code.co_name) + 1 if known else 0)
+    report.emit("raise-line", trace.tb_lineno if known else 0)
+    if not known:
+        return
+    local = trace.tb_frame.f_locals
+    site = (code.co_name, trace.tb_lineno)
+    if site == ("rewrite_sources", 97):
+        fields = local.get("fields")
+        if type(fields) is dict:
+            for key in ("types", "suites", "components"):
+                report.emit("has-" + key, bool(fields.get(key)))
+            report.emit("has-signed-by", "signed-by" in fields)
+            report.emit("signed-by-pinned", fields.get("signed-by", mirror.KEYRING) == mirror.KEYRING)
+    elif site == ("rewrite_sources", 93):
+        line, fields = local.get("line"), local.get("fields")
+        if type(line) is str and type(fields) is dict:
+            field = re.fullmatch(r"([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*)", line)
+            report.emit("continuation", line.startswith((" ", "\t")))
+            report.emit("duplicate", bool(field and field[1].lower() in fields))
+    elif site in (("replacement", 35), ("replacement", 39),
+                  ("rewrite_mirror_list", 166), ("rewrite_mirror_list", 169)):
+        uri = local.get("uri") if code.co_name == "replacement" else None
+        tokens = local.get("tokens")
+        if uri is None and type(tokens) is list and tokens and type(tokens[0]) is str:
+            uri = tokens[0]
+        parts = None
+        if type(uri) is str:
+            try:
+                parts = urlsplit(uri)
+                host = parts.hostname
+            except ValueError:
+                parts = None
+        values = (False,) * 8 if parts is None else (
+            host in mirror.HOSTS, bool(host and host.endswith(".ubuntu.com")),
+            host == "mirrors.edge.kernel.org", parts.scheme in ("http", "https"),
+            parts.path in ("/ubuntu", "/ubuntu/"), parts.netloc == host,
+            bool(parts.query), bool(parts.fragment))
+        for key, value in zip(("host-allowed", "host-ubuntu", "host-kernel", "scheme-allowed",
+                               "path-allowed", "netloc-host", "query-present", "fragment-present"), values):
+            report.emit(key, value)
 
 
 class Stop(Exception):
@@ -58,6 +124,8 @@ class Report:
         # Closed vocabulary and bounded scalar schema, including injected facts.
         if (predicate not in PREDICATES or self.stage not in STAGES
                 or type(value) not in (bool, int) or not 0 <= value <= MAX_READS
+                or (predicate == "raise-line" and value > 251)
+                or (predicate == "raise-function" and value > len(FUNCTIONS))
                 or not 0 <= self.category <= 3 or not 0 <= self.index <= 32):
             raise Stop()
         row = [self.stage, self.category, self.index, predicate, value]
@@ -80,7 +148,7 @@ class Report:
         events = [[sorted(STAGES).index(stage), category, index,
                    sorted(PREDICATES).index(predicate), value]
                   for stage, category, index, predicate, value in rows]
-        return json.dumps({"version": 1, "events": events}, separators=(",", ":"))
+        return json.dumps({"version": 2, "events": events}, separators=(",", ":"))
 
     def encoded(self):
         return self.serialize(self.rows)
@@ -223,7 +291,8 @@ def observe(tree, facts, report):
         report.tick()
         report.stage = "done"
         report.emit("publication-unresolved", True)
-    except mirror.Refusal:
+    except mirror.Refusal as error:
+        refusal_facts(error, report)
         report.emit("parser-unknown", False)
     except OSError as error:
         # Encode errno as a small allowlist index. Never stringify exceptions.
@@ -247,7 +316,7 @@ def main():
     tree = DescriptorTree()
     try:
         # CLI only: a hard wall-clock stop also bounds a blocking filesystem call.
-        # Tests never install process-wide timers or call this production entry.
+        # Unit tests replace the timer, context, tree and output dependencies.
         if sys.platform == "linux":
             def expired(_signum, _frame):
                 raise Deadline()
@@ -257,12 +326,17 @@ def main():
     except BaseException:
         report.rows = [["internal", 0, 0, "unknown", False]]
     finally:
-        if sys.platform == "linux":
-            signal.setitimer(signal.ITIMER_REAL, 0)
+        # Catch an alarm delivered during cancellation or descriptor cleanup too.
         try:
-            tree.close()
+            try:
+                if sys.platform == "linux":
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+            finally:
+                tree.close()
         except OSError:
             report.rows = [["internal", 0, 0, "os-error", 0]]
+        except BaseException:
+            report.rows = [["internal", 0, 0, "unknown", False]]
     print(report.encoded())
     return 1  # Observation never reports mitigation success.
 
