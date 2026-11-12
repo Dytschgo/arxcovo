@@ -13,6 +13,7 @@ KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 MIRROR_LIST = "mirror+file:/etc/apt/apt-mirrors.txt"
 MAX_BYTES = 65536
 MAX_FILES = 32
+MAX_MIRROR_LIST = 4096
 
 
 class Refusal(Exception):
@@ -23,7 +24,9 @@ def replacement(uri, indirect=False):
     if uri == MIRROR_LIST:
         if not indirect:
             raise Refusal()
-        return MIRROR
+        # Keep the indirect URI; the validated list gains the Kernel entry and
+        # APT's mirror method falls back to the original Ubuntu entries.
+        return MIRROR_LIST
     if uri.rstrip("/") == MIRROR:
         return MIRROR
     parts = urlsplit(uri)
@@ -142,16 +145,20 @@ def runner_context():
             and os.environ.get("GITHUB_REPOSITORY") == "Dytschgo/arxcovo")
 
 
-def validate_mirror_list(data):
-    if len(data) > 4096 or b"\x00" in data:
+def rewrite_mirror_list(data):
+    # Prefer the Kernel mirror (lowest priority is tried first) and keep every
+    # validated Ubuntu entry, shifted by one, as an automatic APT fallback.
+    if len(data) > MAX_MIRROR_LIST or b"\x00" in data:
         raise Refusal()
     try:
         lines = data.decode("utf-8").splitlines()
     except UnicodeError:
         raise Refusal() from None
+    result = [f"{MIRROR}/\tpriority:1"]
     count = 0
     for line in lines:
         if not line.strip() or line.lstrip().startswith("#"):
+            result.append(line)
             continue
         tokens = line.split()
         if (len(tokens) not in (1, 2)
@@ -162,9 +169,16 @@ def validate_mirror_list(data):
                 raise Refusal()
         except ValueError:
             raise Refusal() from None
+        if len(tokens) == 2:
+            line = f"{tokens[0]}\tpriority:{int(tokens[1][9:]) + 1}"
+        result.append(line)
         count += 1
     if not 1 <= count <= 16:
         raise Refusal()
+    encoded = ("\n".join(result) + "\n").encode("utf-8")
+    if len(encoded) > MAX_MIRROR_LIST:
+        raise Refusal()
+    return encoded
 
 
 def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
@@ -182,14 +196,15 @@ def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
         raise Refusal()
     records = [(path, *read(path)) for path in paths]
     indirect = any(MIRROR_LIST.encode() in data for _, data, _ in records)
-    if indirect:
-        data, _ = read(apt_root / "apt-mirrors.txt")
-        validate_mirror_list(data)
     plan = []
     for path, before, info in records:
         after = rewrite(before, path.suffix, indirect)
         if before != after:
             plan.append((path, before, after, info))
+    if indirect:
+        listing = apt_root / "apt-mirrors.txt"
+        before, info = read(listing)
+        plan.append((listing, before, rewrite_mirror_list(before), info))
     if not plan:
         raise Refusal()
     # Validate the complete plan before the first change. Only root can modify

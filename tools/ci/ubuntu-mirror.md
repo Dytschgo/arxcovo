@@ -19,7 +19,14 @@ also recognizes only `mirror+file:/etc/apt/apt-mirrors.txt`, after reading that
 exact file with the same native file guards and validating every entry as an
 allowed Ubuntu HTTP/HTTPS URI with at most one bounded `priority:N` tag. A
 foreign entry, malformed line, empty/oversized list or nested mirror URI refuses.
-The mirror list itself is never modified. Suites,
+Sources that use that mirror list keep their URI unchanged (their trust options
+are still validated). Instead the validated list gains the Kernel mirror as
+`priority:1`, and every original Ubuntu entry is kept with its priority raised
+by one. Comments and untagged entries are preserved, the result stays within
+4 KiB, and a second run refuses because the list then has a non-Ubuntu entry.
+[apt-transport-mirror](https://manpages.ubuntu.com/manpages/noble/man1/apt-transport-mirror.1.html)
+tries the lowest priority first. If a mirror is inaccessible, it tries the next
+entry until the file is retrieved. Suites,
 components, architectures, signing-key selection, comments and unrelated
 repositories remain unchanged. Existing global key selection is retained when
 a source has no explicit Signed-By. No keys or insecure APT options are added.
@@ -60,5 +67,28 @@ all four suites from the HTTPS mirror with no signature/fetch warning, and
 passed dependency installation plus browser and Electron smoke in 130 seconds.
 All three Ubuntu-domain DNS controls also resolved in that run. It therefore
 proves the signed-mirror path works, not that it reproduced or fixed the earlier
-DNS failure. The root cause remains unknown. Product installed-service and
+DNS failure. The root cause remains unknown.
+
+## Kernel-only mirror failure and fallback correction
+
+On November 12, fresh main job 130963746682 (source `b5e6556`) and four sibling
+Ubuntu jobs all printed `ubuntu-mirror-updated:1`, and all six DNS controls
+resolved. Each job then failed in APT because it could not connect to
+`mirrors.edge.kernel.org:443`. IPv6 reported network-unreachable (101), and in
+every job the IPv4 connection also timed out. Three jobs failed at InRelease
+(no installation candidate). Two fetched indexes, then failed all nine `.deb`
+downloads. An IPv4-only change would therefore not have helped, because the
+single Kernel host was the only source.
+
+In the PR32 failure, APT on this image went through all three Ubuntu entries
+(`Ign` and then `Err`), spending about 20 s per file and entry on name
+resolution. A list with Ubuntu first and the Kernel mirror last would face that
+per-file cost under the 12-minute limit. The correction therefore puts the
+Kernel entry first and keeps the Ubuntu entries behind it. In the fresh runs,
+Kernel connect failures failed all queued items together after about 16 s.
+Tests model only the documented order. Real fallback timing and the sync of
+packages fetched from a different mirror are **pending hosted confirmation**.
+Sanitized facts are in `docs/evidence/ubuntu-kernel-mirror-failures.json`.
+
+Product installed-service and
 dedicated-account acceptance remain open.
