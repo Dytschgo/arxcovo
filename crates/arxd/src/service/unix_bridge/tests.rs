@@ -150,12 +150,16 @@ fn t1_derivation_factory_once_and_refusals() {
         let mut v = fixture();
         v["limits"]["memory_bytes"] = json!(16777216);
         v["build_account"][key] = value;
-        if let Ok(c) = parse(v, &FakeResolver::default()) {
-            assert!(matches!(
-                derive(&l, &c, "/x".into()),
-                Err(Unavailable::PreflightFailed)
-            ));
-        }
+        let c = ServiceConfig::parse_inventory(
+            &serde_json::to_vec(&v).unwrap(),
+            &l,
+            &FakeResolver::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            derive(&l, &c, "/x".into()),
+            Err(Unavailable::PreflightFailed)
+        ));
     }
     for (field, value) in [
         ("memory_bytes", json!(1024)),
@@ -578,6 +582,7 @@ fn t10_reexec_diagnostics() {
         combined.extend_from_slice(&output.stdout);
         let text = String::from_utf8_lossy(&combined);
         assert!(!text.contains(MARKER));
+        assert!(!text.contains("3141592653"), "identity marker withheld");
         for fixed in [
             "ARX-T10-FIXED-PANIC",
             "ARX-T10-MAPPING-PANIC",
@@ -659,6 +664,8 @@ async fn t8_private_inputs_all_phases_inner() {
             &FakeResolver::default(),
         )
         .unwrap();
+        let marker_seen = Arc::new(AtomicUsize::new(0));
+        let port_seen = marker_seen.clone();
         let b = UnixBridge::new(
             &layout,
             &c,
@@ -676,7 +683,10 @@ async fn t8_private_inputs_all_phases_inner() {
                         .contains(MARKER)
                 );
                 Ok(Box::new(FakePort(Box::new(move |s, _, _| {
-                    assert!(s.arguments.iter().any(|v| v.contains(MARKER)));
+                    port_seen.store(
+                        usize::from(s.arguments.iter().any(|v| v.contains(MARKER))),
+                        Ordering::SeqCst,
+                    );
                     Err(error)
                 }))))
             },
@@ -688,6 +698,11 @@ async fn t8_private_inputs_all_phases_inner() {
         let e = execution(b);
         let id = a.start_dedicated("alpha", "run_command").unwrap();
         let out = e.dispatch(Some(request()), a.clone(), id).await;
+        assert_eq!(
+            marker_seen.load(Ordering::SeqCst),
+            1,
+            "port marker observed"
+        );
         if let Ok(v) = out {
             assert!(!v.to_string().contains(MARKER));
         } else {
@@ -755,10 +770,28 @@ fn t3_fake_port_receives_exact_request() {
             r.tool = None;
             r.executable = Some("/synthetic/target".into());
         }
-        let expected = spec(
-            Layout::for_test(Platform::Linux).binary(),
-            if mode == "probe" { None } else { Some(&r) },
-        );
+        let expected = exec::RunSpec {
+            executable: Layout::for_test(Platform::Linux).binary().into(),
+            arguments: if mode == "probe" {
+                vec!["tool-probe".into()]
+            } else {
+                let mut args = vec![
+                    "exec-child".into(),
+                    mode.into(),
+                    r.executable.clone().or_else(|| r.tool.clone()).unwrap(),
+                    r.cwd.clone(),
+                ];
+                args.extend(r.args.clone());
+                args
+            },
+            cwd: PathBuf::new(),
+            timeout: Duration::from_secs(if mode == "probe" { 60 } else { r.timeout_s }),
+            output_bytes: if mode == "probe" {
+                4096
+            } else {
+                r.output_bytes
+            },
+        };
         let b = bridge(move |s, _, _| {
             assert_eq!(s.executable, expected.executable);
             assert_eq!(s.arguments, expected.arguments);
@@ -767,10 +800,18 @@ fn t3_fake_port_receives_exact_request() {
             assert_eq!(s.output_bytes, expected.output_bytes);
             Ok(result())
         });
-        let _ = b.run(
+        let report = b.run(
             if mode == "probe" { None } else { Some(&r) },
             &Cancellation::default(),
             &Cancellation::default(),
+        );
+        assert!(
+            if mode == "probe" {
+                matches!(report, Report::Discovered { .. })
+            } else {
+                matches!(report, Report::Completed { .. })
+            },
+            "port assertions must survive the bridge panic boundary"
         );
     }
 }

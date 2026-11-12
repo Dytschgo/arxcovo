@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-12
 
+- Stage D production passed Opus contract review; test corrections close swallowed fake assertions, skipped derivation cases and missing numeric marker check. Coordinator Sol medium keeps production unchanged, builds an independent expected spec and records four compiled assertion kills. Final fmt/locked workspace Clippy/focused24 passed (4dffa45b). [Evidence](evidence/unix-bridge-stage-d-review-followup.md). Fresh test-delta recheck is next; CI investigations remain parked and Stage C remains an unmerged dependency.
+
 - ADR0019 Stage D local implementation: inactive UnixBridge, pure config/spec/report mappings, fake runner port, test-only Execution wiring, whole-body panic catch, strict discovery parsing and extended P-SCAN. OpenAI / gpt-6.1-sol / high. Source `d3615be3b9820cf72a40b321a3dcf6c746a9e7bd` is ready for review, not acceptance. [Evidence](evidence/unix-bridge-stage-d.md).
 - Local validation: final fmt and locked workspace all-target Clippy pass; focused 24/24; exactly one final normal workspace nextest **323 passed / 3 skipped**, `8195e507-b3d3-4306-9fe6-72b89fce5a3f`, 11.307s. Compiled mutation evidence retains two original survivors and their assertion-kill rechecks. Linux cross-check failed before arxd: cross C compiler absent; Unix compilation remains pending.
 - Evidence head: `a318c437d01082676fee3a5b0a5f9a5025e24bcf` (docs only after source `d3615be`); final handoff adds only this pin/clarification. Completion returns to the parent coordinator for fresh Opus high review; no child review/publication was started.
