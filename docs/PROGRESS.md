@@ -2,6 +2,15 @@
 
 ## Current state — 2026-11-12
 
+- OpenAI / gpt-6.1-sol / high, implementation sub-agent: S3 correction attempt 1 on clean prepared `c41fbb2cd972f19e3af7af81f0f0b06342f42a0d`. No subagents. Exact Identity refusal, resolver order, changed pins, new SID observation, recorded-grant mirror, parser acceptance bounds, complete marker forwarding, shared library Display output and exact fake start sequence implemented. [Correction evidence](evidence/owner-cli-s3-correction1.md) records validation and limits.
+- Correction source `974048e621edc8c468c9f62943a749bfb0218ddb`: fmt/whitespace and locked workspace all-target Clippy pass; focused14 pass; 11 compiled assertion-kill mutants restored byte-for-byte. Exactly one final default-profile/concurrency normal workspace nextest: **298 passed, 2 skipped**, `1dfe22f1-d91c-4062-aa3d-51bae09aa60a`, 10.483s. Function-pointer compile check counts in totals but supplies no behavioral coverage.
+- Queue priority: fresh Anthropic / Opus 5.5 / high independent recheck of correction source AND coordinator Sol medium contract clarification, then all five hosted gates. S3 remains unpublished, pending review; no acceptance or activation.
+- Last merged PR: #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`. Main run `43221533019` succeeded in 439s (inherited coordinator evidence; not rerun). Milestone 1 accepted; M2 incomplete. Native, installed and dedicated paths are **unverified on real hardware**.
+- S1/S2 library/native/executor behavior is unchanged. Actual read_config_with inventory selection and pin retention remain covered by restored mutations; production guard/SCM/session/adapter selection remains source-only. Unix native cfg paths await hosted Linux/macOS compilation; no local stub/toolchain credit.
+- ExecutionFailed remains unexplained; no local pass fixes or waives it. No owner/native/admin/service/VM/Lab Manager operation, valid owner process invocation, public GitHub action or babysitter change.
+
+## Historical checkpoint before S3 correction attempt 1
+
 - S3 review at `7f70852` is CHANGES REQUIRED on both axes, retained in [the independent report](reviews/0018-s3-independent-review.md). Coordinator Sol medium corrects the brief to preserve the existing Identity mapping for missing old accounts and records the accepted deferred-start shape; both clarifications require cross-provider recheck. Correction attempt 1 will add exact resolver ordering, changed-pin/missing-account/new-SID/recorded-grant wiring cases, accepted parser boundaries, all uninstall tokens and full marker argument forwarding. S3 stays unpublished; no library error mapping change or native owner operation is authorized.
 
 - Coordinator review checkpoint: main after #49, run `43221533019` on `c4ef8ad`, completed successfully (12:50:01 to 12:57:20 UTC, 439s). S3 candidate `558b948` / source `edcadff` is integrated locally for independent Opus high review. The old-build-account token discrepancy is open: existing full config validation maps execution preflight AccountMissing to Identity, both exit 3, while the brief requires AccountMissing. No library or contract change is accepted yet. The deferred Windows start closure and acknowledged recording-matrix gaps also require review. No publication or activation is accepted by the 295-pass local result.
@@ -719,7 +728,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
 
 These task-time records retain the failed Sol handoff and later Opus resolution; the newest checkpoint below governs current status.
 
-## Current-user Windows implementation assignment
+## Historical current-user Windows implementation assignment
 
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
@@ -838,7 +847,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   service schema. Redaction stays best effort, and nothing here isolates the
   owner. M2's dedicated-account criterion remains open.
 
-## Current-user development coordinator integration
+## Historical current-user development coordinator integration
 
 - Codex / gpt-6.1-sol, medium: integrated completed Opus candidate f1541ce with merged main b29f531. Main differed from the candidate activity base only in the already-carried checked_path correction, the committed Windows path regression and README encoding. The candidate source is retained, the main regression is added, and progress is reconciled. The Opus candidate passed 58 tests and 25 mutations. Integrated-revision formatting, workspace Clippy with warnings denied and all 59 nextest tests passed on Windows; executor, audit, MCP and bridge source remain byte-identical to that completed candidate. Fresh independent Sol review and hosted checks are required before any private acceptance run. No production owner execution or administrative operation has occurred.
 
