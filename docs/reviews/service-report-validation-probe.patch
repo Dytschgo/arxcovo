@@ -1,0 +1,61 @@
+--- a/crates/arxd/src/service/executor/tests.rs
++++ b/crates/arxd/src/service/executor/tests.rs
+@@ -689,3 +689,58 @@
+         );
+     }
+ }
++
++
++// Temporary diagnostic only: asserts the observed unsafe acceptance, not policy.
++#[tokio::test]
++async fn diagnostic_n2_report_acceptance() {
++    use crate::store::{Rights, ObservationPoint, TreeBoundary};
++    for case in 0..5 {
++        let dir = private_temp();
++        let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
++        let mut m = Observation::Windows {
++            sid: "S-1-5-21-100-200-300-1001".into(),
++            integrity_rid: 8192,
++            elevated: false,
++            matches: true,
++        }.metadata(Rights::Standard);
++        m.stop_reason = Some(StopReason::Exited);
++        m.exit_code = Some(0);
++        m.cleanup_confirmed = Some(true);
++        m.tree_boundary = Some(TreeBoundary::WindowsJob);
++        match case {
++            0 => {
++                m.observed_kind = None;
++                m.observed_id = None;
++                m.integrity_rid = None;
++                m.elevation = None;
++                m.observation_point = None;
++                m.identity_matches_pin = None;
++            }
++            1 => m.cleanup_confirmed = None,
++            2 => m.rights = Some(Rights::Admin),
++            3 => m.observation_point = Some(ObservationPoint::Child),
++            4 => m.tree_boundary = Some(TreeBoundary::ProcessGroup),
++            _ => unreachable!(),
++        }
++        let report = Report::Completed {
++            metadata: m,
++            stdout: CapturedOutput { head: vec![], tail: vec![], dropped_bytes: 0 },
++            stderr: CapturedOutput { head: vec![], tail: vec![], dropped_bytes: 0 },
++        };
++        let mut e = backend_fixture(Arc::new(OnceReport(Mutex::new(Some(report)))));
++        Arc::get_mut(&mut e).unwrap().rights = Some(Rights::Standard);
++        let id = a.start_dedicated("alpha", "run_command").unwrap();
++        let v = e.dispatch(Some(request()), a.clone(), id).await.ok().unwrap();
++        assert_eq!(v["outcome"], "succeeded", "case {case}");
++        assert_eq!(v["reason"], Value::Null, "case {case}");
++        assert!(!e.quarantined.load(Ordering::Acquire), "case {case}");
++        let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
++        let row: (String, String) = db.query_row(
++            "SELECT outcome,identity_mode FROM activity WHERE id=?", [id],
++            |r| Ok((r.get(0)?,r.get(1)?))
++        ).unwrap();
++        assert_eq!(row, ("succeeded".into(), "dedicated_account".into()));
++        e.drain().await.unwrap();
++    }
++}

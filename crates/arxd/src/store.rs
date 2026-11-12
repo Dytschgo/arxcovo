@@ -714,26 +714,30 @@ impl Metadata {
         if self.argc.is_some_and(|n| n > 128) {
             anyhow::bail!("invalid activity metadata");
         }
-        if let Some(id) = &self.observed_id {
-            let valid = match self.observed_kind {
-                Some(ObservedKind::UnixUid) => decimal(id) && id.parse::<u32>().is_ok(),
-                Some(ObservedKind::WindowsSid) => id.strip_prefix("S-1-").is_some_and(|s| {
-                    let parts: Vec<_> = s.split('-').collect();
-                    (2..=16).contains(&parts.len())
-                        && decimal(parts[0])
-                        && parts[0].parse::<u64>().is_ok_and(|n| n <= 281474976710655)
-                        && parts[1..]
-                            .iter()
-                            .all(|p| decimal(p) && p.parse::<u32>().is_ok())
-                }),
-                None => false,
-            };
-            if id.len() > 184 || !valid {
-                anyhow::bail!("invalid observed identity");
-            }
+        if let Some(id) = &self.observed_id
+            && !self
+                .observed_kind
+                .is_some_and(|kind| observed_id_valid(kind, id))
+        {
+            anyhow::bail!("invalid observed identity");
         }
         Ok(())
     }
+}
+pub(crate) fn observed_id_valid(kind: ObservedKind, id: &str) -> bool {
+    id.len() <= 184
+        && match kind {
+            ObservedKind::UnixUid => decimal(id) && id.parse::<u32>().is_ok(),
+            ObservedKind::WindowsSid => id.strip_prefix("S-1-").is_some_and(|s| {
+                let parts: Vec<_> = s.split('-').collect();
+                (2..=16).contains(&parts.len())
+                    && decimal(parts[0])
+                    && parts[0].parse::<u64>().is_ok_and(|n| n <= 281474976710655)
+                    && parts[1..]
+                        .iter()
+                        .all(|p| decimal(p) && p.parse::<u32>().is_ok())
+            }),
+        }
 }
 fn decimal(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())

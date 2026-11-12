@@ -649,7 +649,7 @@ async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
         preflight_entered: tokio::sync::Notify::new(),
         backend_entered: tokio::sync::Notify::new(),
     });
-    let execution = crate::service::executor::tests::backend_fixture(probe.clone());
+    let execution = crate::service::executor::tests::default_fixture(probe.clone());
     let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
     store.dedicated = Some(execution.clone());
     let activity = Arc::new(store);

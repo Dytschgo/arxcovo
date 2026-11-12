@@ -2,6 +2,15 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main884a301, 08:56:09 UTC, through all five gates and independent review. Main CI run43187047371 passed in428s.
+- Queue priority: PR41 shutdown fix awaits Windows CI (Opus review, Ubuntu, macOS and budget pass); N2 report validation is a separate local child candidate, awaiting fresh Opus integration review before publication. E2 stays held by unexplained ExecutionFailed runbdbf032b.
+- N2 runtime/tests match reviewed local port95f06d3 byte-for-byte; E1 owner and client changes stay inherited. Coordinator fmt/locked all-target Clippy and one full nextest run passed241/241 with2 skipped (ce6a9bc3). No new mutation or native acceptance is claimed.
+- ADR0018's accepted local contract disposition remains on docs/owner-cli-final-contract-corrections (29068df), with N1–N5 due before S2 and all implementation gates retained. ADR0019 has inactive-design PASS. E2's three instrumented passes did not waive its red run.
+- No experiment retry, third S4U probe, owner admin, old Lab Manager/VM or babysitter operation.
+
+## Historical checkpoint before report-validation integration
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**; no native executor or owner CLI is activated.
 - Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main `884a301eaa1e6dda6d218e439315ecdf3902ae82`, 08:56:09 UTC, all five gates on 190c1c7 plus independent Opus review.
 - Main after #40 passed: run 43187047371 at 884a301, 08:56:12–09:03:20 UTC, 428s. Main after #39 passed in 559s, run 43182044209.

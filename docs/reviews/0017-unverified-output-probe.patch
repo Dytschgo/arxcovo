@@ -1,0 +1,39 @@
+diff --git a/crates/arxd/src/service/executor/tests.rs b/crates/arxd/src/service/executor/tests.rs
+index 0dae921..ddb60ce 100644
+--- a/crates/arxd/src/service/executor/tests.rs
++++ b/crates/arxd/src/service/executor/tests.rs
+@@ -1793,3 +1793,34 @@ async fn adr0017_backend_refusal_rows() {
+         e.drain().await.unwrap();
+     }
+ }
++
++
++// Temporary diagnostic: records existing output disclosure, not desired policy.
++#[tokio::test]
++async fn diagnostic_unverified_identity_output_is_returned() {
++    for absent in [false, true] {
++        let dir = private_temp();
++        let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
++        let mut evidence = good(Platform::Windows, Rights::Standard);
++        if absent {
++            evidence.observation = None;
++            evidence.point = None;
++        } else if let Some(Observation::Windows { sid, .. }) = &mut evidence.observation {
++            *sid = SID_B.into();
++        }
++        let report = Report::Completed {
++            evidence,
++            stdout: CapturedOutput { head: SID_B.as_bytes().to_vec(), tail: vec![], dropped_bytes: 0 },
++            stderr: CapturedOutput { head: vec![], tail: SID_B.as_bytes().to_vec(), dropped_bytes: 0 },
++        };
++        let e = backend_fixture(Arc::new(OnceReport(Mutex::new(Some(report)))), Ok(windows_pin(Rights::Standard)));
++        let id = a.start_dedicated("alpha", "run_command").unwrap();
++        let v = e.dispatch(Some(request()), a.clone(), id).await.ok().unwrap();
++        assert_eq!(v["outcome"], "failed");
++        assert!(v["metadata"]["observed_id"].is_null());
++        assert_eq!(v["stdout"]["head"], SID_B);
++        assert_eq!(v["stderr"]["tail"], SID_B);
++        assert!(e.quarantined.load(Ordering::Acquire));
++        e.drain().await.unwrap();
++    }
++}
