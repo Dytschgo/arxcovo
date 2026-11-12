@@ -2,7 +2,8 @@
 
 ## Current state - 2026-11-12
 
-- Queue priority: correct proposed ADR 0020 Stage E after the independent Sol high design review, then obtain a fresh cross-provider recheck. No Stage E implementation or privileged acceptance is authorized by this proposal.
+- Queue priority: independent Sol high recheck of ADR 0020 correction attempt 1. No Stage E implementation or privileged acceptance is authorized by this proposal.
+- Correction `66924d0` (Anthropic / Opus 5.5 / high), retained as `680b143`, addresses the initial five blockers and proposes explicit ADR 0019 amendment A5 for a payload-free residue flag and admission recheck. Outcome: proposed, pending independent review; no builds or behavior tests ran. [Disposition](reviews/0020-correction1-disposition.md).
 - Stage E proposal `e3928f5` (Anthropic / Opus 5.5 / high) is retained as `54032bf`; independent review `8ff4196` (OpenAI / gpt-6.1-sol / high) is retained as `8ff3a54`. Outcome: changes required, five blockers covering sudo executable trust, directory-list offsets, orphan/admission claims, cleanup postconditions and test precedence. [Review](reviews/0020-sol-independent-design-review.md).
 - Stage D PR55 head `fdea1c6` passed exact-head Opus review; hosted Ubuntu and macOS passed. The existing 906-second main baseline keeps ci-time-budget red. Stage C PR53 remains an unmerged dependency. No merge gate is waived; CI performance and diagnostic investigations remain parked while product design continues.
 - Last merged PR52, main `1604db1`. M1 accepted; M2 incomplete. Production native execution remains inactive. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry. No owner/admin/service/VM operation is authorized.
