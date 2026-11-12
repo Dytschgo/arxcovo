@@ -10,6 +10,12 @@
 - E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
 
+## PR38 first hosted validation — lint correction, 2026-11-12
+
+- Published head `6da6224`, CI run43160202605, Ubuntu job130989275950 failed `npm run lint`: ESLint no-regex-spaces rejected two literal-space regexes in the Sol-authored workflow test. The helper/package-fetch step was never reached; this is not another mirror/network failure and provides no fallback acceptance.
+- Coordinator OpenAI / gpt-6.1-sol / medium made the mechanical lint correction to equivalent space quantifiers `{2}` and `{4}`. No helper, workflow behavior, gate, timeout or test assertion is weakened. Locally ran `npm run lint` successfully, Node policy/workflow tests19/19, Python CI helpers29/29 and diff whitespace check. Earlier local validation omitted the full lint command; the hosted check caught that omission.
+- Publish a changed head through its automatic PR CI; no unchanged rerun or duplicate dispatch. Exact-head review must cover this two-line test correction; all gates remain mandatory. Real APT fallback and installed/native/dedicated M2 remain unverified.
+
 ## Ubuntu fallback candidate publication review — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium independently reviewed Opus candidate `1361864..bfa177f`: Standards/Spec pass with no blockers; [report](reviews/ubuntu-fallback-sol-review.md). The earlier Sol concurrency correction retains its independent Opus recheck. Publish this CI unblock as the explicit babysitter queue-recovery exception, without opening a feature PR. Native/M2 acceptance is unchanged; real fallback and all hosted gates remain mandatory.
