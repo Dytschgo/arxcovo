@@ -728,3 +728,45 @@ fn observe_is_read_only_for_absent_partial_and_active() {
         }
     }
 }
+
+pub(super) fn absent_proof() -> Deregistered {
+    engine(false, STOPPED).deregister().unwrap()
+}
+
+#[test]
+fn u1_uninstall_flow_blocks_every_deregister_error() {
+    // Inject every failing native call in the complete successful trace.
+    let mut control = engine(true, STOPPED);
+    let _ = control.deregister().unwrap();
+    let count = control.calls.calls.len();
+    for i in 1..=count {
+        for code in [5, MARKED, 1234] {
+            let mut expected = engine(true, STOPPED);
+            expected.calls.fail = Some((i, code));
+            let error = expected.deregister().err();
+            let mut actual = engine(true, STOPPED);
+            actual.calls.fail = Some((i, code));
+            let mut called = false;
+            let result = uninstall_flow(&mut actual, |_| called = true);
+            assert_eq!(result.err(), error);
+            assert_eq!(called, error.is_none());
+        }
+        let mut expected = engine(true, STOPPED);
+        expected.calls.malformed = Some(i);
+        let error = expected.deregister().err();
+        let mut actual = engine(true, STOPPED);
+        actual.calls.malformed = Some(i);
+        let mut called = false;
+        assert_eq!(uninstall_flow(&mut actual, |_| called = true).err(), error);
+        assert_eq!(called, error.is_none());
+    }
+    for state in [RUNNING, START_PENDING, PAUSED, 999] {
+        let mut scm = engine(true, state);
+        scm.calls.sticky = true;
+        assert!(uninstall_flow(&mut scm, |_| panic!("store reached")).is_err());
+    }
+    let mut foreign = engine(true, STOPPED);
+    foreign.calls.base.image = vec![1];
+    assert!(uninstall_flow(&mut foreign, |_| panic!("store reached")).is_err());
+    assert!(uninstall_flow(&mut engine(false, STOPPED), |_| ()).is_ok());
+}

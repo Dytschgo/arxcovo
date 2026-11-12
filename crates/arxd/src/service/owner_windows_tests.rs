@@ -75,39 +75,15 @@ fn prepare(dir: &Path) -> ProtectionPolicy {
     policy
 }
 fn session(root: &Path, policy: ProtectionPolicy) -> Result<WindowsOwnerStore, Failure> {
-    // Fixture authority is only this test's private parent. Validate the
-    // shared path without retaining global temporary-directory handles; the
-    // production constructor still retains its complete protected chain.
-    for ancestor in root
-        .ancestors()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let pin = raw_open(
-            ancestor,
-            READ_CONTROL | FILE_READ_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            OPEN_EXISTING,
-            None,
-        )?;
-        structural(&pin, true)?;
-        drop(pin);
-    }
-    let pin = raw_open(
-        root,
-        READ_CONTROL | FILE_READ_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        OPEN_EXISTING,
-        None,
-    )?;
-    policy.check(&pin, true)?;
+    let mut pins = pin_private_dirs([root], &policy, |_| Ok(())).map_err(|e| match e {
+        OpenError::Store(f) => f,
+        _ => Failure::RecoveryRequired,
+    })?;
     WindowsOwnerStore::locked(
         root.to_owned(),
         Layout::for_test(Platform::Windows),
         policy,
-        vec![pin],
+        pins.split_off(pins.len() - 1),
     )
 }
 fn open_fixture() -> (Fixture, WindowsOwnerStore) {
@@ -554,4 +530,499 @@ fn sibling_fixture_sessions_release_only_their_own_parent() {
     std::fs::rename(&moved, &first).unwrap();
     assert!(std::fs::rename(&second, second.with_extension("moved")).is_err());
     drop(other);
+}
+
+struct CheckedRight<F> {
+    callback: F,
+    calls: Vec<&'static str>,
+}
+impl<F: FnMut()> BatchRight for CheckedRight<F> {
+    fn observe(&mut self, _: &str) -> Result<bool, Failure> {
+        (self.callback)();
+        self.calls.push("observe");
+        Ok(true)
+    }
+    fn grant(&mut self, _: &str) -> Result<(), Failure> {
+        panic!("grant forbidden")
+    }
+    fn revoke(&mut self, _: &str) -> Result<(), Failure> {
+        (self.callback)();
+        self.calls.push("revoke");
+        Ok(())
+    }
+}
+fn granted() -> OwnerRecord {
+    OwnerRecord::decode(br#"{"version":1,"sid":"S-1-5-21-1-2-3-1001","state":"granted"}"#).unwrap()
+}
+fn private_fixture(
+    root: &Path,
+    policy: ProtectionPolicy,
+    ancestor: impl Fn(&layout::Protection) -> Result<(), Error>,
+) -> Result<WindowsOwnerStore, OpenError> {
+    let mut pins = pin_private_dirs([root], &policy, ancestor)?;
+    // Only root is fixture authority. The shared walk checks the entire chain;
+    // retaining shared-temp ancestor handles would fence unrelated fixtures.
+    let private_pins = pins.split_off(pins.len() - 1);
+    drop(pins);
+    Ok(WindowsOwnerStore::locked(
+        root.to_owned(),
+        Layout::for_test(Platform::Windows),
+        policy,
+        private_pins,
+    )?)
+}
+#[test]
+fn u2_u3_private_pins_cover_configure_and_uninstall() {
+    for uninstall in [false, true] {
+        let (d, policy) = fixture();
+        let mut s = private_fixture(d.path(), policy, |_| Ok(())).unwrap();
+        s.replace_record(None, &granted()).unwrap();
+        let moved = d.path().with_file_name("moved");
+        let mut right = CheckedRight {
+            callback: || {
+                assert!(std::fs::rename(d.path(), &moved).is_err());
+                assert!(matches!(
+                    raw_open(
+                        &d.path().join("owner.lock"),
+                        READ_CONTROL | FILE_READ_DATA,
+                        0,
+                        OPEN_EXISTING,
+                        None
+                    ),
+                    Err(Failure::Busy)
+                ));
+            },
+            calls: vec![],
+        };
+        if uninstall {
+            assert!(matches!(
+                uninstall_locked(
+                    super::super::owner_scm::fixture_deregistered(),
+                    &mut s,
+                    &mut right
+                ),
+                Ok(RightReport::Removed)
+            ));
+            assert_eq!(right.calls, ["observe", "revoke"]);
+        } else {
+            owner_transactions::recover(&mut s, &mut right).unwrap();
+            owner_transactions::observe_batch("S-1-5-21-1-2-3-1001", &mut s, &mut right).unwrap();
+            assert_eq!(right.calls, ["observe"]);
+        }
+        drop(s);
+        std::fs::rename(d.path(), &moved).unwrap();
+        std::fs::rename(&moved, d.path()).unwrap();
+        assert!(
+            raw_open(
+                &d.path().join("owner.lock"),
+                READ_CONTROL | FILE_READ_DATA,
+                0,
+                OPEN_EXISTING,
+                None
+            )
+            .is_ok()
+        );
+    }
+}
+#[test]
+fn u2_recovery_precedes_uninstall_and_failure_stops_right() {
+    let (d, mut s) = open_fixture();
+    let intent =
+        OwnerRecord::decode(br#"{"version":1,"sid":"S-1-5-21-1-2-3-1001","state":"intent"}"#)
+            .unwrap();
+    s.replace_record(None, &intent).unwrap();
+    let mut right = CheckedRight {
+        callback: || (),
+        calls: vec![],
+    };
+    assert!(matches!(
+        uninstall_locked(
+            super::super::owner_scm::fixture_deregistered(),
+            &mut s,
+            &mut right
+        ),
+        Ok(RightReport::RetainedUnproven)
+    ));
+    assert_eq!(right.calls, ["observe", "observe"]);
+    std::fs::write(d.path().join("owner-record.json"), b"invalid").unwrap();
+    right.calls.clear();
+    assert!(matches!(
+        uninstall_locked(
+            super::super::owner_scm::fixture_deregistered(),
+            &mut s,
+            &mut right
+        ),
+        Err(Failure::RecoveryRequired)
+    ));
+    assert!(right.calls.is_empty());
+}
+#[test]
+fn u3_unsafe_private_chains_stop_before_store_or_right() {
+    for uninstall in [false, true] {
+        for case in ["missing", "unsafe", "untrusted", "replaced", "reparse"] {
+            let (d, mut policy) = fixture();
+            // A staging sentinel must survive refusal before store cleanup.
+            std::fs::write(d.path().join("arxd.json.staging"), b"sentinel").unwrap();
+            let missing = d.path().join("missing");
+            let replacement = d.path().join("replacement");
+            let path = match case {
+                "missing" => missing.as_path(),
+                "unsafe" => {
+                    policy.fixture_owner = Some("S-1-0-0".into());
+                    d.path()
+                }
+                "replaced" => {
+                    let _ = prepare(&replacement);
+                    let previous = raw_open(
+                        &replacement,
+                        READ_CONTROL | FILE_READ_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        OPEN_EXISTING,
+                        None,
+                    )
+                    .unwrap();
+                    let previous_id = identity(&previous).unwrap();
+                    drop(previous);
+                    std::fs::rename(&replacement, d.path().join("saved-directory")).unwrap();
+                    std::fs::write(&replacement, b"file instead of directory").unwrap();
+                    let replaced = raw_open(
+                        &replacement,
+                        READ_CONTROL | FILE_READ_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        OPEN_EXISTING,
+                        None,
+                    )
+                    .unwrap();
+                    assert_ne!(previous_id, identity(&replaced).unwrap());
+                    drop(replaced);
+                    replacement.as_path()
+                }
+                "reparse" => {
+                    // A junction needs no symlink privilege and only targets owned temp.
+                    let status = std::process::Command::new("cmd")
+                        .args(["/c", "mklink", "/J"])
+                        .arg(&replacement)
+                        .arg(d.path())
+                        .output()
+                        .unwrap();
+                    assert!(status.status.success());
+                    replacement.as_path()
+                }
+                _ => d.path(),
+            };
+            let mut calls = Vec::new();
+            let result = (|| -> Result<(), OpenError> {
+                let mut s = private_fixture(path, policy, |_| {
+                    if case == "untrusted" {
+                        Err(Error::Permissions)
+                    } else {
+                        Ok(())
+                    }
+                })?;
+                calls.push("store");
+                let mut right = CheckedRight {
+                    callback: || (),
+                    calls: vec![],
+                };
+                if uninstall {
+                    uninstall_locked(
+                        super::super::owner_scm::fixture_deregistered(),
+                        &mut s,
+                        &mut right,
+                    )?;
+                } else {
+                    owner_transactions::recover(&mut s, &mut right)?;
+                }
+                Ok(())
+            })();
+            if case == "missing" {
+                assert!(matches!(result, Err(OpenError::Store(Failure::Io))));
+            } else {
+                assert!(matches!(result, Err(OpenError::Layout(Error::Permissions))));
+            }
+            assert!(calls.is_empty());
+            assert_eq!(
+                std::fs::read(d.path().join("arxd.json.staging")).unwrap(),
+                b"sentinel"
+            );
+            if case == "reparse" {
+                std::fs::remove_dir(&replacement).unwrap();
+            }
+        }
+    }
+}
+
+// Small lexer for this Rust source: comments and all quoted literals are
+// discarded before balanced item/call inspection. No source substring matches.
+fn code_tokens(source: &str) -> Vec<String> {
+    let b = source.as_bytes();
+    let (mut i, mut out) = (0, Vec::new());
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i..].starts_with(b"/*") {
+            i += 2;
+            let mut depth = 1;
+            while depth > 0 {
+                assert!(i < b.len());
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Raw strings, including byte raw strings.
+        let raw = if b[i..].starts_with(b"br") {
+            i + 2
+        } else if b[i] == b'r' {
+            i + 1
+        } else {
+            i
+        };
+        let mut quote = raw;
+        while quote < b.len() && b[quote] == b'#' {
+            quote += 1;
+        }
+        if raw != i && quote < b.len() && b[quote] == b'"' {
+            let hashes = quote - raw;
+            i = quote + 1;
+            loop {
+                assert!(i < b.len());
+                if b[i] == b'"'
+                    && b.get(i + 1..i + 1 + hashes)
+                        .is_some_and(|h| h.iter().all(|c| *c == b'#'))
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        // Character literals (leave lifetime identifiers as code).
+        if b[i] == 39 && (b.get(i + 2) == Some(&39) || b.get(i + 1) == Some(&92)) {
+            i += 1;
+            while i < b.len() {
+                if b[i] == 92 {
+                    i += 2;
+                } else if b[i] == 39 {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        let start = i;
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        out.push(source[start..i].to_owned());
+    }
+    out
+}
+fn balanced(tokens: &[String], start: usize, left: &str, right: &str) -> usize {
+    assert_eq!(tokens[start], left);
+    let mut depth = 0;
+    for (i, token) in tokens.iter().enumerate().skip(start) {
+        if token == left {
+            depth += 1;
+        }
+        if token == right {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+    }
+    panic!("unbalanced source")
+}
+fn function_body<'a>(tokens: &'a [String], name: &str) -> &'a [String] {
+    let indices: Vec<_> = tokens
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[0] == "fn" && w[1] == name)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(indices.len(), 1, "unique function {name}");
+    let start = indices[0] + tokens[indices[0]..].iter().position(|t| t == "{").unwrap();
+    &tokens[start + 1..balanced(tokens, start, "{", "}")]
+}
+fn sequence(tokens: &[String], source: &str) -> usize {
+    let expected = code_tokens(source);
+    let hits: Vec<_> = tokens
+        .windows(expected.len())
+        .enumerate()
+        .filter(|(_, w)| *w == expected)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "unique code sequence: {source}");
+    hits[0]
+}
+#[test]
+fn s1_production_private_pin_calls_are_bound_before_privilege_and_lock() {
+    let tokens = code_tokens(include_str!("owner_windows.rs"));
+    let calls = tokens
+        .windows(2)
+        .enumerate()
+        .filter(|(i, w)| {
+            w[0] == "pin_private_dirs" && w[1] == "(" && (*i == 0 || tokens[*i - 1] != "fn")
+        })
+        .count();
+    assert_eq!(calls, 2);
+    let implementation = sequence(&tokens, "impl WindowsOwnerSession {");
+    assert!(matches!(tokens[implementation - 1].as_str(), "}" | ";"));
+    let end = balanced(&tokens, implementation + 2, "{", "}");
+    for name in ["open", "uninstall"] {
+        let at = sequence(&tokens, &format!("pub fn {name} ("));
+        assert!(implementation < at && at < end);
+        assert!(matches!(tokens[at - 1].as_str(), "{" | "}"));
+        let prefix = &tokens[implementation + 3..at];
+        assert_eq!(
+            prefix.iter().filter(|t| *t == "{").count(),
+            prefix.iter().filter(|t| *t == "}").count()
+        );
+        let body = function_body(&tokens, name);
+        let policy = sequence(body, "let policy = ProtectionPolicy::production();");
+        let pin = sequence(
+            body,
+            "pins.extend(pin_private_dirs(layout.private_dirs(), &policy, layout::check_windows_ancestor,)?);",
+        );
+        let restore = sequence(body, "enable_restore()?");
+        let lock = sequence(body, "let lock = optional(");
+        assert!(policy < pin && pin < restore && restore < lock);
+        let store = sequence(
+            body,
+            "WindowsOwnerStore::with_lock(root, layout, policy, pins, lock)?",
+        );
+        assert!(lock < store, "private pins must reach the locked store");
+        // A conditional/test-only/nested call cannot satisfy the production binding.
+        assert_eq!(
+            body[..pin].iter().filter(|t| *t == "{").count(),
+            body[..pin].iter().filter(|t| *t == "}").count()
+        );
+        assert!(!body[..restore].iter().any(|t| t == "cfg" || t == "return"));
+    }
+    assert!(!tokens.windows(2).any(|w| w == ["fn", "parts"]));
+    assert_eq!(
+        tokens
+            .windows(2)
+            .filter(|w| w[0] == "uninstall_right" && w[1] == "(")
+            .count(),
+        1
+    );
+    sequence(
+        function_body(&tokens, "uninstall_locked"),
+        "owner_transactions::recover(store, right)?; owner_transactions::uninstall_right(store, right)",
+    );
+    // Struct fields drop in declaration order. Staging and pins precede lock.
+    let start = sequence(&tokens, "struct WindowsOwnerStore {") + 3;
+    let fields = &tokens[start..balanced(&tokens, start - 1, "{", "}")];
+    assert!(sequence(fields, "staged:") < sequence(fields, "_pins:"));
+    assert!(sequence(fields, "_pins:") < sequence(fields, "_lock:"));
+    assert_eq!(fields.last().unwrap(), ",");
+    assert_eq!(&fields[fields.len() - 4..], code_tokens("_lock: File,"));
+    for name in ["WindowsOwnerStore", "WindowsBatchRight"] {
+        let at = sequence(&tokens, &format!("struct {name} {{"));
+        assert_ne!(tokens[at.saturating_sub(1)], "pub");
+    }
+}
+#[test]
+fn s1_lexer_ignores_decoy_comments_and_literals() {
+    assert_eq!(
+        code_tokens("/* nested /* fn x() {} */ */ \"fn x() {}\" r#\"fn x() {}\"# fn actual() {}"),
+        code_tokens("fn actual() {}")
+    );
+}
+
+#[test]
+fn overlapping_private_chains_allow_publication_and_pin_directories() {
+    let (fixture, _) = fixture();
+    let config = fixture.path().join("config");
+    let policy = prepare(&config);
+    let mut ids = Vec::new();
+    for path in [fixture.path(), config.as_path()] {
+        let file = raw_open(
+            path,
+            READ_CONTROL | FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+            None,
+        )
+        .unwrap();
+        ids.push(identity(&file).unwrap());
+    }
+    let mut pins =
+        pin_private_dirs([fixture.path(), config.as_path()], &policy, |_| Ok(())).unwrap();
+    // Keep every pin inside the owned scope, including the root in both roles.
+    // Shared temp ancestors are not fixture authority and must not fence peers.
+    pins.retain(|file| ids.contains(&identity(file).unwrap()));
+    assert_eq!(pins.len(), 3);
+    let mut store = WindowsOwnerStore::locked(
+        config.clone(),
+        Layout::for_test(Platform::Windows),
+        policy,
+        pins,
+    )
+    .unwrap();
+    store.replace_record(None, &record()).unwrap();
+    assert_eq!(
+        store.record().unwrap().unwrap().0.encode().unwrap(),
+        record().encode().unwrap()
+    );
+    let staged = store
+        .stage("arxd.json", b"fixed-config-bytes", None, 100)
+        .unwrap();
+    store.publish(staged).unwrap();
+    assert!(std::fs::read(config.join("arxd.json")).unwrap() == b"fixed-config-bytes");
+    let moved = fixture.path().join("moved-config");
+    assert!(std::fs::rename(&config, &moved).is_err());
+    drop(store);
+    assert!(std::fs::rename(&config, &moved).is_ok());
+    assert!(std::fs::rename(&moved, &config).is_ok());
+}
+
+#[test]
+fn shared_walk_preserves_binary_and_private_structural_error_layers() {
+    let (d, policy) = fixture();
+    let file = d.path().join("not-a-directory");
+    std::fs::write(&file, b"fixture").unwrap();
+    let raw = walk_chain(&file, Policy::PrivateDirectory, &|_| Ok(()), &|_| Ok(()));
+    assert!(matches!(
+        raw,
+        Err(OpenError::Store(Failure::RecoveryRequired))
+    ));
+    let private = pin_private_dirs([&file], &policy, |_| Ok(()));
+    assert!(matches!(
+        private,
+        Err(OpenError::Layout(Error::Permissions))
+    ));
 }
