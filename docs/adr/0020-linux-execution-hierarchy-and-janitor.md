@@ -1,5 +1,20 @@
 # 0020: Linux execution hierarchy, janitor, startup discovery and rights checks
 
+Status: **accepted inactive staged contract**, coordinator OpenAI /
+gpt-6.1-sol / medium, 2026-11-12. This records the design disposition only.
+The original Opus proposal and correction 1 retain independent Sol reviews;
+Sol correction 2 `07475b8` passed the independent Opus check `f08a510`.
+[Final recheck](../reviews/0020-correction2-opus-recheck.md) closes P2/P6/P7.
+The advisory-only follow-up clarifies existing errno ordering, splits T20
+across E6/E7, names non-test Runner construction pins and shares W3e's seam.
+This publication delta still requires exact-head independent review and all
+required checks. No implementation starts until this contract PR and Stage C
+(PR53) / Stage D (PR55) merge through all gates. No privileged operation or
+activation is authorized. M2 remains incomplete and native paths remain
+**unverified on real hardware**.
+
+## Historical proposal and correction-1 checkpoint
+
 Status: **proposed, correction 1 of 3** (Anthropic / claude-opus-5-5 / high,
 design sub-agent, 2026-11-12). Not accepted. The original proposal
 (`e3928f5`, retained as `54032bf`) received an independent Sol high review
@@ -125,7 +140,9 @@ packaging changes, the Stage F experiment, Stage G activation and
   plumbing through `Runner::run_core -> unix::run -> Group::create`
   (Linux-gated where needed), plus the cgroup cleanup signal (D6).
   `exec/unix.rs` keeps its behavioral order, cancellation checks, fences,
-  legacy/phased results and original errno capture before cleanup unchanged.
+  legacy/phased results and each branch's existing errno-read/cleanup order
+  unchanged. In particular, the current failed-openat branch reads errno
+  after unlinkat; A5 does not silently correct that existing behavior.
 
 ### D2. Trust anchors (all checked before any write)
 
@@ -199,7 +216,7 @@ keeps the unit's internal node empty, so S5 cannot meet resident processes.
 
 ### D4. Janitor
 
-The janitor runs only inside S7, once per process, before `Ready`. At that
+The janitor runs only inside S7, once per immutable admission domain, before `Ready`. At that
 point this process has created no leaf, so everything under `runs/` is a
 leftover of an earlier instance. The trust boundary is the verified,
 exclusive `runs/` subtree, not the leaf-name grammar.
@@ -451,8 +468,8 @@ residue.
 - **Tool cache.** Only an outcome of `succeeded` (row N) updates it. It holds
   the response's `tools`, the response's `observed_identity` (ADR 0017 rule
   5: built from the redacted `Metadata`, never from `Evidence`) and
-  `tools_observed_at`. Ordering: the caller takes a process-local monotone
-  ticket (an `AtomicU64`) and a wall-clock millisecond timestamp immediately
+  `tools_observed_at`. Ordering: the caller takes a domain-local monotone
+  ticket (an `AtomicU64` alongside the tool cache on `Activity`) and a wall-clock millisecond timestamp immediately
   before the start helper. Under the cache mutex an update replaces the
   whole value only if its ticket is greater than the cached ticket, so a
   slower, earlier-started discovery never overwrites a later one.

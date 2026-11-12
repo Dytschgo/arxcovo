@@ -1,5 +1,13 @@
 # Brief: Linux execution hierarchy, janitor, startup discovery and rights (ADR 0020)
 
+Status: **accepted inactive staged contract**; see ADR 0020's current
+coordinator disposition. The historical checkpoint below records the earlier
+proposal, not the current acceptance state. Tests here remain requirements,
+not evidence. Implementation waits for this contract PR and Stage C/D to
+merge with independent review and all required gates.
+
+## Historical proposal and correction-1 checkpoint
+
 Status: **proposal, correction 1 of 3** (Anthropic / claude-opus-5-5 / high,
 design sub-agent, 2026-11-12, correction base `d44035d`, code identical to
 `fdea1c6`). It is the implementation contract for
@@ -13,9 +21,10 @@ evidence of this plan.
 
 ## Gates before any slice starts
 
-1. A fresh independent Sol high recheck accepts ADR 0020 and this brief. If
-   Sol is limited, the fallback is grok-4.7 high. Opus authored this, so Opus
-   cannot review it.
+1. The inactive contract publication PR has exact-head independent review,
+   all required checks and coordinator merge. Original Opus architecture and
+   correction 1 retain Sol high review; Sol correction 2 retains Opus high
+   review. Reviewer fallback on provider limits remains grok-4.7 high.
 2. ADR 0019 stage C (PR53) and stage D (PR55) are merged with all required
    gates. Both are unmerged at `d44035d`. Slices E4–E7 change their code.
 3. No slice may activate anything. Production stays `MechanismUnavailable`
@@ -372,8 +381,8 @@ hard-coded `true` (S11).
 - Pass only the private flag clone through
   `Runner::run_core -> unix::run -> Group::create`, Linux-gated as needed.
   No static or config-carried flag. Preserve all behavioral ordering,
-  cancellation/fence checks, legacy/phased results and original errno capture
-  before create-path cleanup. Include `exec/unix.rs` in this slice's manifest.
+  cancellation/fence checks, legacy/phased results and each branch's existing
+  errno-read/cleanup order (including failed-openat reading after unlinkat). Include `exec/unix.rs` in this slice's manifest.
 - `Runner` owns `residue: Arc<AtomicBool>` and exposes
   `cleanup_residue(&self) -> bool` (acquire). `Group::create` takes a clone.
   One private helper `release_leaf(parent, name, residue)` does the
@@ -464,17 +473,16 @@ Tests, through real `dispatch` with a counting fake runner port:
   row E; the six are refusals.
 - **T20 single domain / no replacement:** construct the test-only wiring
   domain once for an owned subtree. Clone two bridge handles; latch residue
-  via one and require zero runner calls through the other, including startup
-  discovery. Both share the same slot counter, readiness and ticket allocator
+  via one and require zero runner calls through the other. Both share the
+  same slot counter and readiness
   (identity comparisons use boolean assertions only). Dropping/recreating a
   bridge handle from the retained domain does not clear the latch or allocate
   another runner. The factory's constructor is private to the one wiring
   owner; there are no runner/domain replace, reset, rebind or second-runner
-  attach methods. Visibility/source pins cover every wiring construction
-  site and forbid a second domain constructor call or fresh runner in bridge
-  handle creation. Independent-domain R3 uses distinct owned subtrees only.
+  attach methods. E7 extends this test with startup discovery, ticket allocation and wiring
+  construction pins. No new runner is allocated by bridge-handle creation. Independent-domain R3 uses distinct owned subtrees only.
   A mutation rebuilding a runner/readiness on handle creation must fail the
-  shared-latch test; a second factory call in service wiring fails the pin.
+  shared-latch test; E7 pins forbid a second factory call in service wiring.
 - **T9 (extended)** Production selection stays inert (see E7 pins).
 
 Mutations: gate removed, or readiness checked only in preflight (T18);
@@ -506,6 +514,13 @@ inside `body` (before slot release), which the D6 bound requires.
 
 Tests:
 
+- **T20b wiring extension:** startup discovery and both cloned execution
+  handles use E6 T20's same domain. The ticket allocator is stored alongside
+  the cache on `Activity` and shared by all discoveries. Non-test
+  `exec::Runner::new` call sites must remain absent while production is
+  inactive. Scan those calls explicitly, plus every wiring domain constructor
+  site; bridge-handle creation cannot construct a runner or second domain.
+  Future activation must retain one domain per subtree until restart.
 - **W1 order:** the log shows setup steps, then Ready, then the row insert,
   then the port call.
 - **W2** A setup failure writes zero daemon rows and makes zero port calls.
@@ -518,7 +533,8 @@ Tests:
   port calls.
 - **W3d** Shutdown after the row insert, before dispatch: the daemon row ends
   as the existing refused/`shutdown` row, zero port calls.
-- **W3e** Hold the spawned worker immediately before its final
+- **W3e** Reuse E6/T18's single executor test barrier seam. Hold the
+  spawned worker immediately before its final
   shutdown/admission check, request shutdown, then release the barrier:
   refused `stopping`, zero port calls. Drain joins the sequence handle and
   leaves the executor set empty. A separate case holds a worker after it
