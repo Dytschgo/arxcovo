@@ -2,6 +2,13 @@ use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    if args.first().is_some_and(|arg| {
+        use std::os::unix::ffi::OsStrExt;
+        arg.as_bytes().starts_with(b"exec-child") || arg.as_bytes().starts_with(b"tool-probe")
+    }) {
+        std::process::exit(arxd::unix_shim::entry(&args));
+    }
     if args.first().is_some_and(|arg| arg == "service") {
         let code = if args.len() == 2 && args[1] == "run" {
             arxd::service::run()

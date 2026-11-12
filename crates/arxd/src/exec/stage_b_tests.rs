@@ -323,6 +323,9 @@ fn tokens(source: &str) -> Vec<String> {
     out
 }
 fn scan(source: &str) -> Result<Vec<(String, String)>, &'static str> {
+    scan_with_hook(source, false)
+}
+fn scan_with_hook(source: &str, shim: bool) -> Result<Vec<(String, String)>, &'static str> {
     let mut t = tokens(source);
     let boundary = tokens("#[cfg(test)] mod tests {");
     let hits: Vec<_> = t
@@ -351,17 +354,29 @@ fn scan(source: &str) -> Result<Vec<(String, String)>, &'static str> {
         }
         t.truncate(start);
     }
+    let hooks = t.iter().filter(|v| *v == "set_hook").count();
+    if hooks != usize::from(shim) {
+        return Err("hook inventory");
+    }
     let mut inventory = Vec::new();
     for (i, token) in t.iter().enumerate() {
-        if ["panic_any", "resume_unwind", "take_hook", "set_hook"].contains(&token.as_str()) {
+        if ["panic_any", "resume_unwind", "take_hook"].contains(&token.as_str()) {
             return Err("forbidden diagnostic");
         }
-        if ["expect", "unwrap", "unwrap_err", "expect_err"].contains(&token.as_str())
-            && i > 0
-            && t[i - 1] == "."
-            && t.get(i + 1).is_some_and(|v| v == "(")
-        {
+        if ["expect", "unwrap", "unwrap_err", "expect_err"].contains(&token.as_str()) {
             return Err("fallible payload");
+        }
+        if token == "type" {
+            let end = t[i..]
+                .iter()
+                .position(|v| v == ";")
+                .map_or(t.len(), |n| i + n);
+            if t[i..end].iter().any(|v| v == "RunFailure") {
+                return Err("failure alias");
+            }
+        }
+        if ["dbg", "print", "println", "eprint", "eprintln", "writeln"].contains(&token.as_str()) {
+            return Err("diagnostic name");
         }
         if token == "impl" {
             let end = t[i..]
@@ -454,8 +469,11 @@ fn inventory() -> Vec<(&'static str, String, String)> {
         ("unix", include_str!("unix.rs")),
         ("cgroup", include_str!("cgroup.rs")),
         ("output", include_str!("output.rs")),
+        ("shim", include_str!("../unix_shim.rs")),
     ] {
-        for (mac, literal) in scan(source).expect("production payload scan") {
+        for (mac, literal) in
+            scan_with_hook(source, file == "shim").expect("production payload scan")
+        {
             all.push((file, mac, literal));
         }
     }
@@ -489,6 +507,12 @@ fn p_scan_negative_controls_and_no_blind_test_skip() {
         "println!(x)",
         "set_hook(x)",
         "take_hook()",
+        "Result::unwrap(r)",
+        ".map(Option::unwrap)",
+        "r.r#unwrap()",
+        "use std::eprintln as say; say!(x)",
+        "type F = RunFailure; impl From<E> for F {}",
+        "writeln!(std::io::stderr(), x)",
         "impl From<E> for RunFailure {}",
         "#[cfg(test)] mod tests {} fn production() {x.unwrap();}",
     ] {
@@ -501,4 +525,12 @@ fn p_scan_negative_controls_and_no_blind_test_skip() {
     );
     assert_eq!(scan("unreachable!(\"fixed\");").unwrap().len(), 1);
     assert_eq!(scan("assert!(f(a, b), \"fixed\");").unwrap().len(), 1);
+}
+
+#[test]
+fn p_scan_hook_site_is_exactly_one_and_shim_only() {
+    assert!(scan_with_hook("fn f() {}", true).is_err());
+    assert!(scan_with_hook("set_hook(x); set_hook(y);", true).is_err());
+    assert!(scan_with_hook("set_hook(x);", true).is_ok());
+    assert!(scan_with_hook("set_hook(x);", false).is_err());
 }
