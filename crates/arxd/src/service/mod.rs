@@ -8,6 +8,7 @@ pub mod owner_plan;
 pub mod owner_query;
 pub mod owner_unix;
 
+pub mod executor;
 pub mod owner_transactions;
 pub mod preflight;
 

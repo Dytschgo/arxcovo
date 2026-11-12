@@ -54,7 +54,7 @@ impl ServerHandler for Inventory {
                         .clone(),
                     ),
                 ),
-                Tool::new("run_command", "Run a configured tool in the explicitly enabled development mode", Arc::new(json!({"type":"object","required":["tool"],"properties":{"tool":{"type":"string","enum":crate::development::TOOLS},"args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},"cwd":{"type":"string","maxLength":4096},"timeout_s":{"type":"integer","minimum":1,"maximum":3600},"output_bytes":{"type":"integer","minimum":2,"maximum":8192}},"additionalProperties":false}).as_object().unwrap().clone())),
+                Tool::new("run_command", if self.activity.dedicated.is_some() { "Run a bounded command as the configured dedicated account" } else { "Run a configured tool in the explicitly enabled development mode" }, Arc::new(if self.activity.dedicated.is_some() { crate::service::executor::schema() } else { json!({"type":"object","required":["tool"],"properties":{"tool":{"type":"string","enum":crate::development::TOOLS},"args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},"cwd":{"type":"string","maxLength":4096},"timeout_s":{"type":"integer","minimum":1,"maximum":3600},"output_bytes":{"type":"integer","minimum":2,"maximum":8192}},"additionalProperties":false}) }.as_object().unwrap().clone())),
                 Tool::new("discover_tools", "Probe fixed tool names using the configured executor", Arc::new(json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone())),
             ],
             ..Default::default()
@@ -83,13 +83,57 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
-        let id = if self.execution.is_some() {
+        let id = if self.activity.dedicated.is_some()
+            && matches!(label, "run_command" | "discover_tools")
+        {
+            self.activity.start_dedicated(&principal.0, label)
+        } else if self.execution.is_some() && self.activity.dedicated.is_none() {
             self.activity.start_development(&principal.0, label)
         } else {
             self.activity.start(&principal.0, label)
         }
         .map_err(|_| unavailable())?;
         let args = request.arguments.unwrap_or_default();
+        if let Some(executor) = &self.activity.dedicated
+            && (label == "run_command" || label == "discover_tools")
+        {
+            // Service authority requires an immutable local connection principal.
+            let parsed = if label == "run_command" && !args.values().any(serde_json::Value::is_null)
+            {
+                serde_json::from_value::<crate::service::executor::Request>(args.clone().into())
+                    .ok()
+                    .filter(|r| r.validate())
+            } else {
+                None
+            };
+            if self.principal.is_none()
+                || (label == "run_command" && parsed.is_none())
+                || (label == "discover_tools" && !args.is_empty())
+            {
+                self.activity
+                    .finish_typed(
+                        id,
+                        crate::store::Outcome::Rejected,
+                        &crate::store::Metadata {
+                            reason: Some(crate::store::Reason::InvalidArguments),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|_| unavailable())?;
+                return Err(ErrorData::invalid_params(
+                    "invalid execution arguments",
+                    None,
+                ));
+            }
+            let work = executor.dispatch(parsed, self.activity.clone(), id);
+            let result = tokio::select! {
+                    result = work => result,
+                    _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
+                }.map_err(|e| ErrorData::internal_error(e.reason.as_str(), e.execution_reason.map(|r| json!({"activity_id":id,"outcome":"refused","reason":e.reason.as_str(),"execution_reason":r.as_str()}))))?;
+            return Ok(
+                CallToolResult::success(vec![ContentBlock::text(result.to_string())]).into(),
+            );
+        }
         if label == "run_command" || label == "discover_tools" {
             use crate::{
                 development as dev,
@@ -198,14 +242,23 @@ impl ServerHandler for Inventory {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         let mut value = json!({"hosts":[{"host_id":host_id,"os":std::env::consts::OS,"arch":sysinfo::System::cpu_arch(),"logical_cpus":system.cpus().len(),"ram_bytes":system.total_memory(),"disk_total_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.total_space())),"disk_available_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.available_space())),"execution_available":false,"execution_unavailable_reason":"dedicated account backend not implemented","tool_discovery":"unavailable until dedicated account backend exists"}]});
         let execution = self
-            .execution
+            .activity
+            .dedicated
             .as_ref()
             .map(|e| e.capability())
-            .unwrap_or_else(|| json!({"available":false,"reason":self.activity.service_reason().map(|r| r.as_str()).unwrap_or("not_configured")}));
+            .or_else(|| self.execution.as_ref().map(|e| e.capability()))
+            .unwrap_or_else(|| json!({"available":false,"reason":"not_configured"}));
         value["hosts"][0]["execution_available"] = execution["available"].clone();
         value["hosts"][0]["execution_unavailable_reason"] = execution["reason"].clone();
         value["hosts"][0]["execution"] = execution;
-        value["hosts"][0]["tool_discovery"] = json!(if self.execution.is_some() {
+        if self.activity.dedicated.is_some() {
+            value["hosts"][0]["last_observed_identity"] = serde_json::Value::Null;
+            value["hosts"][0]["tools"] = json!([]);
+            value["hosts"][0]["tools_observed_at"] = serde_json::Value::Null;
+        }
+        value["hosts"][0]["tool_discovery"] = json!(if self.activity.dedicated.is_some() {
+            "unavailable"
+        } else if self.execution.is_some() {
             "discover_tools"
         } else {
             "not_configured"

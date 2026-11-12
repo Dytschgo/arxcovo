@@ -460,3 +460,272 @@ async fn dispatch_dropped_before_first_poll_still_completes_audit() {
         .unwrap();
     assert_eq!(facts, (None, None));
 }
+
+/// Dedicated fake is visibly synthetic; this proves IPC/audit integration only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
+    use std::sync::atomic::Ordering;
+    let state = private_dir();
+    let (execution, calls) = crate::service::executor::tests::fake(false, true);
+    let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
+    store.dedicated = Some(execution.clone());
+    let activity = Arc::new(store);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let agent = |principal: &str, token: &str| crate::config::Agent {
+        principal: principal.into(),
+        token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+    };
+    let alpha = "a".repeat(64);
+    let beta = "b".repeat(64);
+    let cfg = Arc::new(crate::config::Config {
+        execution: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![agent("alpha", &alpha), agent("beta", &beta)],
+    });
+    let stop = crate::service::Shutdown::default();
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = tokio::spawn(listener.run_service(cfg, activity.clone(), stop.clone()));
+    let a = connect(&address, &alpha).await;
+    let b = connect(&address, &beta).await;
+    let tools = a.list_tools(None).await.unwrap().tools;
+    let schema = &tools
+        .iter()
+        .find(|t| t.name == "run_command")
+        .unwrap()
+        .input_schema;
+    assert!(schema["properties"].get("executable").is_some());
+    assert_eq!(schema["additionalProperties"], false);
+    for key in ["mode", "principal", "identity", "executor", "config"] {
+        let mut v = json!({"tool":"cargo"});
+        v[key] = json!("forbidden");
+        assert!(
+            call(&a, "run_command", v)
+                .await
+                .unwrap_err()
+                .contains("invalid execution arguments")
+        );
+    }
+    for v in [
+        json!({"tool":"cargo","executable":r"C:\synthetic\tool.exe"}),
+        json!({"executable":"relative"}),
+        json!({"tool":"cargo","cwd":"../escape"}),
+        json!({"tool":"cargo","tool_typo":"cargo"}),
+        json!({"tool":null}),
+    ] {
+        assert!(call(&a, "run_command", v).await.is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let conn = db(state.path());
+    conn.execute_batch("PRAGMA journal_mode=TRUNCATE;").unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_start BEFORE INSERT ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+    assert!(
+        call(&a, "run_command", json!({"tool":"cargo"}))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    conn.execute_batch("DROP TRIGGER fail_start").unwrap();
+    let result = call(
+        &a,
+        "run_command",
+        json!({"executable":r"C:\synthetic\tool.exe","args":["private-argv"],"cwd":"private-cwd"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["test_outcome"], "FakeForTest");
+    assert_eq!(result["acceptance"], false);
+    assert_eq!(result["metadata"]["observed_id"], Value::Null);
+    let id = result["activity_id"].as_i64().unwrap();
+    let alpha_rows = rows(&a).await;
+    assert!(
+        alpha_rows
+            .iter()
+            .any(|r| r["id"] == id && r["program"] == "path")
+    );
+    assert!(rows(&b).await.iter().all(|r| r["id"] != id));
+    conn.execute_batch("CREATE TRIGGER fail_finish BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'synthetic'); END;").unwrap();
+    assert!(
+        call(&a, "run_command", json!({"tool":"cargo"}))
+            .await
+            .unwrap_err()
+            .contains("storage_failed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    conn.execute_batch("DROP TRIGGER fail_finish").unwrap();
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+    stop.cancel();
+    server.await.unwrap().unwrap();
+    assert!(execution.drain().await.is_err());
+    drop(conn);
+    drop(activity);
+    let bytes = std::fs::read(state.path().join("activity.sqlite3")).unwrap();
+    for marker in [
+        "private-argv",
+        "private-cwd",
+        r"C:\synthetic\tool.exe",
+        "FakeForTest",
+    ] {
+        assert!(!bytes.windows(marker.len()).any(|w| w == marker.as_bytes()));
+    }
+}
+
+// Owned only by this fixture. Dropping the sender releases both preflight and
+// the backend even when a cancellation assertion panics (including mutations).
+struct CancellationProbe {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    preflight_entered: tokio::sync::Notify,
+    backend_entered: tokio::sync::Notify,
+}
+impl crate::service::executor::Executor for CancellationProbe {
+    fn preflight(&self) -> Result<(), crate::service::preflight::ExecutionUnavailable> {
+        self.preflight_entered.notify_one();
+        let _ = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3));
+        Ok(())
+    }
+    fn run(
+        &self,
+        _: Option<&crate::service::executor::Request>,
+        cancel: &crate::development::Cancellation,
+        shutdown: &crate::development::Cancellation,
+    ) -> crate::service::executor::Report {
+        self.backend_entered.notify_one();
+        while !cancel.is_cancelled() && !shutdown.is_cancelled() {
+            // Test failure drops the sender; no worker survives a broken guard.
+            if matches!(
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(2)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ) {
+                break;
+            }
+        }
+        crate::service::executor::Report::FakeForTest {
+            stop: if shutdown.is_cancelled() {
+                crate::store::StopReason::Shutdown
+            } else if cancel.is_cancelled() {
+                crate::store::StopReason::Cancelled
+            } else {
+                crate::store::StopReason::Exited
+            },
+            cleanup: true,
+        }
+    }
+}
+async fn cancellation_stage<T>(stage: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), future)
+        .await
+        .unwrap_or_else(|_| panic!("cancellation stage timed out: {stage}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_sdk_cancellation_propagates_without_shutdown() {
+    dedicated_sdk_cancellation(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_fake_sdk_cancellation_explicit_without_shutdown() {
+    dedicated_sdk_cancellation(false).await;
+}
+
+async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
+    let state = private_dir();
+    let (release, receive) = std::sync::mpsc::channel();
+    let probe = Arc::new(CancellationProbe {
+        release: std::sync::Mutex::new(receive),
+        preflight_entered: tokio::sync::Notify::new(),
+        backend_entered: tokio::sync::Notify::new(),
+    });
+    let execution = crate::service::executor::tests::backend_fixture(probe.clone());
+    let mut store = crate::store::Activity::open_service_fixture(state.path()).unwrap();
+    store.dedicated = Some(execution.clone());
+    let activity = Arc::new(store);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let token = "a".repeat(64);
+    let cfg = Arc::new(crate::config::Config {
+        execution: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![crate::config::Agent {
+            principal: "alpha".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+    });
+    let stop = crate::service::Shutdown::default();
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = tokio::spawn(listener.run_service(cfg, activity, stop.clone()));
+    let a = connect(&address, &token).await;
+    let mut options = PeerRequestOptions::no_options();
+    options.timeout = Some(Duration::from_millis(200));
+    let handle = a
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params(
+                "run_command",
+                json!({"tool":"cargo"}),
+            ))),
+            options,
+        )
+        .await
+        .unwrap();
+    cancellation_stage("preflight entry", probe.preflight_entered.notified()).await;
+    // Deliberately hold the real dispatch beyond the old 200ms startup budget.
+    // rmcp 3.9 starts its response timer when await_response is polled, so keep
+    // the handle unpolled until backend entry. This retains automatic timeout
+    // coverage without requiring Windows to finish preflight inside 200ms.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    release.send(()).expect("preflight release");
+    cancellation_stage("backend entry", probe.backend_entered.notified()).await;
+    if automatic_timeout {
+        let response = cancellation_stage("SDK automatic timeout", handle.await_response()).await;
+        assert!(
+            matches!(response, Err(rmcp::ServiceError::Timeout { .. })),
+            "stage: expected SDK timeout"
+        );
+    } else {
+        cancellation_stage(
+            "SDK explicit cancellation",
+            handle.cancel(Some("fixture cancellation".into())),
+        )
+        .await
+        .unwrap();
+    }
+    let conn = db(state.path());
+    let state = || {
+        conn.query_row::<(String,Option<String>),_,_>("SELECT outcome,stop_reason FROM activity WHERE tool='run_command' ORDER BY id DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    cancellation_stage("durable audit completion without shutdown", async {
+        while state().0 == "started" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        state(),
+        ("failed".into(), Some("cancelled".into())),
+        "stage: durable cancellation before shutdown"
+    );
+    a.cancel().await.unwrap();
+    execution.shutdown();
+    stop.cancel();
+    server.await.unwrap().unwrap();
+    execution.drain().await.unwrap();
+}

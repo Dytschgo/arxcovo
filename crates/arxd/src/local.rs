@@ -1,4 +1,4 @@
-//! Opt-in local inventory transport. No execution or service authority.
+//! Authenticated local transport; executor selection stays internal to startup.
 use anyhow::{Context, Result, bail};
 use rmcp::{ServiceExt, transport::async_rw::AsyncRwTransport};
 use serde::Deserialize;
@@ -194,7 +194,7 @@ async fn run_listener_until(
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
-    // Dedicated execution is absent; all connection tasks are read/audit only.
+    // ServiceApplication cancels and joins dedicated workers after connections stop.
 }
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,

@@ -21,9 +21,15 @@ pub(crate) trait Hooks: Send + Sync + 'static {
     fn store(&self, layout: &Layout) -> Result<Activity, ExitCode>;
     fn bind(&self, layout: &Layout, client: String) -> Result<Listener, ExitCode>;
     fn preflight(&self, layout: &Layout, config: &ServiceConfig) -> ExecutionUnavailable;
+    fn executor(&self, _: &Layout, _: &ServiceConfig) -> Arc<super::executor::Execution> {
+        super::executor::Execution::unavailable()
+    }
 }
 pub(crate) struct Native;
 impl Hooks for Native {
+    fn executor(&self, layout: &Layout, config: &ServiceConfig) -> Arc<super::executor::Execution> {
+        super::executor::Execution::configured(layout.clone(), config.clone())
+    }
     fn load(&self) -> Result<(Layout, ServiceConfig), ExitCode> {
         native::require_service_identity().map_err(category)?;
         let layout = Layout::system().map_err(category)?;
@@ -168,9 +174,12 @@ impl<H: Hooks> Application for ServiceApplication<H> {
     async fn open_store(&mut self) -> Result<(), ExitCode> {
         let hooks = self.hooks.clone();
         let layout = self.layout.clone().ok_or(ExitCode::Layout)?;
-        self.activity = Some(Arc::new(
-            self.blocking.run(move || hooks.store(&layout)).await?,
+        let mut activity = self.blocking.run(move || hooks.store(&layout)).await?;
+        activity.dedicated = Some(self.hooks.executor(
+            self.layout.as_ref().ok_or(ExitCode::Layout)?,
+            self.config.as_ref().ok_or(ExitCode::Config)?,
         ));
+        self.activity = Some(Arc::new(activity));
         Ok(())
     }
     async fn service_start(&mut self) -> Result<(), ExitCode> {
@@ -240,22 +249,36 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         returned.map_err(|_| ExitCode::Endpoint)?
     }
     fn stop_accepting(&mut self) -> Result<(), ExitCode> {
+        if let Some(e) = self.activity.as_ref().and_then(|a| a.dedicated.as_ref()) {
+            e.shutdown();
+        }
         self.stop.cancel();
         self.listener.take();
         Ok(())
     }
     async fn drain(&mut self) -> Result<(), ExitCode> {
+        let mut result = Ok(());
         if let Some(task) = self.serving.as_mut() {
-            task.await.map_err(|_| ExitCode::Endpoint)??;
+            result = task.await.map_err(|_| ExitCode::Endpoint).and_then(|r| r);
         }
         self.serving.take();
+        if let Some(e) = self.activity.as_ref().and_then(|a| a.dedicated.as_ref()) {
+            let drained = e.drain().await.map_err(|_| ExitCode::Store);
+            if result.is_ok() {
+                result = drained;
+            }
+        }
         self.blocking.drain().await;
         if let Some(activity) = self.activity.clone() {
-            self.blocking
+            let pending = self
+                .blocking
                 .run(move || activity.shutdown_pending().map_err(|_| ExitCode::Store))
-                .await?;
+                .await;
+            if result.is_ok() {
+                result = pending;
+            }
         }
-        Ok(())
+        result
     }
     async fn service_stop(&mut self) -> Result<(), ExitCode> {
         self.audit(Lifecycle::Stop).await
