@@ -2,6 +2,16 @@
 
 ## Current state - 2026-11-12
 
+- Milestone 1 accepted; M2 incomplete. Last merged PR52 at `1604db1`. Native/installed/dedicated paths remain **unverified on real hardware**. ExecutionFailed/E_PROTECTION unknown; no fix, waiver or retry.
+- Queue: fresh independent Anthropic Opus 5.5 high security review of the separate read-only diagnostic BEFORE ANY push/CI execution; coordinator may publish only after that review. No hosted execution or publication performed here. All original failure/required gates remain.
+- OpenAI / gpt-6.1-sol / high implemented bounded descriptor-based observation, shared pure-parser dry planning/recheck, closed numeric output and owned-fixture tests at `c7524f6bc3ed4d61a00abbe0d1f0b1179a8aa4de` on prepared base `caf8e3a`, actual-main ancestor `1604db1`. [Evidence/manifest/limits](evidence/ubuntu-mirror-readonly-diagnostic.md). Scope excludes production mitigation changes. Actual prepared branch retained: `t3/ubuntu-mirror-readonly-diagnostic`; requested diag branch already exists and was not overwritten.
+- Local focused suite: 42 tests, 41 passed / 1 Unix-only skipped; whitespace check passed. Owned tree bytes/file-directory metadata unchanged; apply/_apply spies uncalled. Source fences are supplemental, not semantic mutation/network proof; native Unix descriptor/timer behavior remains pending hosted verification. No original runner fixture or structural encoder is claimed.
+- Exact mirror refusal remains UNKNOWN (job131364954122, 23 tests pass, refusal17:33:17; Ubuntu26 revisions20261101.186.1/20261111.82.6). Runtime APT metadata absent; matching public image lookup404 remains prior research only. Dry-plan success would leave publication unresolved.
+- Diagnostic is a separate reviewed run, not performance attempt3; attempt2 remains nonqualifying and attempts are neither consumed nor reset. PR53/54 remain unlabelled/budget-blocked; main906s failed baseline remains authoritative. No performance criteria, OS matrix, limits or gates change.
+- No subagents, GitHub mutations, owner/admin/service/account/SCM/LSA operation, Lab Manager/VM/private state/ignored fixture, installation, production diagnostic/apply or babysitter change. All earlier queue/history retained below.
+
+## Historical checkpoint before read-only diagnostic implementation - 2026-11-12
+
 - Milestone 1 accepted; M2 incomplete. Last merged PR52 at1604db1. Native/installed/dedicated paths remain **unverified on real hardware**; no backend or experiment activation.
 - Queue priority: prepare a separate bounded read-only mirror diagnostic, independently review it before any hosted execution, then capture the unknown refusal predicate. This diagnostic is not performance attempt3 and must not manufacture a passing mitigation. PR53/54 remain unlabelled and budget-blocked; no rerun or threshold relaxation.
 - Performance attempt1 failed its declared200s/141s step criterion; attempt2 head344c406 run43270363385 fails A1/A4 because Ubuntu job131364954122 refused mirror preparation after23 unit tests passed. Both images are Ubuntu26.04.1, revisions20261101.186.1 and20261111.82.6; exact predicate is unknown. [Diagnosis](reviews/ubuntu26-mirror-refusal-diagnosis.md). Main906s first-attempt baseline remains authoritative despite successful capacity retry.
