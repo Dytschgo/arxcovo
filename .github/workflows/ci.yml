@@ -60,10 +60,14 @@ jobs:
       - run: npm test
       - run: npm run build
       - name: Use signed Ubuntu mirror on disposable runner
+        id: ubuntu_mirror
         if: runner.os == 'Linux'
         run: |
           python3 -B -m unittest discover -s tools/ci -p 'test_ubuntu_mirror.py'
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,CI,GITHUB_REPOSITORY /usr/bin/python3 -I -B tools/ci/ubuntu_mirror.py
+      - name: Observe Ubuntu mirror refusal (read only)
+        if: failure() && runner.os == 'Linux' && steps.ubuntu_mirror.outcome == 'failure'
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,CI,GITHUB_REPOSITORY /usr/bin/python3 -I -B tools/ci/observe_ubuntu_mirror.py
       - run: npx playwright install --with-deps chromium
       - run: npm run smoke
       - name: Electron smoke on Linux
