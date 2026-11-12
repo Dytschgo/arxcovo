@@ -2,6 +2,15 @@
 
 ## Current state — 2026-11-12
 
+- Milestone1 accepted; Milestone2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
+- Last merged PR: [#9](https://github.com/Dytschgo/arxcovo/pull/9), `6f18686af7a8498bf887f833f278f43d152867f2`, 05:43:13 UTC, through all five gates.
+- Queue priority: finish #36, #26 and #34 through fresh independent reviews and all required checks. No new feature PRs or bypasses.
+- Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57–05:40:57 UTC,600s. The new main push after #9 is pending, not claimed green.
+- PR26 refresh preserves both parents' provider/evidence rows and published history; only PROGRESS conflicted. Product behavior is unchanged; the inherited #9 policy test correction is already reviewed and merged.
+- No owner-PC administration, old Lab Manager/VM work, native experiment retry or third S4U probe. Historical checkpoints below retain their task-time claims.
+
+## Historical checkpoint before PR9 queue refresh — 2026-11-12
+
 - Milestone 1 is accepted. Milestone 2 remains incomplete; milestones3–6 have no acceptance.
 - Last merged PR: [#38](https://github.com/Dytschgo/arxcovo/pull/38), `441978dd486f5f0299a6968aa4a3104f33996714`, 05:30:55 UTC, through all five required gates.
 - Queue priority: drain existing #36, #9, #26 and #34 with the merged CI fix, independent exact-head reviews and all required checks. No new feature PRs or bypasses.
@@ -10,6 +19,7 @@
 - Reviewed local owner provisioning/report-validation followups remain separate, unpublished and unactivated. Installed/native/dedicated M2 remains **unverified on real hardware**. No third S4U probe, owner-PC administration, old Lab Manager or VM work.
 
 ## PR26 refresh after merged CI unblock — 2026-11-12
+## PR9 refresh after merged CI unblock — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium coordinator merged actual main441978d without rewriting published history. No product source change is introduced by the refresh; PR-specific code remains as independently reviewed at its previous head. Main's reviewed helper/concurrency/lint correction is inherited intact. Current state is first, with one queue row; all provider/history table rows from both parents are retained.
 - Local verification is scoped to unchanged-source equivalence, the CI helper/Node suites and whitespace. Fresh published-head independent recheck, platform CI and required statuses remain mandatory. No acceptance, measured speedup, native experiment or account/service operation.
@@ -684,6 +694,15 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - The history now contains all 19 completed main push CI runs visible in the
   API through PR28. No policy, workflow, required check or timeout changed.
   This evidence refresh still requires independent review and hosted checks.
+## Preserved policy-test PR9 refresh
+
+- Codex / gpt-6.1-sol, medium refreshed PR9 onto current main without changing
+  its test-only concern. The asynchronous status fixture crosses an event-loop
+  turn and asserts failure publication completed before evaluation rejects.
+- All ten budget evaluator tests passed. Removing the production await made
+  the strengthened completion assertion fail; production source was restored
+  byte-for-byte. No gate, policy outcome or workflow was changed by this PR.
+  Fresh independent review and hosted checks remain required.
 ## Unix execution integration after Windows test correction
 
 - Codex / gpt-6.1-sol, medium integrated merged PR28 into PR14, retaining both
@@ -1439,6 +1458,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - OpenAI / gpt-6.1-sol / medium integrated the actual #20 squash `64b50e9` into #21 without rewriting published history. The squash tree is identical to reviewed head `3195f5a`; duplicate-history merge conflicts retained the already validated configuration tree. Configuration source, packaging and Cargo/toolchain files remain identical to reviewed `aadfa05`; CI helpers/workflows match merged main. Prior local verification therefore applies: formatting, locked all-target Clippy, 89/89 nextest and 26/26 CI-helper tests passed; artifact checks had three passes and two native Unix skips. No implementation changed in this refresh. Fresh exact-head independent review and required hosted checks remain necessary.
 - #20 merged at 17:31:46 UTC after all five gates passed; its Windows job completed successfully at 17:30:23. Main push CI for the earlier #32 unblock passed in 548 seconds. The new #20 main push is not yet claimed green. No new feature PR was opened, and Current state remains the first section.
 
+## Awaited policy-failure proof queue preparation
+
+- Codex / gpt-6.1-sol, medium prepared existing #9 locally on merged configuration main `2bdcb20`. JavaScript policy and test files remain identical to published `6c2b70c`; the only additional script inherited from main is the service-artifact checker. Both provider tables and task records are preserved and Current state is first. All **18/18 Node script tests** and **26/26 CI-helper tests** passed. No push/new PR, workflow/policy weakening, privileged action or merge. Fresh independent review and hosted gates remain required.
 ## Unix executor queue refresh after configuration merge
 
 - Codex / gpt-6.1-sol, medium prepared existing #14 on actual main `2bdcb20` (#21). Unix executor code, validation driver and ADR 0007 are byte-identical to published `9055ab0`; the combined manifest/library exports retain both executor and merged service foundations. Workflow conflict resolution keeps the pure Unix guards and both merged Linux CI-unblock steps; no original step or gate is removed. Both parent provider tables/evidence are retained and Current state is first.
@@ -1668,6 +1690,11 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol / medium refreshed existing #26 onto actual main `cd464b2` and retained every historical duration row. Added completed first-attempt main push CI evidence from the Actions attempt API: run 43075630346 at `3f7c515` = **571 seconds** (success), run 43077489596 at `4f2b0c7` = **535 seconds** (success), run 43079116241 at `7c150f0` = **532 seconds** (success), run 43082880556 at `f06e9a2` = **578 seconds** (success). The new #35 main run is still pending and is not added as completed.
 - This JSON remains historical evidence, not a budget-policy input. No workflow, timeout, status gate, runtime or DNS behavior changes; no failures or earlier over-budget runs are removed. Independent exact-head review and required checks remain pending.
+## Awaited policy-failure regression refresh
+
+- Codex / gpt-6.1-sol / medium refreshed existing test-only #9 onto actual main `cd464b2`, preserving published history and the awaited policy-failure regression. Only its existing regression test and progress notes distinguish it from main; no workflow/runtime/budget behavior changes. Current state stays first. Focused test evidence and independent re-review remain required before merge.
+
+- Focused verification passed **18/18 Node policy/budget/auto-merge tests** and **26/26 CI-helper tests**. Temporarily removing the failure-publication await made the focused asynchronous regression fail; the production script was restored byte-for-byte. Runtime Rust/workflow files match merged main and were not retested for this test-only refresh.
 ## Early feasibility documentation refresh on service stack
 
 - Codex / gpt-6.1-sol / medium refreshed existing #10 onto actual main `cd464b2`, preserving the earlier proposed research and owner-only setup checklist. ADR0006 remains historical and points to the settled dedicated-service and separate development contracts; no password fallback, new authority or architecture adoption is introduced. Research documents and setup prerequisites do not establish hardware or M2 acceptance. Current state stays first; fresh exact-head independent review and hosted gates remain required.
@@ -1687,6 +1714,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## CI history alignment after Unix owner merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #26 and retained all earlier duration rows. Appended completed first-attempt Actions API records: run 43087250975 at `cd464b2` = **596 seconds** (success), run 43088994955 at `aafaa3c` = **461 seconds** (success). In-progress runs are not transcribed as completed. This is historical evidence only; budget logic, workflows and runtime remain main-identical. No application rerun is claimed for the documentation-only refresh.
+## Policy regression refresh after Unix owner merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #9, retaining only the awaited-publication regression above main. Policy/test script bytes remain identical to verified `234b934`, so its 18-test pass and await-removal mutation evidence apply without a repeat claim. Main runtime and workflows are preserved; fresh independent exact-head review and hosted gates remain required.
 ## Feasibility notes after Unix owner merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #29 main `aafaa3c` into existing #10. The five research/setup documents remain byte-identical to checked `2b935e6`; the inherited ADR0014/0015 contracts do not adopt any M3/M4 research proposal. Current state and both provider histories remain. No hardware or application rerun is claimed for this documentation-only refresh; independent exact-head review and hosted gates remain required.
@@ -1707,6 +1737,9 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - OpenAI / gpt-6.1-sol / high implemented only the reviewed local E1 scope on base `ce30060`, final `ff5a198`. Added guard/session wrappers, proof-gated uninstall and shared private pinning; removed raw parts and public concrete adapters. Reported formatting, locked workspace/all-target Clippy, 20 focused U/N/S tests, 190 normal nextest (two parent-driven direct fixtures) and four pin-call/checker mutations caught. Coordinator has not independently reproduced those checks. E2, publication and activation remain absent; fresh independent Opus review is required before publication/merge.
 
 - Main #14 first-attempt push run 43091130349 completed successfully in **549 seconds**, verified against the Actions attempt API. Appended this as row 30 while preserving the prior 29 rows. The separately failed disposable Linux experiment is not a main-CI timing row. PR36 full review found three latent execution/audit blockers; Sol high is fixing them locally before any re-review or merge. No gate bypass or privileged probe retry.
+## Policy regression alignment with Unix library main
+
+- Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` with published history preserved. The six Node policy/budget/auto-merge source and test files remain byte-identical to verified 234b934; prior 18-test and await-removal mutation evidence applies without another run. Current state is first, with one queue priority; independent exact-head review and hosted gates remain required. No native activation, privileged experiment retry or new feature PR.
 ## Feasibility documentation alignment with Unix library main
 
 - Codex / gpt-6.1-sol / medium incorporated actual #14 main `5b4f6b2` with published history preserved. Five research/setup documents are unchanged from 9193e93 and remain proposed or historical; their runtime and hardware limits are retained. The added Sol report reviews the retained Opus research, not Sol own metadata edits. Current state is first, with one queue priority; independent exact-head review and hosted gates remain required. No native activation, privileged experiment retry or new feature PR.
@@ -1714,3 +1747,6 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## CI evidence after feasibility merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. All 30 timing rows and the separate failed Linux experiment record remain byte-identical to independently reviewed 31dc149. No evidence value, runtime, workflow, timeout or budget-policy change is introduced; earlier API and privacy verification applies. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
+## Policy regression after feasibility merge
+
+- Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. Node policy/budget/auto-merge source and tests remain byte-identical to independently reviewed 23d839e. This parent adds research/setup documentation only; the prior 18-test and await-removal mutation evidence applies without a repeated run. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
