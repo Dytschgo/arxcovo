@@ -165,6 +165,8 @@ def _rewrite_mirror_list_counted(data):
     raw_pattern = rf"https?://(?=.{{1,253}}/){hostname_pattern}/ubuntu/?"
     for line in lines:
         line = line.removesuffix("\r")
+        if re.search(r"[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", line):
+            raise Refusal()
         if not line.strip() or line.lstrip().startswith("#"):
             result.append(line)
             continue

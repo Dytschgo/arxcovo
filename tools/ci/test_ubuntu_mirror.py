@@ -405,6 +405,18 @@ class UbuntuMirrorTests(unittest.TestCase):
         self.assertEqual(len(FALLBACK_MIRRORS), 195)
         self.assertEqual(self.counted(MIRRORS), (FALLBACK_MIRRORS, 0))
 
+    def test_allowlisted_line_separators_refuse_and_crlf_stays_valid(self):
+        for separator in (b"\r", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e",
+                          "\x85".encode(), "\u2028".encode(), "\u2029".encode()):
+            for tag in (b"", b"\tpriority:1"):
+                for uri in (b"https://archiv" + separator + b"e.ubuntu.com/ubuntu",
+                            separator + b"https://archive.ubuntu.com/ubuntu"):
+                    with self.subTest(separator=separator, tagged=bool(tag)):
+                        with self.assertRaises(mirror.Refusal):
+                            mirror.rewrite_mirror_list(uri + tag + b"\n")
+        self.assertEqual(self.counted(MIRRORS.replace(b"\n", b"\r\n")),
+                         (FALLBACK_MIRRORS, 0))
+
     def test_omission_shape_fences(self):
         host = "fixture-unlisted.ubuntu.com"
         tokens = [f"ftp://{host}/ubuntu", f"https://user@{host}/ubuntu",
