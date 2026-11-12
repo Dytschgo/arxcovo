@@ -1,12 +1,59 @@
 # Arxcovo progress
 
-## Current state — 2026-11-11
+## Current state — 2026-11-12
+
+- Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
+- Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
+- Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Independent Sol review now passes (29 Python,19 Node tests; five independently caught mutations). Next: ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
+- User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. All five fresh Ubuntu jobs have failed; all macOS jobs passed. Fresh main, PR9 and PR34 Windows passed; PR36 and PR26 Windows were still running at this snapshot. The original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
+- Local concurrency review found a pending-main cancellation risk; corrected grouping now uses a unique run ID for every non-PR event. All 19 Node tests and four source mutation assertions pass; Opus high recheck at `f646589` passes with no blockers. Hosted verification of the patch remains pending. No measured speedup is claimed.
+- E1/E2 provisioning and the PR36 blocker corrections have passed their separate local independent reviews on integration candidates; public PR36 has review success at `5c3c01e`. Their hosted platform gates and M2 acceptance remain incomplete. The older unreviewed/blocking status is retained below as history.
+- Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
+
+## PR38 first hosted validation — lint correction, 2026-11-12
+
+- Published head `6da6224`, CI run43160202605, Ubuntu job130989275950 failed `npm run lint`: ESLint no-regex-spaces rejected two literal-space regexes in the Sol-authored workflow test. The helper/package-fetch step was never reached; this is not another mirror/network failure and provides no fallback acceptance.
+- Coordinator OpenAI / gpt-6.1-sol / medium made the mechanical lint correction to equivalent space quantifiers `{2}` and `{4}`. No helper, workflow behavior, gate, timeout or test assertion is weakened. Locally ran `npm run lint` successfully, Node policy/workflow tests19/19, Python CI helpers29/29 and diff whitespace check. Earlier local validation omitted the full lint command; the hosted check caught that omission.
+- Publish a changed head through its automatic PR CI; no unchanged rerun or duplicate dispatch. Exact-head review must cover this two-line test correction; all gates remain mandatory. Real APT fallback and installed/native/dedicated M2 remain unverified.
+
+## Ubuntu fallback candidate publication review — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium independently reviewed Opus candidate `1361864..bfa177f`: Standards/Spec pass with no blockers; [report](reviews/ubuntu-fallback-sol-review.md). The earlier Sol concurrency correction retains its independent Opus recheck. Publish this CI unblock as the explicit babysitter queue-recovery exception, without opening a feature PR. Native/M2 acceptance is unchanged; real fallback and all hosted gates remain mandatory.
+
+## Ubuntu package-fetch three-failure handoff — 2026-11-12
+
+- OpenAI / gpt-6.1-sol / medium coordinator applies the babysitter's three-attempt handoff steering. Stop coordinator fix attempts; Anthropic / claude-opus-5-5 / high takes the Ubuntu CI fix, followed by independent Sol review. This handoff is active, not an unattended pause; delegate completion resumes this thread.
+- Failure evidence 1: original Ubuntu package retrieval failed with name-resolution errors in run [43032348219](https://github.com/Dytschgo/arxcovo/actions/runs/43032348219), source `4ead112`, jobs `130562335529` / `130573258883`.
+- Failure evidence 2: the #32 diagnostic revision still failed package retrieval with name-resolution errors in run [43053098205](https://github.com/Dytschgo/arxcovo/actions/runs/43053098205), source `b475bf1`, job `130635247058`.
+- Failure evidence 3: after the signed-mirror mitigation, fresh main [43152187271](https://github.com/Dytschgo/arxcovo/actions/runs/43152187271), source `b5e6556`, Ubuntu job `130963746682`, failed with Kernel mirror IPv6 network-unreachable101 and APT100 after ubuntu-mirror-updated:1. All four sibling fresh dispatches also failed Ubuntu: 43152254254, 43152257543, 43152261583, 43152265161; their detailed causes need individual verification.
+- These are three hosted failure milestones of the unresolved package-fetch problem, not a claim that three distinct corrective patches were deployed. The #32 diagnostic head predates the mirror helper. The intervening signed-mirror run 43062892241 at `400903d` genuinely passed Ubuntu in130s; it proved that path, not a DNS root-cause fix.
+- Handoff scope: smallest tested CI correction; retain Ubuntu, every check, signature validation and the12-minute job timeout. No blind retry loop or continuing DNS investigation. The reviewed local concurrency correction at47b4f47 may accompany the fix. Coordinator publishes only after Sol reviews Opus changes, then obtains hosted gates and exact-head review before merging. Re-dispatch/drain existing36/9/26/34 afterward. No native experiment, third S4U probe or owner-PC administration.
+- Anthropic / claude-opus-5-5 / high handoff implementer (single agent, no subagents) verified the prepared head `1361864` on base `b5e6556`. It read the detailed logs of all five fresh Ubuntu jobs, PR32 job 130635247058 and the green job 130669921798.
+  - In every fresh job, all six DNS controls resolved and there were zero requests to Ubuntu hosts.
+  - In every fresh job, the Kernel mirror connection failed on both IPv6 (unreachable, error 101) and IPv4 (connect timed out).
+  - Main, PR9: the indexes were fetched, then all nine `.deb` downloads failed.
+  - PR36, PR26, PR34: InRelease failed, leaving "no installation candidate".
+  - So the helper had turned a transient Ubuntu-name failure into a dependency on a single Kernel host. An IPv4-only change was rejected because IPv4 also timed out.
+- Correction `821d496` keeps the mirror+file source URI unchanged. Instead, the validated `apt-mirrors.txt` gains the Kernel mirror as `priority:1`, and the original Ubuntu entries are kept with their priorities shifted by one.
+  - The official apt-transport-mirror manual says the lowest priority is tried first, and that a mirror which is inaccessible falls through to the next entry.
+  - PR32 showed this fallback on the image, at about 20 s per file and entry on name failure. That is why the Kernel mirror comes first and Ubuntu is the fallback, rather than the reverse.
+  - Workflow, matrix, timeouts, pinned actions, permissions, the concurrency grouping, signature/trust validation and every check are unchanged.
+- Local evidence:
+  - Before the fix, the new regression tests failed: four failures and two errors out of 23.
+  - After the fix, `python -B -m unittest discover -s tools/ci -p test_ubuntu_mirror.py` passed 23/23 (Windows Python 3.12.10), the `test_observe_dns.py` suite passed, and `node --test scripts/*.test.mjs` passed 19/19.
+  - A scratch harness made nine source mutations on copies, and all nine were killed: Kernel entry last, priority tie, Kernel-only redirect, skipped indirect trust check, output bound removed, list not published, fresh recheck skipped, foreign entry accepted, comments dropped.
+  - Sanitized facts are in `docs/evidence/ubuntu-kernel-mirror-failures.json`.
+- Not run: real APT, root publication, sudo and any hosted run. Fallback timing, cross-mirror sync and a green Ubuntu job are **pending hosted confirmation**. The root cause of both network failures is unknown.
+- This counts as one corrective patch toward the three-failure rule. If the coordinator's single hosted validation fails, record it with logs instead of retrying blindly. Sol must independently review before publication; the implementer does not self-approve.
+
+## Historical checkpoint from main before the Actions reset — 2026-11-11
 
 - Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#14](https://github.com/Dytschgo/arxcovo/pull/14), `5b4f6b20796d599a015ca048dc4edaeb72546387`, 19:51:48 UTC, through all five gates. The Unix executor is library-only; no Unix MCP execution route is activated.
 - Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. The macOS owner parser still refuses Unknown.
 - Queue priority: fix the three #36 execution/audit review blockers and finish existing evidence/test PRs through independent reviews. No new feature PRs while the queue drains. Windows owner API narrowing E1 is implemented locally, not published, and still needs independent review.
 - Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
+
 
 ## PR29 compatibility integration — Sol high, 2026-11-11
 
@@ -90,7 +137,7 @@
 - First manual Windows run 42995659949 failed without locating its setup failure; cleanup reported true. Second run [43003724132](https://github.com/Dytschgo/arxcovo/actions/runs/43003724132), at reviewed immutable `2299ad4`, returned task code 2 after successful privilege and account API diagnostics. Setup reported result-validation failure and cleanup true. No S4U success is established. The dispatch variable was deleted and read back absent.
 - Owner steering: use the current unelevated Windows user for the development test rather than spend more time on the dedicated-account blocker. ADR 0010 is committed on docs/windows-current-user-development. S4U diagnosis cancellation was requested. This is an explicit development deviation, not proof of dedicated-account isolation or authorization for owner-PC administration.
 - Transport #15 is merged. Independent review cleared peer-error isolation and strict Windows TokenUser ownership. Hosted run 43004413465 passed 28 workspace tests on each platform, including macOS initialization, early-close and endpoint collision cases. Same-user development boundaries remain explicit.
-- Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. No privileged Linux experiment has run.
+- Unix library/harness #14: latest correction `4383b56` fixes the positive-control directory's restrictive-umask issue. Local Python guards: 29 tests and ten killed mutations; Windows workspace: 22 tests. Fresh independent review and hosted acceptance are pending. At this historical checkpoint, no privileged Linux experiment had run (superseded by the first reviewed experiment failure recorded above).
 - Windows rooted-path fix #16 is merged after fresh independent review; its bare-prefix correction passed 39 local tests. Activity-integrity #18 is closed as superseded by merged #19, including completion and fixed unknown-tool-label regressions.
 - Activity v2 merged in #19: atomic migration/recovery, caller isolation, bounded keyset pagination, separate read/action retention, conditional completion and 8 KiB request/64 KiB response bounds. Exact-head independent review and all hosted checks passed; see ADR 0011.
 - Lifecycle candidate `522ed2b`, integrated on feat/service-lifecycle: state machine, shutdown ordering, Windows SCM adapter, Unix signals/notify and exact CLI entry. Coordinator passed 40 Windows tests, formatting and Clippy after transport integration. Production entry remains fail-closed until fixed config, store and inventory hooks are wired. Native service-manager operation is unverified.
@@ -107,6 +154,10 @@
 - [ ] 6. Authenticated browser/Electron dashboard with hosts, VMs, activity, terminal and console; Playwright and screenshots.
 
 ## Blockers and owner actions
+
+- Fresh main Ubuntu CI fails in Playwright dependency installation after the mirror rewrite; job `130963746682` reports network-unreachable on the Kernel mirror IPv6 address (APT exit 100). This is not a green recovery and does not establish a DNS cause. Concurrency cannot repair runner network connectivity; no workaround or retry has been applied.
+
+- Actions reset follow-up (2026-11-12): fresh dispatches now start, but the 12 old queued records reject even force cancellation with 409. Their cleanup still needs GitHub Support; no cause or account restriction is confirmed. New CI results remain pending; the original main push is not green. [Exact reset and local workflow audit](reviews/actions-queue-reset.md).
 
 - Dedicated local Arxcovo account and QEMU were absent at preflight. Owner account/service installation and later WHPX/QEMU/media/disk-cap/CPU-RAM reserve setup remain owner actions. The current-user development authorization permits the development test without doing those administrative steps.
 - docs/dev-host-setup.md and early feasibility ADRs are preserved in open PR #10. Policy regression PR #9 is also open. These have not been accepted or merged.
@@ -189,6 +240,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 | Windows development execution implementation | Codex / gpt-6.1-sol | high | Incomplete candidate 68c6dbd; stopped after three failed junction-fixture fixes |
 | Windows development execution continuation | Anthropic / claude-opus-5-5 | high | Candidate complete locally; fixture root cause fixed; 57 tests and 25/25 mutations killed; fresh independent Sol review pending |
 | Owner-store fixture interference diagnosis | Anthropic / claude-opus-5-5 | high | Cause proven: child-launching development tests pin `%TEMP%` with read-only sharing, which blocks fixture renames. Test-only patch artifact: full suite 144/144 in 5 nextest and 3 cargo test runs. Sol applies the patch; independent review pending |
+| Ubuntu package-fetch handoff implementation | Anthropic / claude-opus-5-5 | high | Local candidate `821d496`: Kernel mirror preferred, Ubuntu mirror-list entries retained as APT fallbacks; 23/23 helper tests, 9/9 mutations killed; Sol review and hosted confirmation pending |
 
 Exact provider allowances and costs are not exposed; no percentages or spend are invented.
 
