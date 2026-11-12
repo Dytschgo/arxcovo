@@ -2,7 +2,9 @@
 
 ## Current state — 2026-11-12
 
-- S1 active locally: OpenAI / gpt-6.1-sol / high on clean prepared base b1663060452f8fed25bf64986bc3892bc37c7313. Library-only config/request, Unix read/owner gate, Windows start/session and shared lexical predicate. Fresh Opus review and hosted gates remain required; S2/S3 and ADR0019 unchanged.
+- S1 implemented locally: OpenAI / gpt-6.1-sol / high, exact base b1663060452f8fed25bf64986bc3892bc37c7313; source dd079957 plus Unix-only fixture correction b25797d. Library-only config/request, Unix read/owner gate, Windows start/session and shared `windows_component_safe` predicate. Fresh Opus exact-head review and hosted gates remain required; S2/S3 and ADR0019 unchanged.
+- S1 local results: fmt and locked all-target workspace Clippy passed; focused69 and9 passed; six mutations compiled and failed assertions, all restored. Exactly one final normal full workspace nextest passed271 with2 skipped (9f1416b4-f139-4185-a981-d49f74cf85a1), default concurrency/no instrumentation. Native acceptance is not claimed. [Bounded evidence, manifest and limitations](evidence/owner-cli-s1.md).
+- S1 isolation correction: task-owned edits initially used canonical D:/Code/Arxcovo; captured diff/bytes/index and copied all8 files byte-for-byte into the existing prepared worktree, committed there before restoring only verified root paths. Root verified clean at b166306. All further work uses prepared isolation; no full test was repeated due migration. Unix-only tests remain uncompiled/unrun locally because the cross C compiler is unavailable; hosted Linux/macOS checks are required.
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), `d70e80818569491238656255ee415669f04a731d`, 10:51:46 UTC, all five gates on d9b6fa3 and exact-head Opus review. Its squash tree equals the reviewed head.
