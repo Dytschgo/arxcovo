@@ -9,6 +9,12 @@
 - PR36 refresh retains published history and both parents' provider/evidence rows. The merge conflict was documentation only. Product source, helper safety, checks/timeouts, inactive native execution and experiment limits are unchanged; inherited #9 policy test correction is already reviewed and merged.
 - No owner-PC administration, old Lab Manager/VM operation, native experiment retry or third S4U probe. Historical checkpoints below retain their task-time claims.
 
+## PR36 hosted cancellation-test failure — 2026-11-12
+
+- CI run43163554382, Windows job131000066825, exacthead `c044b72` failed `local::execution_tests::dedicated_fake_sdk_cancellation_propagates_without_shutdown` at local_execution_tests.rs123: generic condition-not-reached. The helper is used twice in that test, so the log alone does not establish whether backend entry or durable completion was missing. No ExecutionFailed or production cause is inferred.
+- Coordinator OpenAI / gpt-6.1-sol / medium ran the exact normal focused nextest once:1/1 passed, run4494eb3b-5d65-4671-bc57-b4bb07d05409. No unchanged hosted rerun. The SDK timeout200ms and fake backend3s lifetime are leads only, not a proven cause.
+- A scoped Sol high diagnosis/fixture correction is delegated, followed by fresh independent Opus review before publication. Distinguish both waits, reproduce the actual failure, prefer event-based synchronization if supported, preserve cancellation/audit assertions and cleanup; do not weaken checks or alter production behavior. No native executor, owner/admin or direct ignored-fixture operation.
+
 ## Historical checkpoint before PR9 queue refresh — 2026-11-12
 
 - Milestone 1 is accepted. Milestone 2 remains incomplete; milestones3–6 have no acceptance.
