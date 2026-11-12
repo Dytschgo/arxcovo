@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or experiment is activated.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 recovered on attempt 2: the sole failed macOS job passed (retry 15:13:48 to 15:17:20 UTC). Attempt 1 remains failed due to runner acquisition/capacity, with no macOS steps and successful Ubuntu/Windows jobs.
+- CI budget blocker: the policy intentionally measures attempt 1, which lasted 906s (14:47:09 to 15:02:15 UTC), above 900s. The successful infrastructure retry does not replace that baseline. No gate override, timeout increase or ci-speed label on the Stage C feature PR. A separate genuine CI-capacity improvement must be reviewed and show a successful measured reduction under the existing policy before the queue can drain.
+- Queue priority: publish Stage C for real hosted Unix build/execution verification and exact-head review; resolve the separate CI budget/capacity blocker before merge. Stage D and all setup/experiment/activation gates remain separate; no experiment retry is authorized.
+- Stage C candidate fed4036 passed independent Opus high Standards/Spec recheck 993bacb. Coordinator Sol medium retains the report and updates docs only. The only production changes since 656dde3 are the two reviewed Unix lint forms. [Review](reviews/0019-stage-c-independent-review.md) and [lint recheck](reviews/0019-stage-c-lint-opus-recheck.md) retain their own evidence credits.
+- Windows fmt/locked workspace Clippy and focused scanner/S5 4/4 passed; builder's single full 308 passed / 2 skipped stays credited to 656dde3. Pinned Linux/macOS stub checks were type/lint analysis only. Real Unix compilation, S1-S4/S6/S7 execution and Unix mutations remain unverified; all five hosted gates are mandatory. No local Windows pass is Unix evidence.
+- F2 scanner limitations and F3 older-document path cleanup remain recorded. ExecutionFailed and E_PROTECTION are unexplained, with no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage C publication
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or native experiment is activated.
 - Last merged PR: #52 at 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 attempt 1 failed: macOS job 131260319040 started no steps, had no runner name, and was cancelled after runner acquisition failed. Its annotation explicitly reports macOS arm64 capacity constraints. Ubuntu and Windows passed. Main is not green.
 - Coordinator requested exactly one failed-job infrastructure rerun of 43240797525, retaining attempt 1 as failed. No source fix, blind retry-to-green, timeout increase, platform removal or policy bypass. A further capacity failure must be recorded before any next action.
