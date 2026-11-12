@@ -2,12 +2,23 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 remains incomplete. Installed/native/dedicated M2 is **unverified on real hardware**; no native executor or owner CLI is activated.
+- Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), `0937cacfcdb5be036edcd1a126ba0f65521599df`, 06:27:45 UTC, after all five required gates passed on `1f6a42f` and independent review succeeded.
+- Queue priority: the existing public queue is drained (#38, #9, #34, #26 and #36 merged). Next M2 work is integration of the separately reviewed owner provisioning, shutdown/report validation and client corrections, plus independent review of proposed owner CLI/native bridge designs. Each new publication still requires its scoped review and hosted gates.
+- Main push CI after #26 passed on attempt 1: run43166128223 atffe502f, 06:09:14–06:18:58 UTC,584s. Main after #36 is newly triggered and not yet claimed green. Earlier main runs after #38/#9/#34 passed in600/567/562s respectively.
+- Hosted Ubuntu package installation and browser/Electron smoke now pass with the retained mirror-list configuration. The original network cause and fallback under a Kernel outage remain unproven. Old stuck queue records were not successfully cancelled; no account-level cause is established.
+- PR36 fixture correction passed hosted Windows on its published head. Its controlled counterexample explains a possible invalid test assumption; the original failure's scheduling history remains unknown. No claim that unrelated ExecutionFailed intermittency is fixed.
+- No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager or VM work. Proposed ADR0018/0019 and full M2 acceptance remain open. Babysitter unchanged.
+
+## Historical checkpoint before PR36 merged — 2026-11-12
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#26](https://github.com/Dytschgo/arxcovo/pull/26), `ffe502fa7c43594bef1f2c8cf60b6f69ef43481b`, 06:09:12 UTC, through all five gates.
 - Queue priority: finish existing #36 through independent review and every required check. No new feature PRs or bypasses.
 - Main push CI after #34 passed on attempt 1: run43164763220 at3b418cd, 05:57:09–06:06:31 UTC,562s. New main after #26 is pending, not claimed green.
 - PR36's test-only cancellation-fixture correction passed independent Opus high review at6ccfce9: focused2/2, five stress iterations, cancellation guard/early-timer mutations caught, full221/221 passed with two parent-only skips. The actual hosted failure's cause remains unproven. Source is retained unchanged; merged main adds only reviewed docs/history.
 - Native execution and owner CLI remain unactivated. No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work.
+
 
 ## PR36 reviewed fixture publication — 2026-11-12
 
