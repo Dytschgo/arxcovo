@@ -793,5 +793,7 @@ fn cli_start_preflight_precedes_all_scm_calls() {
     )
     .unwrap();
     assert!(released.get());
-    assert!(scm.test_calls().calls.iter().any(|c| c == "start"));
+    let mut direct = engine(true, STOPPED);
+    direct.start().unwrap();
+    assert_eq!(scm.test_calls().calls, direct.test_calls().calls);
 }

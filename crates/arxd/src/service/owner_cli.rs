@@ -5,11 +5,12 @@ use super::{
     config::{ConfigureRequest, Resolver, Rights, ServiceConfig},
     layout::{Error, Layout},
     owner_plan::{self, OwnerContext},
-    owner_transactions::Failure,
+    owner_transactions::{Failure, RightReport},
 };
 use crate::client_config::ClientError;
 use std::{ffi::OsString, io::Write};
 
+#[derive(PartialEq)]
 pub(super) struct ConfigureArgs {
     build: String,
     client: String,
@@ -196,8 +197,12 @@ pub(super) trait OwnerOps {
     fn start(&mut self) -> Result<(), CliError>;
     fn stop(&mut self) -> Result<(), CliError>;
     fn status(&mut self) -> Result<&'static str, CliError>;
-    fn uninstall(&mut self) -> Result<Option<&'static str>, CliError>;
+    fn uninstall(&mut self) -> Result<Option<RightReport>, CliError>;
     fn client(&mut self, args: &ClientArgs) -> Result<String, CliError>;
+}
+// Shared by real dispatch and fake dispatch; tokens belong to library Display.
+fn right_output(report: RightReport) -> String {
+    report.to_string()
 }
 fn dispatch(
     cmd: Command,
@@ -215,7 +220,7 @@ fn dispatch(
         }),
         Command::Uninstall => ops.uninstall().map(|s| {
             if let Some(s) = s {
-                let _ = writeln!(out, "{s}");
+                let _ = writeln!(out, "{}", right_output(s));
             }
         }),
         Command::Client(a) => ops.client(&a).map(|hash| {
@@ -364,23 +369,13 @@ impl OwnerOps for NativeOps {
             .status()?
             .token())
     }
-    fn uninstall(&mut self) -> Result<Option<&'static str>, CliError> {
+    fn uninstall(&mut self) -> Result<Option<RightReport>, CliError> {
         let guard = super::owner_windows::OwnerGuard::acquire()?;
         let mut scm = super::owner_scm::WindowsScm::system(guard.layout())?;
         let report = super::owner_scm::uninstall_flow(&mut scm, |p| {
             super::owner_windows::WindowsOwnerSession::uninstall(guard, p)
         })??;
-        Ok(Some(match report {
-            super::owner_transactions::RightReport::Removed => "batch-right-removed",
-            super::owner_transactions::RightReport::AlreadyAbsent => "batch-right-already-absent",
-            super::owner_transactions::RightReport::RetainedUnproven => {
-                "batch-right-retained-unproven"
-            }
-            super::owner_transactions::RightReport::RetainedNotArxcovo => {
-                "batch-right-retained-not-arxcovo"
-            }
-            super::owner_transactions::RightReport::NotRecorded => "batch-right-not-recorded",
-        }))
+        Ok(Some(report))
     }
     fn client(&mut self, a: &ClientArgs) -> Result<String, CliError> {
         crate::client_config::create(&a.principal, &a.out).map_err(CliError::Client)
@@ -448,7 +443,7 @@ impl OwnerOps for NativeOps {
     fn status(&mut self) -> Result<&'static str, CliError> {
         unix_context(|_, _| Ok(super::owner_unix::status()?.token()))
     }
-    fn uninstall(&mut self) -> Result<Option<&'static str>, CliError> {
+    fn uninstall(&mut self) -> Result<Option<RightReport>, CliError> {
         unix_context(|l, c| {
             unix_verb(
                 owner_plan::Action::Uninstall,
