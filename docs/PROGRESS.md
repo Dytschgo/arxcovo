@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Last merged PR: #48 at `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC, all five gates on `21638d9` and independent Opus review; squash tree equals reviewed head. Main CI after #48 is not yet claimed green.
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor activation.
+- Queue priority: correct S2 security/test findings, independent recheck and hosted gates, then S3 wiring (invalid install test first). The inactive Unix bridge contract refresh is separately prepared at `22ca777`; no implementation or retry is authorized.
+- S1 is merged. Hosted Linux and macOS compiled and passed the Unix-only code on `21638d9`; Windows also passed. S1 follow-up tests remain inherited unchanged.
+- S2 original target `fe8e9a7` (source `6c452ec`, old base `813dd1e`) received Anthropic / Opus 5.5 / high Standards PASS with advisories and Spec CHANGES REQUIRED. [Full report](reviews/0018-s2-independent-review.md). Windows rename pins and macOS variadic mode are high-priority defects; native error propagation and real ACL acquisition need meaningful negative tests. SP-5 through SP-8 and evidence accuracy are included in correction attempt 1. No S2 publication or acceptance.
+- Coordinator OpenAI / gpt-6.1-sol / medium ports only S2-owned files and the retained review onto actual main. No source fix or fresh test result is claimed for this preparation. Sol high will correct; Opus high must independently recheck. The builder's 282-pass result belongs only to `6c452ec`; Unix coverage remains pending.
+- ExecutionFailed remains unexplained; no pass is a fix or waiver. No production create, owner/admin/service, old Lab Manager/VM, experiment retry, third S4U probe or babysitter change.
+
+## Historical checkpoint before S2 correction preparation
+
+
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), d70e80818569491238656255ee415669f04a731d, 10:51:46 UTC, all five gates and independent review. Main run43204089423 passed in564s (10:51:49–11:01:13 UTC).
 - Queue priority: S1 library prerequisites publication and mandatory hosted Unix compilation/tests, then S2 credential writer and S3 wiring. S2 is active in a distinct verified worktree on the private S1 base; it cannot clear or bypass S1's gate.
