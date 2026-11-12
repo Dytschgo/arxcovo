@@ -3,6 +3,17 @@
 ## Current state — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates and independent review. Main run 43240797525 attempt 2 recovered after one failed macOS capacity job; attempt 1 remains failed at 906s and is the policy baseline. No claim of first-attempt main green or budget recovery.
+- Queue priority: separate measured CI headless-shell improvement and independent review under the existing policy, then a fresh successful main run under 15 minutes, then refresh Stage C PR53 and require all five gates. Stage C's ci-time-budget remains red and it is not labelled ci-speed.
+- Coordinator OpenAI / gpt-6.1-sol / medium changes only the browser-install workflow command plus meaningful guard tests: --only-shell omits unused full Chromium while preserving headless UI and Electron smoke, all three OS/arm64 coverage, action pins, permissions, timeouts and policy. [Evidence and six baselines](evidence/ci-headless-shell.md). Node20 tests, four restored assertion mutants, lint/build, UI1/1 and desktop1/1 pass locally. Hosted timing is pending; no speed claim or exception label yet.
+- Candidate acceptance requires first-attempt all-OS success below 900s and 906s, Windows install below the pinned 141s minimum, unchanged UI/desktop counts and independent review. Only then may this genuine performance PR use ci-speed; no gate override or policy edit. Capacity failure stays red. Main must subsequently pass within budget before merging features.
+- Stage C PR53 at 2ce79ca independently passed Standards/Spec; hosted Linux252/4 and macOS253/2 plus S1-S7 passed. Windows and overall candidate readiness must be read live before any action. Real Unix mutation kills remain unrun. Native guard/phase/containment evidence limits are unchanged; no bridge activation.
+- ExecutionFailed and E_PROTECTION remain unexplained, with no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before CI headless-shell candidate
+
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
 - Queue priority: Stage B publication for hosted Unix compilation/tests and exact-head independent review, then merge only after all five gates. Stages C/D follow separately; cgroup setup/cleanup, E_PROTECTION diagnosis/experiment and activation remain gated. No experiment retry is authorized.
 - Stage B source 4fe2bde passed independent Opus high Spec review; the F1 test correction at c60b1cc passed Standards and Spec in recheck 4e3959c. [Full review](reviews/0019-stage-b-independent-review.md) and [F1 recheck](reviews/0019-stage-b-tool-acceptance-opus-recheck.md) are retained. Coordinator Sol medium integrates the report and updates status only; production source is unchanged.

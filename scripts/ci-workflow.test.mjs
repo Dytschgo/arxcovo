@@ -3,6 +3,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
+
+test('CI installs the headless shell used by its unchanged browser smoke tests', () => {
+  assert.match(workflow, /^ {6}- run: npx playwright install --with-deps --only-shell chromium\r?$/m);
+  assert.match(workflow, /^ {8}os: \[ubuntu-latest, windows-latest, macos-latest\]\r?$/m);
+  assert.doesNotMatch(playwrightConfig, /\bchannel\s*:/, 'a browser channel needs a reviewed install change');
+  assert.doesNotMatch(playwrightConfig, /\bheadless\s*:\s*false\b/, 'headed smoke needs a reviewed install change');
+});
 
 test('CI replaces superseded PR runs without cancelling main measurements', () => {
   const concurrency = workflow.match(/^concurrency:\r?\n((?:[ \t]+[^\n]*\n)+)/m)?.[1];
