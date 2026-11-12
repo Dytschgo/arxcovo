@@ -87,5 +87,5 @@ One full workspace invocation; no retries or second full run.
 
 No hardware acceptance is claimed: native/dedicated M2 is **unverified on real
 hardware**. No PR publication or review was performed. Coordinator Opus must
-independently review before publication. Last merged PR remains #9 at
+independently review before publication. Historical builder-base checkpoint: last merged PR was #9 at
 `6f18686af7a8498bf887f833f278f43d152867f2`.

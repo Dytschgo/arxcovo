@@ -199,3 +199,13 @@ and three artifact checks; two native artifact checks skipped. Subprocess-only
 fixtures were exercised through parents. This does not rerun the historical
 mutation checks or establish native Unix execution. Fresh exact-head independent
 review and hosted gates remain required; the privileged experiment remains unrun.
+
+## First reviewed hosted dispatch
+
+The exact reviewed #14 merge `5b4f6b2` was dispatched once in run 43091339273.
+Guard tests and dependency fetch passed; setup refused with `E_PROTECTION`.
+There was no harness-pass or cleanup-confirmed line. The refusal site and mutation
+phase are not established; no runtime containment or cleanup acceptance follows.
+The reviewed-SHA variable was cleared and verified absent. No retry occurred.
+See `evidence/unix-execution-first-dispatch.json`. All earlier unrun descriptions
+above are historical preparation; the privileged execution harness has no pass.
