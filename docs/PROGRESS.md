@@ -2,6 +2,17 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner operation or installed-service acceptance is claimed.
+- Last merged PR: #49, `c4ef8ada086f6595a6a83c38cc77b34f87ebbd9f`, 12:49:59 UTC. All five gates and independent review passed on d330a96; squash tree equals the reviewed head. Main run `43221533019` succeeded in 439s (12:50:01 to 12:57:20 UTC).
+- Queue priority: S3 publication for hosted Linux/macOS/Windows verification and a published-head independent recheck, then merge only after all five gates. The Unix bridge contract remains separately prepared at 22ca777 and inactive; no native experiment retry is authorized.
+- S3 correction 1 at 5cbb32a / source 974048e passed Anthropic / Opus 5.5 / high review 98a5bb5 on Standards and Spec, pending hosted compilation. It accepts coordinator Sol medium's c41fbb2 clarification of existing Identity mapping and deferred start composition. [Recheck](reviews/0018-s3-correction1-opus-recheck.md). Native guard/session/SCM composition remains source-reviewed.
+- Coordinator OpenAI / gpt-6.1-sol / medium fixes low SP-4a by placing each abbreviated flag in its own slot. Three compiled prefix-acceptance mutants are caught and restored: build 5eb85aa5, client cb1defdb, rights 3fc8cd12. Final fmt/locked workspace all-target Clippy and focused 14/14 pass, run `c7de2e00-5299-48ef-8142-58829be12c94`. No full suite was repeated for this test-only change; the builder's 298 passed / 2 skipped full run `1dfe22f1` remains credited to 974048e. Source behavior is unchanged.
+- The correction evidence distinguishes CRLF checkout manifests from committed LF bytes. The ADR checkpoint clarifies the earlier macOS account refusal; token, exit code and refusal order are unchanged. These small test/docs follow-ups require the published-head cross-provider check.
+- All valid owner commands are tested only through fakes. No production NativeOps, credential create, valid owner argv, owner/admin/service, SCM/LSA/account, fixed system path/pipe, VM or Lab Manager operation was invoked. ExecutionFailed remains unexplained; no pass is a fix, rate claim or waiver. No third S4U probe or babysitter change.
+
+## Historical checkpoint before S3 publication
+
+
 - OpenAI / gpt-6.1-sol / high, implementation sub-agent: S3 correction attempt 1 on clean prepared `c41fbb2cd972f19e3af7af81f0f0b06342f42a0d`. No subagents. Exact Identity refusal, resolver order, changed pins, new SID observation, recorded-grant mirror, parser acceptance bounds, complete marker forwarding, shared library Display output and exact fake start sequence implemented. [Correction evidence](evidence/owner-cli-s3-correction1.md) records validation and limits.
 - Correction source `974048e621edc8c468c9f62943a749bfb0218ddb`: fmt/whitespace and locked workspace all-target Clippy pass; focused14 pass; 11 compiled assertion-kill mutants restored byte-for-byte. Exactly one final default-profile/concurrency normal workspace nextest: **298 passed, 2 skipped**, `1dfe22f1-d91c-4062-aa3d-51bae09aa60a`, 10.483s. Function-pointer compile check counts in totals but supplies no behavioral coverage.
 - Queue priority: fresh Anthropic / Opus 5.5 / high independent recheck of correction source AND coordinator Sol medium contract clarification, then all five hosted gates. S3 remains unpublished, pending review; no acceptance or activation.

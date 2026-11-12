@@ -286,10 +286,16 @@ fn parser_exact_bounds_and_guide_forms() {
     let mut odd = configure();
     odd.push("--env".into());
     assert!(parse(&odd).is_err());
-    for flag in ["--Workspace", "--work", "--build", "--client", "--right"] {
+    for (index, flag) in [
+        (8, "--Workspace"),
+        (8, "--work"),
+        (2, "--build"),
+        (4, "--client"),
+        (6, "--right"),
+    ] {
         let mut a = configure();
-        a[8] = flag.into();
-        assert!(parse(&a).is_err());
+        a[index] = flag.into();
+        assert!(parse(&a).is_err(), "abbreviated or wrong-case flag refused");
     }
     let marker = marker_args();
     assert!(

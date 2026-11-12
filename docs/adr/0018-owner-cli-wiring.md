@@ -297,3 +297,13 @@ on d9b6fa3 and independent exact-head Opus review. The brief now names that
 publication gate explicitly and states that all unaffected safety assertions
 still apply to deliberately invalid Verify fixtures. These wording follow-ups
 implement the final non-blocking review notes, with no new authority.
+
+## S3 clarification review checkpoint, 2026-11-12
+
+Independent Opus high recheck 98a5bb5 accepts the coordinator's c41fbb2
+clarification: old missing accounts give service-identity, with unchanged
+library semantics. On Windows and Linux this occurs through full validation;
+on macOS the earlier account lookup in parse can refuse first. The token,
+exit class and refusal before the old workspace check hold on all platforms.
+The deferred start closure is accepted; native guard release and SCM ordering
+remain source-reviewed. No native or installed acceptance is granted.

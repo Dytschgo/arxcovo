@@ -119,7 +119,7 @@ suite starts only after every restoration. No instrumentation or custom env.
 | native-inventory | `7af5f540-17ec-4526-9f13-0150bd0c2de5` | 100; compiled assertion; restored |
 | native-pins | `b221543b-6894-4185-8392-df6240016a83` | 100; compiled assertion; restored |
 
-## Checkout byte manifest (SHA256)
+## Historical checkout byte manifest (SHA256)
 
 - `crates/arxd/src/service/owner_cli.rs`: `4c3d80b9b45be7ca539a5fe1c0201f2cac73c5e33f90499253e0f0049159fb39`
 - `crates/arxd/src/service/owner_cli/tests.rs`: `2362c8b8dc30acf32f3c832c07e6662dce80ce57e481d67da3c0512ee5ee78fb`
@@ -155,3 +155,20 @@ account/privilege/service/SCM/LSA/VM/Lab Manager operation was invoked. No priva
 state or ignored fixture was read; ordinary benign owned-temp full-suite
 fixtures only. No private data sent externally; no GitHub/push/PR/watch/merge/rerun/settings,
 babysitter, owner admin, installation or toolchain action. No subagents.
+
+## Publication manifest clarification
+
+The three changed-file hashes above describe the builder's CRLF checkout
+copies, not the LF Git blobs. The retained Opus recheck verified that converting
+the committed files to CRLF reproduces them. The eight committed LF SHA-256
+values at source 974048e are listed below; these are coordinator Git-object
+reads, not a fresh test result.
+
+- `crates/arxd/src/service/owner_cli.rs`: `1723d3206d9005fb65a1ffc7f556ec37d0637e6402525de6e7c5639af20cb962`
+- `crates/arxd/src/service/owner_cli/tests.rs`: `3dacc84334956ff54075376ba43a286b623f350f8b40f19d95b2e9f214b271af`
+- `crates/arxd/src/service/owner_scm_tests.rs`: `5cec6c74ae2c152e0cfca578004f5cf301fb5a201a056ee018a4f96dc5fe8603`
+- `crates/arxd/src/service/native.rs`: `7631b2f4b1faf221882c0857f60c90b0412758b3323569a6bd1d9de2dfdee4f8`
+- `crates/arxd/src/service/config.rs`: `e5c0df0fa5bad1b85b81c8a360e7fad1166c71a1aa55f0c72f0a0350beab7f03`
+- `crates/arxd/src/service/executor.rs`: `0b81f1b6a68f78babc59fe7501a2b0c636f5b989e2df99fc134003b857086949`
+- `crates/arxd/src/client_config.rs`: `e0acffe09e606dc05a1a06e1231d08af52d8210cb06930a898f75a1985ebcc8c`
+- `crates/arxd/tests/service.rs`: `91bf603533b4219c89e0b12216efc796399afb4eb5a82fb0c59b5871a00b776e`
