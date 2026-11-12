@@ -928,6 +928,12 @@ mod imp {
                 std::fs::write(&target, b"previous bytes").unwrap();
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
                 assert_eq!(m.read_config(), Ok(Some(b"previous bytes".to_vec())));
+                let config_directory = target.parent().unwrap();
+                std::fs::set_permissions(config_directory, std::fs::Permissions::from_mode(0o750))
+                    .unwrap();
+                assert_eq!(m.read_config(), Err(Error::Permissions));
+                std::fs::set_permissions(config_directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
                 assert_eq!(m.read_config(), Err(Error::Permissions));
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();

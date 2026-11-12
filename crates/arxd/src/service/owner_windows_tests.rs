@@ -1133,7 +1133,7 @@ fn s1_owner_authority_cannot_be_forged_by_sibling_modules() {
 }
 
 #[test]
-fn configure_session_seam_has_no_required_native_authority() {
+fn configure_session_fake_can_refuse_without_native_calls() {
     struct Refusal;
     impl ConfigureSession for Refusal {
         fn read_config(&mut self) -> Result<Option<Vec<u8>>, Failure> {

@@ -2,6 +2,16 @@
 
 ## Current state — 2026-11-12
 
+- Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
+- Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), d70e80818569491238656255ee415669f04a731d, 10:51:46 UTC, all five gates and independent review. Main run43204089423 passed in564s (10:51:49–11:01:13 UTC).
+- Queue priority: S1 library prerequisites publication and mandatory hosted Unix compilation/tests, then S2 credential writer and S3 wiring. S2 is active in a distinct verified worktree on the private S1 base; it cannot clear or bypass S1's gate.
+- Provider/outcome: OpenAI / gpt-6.1-sol / high S1 implementation813dd1e passed fmt/locked Clippy/full271 with2 skips. Anthropic / Opus 5.5 / high full review b4b8154 passes Standards and conditionally Spec; Unix-only code has not compiled locally. Coordinator Sol medium adds the private-directory0750 negative and accurately renames the fake-session test; final fmt/Clippy/exact test1/1 pass. [Follow-up](evidence/owner-cli-s1-review-followup.md).
+- Fresh published-head recheck and every hosted OS gate remain required. No claim of Unix compilation, real WindowsOwnerSession behavior or actual native wiring-test coverage is made. Residual review advisories remain tracked.
+- The Unix bridge proposal has independent Sol high changes-required review for B1; direct coordinator correction eaf1bc0 fixes the validator/legacy-entry test contract, awaiting recheck. No bridge implementation or experiment retry.
+- S1 worktree migration is resolved and root is clean; new agents use explicit distinct tool-prepared paths. No owner/admin/service operation, third S4U probe, old Lab Manager/VM or babysitter change. ExecutionFailed remains open, not fixed by local passes.
+
+## Historical checkpoint before S1 source publication
+
 - S1 implemented locally: OpenAI / gpt-6.1-sol / high, exact base b1663060452f8fed25bf64986bc3892bc37c7313; source dd079957 plus Unix-only fixture correction b25797d. Library-only config/request, Unix read/owner gate, Windows start/session and shared `windows_component_safe` predicate. Fresh Opus exact-head review and hosted gates remain required; S2/S3 and ADR0019 unchanged.
 - S1 local results: fmt and locked all-target workspace Clippy passed; focused69 and9 passed; six mutations compiled and failed assertions, all restored. Exactly one final normal full workspace nextest passed271 with2 skipped (9f1416b4-f139-4185-a981-d49f74cf85a1), default concurrency/no instrumentation. Native acceptance is not claimed. [Bounded evidence, manifest and limitations](evidence/owner-cli-s1.md).
 - S1 isolation correction: task-owned edits initially used canonical D:/Code/Arxcovo; captured diff/bytes/index and copied all8 files byte-for-byte into the existing prepared worktree, committed there before restoring only verified root paths. Root verified clean at b166306. All further work uses prepared isolation; no full test was repeated due migration. Unix-only tests remain uncompiled/unrun locally because the cross C compiler is unavailable; hosted Linux/macOS checks are required.
