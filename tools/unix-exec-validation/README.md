@@ -1,6 +1,6 @@
 # Disposable Linux experiment tooling
 
-This is a future manual CI experiment, not a local provisioning tool. Run only
+This is a guarded manual CI experiment, not a local provisioning tool. Run only
 the pure tests on a development machine:
 
 ```powershell
@@ -74,7 +74,10 @@ Primary references checked during preparation:
 
 Static tests are guard/planning evidence only. Runtime setup, systemd trimming,
 Cargo runner arguments, account cleanup and Linux containment are **unverified
-on real hardware**. No privileged experiment has been dispatched or executed.
+on real hardware**. The first reviewed hosted dispatch at `5b4f6b2` failed
+with `E_PROTECTION` before any harness-pass or cleanup-confirmed evidence. Its
+mutation phase is not established. The reviewed-SHA variable was cleared; no
+retry occurred. See `docs/evidence/unix-execution-first-dispatch.json`.
 
 Git verification uses command-scoped safe.directory for the exact checkout path;
 it does not depend on the hosted image's global wildcard safe.directory setting.
