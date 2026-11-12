@@ -1,4 +1,5 @@
 //! Authenticated foreground MCP server and a separate Unix execution library.
+mod client_config;
 pub mod config;
 pub mod exec;
 pub mod http;
