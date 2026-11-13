@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- Queue priority: publish/review Stage C PR53 integration on main after #54, then normal five-gate merge, followed by PR55 and PR56 in dependency order. Stage C production shim/scanner/routing bytes remain identical to reviewed `2ce79ca`; parent refresh carries the separately reviewed CI recovery and policy repair unchanged. No native execution backend is activated.
+- Last merged: PR54 `79276b93e14a483ff63a189545d148cd2f6f0b0e`, 2026-11-13 16:26:36Z. All five required gates and independent Opus integration review passed on `d276f7f`; first integration CI `43461011104` succeeded in 528s. Squash tree equals that reviewed head. Original performance attempt 3 qualification remains recorded, no reset. Main after #54 is pending, not claimed green.
+- Main after #57 passed run `43459116760` attempt1 in 590s. All five original protection contexts/app pins and strict mode are restored; owner-authorized bootstrap exception is exhausted. No gate bypass applies to this or later product PRs.
+- Provider: coordinator OpenAI / gpt-6.1-sol / medium integrates; fresh independent Anthropic / Opus 5.5 / high exact-head review required. Prior Stage C checks remain credited to their exact pins. M2 incomplete; production native execution inactive. Native/installed/dedicated paths **unverified on real hardware**. E1/E5 held locally, ExecutionFailed/E_PROTECTION unresolved without retry.
+
+## Historical state before Stage C integration after CI recovery
+
 - Queue priority: main run `43459116760` attempt 1 after #57 at `f1340a4` SUCCEEDED in 590s (2026-11-13T16:05:13Z to 2026-11-13T16:15:03Z), below 900s. Publish reviewed #54 integration refresh and merge only after fresh normal gates. The repaired bot now posts ci-time-budget SUCCESS on qualifying measured head `c5bb191`. Strict main protection and all five requirements are restored.
 - Last merged: PR57 `f1340a4`, 2026-11-13 16:05:11Z. After separate explicit owner approval, the coordinator temporarily removed ONLY ci-time-budget, merged pinned reviewed `a5ee45f`, and restored the original configuration in a finally block; readback verified all five checks, app pins and strict=true. [Executed exception](adr/0022-ci-policy-buffer-bootstrap.md). No exception applies to #54 or product PRs.
 - New-head rule: the successful `c5bb191` performance attempt 3 is retained, not reset. This base-integration run is not a fourth performance-fix attempt; it still requires all normal new-head gates. A slow/failing first integration run stops delivery and is handed to the other provider/owner with evidence, with no repeat-to-green, waiver or claimed old-head success on new bytes. Budget success on c5 against old906 does not carry over; the bot must independently evaluate the new head against the authoritative baseline or its own qualifying first run.
@@ -48,6 +55,47 @@
 - Product PR53/55/56 and local E1/E5 remain held; no new product stack. M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed/E_PROTECTION remain unresolved; no native/owner/VM/experiment action.
 
 ## Historical checkpoint before policy-buffer bootstrap
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or experiment is activated.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 recovered on attempt 2: the sole failed macOS job passed (retry 15:13:48 to 15:17:20 UTC). Attempt 1 remains failed due to runner acquisition/capacity, with no macOS steps and successful Ubuntu/Windows jobs.
+- CI budget blocker: the policy intentionally measures attempt 1, which lasted 906s (14:47:09 to 15:02:15 UTC), above 900s. The successful infrastructure retry does not replace that baseline. No gate override, timeout increase or ci-speed label on the Stage C feature PR. A separate genuine CI-capacity improvement must be reviewed and show a successful measured reduction under the existing policy before the queue can drain.
+- Queue priority: publish Stage C for real hosted Unix build/execution verification and exact-head review; resolve the separate CI budget/capacity blocker before merge. Stage D and all setup/experiment/activation gates remain separate; no experiment retry is authorized.
+- Stage C candidate fed4036 passed independent Opus high Standards/Spec recheck 993bacb. Coordinator Sol medium retains the report and updates docs only. The only production changes since 656dde3 are the two reviewed Unix lint forms. [Review](reviews/0019-stage-c-independent-review.md) and [lint recheck](reviews/0019-stage-c-lint-opus-recheck.md) retain their own evidence credits.
+- Windows fmt/locked workspace Clippy and focused scanner/S5 4/4 passed; builder's single full 308 passed / 2 skipped stays credited to 656dde3. Pinned Linux/macOS stub checks were type/lint analysis only. Real Unix compilation, S1-S4/S6/S7 execution and Unix mutations remain unverified; all five hosted gates are mandatory. No local Windows pass is Unix evidence.
+- F2 scanner limitations and F3 older-document path cleanup remain recorded. ExecutionFailed and E_PROTECTION are unexplained, with no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+## Historical checkpoint before Stage C publication
+
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or native experiment is activated.
+- Last merged PR: #52 at 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 attempt 1 failed: macOS job 131260319040 started no steps, had no runner name, and was cancelled after runner acquisition failed. Its annotation explicitly reports macOS arm64 capacity constraints. Ubuntu and Windows passed. Main is not green.
+- Coordinator requested exactly one failed-job infrastructure rerun of 43240797525, retaining attempt 1 as failed. No source fix, blind retry-to-green, timeout increase, platform removal or policy bypass. A further capacity failure must be recorded before any next action.
+- Queue priority: Stage C two-line Unix Clippy correction independent Opus recheck, then publication for hosted Unix build/execution tests and all five gates. Main capacity recovery must also be verified before merge. Stage D and cgroup setup/experiments/activation remain separately gated.
+- Stage C source 656dde3 / candidate cc876ab passed independent Opus high Spec review; Standards F1 requires catch_unwind(...).unwrap_or(125) and an empty unit arm. Coordinator Sol medium applies only those production changes, retains the review and redacts the local account path in current evidence. Final Windows fmt/locked workspace Clippy and focused scanner/S5 4/4 pass (475526ac). [Follow-up](evidence/unix-shim-stage-c-review-followup.md). No real Unix compile/test or mutation kill is claimed; builder's 308/2 full run remains credited to 656dde3.
+- F2 remaining lexical scan limits are disclosed, including renamed hook aliases, indirect stderr writes and macro-expanded unwrap. Existing shim has none of the unsafe alias/writer/hook forms; no semantic privacy proof. Older evidence paths containing local account names need a separate docs cleanup preserving historical credit.
+- ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, secret exposure or babysitter change.
+
+## Historical checkpoint before Stage C Unix lint follow-up
+
+
+- Stage C local implementation is committed at `656dde3c4c221b0048487a738ede5f0782f078c5`: standalone Unix exec-child/tool-probe, early reserved-prefix routing, one silent shim-only hook/catch, owned-temp S1–S7 tests and extended P-SCAN. [Evidence](evidence/unix-shim-stage-c.md) records the source manifest, commands, failure and coverage limits.
+- Own Windows validation: fmt/whitespace and locked workspace all-target Clippy passed. Focused scanner/identity: 4 passed (`5a120636`). Exactly ONE final default-concurrency workspace nextest after final source: **308 passed, 2 skipped**, `be7440d0-0f61-4a24-8201-90a42bf1f5c5`, 10.608s. No Unix execution or mutation credit: Linux cross-check failed before arxd because the cross C compiler is unavailable. Unix tests/Clippy and compiled shim mutations remain pending hosted verification.
+- Queue: fresh Anthropic / Opus 5.5 / high source/security review BEFORE publication, then all five hosted checks at the actual candidate head before any merge. This implementation sub-agent performs no publication or delegation. Stages D/E/F/G remain unbuilt here; production native execution stays inactive. ExecutionFailed and E_PROTECTION remain unexplained, without a fix, waiver or retry.
+- Provider/outcome: OpenAI / gpt-6.1-sol / high — Stage C implemented locally; independent review and Unix acceptance pending. M2 remains incomplete; native, installed and dedicated paths remain **unverified on real hardware**.
+- Last merged PR remains #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`; inherited five-gate/review credit only. Main after #52 is pending, not claimed green. All earlier provider rows and queue history are retained below.
+
+## Historical checkpoint before Stage C implementation
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. Production native execution is inactive; no experiment retry is authorized.
+- Last merged PR: #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`, 14:47:06 UTC, all five gates on c6eb700 plus independent Opus review. Squash tree equals reviewed head. Main CI after #52 is pending, not claimed green.
+- Stage B hosted Unix condition is met: run `43238092776` passed all platforms. Linux nextest 243 passed / 3 skipped; macOS 244 passed / 1 skipped. Both logs show r1_l1_marker_never_executes passed. These are hosted job-log observations, not local Unix runs. Root-only phase sites and real shutdown propagation remain source-reviewed, not native acceptance.
+- Queue priority: Stage C fixed Unix exec-child shim and tool-probe, independent Opus security review, then hosted gates; Stage D bridge follows separately. Cgroup setup/cleanup, E_PROTECTION diagnosis/disposable experiment and activation retain separate gates. No runner root-only path or production caller is enabled.
+- Provider assignment: OpenAI / gpt-6.1-sol / high builds Stage C in an isolated worktree. Anthropic / Opus 5.5 / high independently reviews. The shim routes before runtime/config access, refuses euid 0, resolves only fixed tools or absolute targets, opens cwd without links, bounds probe output/time and uses a silent panic hook only in its separate shim process. All valid execution fixtures must be ordinary-user owned synthetic paths, never service/build accounts or installed state.
+- Before adding the shim to P-SCAN, audit the disclosed alternate forms (UFCS/function-value/raw unwrap, renamed logging macro, RunFailure type alias From and stderr writeln). A green lexical scan alone is not a privacy proof. Preserve owner CLI routing and every Stage B legacy/phase/cancellation guarantee.
+- Main after #51 passed run 43233144276 in 596s. ExecutionFailed and E_PROTECTION remain unexplained; no pass is a fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe or babysitter change.
+
+## Historical checkpoint before Stage B merge
+
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).

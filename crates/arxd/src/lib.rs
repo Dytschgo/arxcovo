@@ -10,3 +10,5 @@ pub mod service;
 pub mod store;
 
 pub mod development;
+#[cfg(any(unix, test))]
+pub mod unix_shim;
