@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E3 review `de2cc44` found one test-only B1 blocker (bounded-read overconsumption). Sol medium added Linux pipe test `c13fc98`; production unchanged, Windows fmt and scanner4 pass. Native test/mutants remain unrun, narrow Opus recheck is next. E3 unpublished/inactive.
 - E3 Linux descriptor adapter is built locally by Sol high: source `eb93620`, evidence `61b0ec9`, ported unchanged onto merged E2 main `c56b6b5`. Windows fmt/Clippy, focused60 and single final362/3 workspace pass are credited at original source only. Actual Linux compilation/native tests/mutations remain unverified (missing cross C compiler). Independent Opus high security review is next; no publication or activation.
 - Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`, at 18:46:14Z. Its squash tree equals independently reviewed `be629c8`; all five required checks passed. Main-after-PR60 run `43485836788` succeeded on attempt 1 in 657s (18:46:16-18:57:13Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - E2 setup/janitor over fake ports is integrated and inactive. Sol high is building E3 Linux descriptor adapter locally on reviewed E2; parent source will be re-pinned to merged main before publication. No real cgroup setup or activation.
