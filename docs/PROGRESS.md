@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR58, `2fbc6476fde3aaa5c1e94ad46872e46315d73018`, at 17:41:49Z. Its tree equals reviewed head `f80526a`; all five checks and independent Opus high integration review passed. Main-after-PR58 run `43475344395` is pending.
+- Main-after-PR56 run `43473029593` succeeded on attempt 1 in 507s (17:27:48-17:36:15Z). No gate bypass or policy change. The bootstrap exception remains exhausted.
+- Next: independent Opus high recheck of Sol medium E5 tests-only correction `c46304e`, evidence `da1762d`, then re-pin onto current main and integrate with reviewed E1. E5 remains unpublished and inactive. Earlier source/verification credits remain at their stated pins.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved; no fix, waiver or retry.
+
+## Historical checkpoint before E1 merge
+
 - Queue priority: PR58 E1 exact-head review/gates, then E5 test-correction security recheck. PR56 merged normally3875466 at17:27:45Z, contract is on main. E5 source f866af4 first Opus review4e1d6b8 required tests-only S1/B1 repairs. Coordinator correctionc46304e restores rustfmt coverage and pins both production forwarding sites; focused17/fmt/Clippy pass, both surviving mutants now fail assertions and formatting negative control is caught. Production bytes unchanged. E5 unpublished; no activation, hardware acceptance or exception. E1 published source is reviewed; its exact-head recheck starts next.
 - Main after PR53 run43464791125 passed attempt1 in598s; main after PR54 run43462769959 passed567s. All five protection requirements/app pins and strict mode remain restored; bootstrap exception exhausted, no product waiver.
 - ADR0020/brief carry the previously independently reviewed local-delivery clarification4272291 (Opus PASS0f471e8), allowing local inactive implementation on explicit reviewed dependencies while publication/integration retain gates. Technical design unchanged; local E1/E5 are built but pending source review/re-pin. No native owner/service/cgroup/VM/experiment or production activation. Coordinator OpenAI / gpt-6.1-sol / medium.
