@@ -222,3 +222,25 @@ not claimed guards. Current tree has no such production calls. Stage F/G
 and activation remain gated; M2 incomplete and hardware unverified.
 
 Updated committed scanner blob `3a75dd0b980b5d8621c3a4a3cd6198d4f04d3bbb`; SHA-256 `f6482569f8f0032a51480e18a13a14c62e332efad2b51d1cbe3b18e39c6004bc`.
+
+## PB3 generic and closure boundary correction
+
+Opus high recheckef368d0 (retained346c589) closes PB2 braced cases but
+finds over-stripping inside attributed generics/lifetimes/closure parameters.
+Sol medium correction `f059a53886d4bc9aae82fc189868921d54e5490d` adds top-level > and | stops. The
+control set is now7 shapes times2 forbidden calls, adding attributed type,
+lifetime and single closure parameter cases. The previous stop-set mutant
+fails the new regression with exit100. All3 actual uncompiled source-file
+probes fail the crate inventory and were removed, with bytes restored.
+
+Fmt and locked workspace/all-target Clippy pass. Restored focused11/11
+passed in0.418s (7c2a7846-9f96-47d6-b996-04d705afb83e). No full-suite or
+seven-mutant repeat; prior credits remain at their pins. Production unchanged.
+Stopping at > or | can expose a cfg(test) return/closure body and raise a
+false positive; this stricter behavior is accepted for the lexical fence,
+not claimed to parse arbitrary Rust semantically. Other disclosed PA8/PA9
+limits remain. This is correction attempt3 after two failed inventory
+fixes; if independent recheck fails, hand off correction to the other
+provider with all three reports, without resetting the count.
+
+Current committed scanner blob `1ba51296f1567c96fad348adf2f4763540e76d31`; SHA-256 `07ef5abbe8319e369e5fc30321a2e41b49861519af417c6c5b2101a79f1022eb`.
