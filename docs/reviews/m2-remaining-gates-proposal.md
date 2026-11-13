@@ -1,8 +1,10 @@
 # M2 remaining gates: proposed next slices (design only)
 
 Author: Anthropic / claude-opus-5-5 / high, design sub-agent, 2026-11-14.
-Status: **proposal, not accepted.** It needs an independent Sol high review
-before anyone acts on it. I claim no review independence for ADR 0019/0020
+Status: **proposal, not accepted.** Independent Sol high review
+`9b62dd2` requested changes; this
+revision addresses its findings and awaits a narrow Opus high recheck.
+I claim no review independence for ADR 0019/0020
 text I helped write. This file grants no implementation, run, dispatch,
 activation or owner step.
 
@@ -29,8 +31,10 @@ activation or owner step.
 ## Current state (facts only)
 
 - M1 is accepted and M2 is incomplete. E1-E7 are merged and inactive, with
-  main at `5ae645e`. PR66 is a test-only source PASS (`414caaa`), and its CI
-  is still outstanding. Production is `MechanismUnavailable`:
+  main at merged PR66 `1ac4047`. PR66 passed independent source review
+  (`414caaa`) and all five required checks before merging. Main-after-PR66
+  run `43527940656` remains pending in this record. Production is
+  `MechanismUnavailable`:
   `Execution::configured` builds `Self::native(` (`service/executor.rs`).
 - Native, installed and dedicated paths are **unverified on real hardware**.
   The dispatcher privacy flake, `E_PROTECTION` and `ExecutionFailed` are
@@ -70,9 +74,11 @@ cfg stripping):
    consumed, so setup and the janitor never run.
 4. `check` becomes a `StartupDomain::new` parameter, the same shape
    `Execution::configured` uses (`executor.rs`, `configured`). Tests pass
-   `config.execution_preflight(&layout, &FakeResolver)` (the existing
-   `config.rs` test resolver) and a refusing closure. A wiring pin forbids
-   a literal `|| Ok(())` check in `StartupDomain`.
+   an owned `Fn() -> Result<(), Unavailable> + Send + Sync + 'static`
+   closure invoking `execution_preflight(&layout, &FakeResolver)` on every
+   preflight, using the existing test resolver, plus a refusing closure.
+   Do not pass an eagerly evaluated Result or a NativeResolver. A wiring pin
+   forbids a literal `|| Ok(())` check in `StartupDomain`.
 
 Tests (one module):
 
@@ -127,9 +133,14 @@ closure (`executor.rs:395-406`).
   directly. When it returns, assert `Failed{Unknown}` and that the flag is
   already true. The flag is set by real `Drop` code during a real unwind,
   not by the fake. This differs materially from the current fake PA6.
-- **U-b.** Through `dispatch` with `limit = 1`, the next request reaches the
-  gate, latches at step 1 (`unix_bridge.rs:86-87`), refuses, and makes 0
-  port calls.
+- **U-b.** Keep two separate assertions with `limit = 1`: an ordinary
+  request refuses early after the panic latch; a deterministically
+  pre-admitted request is held before slot acquisition and released only
+  after residue publication. Observe the actual in-slot residue gate and
+  zero Runner calls for that request. Neither readiness nor quarantine nor
+  the monotone flag may be reset to make it reach the gate. A gate-omission
+  mutant must fail this assertion; an early preflight or row-G quarantine
+  refusal earns no gate credit.
 - **U-c.** A source-inventory test with a mutant control. In `unix.rs`,
   `Group` appears only as the local `group` and the `ChildGuard` field.
   There is no `forget`, `ManuallyDrop`, `Box::leak`, `Arc<Group>` or thread
@@ -137,10 +148,13 @@ closure (`executor.rs:395-406`).
   the same closure. This is a lexical guard (as E7 PA1 discloses), not a
   proof.
 - **Mutants:** `drop_skips_store`, `catch_outside_slot` (moves `fetch_sub`
-  before `backend.run` returns) and `group_forgotten`.
+  before `backend.run` returns), `group_forgotten` and
+  `in_slot_residue_gate_omitted`. U-a remains real-Group Drop/bridge
+  decomposition evidence; U-c is only a partial lexical guard. Neither
+  earns real-Runner, root or cgroupfs evidence.
 
-**Finding for the reviewer (not silently resolved).** On unwind, `body`
-exits before its post-run latch (`unix_bridge.rs:94-103`), and the catch arm
+**D6 disposition proposed for separate implementation review.** On unwind,
+`body` exits before its post-run latch (`unix_bridge.rs:94-103`), and the catch arm
 maps to `Failed{Unknown}` without latching. ADR 0020 D6 says "stores the
 flag, then latches, before its slot release". On this path only the store
 precedes release. The bound still holds through gate step 1 at the next
@@ -158,7 +172,8 @@ refused. This needs a test-only panic point in the privileged module, and
 it runs only from the ignored disposable fixture. I propose adding it as
 brief item **A13**, under Stage F's separate design and review. It stays
 **unverified on real hardware**. S2 closes only PA6-local. Whether PA6-local
-plus A13 replaces "PA6 open" is a decision for the Sol review.
+plus A13 suffices remains subject to a separately reviewed native design
+and accepted evidence. Real-Runner PA6 remains OPEN after S2.
 
 Acceptance is the same as S1, and U-a/U-b run on hosted Linux only.
 
@@ -181,6 +196,10 @@ fix.**
 - The top level records the first and the final exception separately, plus
   fixed mutation tokens (none, staged, account, service, cgroup) and a
   cleanup token (confirmed, unconfirmed, not_reached).
+- The record has a fixed schema/version, reviewed source and workflow SHAs,
+  and run/attempt association in a bounded envelope. Bound predecessor count
+  and total input as well as the 4 KiB output; reject overflow and malformed
+  records rather than truncate them into replay evidence.
 - The record has one schema-validated JSON line of at most 4 KiB. It
   contains no path, uid number, name, argv, environment or payload. The
   workflow prints only that validated line.
@@ -189,6 +208,10 @@ fix.**
   real `decide` and requires the recorded refusal. That makes it
   red-capable once a real line exists. Until then, tests on synthetic
   triples are labelled mechanism tests, not reproduction.
+- Tests exercise the real predicate, both initial/final exception orderings,
+  hostile payload suppression and every bound. Synthetic tests remain
+  mechanism evidence until a captured refusal reproduces through the real
+  predicate; no historical red replay exists.
 - Known unknown for F0 review: whether the unchanged driver and
   `disposable.rs` still match the post-0019/0020 Runner contract.
 
@@ -196,13 +219,15 @@ fix.**
 requires before any diagnostic proposal runs, and Sol for this
 architecture. F0 merges through the normal gates.
 
-**F2 (fresh proof, not a retry).** A new reviewed SHA is dispatched once
-under the existing gate. It produces new evidence and claims nothing about
-run 43091339273, which stays unknown permanently. If the outcome is
-refused, the trace drives the debug loop (red replay, then hypotheses),
-with no automatic second dispatch. If it passes, it supplies inputs for
-A1-A13 only after their own design. Cleanup that is unknown or unconfirmed
-ends that environment's use.
+**F2 (no dispatch authorized).** A new SHA does not discharge ADR 0019
+D7's no-retry restriction or the diagnostic evidence gap. Root must
+explicitly disposition both before proposing any observation or experiment.
+Any such proposal needs its own reviewed scope, source pins, fresh disposable
+environment, technical fences and owner-only dispatch. Diagnostic observation
+is not A1-A13 acceptance. F0 artifact/replay comes before hypotheses or fixes;
+a fresh captured refusal must reproduce through the real predicate before
+diagnosis. Unknown or unconfirmed cleanup permanently excludes that
+environment. This proposal authorizes no historical retry or new dispatch.
 
 ## Stage G (out of scope here)
 
@@ -216,10 +241,12 @@ proposal adds no approval flow and does not widen agent or user authority.
 
 None are needed for S1, S2 or F0. These are needed later:
 
-1. **F2 dispatch.** The workflow requires `github.actor ==` the owner
-   account and a `UNIX_EXECUTION_REVIEWED_SHA` repository variable
-   (`.github/workflows/unix-execution-experiment.yml`). The owner sets the
-   variable to the reviewed SHA, dispatches once, then clears it.
+1. **Any later observation/experiment.** An explicit owner decision must
+   first resolve the no-retry restriction for a separately reviewed bounded
+   scope; no request or preapproval is made here. Existing technical fences
+   require owner actor and triggering actor, main ref, matching reviewed
+   source/workflow SHAs and `UNIX_EXECUTION_REVIEWED_SHA`. Only the owner
+   may set that variable, dispatch and clear it after all applicable gates.
 2. **The M2 acceptance host.** A real host where the owner installs `arxd`
    and creates the dedicated standard build account (KICKOFF M2; ADR 0009).
    Which OS and host are used is not settled by the documents I read
@@ -236,6 +263,13 @@ None are needed for S1, S2 or F0. These are needed later:
 In order: S1, then S2 (one PR each, Sol builds, Opus reviews), then F0
 (Opus or Sol builds, the other provider reviews, plus the Opus diagnostic
 review). None activates anything.
+
+Failure accounting is unchanged across S1, S2, F0 and every new SHA: three
+failed fixes require other-provider handoff with failure evidence, and
+KICKOFF's both-provider stop condition remains. No slice resets counters or
+waives a gate. Prior test/CI credits stay at their original pins. The drain
+waiting, autonomous-release and inspection-only seam advisories remain;
+they earn no new hardware credit and authorize no parked-work retry.
 
 ## Known unknowns
 
