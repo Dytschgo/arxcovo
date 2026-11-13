@@ -278,6 +278,12 @@ mod tests {
             assert_eq!(l.runs(), expected);
         }
         for input in [
+            "0::/x\n1:name=systemd:/arxd.service/supervisor",
+            "0::/x\n0::/arxd.service/supervisor",
+            "0::/a\0/arxd.service/supervisor",
+            "0::/a\r/arxd.service/supervisor",
+            "0::/a\\b/arxd.service/supervisor",
+            "0::/xarxd.service/supervisor",
             "0::/a/supervisor",
             "0::/system.slice/foo.service/supervisor",
             "0::/arxd.service/x/supervisor",
@@ -309,7 +315,11 @@ mod tests {
     }
     #[test]
     fn p2_leaf_grammar() {
-        for s in ["arx-0-0", "arx-4194304-18446744073709551615"] {
+        for s in [
+            "arx-0-0",
+            "arx-4194304-18446744073709551615",
+            "arx-1234567890-12345678901234567890",
+        ] {
             assert!(leaf_name(s.as_bytes()));
         }
         for s in [
@@ -346,6 +356,7 @@ mod tests {
             "frozen 0",
             "populated 2",
             "Populated 0",
+            "Populated 0\npopulated 0\n",
             "populated 0\nfrozen-x 0",
             "populated 0\nfrozen x",
             "populated 0\r\n",
@@ -411,6 +422,8 @@ mod tests {
             good.replace("00c1", "01c1"),
             good.replace("00c1", "00C1"),
             good.replace("Privs:\t1", "Privs:\t0"),
+            good.replace("Privs:\t1", "Privs:\t10"),
+            good.replace("00c1", "00c1x"),
             format!("{good}NoNewPrivs:\t1\n"),
             format!("{good}CapBnd:\t00000000000000c1\n"),
             "NoNewPrivs:\t1\n".into(),
@@ -560,6 +573,9 @@ mod tests {
             Some(Err(())),
             Some(Ok(0o120777)),
             Some(Ok(0o020600)),
+            Some(Ok(0o140600)),
+            Some(Ok(0o060600)),
+            Some(Ok(0o010600)),
             Some(Ok(0)),
         ] {
             assert_eq!(classify_entry(b"cgroup.events", 0, mode), Refused);
