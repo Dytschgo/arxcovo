@@ -3,7 +3,7 @@
 ## Current state - 2026-11-13
 
 - Local inactive discovery coverage follow-up is complete by Sol high: source `99a1fd7`, evidence `52dfcc8`, ported unchanged onto merged E7. Fmt/workspace Clippy, focused49, seven compiled kills and final386/3 are credited at source pin. PA1-PA4 tests added; PA5 and real Runner unwind/store-before-slot-release PA6 proof remain open. Fresh Opus high security review is next, no publication or activation.
-- Last merged PR64 `0a95d2806b197431ae7d7c9cc002fdaadaeb145d`, at 22:42:24Z. Squash tree equals independently reviewed `9f44c0a`; all five required checks passed. Main-after-PR64 run `43521455840` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Last merged PR64 `0a95d2806b197431ae7d7c9cc002fdaadaeb145d`, at 22:42:24Z. Squash tree equals independently reviewed `9f44c0a`; all five required checks passed. Main-after-PR64 run `43521455840` succeeded on attempt 1 in 619s (22:42:27-22:52:46Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - Inactive Stage E slices E1-E7 are merged. Sol high is strengthening the retained pre-activation test gaps locally; source review and normal gates remain required for that follow-up. Production Unix startup/execution is still inactive; Stage F/G and hardware acceptance are separate outstanding gates.
 - Latest main-after-PR63 run `43510685416` passed attempt1 in632s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix, waiver or retry.
 
