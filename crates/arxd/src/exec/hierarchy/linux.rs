@@ -395,6 +395,28 @@ mod tests {
         std::fs::write(path, b"safe").unwrap();
     }
     #[test]
+    fn l1_read_limit_leaves_excess_pipe_bytes_unread() {
+        use std::io::Write;
+        if !ordinary() {
+            return;
+        }
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let mut remaining = File::from(reader.try_clone().unwrap());
+        let mut writer = File::from(writer);
+        writer.write_all(&[b'x'; 32]).unwrap();
+        drop(writer);
+        assert!(matches!(text(reader, 7), Err(FsError::TooBig)));
+        let mut unread = Vec::new();
+        remaining.read_to_end(&mut unread).unwrap();
+        assert_eq!(unread, vec![b'x'; 24]);
+    }
+    #[test]
     fn l1_bounds_and_bounded_writes() {
         let Some((t, fs, dir)) = fixture() else {
             return;
