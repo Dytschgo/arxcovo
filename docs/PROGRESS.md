@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Coordinator OpenAI / gpt-6.1-sol / medium accepts bounded local S1/S2a/S2b/F0 preparation after Sol high design review `9b62dd2` and Opus high delta recheck `29e2d03` (retained `b4f78a4`), both blockers resolved. S1 failed-Locate/live-check implementation is next, independently reviewed before publication. Distinct-token and observed-gate limitations are explicit. No dispatch, historical retry, A13 acceptance, activation or owner step is authorized; real-Runner PA6 remains OPEN. Earlier unaccepted checkpoints below are superseded by this disposition.
+
 - Opus high correction recheck `ae05533` (retained `f757b3a`) requested one narrow Spec correction: prerequisite D6 merge order, distinct in-slot readiness/residue mutants, and release only after the slot is free. Coordinator Sol medium revised the proposal and clarified the single-line envelope, revision credit and missing-location/check precedence. Narrow recheck remains required; proposal unaccepted and no implementation/dispatch authorized.
 
 - Last merged PR66 `1ac40479707718a045dbe6cfcc7d9b0cdf234622`, at 2026-11-13 23:33:02Z. Squash tree equals independently reviewed `43ee910`; all five required checks passed. Main-after-PR66 run `43527940656` succeeded on attempt 1 in 624s (2026-11-13 23:33:04-23:43:28Z), below the 900s budget. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.

@@ -3,12 +3,16 @@
 Author: Anthropic / claude-opus-5-5 / high, design sub-agent, 2026-11-14.
 Revisions: OpenAI / gpt-6.1-sol / medium, `a7b98df` and the subsequent
 SP-R1 correction; original architecture authorship remains with Opus.
-Status: **proposal, not accepted.** Independent Sol high review
-`9b62dd2` requested changes; this
-revision addresses its findings and awaits a narrow Opus high recheck.
-I claim no review independence for ADR 0019/0020
-text I helped write. This file grants no implementation, run, dispatch,
-activation or owner step.
+Status: **accepted by coordinator for bounded local S1, S2a, S2b and F0
+preparation, 2026-11-14.** Original Opus design received independent Sol high
+review `9b62dd2` (retained `8b8fca3`). Sol revisions address that review and
+Opus correction review `ae05533` (retained `f757b3a`); final correction
+`1a173a9` passed Opus high recheck `29e2d03` (retained `b4f78a4`).
+Coordinator: OpenAI / gpt-6.1-sol / medium. Each implementation still needs
+independent source review, current-base integration and green required checks.
+No dispatch, historical retry, native acceptance, activation or owner step is
+authorized. A13 remains proposed and real-Runner PA6 stays OPEN. Original
+Opus architecture authorship is retained without independent Opus credit.
 
 ## Isolation and pins
 
@@ -94,8 +98,9 @@ Tests (one module):
   that check's token, the runner is not called, and Ready is still
   reachable only through setup.
 - **L-b2.** Missing location plus a refusing live check returns that check's
-  exact error token. This pins check-before-runner-before-readiness
-  preflight precedence, with zero factory/setup/Runner calls.
+  exact error token, distinct from `MechanismUnavailable`. This proves
+  only that the live check runs first, with zero factory/setup/Runner calls;
+  identical later refusal tokens do not prove runner/readiness order.
 - **L-c.** A located input with the real `execution_preflight` and the fake
   resolver: the W1 log is unchanged.
 - **Mutants**, compiled, with an exact SHA-256 restore:
@@ -162,6 +167,8 @@ closure (`executor.rs:395-406`).
      request; require the actual residue check to latch Containment and
      refuse with zero Runner calls. Removing only that check
      (`in_slot_residue_check_omitted`) must fail the named assertion.
+  Gate evidence relies on the held position, zero Runner calls and absence
+  of Busy/Stopping, never the shared `MechanismUnavailable` token alone.
   No assertion may reset readiness, quarantine or the monotone flag. Tests
   must distinguish gate entry and refusal from any unrelated early refusal.
 - **U-c.** A source-inventory test with a mutant control. In `unix.rs`,
