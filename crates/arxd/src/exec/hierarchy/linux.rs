@@ -603,7 +603,7 @@ mod tests {
         for n in ["cgroup.events", "arx-1-2", "target"] {
             file(&t.path().join(n));
         }
-        symlink("target", t.path().join("link")).unwrap();
+        symlink("target", t.path().join("memory.max")).unwrap();
         let fifo = CString::new(t.path().join("fifo").as_os_str().as_bytes()).unwrap();
         assert!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0);
         let _socket = UnixListener::bind(t.path().join("socket")).unwrap();
@@ -612,7 +612,7 @@ mod tests {
             (b"child".as_slice(), Entry::Child),
             (b"cgroup.events", Entry::Control),
             (b"arx-1-2", Entry::Refused),
-            (b"link", Entry::Refused),
+            (b"memory.max", Entry::Refused),
             (b"fifo", Entry::Refused),
             (b"socket", Entry::Refused),
         ] {
