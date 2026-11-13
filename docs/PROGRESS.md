@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`, at 20:53:55Z. Its squash tree equals independently reviewed `9937c16`; all five required checks and both native evidence jobs passed. Main-after-PR62 run `43505759245` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- E4 native run `43504012486` passed attempt1 in111s as UID/euid1001 with all11 mutation kills, before/after baselines and matching restored fingerprints. Independent Opus completed-evidence comment6864567049 confirms it. This is hosted owned-fixture evidence, not real product-hardware acceptance. No production execution activation.
+- Sol high is implementing local E6 readiness, in-slot gates and latches over fakes on the reviewed E4 stack. Re-pin onto merged E4, independent source/integration review and required checks remain publication/merge gates. E7 startup/cache and Stage F/G remain separate.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry. Strict five-check protection unchanged; bootstrap exception exhausted.
+
+## Historical checkpoint before E4 merge
+
 - E4 native run `43504012486` succeeded attempt1 at PR62 head `9937c16` in111s. Root parsed UID/euid1001, all11 exit100 kills, restored matching fingerprints, before/after library and L8 pass, and fenced S6 baselines10.593/6.646s. Completed-evidence independent confirmation is next before agent-review; Windows/macOS still pending at prior read. No merge or activation.
 - E4 native harness pre-push review is complete: Opus high `23dee78` and label recheck PASS `0123317` close B1. Coordinator publishes the reviewed harness for its first ordinary-user Ubuntu execution on PR62. Eleven native kills, explicit skip/pass baselines, restoration, exact-head review and refreshed five checks remain merge requirements; no activation.
 - E4 harness review `23dee78` required B1 integration label correction. Sol medium `d06e541` unifies Cargo target/nextest label mapping; portable22 pass, old-driver control fails, and real nextest synthetic integration pass/fail outputs classify correctly. No E4 native execution. Narrow Opus recheck pending before push.
