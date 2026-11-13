@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- E2 fake-port setup/janitor is ready for publication on main `064113a`. Sol high source `b40e81a` passed Opus high review `dd4dad8` after Sol medium tests-only correction `70729f6` passed recheck `352a8c1` (retained `12578aa`); B1/B2 closed. Production setup.rs is unchanged. Exact-head integration review and all five hosted checks remain required; no activation.
+- Verification credits: builder fmt/Clippy, focused58, 14 mutation kills and one full360/3 at b40e81a; coordinator test correction fmt/Clippy and focused24; reviewer restored focused24 and three targeted mutation/probe kills. No new full-suite run claimed for docs/test-only changes.
+- Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`; main run `43479932347` passed attempt1 in511s. All five required checks/strict protection retained; bootstrap exception exhausted.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy assertion flake, ExecutionFailed and E_PROTECTION remain unresolved; no fix, waiver or retry.
+
+## Historical E2 review checkpoint
+
 - E2 first review `dd4dad8` passed Standards and required two tests-only Spec fixes. Sol medium correction `70729f6` catches both surviving mutants; fmt/workspace Clippy and focused 24/24 pass. Production is unchanged; narrow Opus recheck is next, E2 remains unpublished.
 - E2 local fake-port setup/janitor is implemented by OpenAI / gpt-6.1-sol / high: source `b40e81a`, evidence `a4deb6e`, retained `af72d31`/`329e538` on merged E5. Builder fmt/Clippy, focused 58, 14 mutation kills and single final 360/3 workspace run passed at original pins. Source is unchanged by the port. Independent Opus high security review is next; no publication or activation.
 - Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`, at 18:09:55Z. Squash tree equals reviewed `ab9ea63`; independent Opus high integration review and all five required checks passed. Main CI run `43479932347` succeeded on attempt 1 in 511s (18:09:58-18:18:29Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.

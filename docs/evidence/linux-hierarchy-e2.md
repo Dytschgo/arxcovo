@@ -219,3 +219,12 @@ review, including unproven mkdir mode and fake/driver guard distinctions.
 
 Updated committed fake.rs manifest:
 - Git blob `0de9e4e95ee4101f195b06e5115203035e7ac078`; SHA-256 `69838972dbd426c3c227ba0613a7054a609d0b8dc34c912780f52d60043ed90f`.
+
+## Publication checkpoint
+
+Opus high recheck352a8c1 (retained12578aa) passes Standards and Spec, closing
+B1/B2. Current main064113a is unchanged since the root port; source delta
+remains exactly hierarchy.rs/setup.rs/fake.rs. Production setup.rs is identical
+to b40e81a, and fake.rs matches corrected70729f6. Retained review notes are
+unchanged. No extra full-suite run for report/docs changes. Exact-head
+integration review and all hosted gates remain required.
