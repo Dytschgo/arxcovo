@@ -165,3 +165,27 @@ Native kills: **zero measured here**. Ordinary Ubuntu baselines and kills,
 fresh Opus high review and the S11 fixture repair remain outstanding. M2 is
 incomplete; production remains inactive/MechanismUnavailable. Native and
 hardware paths remain **unverified on real hardware**.
+
+## Coordinator S11 fixture correction before review
+
+Sol medium correction `f17a7ac69892b2d6bd65502afac00428373f3756` reads PR_GET_NO_NEW_PRIVS directly
+for the inherited-NNP precondition, independently of nnp(). An inherited
+NNP1 still produces the explicit skip; invalid kernel observation fails.
+The hard-coded nnp=true mutant can no longer manufacture its own skip.
+Production bytes are unchanged. This is source reasoning, not a native kill.
+
+The fixed manifest now has11 runnable cases and no blocked row. Source and
+manifest hashes were refreshed; the portable suite validates all fragments
+in memory.21 portable tests passed, including full11-kill synthetic flow
+and the oldblocked-case fail-closed check. Fmt passed. No native execution,
+push or CI action. Fresh Opus high review is required before publication.
+
+Updated committed manifest:
+
+| Path | SHA-256 |
+| --- | --- |
+| `crates/arxd/src/unix_shim_rights_linux_tests.rs` | `102ec5720cd1ecfd1236ebea4237025e155bcef974de27ad876b550525e059fd` |
+| `.github/workflows/e4-native-evidence.yml` | `48122e681f227be7e7b2b6acc091c10782dd8685e9d71c81ffd4dcbb377834f8` |
+| `tools/ci/e4-native/driver.py` | `7226a7df6e29eef8f8c8cb7e7be6b8f4c268c9a3181353de9352f42927fa9e37` |
+| `tools/ci/e4-native/test_driver.py` | `57f33fe4b380119ae79dc3177bf640f6dc878a91c2b419cc78da262fdc1c5dfa` |
+| `tools/ci/e4-native/mutations.jsonl` | `15980053ce88457578407686d309af95a6dd18cb175fd777d82ac0e70b850671` |
