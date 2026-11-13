@@ -41,7 +41,7 @@ fn domain(
     AdmissionDomain::new(
         &Layout::for_test(Platform::Linux),
         &c,
-        "/owned-synthetic/runs".into(),
+        Some("/owned-synthetic/runs".into()),
         |_| {
             Ok(Box::new(Port {
                 step: Box::new(step),
@@ -450,7 +450,7 @@ async fn t20_shared_domain_handles_never_replace_runner() {
     let d = AdmissionDomain::new(
         &Layout::for_test(Platform::Linux),
         &config(),
-        parent.clone(),
+        Some(parent.clone()),
         |owner| {
             allocations.fetch_add(1, Ordering::AcqRel);
             assert!(
@@ -544,7 +544,7 @@ pub(super) async fn pa6_panic_residue_report_and_gate() {
     let b = Arc::new(UnixBridge::new(
         &Layout::for_test(Platform::Linux),
         &config(),
-        "/owned-synthetic/runs".into(),
+        Some("/owned-synthetic/runs".into()),
         |_| {
             Ok(Box::new(Port {
                 calls: count,
