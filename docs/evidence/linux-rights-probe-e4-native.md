@@ -189,3 +189,24 @@ Updated committed manifest:
 | `tools/ci/e4-native/driver.py` | `7226a7df6e29eef8f8c8cb7e7be6b8f4c268c9a3181353de9352f42927fa9e37` |
 | `tools/ci/e4-native/test_driver.py` | `57f33fe4b380119ae79dc3177bf640f6dc878a91c2b419cc78da262fdc1c5dfa` |
 | `tools/ci/e4-native/mutations.jsonl` | `15980053ce88457578407686d309af95a6dd18cb175fd777d82ac0e70b850671` |
+
+## Native harness integration-label correction
+
+Opus high review23dee78 (retainedf78be2f) found B1 nextestintegration label
+was wrong. Sol medium correction `d06e5418d502d29213f87d4d25d7d1c4d541af81` maps Cargo selector unix_shim
+to reported label arxd::unix_shim using one binary configuration for both
+parsing and command selection. Library label arxd remains unchanged.
+The regression fixture accepts the qualified label, rejects the bare label
+for baseline/kill and preserves --test unix_shim. The old driver fails it.
+
+Portable22 tests passed. A separate owned scratch crate with no dependencies
+was built offline on Windows using actualnextest0.9.151 and the driverflags:
+a passing synthetic integrationtest (exit0) classified survived, and an
+assertion failure (exit100) classified killed. This validates reporter format,
+NOT E4 native behavior. No project test, nativeharness or CI run was executed.
+Production/workflow/manifest/sourcepins unchanged. Fresh narrow Opus recheck
+remains required before push. All11 native mutation kills remain unrun.
+
+Updated committed hashes:
+- `tools/ci/e4-native/driver.py`: `9b1dc47f83909fe493ed4910ddb9656c2656babe0e775b4e6cf1079daef4d658`.
+- `tools/ci/e4-native/test_driver.py`: `38e14eb4fc92fff62a304d53473dffc80cbb7465a25b31b65084f613d3104eff`.
