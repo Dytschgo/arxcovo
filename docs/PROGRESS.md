@@ -1,6 +1,12 @@
 # Arxcovo progress
 
-## Current state - 2026-11-12
+## Current state - 2026-11-13
+
+- Queue priority: validate main run `43459116760` after #57 merged `f1340a4`, then refresh #54 integration and merge through all normal gates. The repaired bot now posts ci-time-budget SUCCESS on qualifying measured head `c5bb191`. Strict main protection and all five requirements are restored.
+- #54 integration refresh inherits only the reviewed policy repair from new main. Original performance attempt 3 remains qualified at 567s/88s/0.946; no new performance fix, rerun or reset is claimed. New-head CI and independent integration review are required because main changed. Existing 21 Node checks remain plus seven inherited buffer regressions (28 total). Other performance and coverage criteria remain.
+- One PROGRESS conflict retains both complete histories below; no product source conflict. Provider: coordinator OpenAI / gpt-6.1-sol / medium. No product PR exception or native activation; M2 incomplete, hardware paths **unverified on real hardware**.
+
+## Historical candidate state - 2026-11-12
 
 - Queue priority: PR54 final performance attempt 3, integrating reviewed mirror compatibility source. Owner approved the exact A5 path expansion and separate compatibility prerequisite commit; all A1-A4/A6 numerical/coverage gates remain frozen. No ci-speed label until independently verified qualifying measurement.
 - Source `e9d63df` plus B1 correction `4b96952` is retained as `795a09e` / `6afecda`; independent Opus high full review `57f3ab12` and B1 PASS `2b1cb6e` are retained. Original reviewed helper bytes carry over exactly. [Evidence](evidence/ubuntu26-mirror-compatibility-fix.md), [source review](reviews/ubuntu26-mirror-compatibility-implementation-opus-review.md).
@@ -32,6 +38,16 @@
 
 ## Historical checkpoint before CI headless-shell candidate
 
+
+## Historical policy-repair state - 2026-11-13
+
+- Queue priority: publish the standalone bounded policy-buffer repair, normal CI and exact-head independent review, then hand back for the OWNER's authorized admin merge bypassing only ci-time-budget. Agent will not perform the admin merge or change branch protection. [Exception record](adr/0022-ci-policy-buffer-bootstrap.md).
+- One production line raises API maxBuffer from 1 MiB to finite 8 MiB; selection, first-attempt reads, thresholds, labels and status logic stay unchanged. Sol high source `bed6e5d`, evidence `80d14ea`; Opus high review `62b0dc1` passed. Main-base integration: 26 Node tests pass. [Evidence](reviews/ci-policy-buffer-repair-evidence.md), [review](reviews/ci-policy-buffer-independent-review.md).
+- #54 head `c5bb191` independently qualified on attempt 3, run `43318031363`: 567s, Windows compile88s/Clippy93s ratio0.946. ci-speed is applied. Trusted policy `43326387032` failed ENOBUFS, so no merge. Main is still #52 `1604db1`, baseline906s. Read-only protection requires Actions app15368 for ci-time-budget; local owner status cannot satisfy it.
+- User approved the reviewed gate-repair route after explanation. Once repair CI and independent agent-review are green, OWNER may bypass only the broken budget check for this repair PR. Then bot evaluation and #54 normal merge must use unchanged gates. No budget bypass for product PRs, no performance reset/retry or main force push.
+- Product PR53/55/56 and local E1/E5 remain held; no new product stack. M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed/E_PROTECTION remain unresolved; no native/owner/VM/experiment action.
+
+## Historical checkpoint before policy-buffer bootstrap
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
 - Last merged PR: #51, `064736022e559d0fb46a1de3943e57212eca87b0`, 14:02:39 UTC, all five gates on f627075 and independent review. Main run `43233144276` passed in 596s (14:02:42 to 14:12:38 UTC).
