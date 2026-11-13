@@ -6,7 +6,7 @@ use std::{path::Path, sync::Mutex, time::Duration};
 #[cfg(all(test, windows))]
 mod crash_tests;
 
-/// Private local identity and bounded activity; no credentials or host paths.
+/// Memory-only cache of released discovery response metadata.
 #[derive(Clone)]
 pub(crate) struct ToolCache {
     pub(crate) ticket: u64,
@@ -14,6 +14,7 @@ pub(crate) struct ToolCache {
     pub(crate) observed_identity: serde_json::Value,
     pub(crate) observed_at_ms: u64,
 }
+/// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     tool_cache: Mutex<Option<ToolCache>>,
     discovery_ticket: std::sync::atomic::AtomicU64,

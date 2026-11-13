@@ -740,3 +740,219 @@ fn s12_e4_portable_production_pins() {
         .unwrap();
     assert!(tools < line, "rights follow tools");
 }
+
+// Lexical regression inventory, not a semantic Rust reachability proof.
+fn e7_non_test_tokens(source: &str) -> Vec<String> {
+    let input = tokens(source);
+    let attribute = tokens("#[cfg(test)]");
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i..].starts_with(&attribute) {
+            i += attribute.len();
+            while input.get(i).is_some_and(|v| v == "#") {
+                i += 1;
+                assert_eq!(input.get(i).map(String::as_str), Some("["));
+                let mut depth = 0;
+                loop {
+                    match input[i].as_str() {
+                        "[" => depth += 1,
+                        "]" => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            let begin = i;
+            let mut nesting = Vec::new();
+            let mut block_item = input.get(i).is_some_and(|v| v == "{");
+            while i < input.len() {
+                let token = input[i].as_str();
+                // A cfg(test) argument can end at its surrounding call's
+                // delimiter rather than a semicolon (for example a closure).
+                if nesting.is_empty() && matches!(token, ")" | "]" | "}") {
+                    break;
+                }
+                if nesting.is_empty() && matches!(token, ";" | ",") {
+                    i += 1;
+                    break;
+                }
+                if token == "{" && nesting.is_empty() {
+                    block_item |= input[begin..i].iter().any(|v| {
+                        matches!(
+                            v.as_str(),
+                            "fn" | "impl" | "mod" | "struct" | "enum" | "trait"
+                        )
+                    });
+                }
+                match token {
+                    "(" | "[" | "{" => nesting.push(token),
+                    ")" | "]" | "}" => {
+                        nesting.pop().expect("balanced test-only item");
+                    }
+                    _ => {}
+                }
+                i += 1;
+                if token == "}" && nesting.is_empty() && block_item {
+                    break;
+                }
+            }
+        } else {
+            out.push(input[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+fn e7_inactive_source_allowed(path: &str, source: &str) -> bool {
+    let mut production = e7_non_test_tokens(source);
+    // The other reviewed pure imports are cfg(test) locate and the E6 test
+    // SetupFailure import. Those are covered by test-only context below.
+    let allowed = match path {
+        "service/unix_bridge.rs" => Some(
+            "use crate::exec::hierarchy::parse::{Hardening, RightsFact, classify_rights, rights_line};",
+        ),
+        "service/unix_bridge/readiness.rs" => {
+            Some("use crate::exec::hierarchy::setup::SetupFailure;")
+        }
+        _ => None,
+    };
+    if let Some(import) = allowed {
+        let import = tokens(import);
+        let hits: Vec<_> = production
+            .windows(import.len())
+            .enumerate()
+            .filter_map(|(i, v)| (v == import).then_some(i))
+            .collect();
+        if hits.len() != 1 {
+            return false;
+        }
+        production.drain(hits[0]..hits[0] + import.len());
+    }
+    for forbidden in [
+        "Runner::new(",
+        "hierarchy::",
+        "start_daemon_discovery(",
+        "StartupDomain::new(",
+        "AdmissionDomain::new(",
+    ] {
+        let pattern = tokens(forbidden);
+        if production.windows(pattern.len()).any(|v| v == pattern) {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn w8_e7_crate_wide_inactive_source_inventory() {
+    use std::path::Path;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let reviewed_test_files = [
+        "exec/tests.rs",
+        "exec/stage_b_tests.rs",
+        "exec/residue_tests.rs",
+        "exec/disposable.rs",
+        "exec/hierarchy/fake.rs",
+        "service/unix_bridge/tests.rs",
+        "service/unix_bridge/tests/e6.rs",
+        "service/unix_bridge/tests/e7.rs",
+    ];
+    for (parent, declaration) in [
+        ("exec/mod.rs", "#[cfg(test)] mod tests;"),
+        ("exec/mod.rs", "#[cfg(test)] mod stage_b_tests;"),
+        ("exec/mod.rs", "#[cfg(test)] mod residue_tests;"),
+        (
+            "exec/mod.rs",
+            "#[cfg(all(test, target_os = \"linux\"))] mod disposable;",
+        ),
+        ("exec/hierarchy.rs", "#[cfg(test)] pub(crate) mod fake;"),
+        ("service/unix_bridge.rs", "#[cfg(test)] mod tests;"),
+        ("service/unix_bridge/tests.rs", "mod e6;"),
+        ("service/unix_bridge/tests.rs", "mod e7;"),
+    ] {
+        let source = tokens(&std::fs::read_to_string(root.join(parent)).unwrap());
+        let required = tokens(declaration);
+        assert_eq!(
+            source
+                .windows(required.len())
+                .filter(|v| *v == required)
+                .count(),
+            1,
+            "reviewed test-only module declaration"
+        );
+    }
+    let mut directories = vec![root.clone()];
+    let mut count = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.path().symlink_metadata().unwrap();
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "source inventory follows no links"
+            );
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                assert_eq!(
+                    metadata.file_attributes() & 0x400,
+                    0,
+                    "source inventory no reparse"
+                );
+            }
+            if metadata.is_dir() {
+                directories.push(entry.path());
+                continue;
+            }
+            if entry.path().extension().is_none_or(|v| v != "rs") {
+                continue;
+            }
+            count += 1;
+            assert!(
+                count <= 1024 && metadata.len() <= 1_048_576,
+                "source inventory bounds"
+            );
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if reviewed_test_files.contains(&relative.as_str()) {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                e7_inactive_source_allowed(&relative, &source),
+                "inactive crate source fence"
+            );
+        }
+    }
+    assert!(count > 20, "crate-wide inventory is nonempty");
+    for forbidden in [
+        "fn p() { crate::exec::Runner::new(c); }",
+        "fn p() { crate::exec::hierarchy::setup(); }",
+        "fn p() { activity.start_daemon_discovery(); }",
+        "fn p() { StartupDomain::new(); }",
+        "fn p() { AdmissionDomain::new(); }",
+    ] {
+        assert!(
+            !e7_inactive_source_allowed("new_module.rs", forbidden),
+            "production negative control"
+        );
+        let guarded = format!("#[cfg(test)] mod tests {{ {forbidden} }}");
+        assert!(
+            e7_inactive_source_allowed("new_module.rs", &guarded),
+            "test-only positive control"
+        );
+        assert!(
+            !e7_inactive_source_allowed("new_module.rs", &(guarded + forbidden)),
+            "production after tests is still scanned"
+        );
+    }
+}

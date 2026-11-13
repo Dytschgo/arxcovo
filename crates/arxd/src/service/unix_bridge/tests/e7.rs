@@ -267,10 +267,14 @@ async fn w9_stuck_drain_is_failure_not_interruption() {
     app.start_discovery();
     gate.reached().await;
     app.stop_accepting().unwrap();
-    let code = tokio::time::timeout(Duration::from_secs(10), app.drain())
-        .await
-        .unwrap_or(Err(ExitCode::Store));
-    assert_eq!(code, Err(ExitCode::Store));
+    // The production ten-second bound is covered with paused time in
+    // service::tests::stuck_drain_is_bounded_and_never_claims_stop_audit.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), app.drain())
+            .await
+            .is_err(),
+        "stuck sequence remains owned"
+    );
     assert_eq!(rows(&dir)[0].2, "started");
     assert!(!gate.release.load(Ordering::Acquire));
     gate.open();

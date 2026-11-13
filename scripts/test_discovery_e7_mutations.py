@@ -17,7 +17,7 @@ try:
  for name,path,before,after,test in mutants:
   source=original[path].decode().replace('\r\n','\n')
   assert before in source, 'anchor required'
-  path.write_text(source.replace(before,after,1))
+  path.write_bytes(source.replace(before,after,1).encode("utf-8"))
   result=subprocess.run(['cargo','test','-p','arxd','--lib','--locked',test],capture_output=True,timeout=120)
   output=result.stdout+result.stderr
   compiled=b'error[E' not in output and b'could not compile' not in output
