@@ -343,8 +343,10 @@ fn s11_nnp_observed_in_child() {
     if !ordinary() {
         return;
     }
+    let inherited = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    assert!(matches!(inherited, 0 | 1), "kernel NNP precondition");
     for enabled in [false, true] {
-        if !enabled && nnp() == Some(true) {
+        if !enabled && inherited == 1 {
             eprintln!("E4_SKIP_INHERITED_NNP");
             continue;
         }

@@ -143,7 +143,7 @@ class HarnessTests(unittest.TestCase):
         root = Path(__file__).absolute().parents[3]
         rows = d.load_mutations(root)
         self.assertEqual(len(rows), 11)
-        self.assertEqual(sum(r["blocker"] is None for r in rows), 10)
+        self.assertEqual(sum(r["blocker"] is None for r in rows), 11)
         for row in rows:
             change = row["changes"][0]
             original = d.bounded_read(d.regular(root, change["target"]), 262144)
@@ -252,6 +252,34 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(sum(r["status"] == "killed" for r in evidence), 10)
         self.assertEqual(sum(r["status"] == "blocked" for r in evidence), 1)
         self.assertEqual(len(native_calls), 16)
+
+    def test_all_eleven_kills_require_final_restored_baselines(self):
+        rows = [{**self.row, "mutation": f"S8_synthetic_{n}"} for n in range(10)]
+        rows.append({**self.row, "mutation": "S11_nnp_true", "blocker": None})
+        native_calls = []
+        def runner(cmd, root, seconds, limit=d.LIMIT):
+            self.assertGreater(seconds, 0)
+            if cmd[0] == "git":
+                return 0, "".join(f"100644 {'b'*40} 0\t{p}\0" for p in (*d.TARGETS, d.MANIFEST)), 0.01
+            native_calls.append(cmd)
+            if 4 <= len(native_calls) <= 14:
+                self.assertIn(b"MUTANT", self.target.read_bytes())
+                return 100, status("FAIL", d.TESTS[0]) + "error: test run failed\n", 0.01
+            for target in d.TARGETS:
+                self.assertEqual((self.root / target).read_bytes(), self.original)
+            selection = cmd[cmd.index("-E") + 1]
+            if selection == f"test(={d.S6})":
+                return 0, status("PASS", d.S6, "unix_shim"), 0.01
+            names = (d.L8,) if selection == f"test(={d.L8})" else d.TESTS
+            return 0, "".join(status("PASS", n) for n in names), 0.01
+        output = io.StringIO()
+        with patch.object(d, "PINS", {p: d.sha(self.original) for p in d.TARGETS}), \
+                patch.object(d, "load_mutations", return_value=rows), contextlib.redirect_stdout(output):
+            self.assertEqual(d.execute(self.root, runner), 0)
+        evidence = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(sum(r["status"] == "killed" for r in evidence), 11)
+        self.assertEqual(sum(r["status"] == "blocked" for r in evidence), 0)
+        self.assertEqual(len(native_calls), 17)
 
     def test_workflow_is_separate_read_only_plain_pr_with_fixed_actions(self):
         root = Path(__file__).absolute().parents[3]

@@ -12,10 +12,10 @@ import sys
 import threading
 import time
 
-PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': 'ba73cff90373c19929aea9dd732a667af9b5e6dc3909b32641d0b9fc20517024', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
+PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': '102ec5720cd1ecfd1236ebea4237025e155bcef974de27ad876b550525e059fd', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
 TARGETS = tuple(PINS)
 MANIFEST = "tools/ci/e4-native/mutations.jsonl"
-MANIFEST_SHA = '259a2bb6e113c582e3102253c13169ceca4df2b8e3c324412640f7bbcbe95a50'
+MANIFEST_SHA = '15980053ce88457578407686d309af95a6dd18cb175fd777d82ac0e70b850671'
 PREFIX = 'unix_shim::rights::linux::tests::'
 NAMES = ('s8_outcomes_and_reap', 's9_all_candidates_before_exec', 's9b_exact_alias', 's9c_bound_object_survives_file_and_directory_swap', 's10_path_is_irrelevant', 's12_production_constants', 's11_nnp_parser', 's11_nnp_observed_in_child', 's9_final_object_owner_check')
 TESTS = tuple(PREFIX + name for name in NAMES)
@@ -150,7 +150,7 @@ def load_mutations(root):
         if not re.fullmatch(r"S[0-9A-Za-z_]{1,48}", row["mutation"]) or row["mutation"] in ids:
             raise GuardError("manifest_schema")
         ids.add(row["mutation"])
-        if row["blocker"] != ("nnp_self_skip" if row["mutation"] == "S11_nnp_true" else None):
+        if row["blocker"] is not None:
             raise GuardError("manifest_schema")
         if row["binary"] == "arxd":
             valid = row["assertion"] in TESTS
