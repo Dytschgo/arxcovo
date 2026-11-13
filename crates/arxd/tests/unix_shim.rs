@@ -91,13 +91,13 @@ fn s1_target_bytes_and_exit() {
     let target = script(
         d.path(),
         "args",
-        "test \"$#\" = 4 && test \"$1\" = '-x' && test \"$2\" = '--' && test \"$3\" = '' && test \"$4\" = 'Ã¼' && test \"${PWD##*/}\" = child",
+        "test \"$#\" = 4 && test \"$1\" = '-x' && test \"$2\" = '--' && test \"$3\" = '' && test \"$4\" = 'ü' && test \"${PWD##*/}\" = child",
     );
     silent(
         command(d.path())
             .args(["exec-child", "path"])
             .arg(target)
-            .args(["child", "-x", "--", "", "Ã¼"])
+            .args(["child", "-x", "--", "", "ü"])
             .pipe_output(),
         0,
     );
