@@ -176,3 +176,29 @@ Current local manifest (before merged-main re-pin):
 | `crates/arxd/src/exec/residue_tests.rs` | `91c52516fba2b4b1740309c7b986759e6aa60fc4` | `8f3af42826c53896aa43282df75aecba6c835fb404bed35c90896495fecb8af8` |
 | `crates/arxd/src/exec/unix.rs` | `0d087e37f31f3e17db652a87f2a0364eb398479e` | `500a914a1f6c6b16de516a9c9df332a47ab89f17769b6a48cd5f06dcb70af0b7` |
 | `crates/arxd/src/exec/cgroup.rs` | `d85544b0493727a780a902a0d934dd9ddea135e3` | `039a2f9c3a864816786cf8c11c63a3712601f1211a443874cfe7641d333b6c6c` |
+
+## Integration onto merged E1
+
+Sol medium integrated main `2fbc647` in source merge `589fc2a`. E1 hierarchy
+module is preserved; unix.rs/cgroup.rs exactly match reviewed f866af4.
+Fmt and locked workspace all-target Clippy passed. First full run
+`65762554-f812-4f0f-9a08-0b1af8d6ddfa` failed an unchanged dispatcher durable
+privacy assertion (case unix_windows): 143 passed, 1 failed, 3 skipped,
+193 not run due to fail-fast. No secret or raw database contents were logged.
+The focused test then passed once and 10 bounded repeats, with no source
+change. Cause remains UNKNOWN; this is not a fix or waiver. A single complete
+no-fail-fast diagnostic workspace run `c5443913-3035-4def-9ae5-305cf9a16659` then passed 337/337, 3 skipped
+in 13.021s. Both full-run outcomes remain credited separately.
+
+Current integration manifest (committed source bytes):
+
+| Path | Git blob | SHA-256 |
+| --- | --- | --- |
+| `crates/arxd/src/exec/mod.rs` | `ddf668d71c78aefe10103ee0e8d8b4ab4eea18f4` | `16201cfb37a927bfcf7afc45481ef988b6dca418a27bb2a74b3738e316da1514` |
+| `crates/arxd/src/exec/residue_tests.rs` | `91c52516fba2b4b1740309c7b986759e6aa60fc4` | `8f3af42826c53896aa43282df75aecba6c835fb404bed35c90896495fecb8af8` |
+| `crates/arxd/src/exec/unix.rs` | `0d087e37f31f3e17db652a87f2a0364eb398479e` | `500a914a1f6c6b16de516a9c9df332a47ab89f17769b6a48cd5f06dcb70af0b7` |
+| `crates/arxd/src/exec/cgroup.rs` | `d85544b0493727a780a902a0d934dd9ddea135e3` | `039a2f9c3a864816786cf8c11c63a3712601f1211a443874cfe7641d333b6c6c` |
+
+Independent exact-head integration review and hosted gates remain required.
+Linux R1/R2 have not run locally. Production remains inactive; M2 incomplete.
+Native paths remain **unverified on real hardware**.

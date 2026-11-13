@@ -2,7 +2,7 @@
 
 ## Current state - 2026-11-13
 
-- E5 source review is complete: first review `4e1d6b8`, forwarding recheck `2c47ec9`, and returned-flag recheck `a1e0cea` close required S1/B1/B2. Sol medium integrates reviewed E5 onto merged E1 main `2fbc647`. Production remains inactive; fresh combined validation and exact-head independent integration review are required before merge.
+- E5 source review is complete: first review `4e1d6b8`, forwarding recheck `2c47ec9`, and returned-flag recheck `a1e0cea` close required S1/B1/B2. Sol medium integrates reviewed E5 onto merged E1 main `2fbc647`. Production remains inactive; combined fmt/Clippy pass and complete diagnostic workspace run passes 337/3. The first full run failed an unchanged dispatcher privacy assertion; 11 focused passes and the complete run do not establish a cause or fix. Both outcomes are retained in evidence. Exact-head independent integration review and hosted gates remain required before merge.
 - Last merged PR58 `2fbc6476fde3aaa5c1e94ad46872e46315d73018`. Main-after-PR58 run `43475344395` succeeded on attempt 1 in 602s. All five required checks and strict protection remain in place; bootstrap exception exhausted.
 - M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Linux E5 R1/R2 and hosted compilation remain pending. ExecutionFailed/E_PROTECTION unresolved; no retry or waiver.
 
