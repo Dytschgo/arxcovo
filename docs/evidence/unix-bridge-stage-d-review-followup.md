@@ -54,3 +54,21 @@ Final fmt check passes and bridge-focused tests pass15/15, run
 a052ca8f-c825-4281-9db8-f5bc96f3a877. No new full suite or Clippy run is claimed
 for these two test literals; prior checks retain their pins. Production remains
 byte-identical to d3615be. A narrow cross-provider check is still required.
+
+## Main-after-53 integration
+
+Coordinator OpenAI / gpt-6.1-sol / medium, 2026-11-13. Source merge `b1538c39e19a0972a8694c0c0a4591321150f14c`
+onto main `6dd7467` after PR53. All five changed crate files are byte-identical
+to reviewed Stage D `fdea1c6`; all other product files inherit main. Scanner
+conflict chose that exact reviewed file, preserving the stronger Stage D scan.
+PROGRESS retained both parent histories; shim evidence retained its main append.
+No new bridge constructor, native backend, schema or owner authority.
+
+At the source merge: fmt and locked workspace/all-target Clippy -D warnings
+passed, one normal full nextest passed **324 / 3 skipped**, run `ac9b5607-35bd-4d77-9ae4-353934ad30a5`,
+12.307s. No existing ignored fixture directly invoked. No Unix runtime rerun
+locally; earlier Unix/architecture evidence retains its own source pins.
+Fresh hosted checks and exact-head review remain required. Main after PR54
+passed run43462769959 attempt1 in567s; main after PR53 run43464791125 is pending.
+M2 incomplete; hardware paths **unverified on real hardware**. No retry or
+resolution of ExecutionFailed/E_PROTECTION is claimed.
