@@ -140,17 +140,26 @@ no diagnosis, retry or activation is authorized or claimed.
 
 ## B1 test-only correction
 
-Opus high source review de2cc44 (retainedf38d082) found L1 did not detect
+Opus high source review de2cc44 (retained f38d082) found L1 did not detect
 over-reading followed by TooBig. Sol medium correction `c13fc98cc494a836676e39acff70a4494b477171` adds a
 Linux-only pipe test: 32 bytes are written, text(reader,7) must return TooBig
-and leave exactly24 unread through a second read handle. Writer closes before
-reading, so EOF is bounded and the32-byte preload fits the minimum pipe capacity.
+and leave exactly 24 unread through a second read handle. Writer closes before
+reading, so EOF is bounded and the 32-byte preload fits the minimum pipe capacity.
 Production text and every other production byte are unchanged.
 
-Windows fmt passed. Portable L6 and P-SCAN tests passed4/4, run
+Windows fmt passed. Portable L6 and P-SCAN tests passed 4/4, run
 2a369d29-5763-41ce-8aaf-79e6b4771a50. The pipe test was NOT compiled or run
 on Linux here; no native mutation kill is claimed. No full-suite repeat for
 Linux-test-only changes. Hosted Linux must run the new test and its read-limit
 mutants. Narrow independent recheck is pending before publication.
 
 Corrected linux.rs blob `945e34ccc1ab47c0836da5d2b4d5747df12594c6`; committed SHA-256 `c45d2a416f8504cba34368c5d11558f00d149d4cc31b208ecb41a4b4bbeeb863`.
+
+## Publication for hosted evidence
+
+Opus high recheck1de4a5b (retained c77683c) closes B1 by source analysis,
+not native execution. Main c56b6b5 has the same tree as original parent
+be629c8. Current source remains reviewed eb93620 plus only the Linux-test
+correction c13fc98. Real Linux compilation, L1-L10 and native mutation
+results remain outstanding. Exact-head independent integration review and
+all hosted required checks remain required; no native kill credit is implied.

@@ -2,7 +2,14 @@
 
 ## Current state - 2026-11-13
 
-- E3 review `de2cc44` found one test-only B1 blocker (bounded-read overconsumption). Sol medium added Linux pipe test `c13fc98`; production unchanged, Windows fmt and scanner4 pass. Native test/mutants remain unrun, narrow Opus recheck is next. E3 unpublished/inactive.
+- E3 Linux descriptor adapter source review is complete: Opus high `de2cc44` plus read-bound recheck `1de4a5b` (retained `c77683c`) resolve B1 by source analysis. Sol high source `eb93620` and Sol medium Linux-only test correction `c13fc98` are unchanged on merged E2 main `c56b6b5`. Publication seeks hosted evidence; it does not claim native mutation kills or clear merge.
+- Required next evidence: real Linux crate compilation/Clippy, ordinary-user L1-L10 including the new pipe test, native read-limit and other specified mutation kills, exact-head integration review and all five checks. Windows/stub checks do not satisfy those native gates. Production remains MechanismUnavailable.
+- Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`; main CI `43485836788` passed attempt1 in657s. Protection remains strict with all five checks; no bypass.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
+
+## Historical E3 source-review checkpoint
+
+- E3 review `de2cc44` found one test-only B1 blocker (bounded-read overconsumption). Sol medium added Linux pipe test `c13fc98`; production unchanged, Windows fmt and scanner 4 pass. Native test/mutants remain unrun, narrow Opus recheck is next. E3 unpublished/inactive.
 - E3 Linux descriptor adapter is built locally by Sol high: source `eb93620`, evidence `61b0ec9`, ported unchanged onto merged E2 main `c56b6b5`. Windows fmt/Clippy, focused60 and single final362/3 workspace pass are credited at original source only. Actual Linux compilation/native tests/mutations remain unverified (missing cross C compiler). Independent Opus high security review is next; no publication or activation.
 - Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`, at 18:46:14Z. Its squash tree equals independently reviewed `be629c8`; all five required checks passed. Main-after-PR60 run `43485836788` succeeded on attempt 1 in 657s (18:46:16-18:57:13Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - E2 setup/janitor over fake ports is integrated and inactive. Sol high is building E3 Linux descriptor adapter locally on reviewed E2; parent source will be re-pinned to merged main before publication. No real cgroup setup or activation.
