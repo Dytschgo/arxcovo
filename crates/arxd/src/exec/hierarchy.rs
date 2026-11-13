@@ -4,3 +4,7 @@
 pub(crate) mod parse;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use parse::locate;
+
+#[cfg(test)]
+mod fake;
+pub(crate) mod setup;
