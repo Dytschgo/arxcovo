@@ -145,27 +145,50 @@ def runner_context():
             and os.environ.get("GITHUB_REPOSITORY") == "Dytschgo/arxcovo")
 
 
-def rewrite_mirror_list(data):
+def _rewrite_mirror_list_counted(data):
     # Prefer the Kernel mirror (lowest priority is tried first) and keep every
     # validated Ubuntu entry, shifted by one, as an automatic APT fallback.
     if len(data) > MAX_MIRROR_LIST or b"\x00" in data:
         raise Refusal()
     try:
-        lines = data.decode("utf-8").splitlines()
+        # Only ASCII line/token separators: Unicode splitlines/split would
+        # silently remove control or non-ASCII prefixes before the raw fence.
+        lines = data.decode("utf-8").split("\n")
+        if lines[-1] == "":
+            lines.pop()
     except UnicodeError:
         raise Refusal() from None
     result = [f"{MIRROR}/\tpriority:1"]
     count = 0
+    omitted = 0
+    hostname_pattern = r"(?:(?!xn--)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ubuntu\.com"
+    raw_pattern = rf"https?://(?=.{{1,253}}/){hostname_pattern}/ubuntu/?"
     for line in lines:
+        line = line.removesuffix("\r")
+        if re.search(r"[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", line):
+            raise Refusal()
         if not line.strip() or line.lstrip().startswith("#"):
             result.append(line)
             continue
-        tokens = line.split()
+        tokens = re.split(r"[ \t]+", line.strip(" \t"))
         if (len(tokens) not in (1, 2)
                 or (len(tokens) == 2 and not re.fullmatch(r"priority:[0-9]{1,6}", tokens[1]))):
             raise Refusal()
         try:
-            if urlsplit(tokens[0]).hostname not in HOSTS or replacement(tokens[0]) != MIRROR:
+            # Match the entire raw token before urlsplit can normalize it.
+            raw_omittable = re.fullmatch(raw_pattern, tokens[0]) is not None
+            parts = urlsplit(tokens[0])
+            host = parts.hostname
+            if (raw_omittable and parts.scheme in ("http", "https")
+                    and host is not None and parts.netloc == host and len(host) <= 253
+                    and re.fullmatch(hostname_pattern, host)
+                    and not any(label.startswith("xn--") for label in host.split("."))
+                    and host not in HOSTS and host != "mirrors.edge.kernel.org"
+                    and parts.path in ("/ubuntu", "/ubuntu/")
+                    and not parts.query and not parts.fragment):
+                omitted += 1
+                continue
+            if host not in HOSTS or replacement(tokens[0]) != MIRROR:
                 raise Refusal()
         except ValueError:
             raise Refusal() from None
@@ -173,12 +196,16 @@ def rewrite_mirror_list(data):
             line = f"{tokens[0]}\tpriority:{int(tokens[1][9:]) + 1}"
         result.append(line)
         count += 1
-    if not 1 <= count <= 16:
+    if not 1 <= count <= count + omitted <= 16:
         raise Refusal()
     encoded = ("\n".join(result) + "\n").encode("utf-8")
     if len(encoded) > MAX_MIRROR_LIST:
         raise Refusal()
-    return encoded
+    return encoded, omitted
+
+
+def rewrite_mirror_list(data):
+    return _rewrite_mirror_list_counted(data)[0]
 
 
 def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
@@ -197,6 +224,7 @@ def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
     records = [(path, *read(path)) for path in paths]
     indirect = any(MIRROR_LIST.encode() in data for _, data, _ in records)
     plan = []
+    omitted = 0
     for path, before, info in records:
         after = rewrite(before, path.suffix, indirect)
         if before != after:
@@ -204,7 +232,8 @@ def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
     if indirect:
         listing = apt_root / "apt-mirrors.txt"
         before, info = read(listing)
-        plan.append((listing, before, rewrite_mirror_list(before), info))
+        after, omitted = _rewrite_mirror_list_counted(before)
+        plan.append((listing, before, after, info))
     if not plan:
         raise Refusal()
     # Validate the complete plan before the first change. Only root can modify
@@ -224,7 +253,7 @@ def _apply(apt_root, read=read_source, inspect_dir=Path.lstat):
         finally:
             if os.path.exists(staged):
                 os.unlink(staged)
-    return len(plan)
+    return len(plan), omitted
 
 
 def apply():
@@ -239,11 +268,12 @@ def main():
         print("ubuntu-mirror-arguments", file=sys.stderr)
         return 2
     try:
-        count = apply()
+        count, omitted = apply()
     except (OSError, Refusal):
         print("ubuntu-mirror-refused", file=sys.stderr)
         return 1
     print(f"ubuntu-mirror-updated:{count}")
+    print(f"ubuntu-mirror-omitted:{omitted}")
     return 0
 
 

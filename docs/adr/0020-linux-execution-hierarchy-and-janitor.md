@@ -8,9 +8,12 @@ Sol correction 2 `07475b8` passed the independent Opus check `f08a510`.
 The advisory-only follow-up clarifies existing errno ordering, splits T20
 across E6/E7, names non-test Runner construction pins and shares W3e's seam.
 This publication delta still requires exact-head independent review and all
-required checks. No implementation starts until this contract PR and Stage C
-(PR53) / Stage D (PR55) merge through all gates. No privileged operation or
-activation is authorized. M2 remains incomplete and native paths remain
+required checks. Local inactive implementation may proceed on the explicit
+unmerged Stage C/D/contract stack after independent design review, under the
+user's product-first direction. Integration/publication of implementation
+slices waits for this contract PR and Stage C (PR53) / Stage D (PR55) to merge
+through all gates, then requires a re-pin and final integration review.
+No privileged operation or activation is authorized. M2 remains incomplete and native paths remain
 **unverified on real hardware**.
 
 ## Historical proposal and correction-1 checkpoint
@@ -141,7 +144,7 @@ packaging changes, the Stage F experiment, Stage G activation and
   (Linux-gated where needed), plus the cgroup cleanup signal (D6).
   `exec/unix.rs` keeps its behavioral order, cancellation checks, fences,
   legacy/phased results and each branch's existing errno-read/cleanup order
-  unchanged. In particular, the current failed-openat branch reads errno
+  unchanged. In particular, exec/cgroup.rs Group::create's failed-openat branch reads errno
   after unlinkat; A5 does not silently correct that existing behavior.
 
 ### D2. Trust anchors (all checked before any write)
@@ -802,7 +805,7 @@ refuse unknown names without removing them (D4). U7 no startup retry (D7).
 U8 `unknown` → `rights_mismatch`, with `untrusted` distinct from `absent`
 (D8). U9 systemd directory removal stays unresolved for Stage F (D9).
 
-## Residual decisions for the recheck
+## Historical recheck prompts (resolved by retained independent reviews)
 
 - R-1: accept A5 as the only runner change, or prefer documenting an
   unbounded empty-leaf residual (rejected above).
@@ -821,3 +824,18 @@ systemd delegation, `systemd.resource-control`, `systemd.exec`,
 `systemd.kill`, kill(2), open(2), dup(2), opendir(3), execveat(2)) with fetch
 details, and the full inference list. Hardware, kernel and systemd behaviour
 on the owner's machine is **unverified on real hardware**.
+
+## Delivery sequencing clarification - 2026-11-12
+
+Coordinator OpenAI / gpt-6.1-sol / medium. The user's explicit direction to
+keep implementing product features while macOS CI waits permits local,
+inactive work on reviewed designs with declared unmerged dependencies, as
+already used for Stage D. This changes the earlier implementation-start
+sequencing requirement, not a technical fence or merge rule. E1 starts with
+pure parsers only; later slices keep their one-concern scope and independent
+reviews. No implementation PR is published or integrated before its contract
+and prerequisite PRs merge through all required gates. Re-pin, preserve source
+identity and re-review integration when that base changes. Production remains
+MechanismUnavailable; native, owner, admin, experiment and activation gates
+are unchanged. CI investigations remain parked. Stage F's historical replay
+is unavailable: no diagnosis beyond phase 1, retry or fix is claimed.

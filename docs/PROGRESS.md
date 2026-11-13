@@ -1,6 +1,13 @@
 # Arxcovo progress
 
-## Current state - 2026-11-12
+## Current state - 2026-11-13
+
+- Queue priority: merge refreshed inactive ADR0020 Stage E contract PR56 after exact-head independent review and all normal gates. Last merged PR55 `f91ae5a7d95645fb2057f70411675d6f1e07d1df`, 16:50:53Z; squash tree equals reviewed `72bd0af`. Main-after-55 run is pending, not claimed green.
+- Main after PR53 run43464791125 passed attempt1 in598s; main after PR54 run43462769959 passed567s. All five protection requirements/app pins and strict mode remain restored; bootstrap exception exhausted, no product waiver.
+- ADR0020/brief carry the previously independently reviewed local-delivery clarification4272291 (Opus PASS0f471e8), allowing local inactive implementation on explicit reviewed dependencies while publication/integration retain gates. Technical design unchanged; local E1/E5 are built but pending source review/re-pin. No native owner/service/cgroup/VM/experiment or production activation. Coordinator OpenAI / gpt-6.1-sol / medium.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved with no fix, waiver or retry. Parent histories and evidence retained below.
+
+## Historical parent checkpoint
 
 - Queue priority: publish the accepted inactive ADR 0020 contract stacked on Stage D, obtain exact-head independent review and all required gates. Sol correction 2 `07475b8` passed Opus high recheck `f08a510` (retained `14314fa`); P2/P6/P7 are closed at design level. Coordinator Sol medium addresses five advisory clarifications before publication. No implementation starts until contract and Stage C/D merge; no privileged acceptance or activation is authorized.
 - Correction `66924d0` (Anthropic / Opus 5.5 / high), retained as `680b143`, addresses the initial five blockers and proposes explicit ADR 0019 amendment A5 for a payload-free residue flag and admission recheck. Outcome: proposed, pending independent review; no builds or behavior tests ran. [Disposition](reviews/0020-correction1-disposition.md).
@@ -9,6 +16,15 @@
 - Last merged PR52, main `1604db1`. M1 accepted; M2 incomplete. Production native execution remains inactive. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry. No owner/admin/service/VM operation is authorized.
 
 ## Historical checkpoint before Stage E design review
+
+## Historical parent checkpoint
+
+- Queue priority: integrate PR55 Stage D on merged PR53, then normal exact-head review and all five checks before merge; PR56 follows. Last merged PR53 `6dd74673265d488d9da18e863d1fde651d6d0304`, 16:38:42Z. Its squash tree matches reviewed `46f90c9`. Main after PR53 run43464791125 is pending.
+- Main after PR54 run43462769959 succeeded on attempt1 in 567s (16:26:39-16:36:06Z). PR54 merged with all normal gates; the one-time bootstrap protection exception remains exhausted/restored.
+- Stage D product bytes remain identical to reviewed fdea1c6 and original d3615be except previously reviewed test corrections. Scanner conflict resolves to exactly reviewed Stage D file, preserving its Stage C rules and stronger scan. PROGRESS keeps both histories. Coordinator OpenAI / gpt-6.1-sol / medium; fresh Opus high integration review required. No production bridge constructor or native activation.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. E1/E5 held, ExecutionFailed/E_PROTECTION unresolved, no retry or owner operation.
+
+## Historical parent checkpoint
 
 - Stage D local product review is complete: full review85da90f plus test rechecks7569728 and056327a close T1/T3/T8/T10 and distinct request-limit R1. Coordinator Sol medium retains the final report and queues a one-concern bridge PR on explicit unmerged Stage C PR53; production remains inactive and all merge gates remain. Next product work is separate Stage E architecture for cgroup setup/cleanup and discovery ordering, design only with no native/owner/experiment execution. CI investigations remain parked.
 
@@ -34,6 +50,63 @@
 
 ## Historical checkpoint before product-priority steering
 
+
+
+## Historical parent checkpoint
+
+- Queue priority: publish/review Stage C PR53 integration on main after #54, then normal five-gate merge, followed by PR55 and PR56 in dependency order. Stage C production shim/scanner/routing bytes remain identical to reviewed `2ce79ca`; parent refresh carries the separately reviewed CI recovery and policy repair unchanged. No native execution backend is activated.
+- Last merged: PR54 `79276b93e14a483ff63a189545d148cd2f6f0b0e`, 2026-11-13 16:26:36Z. All five required gates and independent Opus integration review passed on `d276f7f`; first integration CI `43461011104` succeeded in 528s. Squash tree equals that reviewed head. Original performance attempt 3 qualification remains recorded, no reset. Main after #54 is pending, not claimed green.
+- Main after #57 passed run `43459116760` attempt1 in 590s. All five original protection contexts/app pins and strict mode are restored; owner-authorized bootstrap exception is exhausted. No gate bypass applies to this or later product PRs.
+- Provider: coordinator OpenAI / gpt-6.1-sol / medium integrates; fresh independent Anthropic / Opus 5.5 / high exact-head review required. Prior Stage C checks remain credited to their exact pins. M2 incomplete; production native execution inactive. Native/installed/dedicated paths **unverified on real hardware**. E1/E5 held locally, ExecutionFailed/E_PROTECTION unresolved without retry.
+
+## Historical state before Stage C integration after CI recovery
+
+- Queue priority: main run `43459116760` attempt 1 after #57 at `f1340a4` SUCCEEDED in 590s (2026-11-13T16:05:13Z to 2026-11-13T16:15:03Z), below 900s. Publish reviewed #54 integration refresh and merge only after fresh normal gates. The repaired bot now posts ci-time-budget SUCCESS on qualifying measured head `c5bb191`. Strict main protection and all five requirements are restored.
+- Last merged: PR57 `f1340a4`, 2026-11-13 16:05:11Z. After separate explicit owner approval, the coordinator temporarily removed ONLY ci-time-budget, merged pinned reviewed `a5ee45f`, and restored the original configuration in a finally block; readback verified all five checks, app pins and strict=true. [Executed exception](adr/0022-ci-policy-buffer-bootstrap.md). No exception applies to #54 or product PRs.
+- New-head rule: the successful `c5bb191` performance attempt 3 is retained, not reset. This base-integration run is not a fourth performance-fix attempt; it still requires all normal new-head gates. A slow/failing first integration run stops delivery and is handed to the other provider/owner with evidence, with no repeat-to-green, waiver or claimed old-head success on new bytes. Budget success on c5 against old906 does not carry over; the bot must independently evaluate the new head against the authoritative baseline or its own qualifying first run.
+- #54 integration refresh inherits only the reviewed policy repair from new main. Original performance attempt 3 remains qualified at 567s/88s/0.946; no new performance fix, rerun or reset is claimed. New-head CI and independent integration review are required because main changed. Existing 21 Node checks remain plus seven inherited buffer regressions (28 total). Other performance and coverage criteria remain.
+- One PROGRESS conflict retains both complete histories below; no product source conflict. Provider: coordinator OpenAI / gpt-6.1-sol / medium. No product PR exception or native activation; M2 incomplete, hardware paths **unverified on real hardware**.
+
+## Historical candidate state - 2026-11-12
+
+- Queue priority: PR54 final performance attempt 3, integrating reviewed mirror compatibility source. Owner approved the exact A5 path expansion and separate compatibility prerequisite commit; all A1-A4/A6 numerical/coverage gates remain frozen. No ci-speed label until independently verified qualifying measurement.
+- Source `e9d63df` plus B1 correction `4b96952` is retained as `795a09e` / `6afecda`; independent Opus high full review `57f3ab12` and B1 PASS `2b1cb6e` are retained. Original reviewed helper bytes carry over exactly. [Evidence](evidence/ubuntu26-mirror-compatibility-fix.md), [source review](reviews/ubuntu26-mirror-compatibility-implementation-opus-review.md).
+- Provider/outcome: OpenAI / gpt-6.1-sol / high implemented, coordinator Sol medium corrected B1, Anthropic / Opus 5.5 / high reviewed both. Root integration checks run before push and credited below. No new Rust behavior or workflow/policy change in the compatibility delta.
+- Ledgers before push: performance attempts 1 and 2 failed, attempt 3 unused until final-head pull_request run starts. Fetch-path hosted failures: two (original #54 plus diagnostic), no hosted fixes yet. No manual precheck, rerun, false label, threshold relaxation or count reset.
+- Main remains `1604db1` (#52), baseline run `43240797525` attempt 1 = 906s. Product PR53/55/56 remain blocked; local E1/E5 are held unpublished and unintegrated. No new product stack. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved, no retry.
+
+## Historical checkpoint before final compatibility integration
+
+- OpenAI / gpt-6.1-sol / high implements accepted CI performance attempt 2 on clean prepared base d3bc3aa0c2d15b8661543f401b100fc853b4079d, published source48d4916, actual main1604db1. S1/S2/SP1/SP2 were accepted before implementation; all numerical A1-A4/A6 gates remain frozen. Three-file source c3285a8d6fd76c3a3ebcf311ac2c2529d6cfd732 is committed. Node21/UI1, lint/build, fmt, locked workspace all-target Clippy and guest2/2 pass under DEV_DEBUG=0 with unoptimized banners. Nine Node assertion mutants and two compiled Rust assertion kills were restored; final guest run eaaf18df-d122-4f87-b6bb-8021e4cd311c passes2/2. Initial missing npm dependencies and Clippy constant-assertion failure were corrected. [Full evidence](evidence/ci-headless-shell.md). No hosted measurement or acceptance is claimed.
+- Queue priority: fresh independent Anthropic / Opus 5.5 / high review of actual patch before coordinator push, then measure the substantive head's FIRST hosted attempt against all frozen criteria, then independent measured review before any ci-speed label. Fresh main under15min remains necessary before Stage C PR53 resumes. No subagents/GitHub operations in this local task.
+- Attempt1 remains failed/nonqualifying: run43248592153 at48d4916 took848s but Windows install200s exceeded141s. Design corrections are not new performance attempts. After three failed performance attempts, hand off to the other provider; no empty commit, rebase or rerun resets counts.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, inherited all five gates and independent review. Main first attempt43240797525 failed at906s; recovered attempt2 does not repair the policy baseline. Milestone1 accepted; M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**.
+- ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry. No owner/admin/service/native provisioning, VM/Lab Manager, private-state, ignored-fixture or babysitter operation occurred.
+
+## Historical checkpoint before attempt-2 implementation
+
+- Attempt-2 design review 6b9af143 requested documentation corrections only. Coordinator Sol medium accepts the amended proposal before implementation: three implementation paths plus evidence/PROGRESS/review docs, explicit C frame-pointer effects, direct caller-location smoke limits and comparative (not causal) timing claims. Numerical gates remain unchanged. Sol high implementation and Opus independent patch review are next; no measurement, ci-speed label or merge yet.
+
+- CI performance attempt 1 is NOT QUALIFYING: #54 head48d4916 first run43248592153 succeeded in848s, but Windows install200s exceeded the declared141s ceiling. No ci-speed label or merge. Windows log spends about193s before Media Foundation completes, then about7s downloading shell/support binaries. The 906s main baseline remains blocking. A revised substantive approach and criteria must be reviewed before another measurement; no empty commit or rerun resets this result. PR watches missed the completed run; future waits need explicit tracked completion as well as PR events.
+
+- Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production execution backend or experiment is activated.
+- Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates and independent review. Main run 43240797525 attempt 2 recovered after one failed macOS capacity job; attempt 1 remains failed at 906s and is the policy baseline. No claim of first-attempt main green or budget recovery.
+- Queue priority: separate measured CI headless-shell improvement and independent review under the existing policy, then a fresh successful main run under 15 minutes, then refresh Stage C PR53 and require all five gates. Stage C's ci-time-budget remains red and it is not labelled ci-speed.
+- Coordinator OpenAI / gpt-6.1-sol / medium changes only the browser-install workflow command plus meaningful guard tests: --only-shell omits unused full Chromium while preserving headless UI and Electron smoke, all three OS/arm64 coverage, action pins, permissions, timeouts and policy. [Evidence and six baselines](evidence/ci-headless-shell.md). Node20 tests, four restored assertion mutants, lint/build, UI1/1 and desktop1/1 pass locally. Hosted timing is pending; no speed claim or exception label yet.
+- Candidate acceptance requires first-attempt all-OS success below 900s and 906s, Windows install below the pinned 141s minimum, unchanged UI/desktop counts and independent review. Only then may this genuine performance PR use ci-speed; no gate override or policy edit. Capacity failure stays red. Main must subsequently pass within budget before merging features.
+- Stage C PR53 at 2ce79ca independently passed Standards/Spec; hosted Linux252/4 and macOS253/2 plus S1-S7 passed. Windows and overall candidate readiness must be read live before any action. Real Unix mutation kills remain unrun. Native guard/phase/containment evidence limits are unchanged; no bridge activation.
+- ExecutionFailed and E_PROTECTION remain unexplained, with no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
+
+
+## Historical policy-repair state - 2026-11-13
+
+- Queue priority: publish the standalone bounded policy-buffer repair, normal CI and exact-head independent review, then hand back for the OWNER's authorized admin merge bypassing only ci-time-budget. Agent will not perform the admin merge or change branch protection. [Exception record](adr/0022-ci-policy-buffer-bootstrap.md).
+- One production line raises API maxBuffer from 1 MiB to finite 8 MiB; selection, first-attempt reads, thresholds, labels and status logic stay unchanged. Sol high source `bed6e5d`, evidence `80d14ea`; Opus high review `62b0dc1` passed. Main-base integration: 26 Node tests pass. [Evidence](reviews/ci-policy-buffer-repair-evidence.md), [review](reviews/ci-policy-buffer-independent-review.md).
+- #54 head `c5bb191` independently qualified on attempt 3, run `43318031363`: 567s, Windows compile88s/Clippy93s ratio0.946. ci-speed is applied. Trusted policy `43326387032` failed ENOBUFS, so no merge. Main is still #52 `1604db1`, baseline906s. Read-only protection requires Actions app15368 for ci-time-budget; local owner status cannot satisfy it.
+- User approved the reviewed gate-repair route after explanation. Once repair CI and independent agent-review are green, OWNER may bypass only the broken budget check for this repair PR. Then bot evaluation and #54 normal merge must use unchanged gates. No budget bypass for product PRs, no performance reset/retry or main force push.
+- Product PR53/55/56 and local E1/E5 remain held; no new product stack. M2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed/E_PROTECTION remain unresolved; no native/owner/VM/experiment action.
+
+## Historical checkpoint before policy-buffer bootstrap
 
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No production backend or experiment is activated.
 - Last merged PR: #52, 1604db1, 14:47:06 UTC, all five gates on c6eb700 and independent review; squash tree matches. Main run 43240797525 recovered on attempt 2: the sole failed macOS job passed (retry 15:13:48 to 15:17:20 UTC). Attempt 1 remains failed due to runner acquisition/capacity, with no macOS steps and successful Ubuntu/Windows jobs.

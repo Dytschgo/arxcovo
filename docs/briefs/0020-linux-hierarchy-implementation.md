@@ -3,8 +3,9 @@
 Status: **accepted inactive staged contract**; see ADR 0020's current
 coordinator disposition. The historical checkpoint below records the earlier
 proposal, not the current acceptance state. Tests here remain requirements,
-not evidence. Implementation waits for this contract PR and Stage C/D to
-merge with independent review and all required gates.
+not evidence. Local inactive implementation may start on the explicit
+unmerged stack after independent design review; implementation publication
+and integration wait for contract and Stage C/D merges through all gates.
 
 ## Historical proposal and correction-1 checkpoint
 
@@ -19,14 +20,17 @@ finding. Nothing here was built, run or tested. Every test, mutation and
 acceptance item below is a requirement, not evidence. Current tests are not
 evidence of this plan.
 
-## Gates before any slice starts
+## Gates for local work and later integration
 
-1. The inactive contract publication PR has exact-head independent review,
-   all required checks and coordinator merge. Original Opus architecture and
-   correction 1 retain Sol high review; Sol correction 2 retains Opus high
-   review. Reviewer fallback on provider limits remains grok-4.7 high.
-2. ADR 0019 stage C (PR53) and stage D (PR55) are merged with all required
-   gates. Both are unmerged at `d44035d`. Slices E4–E7 change their code.
+1. Local inactive work requires the accepted design and independent review:
+   original Opus architecture/correction 1 retain Sol high review, and Sol
+   correction 2/publication retain Opus high review. Declare the unmerged
+   dependency pins. Reviewer fallback remains grok-4.7 high.
+2. Before implementation publication/integration, this contract PR and ADR
+   0019 Stage C (PR53) / Stage D (PR55) must merge through all required gates.
+   Re-pin and re-review the implementation on that merged base. This follows
+   the user's product-first direction; it permits local work during CI waits
+   and waives no merge check. Slices E4-E7 change prerequisite code.
 3. No slice may activate anything. Production stays `MechanismUnavailable`
    (pins in E7).
 
