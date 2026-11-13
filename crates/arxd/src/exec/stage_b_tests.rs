@@ -771,7 +771,7 @@ fn e7_non_test_tokens(source: &str) -> Vec<String> {
                 let token = input[i].as_str();
                 // A cfg(test) argument can end at its surrounding call's
                 // delimiter rather than a semicolon (for example a closure).
-                if nesting.is_empty() && matches!(token, ")" | "]" | "}") {
+                if nesting.is_empty() && matches!(token, ")" | "]" | "}" | ">" | "|") {
                     break;
                 }
                 if nesting.is_empty() && matches!(token, ";" | ",") {
@@ -954,6 +954,9 @@ fn w8_e7_test_braces_never_hide_following_production() {
         "#[cfg(test)] unsafe extern \"C\" { fn test_only(); } fn p() { PRODUCTION_CALL }",
         "fn p() { match 0 { #[cfg(test)] 0 => {} _ => { PRODUCTION_CALL } } }",
         "fn p() { #[cfg(test)] if true {} PRODUCTION_CALL }",
+        "fn p<#[cfg(test)] T>() { PRODUCTION_CALL }",
+        "fn p<#[cfg(test)] 'a>() { PRODUCTION_CALL }",
+        "fn p() { let _closure = |#[cfg(test)] a: u8| { PRODUCTION_CALL }; }",
     ];
     for shape in shapes {
         for call in [
