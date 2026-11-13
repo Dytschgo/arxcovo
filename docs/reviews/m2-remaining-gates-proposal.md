@@ -1,6 +1,8 @@
 # M2 remaining gates: proposed next slices (design only)
 
 Author: Anthropic / claude-opus-5-5 / high, design sub-agent, 2026-11-14.
+Revisions: OpenAI / gpt-6.1-sol / medium, `a7b98df` and the subsequent
+SP-R1 correction; original architecture authorship remains with Opus.
 Status: **proposal, not accepted.** Independent Sol high review
 `9b62dd2` requested changes; this
 revision addresses its findings and awaits a narrow Opus high recheck.
@@ -33,7 +35,7 @@ activation or owner step.
 - M1 is accepted and M2 is incomplete. E1-E7 are merged and inactive, with
   main at merged PR66 `1ac4047`. PR66 passed independent source review
   (`414caaa`) and all five required checks before merging. Main-after-PR66
-  run `43527940656` remains pending in this record. Production is
+  run `43527940656` passed attempt 1 in 624s. Production is
   `MechanismUnavailable`:
   `Execution::configured` builds `Self::native(` (`service/executor.rs`).
 - Native, installed and dedicated paths are **unverified on real hardware**.
@@ -91,6 +93,9 @@ Tests (one module):
 - **L-b.** A located input with a refusing check: preflight refuses with
   that check's token, the runner is not called, and Ready is still
   reachable only through setup.
+- **L-b2.** Missing location plus a refusing live check returns that check's
+  exact error token. This pins check-before-runner-before-readiness
+  preflight precedence, with zero factory/setup/Runner calls.
 - **L-c.** A located input with the real `execution_preflight` and the fake
   resolver: the W1 log is unchanged.
 - **Mutants**, compiled, with an exact SHA-256 restore:
@@ -105,6 +110,13 @@ high review (Sol builds) and the normal five checks. **Non-goals:** no
 production `Locate` read, no change to `configured`, no Stage F/G.
 
 ## Slice S2: PA6, residue stored before the slot is released on unwind
+
+Sequence is mandatory: **S2a** implements the D6 panic latch described below,
+with its own meaningful tests, independent source review and green required
+checks. It merges first as a separate inert correction PR. **S2b** is the
+local decomposition/gate proof PR, re-pinned onto merged S2a. U-a's latch
+assertion and U-b's post-panic early refusal depend on S2a; neither is claimed
+against the original catch arm. No production constructor is introduced.
 
 **Can ordinary owned temp/test seams prove the order for the real Runner?
 Not end to end without weakening a fence.** The fences come before any
@@ -133,14 +145,25 @@ closure (`executor.rs:395-406`).
   directly. When it returns, assert `Failed{Unknown}` and that the flag is
   already true. The flag is set by real `Drop` code during a real unwind,
   not by the fake. This differs materially from the current fake PA6.
-- **U-b.** Keep two separate assertions with `limit = 1`: an ordinary
-  request refuses early after the panic latch; a deterministically
-  pre-admitted request is held before slot acquisition and released only
-  after residue publication. Observe the actual in-slot residue gate and
-  zero Runner calls for that request. Neither readiness nor quarantine nor
-  the monotone flag may be reset to make it reach the gate. A gate-omission
-  mutant must fail this assertion; an early preflight or row-G quarantine
-  refusal earns no gate credit.
+- **U-b.** Keep three distinct assertions with `limit = 1`:
+  1. An ordinary request after the panic latch refuses in preflight.
+  2. Before the panic, hold a pre-admitted request at the existing hook,
+     after quarantine checking and before slot acquisition. Release it only
+     after the panicking call has returned **and its slot is observed free**,
+     with residue published and readiness latched. Observe entry into the
+     actual in-slot readiness refusal and zero Runner calls. Define
+     `in_slot_readiness_refusal_omitted` to remove that readiness refusal,
+     not merely the preceding residue check. It must fail this assertion.
+     Early preflight, row-G quarantine or `Busy` earns no gate credit.
+  3. Independently test the residue-check step with readiness initially
+     Ready and residue published while the request is held at the same
+     pre-slot hook. This separate controlled case has no panic latch or
+     quarantined prior dispatch. After observing the slot free, release the
+     request; require the actual residue check to latch Containment and
+     refuse with zero Runner calls. Removing only that check
+     (`in_slot_residue_check_omitted`) must fail the named assertion.
+  No assertion may reset readiness, quarantine or the monotone flag. Tests
+  must distinguish gate entry and refusal from any unrelated early refusal.
 - **U-c.** A source-inventory test with a mutant control. In `unix.rs`,
   `Group` appears only as the local `group` and the `ChildGuard` field.
   There is no `forget`, `ManuallyDrop`, `Box::leak`, `Arc<Group>` or thread
@@ -149,7 +172,8 @@ closure (`executor.rs:395-406`).
   proof.
 - **Mutants:** `drop_skips_store`, `catch_outside_slot` (moves `fetch_sub`
   before `backend.run` returns), `group_forgotten` and
-  `in_slot_residue_gate_omitted`. U-a remains real-Group Drop/bridge
+  `in_slot_readiness_refusal_omitted` and
+  `in_slot_residue_check_omitted`. U-a remains real-Group Drop/bridge
   decomposition evidence; U-c is only a partial lexical guard. Neither
   earns real-Runner, root or cgroupfs evidence.
 
@@ -177,7 +201,7 @@ and accepted evidence. Real-Runner PA6 remains OPEN after S2.
 
 Acceptance is the same as S1, and U-a/U-b run on hosted Linux only.
 
-## Stage F: a bounded feedback artifact for a future fresh proof
+## Stage F: local feedback artifact; any dispatch remains unauthorized
 
 The phase-1 facts stand. Only the fixed code `E_PROTECTION` was retained.
 The 13 `protected` call sites (`driver.py:99`…`388`) are not
@@ -197,7 +221,8 @@ fix.**
   fixed mutation tokens (none, staged, account, service, cgroup) and a
   cleanup token (confirmed, unconfirmed, not_reached).
 - The record has a fixed schema/version, reviewed source and workflow SHAs,
-  and run/attempt association in a bounded envelope. Bound predecessor count
+  and run/attempt association in an envelope **inside the same single
+  validated 4 KiB JSON line**, not a separate artifact. Bound predecessor count
   and total input as well as the 4 KiB output; reject overflow and malformed
   records rather than truncate them into replay evidence.
 - The record has one schema-validated JSON line of at most 4 KiB. It
@@ -260,7 +285,7 @@ None are needed for S1, S2 or F0. These are needed later:
 
 ## Smallest work possible before any owner step
 
-In order: S1, then S2 (one PR each, Sol builds, Opus reviews), then F0
+In order: S1, then S2a, then S2b (one PR each, Sol builds, Opus reviews), then F0
 (Opus or Sol builds, the other provider reviews, plus the Opus diagnostic
 review). None activates anything.
 
