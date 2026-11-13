@@ -156,3 +156,23 @@ original helper before successful verification. No claim of Linux compilation
 or R1/R2 execution, no full-suite repeat or native action. Fresh narrow Opus
 recheck is pending. Publication requires that review plus exact main-base
 integration and all hosted gates. M2 incomplete; hardware remains unverified.
+
+## B2 returned-Group flag correction
+
+Coordinator OpenAI / gpt-6.1-sol / medium added only the proposed portable
+assertion pinning the returned Group field to the incoming residue parameter.
+Source/test commit `e36f4fdc0fa877200ca7aec5c1c79331debe5dea`. Production bytes remain unchanged.
+Fmt passed; baseline 2/2 passed (428e581e), both fresh-field mutants failed
+at the new assertion with exit 100, and restored 2/2 passed
+(0b0804b8-53e8-4a34-a285-367645dc280a). Mutated production bytes were restored
+exactly. These Windows source-pin runs give no Linux syscall/runtime credit.
+No full-suite repeat, native action or hosted run. Narrow Opus review pending.
+
+Current local manifest (before merged-main re-pin):
+
+| Path | Git blob | SHA-256 of committed bytes |
+| --- | --- | --- |
+| `crates/arxd/src/exec/mod.rs` | `7d63eee9ae4c78d5f963b92976bd1f7ba22c338c` | `b6cc7f6b8be9d08e06d3541542d20fa1a435b3de6af749b0c093973b9b9aa4a2` |
+| `crates/arxd/src/exec/residue_tests.rs` | `91c52516fba2b4b1740309c7b986759e6aa60fc4` | `8f3af42826c53896aa43282df75aecba6c835fb404bed35c90896495fecb8af8` |
+| `crates/arxd/src/exec/unix.rs` | `0d087e37f31f3e17db652a87f2a0364eb398479e` | `500a914a1f6c6b16de516a9c9df332a47ab89f17769b6a48cd5f06dcb70af0b7` |
+| `crates/arxd/src/exec/cgroup.rs` | `d85544b0493727a780a902a0d934dd9ddea135e3` | `039a2f9c3a864816786cf8c11c63a3712601f1211a443874cfe7641d333b6c6c` |
