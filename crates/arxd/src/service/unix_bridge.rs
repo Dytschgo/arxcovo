@@ -20,7 +20,12 @@ use std::{
 #[cfg(test)]
 use crate::exec::hierarchy::locate;
 
+mod readiness;
+use crate::exec::hierarchy::parse::{Hardening, RightsFact, classify_rights, rights_line};
+use readiness::{Cause, Readiness};
+
 trait RunnerPort: Send + Sync {
+    fn cleanup_residue(&self) -> bool;
     fn run(
         &self,
         spec: &exec::RunSpec,
@@ -29,6 +34,9 @@ trait RunnerPort: Send + Sync {
     ) -> Result<exec::RunResult, exec::RunError>;
 }
 impl RunnerPort for exec::Runner {
+    fn cleanup_residue(&self) -> bool {
+        self.cleanup_residue()
+    }
     fn run(
         &self,
         spec: &exec::RunSpec,
@@ -42,7 +50,7 @@ struct UnixBridge {
     binary: PathBuf,
     runner: Result<Box<dyn RunnerPort>, Unavailable>,
     check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
-    ready: bool,
+    readiness: Readiness,
     #[cfg(test)]
     seam: u8,
 }
@@ -54,14 +62,14 @@ impl UnixBridge {
         parent: PathBuf,
         factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
         check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
-        ready: bool,
+        readiness: Readiness,
     ) -> Self {
         let runner = derive(layout, config, parent).and_then(factory);
         Self {
             binary: layout.binary().into(),
             runner,
             check,
-            ready,
+            readiness,
             seam: 0,
         }
     }
@@ -71,12 +79,29 @@ impl UnixBridge {
         cancel: &Cancellation,
         shutdown: &Cancellation,
     ) -> Report {
-        let spec = spec(&self.binary, request);
         let runner = match &self.runner {
             Ok(r) => r,
             Err(r) => return Report::Unavailable(*r),
         };
-        match runner.run(&spec, cancel, shutdown) {
+        if runner.cleanup_residue() {
+            self.readiness.latch(Cause::Containment);
+        }
+        if let Err(token) = self.readiness.check() {
+            return Report::Unavailable(token);
+        }
+        let spec = spec(&self.binary, request);
+        let outcome = runner.run(&spec, cancel, shutdown);
+        if runner.cleanup_residue()
+            || matches!(
+                outcome,
+                Err(exec::RunError::NotStarted(
+                    exec::NotStarted::Containment | exec::NotStarted::Resource
+                ))
+            )
+        {
+            self.readiness.latch(Cause::Containment);
+        }
+        match outcome {
             Err(error) => failure(error),
             Ok(result) => {
                 #[cfg(test)]
@@ -89,10 +114,17 @@ impl UnixBridge {
                     if self.seam == 2 {
                         panic!("ARX-T10-DISCOVERY-PANIC");
                     }
-                    Report::Discovered {
-                        evidence,
-                        tools: parse_tools(&result).unwrap_or_default(),
-                    }
+                    let tools = match parse_tools(&result) {
+                        Some((tools, fact)) => {
+                            if classify_rights(Rights::Standard, Hardening::Standard, fact).is_err()
+                            {
+                                self.readiness.latch(Cause::Rights);
+                            }
+                            tools
+                        }
+                        None => Vec::new(),
+                    };
+                    Report::Discovered { evidence, tools }
                 } else {
                     Report::Completed {
                         evidence,
@@ -108,10 +140,7 @@ impl Executor for UnixBridge {
     fn preflight(&self) -> Result<(), Unavailable> {
         (self.check)()?;
         self.runner.as_ref().map_err(|r| *r)?;
-        if !self.ready {
-            return Err(Unavailable::MechanismUnavailable);
-        }
-        Ok(())
+        self.readiness.check()
     }
     fn run(
         &self,
@@ -270,7 +299,7 @@ struct ProbeRow {
     found: bool,
     version: Option<String>,
 }
-fn parse_tools(result: &exec::RunResult) -> Option<Vec<ToolVersion>> {
+fn parse_tools(result: &exec::RunResult) -> Option<(Vec<ToolVersion>, RightsFact)> {
     if result.outcome != exec::Outcome::Exited
         || result.exit_code != Some(0)
         || result.stdout.dropped_bytes != 0
@@ -281,9 +310,10 @@ fn parse_tools(result: &exec::RunResult) -> Option<Vec<ToolVersion>> {
     bytes.extend_from_slice(&result.stdout.tail);
     let text = std::str::from_utf8(&bytes).ok()?;
     let lines: Vec<_> = text.lines().collect();
-    if lines.len() != TOOLS.len() {
+    if lines.len() != TOOLS.len() + 1 {
         return None;
     }
+    let fact = rights_line(lines.last()?)?;
     let mut tools = Vec::new();
     for (line, expected) in lines.into_iter().zip(TOOLS) {
         // Value's key set makes the nullable version field mandatory too.
@@ -315,7 +345,36 @@ fn parse_tools(result: &exec::RunResult) -> Option<Vec<ToolVersion>> {
             version: row.version,
         });
     }
-    Some(tools)
+    Some((tools, fact))
 }
 #[cfg(test)]
 mod tests;
+
+// The inactive wiring owner retains the sole domain. Handles clone Execution,
+// including its backend, readiness and slot counter, without another factory call.
+#[cfg(test)]
+struct AdmissionDomain {
+    execution: std::sync::Arc<super::executor::Execution>,
+}
+#[cfg(test)]
+impl AdmissionDomain {
+    fn new(
+        layout: &Layout,
+        config: &ServiceConfig,
+        parent: PathBuf,
+        factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
+        check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
+        readiness: Readiness,
+    ) -> Self {
+        let bridge = UnixBridge::new(layout, config, parent, factory, check, readiness);
+        Self {
+            execution: super::executor::Execution::unix_bridge_for_test(
+                std::sync::Arc::new(bridge),
+                config,
+            ),
+        }
+    }
+    fn handle(&self) -> std::sync::Arc<super::executor::Execution> {
+        self.execution.clone()
+    }
+}

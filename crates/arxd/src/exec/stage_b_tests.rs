@@ -501,6 +501,14 @@ fn inventory() -> Vec<(&'static str, String, String)> {
             include_str!("../unix_shim_rights_linux.rs"),
         ),
         ("bridge", include_str!("../service/unix_bridge.rs")),
+        (
+            "readiness",
+            include_str!("../service/unix_bridge/readiness.rs"),
+        ),
+        ("hierarchy", include_str!("hierarchy.rs")),
+        ("hierarchy-parse", include_str!("hierarchy/parse.rs")),
+        ("hierarchy-setup", include_str!("hierarchy/setup.rs")),
+        ("hierarchy-linux", include_str!("hierarchy/linux.rs")),
     ] {
         for (mac, literal) in
             scan_with_hook(source, file == "shim").expect("production payload scan")
@@ -613,6 +621,8 @@ fn l6_e3_tokenized_source_inventory_and_mutants() {
     let sources = [
         ("hierarchy.rs", include_str!("hierarchy.rs")),
         ("hierarchy/linux.rs", include_str!("hierarchy/linux.rs")),
+        ("hierarchy/parse.rs", include_str!("hierarchy/parse.rs")),
+        ("hierarchy/setup.rs", include_str!("hierarchy/setup.rs")),
     ];
     assert!(
         sources

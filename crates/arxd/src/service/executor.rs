@@ -160,6 +160,8 @@ impl Executor for Native {
     }
 }
 pub struct Execution {
+    #[cfg(test)]
+    admission_barrier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     backend: Arc<dyn Executor>,
     reason: Arc<Mutex<Unavailable>>,
     shutdown: Cancellation,
@@ -193,6 +195,8 @@ impl Execution {
     ) -> Arc<Self> {
         let reason = Arc::new(Mutex::new(Unavailable::MechanismUnavailable));
         Arc::new(Self {
+            #[cfg(test)]
+            admission_barrier: Mutex::new(None),
             backend: Arc::new(Native {
                 reason: reason.clone(),
                 check,
@@ -262,6 +266,10 @@ impl Execution {
     #[cfg(test)]
     pub(super) fn preflight_for_test(&self) -> Result<(), Unavailable> {
         self.preflight()
+    }
+    #[cfg(test)]
+    pub(super) fn admission_barrier_for_test(&self, barrier: Arc<dyn Fn() + Send + Sync>) {
+        *self.admission_barrier.lock().unwrap() = Some(barrier);
     }
     pub(crate) fn set_reason(&self, reason: Unavailable) {
         *self.reason.lock().unwrap() = reason;
@@ -337,19 +345,28 @@ impl Execution {
             workers.spawn_blocking(move || {
                 let report = if let Err(r) = this.preflight() {
                     Report::Unavailable(r)
-                } else if this.active.fetch_add(1, Ordering::AcqRel) >= this.limit {
-                    this.active.fetch_sub(1, Ordering::AcqRel);
-                    Report::Unavailable(Unavailable::Busy)
                 } else {
-                    let r = if cancel.is_cancelled() {
-                        Report::CancelledBeforeSpawn
-                    } else if this.shutdown.is_cancelled() {
-                        Report::Unavailable(Unavailable::Stopping)
+                    #[cfg(test)]
+                    {
+                        let seam = this.admission_barrier.lock().unwrap().clone();
+                        if let Some(seam) = seam {
+                            seam();
+                        }
+                    }
+                    if this.active.fetch_add(1, Ordering::AcqRel) >= this.limit {
+                        this.active.fetch_sub(1, Ordering::AcqRel);
+                        Report::Unavailable(Unavailable::Busy)
                     } else {
-                        this.backend.run(request.as_ref(), &cancel, &this.shutdown)
-                    };
-                    this.active.fetch_sub(1, Ordering::AcqRel);
-                    r
+                        let r = if cancel.is_cancelled() {
+                            Report::CancelledBeforeSpawn
+                        } else if this.shutdown.is_cancelled() {
+                            Report::Unavailable(Unavailable::Stopping)
+                        } else {
+                            this.backend.run(request.as_ref(), &cancel, &this.shutdown)
+                        };
+                        this.active.fetch_sub(1, Ordering::AcqRel);
+                        r
+                    }
                 };
                 let result = this.complete(report, request.as_ref(), &activity, id);
                 let _ = send.send(result);
