@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E3 Linux descriptor adapter is built locally by Sol high: source `eb93620`, evidence `61b0ec9`, ported unchanged onto merged E2 main `c56b6b5`. Windows fmt/Clippy, focused60 and single final362/3 workspace pass are credited at original source only. Actual Linux compilation/native tests/mutations remain unverified (missing cross C compiler). Independent Opus high security review is next; no publication or activation.
 - Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`, at 18:46:14Z. Its squash tree equals independently reviewed `be629c8`; all five required checks passed. Main-after-PR60 run `43485836788` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - E2 setup/janitor over fake ports is integrated and inactive. Sol high is building E3 Linux descriptor adapter locally on reviewed E2; parent source will be re-pinned to merged main before publication. No real cgroup setup or activation.
 - Main-after-PR59 run `43479932347` passed attempt1 in511s. Strict protection and all five contexts remain unchanged; bootstrap exception exhausted. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix/waiver/retry.
