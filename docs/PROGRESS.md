@@ -3,7 +3,7 @@
 ## Current state - 2026-11-13
 
 - E5 recheck `2c47ec9`: Standards approved; Spec B2 required pinning the returned Group flag. Sol medium added the tests-only assertion; both new-flag mutants fail and restored tests pass 2/2. Narrow Opus recheck is next; publication remains gated.
-- Last merged PR58, `2fbc6476fde3aaa5c1e94ad46872e46315d73018`, at 17:41:49Z. Its tree equals reviewed head `f80526a`; all five checks and independent Opus high integration review passed. Main-after-PR58 run `43475344395` is pending.
+- Last merged PR58, `2fbc6476fde3aaa5c1e94ad46872e46315d73018`, at 17:41:49Z. Its tree equals reviewed head `f80526a`; all five checks and independent Opus high integration review passed. Main-after-PR58 run `43475344395` succeeded on attempt 1 in 602s (17:41:52-17:51:54Z).
 - Main-after-PR56 run `43473029593` succeeded on attempt 1 in 507s (17:27:48-17:36:15Z). No gate bypass or policy change. The bootstrap exception remains exhausted.
 - Next: independent Opus high recheck of Sol medium E5 tests-only correction `c46304e`, evidence `da1762d`, then re-pin onto current main and integrate with reviewed E1. E5 remains unpublished and inactive. Earlier source/verification credits remain at their stated pins.
 - M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved; no fix, waiver or retry.
