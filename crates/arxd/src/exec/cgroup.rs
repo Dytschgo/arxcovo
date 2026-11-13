@@ -9,7 +9,10 @@ use std::{
     fs::File,
     io::Read,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -19,6 +22,14 @@ pub(super) struct Group {
     name: CString,
     pub procs: File,
     removed: std::cell::Cell<bool>,
+    residue: Arc<AtomicBool>,
+}
+// Keep this helper syscall-free after unlinkat: the failed-openat caller
+// deliberately reads errno after cleanup, preserving the legacy error.
+fn release_leaf(parent: i32, name: &std::ffi::CStr, residue: &AtomicBool) {
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        residue.store(true, Ordering::Release);
+    }
 }
 fn text(fd: i32, name: &std::ffi::CStr) -> std::io::Result<String> {
     let mut s = String::new();
@@ -31,7 +42,7 @@ fn text(fd: i32, name: &std::ffi::CStr) -> std::io::Result<String> {
     Ok(s)
 }
 impl Group {
-    pub fn create(c: &OwnerConfig) -> Result<Self, ExecError> {
+    pub fn create(c: &OwnerConfig, residue: Arc<AtomicBool>) -> Result<Self, ExecError> {
         let path = c.cgroup_parent.as_ref().ok_or(ExecError::Unavailable(
             "verified Linux cgroup delegation required",
         ))?;
@@ -82,9 +93,7 @@ impl Group {
             )
         };
         if raw < 0 {
-            unsafe {
-                libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR);
-            }
+            release_leaf(fd, &name, &residue);
             return Err(std::io::Error::last_os_error().into());
         }
         let dir = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -104,11 +113,10 @@ impl Group {
                 name,
                 procs,
                 removed: std::cell::Cell::new(false),
+                residue,
             }),
             Err(e) => {
-                unsafe {
-                    libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR);
-                }
+                release_leaf(fd, &name, &residue);
                 Err(e.into())
             }
         }
@@ -146,7 +154,9 @@ impl Group {
 }
 impl Drop for Group {
     fn drop(&mut self) {
-        self.kill_and_confirm();
+        if !self.kill_and_confirm() {
+            self.residue.store(true, Ordering::Release);
+        }
         // Normal completion reports removal failure through kill_and_confirm.
         // Error unwinding remains best effort; caller must quarantine errors.
     }
@@ -155,6 +165,61 @@ impl Drop for Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_leaf_tracks_failed_unlink_without_reset_or_errno_change() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = File::open(base.path()).unwrap();
+        let flag = AtomicBool::new(false);
+        std::fs::create_dir(base.path().join("empty")).unwrap();
+        release_leaf(parent.as_raw_fd(), c"empty", &flag);
+        assert!(!base.path().join("empty").exists());
+        assert!(!flag.load(Ordering::Acquire));
+
+        std::fs::create_dir(base.path().join("full")).unwrap();
+        std::fs::write(base.path().join("full/owned-file"), b"").unwrap();
+        release_leaf(parent.as_raw_fd(), c"full", &flag);
+        let error = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(error, Some(libc::ENOTEMPTY));
+        assert!(flag.load(Ordering::Acquire));
+        assert!(base.path().join("full/owned-file").exists());
+
+        // A later confirmed removal cannot clear earlier uncertainty.
+        std::fs::create_dir(base.path().join("later")).unwrap();
+        release_leaf(parent.as_raw_fd(), c"later", &flag);
+        assert!(!base.path().join("later").exists());
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn group_drop_signals_nonempty_leaf_but_not_already_removed() {
+        for removed in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let leaf = base.path().join("leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.kill"), b"").unwrap();
+            std::fs::write(leaf.join("cgroup.events"), b"populated 0\n").unwrap();
+            let residue = Arc::new(AtomicBool::new(false));
+            let group = Group {
+                parent: File::open(base.path()).unwrap().into(),
+                dir: File::open(&leaf).unwrap().into(),
+                name: CString::new("leaf").unwrap(),
+                procs: File::open(leaf.join("cgroup.events")).unwrap(),
+                removed: std::cell::Cell::new(removed),
+                residue: residue.clone(),
+            };
+            drop(group);
+            assert_eq!(residue.load(Ordering::Acquire), !removed);
+            assert_eq!(
+                std::fs::read(leaf.join("cgroup.kill")).unwrap(),
+                if removed {
+                    b"".as_slice()
+                } else {
+                    b"1".as_slice()
+                }
+            );
+        }
+    }
     #[test]
     fn populated_zero_with_removal_failure_is_not_confirmed() {
         // Ordinary temporary files only; never a real cgroup or privileged write.
@@ -174,6 +239,7 @@ mod tests {
             name: CString::new("leaf").unwrap(),
             procs: File::open(leaf.join("cgroup.events")).unwrap(),
             removed: std::cell::Cell::new(false),
+            residue: Arc::new(AtomicBool::new(false)),
         };
         assert!(!group.kill_and_confirm());
         drop(group);

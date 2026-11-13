@@ -2,6 +2,43 @@
 
 ## Current state - 2026-11-13
 
+- E5 source review is complete: first review `4e1d6b8`, forwarding recheck `2c47ec9`, and returned-flag recheck `a1e0cea` close required S1/B1/B2. Sol medium integrates reviewed E5 onto merged E1 main `2fbc647`. Production remains inactive; combined fmt/Clippy pass and complete diagnostic workspace run passes 337/3. The first full run failed an unchanged dispatcher privacy assertion; 11 focused passes and the complete run do not establish a cause or fix. Both outcomes are retained in evidence. Exact-head independent integration review and hosted gates remain required before merge.
+- Last merged PR58 `2fbc6476fde3aaa5c1e94ad46872e46315d73018`. Main-after-PR58 run `43475344395` succeeded on attempt 1 in 602s. All five required checks and strict protection remain in place; bootstrap exception exhausted.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Linux E5 R1/R2 and hosted compilation remain pending. ExecutionFailed/E_PROTECTION unresolved; no retry or waiver.
+
+## Historical E5 review state
+
+- E5 recheck `2c47ec9`: Standards approved; Spec B2 required pinning the returned Group flag. Sol medium added the tests-only assertion; both new-flag mutants fail and restored tests pass 2/2. Narrow Opus recheck is next; publication remains gated.
+- Last merged PR58, `2fbc6476fde3aaa5c1e94ad46872e46315d73018`, at 17:41:49Z. Its tree equals reviewed head `f80526a`; all five checks and independent Opus high integration review passed. Main-after-PR58 run `43475344395` succeeded on attempt 1 in 602s (17:41:52-17:51:54Z).
+- Main-after-PR56 run `43473029593` succeeded on attempt 1 in 507s (17:27:48-17:36:15Z). No gate bypass or policy change. The bootstrap exception remains exhausted.
+- Next: independent Opus high recheck of Sol medium E5 tests-only correction `c46304e`, evidence `da1762d`, then re-pin onto current main and integrate with reviewed E1. E5 remains unpublished and inactive. Earlier source/verification credits remain at their stated pins.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved; no fix, waiver or retry.
+
+## Historical checkpoint before E1 merge
+
+- Queue priority: PR58 E1 exact-head review/gates, then E5 test-correction security recheck. PR56 merged normally3875466 at17:27:45Z, contract is on main. E5 source f866af4 first Opus review4e1d6b8 required tests-only S1/B1 repairs. Coordinator correctionc46304e restores rustfmt coverage and pins both production forwarding sites; focused17/fmt/Clippy pass, both surviving mutants now fail assertions and formatting negative control is caught. Production bytes unchanged. E5 unpublished; no activation, hardware acceptance or exception. E1 published source is reviewed; its exact-head recheck starts next.
+- Main after PR53 run43464791125 passed attempt1 in598s; main after PR54 run43462769959 passed567s. All five protection requirements/app pins and strict mode remain restored; bootstrap exception exhausted, no product waiver.
+- ADR0020/brief carry the previously independently reviewed local-delivery clarification4272291 (Opus PASS0f471e8), allowing local inactive implementation on explicit reviewed dependencies while publication/integration retain gates. Technical design unchanged; local E1/E5 are built but pending source review/re-pin. No native owner/service/cgroup/VM/experiment or production activation. Coordinator OpenAI / gpt-6.1-sol / medium.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved with no fix, waiver or retry. Parent histories and evidence retained below.
+
+## Historical parent checkpoint
+
+- Queue priority: publish the accepted inactive ADR 0020 contract stacked on Stage D, obtain exact-head independent review and all required gates. Sol correction 2 `07475b8` passed Opus high recheck `f08a510` (retained `14314fa`); P2/P6/P7 are closed at design level. Coordinator Sol medium addresses five advisory clarifications before publication. No implementation starts until contract and Stage C/D merge; no privileged acceptance or activation is authorized.
+- Correction `66924d0` (Anthropic / Opus 5.5 / high), retained as `680b143`, addresses the initial five blockers and proposes explicit ADR 0019 amendment A5 for a payload-free residue flag and admission recheck. Outcome: proposed, pending independent review; no builds or behavior tests ran. [Disposition](reviews/0020-correction1-disposition.md).
+- Stage E proposal `e3928f5` (Anthropic / Opus 5.5 / high) is retained as `54032bf`; independent review `8ff4196` (OpenAI / gpt-6.1-sol / high) is retained as `8ff3a54`. Outcome: changes required, five blockers covering sudo executable trust, directory-list offsets, orphan/admission claims, cleanup postconditions and test precedence. [Review](reviews/0020-sol-independent-design-review.md).
+- Stage D PR55 head `fdea1c6` passed exact-head Opus review; hosted Ubuntu and macOS passed. The existing 906-second main baseline keeps ci-time-budget red. Stage C PR53 remains an unmerged dependency. No merge gate is waived; CI performance and diagnostic investigations remain parked while product design continues.
+- Last merged PR52, main `1604db1`. M1 accepted; M2 incomplete. Production native execution remains inactive. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry. No owner/admin/service/VM operation is authorized.
+
+## Historical checkpoint before Stage E design review
+
+## Historical parent checkpoint
+
+- Queue priority: integrate PR55 Stage D on merged PR53, then normal exact-head review and all five checks before merge; PR56 follows. Last merged PR53 `6dd74673265d488d9da18e863d1fde651d6d0304`, 16:38:42Z. Its squash tree matches reviewed `46f90c9`. Main after PR53 run43464791125 is pending.
+- Main after PR54 run43462769959 succeeded on attempt1 in 567s (16:26:39-16:36:06Z). PR54 merged with all normal gates; the one-time bootstrap protection exception remains exhausted/restored.
+- Stage D product bytes remain identical to reviewed fdea1c6 and original d3615be except previously reviewed test corrections. Scanner conflict resolves to exactly reviewed Stage D file, preserving its Stage C rules and stronger scan. PROGRESS keeps both histories. Coordinator OpenAI / gpt-6.1-sol / medium; fresh Opus high integration review required. No production bridge constructor or native activation.
+
+## Historical merged E1 state
+
 - Queue priority: publish reviewed Stage E E1 pure parsers on merged ADR0020, exact-head review and hosted gates, then continue the remaining E slices. PR56 merged normally as `3875466129dd16d0dfa60387a3015726b17ee17a` at 2026-11-13 17:27:45Z, all five gates on fc1a664 plus independent Opus recheck; squash tree is exact. Its first macOS capacity cancellation remains recorded, the single infrastructure retry passed. No gate exception.
 - E1 publication boundary: Sol high source55c2220, test-only coordinator correctionddc89fc, independent Opus fullreviewe77cda7 and S1recheckf7cacdc PASS. Production parser prefix unchanged; final main re-pin adds no source changes. [Source review](reviews/0020-e1-independent-source-review.md), [guard recheck](reviews/0020-e1-guard-tests-opus-recheck.md), [evidence](evidence/linux-hierarchy-e1.md). Existing SA1/A5 advisories remain disclosed. Exact-head reviewer is queued after active E5 review (one reviewer at a time). Publication is not M2 acceptance or activation.
 - Main after PR53 run43464791125 passed attempt1 in598s; main after PR54 run43462769959 passed567s. All five protection requirements/app pins and strict mode remain restored; bootstrap exception exhausted, no product waiver.

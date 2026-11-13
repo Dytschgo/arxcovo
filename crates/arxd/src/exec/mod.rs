@@ -7,6 +7,10 @@
 use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -160,6 +164,7 @@ fn recheck(cancel: bool, shutdown: bool) -> Option<RunFailure> {
 pub struct Runner {
     config: OwnerConfig,
     shutdown: Cancellation,
+    residue: Arc<AtomicBool>,
 }
 impl Runner {
     pub fn new(config: OwnerConfig) -> Result<Self, ExecError> {
@@ -167,12 +172,17 @@ impl Runner {
         Ok(Self {
             config,
             shutdown: Cancellation::default(),
+            residue: Arc::new(AtomicBool::new(false)),
         })
     }
     /// Integration must signal this token during daemon shutdown and join run threads.
     /// Every active run polls it; callers must not forcibly abort their run threads.
     pub fn shutdown_handle(&self) -> Cancellation {
         self.shutdown.clone()
+    }
+    /// Monotone cleanup uncertainty for this runner's admission domain.
+    pub fn cleanup_residue(&self) -> bool {
+        self.residue.load(Ordering::Acquire)
     }
     pub fn run(&self, spec: &RunSpec, cancellation: &Cancellation) -> Result<RunResult, ExecError> {
         validate_spec(spec)?;
@@ -203,6 +213,8 @@ impl Runner {
                 cancellation,
                 &self.shutdown,
                 caller_shutdown,
+                #[cfg(target_os = "linux")]
+                self.residue.clone(),
             )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -353,7 +365,9 @@ fn stop_reason(
 #[cfg(all(test, target_os = "linux"))]
 mod disposable;
 #[cfg(test)]
-mod tests;
+mod stage_b_tests;
 
 #[cfg(test)]
-mod stage_b_tests;
+mod residue_tests;
+#[cfg(test)]
+mod tests;
