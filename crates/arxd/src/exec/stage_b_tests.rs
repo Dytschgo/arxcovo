@@ -766,9 +766,7 @@ fn e7_non_test_tokens(source: &str) -> Vec<String> {
                     }
                 }
             }
-            let begin = i;
             let mut nesting = Vec::new();
-            let mut block_item = input.get(i).is_some_and(|v| v == "{");
             while i < input.len() {
                 let token = input[i].as_str();
                 // A cfg(test) argument can end at its surrounding call's
@@ -780,14 +778,6 @@ fn e7_non_test_tokens(source: &str) -> Vec<String> {
                     i += 1;
                     break;
                 }
-                if token == "{" && nesting.is_empty() {
-                    block_item |= input[begin..i].iter().any(|v| {
-                        matches!(
-                            v.as_str(),
-                            "fn" | "impl" | "mod" | "struct" | "enum" | "trait"
-                        )
-                    });
-                }
                 match token {
                     "(" | "[" | "{" => nesting.push(token),
                     ")" | "]" | "}" => {
@@ -796,7 +786,7 @@ fn e7_non_test_tokens(source: &str) -> Vec<String> {
                     _ => {}
                 }
                 i += 1;
-                if token == "}" && nesting.is_empty() && block_item {
+                if token == "}" && nesting.is_empty() {
                     break;
                 }
             }
@@ -954,5 +944,27 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
             !e7_inactive_source_allowed("new_module.rs", &(guarded + forbidden)),
             "production after tests is still scanned"
         );
+    }
+}
+
+#[test]
+fn w8_e7_test_braces_never_hide_following_production() {
+    let shapes = [
+        "#[cfg(test)] macro_rules! only_test { () => {} } fn p() { PRODUCTION_CALL }",
+        "#[cfg(test)] unsafe extern \"C\" { fn test_only(); } fn p() { PRODUCTION_CALL }",
+        "fn p() { match 0 { #[cfg(test)] 0 => {} _ => { PRODUCTION_CALL } } }",
+        "fn p() { #[cfg(test)] if true {} PRODUCTION_CALL }",
+    ];
+    for shape in shapes {
+        for call in [
+            "crate::exec::Runner::new(c);",
+            "crate::exec::hierarchy::setup();",
+        ] {
+            let source = shape.replace("PRODUCTION_CALL", call);
+            assert!(
+                !e7_inactive_source_allowed("probe.rs", &source),
+                "test-only braced forms cannot hide production"
+            );
+        }
     }
 }
