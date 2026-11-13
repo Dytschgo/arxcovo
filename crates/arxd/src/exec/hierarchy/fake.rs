@@ -603,6 +603,15 @@ fn h9_bounds() {
     f.no_mutation();
 }
 #[test]
+fn h10_valid_foreign_location_refused_before_mutation() {
+    let f = Fake::new();
+    let bytes = b"0::/other.slice/arxd.service/supervisor";
+    assert!(parse::locate(bytes).is_some());
+    f.0.borrow_mut().cgroup.bytes = bytes.to_vec();
+    f.fail(SetupFailure::Locate);
+    f.no_mutation();
+}
+#[test]
 fn h10_anchors_zero_mutations() {
     use SetupFailure::*;
     for case in 0..21 {
@@ -778,6 +787,7 @@ fn h14_shutdown_boundaries() {
     let f = Fake::new();
     let r = f.prepared();
     f.leaf(r, b"arx-1-0");
+    f.0.borrow_mut().kill_delay = None;
     let token = Cancellation::default();
     let clock = Manual {
         cancel: Some(token.clone()),
