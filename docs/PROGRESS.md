@@ -2,6 +2,26 @@
 
 ## Current state - 2026-11-13
 
+- Native harness pre-push review is complete: Opus high `59525d6`, parser recheck `302175a`, and padded-counter PASS `b6fcefc` close B1/B2. Coordinator publishes reviewed harness for its first ordinary-user Ubuntu evidence run on PR61. Native mutation kills remain unrun until logs prove them; refreshed exact-head review/all checks and native evidence are required before merge. No production activation.
+- E3 native parser recheck `302175a` closed B2 but required padded-counter B1 correction. Sol medium `729922a` adds padded real-output/baseline fixtures; portable24 pass/1 skip and old-pattern negative control fails. Fresh narrow review required before push; no native kills claimed.
+- Native harness review `59525d6` found fail-closed nextest output parsing blockers B1/B2. Sol medium correction `78f1f3d` uses actual counter/footer fixtures; portable24 pass/1 skip, and old-driver/counter/footer negative controls fail. Narrow Opus recheck pending before push; no native execution or kill credit.
+- E3 native evidence harness is prepared locally (`486b149`, retained `ad8b996`). Sol medium fixture correction `231e6d7` makes L10 discriminate a symlink reported as regular and refreshes the pin. Portable tests 23 pass/1 skip and scanner4 pass; zero native kill credit. Fresh Opus high review required before push or hosted execution. PR61 remains unmerged despite its existing five green checks.
+- PR61 head `f32deee` has all five required checks green (CI `43489053601`), plus source-only Opus integration PASS. Merge remains held for native mutation kills and visible L7/L8 pass-or-skip evidence. Sol high is preparing a bounded Ubuntu-only verification harness locally; independent review is required before pushing it. This checkpoint grants no merge or activation.
+- E3 Linux descriptor adapter source review is complete: Opus high `de2cc44` plus read-bound recheck `1de4a5b` (retained `c77683c`) resolve B1 by source analysis. Sol high source `eb93620` and Sol medium Linux-only test correction `c13fc98` are unchanged on merged E2 main `c56b6b5`. Publication seeks hosted evidence; it does not claim native mutation kills or clear merge.
+- Required next evidence: real Linux crate compilation/Clippy, ordinary-user L1-L10 including the new pipe test, native read-limit and other specified mutation kills, exact-head integration review and all five checks. Windows/stub checks do not satisfy those native gates. Production remains MechanismUnavailable.
+- Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`; main CI `43485836788` passed attempt1 in657s. Protection remains strict with all five checks; no bypass.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
+
+## Historical E3 source-review checkpoint
+
+- E3 review `de2cc44` found one test-only B1 blocker (bounded-read overconsumption). Sol medium added Linux pipe test `c13fc98`; production unchanged, Windows fmt and scanner 4 pass. Native test/mutants remain unrun, narrow Opus recheck is next. E3 unpublished/inactive.
+- E3 Linux descriptor adapter is built locally by Sol high: source `eb93620`, evidence `61b0ec9`, ported unchanged onto merged E2 main `c56b6b5`. Windows fmt/Clippy, focused60 and single final362/3 workspace pass are credited at original source only. Actual Linux compilation/native tests/mutations remain unverified (missing cross C compiler). Independent Opus high security review is next; no publication or activation.
+- Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`, at 18:46:14Z. Its squash tree equals independently reviewed `be629c8`; all five required checks passed. Main-after-PR60 run `43485836788` succeeded on attempt 1 in 657s (18:46:16-18:57:13Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- E2 setup/janitor over fake ports is integrated and inactive. Sol high is building E3 Linux descriptor adapter locally on reviewed E2; parent source will be re-pinned to merged main before publication. No real cgroup setup or activation.
+- Main-after-PR59 run `43479932347` passed attempt1 in511s. Strict protection and all five contexts remain unchanged; bootstrap exception exhausted. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix/waiver/retry.
+
+## Historical checkpoint before E2 merge
+
 - E2 fake-port setup/janitor is ready for publication on main `064113a`. Sol high source `b40e81a` passed Opus high review `dd4dad8` after Sol medium tests-only correction `70729f6` passed recheck `352a8c1` (retained `12578aa`); B1/B2 closed. Production setup.rs is unchanged. Exact-head integration review and all five hosted checks remain required; no activation.
 - Verification credits: builder fmt/Clippy, focused58, 14 mutation kills and one full360/3 at b40e81a; coordinator test correction fmt/Clippy and focused24; reviewer restored focused24 and three targeted mutation/probe kills. No new full-suite run claimed for docs/test-only changes.
 - Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`; main run `43479932347` passed attempt1 in511s. All five required checks/strict protection retained; bootstrap exception exhausted.
