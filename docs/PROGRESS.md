@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- E4 descriptor-bound rights probe is ready for hosted publication on merged E3 main `af9289a`. Sol high source4967b53 and Sol medium correctioncf8b9e7 passed Opus high recheck063c4bf (retained737d623), closing Linux compile/lint B1 and unfenced S6 B2 by source/stub evidence. Unicode-only test fixture87ef559 restores the original literals. No real Linux runtime or native mutation result is claimed yet.
+- Next merge requirements: exact-head independent integration review, all five required checks, ordinary-user Linux/macOS test evidence and specified native mutation kills. S6's system probe is NNP-fenced; no unfenced privileged test is authorized. Production execution stays MechanismUnavailable.
+- Last merged PR61 `af9289a5dbd648d94db338c017bbcd8f801c7ebf`; main run43495122702 passed attempt1 in549s. E3 native run43493588144 satisfied eight mutation kills and L7/L8 pass as UID1001. Strict five-check protection remains unchanged; bootstrap exception exhausted.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry.
+
+## Historical E4 source-review checkpoint
+
 - E4 source review `cf5f282` required B1 Linux compile/lint corrections and B2 NNP-fenced integration probe. Sol medium correction `cf8b9e7` also restores rustfmt coverage for the Linux tests. Windows fmt/Clippy and focused8 pass; Linux results remain unclaimed. Fresh Opus recheck is next, E4 unpublished/inactive.
 - E4 rights probe is implemented locally by Sol high: source `4967b53`, evidence `e011ec1`, retained unchanged on merged E3. Windows fmt/locked workspace Clippy and one final 366 passed/3 ignored workspace run are credited at source pin only. Linux compilation/runtime/native mutations remain unrun. Fresh Opus high security review is next; no publication or activation.
 - Last merged PR61 `af9289a5dbd648d94db338c017bbcd8f801c7ebf`, at 19:45:03Z. Its squash tree equals reviewed `231c367`; all five required checks plus the native-evidence job passed. Main-after-PR61 run `43495122702` succeeded on attempt 1 in 549s (19:45:06-19:54:15Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.

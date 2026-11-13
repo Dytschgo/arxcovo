@@ -162,3 +162,22 @@ Updated correction manifest (committed bytes):
 | `crates/arxd/src/unix_shim_rights_linux.rs` | `080778591d6744018015cae1ab9457a58a028c0e` | `2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd` |
 | `crates/arxd/src/unix_shim_rights_linux_tests.rs` | `32d55ad9354e7cf515920b4d975866de77f46a6c` | `ba73cff90373c19929aea9dd732a667af9b5e6dc3909b32641d0b9fc20517024` |
 | `crates/arxd/tests/unix_shim.rs` | `a26e24c6f0d62c18ffc4c727046e099b5f489329` | `83dbfc32895704f4f6578755878550cc64c8681e2dde3cb638986f5953160297` |
+
+## Publication checkpoint and Unicode fixture restoration
+
+Opus high recheck063c4bf (retained737d623) closes B1/B2 and rustfmt coverage.
+N1 was corrected in87ef559: both S1 Unicode literals are restored to their
+original single-encoded character. No new production change. Fmt passed.
+The root8-test selection was exactly:
+`test(unix_shim) | test(s13_) | test(e4_) | test(p_scan_)`; it includes
+`s5_injected_identity_refuses_root`, which accounts for the eighth test
+beyond the reviewer's narrower seven. Neither run is Linux evidence.
+
+Main af9289a has the same tree as reviewed E3 parent231c367, and the
+local38b207d evidence record is retained. No new full-suite run is claimed
+for corrections/reports. Exact-head integration review, real Linux/macOS
+compilation/runtime and native mutation kills remain required before merge.
+Production remains MechanismUnavailable, M2 incomplete.
+
+Restored integration fixture (committed bytes):
+- Git blob `4108b5c47238e5ef9be9e6c23dad1351cda90c9f`; SHA-256 `20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a`.
