@@ -7,7 +7,7 @@ is required; this evidence is not independent review or publication approval.
 ## Isolation and pins
 
 Cwd and Git top level were both
-`C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-af8951a3-554ed6a00fb07e0f`,
+`<prepared-worktree>`,
 branch `t3/discovery-regression-tests`, outside the canonical checkout.
 Initial HEAD was `4eaad1dd4969d2a3207630680bbf002bb0d932a5`, clean. Its only
 difference from PR #64 reviewed head
