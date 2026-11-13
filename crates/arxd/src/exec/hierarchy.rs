@@ -8,3 +8,6 @@ pub(crate) use parse::locate;
 #[cfg(test)]
 mod fake;
 pub(crate) mod setup;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;

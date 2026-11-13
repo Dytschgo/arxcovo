@@ -573,3 +573,65 @@ fn p_scan_hook_site_is_exactly_one_and_shim_only() {
     assert!(scan_with_hook("set_hook(x);", true).is_ok());
     assert!(scan_with_hook("set_hook(x);", false).is_err());
 }
+
+// E3 extends the existing tokenizer and payload scanner on every host. Native
+// syscall tests remain Linux-only; this test cannot establish Linux behavior.
+fn e3_source_allowed(source: &str) -> bool {
+    if scan(source).is_err() {
+        return false;
+    }
+    let mut t = tokens(source);
+    let boundary = tokens("#[cfg(test)] mod tests {");
+    if let Some(i) = t.windows(boundary.len()).position(|w| w == boundary) {
+        t.truncate(i);
+    }
+    let calls = [
+        "read_dir",
+        "canonicalize",
+        "metadata",
+        "exists",
+        "kill",
+        "killpg",
+        "setpriority",
+        "dup",
+        "dup2",
+    ];
+    !t.iter()
+        .any(|s| s == "Command" || s == "F_DUPFD" || s == "F_DUPFD_CLOEXEC")
+        && !t
+            .windows(2)
+            .any(|w| calls.contains(&w[0].as_str()) && w[1] == "(")
+        && !t.windows(5).any(|w| w == ["File", ":", ":", "open", "("])
+}
+#[test]
+fn l6_e3_tokenized_source_inventory_and_mutants() {
+    let sources = [
+        ("hierarchy.rs", include_str!("hierarchy.rs")),
+        ("hierarchy/linux.rs", include_str!("hierarchy/linux.rs")),
+    ];
+    assert!(
+        sources
+            .iter()
+            .all(|(name, source)| *name != "hierarchy/fake.rs" && e3_source_allowed(source))
+    );
+    for mutant in [
+        "read_dir(p)",
+        "File::open(p)",
+        "canonicalize(p)",
+        "metadata(p)",
+        "exists(p)",
+        "kill(p)",
+        "killpg(p)",
+        "setpriority(p)",
+        "Command::new(p)",
+        "set_hook(p)",
+        "dup(p)",
+        "dup2(p)",
+        "fcntl(p,F_DUPFD)",
+        "fcntl(p,F_DUPFD_CLOEXEC)",
+        "panic!(\"{p}\")",
+    ] {
+        assert!(!e3_source_allowed(mutant), "E3 source mutant rejected");
+    }
+    assert!(e3_source_allowed("// dup(p)\nlet s = \"kill(p)\";"));
+}
