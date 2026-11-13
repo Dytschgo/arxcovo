@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E7 local inactive startup discovery/cache implementation is complete by Sol high: source `cea3038`, evidence `20d76c7`, retained unchanged on merged E6. Builder fmt/locked workspace Clippy, final383/3 and7 compiled kills are credited at original pin. Fresh Opus high security review is next; no publication or activation, Stage F/G remain separate.
 - Last merged PR63 `85209a46972bd0f7c92a4e490ddbf20a99f2bfcb`, at 21:26:18Z. Its squash tree equals independently reviewed `338d12c`; all five required checks passed. Main-after-PR63 run `43510685416` succeeded on attempt 1 in 632s (21:26:20-21:36:52Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
 - E6 readiness/in-slot gates are merged and inactive. Sol high is implementing E7 startup discovery and Activity tool-cache lifecycle locally on reviewed E6. Re-pin onto merged E6, independent source/integration review and required checks remain gates before E7 publication/merge. E7 must retain single domain/runner, hardening-before-Ready and no production startup override.
 - Last main-after-PR62 run `43505759245` passed attempt1 in574s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete; production remains MechanismUnavailable; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix, waiver or retry.
