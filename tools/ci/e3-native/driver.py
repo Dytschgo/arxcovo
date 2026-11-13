@@ -158,7 +158,7 @@ def run_bounded(command, cwd, seconds, limit=LIMIT):
 
 
 def statuses(output, name):
-    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?arxd\s+" + re.escape(name) + r"\s*$"
+    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+(?:\(\s*\d+/\d+\)\s+)?arxd\s+" + re.escape(name) + r"\s*$"
     return re.findall(pattern, output, re.MULTILINE)
 
 

@@ -21,7 +21,8 @@ def status(kind, name):
 
 
 def baseline():
-    return "".join(status("PASS", name) for name in d.TESTS)
+    return "".join(f"        PASS [   0.028s] ({n:2d}/{len(d.TESTS)}) arxd {name}\n"
+                   for n, name in enumerate(d.TESTS, 1))
 
 
 class HarnessTests(unittest.TestCase):
@@ -119,6 +120,10 @@ class HarnessTests(unittest.TestCase):
         passed = "PASS [   0.021s] (2/2) arxd tests::good\n"
         self.assertEqual(d.classify(100, failed, "tests::bad"), "killed")
         self.assertEqual(d.classify(0, passed, "tests::good"), "survived")
+        padded = "PASS [   0.028s] ( 1/11) arxd tests::t3\n"
+        self.assertEqual(d.classify(0, padded, "tests::t3"), "survived")
+        self.assertEqual(d.statuses(padded, "tests::t3"), ["PASS"])
+
         self.assertEqual(d.statuses(passed.replace("(2/2) ", ""), "tests::good"), ["PASS"])
         for output in (failed.replace("error: test run failed\n", ""),
                        failed + "error: test run failed\n",
@@ -136,7 +141,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(d.baseline_result(0, baseline() +
                          "    SKIP L7: user xattrs refused\n    SKIP L8: unexpected Standard hardening\n"),
                          {"L7": "skipped", "L8": "skipped"})
-        for output in ("", baseline().replace(status("PASS", d.TESTS[1]), ""),
+        for output in ("", baseline().replace(d.TESTS[1], d.TESTS[1] + "_suffix"),
                        baseline() + "SKIP E3 owned native tests: root", baseline() + "SKIP unknown"):
             with self.assertRaises(d.GuardError):
                 d.baseline_result(0, output)
