@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E4 native harness pre-push review is complete: Opus high `23dee78` and label recheck PASS `0123317` close B1. Coordinator publishes the reviewed harness for its first ordinary-user Ubuntu execution on PR62. Eleven native kills, explicit skip/pass baselines, restoration, exact-head review and refreshed five checks remain merge requirements; no activation.
 - E4 harness review `23dee78` required B1 integration label correction. Sol medium `d06e541` unifies Cargo target/nextest label mapping; portable22 pass, old-driver control fails, and real nextest synthetic integration pass/fail outputs classify correctly. No E4 native execution. Narrow Opus recheck pending before push.
 - PR62 published head `93046dd` now has all five required checks green and source/integration review PASS. Existing native-evidence is E3, not E4. Merge remains held for E4 native mutation kills and explicit ordinary-UID/pass-or-skip evidence. Local harness/S11 correction `f17a7ac` is under Opus high pre-push review; no native run or publication of that harness yet.
 - E4 native harness is prepared locally (`5e9198c`/`c0c021f`, retained `d24eaf4`/`9b29d38`). Sol medium correction `f17a7ac` decouples S11 inherited-NNP skip from nnp(); manifest now11 runnable native cases. Portable21 pass, fmt pass; no native execution. Fresh Opus high security review required before pushing the harness. PR62 remains unmerged.

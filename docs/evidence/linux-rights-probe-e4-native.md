@@ -210,3 +210,12 @@ remains required before push. All11 native mutation kills remain unrun.
 Updated committed hashes:
 - `tools/ci/e4-native/driver.py`: `9b1dc47f83909fe493ed4910ddb9656c2656babe0e775b4e6cf1079daef4d658`.
 - `tools/ci/e4-native/test_driver.py`: `38e14eb4fc92fff62a304d53473dffc80cbb7465a25b31b65084f613d3104eff`.
+
+## First hosted publication checkpoint
+
+Opus high label recheck0123317 passes B1, carrying forward the pre-push
+security review23dee78. Coordinator publishes the reviewed head for first
+hosted native E4 evidence. No native baseline, S6 timing or mutation kill
+is claimed before the run completes. All11 kills, ordinary UID, explicit
+skip/pass outcomes, source restoration and exact-head review/gates remain
+required before merge. Production remains inactive.
