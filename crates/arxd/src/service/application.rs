@@ -358,6 +358,8 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         }
         self.serving.take();
         if let Some(e) = self.activity.as_ref().and_then(|a| a.dedicated.as_ref()) {
+            #[cfg(test)]
+            self.hooks.discovery_barrier("drain_execution");
             let drained = e.drain().await.map_err(|_| ExitCode::Store);
             if result.is_ok() {
                 result = drained;
@@ -365,6 +367,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         }
         #[cfg(test)]
         if let Some(task) = self.discovery.as_mut() {
+            self.hooks.discovery_barrier("drain_sequence");
             let joined = task.await.map_err(|_| ExitCode::Store).and_then(|r| r);
             if result.is_ok() {
                 result = joined;
@@ -372,6 +375,8 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         }
         #[cfg(test)]
         self.discovery.take();
+        #[cfg(test)]
+        self.hooks.discovery_barrier("drain_blocking");
         self.blocking.drain().await;
         if let Some(activity) = self.activity.clone() {
             let pending = self

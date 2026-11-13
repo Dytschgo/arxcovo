@@ -534,3 +534,72 @@ async fn t13c_existing_residue_gate() {
     assert!(calls.load(Ordering::Acquire) == 0, "existing residue gate");
     e.drain().await.unwrap();
 }
+
+// Invoked only inside the existing normal T10 parent's isolated child.
+pub(super) async fn pa6_panic_residue_report_and_gate() {
+    let residue = Arc::new(AtomicBool::new(false));
+    let flag = residue.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let b = Arc::new(UnixBridge::new(
+        &Layout::for_test(Platform::Linux),
+        &config(),
+        "/owned-synthetic/runs".into(),
+        |_| {
+            Ok(Box::new(Port {
+                calls: count,
+                residue: residue.clone(),
+                step: Box::new(move |_, _, _| {
+                    flag.store(true, Ordering::Release);
+                    panic!("ARX-PA6-FIXED-PANIC");
+                }),
+            }))
+        },
+        Box::new(|| Ok(())),
+        ready(),
+    ));
+    let e = Execution::unix_bridge_for_test(b.clone(), &config());
+    let dir = private_temp();
+    let a = activity(&dir);
+    let out = call(&e, &a, false).await;
+    assert!(
+        out.as_ref()
+            .is_ok_and(|v| v["outcome"] == "failed" && v["cleanup_confirmed"] == false),
+        "unknown creation is an honest failed dispatch"
+    );
+    row(&a, "failed", Some("cleanup_unconfirmed"), Some("failed"));
+    assert!(
+        residue.load(Ordering::Acquire),
+        "residue remains visible after the failed response"
+    );
+    // Exercise the bridge's next in-slot gate, independently of Execution's G latch.
+    assert!(matches!(
+        b.run(
+            Some(&request()),
+            &Cancellation::default(),
+            &Cancellation::default()
+        ),
+        Report::Unavailable(Unavailable::MechanismUnavailable)
+    ));
+    assert_eq!(b.readiness.check(), Err(Unavailable::MechanismUnavailable));
+    residue.store(false, Ordering::Release);
+    assert_eq!(
+        b.preflight(),
+        Err(Unavailable::MechanismUnavailable),
+        "terminal latch survives cleared residue"
+    );
+    for _ in 0..4 {
+        refused(call(&e, &a, false).await, Unavailable::Quarantined);
+    }
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "unwind cannot readmit the port"
+    );
+    let text = serde_json::to_string(&list(&a)).unwrap();
+    assert!(
+        !text.contains("ARX-PA6-FIXED-PANIC"),
+        "panic payload withheld from activity"
+    );
+    e.drain().await.unwrap();
+}

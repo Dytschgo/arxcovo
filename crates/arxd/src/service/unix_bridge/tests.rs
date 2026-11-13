@@ -608,6 +608,7 @@ fn t10_reexec_diagnostics() {
         assert!(!text.contains(MARKER));
         assert!(!text.contains("3141592653"), "identity marker withheld");
         for fixed in [
+            "ARX-PA6-FIXED-PANIC",
             "ARX-T10-FIXED-PANIC",
             "ARX-T10-MAPPING-PANIC",
             "ARX-T10-DISCOVERY-PANIC",
@@ -625,6 +626,7 @@ fn t10_fixture() {
     rt.block_on(async {
         t8_private_inputs_all_phases_inner().await;
         t4_phase_matrix_and_panic_finish_inner().await;
+        e6::pa6_panic_residue_report_and_gate().await;
     });
 }
 async fn t4_phase_matrix_and_panic_finish_inner() {
