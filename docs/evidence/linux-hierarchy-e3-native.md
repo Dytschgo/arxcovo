@@ -199,3 +199,18 @@ Updated harness manifest (committed bytes):
 | `.github/workflows/e3-native-evidence.yml` | `7c7850d57ad6db22a8fd48f74396a4790b4eaa5d09cc853e19f025a725aa2e66` |
 | `tools/ci/e3-native/driver.py` | `e359723257d93adbec3861b2e4105b993233b35a79738e96aada30752494cbf0` |
 | `tools/ci/e3-native/test_driver.py` | `8b3bb14aec92955a929651eb1afcac62c322e2d5a125a58b01ff20578bc111f3` |
+
+## Padded progress-counter correction
+
+Opus high recheck302175a (retained64264ae) closed B2 and found padded
+nextest counters still failed B1. Sol medium correction `729922a3b475e608b05f7176961f5b6359956e5c`
+accepts whitespace before the counter numerator, adds the verbatim padded
+0.9.151 line, and makes the baseline fixture use padded counters for all
+ten native tests. Portable25 discovered:24 passed,one Windows symlink skip.
+The unpadded-only regex mutant fails the real-output and baseline tests
+on an owned scratch copy (exit1). No native execution or kill credit.
+Production and workflow are unchanged; fresh narrow review remains pending.
+
+Updated committed hashes:
+- `tools/ci/e3-native/driver.py`: `2916049ab278ddf2a97da851925cf5b2688d3902775c16453beb3a49578489c7`.
+- `tools/ci/e3-native/test_driver.py`: `2f3fba561afa0058abd55eaa7a799cc6a0b7acbd4b2c3a7c4b756331dc305471`.
