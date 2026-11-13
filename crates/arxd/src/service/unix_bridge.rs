@@ -356,6 +356,7 @@ mod tests;
 struct StartupDomain {
     domain: AdmissionDomain,
     setup: std::sync::Mutex<Option<StartupSetup>>,
+    readiness: Readiness,
 }
 #[cfg(test)]
 type StartupSetup = Box<dyn FnOnce(Cancellation) -> bool + Send>;
@@ -391,6 +392,7 @@ impl StartupDomain {
         let valid = constructed.get();
         Self {
             domain,
+            readiness: state.clone(),
             setup: std::sync::Mutex::new(Some(Box::new(move |stop| {
                 if !valid {
                     state.fail(Cause::Setup);

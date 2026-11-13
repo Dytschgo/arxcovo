@@ -94,25 +94,47 @@ fn app(
     + Send
     + Sync
     + 'static,
-) -> (App, Arc<Activity>, Arc<Execution>, Arc<AtomicUsize>) {
+) -> (
+    App,
+    Arc<Activity>,
+    Arc<Execution>,
+    Arc<AtomicUsize>,
+    Readiness,
+) {
     let allocations = Arc::new(AtomicUsize::new(0));
     let count = allocations.clone();
     let setup_seam = seam.clone();
+    let mut value = fixture();
+    value["limits"]["memory_bytes"] = json!(16777216);
+    value["limits"]["max_concurrent_runs"] = json!(2);
+    let config = parse(value, &FakeResolver::default()).unwrap();
+    let location = locate(b"0::/arxd.service/supervisor\n").unwrap();
+    let expected_parent = location.runs();
+    let setup_components = location.unit_components().to_vec();
     let d = Arc::new(StartupDomain::new(
         &Layout::for_test(Platform::Linux),
-        &config(),
-        locate(b"0::/arxd.service/supervisor\n").unwrap(),
-        move |_| {
+        &config,
+        location,
+        move |owner| {
+            assert_eq!(owner.cgroup_parent, Some(expected_parent));
             count.fetch_add(1, Ordering::AcqRel);
             Ok(Box::new(FakePort(Box::new(step))))
         },
         move |location, stop| {
+            assert_eq!(location.unit_components(), setup_components);
             setup_seam("setup");
-            crate::exec::hierarchy::fake::startup_setup(
-                location, stop, failure, waiting, setup_seam,
-            )
+            let outcome = crate::exec::hierarchy::fake::startup_setup(
+                location,
+                stop,
+                failure,
+                waiting,
+                setup_seam.clone(),
+            );
+            setup_seam("s10");
+            outcome
         },
     ));
+    let state = d.readiness.clone();
     let e = d.domain.handle();
     assert!(Arc::ptr_eq(&e, &d.domain.handle()));
     let mut a = Activity::open_service_fixture(dir.path()).unwrap();
@@ -123,6 +145,7 @@ fn app(
         a,
         e,
         allocations,
+        state,
     )
 }
 async fn done(app: &mut App) {
@@ -146,7 +169,7 @@ async fn w1_w4_t20b_order_single_domain() {
     let events = log.clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let (mut app, a, e, allocations) = app(&dir, false, false, seam, move |_, _, _| {
+    let (mut app, a, e, allocations, _) = app(&dir, false, false, seam, move |_, _, _| {
         events.lock().unwrap().push("port");
         if count.fetch_add(1, Ordering::AcqRel) == 0 {
             Ok(probe())
@@ -159,7 +182,7 @@ async fn w1_w4_t20b_order_single_domain() {
     gate.reached().await;
     assert_eq!(
         *log.lock().unwrap(),
-        ["setup", "s9", "ready", "row", "port", "dispatch"]
+        ["setup", "s9", "s10", "ready", "row", "port", "dispatch"]
     );
     assert_eq!(
         rows(&dir),
@@ -186,16 +209,29 @@ async fn w1_w4_t20b_order_single_domain() {
     );
     gate.open();
     done(&mut app).await;
+    assert_eq!(
+        &log.lock().unwrap()[8..],
+        ["drain_execution", "drain_sequence", "drain_blocking"]
+    );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn w2_w3_shutdown_boundaries() {
-    for point in ["failure", "wait", "s9", "ready", "row", "admission", "port"] {
+    for point in [
+        "failure",
+        "wait",
+        "s9",
+        "s10",
+        "ready",
+        "row",
+        "admission",
+        "port",
+    ] {
         let dir = private_temp();
         let gate = Arc::new(Gate::default());
         let g = gate.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let (mut app, a, e, _) = app(
+        let (mut app, a, e, _, state) = app(
             &dir,
             point == "failure",
             point == "wait",
@@ -241,6 +277,19 @@ async fn w2_w3_shutdown_boundaries() {
             assert!(rows(&dir).is_empty(), "failure never writes a daemon row");
         }
         done(&mut app).await;
+        if matches!(point, "wait" | "s9" | "s10") {
+            assert_eq!(
+                state.check(),
+                Err(Unavailable::Stopping),
+                "Stopped, never Ready"
+            );
+        } else if point == "ready" {
+            assert_eq!(
+                state.check(),
+                Ok(()),
+                "already Ready; shutdown is independent"
+            );
+        }
         let r = rows(&dir);
         if matches!(point, "row" | "admission" | "port") {
             assert_eq!(r.len(), 1);
@@ -260,7 +309,7 @@ async fn w9_stuck_drain_is_failure_not_interruption() {
     let dir = private_temp();
     let gate = Arc::new(Gate::default());
     let g = gate.clone();
-    let (mut app, a, _, _) = app(&dir, false, false, Arc::new(|_| {}), move |_, _, _| {
+    let (mut app, a, _, _, _) = app(&dir, false, false, Arc::new(|_| {}), move |_, _, _| {
         g.hold();
         Ok(probe())
     });
@@ -573,4 +622,90 @@ async fn w2_nonstandard_and_hardening_fail_before_ready() {
             .is_some_and(|e| e.execution_reason == Some(Unavailable::MechanismUnavailable))
     );
     e.drain().await.unwrap();
+}
+
+// Exercise allocation in the actual callers, never placing Activity tickets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pa1_actual_callers_reverse_finish() {
+    use rmcp::{ServiceExt, model::CallToolRequestParams};
+    for startup_first in [true, false] {
+        let dir = private_temp();
+        let gate = Arc::new(Gate::default());
+        let g = gate.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let held_call = usize::from(!startup_first);
+        let (mut app, a, e, _, _) = app(&dir, false, false, Arc::new(|_| {}), move |_, _, _| {
+            let n = count.fetch_add(1, Ordering::AcqRel);
+            if n == held_call {
+                g.hold();
+            }
+            let mut r = probe();
+            r.stdout.head = String::from_utf8(table())
+                .unwrap()
+                .replace("synthetic 1", &format!("synthetic {}", n + 10))
+                .into_bytes();
+            Ok(r)
+        });
+        app.start_discovery();
+        if !startup_first {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !app.discovery_finished_for_test() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(a.tool_cache().is_some(), "existing cache will be replaced");
+        }
+        let inventory = crate::mcp::Inventory {
+            activity: a.clone(),
+            execution: None,
+            principal: Some(crate::mcp::Principal("alpha".into())),
+        };
+        let (s, c) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+        let client = ().serve(c).await.unwrap();
+        let first = if startup_first {
+            None
+        } else {
+            let peer = client.peer().clone();
+            Some(tokio::spawn(async move {
+                peer.call_tool(CallToolRequestParams::new("discover_tools"))
+                    .await
+                    .unwrap()
+            }))
+        };
+        gate.reached().await;
+        let newer = client
+            .call_tool(CallToolRequestParams::new("discover_tools"))
+            .await
+            .unwrap();
+        let newer: Value = serde_json::from_str(&newer.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(newer["outcome"], "succeeded");
+        let ticket = a.tool_cache().unwrap().ticket;
+        gate.open();
+        if let Some(first) = first {
+            first.await.unwrap();
+        }
+        done(&mut app).await;
+        let hosts = client
+            .call_tool(CallToolRequestParams::new("list_hosts"))
+            .await
+            .unwrap();
+        let hosts: Value = serde_json::from_str(&hosts.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(
+            a.tool_cache().unwrap().ticket,
+            ticket,
+            "older completion cannot replace newer start"
+        );
+        assert_eq!(hosts["hosts"][0]["tools"], newer["tools"]);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            if startup_first { 2 } else { 3 }
+        );
+        client.cancel().await.unwrap();
+        server.await.unwrap().unwrap();
+        e.drain().await.unwrap();
+    }
 }
