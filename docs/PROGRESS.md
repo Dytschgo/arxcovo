@@ -2,7 +2,7 @@
 
 ## Current state - 2026-11-14
 
-- Last merged PR66 `1ac40479707718a045dbe6cfcc7d9b0cdf234622`, at 2026-11-13 23:33:02Z. Squash tree equals independently reviewed `43ee910`; all five required checks passed. Main-after-PR66 run `43527940656` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Last merged PR66 `1ac40479707718a045dbe6cfcc7d9b0cdf234622`, at 2026-11-13 23:33:02Z. Squash tree equals independently reviewed `43ee910`; all five required checks passed. Main-after-PR66 run `43527940656` succeeded on attempt 1 in 624s (2026-11-13 23:33:04-23:43:28Z), below the 900s budget. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - Actual-drain SP1/SP2 tests are integrated with their disclosed limits. PA5 and real-Runner unwind/store-before-slot-release evidence remain open. Opus high proposal `1642726` separates local test-only S1/S2 and F0 feedback-artifact preparation from future native runs/Stage G activation. Independent OpenAI / gpt-6.1-sol / high review `9b62dd2` (retained `8b8fca3`) requested changes: unauthorized new-SHA/no-retry inference and a masked residue-gate proof. Coordinator Sol medium corrected the proposal text; narrow Opus high recheck is next. It remains unaccepted; no implementation or experiment is authorized by it.
 - Latest main-after-PR65 run `43524629307` passed attempt1 in587s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
 
