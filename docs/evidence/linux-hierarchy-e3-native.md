@@ -170,3 +170,32 @@ Current committed source/harness manifest:
 | `tools/ci/e3-native/driver.py` | `d7727f88d3f99c57e321707bd397f8ea235bcc3fca22bb4c881fa150975ef22f` |
 | `tools/ci/e3-native/test_driver.py` | `e854b17fd1c4228f84fc47fb26e1acd67cd71a4ad7eb06217d4213179adec3ac` |
 | `tools/ci/e3-native/mutations.jsonl` | `c824820588a406800124352931597e3a220a32b945333e85d3a186612bca3d93` |
+
+## Harness output correction before hosted execution
+
+Opus high review59525d6 (retained fe5fc99) found B1 nextest progress-counter
+parsing and B2 rejection of the normal failure footer. Sol medium correction
+78f1f3d accepts the optional numeric counter and requires exactly one
+error: test run failed footer for exit100 with the named FAIL. Other compiler
+error lines and duplicate/missing footers fail closed. Real 0.9.151 status
+line excerpts from the review are now test fixtures; synthetic statuses also
+include counters and synthetic kills include the real footer.
+
+Portable suite:25 discovered,24 passed,one Windows symlink skip. The new
+real-output regression test fails against the original driver, a counter
+parser removal and a footer-check removal, each exit1 on owned temporary
+copies. No native mutation is credited. No production source changed.
+
+The workflow explicitly enables CARGO_INCREMENTAL=1 while preserving its
+10-minute timeout and all driver deadlines. Fixed failure categories now
+appear in final JSON; OS/value/reap exceptions emit only fixed categories,
+not exception text. Cold-build timing remains unmeasured, not guaranteed.
+Fresh narrow Opus review is required before any push or hosted run.
+
+Updated harness manifest (committed bytes):
+
+| Path | SHA-256 |
+| --- | --- |
+| `.github/workflows/e3-native-evidence.yml` | `7c7850d57ad6db22a8fd48f74396a4790b4eaa5d09cc853e19f025a725aa2e66` |
+| `tools/ci/e3-native/driver.py` | `e359723257d93adbec3861b2e4105b993233b35a79738e96aada30752494cbf0` |
+| `tools/ci/e3-native/test_driver.py` | `8b3bb14aec92955a929651eb1afcac62c322e2d5a125a58b01ff20578bc111f3` |
