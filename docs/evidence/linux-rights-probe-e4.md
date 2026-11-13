@@ -132,3 +132,33 @@ MechanismUnavailable; M2 remains incomplete and native paths remain
 **unverified on real hardware**. E_PROTECTION and ExecutionFailed diagnosis
 remain unknown, with no experiment retry. The known unrelated privacy flake
 remains unresolved; this one green Windows run does not resolve it.
+
+## First independent-review correction
+
+Opus high review cf5f282 (retained41bb2bb) required Linux compile/lint B1
+and unfenced integration-probe B2 repairs. Sol medium source correction
+`cf8b9e795789f517ea65ec99c8fa79e574d4880c` casts both execveat pointer arrays to the pinned libc
+signature, derives empty production Settings Default while retaining test
+defaults, and removes the needless helper return. These are source corrections,
+not a real Linux compile result.
+
+The S6 integration command now sets PR_SET_NO_NEW_PRIVS in Linux pre_exec
+and aborts spawn if setting it fails. The output must report no_new_privs:true
+and sudo must not be exit_zero. Non-Linux output must be null/unknown.
+No unfenced system probe was run. The test module is out-of-line through a
+path attribute, so cargo fmt follows it; all formerly hidden hunks are formatted.
+A deliberate misformat in that file now fails fmt and exact bytes were restored.
+
+Windows fmt and locked workspace/all-target Clippy pass. Focused portable
+selection passed8/8 (2d1d0b7b-af1b-4fa1-9d59-07ce6c8bfb8f). No full-suite
+repeat for these corrections; no Linux runtime/native mutation credit.
+Independent Opus recheck, real Linux/macOS compilation and native tests remain
+required before publication/merge. Production remains inactive.
+
+Updated correction manifest (committed bytes):
+
+| Path | Git blob | SHA-256 |
+| --- | --- | --- |
+| `crates/arxd/src/unix_shim_rights_linux.rs` | `080778591d6744018015cae1ab9457a58a028c0e` | `2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd` |
+| `crates/arxd/src/unix_shim_rights_linux_tests.rs` | `32d55ad9354e7cf515920b4d975866de77f46a6c` | `ba73cff90373c19929aea9dd732a667af9b5e6dc3909b32641d0b9fc20517024` |
+| `crates/arxd/tests/unix_shim.rs` | `a26e24c6f0d62c18ffc4c727046e099b5f489329` | `83dbfc32895704f4f6578755878550cc64c8681e2dde3cb638986f5953160297` |

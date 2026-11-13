@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E4 source review `cf5f282` required B1 Linux compile/lint corrections and B2 NNP-fenced integration probe. Sol medium correction `cf8b9e7` also restores rustfmt coverage for the Linux tests. Windows fmt/Clippy and focused8 pass; Linux results remain unclaimed. Fresh Opus recheck is next, E4 unpublished/inactive.
 - E4 rights probe is implemented locally by Sol high: source `4967b53`, evidence `e011ec1`, retained unchanged on merged E3. Windows fmt/locked workspace Clippy and one final 366 passed/3 ignored workspace run are credited at source pin only. Linux compilation/runtime/native mutations remain unrun. Fresh Opus high security review is next; no publication or activation.
 - Last merged PR61 `af9289a5dbd648d94db338c017bbcd8f801c7ebf`, at 19:45:03Z. Its squash tree equals reviewed `231c367`; all five required checks plus the native-evidence job passed. Main-after-PR61 run `43495122702` succeeded on attempt 1 in 549s (19:45:06-19:54:15Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
 - E3 hosted ordinary-user evidence is complete at the reviewed head: UID/euid1001, eight native mutation kills, L7/L8 passed, before/after baselines and restoration matched (run `43493588144`, 91s workflow elapsed). This is not real product-hardware acceptance. E3 remains inactive with no production caller.
