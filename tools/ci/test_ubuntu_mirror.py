@@ -83,7 +83,7 @@ class UbuntuMirrorTests(unittest.TestCase):
                 return fixture_reader(path)
 
             with patch.object(mirror.os, "fchmod", create=True) as mode:
-                self.assertEqual(mirror._apply(root, read, fixture_directory), 2)
+                self.assertEqual(mirror._apply(root, read, fixture_directory), (2, 0))
             # The indirect source keeps its mirror-list URI; only the list gains
             # the preferred Kernel entry while every Ubuntu entry stays a fallback.
             self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
@@ -365,6 +365,190 @@ class UbuntuMirrorTests(unittest.TestCase):
              contextlib.redirect_stderr(io.StringIO()) as error:
             self.assertEqual(mirror.main(), 1)
         self.assertEqual(error.getvalue(), "ubuntu-mirror-refused\n")
+
+
+    def counted(self, data):
+        try:
+            return mirror._rewrite_mirror_list_counted(data)
+        except mirror.Refusal:
+            self.fail("valid representative mirror list unexpectedly refused")
+
+    def apply_owned(self, root):
+        try:
+            return mirror._apply(root, fixture_reader, fixture_directory)
+        except mirror.Refusal:
+            self.fail("valid owned-temp plan unexpectedly refused")
+
+    # Synthetic class representatives, never the unknown historical host/bytes.
+    def omission_cases(self):
+        unknown = b"http://fixture-unlisted.ubuntu.com/ubuntu/\tpriority:1\n"
+        lines = MIRRORS.splitlines(keepends=True)
+        kernel = FALLBACK_MIRRORS.splitlines(keepends=True)[0]
+        return [
+            (unknown + b"".join(lines[1:]), kernel + b"".join(
+                FALLBACK_MIRRORS.splitlines(keepends=True)[2:])),
+            (lines[0] + b"https://fixture-unlisted.ubuntu.com/ubuntu\tpriority:2\n" + lines[2],
+             kernel + FALLBACK_MIRRORS.splitlines(keepends=True)[1]
+             + FALLBACK_MIRRORS.splitlines(keepends=True)[3]),
+            (MIRRORS + b"https://fixture-unlisted.ubuntu.com/ubuntu\n", FALLBACK_MIRRORS),
+        ]
+
+    def test_representative_omissions_exact_bytes_counts_absence_order(self):
+        for before, expected in self.omission_cases():
+            with self.subTest(size=len(before)):
+                self.assertEqual(self.counted(before), (expected, 1))
+                self.assertEqual(mirror.rewrite_mirror_list(before), expected)
+                self.assertNotIn(b"fixture-unlisted", expected)
+                ordered = apt_mirror_order(expected)
+                self.assertEqual(ordered, [line.split()[0].decode() for line in expected.splitlines()])
+        self.assertEqual(len(MIRRORS), 144)
+        self.assertEqual(len(FALLBACK_MIRRORS), 195)
+        self.assertEqual(self.counted(MIRRORS), (FALLBACK_MIRRORS, 0))
+
+    def test_allowlisted_line_separators_refuse_and_crlf_stays_valid(self):
+        for separator in (b"\r", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e",
+                          "\x85".encode(), "\u2028".encode(), "\u2029".encode()):
+            for tag in (b"", b"\tpriority:1"):
+                for uri in (b"https://archiv" + separator + b"e.ubuntu.com/ubuntu",
+                            separator + b"https://archive.ubuntu.com/ubuntu"):
+                    with self.subTest(separator=separator, tagged=bool(tag)):
+                        with self.assertRaises(mirror.Refusal):
+                            mirror.rewrite_mirror_list(uri + tag + b"\n")
+        self.assertEqual(self.counted(MIRRORS.replace(b"\n", b"\r\n")),
+                         (FALLBACK_MIRRORS, 0))
+
+    def test_omission_shape_fences(self):
+        host = "fixture-unlisted.ubuntu.com"
+        tokens = [f"ftp://{host}/ubuntu", f"https://user@{host}/ubuntu",
+                  f"http://{host}:80/ubuntu", f"https://{host.upper()}/ubuntu",
+                  f"https://{host}/other", f"https://{host}/ubuntu-ports",
+                  f"https://{host}/ubuntu?q=1", f"https://{host}/ubuntu#f",
+                  "http://ubuntu.com/ubuntu", "http://x.ubuntu.com./ubuntu",
+                  "http://ubuntu.com.evil.invalid/ubuntu", "http://a_b.ubuntu.com/ubuntu",
+                  "http://" + "a" * 64 + ".ubuntu.com/ubuntu",
+                  "http://" + ("a" * 60 + ".") * 4 + "ubuntu.com/ubuntu",
+                  "http://foreign.invalid/ubuntu", f"\x01http://{host}/ubuntu",
+                  f"\x7fhttp://{host}/ubuntu", f"HTTP://{host}/ubuntu",
+                  f"http://{host}/ubuntu?", f"http://{host}/ubuntu#",
+                  "http://fixture%2dunlisted.ubuntu.com/ubuntu",
+                  f"http://{host}\\/ubuntu", "http://xn--fixture.ubuntu.com/ubuntu",
+                  "http://\u00e9.ubuntu.com/ubuntu"]
+        tokens += [chr(c) + f"http://{host}/ubuntu" for c in range(1, 32) if c not in (9, 10, 13)]
+        tokens += [f"\u0085http://{host}/ubuntu", f"\u00a0http://{host}/ubuntu"]
+        for token in tokens:
+            with self.subTest(token=token), self.assertRaises(mirror.Refusal):
+                mirror.rewrite_mirror_list(MIRRORS + (token + "\n").encode("utf-8"))
+
+    def test_omission_active_bounds_and_fallback_required(self):
+        retained = b"http://archive.ubuntu.com/ubuntu\tpriority:2\n"
+        dropped = b"http://fixture-unlisted.ubuntu.com/ubuntu\n"
+        expected = b"https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n" + retained.replace(b":2", b":3")
+        self.assertEqual(self.counted(retained + dropped * 15), (expected, 15))
+        self.assertEqual(self.counted(retained + dropped * 2), (expected, 2))
+        for data in (dropped, dropped * 16, retained + dropped * 16, retained * 16 + dropped,
+                     b"#" + b"x" * 4096 + b"\n" + retained):
+            with self.subTest(size=len(data)), self.assertRaises(mirror.Refusal):
+                mirror.rewrite_mirror_list(data)
+        # Input fits; Kernel + preserved comment make output exceed 4 KiB.
+        data = retained + b"#" + b"x" * (4095 - len(retained))
+        self.assertEqual(len(data), 4096)
+        with self.assertRaises(mirror.Refusal):
+            mirror.rewrite_mirror_list(data)
+
+    def test_omission_keeps_comments_ties_untagged_and_priority_shift(self):
+        before = (b"# fixed\n\nhttp://archive.ubuntu.com/ubuntu priority:2\n"
+                  b"http://fixture-unlisted.ubuntu.com/ubuntu priority:2\n"
+                  b"http://security.ubuntu.com/ubuntu priority:2\n"
+                  b"  http://archive.ubuntu.com/ubuntu  \n")
+        expected = (b"https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n# fixed\n\n"
+                    b"http://archive.ubuntu.com/ubuntu\tpriority:3\n"
+                    b"http://security.ubuntu.com/ubuntu\tpriority:3\n"
+                    b"  http://archive.ubuntu.com/ubuntu  \n")
+        self.assertEqual(self.counted(before), (expected, 1))
+
+    def test_omission_publication_exact_plan_and_second_run_refusal(self):
+        for before, expected in self.omission_cases():
+            with tempfile.TemporaryDirectory() as directory:
+                root, source = make_tree(directory)
+                listing = root / "apt-mirrors.txt"
+                listing.write_bytes(before)
+                direct = root / "sources.list"
+                original = b"deb http://archive.ubuntu.com/ubuntu resolute main\n"
+                direct.write_bytes(original)
+                vendor = root / "sources.list.d" / "vendor.list"
+                vendor.write_bytes(b"deb https://foreign.invalid/repo stable main\n")
+                self.assertEqual(self.apply_owned(root), (2, 1))
+                self.assertEqual(listing.read_bytes(), expected)
+                self.assertNotIn(b"fixture-unlisted", listing.read_bytes())
+                self.assertEqual(source.read_bytes(), INDIRECT_SOURCE)
+                self.assertEqual(direct.read_bytes(), b"deb https://mirrors.edge.kernel.org/ubuntu resolute main\n")
+                self.assertEqual(vendor.read_bytes(), b"deb https://foreign.invalid/repo stable main\n")
+                snapshot = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                with patch.object(mirror.os, "replace") as publish:
+                    with self.assertRaises(mirror.Refusal):
+                        mirror._apply(root, fixture_reader, fixture_directory)
+                publish.assert_not_called()
+                self.assertEqual({p: p.read_bytes() for p in snapshot}, snapshot)
+
+    def test_omission_unknown_tail_and_kernel_anywhere_never_publish(self):
+        dropped = b"http://fixture-unlisted.ubuntu.com/ubuntu\n"
+        kernel = b"https://mirrors.edge.kernel.org/ubuntu/ priority:1\n"
+        invalid = [b"http://foreign.invalid/ubuntu\n", b"bad\n", kernel, kernel * 2,
+                   dropped.rstrip() + b" priority:-1\n", dropped.rstrip() + b" priority:1 extra\n",
+                   dropped.rstrip() + b" priority:1 priority:2\n",
+                   b"mirror+file:/etc/apt/apt-mirrors.txt\n"]
+        cases = [MIRRORS + dropped + tail for tail in invalid]
+        cases += [kernel + MIRRORS + dropped, MIRRORS + kernel + dropped]
+        for before in cases:
+            with self.subTest(size=len(before)), tempfile.TemporaryDirectory() as directory:
+                root, _ = make_tree(directory)
+                (root / "apt-mirrors.txt").write_bytes(before)
+                (root / "sources.list").write_bytes(b"deb http://archive.ubuntu.com/ubuntu resolute main\n")
+                snapshot = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                with patch.object(mirror.os, "replace") as publish:
+                    with self.assertRaises(mirror.Refusal):
+                        mirror._apply(root, fixture_reader, fixture_directory)
+                publish.assert_not_called()
+                self.assertEqual({p: p.read_bytes() for p in snapshot}, snapshot)
+                self.assertFalse(any(root.rglob(".arxcovo-mirror-*")))
+
+    def test_omission_does_not_extend_direct_source_trust(self):
+        uri = b"http://fixture-unlisted.ubuntu.com/ubuntu"
+        for data, suffix in [(b"deb " + uri + b" resolute main\n", ".list"),
+                             (INDIRECT_SOURCE.replace(mirror.MIRROR_LIST.encode(), uri), ".sources")]:
+            with self.subTest(suffix=suffix), self.assertRaises(mirror.Refusal):
+                mirror.rewrite(data, suffix, indirect=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root, source = make_tree(directory)
+            source.write_bytes(INDIRECT_SOURCE.replace(mirror.MIRROR_LIST.encode(), b"http://archive.ubuntu.com/ubuntu"))
+            self.assertEqual(self.apply_owned(root), (1, 0))
+            self.assertEqual((root / "apt-mirrors.txt").read_bytes(), MIRRORS)
+
+    def test_main_success_and_refusals_have_only_fixed_count_tokens(self):
+        for result in ((1, 0), (2, 1), (1, 15)):
+            with patch.object(mirror.sys, "argv", ["ubuntu_mirror.py"]), \
+                 patch.object(mirror, "apply", return_value=result), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(mirror.main(), 0)
+            self.assertEqual(out.getvalue(), f"ubuntu-mirror-updated:{result[0]}\nubuntu-mirror-omitted:{result[1]}\n")
+            self.assertEqual(err.getvalue(), "")
+        for failure in (OSError("private-error"), mirror.Refusal("private-error")):
+            with patch.object(mirror.sys, "argv", ["ubuntu_mirror.py"]), \
+                 patch.object(mirror, "apply", side_effect=failure), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(mirror.main(), 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(), "ubuntu-mirror-refused\n")
+        with patch.object(mirror.sys, "argv", ["ubuntu_mirror.py", "private-input"]), \
+             patch.object(mirror, "apply") as apply, \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(mirror.main(), 2)
+        apply.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "ubuntu-mirror-arguments\n")
 
 
 if __name__ == "__main__":

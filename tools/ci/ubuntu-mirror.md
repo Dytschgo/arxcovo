@@ -16,13 +16,15 @@ The [Kernel Archives Ubuntu mirror](https://mirrors.edge.kernel.org/ubuntu/dists
 lists resolute, updates, security and backports. The candidate rewrites only
 the exact URI values for the three observed hosts to its HTTPS endpoint. It
 also recognizes only `mirror+file:/etc/apt/apt-mirrors.txt`, after reading that
-exact file with the same native file guards and validating every entry as an
-allowed Ubuntu HTTP/HTTPS URI with at most one bounded `priority:N` tag. A
-foreign entry, malformed line, empty/oversized list or nested mirror URI refuses.
+exact file with the same native file guards. Every active entry has at most
+one bounded `priority:N` tag and must be either a retained HOSTS HTTP/HTTPS
+URI or an omitted entry matching the narrow grammar below. A foreign entry,
+malformed line, empty/oversized list or nested mirror URI refuses.
 Sources that use that mirror list keep their URI unchanged (their trust options
 are still validated). Instead the validated list gains the Kernel mirror as
 `priority:1`, and every original Ubuntu entry is kept with its priority raised
-by one. Comments and untagged entries are preserved, the result stays within
+by one. Unsupported entries matching the omission grammar are removed.
+Comments, existing priority ties and untagged entries are preserved, the result stays within
 4 KiB, and a second run refuses because the list then has a non-Ubuntu entry.
 [apt-transport-mirror](https://manpages.ubuntu.com/manpages/noble/man1/apt-transport-mirror.1.html)
 tries the lowest priority first. If a mirror is inaccessible, it tries the next
@@ -37,7 +39,9 @@ Both legacy `.list` and deb822 `.sources` are supported conservatively. Unsafe
 trust options, foreign explicit keyrings, malformed target stanzas, unknown
 Ubuntu hosts and mixed target/foreign URI stanzas refuse. Every file is bounded
 to 64 KiB and at most 32 source files are read, plus the optional mirror list
-bounded to 4 KiB and sixteen entries. The whole plan is validated first.
+bounded to 4 KiB input/output and sixteen active entries, including omissions.
+At least one HOSTS fallback must remain. The whole plan, including every entry
+after an omission, is validated before publication.
 Only root-owned, private-against-write, regular single-link files under the
 fixed APT directories are replaced through same-directory staging. Existing
 source identity and bytes are checked before replacement. A failure leaves CI
@@ -92,3 +96,34 @@ Sanitized facts are in `docs/evidence/ubuntu-kernel-mirror-failures.json`.
 
 Product installed-service and
 dedicated-account acceptance remain open.
+
+## Narrow unsupported-entry omission
+
+For the indirect list only, `_rewrite_mirror_list_counted` returns bytes and
+an omission count; `rewrite_mirror_list` retains its bytes API. A full raw-token
+match runs before URL parsing: lowercase ASCII HTTP(S), ASCII LDH labels of
+1–63 characters under `.ubuntu.com`, total hostname at most 253 characters,
+and exactly `/ubuntu` or `/ubuntu/`. Bare domains, `xn--` labels, non-ASCII,
+C0/DEL, escapes, backslashes, userinfo, ports, query/fragment delimiters
+(including empty delimiters), other schemes and paths cannot be omitted.
+ASCII line/token separators avoid Unicode whitespace/control normalization.
+Parsed checks retain independent scheme, authority, hostname, length, label,
+path and query/fragment guards. Only unsupported hosts outside HOSTS are
+omitted; Kernel entries always refuse, anywhere, including a second run.
+
+All retained and dropped active entries count toward sixteen; an all-omitted
+list refuses. The public 144-byte list still yields exactly the same 195 bytes.
+Priority+1 and existing ties are unchanged; no universal uniqueness is promised.
+Direct sources still refuse unsupported Ubuntu-domain URIs. Third-party source
+preservation, HOSTS, Kernel endpoint, keyring, signature and Valid-Until checks,
+file guards, rechecks and publication-error behavior remain unchanged.
+Success prints exactly `ubuntu-mirror-updated:N` and `ubuntu-mirror-omitted:M`
+(on separate lines), where M is 0–15 and direct mode reports 0. Refusal prints
+only `ubuntu-mirror-refused` to stderr; invalid arguments print only
+`ubuntu-mirror-arguments`. No host, source bytes, index or error is printed.
+
+This is the approved ADR 0021 availability tradeoff: removed hosts are never
+contacted or trusted. If only an omitted host was reachable, installation can
+still fail. Representative synthetic fixtures establish parser behavior only;
+the actual historical hostname and unchecked tail remain UNKNOWN. This local
+correction is **unverified on real hardware**, without a hosted fetch trial.
