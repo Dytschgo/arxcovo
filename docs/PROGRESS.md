@@ -2,6 +2,40 @@
 
 ## Current state - 2026-11-13
 
+- Queue priority: integrate PR55 Stage D on merged PR53, then normal exact-head review and all five checks before merge; PR56 follows. Last merged PR53 `6dd74673265d488d9da18e863d1fde651d6d0304`, 16:38:42Z. Its squash tree matches reviewed `46f90c9`. Main after PR53 run43464791125 is pending.
+- Main after PR54 run43462769959 succeeded on attempt1 in 567s (16:26:39-16:36:06Z). PR54 merged with all normal gates; the one-time bootstrap protection exception remains exhausted/restored.
+- Stage D product bytes remain identical to reviewed fdea1c6 and original d3615be except previously reviewed test corrections. Scanner conflict resolves to exactly reviewed Stage D file, preserving its Stage C rules and stronger scan. PROGRESS keeps both histories. Coordinator OpenAI / gpt-6.1-sol / medium; fresh Opus high integration review required. No production bridge constructor or native activation.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. E1/E5 held, ExecutionFailed/E_PROTECTION unresolved, no retry or owner operation.
+
+## Historical parent checkpoint
+
+- Stage D local product review is complete: full review85da90f plus test rechecks7569728 and056327a close T1/T3/T8/T10 and distinct request-limit R1. Coordinator Sol medium retains the final report and queues a one-concern bridge PR on explicit unmerged Stage C PR53; production remains inactive and all merge gates remain. Next product work is separate Stage E architecture for cgroup setup/cleanup and discovery ordering, design only with no native/owner/experiment execution. CI investigations remain parked.
+
+- Stage D R1: distinguish request7s/333bytes from probe60s/4096. Hard-coded-limit mutant is caught (ac960a28), fmt and focused15 pass (a052ca8f). Production remains unchanged; the narrow independent two-line recheck is next. Product work continues locally; CI investigations stay parked.
+
+- Stage D production passed Opus contract review; test corrections close swallowed fake assertions, skipped derivation cases and missing numeric marker check. Coordinator Sol medium keeps production unchanged, builds an independent expected spec and records four compiled assertion kills. Final fmt/locked workspace Clippy/focused24 passed (4dffa45b). [Evidence](evidence/unix-bridge-stage-d-review-followup.md). Fresh test-delta recheck is next; CI investigations remain parked and Stage C remains an unmerged dependency.
+
+- ADR0019 Stage D local implementation: inactive UnixBridge, pure config/spec/report mappings, fake runner port, test-only Execution wiring, whole-body panic catch, strict discovery parsing and extended P-SCAN. OpenAI / gpt-6.1-sol / high. Source `d3615be3b9820cf72a40b321a3dcf6c746a9e7bd` is ready for review, not acceptance. [Evidence](evidence/unix-bridge-stage-d.md).
+- Local validation: final fmt and locked workspace all-target Clippy pass; focused 24/24; exactly one final normal workspace nextest **323 passed / 3 skipped**, `8195e507-b3d3-4306-9fe6-72b89fce5a3f`, 11.307s. Compiled mutation evidence retains two original survivors and their assertion-kill rechecks. Linux cross-check failed before arxd: cross C compiler absent; Unix compilation remains pending.
+- Evidence head: `a318c437d01082676fee3a5b0a5f9a5025e24bcf` (docs only after source `d3615be`); final handoff adds only this pin/clarification. Completion returns to the parent coordinator for fresh Opus high review; no child review/publication was started.
+- Queue: fresh independent Anthropic / Opus 5.5 / high product/security review BEFORE publication. This implementation child creates no delegates and performs no publication. Stage C PR53 source `2ce79caf9ded55976e3e83b2c49b41d54160f2da` remains an explicit unmerged dependency; base `7b2cfa1cd00d0f3dc657513dd07bc684739cc1e1`. No gate waiver.
+- User priority: product work continues; CI optimization/diagnostics and hosted-capacity investigation remain parked. No workflow/policy/dependency/schema/native-composition change, GitHub action, experiment retry or owner operation in this slice.
+- M1 accepted; M2 incomplete. Last merged PR52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`. Native, installed and dedicated paths remain **unverified on real hardware**. Production remains MechanismUnavailable. Stage E setup/janitor, F diagnosis/experiment and G activation retain all gates.
+- ExecutionFailed / E_PROTECTION remain unknown and unresolved: no fix, waiver or retry. No old Lab Manager/VM or babysitter change. All earlier pins, failure credits, provider rows and queue history remain below.
+
+## Historical checkpoint before Stage D implementation
+
+- User priority: continue product features while hosted macOS capacity is slow. CI speed/diagnostic investigations are parked; preserve their local commits and failed measurements. No more CI trials or diagnostics are scheduled. Existing merge checks remain enforced, but pending hosted CI does not stop local implementation.
+- M1 accepted; M2 incomplete. Last merged PR52 at1604db1. Stage C PR53 source2ce79ca is independently reviewed with hosted shim tests passed; it remains unmerged due to budget policy. Stage D is prepared locally on that explicit unmerged dependency, without claiming its merge gate cleared.
+- Queue priority: implement ADR0019 Stage D pure Unix runner/report bridge with a test-only constructor, independent review and meaningful fake tests. Then address remaining M2 features under their existing authority limits. No production native activation, cgroup setup or experiment is authorized by the priority change.
+- Provider assignment: Sol high implements in an isolated worktree, Opus high reviews product changes. Preserve all Stage B/C and owner CLI source and assertions. No changes to CI workflow, policy, mirror helper, platform coverage or timeouts in this product slice.
+- Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, no fix/waiver/retry. No owner/admin/service operation, old Lab Manager/VM, third S4U probe or babysitter change.
+
+## Historical checkpoint before product-priority steering
+
+
+## Historical parent checkpoint
+
 - Queue priority: publish/review Stage C PR53 integration on main after #54, then normal five-gate merge, followed by PR55 and PR56 in dependency order. Stage C production shim/scanner/routing bytes remain identical to reviewed `2ce79ca`; parent refresh carries the separately reviewed CI recovery and policy repair unchanged. No native execution backend is activated.
 - Last merged: PR54 `79276b93e14a483ff63a189545d148cd2f6f0b0e`, 2026-11-13 16:26:36Z. All five required gates and independent Opus integration review passed on `d276f7f`; first integration CI `43461011104` succeeded in 528s. Squash tree equals that reviewed head. Original performance attempt 3 qualification remains recorded, no reset. Main after #54 is pending, not claimed green.
 - Main after #57 passed run `43459116760` attempt1 in 590s. All five original protection contexts/app pins and strict mode are restored; owner-authorized bootstrap exception is exhausted. No gate bypass applies to this or later product PRs.

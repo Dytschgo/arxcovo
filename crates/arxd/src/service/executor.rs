@@ -227,6 +227,42 @@ impl Execution {
             limit,
         )
     }
+    #[cfg(test)]
+    pub(super) fn unix_bridge_for_test(
+        backend: Arc<dyn Executor>,
+        config: &super::config::ServiceConfig,
+    ) -> Arc<Self> {
+        let mut execution = Self::native(
+            None,
+            Pin::from_config(config, Platform::Linux),
+            Some(match config.rights() {
+                super::config::Rights::Standard => Rights::Standard,
+                super::config::Rights::Admin => Rights::Admin,
+            }),
+            config.limits().0 as usize,
+        );
+        if let Some(inner) = Arc::get_mut(&mut execution) {
+            inner.backend = backend;
+        }
+        execution
+    }
+    #[cfg(test)]
+    pub(super) fn inactive_native_for_test(
+        platform: Platform,
+        identity: &str,
+        gid: Option<u32>,
+    ) -> Arc<Self> {
+        Self::native(
+            Some(Box::new(|| Ok(()))),
+            Pin::new(platform, identity.into(), gid, Rights::Standard),
+            Some(Rights::Standard),
+            1,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn preflight_for_test(&self) -> Result<(), Unavailable> {
+        self.preflight()
+    }
     pub(crate) fn set_reason(&self, reason: Unavailable) {
         *self.reason.lock().unwrap() = reason;
     }

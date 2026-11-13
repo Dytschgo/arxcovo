@@ -358,13 +358,38 @@ fn scan_with_hook(source: &str, shim: bool) -> Result<Vec<(String, String)>, &'s
     if hooks != usize::from(shim) {
         return Err("hook inventory");
     }
+    if !shim
+        && (t.windows(3).any(|v| v == [":", ":", "stderr"])
+            || t.windows(2).any(|v| v == ["stderr", "as"]))
+    {
+        return Err("stderr writer");
+    }
     let mut inventory = Vec::new();
     for (i, token) in t.iter().enumerate() {
-        if ["panic_any", "resume_unwind", "take_hook"].contains(&token.as_str()) {
+        if ["panic_any", "resume_unwind", "take_hook", "macro_rules"].contains(&token.as_str()) {
             return Err("forbidden diagnostic");
         }
         if ["expect", "unwrap", "unwrap_err", "expect_err"].contains(&token.as_str()) {
             return Err("fallible payload");
+        }
+        if token == "use" {
+            let end = t[i..]
+                .iter()
+                .position(|v| v == ";")
+                .map_or(t.len(), |n| i + n);
+            if t[i..end].iter().any(|v| {
+                [
+                    "RunFailure",
+                    "tracing",
+                    "log",
+                    "set_hook",
+                    "take_hook",
+                    "stderr",
+                ]
+                .contains(&v.as_str())
+            }) {
+                return Err("diagnostic import alias");
+            }
         }
         if token == "type" {
             let end = t[i..]
@@ -470,6 +495,7 @@ fn inventory() -> Vec<(&'static str, String, String)> {
         ("cgroup", include_str!("cgroup.rs")),
         ("output", include_str!("output.rs")),
         ("shim", include_str!("../unix_shim.rs")),
+        ("bridge", include_str!("../service/unix_bridge.rs")),
     ] {
         for (mac, literal) in
             scan_with_hook(source, file == "shim").expect("production payload scan")
@@ -483,12 +509,20 @@ fn inventory() -> Vec<(&'static str, String, String)> {
 #[test]
 fn p_scan_checked_nonempty_inventory() {
     let expected = vec![
+        ("bridge", "panic".into(), "\"ARX-T10-MAPPING-PANIC\"".into()),
+        (
+            "bridge",
+            "panic".into(),
+            "\"ARX-T10-DISCOVERY-PANIC\"".into(),
+        ),
         ("cgroup", "unreachable".into(), "\"numeric name\"".into()),
         ("unix", "unreachable".into(), "\"validated cwd\"".into()),
         ("unix", "unreachable".into(), "\"validated path\"".into()),
         ("unix", "unreachable".into(), "\"validated path\"".into()),
     ];
     assert!(!expected.is_empty());
+    let mut expected = expected;
+    expected.sort();
     assert_eq!(inventory(), expected);
 }
 #[test]
@@ -508,10 +542,15 @@ fn p_scan_negative_controls_and_no_blind_test_skip() {
         "set_hook(x)",
         "take_hook()",
         "Result::unwrap(r)",
+        "use std::io::stderr as stream; stream().write_all(x)",
+        "macro_rules! hidden { () => { r.unwrap() } }",
+        "use std::panic::set_hook as install; install(x)",
         ".map(Option::unwrap)",
         "r.r#unwrap()",
         "use std::eprintln as say; say!(x)",
         "type F = RunFailure; impl From<E> for F {}",
+        "use super::RunFailure as F; impl From<E> for F {}",
+        "use tracing::error as report; report!(x)",
         "writeln!(std::io::stderr(), x)",
         "impl From<E> for RunFailure {}",
         "#[cfg(test)] mod tests {} fn production() {x.unwrap();}",
