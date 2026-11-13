@@ -1012,3 +1012,49 @@ fn step_failures_are_fixed() {
     f.fail(Hardening);
     f.no_mutation();
 }
+
+// Pure model entry point for the inactive application wiring tests.
+pub(crate) fn startup_setup(
+    location: &parse::Location,
+    token: &Cancellation,
+    failure: bool,
+    waiting: bool,
+    barrier: std::sync::Arc<dyn Fn(&'static str) + Send + Sync>,
+) -> SetupOutcome {
+    let fs = Fake::new();
+    if failure {
+        fs.0.borrow_mut().status.bytes.clear();
+    }
+    let runs = fs.prepared();
+    if waiting {
+        fs.leaf(runs, b"arx-17-1");
+        fs.0.borrow_mut().kill_delay = None;
+    }
+    let seam = barrier.clone();
+    fs.0.borrow_mut().hook = Some(Box::new(move |model, operation| {
+        if operation.kind == "list"
+            && operation.dir == runs
+            && model.nodes[runs].enabled.contains("memory")
+        {
+            seam("s9");
+        }
+    }));
+    struct ClockSeam {
+        now: Cell<Duration>,
+        barrier: std::sync::Arc<dyn Fn(&'static str) + Send + Sync>,
+    }
+    impl Clock for ClockSeam {
+        fn now(&self) -> Duration {
+            self.now.get()
+        }
+        fn sleep(&self, duration: Duration) {
+            (self.barrier)("wait");
+            self.now.set(self.now.get() + duration);
+        }
+    }
+    let clock = ClockSeam {
+        now: Cell::new(Duration::ZERO),
+        barrier,
+    };
+    setup(&fs, location, &clock, token)
+}

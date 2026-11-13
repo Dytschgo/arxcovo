@@ -1,0 +1,23 @@
+:[{"host_id":host_id,"os":std::env::consts::OS,"arch":sysinfo::System::cpu_arch(),"logical_cpus":system.cpus().len(),"ram_bytes":system.total_memory(),"disk_total_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.total_space())),"disk_available_bytes":disks.iter().fold(0u64, |sum,d| sum.saturating_add(d.available_space())),"execution_available":false,"execution_unavailable_reason":"dedicated account backend not implemented","tool_discovery":"unavailable until dedicated account backend exists"}]});
+        let execution = self
+            .activity
+            .dedicated
+            .as_ref()
+            .map(|e| e.capability())
+            .or_else(|| self.execution.as_ref().map(|e| e.capability()))
+            .unwrap_or_else(|| json!({"available":false,"reason":"not_configured"}));
+        value["hosts"][0]["execution_available"] = execution["available"].clone();
+        value["hosts"][0]["execution_unavailable_reason"] = execution["reason"].clone();
+        value["hosts"][0]["execution"] = execution;
+        if self.activity.dedicated.is_some() {
+            value["hosts"][0]["last_observed_identity"] = serde_json::Value::Null;
+            value["hosts"][0]["tools"] = json!([]);
+            value["hosts"][0]["tools_observed_at"] = serde_json::Value::Null;
+        }
+        value["hosts"][0]["tool_discovery"] = json!(if self.activity.dedicated.is_some() {
+            "unavailable"
+        } else if self.execution.is_some() {
+            "discover_tools"
+        } else {
+            "not_configured"
+        });

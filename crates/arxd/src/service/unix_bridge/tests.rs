@@ -1012,3 +1012,5 @@ impl TestRights for String {
 }
 
 mod e6;
+
+mod e7;

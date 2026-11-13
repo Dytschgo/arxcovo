@@ -16,6 +16,14 @@ use std::sync::{
 };
 
 pub(crate) trait Hooks: Send + Sync + 'static {
+    #[cfg(test)]
+    fn start_discovery(
+        &self,
+    ) -> Option<Box<dyn FnOnce(crate::development::Cancellation) -> bool + Send>> {
+        None
+    }
+    #[cfg(test)]
+    fn discovery_barrier(&self, _: &'static str) {}
     fn load(&self) -> Result<(Layout, ServiceConfig), ExitCode>;
     fn layout(&self, layout: &Layout) -> Result<Vec<native::Observed>, ExitCode>;
     fn store(&self, layout: &Layout) -> Result<Activity, ExitCode>;
@@ -126,6 +134,10 @@ pub(crate) struct ServiceApplication<H = Native> {
     activity: Option<Arc<Activity>>,
     listener: Option<Listener>,
     serving: Option<tokio::task::JoinHandle<Result<(), ExitCode>>>,
+    #[cfg(test)]
+    discovery: Option<tokio::task::JoinHandle<Result<(), ExitCode>>>,
+    #[cfg(test)]
+    discovery_started: bool,
     stop: Shutdown,
 }
 impl ServiceApplication<Native> {
@@ -134,6 +146,18 @@ impl ServiceApplication<Native> {
     }
 }
 impl<H: Hooks> ServiceApplication<H> {
+    #[cfg(test)]
+    pub(crate) fn discovery_finished_for_test(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+    }
+    #[cfg(test)]
+    pub(crate) fn discovery_fixture(hooks: H, activity: Arc<Activity>) -> Self {
+        let mut app = Self::new(hooks);
+        app.activity = Some(activity);
+        app
+    }
     fn new(hooks: H) -> Self {
         Self {
             hooks: Arc::new(hooks),
@@ -144,6 +168,10 @@ impl<H: Hooks> ServiceApplication<H> {
             activity: None,
             listener: None,
             serving: None,
+            #[cfg(test)]
+            discovery: None,
+            #[cfg(test)]
+            discovery_started: false,
             stop: Shutdown::default(),
         }
     }
@@ -224,6 +252,67 @@ impl<H: Hooks> Application for ServiceApplication<H> {
     }
     fn start_discovery(&mut self) {
         // No build-account backend: never probe the privileged service's PATH.
+        #[cfg(test)]
+        {
+            if self.discovery_started {
+                return;
+            }
+            self.discovery_started = true;
+            let Some(setup) = self.hooks.start_discovery() else {
+                return;
+            };
+            let Some(activity) = self.activity.clone() else {
+                return;
+            };
+            let Some(execution) = activity.dedicated.clone() else {
+                return;
+            };
+            let blocking = self.blocking.clone();
+            let hooks = self.hooks.clone();
+            let stop = execution.shutdown_token_for_test();
+            self.discovery = Some(tokio::spawn(async move {
+                let setup_stop = stop.clone();
+                if !blocking.run(move || Ok(setup(setup_stop))).await? {
+                    return Ok(());
+                }
+                let barrier_hooks = hooks.clone();
+                blocking
+                    .run(move || {
+                        barrier_hooks.discovery_barrier("ready");
+                        Ok(())
+                    })
+                    .await?;
+                if stop.is_cancelled() {
+                    return Ok(());
+                }
+                let a = activity.clone();
+                let (id, observation) = blocking
+                    .run(move || {
+                        let observation = a.discovery_observation().map_err(|_| ExitCode::Store)?;
+                        let id = a.start_daemon_discovery().map_err(|_| ExitCode::Store)?;
+                        Ok((id, observation))
+                    })
+                    .await?;
+                let barrier_hooks = hooks.clone();
+                blocking
+                    .run(move || {
+                        barrier_hooks.discovery_barrier("row");
+                        Ok(())
+                    })
+                    .await?;
+                let result = execution.dispatch(None, activity.clone(), id).await;
+                if let Ok(response) = result {
+                    activity.cache_discovery(observation, &response);
+                }
+                blocking
+                    .run(move || {
+                        hooks.discovery_barrier("dispatch");
+                        Ok(())
+                    })
+                    .await?;
+                Ok(())
+            }));
+        }
     }
     async fn serve(&mut self) -> Result<(), ExitCode> {
         let config = self.config.as_ref().ok_or(ExitCode::Config)?;
@@ -274,6 +363,15 @@ impl<H: Hooks> Application for ServiceApplication<H> {
                 result = drained;
             }
         }
+        #[cfg(test)]
+        if let Some(task) = self.discovery.as_mut() {
+            let joined = task.await.map_err(|_| ExitCode::Store).and_then(|r| r);
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        #[cfg(test)]
+        self.discovery.take();
         self.blocking.drain().await;
         if let Some(activity) = self.activity.clone() {
             let pending = self

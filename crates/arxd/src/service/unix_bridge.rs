@@ -350,6 +350,65 @@ fn parse_tools(result: &exec::RunResult) -> Option<(Vec<ToolVersion>, RightsFact
 #[cfg(test)]
 mod tests;
 
+// Inactive owned-subtree wiring. Readiness is allocated here, never supplied by
+// another domain. The setup closure and runner factory are each consumed once.
+#[cfg(test)]
+struct StartupDomain {
+    domain: AdmissionDomain,
+    setup: std::sync::Mutex<Option<StartupSetup>>,
+}
+#[cfg(test)]
+type StartupSetup = Box<dyn FnOnce(Cancellation) -> bool + Send>;
+#[cfg(test)]
+impl StartupDomain {
+    fn new(
+        layout: &Layout,
+        config: &ServiceConfig,
+        location: exec::hierarchy::parse::Location,
+        factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
+        setup: impl FnOnce(
+            &exec::hierarchy::parse::Location,
+            &Cancellation,
+        ) -> exec::hierarchy::setup::SetupOutcome
+        + Send
+        + 'static,
+    ) -> Self {
+        let readiness = Readiness::pending();
+        let state = readiness.clone();
+        let constructed = std::cell::Cell::new(false);
+        let domain = AdmissionDomain::new(
+            layout,
+            config,
+            location.runs(),
+            |owner| {
+                let runner = factory(owner);
+                constructed.set(runner.is_ok());
+                runner
+            },
+            Box::new(|| Ok(())),
+            readiness,
+        );
+        let valid = constructed.get();
+        Self {
+            domain,
+            setup: std::sync::Mutex::new(Some(Box::new(move |stop| {
+                if !valid {
+                    state.fail(Cause::Setup);
+                    return false;
+                }
+                match setup(&location, &stop) {
+                    exec::hierarchy::setup::SetupOutcome::Ready(_) if !stop.is_cancelled() => {
+                        state.set_ready()
+                    }
+                    exec::hierarchy::setup::SetupOutcome::Ready(_) => state.fail(Cause::Stopped),
+                    exec::hierarchy::setup::SetupOutcome::Unavailable(f) => state.fail(f.into()),
+                }
+                state.check().is_ok()
+            }))),
+        }
+    }
+}
+
 // The inactive wiring owner retains the sole domain. Handles clone Execution,
 // including its backend, readiness and slot counter, without another factory call.
 #[cfg(test)]
