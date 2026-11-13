@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- Native harness pre-push review is complete: Opus high `59525d6`, parser recheck `302175a`, and padded-counter PASS `b6fcefc` close B1/B2. Coordinator publishes reviewed harness for its first ordinary-user Ubuntu evidence run on PR61. Native mutation kills remain unrun until logs prove them; refreshed exact-head review/all checks and native evidence are required before merge. No production activation.
 - E3 native parser recheck `302175a` closed B2 but required padded-counter B1 correction. Sol medium `729922a` adds padded real-output/baseline fixtures; portable24 pass/1 skip and old-pattern negative control fails. Fresh narrow review required before push; no native kills claimed.
 - Native harness review `59525d6` found fail-closed nextest output parsing blockers B1/B2. Sol medium correction `78f1f3d` uses actual counter/footer fixtures; portable24 pass/1 skip, and old-driver/counter/footer negative controls fail. Narrow Opus recheck pending before push; no native execution or kill credit.
 - E3 native evidence harness is prepared locally (`486b149`, retained `ad8b996`). Sol medium fixture correction `231e6d7` makes L10 discriminate a symlink reported as regular and refreshes the pin. Portable tests 23 pass/1 skip and scanner4 pass; zero native kill credit. Fresh Opus high review required before push or hosted execution. PR61 remains unmerged despite its existing five green checks.

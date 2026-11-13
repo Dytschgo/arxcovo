@@ -214,3 +214,12 @@ Production and workflow are unchanged; fresh narrow review remains pending.
 Updated committed hashes:
 - `tools/ci/e3-native/driver.py`: `2916049ab278ddf2a97da851925cf5b2688d3902775c16453beb3a49578489c7`.
 - `tools/ci/e3-native/test_driver.py`: `2f3fba561afa0058abd55eaa7a799cc6a0b7acbd4b2c3a7c4b756331dc305471`.
+
+## First hosted publication checkpoint
+
+Opus high padded-counter recheck b6fcefc passes the narrow B1 delta; B2
+remains closed from302175a. Reviewed source/manifest pins are unchanged.
+Coordinator publishes the reviewed harness for its first hosted execution.
+No native result, skip/pass outcome or mutation kill is claimed before that
+run completes. Merge still requires native evidence plus refreshed exact-head
+integration review and all five required checks. No activation.
