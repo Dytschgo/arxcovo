@@ -113,3 +113,23 @@ No secrets or private payloads were logged. Work is local only. Publication
 waits for the parent's PR #65 merge, exact re-pin, independent Opus high
 review and all five required gates. No acceptance or merge credit is implied
 by the parent's supplied Windows-running/source-PASS status.
+
+## Independent review and publication limits
+
+Opus high review c45d35e approves both axes and closes SP1/SP2. The four
+source files remain identical to1eccbfc on merged PR65 main5ae645e.
+Original387/3 and two mutation kills retain their source-pin credit; no new
+full suite is claimed for reports/docs.
+
+Qualification of the waiting claim above: the new snapshot test samples
+non-completion once at drain entry, not continuously. A detach_all mutant
+survives this new test, while three existing tests catch it. The committed
+join-loop mutant is caught because a worker remains, not because this new
+test alone proves waiting. Its worker timeout also leaves a narrow scheduling
+false-pass window; explicit test-release proof is a retained advisory.
+The single admission seam was confirmed by source reading, not a counting
+test. No stronger proof is claimed. PA5 and real-Runner PA6 remain open;
+Stage F/G and hardware acceptance remain separate.
+
+Exact-head independent integration review and all five hosted required checks
+remain required before merge. Production behavior is unchanged and inactive.
