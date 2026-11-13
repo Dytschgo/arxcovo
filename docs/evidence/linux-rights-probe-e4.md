@@ -181,3 +181,15 @@ Production remains MechanismUnavailable, M2 incomplete.
 
 Restored integration fixture (committed bytes):
 - Git blob `4108b5c47238e5ef9be9e6c23dad1351cda90c9f`; SHA-256 `20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a`.
+
+## First published-head hosted compile/test evidence
+
+Independent Opus integration review of head93046dd
+[records CI43499754522](https://github.com/Dytschgo/arxcovo/pull/62#issuecomment-6863902435):
+Linux Clippy clean,331 nextest passed/8 skipped, E4 S8-S13 tests and
+NNP-fenced S6 passed (5.07s). macOS Clippy clean,312 nextest passed, S6 and
+non-Linux no-probe test passed. Root independently checked live check states;
+the test counts/log interpretation above are credited to the reviewer.
+Windows remained pending. UID and inline root-skip status are not proven
+by those logs, so ordinary-user mutation evidence remains required. Existing
+native-evidence is the E3 job, not an E4 kill claim. No merge or activation.

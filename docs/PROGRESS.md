@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- PR62 exact-head Opus source/integration review passed at `93046dd` (comment6863902435). Hosted CI43499754522 provides real Linux/macOS Clippy and tests, including NNP-fenced S6; Windows remains pending. E3 native-evidence success is not E4 mutation credit. E4 non-root/native mutation evidence remains a merge gate; Sol high is preparing that harness locally for review before push.
 - E4 descriptor-bound rights probe is ready for hosted publication on merged E3 main `af9289a`. Sol high source4967b53 and Sol medium correctioncf8b9e7 passed Opus high recheck063c4bf (retained737d623), closing Linux compile/lint B1 and unfenced S6 B2 by source/stub evidence. Unicode-only test fixture87ef559 restores the original literals. No real Linux runtime or native mutation result is claimed yet.
 - Next merge requirements: exact-head independent integration review, all five required checks, ordinary-user Linux/macOS test evidence and specified native mutation kills. S6's system probe is NNP-fenced; no unfenced privileged test is authorized. Production execution stays MechanismUnavailable.
 - Last merged PR61 `af9289a5dbd648d94db338c017bbcd8f801c7ebf`; main run43495122702 passed attempt1 in549s. E3 native run43493588144 satisfied eight mutation kills and L7/L8 pass as UID1001. Strict five-check protection remains unchanged; bootstrap exception exhausted.
