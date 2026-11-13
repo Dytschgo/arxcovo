@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR61 `af9289a5dbd648d94db338c017bbcd8f801c7ebf`, at 19:45:03Z. Its squash tree equals reviewed `231c367`; all five required checks plus the native-evidence job passed. Main-after-PR61 run `43495122702` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- E3 hosted ordinary-user evidence is complete at the reviewed head: UID/euid1001, eight native mutation kills, L7/L8 passed, before/after baselines and restoration matched (run `43493588144`, 91s workflow elapsed). This is not real product-hardware acceptance. E3 remains inactive with no production caller.
+- Sol high is implementing E4 bound-executable rights reporting locally on the reviewed E3 stack; re-pin and independent review remain required before publication. No owner, service, cgroup or VM activation. Strict five-check protection unchanged; bootstrap exception exhausted.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix, waiver or retry.
+
+## Historical checkpoint before E3 merge
+
 - PR61 native evidence run `43493588144` succeeded on attempt1 at reviewed head `231c367` in91s workflow elapsed. Opus exact-head review comment6863013251 records UID/euid1001, eight native kills, both baselines/restoration pass and L7/L8 passed. Native evidence gate is satisfied for hosted ordinary-user behavior; hardware acceptance remains unverified. Windows required verify remains pending, no merge yet.
 - Native harness pre-push review is complete: Opus high `59525d6`, parser recheck `302175a`, and padded-counter PASS `b6fcefc` close B1/B2. Coordinator publishes reviewed harness for its first ordinary-user Ubuntu evidence run on PR61. Native mutation kills remain unrun until logs prove them; refreshed exact-head review/all checks and native evidence are required before merge. No production activation.
 - E3 native parser recheck `302175a` closed B2 but required padded-counter B1 correction. Sol medium `729922a` adds padded real-output/baseline fixtures; portable24 pass/1 skip and old-pattern negative control fails. Fresh narrow review required before push; no native kills claimed.
