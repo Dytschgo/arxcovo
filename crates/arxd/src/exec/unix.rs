@@ -162,6 +162,7 @@ pub(super) fn run(
     cancel: &Cancellation,
     shutdown: &Cancellation,
     caller_shutdown: Option<&Cancellation>,
+    #[cfg(target_os = "linux")] residue: Arc<AtomicBool>,
 ) -> Result<RunResult, RunFailure> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
         return Err(RunFailure::new(
@@ -216,7 +217,7 @@ pub(super) fn run(
         max as i32
     };
     #[cfg(target_os = "linux")]
-    let group = super::cgroup::Group::create(c)
+    let group = super::cgroup::Group::create(c, residue)
         .map_err(|e| RunFailure::new(RunError::NotStarted(NotStarted::Containment), e))?;
     #[cfg(target_os = "linux")]
     let procs_fd = group.procs.as_raw_fd();
