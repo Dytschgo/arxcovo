@@ -22,6 +22,8 @@ TESTS = tuple(PREFIX + name for name in NAMES)
 S6 = "s6_probe_bounded_order_root_cwd_and_deadline"
 L8 = "exec::hierarchy::linux::tests::l8_unprivileged_hardening_zero_changes"
 LIMIT = 2 * 1024 * 1024
+BINARIES = {"arxd": ("arxd", ("--lib",)),
+            "unix_shim": ("arxd::unix_shim", ("--test", "unix_shim"))}
 
 class GuardError(Exception):
     """Fixed failure category; exception details are never evidence."""
@@ -113,7 +115,10 @@ def run_bounded(command, cwd, seconds, limit=LIMIT):
 
 
 def statuses(output, name, binary="arxd"):
-    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+(?:\(\s*\d+/\d+\)\s+)?" + re.escape(binary) + r"\s+" + re.escape(name) + r"\s*$"
+    if binary not in BINARIES:
+        return []
+    label = BINARIES[binary][0]
+    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+(?:\(\s*\d+/\d+\)\s+)?" + re.escape(label) + r"\s+" + re.escape(name) + r"\s*$"
     return re.findall(pattern, output, re.MULTILINE)
 
 
@@ -196,7 +201,9 @@ def mutated(root, originals, row):
 def command(name=None, binary="arxd"):
     selection = "test(=" + name + ")" if name else " | ".join(
         "test(=" + n + ")" for n in TESTS)
-    target = ["--lib"] if binary == "arxd" else ["--test", "unix_shim"]
+    if binary not in BINARIES:
+        raise GuardError("binary_guard")
+    target = BINARIES[binary][1]
     return ["cargo", "nextest", "run", "--locked", "-p", "arxd", *target, "-E", selection,
             "--success-output", "immediate", "--no-fail-fast", "--color", "never",
             "--failure-output", "immediate", "--status-level", "pass",

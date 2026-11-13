@@ -16,6 +16,7 @@ spec.loader.exec_module(d)
 
 
 def status(kind, name, binary="arxd"):
+    binary = "arxd::unix_shim" if binary == "unix_shim" else binary
     return f"    {kind} [   0.015s] ( 1/11) {binary} {name}\n"
 
 
@@ -93,6 +94,24 @@ class HarnessTests(unittest.TestCase):
                                  (100, failed + status("PASS", name, binary)), (100, "")):
                 with self.subTest(code=code, output=output):
                     self.assertEqual(d.classify(code, output, name, binary), "invalid")
+
+    def test_real_integration_binary_label_and_cargo_selector(self):
+        passed = "PASS [   5.070s] (1/1) arxd::unix_shim s6_probe_bounded_order_root_cwd_and_deadline\n"
+        failed = passed.replace("PASS", "FAIL") + "error: test run failed\n"
+        self.assertEqual(d.statuses(passed, d.S6, "unix_shim"), ["PASS"])
+        d.baseline_result(0, passed, (d.S6,), "unix_shim")
+        self.assertEqual(d.classify(100, failed, d.S6, "unix_shim"), "killed")
+        bare = passed.replace("arxd::unix_shim", "unix_shim")
+        self.assertEqual(d.statuses(bare, d.S6, "unix_shim"), [])
+        with self.assertRaisesRegex(d.GuardError, "baseline_missing_test"):
+            d.baseline_result(0, bare, (d.S6,), "unix_shim")
+        self.assertEqual(d.classify(100, bare.replace("PASS", "FAIL") +
+                                   "error: test run failed\n", d.S6, "unix_shim"), "invalid")
+        cmd = d.command(d.S6, "unix_shim")
+        self.assertEqual(cmd[cmd.index("--test") + 1], "unix_shim")
+        self.assertNotIn("arxd::unix_shim", cmd)
+        with self.assertRaisesRegex(d.GuardError, "binary_guard"):
+            d.command(d.S6, "other")
 
     def test_baseline_visible_skips_and_refusals(self):
         text = "".join(status("PASS", n) for n in d.TESTS)
