@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- PR62 published head `93046dd` now has all five required checks green and source/integration review PASS. Existing native-evidence is E3, not E4. Merge remains held for E4 native mutation kills and explicit ordinary-UID/pass-or-skip evidence. Local harness/S11 correction `f17a7ac` is under Opus high pre-push review; no native run or publication of that harness yet.
 - E4 native harness is prepared locally (`5e9198c`/`c0c021f`, retained `d24eaf4`/`9b29d38`). Sol medium correction `f17a7ac` decouples S11 inherited-NNP skip from nnp(); manifest now11 runnable native cases. Portable21 pass, fmt pass; no native execution. Fresh Opus high security review required before pushing the harness. PR62 remains unmerged.
 - PR62 exact-head Opus source/integration review passed at `93046dd` (comment6863902435). Hosted CI43499754522 provides real Linux/macOS Clippy and tests, including NNP-fenced S6; Windows remains pending. E3 native-evidence success is not E4 mutation credit. E4 non-root/native mutation evidence remains a merge gate; Sol high is preparing that harness locally for review before push.
 - E4 descriptor-bound rights probe is ready for hosted publication on merged E3 main `af9289a`. Sol high source4967b53 and Sol medium correctioncf8b9e7 passed Opus high recheck063c4bf (retained737d623), closing Linux compile/lint B1 and unfenced S6 B2 by source/stub evidence. Unicode-only test fixture87ef559 restores the original literals. No real Linux runtime or native mutation result is claimed yet.
