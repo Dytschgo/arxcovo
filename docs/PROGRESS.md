@@ -2,6 +2,23 @@
 
 ## Current state - 2026-11-13
 
+- Queue priority: merge refreshed inactive ADR0020 Stage E contract PR56 after exact-head independent review and all normal gates. Last merged PR55 `f91ae5a7d95645fb2057f70411675d6f1e07d1df`, 16:50:53Z; squash tree equals reviewed `72bd0af`. Main-after-55 run is pending, not claimed green.
+- Main after PR53 run43464791125 passed attempt1 in598s; main after PR54 run43462769959 passed567s. All five protection requirements/app pins and strict mode remain restored; bootstrap exception exhausted, no product waiver.
+- ADR0020/brief carry the previously independently reviewed local-delivery clarification4272291 (Opus PASS0f471e8), allowing local inactive implementation on explicit reviewed dependencies while publication/integration retain gates. Technical design unchanged; local E1/E5 are built but pending source review/re-pin. No native owner/service/cgroup/VM/experiment or production activation. Coordinator OpenAI / gpt-6.1-sol / medium.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved with no fix, waiver or retry. Parent histories and evidence retained below.
+
+## Historical parent checkpoint
+
+- Queue priority: publish the accepted inactive ADR 0020 contract stacked on Stage D, obtain exact-head independent review and all required gates. Sol correction 2 `07475b8` passed Opus high recheck `f08a510` (retained `14314fa`); P2/P6/P7 are closed at design level. Coordinator Sol medium addresses five advisory clarifications before publication. No implementation starts until contract and Stage C/D merge; no privileged acceptance or activation is authorized.
+- Correction `66924d0` (Anthropic / Opus 5.5 / high), retained as `680b143`, addresses the initial five blockers and proposes explicit ADR 0019 amendment A5 for a payload-free residue flag and admission recheck. Outcome: proposed, pending independent review; no builds or behavior tests ran. [Disposition](reviews/0020-correction1-disposition.md).
+- Stage E proposal `e3928f5` (Anthropic / Opus 5.5 / high) is retained as `54032bf`; independent review `8ff4196` (OpenAI / gpt-6.1-sol / high) is retained as `8ff3a54`. Outcome: changes required, five blockers covering sudo executable trust, directory-list offsets, orphan/admission claims, cleanup postconditions and test precedence. [Review](reviews/0020-sol-independent-design-review.md).
+- Stage D PR55 head `fdea1c6` passed exact-head Opus review; hosted Ubuntu and macOS passed. The existing 906-second main baseline keeps ci-time-budget red. Stage C PR53 remains an unmerged dependency. No merge gate is waived; CI performance and diagnostic investigations remain parked while product design continues.
+- Last merged PR52, main `1604db1`. M1 accepted; M2 incomplete. Production native execution remains inactive. Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, with no fix, waiver or retry. No owner/admin/service/VM operation is authorized.
+
+## Historical checkpoint before Stage E design review
+
+## Historical parent checkpoint
+
 - Queue priority: integrate PR55 Stage D on merged PR53, then normal exact-head review and all five checks before merge; PR56 follows. Last merged PR53 `6dd74673265d488d9da18e863d1fde651d6d0304`, 16:38:42Z. Its squash tree matches reviewed `46f90c9`. Main after PR53 run43464791125 is pending.
 - Main after PR54 run43462769959 succeeded on attempt1 in 567s (16:26:39-16:36:06Z). PR54 merged with all normal gates; the one-time bootstrap protection exception remains exhausted/restored.
 - Stage D product bytes remain identical to reviewed fdea1c6 and original d3615be except previously reviewed test corrections. Scanner conflict resolves to exactly reviewed Stage D file, preserving its Stage C rules and stronger scan. PROGRESS keeps both histories. Coordinator OpenAI / gpt-6.1-sol / medium; fresh Opus high integration review required. No production bridge constructor or native activation.
@@ -32,6 +49,7 @@
 - Native, installed and dedicated paths remain **unverified on real hardware**. ExecutionFailed and E_PROTECTION remain unresolved, no fix/waiver/retry. No owner/admin/service operation, old Lab Manager/VM, third S4U probe or babysitter change.
 
 ## Historical checkpoint before product-priority steering
+
 
 
 ## Historical parent checkpoint
