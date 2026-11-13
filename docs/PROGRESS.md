@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- PR64 exact-head Opus integration PASS (comment6866653579); Ubuntu/macOS, native-evidence, ci-time-budget and agent-review pass, Windows remains pending. Before activation, E7 coverage follow-up must protect ticket allocation at both callers, shutdown readiness, drain ordering, identical setup/bridge Location and panic/residue handling. D7 failed-Locate wiring remains a future inactive/activation contract obligation. No waiver or activation follows from this source PASS.
 - E7 review chain is complete: `4728c3d`, `59c169b`, `ef368d0` and final PASS `dc4a0d6` (retained `a027636`) close SB1/PB1/PB2/PB3. The third inventory correction passed; no provider handoff is required. Coordinator publishes inactive E7 on merged E6 for exact-head review and hosted checks. Production activation and Stage F/G remain gated.
 - E7 inventory correction attempt3 `f059a53` addresses PB3 from `ef368d0`: generic/closure stop boundaries and3 new shapes. Old-boundary and3 real source probes fail, fmt/workspace Clippy/focused11 pass. Narrow Opus recheck pending; a third failed fix requires other-provider correction handoff. No publication/activation.
 - E7 recheck `59c169b` closed drain/LF fixes but found PB2 lexical over-stripping. Sol medium correction `a3e2711` stops at every top-level brace and adds four braced-form controls. Old-stripper and actual macro source probes fail; fmt/workspace Clippy/focused11 pass. Narrow Opus recheck pending; source inventory remains lexical with PA8/PA9 disclosed. No publication/activation.
