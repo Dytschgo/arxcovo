@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- Discovery coverage follow-up source `99a1fd7` passed Opus high review `1ad362e`. PA1/PA2/PA4 are covered; PA3 closes the named hook-order mutant only, while observing actual drain completion remains open (SP1). PA5 and real Runner unwind-before-slot-release PA6 proof remain open; fake-port PA6 is partial. Coordinator publishes tests only for exact-head review and hosted gates, without activation.
 - Local inactive discovery coverage follow-up is complete by Sol high: source `99a1fd7`, evidence `52dfcc8`, ported unchanged onto merged E7. Fmt/workspace Clippy, focused49, seven compiled kills and final386/3 are credited at source pin. PA1-PA4 tests added; PA5 and real Runner unwind/store-before-slot-release PA6 proof remain open. Fresh Opus high security review is next, no publication or activation.
 - Last merged PR64 `0a95d2806b197431ae7d7c9cc002fdaadaeb145d`, at 22:42:24Z. Squash tree equals independently reviewed `9f44c0a`; all five required checks passed. Main-after-PR64 run `43521455840` succeeded on attempt 1 in 619s (22:42:27-22:52:46Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - Inactive Stage E slices E1-E7 are merged. Sol high is strengthening the retained pre-activation test gaps locally; source review and normal gates remain required for that follow-up. Production Unix startup/execution is still inactive; Stage F/G and hardware acceptance are separate outstanding gates.

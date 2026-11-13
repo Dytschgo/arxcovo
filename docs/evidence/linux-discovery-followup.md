@@ -143,3 +143,18 @@ Git blobs and SHA-256 of the committed UTF-8 bytes at `99a1fd7`:
 | `crates/arxd/src/service/unix_bridge/tests/e6.rs` | `bf2d031b77b90f2bbfadb0db0419030cf720bde4` | `675ca66e4ce977f9953e80cec2e50681eb1fc398bbe29abbf58cd3fa61aed5d4` |
 | `crates/arxd/src/service/unix_bridge/tests/e7.rs` | `696a475ed2fa7d8109cb36648550e033f95a7209` | `edb057eed09832abaf29f5665965a8e0f9c67efdc95c93f7ea00babf7d63edb7` |
 | `scripts/test_discovery_followup_mutations.py` | `962e9e4f0d06e84755b5a87ef3332c1e265c30a9` | `6c06cb3464f2451a4af07880ccc28ac829eb9ce6b70f2b1ad51be444f3ea7796` |
+
+## Independent review and publication limits
+
+Opus high review1ad362e approves both axes. Source remains identical to
+99a1fd7 on merged E7 main0a95d28. Original386/3, focused49 and seven-kill
+credits remain at source99a1fd7; no new full suite is claimed for docs/reports.
+
+PA3 evidence is limited: hook labels prove their placement/order, not the
+actual ordering of Execution::drain versus joining the discovery sequence.
+A mutant moving the real drain while leaving the labels survived review.
+SP1 therefore remains a pre-activation test gate, along with asserting the
+executor set is empty. PA5 and real Runner unwind/store-before-slot-release
+ordering remain open. Fake-port panic/residue coverage is partial only.
+Cache status wording and start-time timestamp semantics need activation review.
+No activation, Stage F/G permission or hardware acceptance follows from PASS.
