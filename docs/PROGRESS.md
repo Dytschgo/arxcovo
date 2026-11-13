@@ -3,7 +3,7 @@
 ## Current state - 2026-11-13
 
 - E2 local fake-port setup/janitor is implemented by OpenAI / gpt-6.1-sol / high: source `b40e81a`, evidence `a4deb6e`, retained `af72d31`/`329e538` on merged E5. Builder fmt/Clippy, focused 58, 14 mutation kills and single final 360/3 workspace run passed at original pins. Source is unchanged by the port. Independent Opus high security review is next; no publication or activation.
-- Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`, at 18:09:55Z. Squash tree equals reviewed `ab9ea63`; independent Opus high integration review and all five required checks passed. Main CI run `43479932347` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`, at 18:09:55Z. Squash tree equals reviewed `ab9ea63`; independent Opus high integration review and all five required checks passed. Main CI run `43479932347` succeeded on attempt 1 in 511s (18:09:58-18:18:29Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
 - E5 cleanup-residue source is integrated, with Windows source-pin evidence and hosted Linux/macOS compilation. Linux owned-temp R1/R2 runtime credit remains unclaimed until exact logs are checked. E2 setup/janitor over a fake port is being built locally by Sol high; no real cgroup or activation.
 - The unchanged dispatcher privacy assertion failed once locally in run `65762554`; 11 focused passes, a separate complete 337/3 run, and hosted Windows success do not establish its cause or fix. Separate diagnostic follow-up remains open. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved; no retry or waiver.
 
