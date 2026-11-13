@@ -2,6 +2,12 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`, at 18:46:14Z. Its squash tree equals independently reviewed `be629c8`; all five required checks passed. Main-after-PR60 run `43485836788` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- E2 setup/janitor over fake ports is integrated and inactive. Sol high is building E3 Linux descriptor adapter locally on reviewed E2; parent source will be re-pinned to merged main before publication. No real cgroup setup or activation.
+- Main-after-PR59 run `43479932347` passed attempt1 in511s. Strict protection and all five contexts remain unchanged; bootstrap exception exhausted. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix/waiver/retry.
+
+## Historical checkpoint before E2 merge
+
 - E2 fake-port setup/janitor is ready for publication on main `064113a`. Sol high source `b40e81a` passed Opus high review `dd4dad8` after Sol medium tests-only correction `70729f6` passed recheck `352a8c1` (retained `12578aa`); B1/B2 closed. Production setup.rs is unchanged. Exact-head integration review and all five hosted checks remain required; no activation.
 - Verification credits: builder fmt/Clippy, focused58, 14 mutation kills and one full360/3 at b40e81a; coordinator test correction fmt/Clippy and focused24; reviewer restored focused24 and three targeted mutation/probe kills. No new full-suite run claimed for docs/test-only changes.
 - Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`; main run `43479932347` passed attempt1 in511s. All five required checks/strict protection retained; bootstrap exception exhausted.
