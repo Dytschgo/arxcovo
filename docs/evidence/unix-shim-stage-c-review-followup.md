@@ -37,3 +37,22 @@ or private-state operation ran. ExecutionFailed and E_PROTECTION remain
 unexplained, without fix, waiver or retry. Native, installed and dedicated
 paths remain **unverified on real hardware**. M2 is incomplete. A fresh
 independent recheck and all five hosted gates remain mandatory before merge.
+
+## Main-after-54 integration checkpoint
+
+Coordinator OpenAI / gpt-6.1-sol / medium, 2026-11-13. Source merge `baa35f1477c505222913b6ed82356700ddaeab6f`
+inherits main `79276b9` and preserves all shim/routing/scanner source bytes
+from reviewed `2ce79ca`. No product source conflict; PROGRESS auto-merged and
+current status is refreshed above the preserved history. #54 normal merge
+followed all five gates and its first integration run passed in 528 seconds.
+Main after #54 run43462769959 is pending, not claimed green.
+
+At this merged source: cargo fmt --all --check and locked workspace/all-target
+Clippy -D warnings passed. One normal full workspace nextest run at default
+concurrency passed 309 tests / 2 skipped, run
+d1260723-0450-4807-bccc-119af0587b85, 11.568s. No ignored fixture directly
+invoked; Unix runtime and mutations were not rerun locally. Earlier hosted
+Unix proofs remain credited to their own heads, and this new head needs all
+hosted gates and an independent integration review. No native backend or
+owner/service/cgroup/VM/experiment activation. M2 incomplete; native paths
+**unverified on real hardware**, ExecutionFailed/E_PROTECTION unresolved.
