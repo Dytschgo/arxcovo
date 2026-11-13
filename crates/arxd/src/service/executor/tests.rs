@@ -36,6 +36,7 @@ impl Executor for Fake {
 pub(crate) fn fake(wait: bool, cleanup: bool) -> (Arc<Execution>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let e = Execution {
+        admission_barrier: Mutex::new(None),
         backend: Arc::new(Fake {
             calls: calls.clone(),
             wait,

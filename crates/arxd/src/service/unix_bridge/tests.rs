@@ -16,6 +16,9 @@ type Step = dyn Fn(&exec::RunSpec, &Cancellation, &Cancellation) -> Result<exec:
     + Sync;
 struct FakePort(Box<Step>);
 impl RunnerPort for FakePort {
+    fn cleanup_residue(&self) -> bool {
+        false
+    }
     fn run(
         &self,
         s: &exec::RunSpec,
@@ -24,6 +27,11 @@ impl RunnerPort for FakePort {
     ) -> Result<exec::RunResult, exec::RunError> {
         (self.0)(s, c, h)
     }
+}
+fn ready() -> Readiness {
+    let r = Readiness::pending();
+    r.set_ready();
+    r
 }
 fn config() -> ServiceConfig {
     let mut v = fixture();
@@ -47,7 +55,7 @@ fn bridge(
         "/synthetic/unit/runs".into(),
         |_| Ok(Box::new(FakePort(Box::new(step)))),
         Box::new(|| Ok(())),
-        true,
+        ready(),
     )
 }
 fn execution(b: UnixBridge) -> Arc<Execution> {
@@ -188,7 +196,7 @@ fn t1_derivation_factory_once_and_refusals() {
             Ok(Box::new(FakePort(Box::new(|_, _, _| Ok(result())))))
         },
         Box::new(|| Ok(())),
-        true,
+        ready(),
     );
     for _ in 0..2 {
         b.preflight().unwrap();
@@ -200,7 +208,7 @@ fn t1_derivation_factory_once_and_refusals() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let mut b = b;
-    b.ready = false;
+    b.readiness = Readiness::pending();
     assert_eq!(b.preflight(), Err(Unavailable::MechanismUnavailable));
 }
 #[test]
@@ -379,16 +387,28 @@ fn table() -> Vec<u8> {
         .iter()
         .map(|n| json!({"version":"synthetic 1","found":true,"name":n}).to_string() + "\n")
         .collect::<String>()
-        .into_bytes()
+        .add_rights()
 }
 #[tokio::test]
 async fn t6_discovery_exact_table() {
-    for case in 0..17 {
+    for case in 0..19 {
         let (v, _) = dispatch(
             bridge(move |_, _, _| {
                 let mut r = result();
                 let mut bytes = table();
                 match case {
+                    17 => {
+                        bytes = String::from_utf8(bytes)
+                            .unwrap()
+                            .lines()
+                            .take(TOOLS.len())
+                            .map(|l| l.to_owned() + "\n")
+                            .collect::<String>()
+                            .into_bytes();
+                    }
+                    18 => bytes.extend_from_slice(
+                        b"{\"rights\":{\"no_new_privs\":true,\"sudo\":\"absent\"}}\n",
+                    ),
                     1 => r.stdout.dropped_bytes = 1,
                     2 => bytes.reverse(),
                     3 => bytes.extend_from_slice(b"{}\n"),
@@ -695,7 +715,7 @@ async fn t8_private_inputs_all_phases_inner() {
                 }))))
             },
             Box::new(|| Ok(())),
-            true,
+            ready(),
         );
         let dir = private_temp();
         let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
@@ -836,7 +856,7 @@ fn t1_preflight_order_stored_refusal_and_readiness() {
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }),
-        false,
+        Readiness::pending(),
     );
     for _ in 0..2 {
         assert_eq!(b.preflight(), Err(Unavailable::PreflightFailed));
@@ -981,3 +1001,14 @@ fn t3_max_agent_tail_stays_separate_from_prefix() {
         }
     ));
 }
+
+trait TestRights {
+    fn add_rights(self) -> Vec<u8>;
+}
+impl TestRights for String {
+    fn add_rights(self) -> Vec<u8> {
+        (self + "{\"rights\":{\"no_new_privs\":true,\"sudo\":\"absent\"}}\n").into_bytes()
+    }
+}
+
+mod e6;

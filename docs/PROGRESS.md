@@ -2,6 +2,22 @@
 
 ## Current state - 2026-11-13
 
+- E6 readiness/in-slot admission source `87957dd` passed independent Opus high review `7814312` (retained `e0b69cb`), with no blockers. Source is unchanged on merged E4 main `f4fb126`; publication now seeks exact-head integration review and all five required hosted checks. Sol high builder full375/3 and11 compiled kills stay credited at the original source pin; no docs-only full repeat is claimed.
+- Review advisories are disclosed in E6 evidence: text-only signal scan/inventory limits, numeric readiness-state coupling, T16 late-writer coverage, pointer-identity domain mutant and untested panic/residue edge. E7 must preserve one domain/runner and hardening-before-Ready while keeping non-standard configs refused. E7 is not built in this slice.
+- Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`; main run `43505759245` passed attempt1 in574s. The E4 native run `43504012486` passed11 kills and all baselines/restoration as UID/euid1001. Its result record is carried forward in docs only. Strict five-check protection unchanged; no bypass.
+- M2 incomplete; production stays MechanismUnavailable. Native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry.
+
+## Historical E6 local-review checkpoint
+
+- E6 local readiness/admission implementation is complete by Sol high: source `87957dd`, evidence `9699c8c`, ported unchanged onto merged E4. Fmt/locked workspace Clippy, one final375/3 suite and11 compiled mutation kills are credited at source pin. Fresh Opus high security review is next; no publication or activation, E7 remains separate.
+- Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`, at 20:53:55Z. Its squash tree equals independently reviewed `9937c16`; all five required checks and both native evidence jobs passed. Main-after-PR62 run `43505759245` succeeded on attempt 1 in 574s (20:53:58-21:03:32Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- E4 native run `43504012486` passed attempt1 in111s as UID/euid1001 with all11 mutation kills, before/after baselines and matching restored fingerprints. Independent Opus completed-evidence comment6864567049 confirms it. This is hosted owned-fixture evidence, not real product-hardware acceptance. No production execution activation.
+- Sol high is implementing local E6 readiness, in-slot gates and latches over fakes on the reviewed E4 stack. Re-pin onto merged E4, independent source/integration review and required checks remain publication/merge gates. E7 startup/cache and Stage F/G remain separate.
+- M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry. Strict five-check protection unchanged; bootstrap exception exhausted.
+
+## Historical checkpoint before E4 merge
+
+- E4 native run `43504012486` succeeded attempt1 at PR62 head `9937c16` in111s. Root parsed UID/euid1001, all11 exit100 kills, restored matching fingerprints, before/after library and L8 pass, and fenced S6 baselines10.593/6.646s. Completed-evidence independent confirmation is next before agent-review; Windows/macOS still pending at prior read. No merge or activation.
 - E4 native harness pre-push review is complete: Opus high `23dee78` and label recheck PASS `0123317` close B1. Coordinator publishes the reviewed harness for its first ordinary-user Ubuntu execution on PR62. Eleven native kills, explicit skip/pass baselines, restoration, exact-head review and refreshed five checks remain merge requirements; no activation.
 - E4 harness review `23dee78` required B1 integration label correction. Sol medium `d06e541` unifies Cargo target/nextest label mapping; portable22 pass, old-driver control fails, and real nextest synthetic integration pass/fail outputs classify correctly. No E4 native execution. Narrow Opus recheck pending before push.
 - PR62 published head `93046dd` now has all five required checks green and source/integration review PASS. Existing native-evidence is E3, not E4. Merge remains held for E4 native mutation kills and explicit ordinary-UID/pass-or-skip evidence. Local harness/S11 correction `f17a7ac` is under Opus high pre-push review; no native run or publication of that harness yet.
