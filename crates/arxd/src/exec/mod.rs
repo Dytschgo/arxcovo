@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod hierarchy;
+
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
