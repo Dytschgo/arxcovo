@@ -83,6 +83,15 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
+        let observation = if self.activity.dedicated.is_some() && label == "discover_tools" {
+            Some(
+                self.activity
+                    .discovery_observation()
+                    .map_err(|_| unavailable())?,
+            )
+        } else {
+            None
+        };
         let id = if self.activity.dedicated.is_some()
             && matches!(label, "run_command" | "discover_tools")
         {
@@ -130,6 +139,9 @@ impl ServerHandler for Inventory {
                     result = work => result,
                     _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
                 }.map_err(|e| ErrorData::internal_error(e.reason.as_str(), e.execution_reason.map(|r| json!({"activity_id":id,"outcome":"refused","reason":e.reason.as_str(),"execution_reason":r.as_str()}))))?;
+            if let Some(observation) = observation {
+                self.activity.cache_discovery(observation, &result);
+            }
             return Ok(
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())]).into(),
             );
@@ -263,6 +275,11 @@ impl ServerHandler for Inventory {
         } else {
             "not_configured"
         });
+        if let Some(cache) = self.activity.tool_cache() {
+            value["hosts"][0]["tools"] = cache.tools;
+            value["hosts"][0]["tools_observed_at"] = json!(cache.observed_at_ms);
+            value["hosts"][0]["last_observed_identity"] = cache.observed_identity;
+        }
         self.activity
             .finish(id, "succeeded")
             .map_err(|_| unavailable())?;

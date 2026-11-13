@@ -299,6 +299,10 @@ impl Execution {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+    #[cfg(test)]
+    pub(crate) fn shutdown_token_for_test(&self) -> Cancellation {
+        self.shutdown.clone()
+    }
     pub async fn drain(&self) -> Result<(), Reason> {
         self.shutdown();
         let mut workers = std::mem::take(&mut *self.workers.lock().unwrap());

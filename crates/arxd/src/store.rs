@@ -7,7 +7,16 @@ use std::{path::Path, sync::Mutex, time::Duration};
 mod crash_tests;
 
 /// Private local identity and bounded activity; no credentials or host paths.
+#[derive(Clone)]
+pub(crate) struct ToolCache {
+    pub(crate) ticket: u64,
+    pub(crate) tools: serde_json::Value,
+    pub(crate) observed_identity: serde_json::Value,
+    pub(crate) observed_at_ms: u64,
+}
 pub struct Activity {
+    tool_cache: Mutex<Option<ToolCache>>,
+    discovery_ticket: std::sync::atomic::AtomicU64,
     db: Mutex<Connection>,
     pub(crate) dedicated: Option<std::sync::Arc<crate::service::executor::Execution>>,
     service_reason: Mutex<Option<ExecutionUnavailable>>,
@@ -132,6 +141,8 @@ impl Activity {
         check_size(&tx)?;
         tx.commit()?;
         Ok(Self {
+            tool_cache: Mutex::new(None),
+            discovery_ticket: std::sync::atomic::AtomicU64::new(0),
             db: Mutex::new(db),
             dedicated: service.then(crate::service::executor::Execution::unavailable),
             service_reason: Mutex::new(
@@ -143,6 +154,42 @@ impl Activity {
     }
     pub(crate) fn service_reason(&self) -> Option<ExecutionUnavailable> {
         self.service_reason.lock().ok().and_then(|r| *r)
+    }
+    pub(crate) fn discovery_observation(&self) -> Result<(u64, u64)> {
+        use std::sync::atomic::Ordering;
+        let ticket = self
+            .discovery_ticket
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("discovery unavailable"))?
+            + 1;
+        Ok((ticket, now_ms()? as u64))
+    }
+    pub(crate) fn cache_discovery(&self, observation: (u64, u64), response: &serde_json::Value) {
+        if response["outcome"] != "succeeded" {
+            return;
+        }
+        if let Ok(mut cache) = self.tool_cache.lock()
+            && cache.as_ref().is_none_or(|c| observation.0 > c.ticket)
+        {
+            *cache = Some(ToolCache {
+                ticket: observation.0,
+                tools: response["tools"].clone(),
+                observed_identity: response["observed_identity"].clone(),
+                observed_at_ms: observation.1,
+            });
+        }
+    }
+    pub(crate) fn tool_cache(&self) -> Option<ToolCache> {
+        self.tool_cache.lock().ok().and_then(|c| c.clone())
+    }
+    #[cfg(test)]
+    pub(crate) fn start_daemon_discovery(&self) -> Result<i64> {
+        self.start_typed(
+            "arxd",
+            Tool::DiscoverTools,
+            true,
+            Some(IdentityMode::DedicatedAccount),
+        )
     }
     pub(crate) fn set_service_reason(&self, reason: ExecutionUnavailable) {
         if let Some(e) = &self.dedicated {
