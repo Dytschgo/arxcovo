@@ -2,6 +2,21 @@
 
 ## Current state - 2026-11-13
 
+- E2 fake-port setup/janitor is ready for publication on main `064113a`. Sol high source `b40e81a` passed Opus high review `dd4dad8` after Sol medium tests-only correction `70729f6` passed recheck `352a8c1` (retained `12578aa`); B1/B2 closed. Production setup.rs is unchanged. Exact-head integration review and all five hosted checks remain required; no activation.
+- Verification credits: builder fmt/Clippy, focused58, 14 mutation kills and one full360/3 at b40e81a; coordinator test correction fmt/Clippy and focused24; reviewer restored focused24 and three targeted mutation/probe kills. No new full-suite run claimed for docs/test-only changes.
+- Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`; main run `43479932347` passed attempt1 in511s. All five required checks/strict protection retained; bootstrap exception exhausted.
+- M2 incomplete. Native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy assertion flake, ExecutionFailed and E_PROTECTION remain unresolved; no fix, waiver or retry.
+
+## Historical E2 review checkpoint
+
+- E2 first review `dd4dad8` passed Standards and required two tests-only Spec fixes. Sol medium correction `70729f6` catches both surviving mutants; fmt/workspace Clippy and focused 24/24 pass. Production is unchanged; narrow Opus recheck is next, E2 remains unpublished.
+- E2 local fake-port setup/janitor is implemented by OpenAI / gpt-6.1-sol / high: source `b40e81a`, evidence `a4deb6e`, retained `af72d31`/`329e538` on merged E5. Builder fmt/Clippy, focused 58, 14 mutation kills and single final 360/3 workspace run passed at original pins. Source is unchanged by the port. Independent Opus high security review is next; no publication or activation.
+- Last merged PR59 `064113a820a65989204e0810185f7af2f373f719`, at 18:09:55Z. Squash tree equals reviewed `ab9ea63`; independent Opus high integration review and all five required checks passed. Main CI run `43479932347` succeeded on attempt 1 in 511s (18:09:58-18:18:29Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- E5 cleanup-residue source is integrated, with Windows source-pin evidence and hosted Linux/macOS compilation. Linux owned-temp R1/R2 runtime credit remains unclaimed until exact logs are checked. E2 setup/janitor over a fake port is being built locally by Sol high; no real cgroup or activation.
+- The unchanged dispatcher privacy assertion failed once locally in run `65762554`; 11 focused passes, a separate complete 337/3 run, and hosted Windows success do not establish its cause or fix. Separate diagnostic follow-up remains open. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. ExecutionFailed/E_PROTECTION unresolved; no retry or waiver.
+
+## Historical checkpoint before E5 merge
+
 - E5 source review is complete: first review `4e1d6b8`, forwarding recheck `2c47ec9`, and returned-flag recheck `a1e0cea` close required S1/B1/B2. Sol medium integrates reviewed E5 onto merged E1 main `2fbc647`. Production remains inactive; combined fmt/Clippy pass and complete diagnostic workspace run passes 337/3. The first full run failed an unchanged dispatcher privacy assertion; 11 focused passes and the complete run do not establish a cause or fix. Both outcomes are retained in evidence. Exact-head independent integration review and hosted gates remain required before merge.
 - Last merged PR58 `2fbc6476fde3aaa5c1e94ad46872e46315d73018`. Main-after-PR58 run `43475344395` succeeded on attempt 1 in 602s. All five required checks and strict protection remain in place; bootstrap exception exhausted.
 - M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Linux E5 R1/R2 and hosted compilation remain pending. ExecutionFailed/E_PROTECTION unresolved; no retry or waiver.
