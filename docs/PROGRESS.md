@@ -2,6 +2,12 @@
 
 ## Current state - 2026-11-14
 
+- Last merged PR66 `1ac40479707718a045dbe6cfcc7d9b0cdf234622`, at 2026-11-13 23:33:02Z. Squash tree equals independently reviewed `43ee910`; all five required checks passed. Main-after-PR66 run `43527940656` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Actual-drain SP1/SP2 tests are integrated with their disclosed limits. PA5 and real-Runner unwind/store-before-slot-release evidence remain open. Opus high proposal `1642726` separates local test-only S1/S2 and F0 feedback-artifact preparation from future native runs/Stage G activation. It is unaccepted pending independent Sol high review; no new implementation or experiment is authorized by the proposal.
+- Latest main-after-PR65 run `43524629307` passed attempt1 in587s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
+
+## Historical checkpoint before actual-drain regression merge
+
 - Actual-drain test-only source `1eccbfc` passed Opus high review `c45d35e`, closing SP1/SP2. Published follow-up will retain limitations: single entry snapshot, timeout-release false-pass window, existing tests cover detach_all, and single seam confirmed by source. PA5 and real Runner PA6 remain open. No new full-suite or native claim; exact-head review and five checks remain merge gates.
 - Test-only actual-drain follow-up is complete by Sol high: source `1eccbfc`, evidence `711b11b`, ported unchanged onto merged PR65. Actual transferred/completed JoinSet observations and a real-set-empty accessor target SP1/SP2. Fmt/workspace Clippy, focused tests, two compiled counterfactual kills and final387/3 are credited at original source. Fresh Opus high review is next; PA5/real Runner PA6 remain open, no publication/activation.
 - Last merged PR65 `5ae645e6dc49d551298b32d5f72c871acb007864`, at 2026-11-13 23:06:53Z. Its squash tree equals independently reviewed `45549fe`; all five required checks passed. Main-after-PR65 run `43524629307` succeeded on attempt 1 in 587s (2026-11-13 23:06:55-23:16:42Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
