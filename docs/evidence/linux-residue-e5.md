@@ -133,3 +133,26 @@ diagnostic rerun. Production remains inactive/MechanismUnavailable. Native,
 installed and dedicated paths are **unverified on real hardware**. M2 is
 incomplete; ExecutionFailed / E_PROTECTION remain unresolved with unknown
 cause, no fix, waiver or retry.
+
+## First security-review test correction
+
+Opus high first review4e1d6b8 (retained7ab6f3a) found S1 rustfmt coverage and
+B1 unpinned forwarding. Coordinator Sol medium test correction c46304e restores
+out-of-line mod tests and moves the two new tests to exec/residue_tests.rs.
+Production mod.rs prefix, unix.rs and cgroup.rs remain identical to f866af4.
+The portable pin now requires self.residue.clone at run_core, exactly one
+false Arc allocation in Runner::new, exactly two production unix residue uses,
+and no store(false). These are source-pin proofs, not Linux runtime proofs.
+
+Fresh fmt and locked workspace/all-target Clippy passed; baseline and final
+focused exec runs each passed17. Final run c40ef903-2234-47fb-ad57-b90eb66c6ae8.
+Both surviving mutations now compile on Windows and fail source-pin assertions:
+- run_core fresh flag: 2d5a2342-116f-4a1c-919d-69a471644855
+- unix::run fresh flag: 9c1f6532-6c2b-49b9-b439-93d96ce90720
+All original bytes restored and checked. Deliberate tests.rs misformatting is
+now detected by fmt --check; restored afterward. An initial duplicate test
+helper visibility caused a fmt parse error and was restored to the unchanged
+original helper before successful verification. No claim of Linux compilation
+or R1/R2 execution, no full-suite repeat or native action. Fresh narrow Opus
+recheck is pending. Publication requires that review plus exact main-base
+integration and all hosted gates. M2 incomplete; hardware remains unverified.
