@@ -219,3 +219,19 @@ hosted native E4 evidence. No native baseline, S6 timing or mutation kill
 is claimed before the run completes. All11 kills, ordinary UID, explicit
 skip/pass outcomes, source restoration and exact-head review/gates remain
 required before merge. Production remains inactive.
+
+## First hosted native E4 result
+
+Run43504012486, attempt1, exacthead9937c16 succeeded at
+2026-11-13 20:42:24-20:44:15Z (111s workflow elapsed). Root read the API
+metadata and parsed the fixed JSON records from job logs. UID/euid1001.
+All11 manifest labels reported killed with exit100. Source fingerprint
+bdc038f1fcd64d72b3ad2c8fdab23239c0f926367d7c30fb4633e82a61895bdc
+matched baselines and restored_sources.
+
+Before/after library baselines passed in40.582/2.330s with inherited-NNP
+false observation marked passed, not skipped. L8 passed in0.243/0.240s.
+NNP-fenced S6 baselines passed in10.593/6.646s; the measured final baseline
+is below its20s cap. Native results remain hosted owned-fixture evidence,
+not real product hardware acceptance. Independent completed-evidence review
+and the remaining required checks still precede merge. No retry or activation.
