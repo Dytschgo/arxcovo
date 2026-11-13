@@ -8,12 +8,14 @@ Sol correction 2 `07475b8` passed the independent Opus check `f08a510`.
 The advisory-only follow-up clarifies existing errno ordering, splits T20
 across E6/E7, names non-test Runner construction pins and shares W3e's seam.
 This publication delta still requires exact-head independent review and all
-required checks. Local inactive implementation may proceed on the explicit
-unmerged Stage C/D/contract stack after independent design review, under the
-user's product-first direction. Integration/publication of implementation
-slices waits for this contract PR and Stage C (PR53) / Stage D (PR55) to merge
-through all gates, then requires a re-pin and final integration review.
-No privileged operation or activation is authorized. M2 remains incomplete and native paths remain
+required checks. Stage C PR53 merged on 2026-11-13 as `6dd7467`, and
+Stage D PR55 merged that day as `f91ae5a`, both through all normal gates.
+Their prerequisite merge gates are complete. Local inactive implementation
+may proceed on the reviewed design. Implementation publication/integration
+still requires this contract PR to merge through all gates, then an exact
+re-pin and independent integration review on that merged base.
+No privileged operation or activation is authorized. M2 remains incomplete;
+native paths remain
 **unverified on real hardware**.
 
 ## Historical proposal and correction-1 checkpoint
@@ -144,7 +146,8 @@ packaging changes, the Stage F experiment, Stage G activation and
   (Linux-gated where needed), plus the cgroup cleanup signal (D6).
   `exec/unix.rs` keeps its behavioral order, cancellation checks, fences,
   legacy/phased results and each branch's existing errno-read/cleanup order
-  unchanged. In particular, exec/cgroup.rs Group::create's failed-openat branch reads errno
+  unchanged. In particular, `exec/cgroup.rs` `Group::create` reads errno
+  after a failed openat
   after unlinkat; A5 does not silently correct that existing behavior.
 
 ### D2. Trust anchors (all checked before any write)

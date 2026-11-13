@@ -3,9 +3,11 @@
 Status: **accepted inactive staged contract**; see ADR 0020's current
 coordinator disposition. The historical checkpoint below records the earlier
 proposal, not the current acceptance state. Tests here remain requirements,
-not evidence. Local inactive implementation may start on the explicit
-unmerged stack after independent design review; implementation publication
-and integration wait for contract and Stage C/D merges through all gates.
+not evidence. Stage C PR53 merged on 2026-11-13 as `6dd7467` and Stage D
+PR55 as `f91ae5a`; both prerequisite merge gates are complete. Local inactive
+implementation may proceed after design review. Publication/integration still
+requires this contract PR's merge, an exact re-pin and independent integration
+review on that merged base.
 
 ## Historical proposal and correction-1 checkpoint
 
@@ -24,10 +26,11 @@ evidence of this plan.
 
 1. Local inactive work requires the accepted design and independent review:
    original Opus architecture/correction 1 retain Sol high review, and Sol
-   correction 2/publication retain Opus high review. Declare the unmerged
+   correction 2/publication retain Opus high review. Declare exact reviewed
    dependency pins. Reviewer fallback remains grok-4.7 high.
-2. Before implementation publication/integration, this contract PR and ADR
-   0019 Stage C (PR53) / Stage D (PR55) must merge through all required gates.
+2. Stage C PR53 (`6dd7467`) and Stage D PR55 (`f91ae5a`) merged on
+   2026-11-13 through all required gates. Before implementation publication
+   or integration, this contract PR must also merge through all gates.
    Re-pin and re-review the implementation on that merged base. This follows
    the user's product-first direction; it permits local work during CI waits
    and waives no merge check. Slices E4-E7 change prerequisite code.
