@@ -198,3 +198,24 @@ fix, waiver or diagnosis was performed. Production stays MechanismUnavailable.
 Next: independent Opus high exact-source review, then coordinator-owned
 publication/integration only after dependency and required gates pass. This
 local implementation/evidence does not grant activation.
+
+## First source-review correction
+
+Opus high review dd4dad8 (retained3bc285e) passed Standards and required
+Spec B1/B2 tests-only repairs. Sol medium correction `70729f68a649aaad5f7b2282a4c7fa90b93188af` sets the H14
+kill delay to never complete, and adds a valid-but-different cgroup location
+case requiring Locate with zero mutations. Production setup.rs is unchanged.
+
+Fmt and locked workspace/all-target Clippy passed. Three targeted tests passed
+(eaabfd60); final E2 fake selection passed 24/24, run
+`b23eb3e4-1197-43ad-9641-aade301bef27`. No full workspace repeat.
+Both production mutants compiled and failed the intended test assertion:
+- wait-cancel: `640ea4e8-b015-44c4-8570-70078b0903d5`, exit100.
+- location: `67492d14-55c4-4f98-8d9e-9f2ee09a1906`, exit100.
+All mutated setup.rs bytes restored exactly. Original 360/3 full suite
+credit stays at b40e81a. Narrow independent recheck pending; no publication,
+hosted run, native action or activation. Advisories remain disclosed in the
+review, including unproven mkdir mode and fake/driver guard distinctions.
+
+Updated committed fake.rs manifest:
+- Git blob `0de9e4e95ee4101f195b06e5115203035e7ac078`; SHA-256 `69838972dbd426c3c227ba0613a7054a609d0b8dc34c912780f52d60043ed90f`.
