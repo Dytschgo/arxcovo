@@ -158,23 +158,29 @@ def run_bounded(command, cwd, seconds, limit=LIMIT):
 
 
 def statuses(output, name):
-    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+arxd\s+" + re.escape(name) + r"\s*$"
+    pattern = r"^\s*(PASS|FAIL|SKIP)\s+\[[^\]\r\n]+\]\s+(?:\(\d+/\d+\)\s+)?arxd\s+" + re.escape(name) + r"\s*$"
     return re.findall(pattern, output, re.MULTILINE)
 
 
+def error_lines(output):
+    return [line.strip() for line in output.splitlines()
+            if re.match(r"^error(?::|\[)", line.strip())]
+
+
 def classify(code, output, name):
-    if "SKIP" in output or "error:" in output:
+    if "SKIP" in output:
         return "invalid"
+    errors = error_lines(output)
     marks = statuses(output, name)
-    if code == 100 and marks == ["FAIL"]:
+    if code == 100 and marks == ["FAIL"] and errors == ["error: test run failed"]:
         return "killed"
-    if code == 0 and marks == ["PASS"]:
+    if code == 0 and marks == ["PASS"] and not errors:
         return "survived"
     return "invalid"
 
 
 def baseline_result(code, output):
-    if code != 0 or "SKIP E3" in output or "error:" in output:
+    if code != 0 or "SKIP E3" in output or error_lines(output):
         raise GuardError("baseline_failed")
     for name in TESTS:
         if statuses(output, name) != ["PASS"]:
@@ -287,6 +293,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, interrupted)
     try:
         sys.exit(main())
-    except (GuardError, OSError, ValueError):
-        emit("harness", "failed_closed")
+    except GuardError as error:
+        emit("harness", "failed_closed", reason=str(error))
+        sys.exit(1)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        reason = "reap_timeout" if isinstance(error, subprocess.TimeoutExpired) else (
+            "os_error" if isinstance(error, OSError) else "value_error")
+        emit("harness", "failed_closed", reason=reason)
         sys.exit(1)

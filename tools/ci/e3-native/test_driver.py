@@ -17,7 +17,7 @@ spec.loader.exec_module(d)
 
 
 def status(kind, name):
-    return f"        {kind} [   0.012s] arxd {name}\n"
+    return f"        {kind} [   0.012s] (1/1) arxd {name}\n"
 
 
 def baseline():
@@ -99,7 +99,7 @@ class HarnessTests(unittest.TestCase):
 
     def test_named_failure_and_exit_100_required(self):
         name = d.TESTS[0]
-        self.assertEqual(d.classify(100, status("FAIL", name), name), "killed")
+        self.assertEqual(d.classify(100, status("FAIL", name) + "error: test run failed\n", name), "killed")
         self.assertEqual(d.classify(0, status("PASS", name), name), "survived")
         for code, output in (
             (101, status("FAIL", name)), (100, "error: compile failed"),
@@ -112,6 +112,24 @@ class HarnessTests(unittest.TestCase):
         ):
             with self.subTest(code=code, output=output):
                 self.assertEqual(d.classify(code, output, name), "invalid")
+
+    def test_real_nextest_0_9_151_status_excerpts(self):
+        # Verbatim lines captured by the reviewer from nextest 0.9.151.
+        failed = "FAIL [   0.015s] (1/1) arxd tests::bad\nerror: test run failed\n"
+        passed = "PASS [   0.021s] (2/2) arxd tests::good\n"
+        self.assertEqual(d.classify(100, failed, "tests::bad"), "killed")
+        self.assertEqual(d.classify(0, passed, "tests::good"), "survived")
+        self.assertEqual(d.statuses(passed.replace("(2/2) ", ""), "tests::good"), ["PASS"])
+        for output in (failed.replace("error: test run failed\n", ""),
+                       failed + "error: test run failed\n",
+                       failed + "error[E0308]: mismatched types\n",
+                       failed + "error: could not compile arxd\n",
+                       failed.replace("(1/1)", "(1/x)")):
+            with self.subTest(output=output):
+                self.assertEqual(d.classify(100, output, "tests::bad"), "invalid")
+        for error in ("error[E0308]: mismatched types\n", "error: could not compile arxd\n"):
+            with self.assertRaises(d.GuardError):
+                d.baseline_result(0, baseline() + error)
 
     def test_baseline_visible_markers_distinguish_skips(self):
         self.assertEqual(d.baseline_result(0, baseline()), {"L7": "passed", "L8": "passed"})
@@ -244,7 +262,7 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(self.target.read_bytes(), self.original)
                 return 0, baseline(), 0.01
             self.assertIn(b"MUTANT", self.target.read_bytes())
-            return 100, status("FAIL", d.TESTS[0]), 0.01
+            return 100, status("FAIL", d.TESTS[0]) + "error: test run failed\n", 0.01
 
         buffer = io.StringIO()
         with patch.object(d, "SOURCE_SHA", d.sha(self.original)), \
