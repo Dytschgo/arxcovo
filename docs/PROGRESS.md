@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- E7 recheck `59c169b` closed drain/LF fixes but found PB2 lexical over-stripping. Sol medium correction `a3e2711` stops at every top-level brace and adds four braced-form controls. Old-stripper and actual macro source probes fail; fmt/workspace Clippy/focused11 pass. Narrow Opus recheck pending; source inventory remains lexical with PA8/PA9 disclosed. No publication/activation.
 - E7 review `4728c3d` required SB1 short W9 and PB1 crate-wide inactive source pins. Sol medium correction `09cc061` uses100ms liveness plus existing paused production-bound test, adds bounded lexical inventory with real source-probe controls, and fixes LF mutation writes. Fmt/workspace Clippy and finalfocused10 pass; all7 genuine mutants killed/restored. Fresh Opus recheck pending; no publication/activation.
 - E7 local inactive startup discovery/cache implementation is complete by Sol high: source `cea3038`, evidence `20d76c7`, retained unchanged on merged E6. Builder fmt/locked workspace Clippy, final383/3 and7 compiled kills are credited at original pin. Fresh Opus high security review is next; no publication or activation, Stage F/G remain separate.
 - Last merged PR63 `85209a46972bd0f7c92a4e490ddbf20a99f2bfcb`, at 21:26:18Z. Its squash tree equals independently reviewed `338d12c`; all five required checks passed. Main-after-PR63 run `43510685416` succeeded on attempt 1 in 632s (21:26:20-21:36:52Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.

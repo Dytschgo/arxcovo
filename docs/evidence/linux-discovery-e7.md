@@ -196,3 +196,29 @@ Updated correction manifest (committed bytes):
 | `crates/arxd/src/service/unix_bridge/tests/e7.rs` | `498fdfa3cbb9d11f243079bba052a0621d2f54fb` | `d6faaabe4c5adc9203410936df58c04aaaaba5ec078832e156bbebe27d6a7dd8` |
 | `crates/arxd/src/store.rs` | `265e3533481e288c691ac6b94b4f94669a75d1cf` | `6bfe7db1b5a32f94a462290444eae04389003263563f9f49dcf0e712636cbcb1` |
 | `scripts/test_discovery_e7_mutations.py` | `1ac80cdf093fda548fe641ba6933824fcfb0c233` | `d66938a2cae43084d9d22e8204e6716f60d6a5a6564abfa6cc2b7663ed525a4a` |
+
+## PB2 lexical boundary correction
+
+Opus high recheck59c169b (retained69931fd) closed SB1 and LF/comment
+advisories, but found that unknown braced cfg(test) forms could hide later
+production calls. Sol medium correction `a3e27118895627c1571bd49a706a7f5a461324c3` removes the item-kind
+heuristic and stops stripping at every top-level closing brace. New negative
+controls cover test-only macro_rules, unsafe extern, a block match arm, and
+an if statement, each followed by Runner or hierarchy production calls.
+The old stripper fails the new compiled regression (exit100). Actual
+uncompiled source-file probes after a cfg(test) macro also fail the crate
+inventory for both calls; each probe was removed and source restored.
+
+Fmt and locked workspace/all-target Clippy pass. Final focused11/11 passed
+in0.457s, run4b761b01-bb33-4b5b-aed4-c735dd73093f, including E7, both
+inventory tests and paused production-drain test. No full-suite or7-mutant
+repeat: prior383/3 remains atcea3038, LF seven-kill credit at09cc061.
+Production behavior is unchanged. Narrow independent recheck pending.
+
+Limits remain explicit: this scans arxd/src lexically, not other crates or
+semantic aliases. Qualified <Runner>::new, type/import aliases, and non-test
+path/include reuse of reviewed test files are disclosed gaps (PA8/PA9),
+not claimed guards. Current tree has no such production calls. Stage F/G
+and activation remain gated; M2 incomplete and hardware unverified.
+
+Updated committed scanner blob `3a75dd0b980b5d8621c3a4a3cd6198d4f04d3bbb`; SHA-256 `f6482569f8f0032a51480e18a13a14c62e332efad2b51d1cbe3b18e39c6004bc`.
