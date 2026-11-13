@@ -274,7 +274,11 @@ fn s6_probe_bounded_order_root_cwd_and_deadline() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(rows.len(), arxd::development::TOOLS.len());
+    assert_eq!(rows.len(), arxd::development::TOOLS.len() + 1);
+    let rights = rows.last().unwrap();
+    assert!(rights.get("rights").is_some());
+    assert!(rights.get("name").is_none());
+    assert_eq!(rights["rights"].as_object().unwrap().len(), 2);
     for (row, name) in rows.iter().zip(arxd::development::TOOLS) {
         assert_eq!(row["name"], *name);
     }
