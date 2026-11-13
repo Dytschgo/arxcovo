@@ -203,3 +203,14 @@ Coordinator correction baseline/final used exactly
 No platform inference or extra coordinator run is claimed. Independent recheck
 f7cacdc closes S1 and supplies the boundary-fixture mutation proofs at its own
 pins. The production parser remains unchanged.
+
+## Publication integration after contract merge
+
+Source merge `8fbdd16b613a2f873a6f30ebcfb02afbdce4cb59` on main `3875466` (PR56) retains all five reviewed E1
+source files exactly, including test correction ddc89fc. The contract squash
+tree equals fc1a664. No E5, setup, native adapter or readiness activation.
+Coordinator Sol medium ran final fmt, locked workspace/all-target Clippy and
+ONE normal full nextest:335 passed/3 skipped, run `8ad01c92-89cc-4fb9-991b-be68737d04e8`,12.506s. Earlier
+334/3 and mutation evidence remains credited to its historical pins. No
+ignored native fixture directly invoked. This integration requires exact-head
+review and all hosted gates; main-after-56 run43473029593 is pending here.
