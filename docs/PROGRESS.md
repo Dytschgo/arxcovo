@@ -3,6 +3,8 @@
 ## Current state - 2026-11-13
 
 - Queue priority: validate main run `43459116760` after #57 merged `f1340a4`, then refresh #54 integration and merge through all normal gates. The repaired bot now posts ci-time-budget SUCCESS on qualifying measured head `c5bb191`. Strict main protection and all five requirements are restored.
+- Last merged: PR57 `f1340a4`, 2026-11-13 16:05:11Z. After separate explicit owner approval, the coordinator temporarily removed ONLY ci-time-budget, merged pinned reviewed `a5ee45f`, and restored the original configuration in a finally block; readback verified all five checks, app pins and strict=true. [Executed exception](adr/0022-ci-policy-buffer-bootstrap.md). No exception applies to #54 or product PRs.
+- New-head rule: the successful `c5bb191` performance attempt 3 is retained, not reset. This base-integration run is not a fourth performance-fix attempt; it still requires all normal new-head gates. A slow/failing first integration run stops delivery and is handed to the other provider/owner with evidence, with no repeat-to-green, waiver or claimed old-head success on new bytes. Budget success on c5 against old906 does not carry over; the bot must independently evaluate the new head against the authoritative baseline or its own qualifying first run.
 - #54 integration refresh inherits only the reviewed policy repair from new main. Original performance attempt 3 remains qualified at 567s/88s/0.946; no new performance fix, rerun or reset is claimed. New-head CI and independent integration review are required because main changed. Existing 21 Node checks remain plus seven inherited buffer regressions (28 total). Other performance and coverage criteria remain.
 - One PROGRESS conflict retains both complete histories below; no product source conflict. Provider: coordinator OpenAI / gpt-6.1-sol / medium. No product PR exception or native activation; M2 incomplete, hardware paths **unverified on real hardware**.
 
@@ -35,8 +37,6 @@
 - Candidate acceptance requires first-attempt all-OS success below 900s and 906s, Windows install below the pinned 141s minimum, unchanged UI/desktop counts and independent review. Only then may this genuine performance PR use ci-speed; no gate override or policy edit. Capacity failure stays red. Main must subsequently pass within budget before merging features.
 - Stage C PR53 at 2ce79ca independently passed Standards/Spec; hosted Linux252/4 and macOS253/2 plus S1-S7 passed. Windows and overall candidate readiness must be read live before any action. Real Unix mutation kills remain unrun. Native guard/phase/containment evidence limits are unchanged; no bridge activation.
 - ExecutionFailed and E_PROTECTION remain unexplained, with no fix, rate claim or waiver. No owner/admin/service operation, old Lab Manager/VM change, third S4U probe, credential exposure or babysitter change.
-
-## Historical checkpoint before CI headless-shell candidate
 
 
 ## Historical policy-repair state - 2026-11-13

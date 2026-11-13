@@ -1,6 +1,7 @@
 # 0022: Owner bootstrap for the CI policy buffer repair
 
-Status: owner-authorized delivery route, 2026-11-13; admin merge not performed.
+Status: executed 2026-11-13 under separate explicit owner approval;
+protection restored and exception exhausted.
 
 Trusted policy run 43326387032 failed ENOBUFS reading completed CI runs above
 its 1 MiB subprocess buffer. #54 independently passed frozen A1-A6 on head
@@ -12,6 +13,8 @@ The one-line finite 8 MiB repair and regression tests were independently
 reviewed by Opus high after Sol high implementation. Policy semantics,
 thresholds, first-attempt selection and required sources remain unchanged.
 Tests reproduce the failure and retain fail-closed behavior above the bound.
+
+## Historical approved plan (superseded by actual execution below)
 
 After explanation, the owner approved publishing a standalone repair PR.
 Normal platform CI and exact-head different-provider agent-review must pass.
