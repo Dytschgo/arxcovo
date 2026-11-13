@@ -21,6 +21,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 const NULL: &CStr = c"/dev/null";
 const CWD: &CStr = c"/";
 
+#[cfg_attr(not(test), derive(Default))]
 struct Settings {
     #[cfg(test)]
     anchor: CString,
@@ -69,6 +70,7 @@ impl Settings {
         values
     }
 }
+#[cfg(test)]
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -308,8 +310,8 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
                 libc::execveat(
                     executable.as_raw_fd(),
                     c"".as_ptr(),
-                    argv.as_ptr(),
-                    env.as_ptr(),
+                    argv.as_ptr().cast(),
+                    env.as_ptr().cast(),
                     libc::AT_EMPTY_PATH,
                 );
             }
@@ -398,6 +400,5 @@ fn parse_nnp(bytes: &[u8]) -> Option<bool> {
 }
 
 #[cfg(test)]
-mod tests {
-    include!("unix_shim_rights_linux_tests.rs");
-}
+#[path = "unix_shim_rights_linux_tests.rs"]
+mod tests;

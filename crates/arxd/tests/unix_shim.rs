@@ -91,13 +91,13 @@ fn s1_target_bytes_and_exit() {
     let target = script(
         d.path(),
         "args",
-        "test \"$#\" = 4 && test \"$1\" = '-x' && test \"$2\" = '--' && test \"$3\" = '' && test \"$4\" = 'ü' && test \"${PWD##*/}\" = child",
+        "test \"$#\" = 4 && test \"$1\" = '-x' && test \"$2\" = '--' && test \"$3\" = '' && test \"$4\" = 'Ã¼' && test \"${PWD##*/}\" = child",
     );
     silent(
         command(d.path())
             .args(["exec-child", "path"])
             .arg(target)
-            .args(["child", "-x", "--", "", "ü"])
+            .args(["child", "-x", "--", "", "Ã¼"])
             .pipe_output(),
         0,
     );
@@ -260,10 +260,18 @@ fn s6_probe_bounded_order_root_cwd_and_deadline() {
         "i=0; while test $i -lt 5000; do printf x; i=$((i+1)); done",
     );
     let start = Instant::now();
-    let o = command(d.path())
-        .env("PATH", d.path())
-        .arg("tool-probe")
-        .pipe_output();
+    let mut probe = command(d.path());
+    probe.env("PATH", d.path()).arg("tool-probe");
+    #[cfg(target_os = "linux")]
+    unsafe {
+        probe.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let o = probe.pipe_output();
     assert_eq!(o.status.code(), Some(0));
     assert!(o.stderr.is_empty());
     assert!(o.stdout.len() <= 4096);
@@ -279,6 +287,17 @@ fn s6_probe_bounded_order_root_cwd_and_deadline() {
     assert!(rights.get("rights").is_some());
     assert!(rights.get("name").is_none());
     assert_eq!(rights["rights"].as_object().unwrap().len(), 2);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(rights["rights"]["no_new_privs"], true);
+        assert_ne!(rights["rights"]["sudo"], "exit_zero");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(rights["rights"]["no_new_privs"].is_null());
+        assert_eq!(rights["rights"]["sudo"], "unknown");
+    }
+
     for (row, name) in rows.iter().zip(arxd::development::TOOLS) {
         assert_eq!(row["name"], *name);
     }
