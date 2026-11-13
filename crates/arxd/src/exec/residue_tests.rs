@@ -63,6 +63,13 @@ fn cleanup_source_pins_release_sites_and_legacy_errno_order() {
         .split("impl Drop for Group")
         .next()
         .unwrap();
+    let create_compact: String = create.split_whitespace().collect();
+    assert_eq!(
+        create_compact
+            .matches("removed:std::cell::Cell::new(false),residue,}")
+            .count(),
+        1
+    );
     assert_eq!(source.matches("libc::unlinkat(").count(), 2);
     assert_eq!(helper.matches("libc::unlinkat(").count(), 1);
     assert_eq!(kill.matches("libc::unlinkat(").count(), 1);
