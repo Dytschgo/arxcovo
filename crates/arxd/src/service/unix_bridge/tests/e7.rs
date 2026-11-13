@@ -709,3 +709,77 @@ async fn pa1_actual_callers_reverse_finish() {
         e.drain().await.unwrap();
     }
 }
+
+// SP1/SP2: observe Execution itself, independently of application hook labels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sp1_sp2_actual_drain_precedes_sequence_and_empties_workers() {
+    let dir = private_temp();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let (mut app, _, e, _, _) = app(&dir, false, false, Arc::new(|_| {}), move |_, _, _| {
+        count.fetch_add(1, Ordering::AcqRel);
+        Ok(probe())
+    });
+    let reached = Arc::new(AtomicBool::new(false));
+    let entered = reached.clone();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    // Reuse E6's sole admission seam; disconnect also releases on test failure.
+    e.admission_barrier_for_test(Arc::new(move || {
+        entered.store(true, Ordering::Release);
+        let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(1));
+    }));
+    app.start_discovery();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !reached.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker reached existing admission seam");
+    assert_eq!(e.drain_snapshot_for_test().1, 1, "real worker registered");
+    app.stop_accepting().unwrap();
+    let draining = tokio::spawn(async move { app.drain().await });
+    // The sequence cannot finish while its dispatch worker is held. The real
+    // execution drain must nevertheless have taken ownership before release.
+    let observed = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let snapshot = e.drain_snapshot_for_test();
+            if snapshot.0.entered {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let returned_while_held = draining.is_finished();
+    // Always release and join before asserting the counterfactual failure.
+    drop(release);
+    let drained = tokio::time::timeout(Duration::from_secs(1), draining)
+        .await
+        .expect("bounded application drain")
+        .expect("drain task");
+    assert!(drained.is_ok());
+    let (held, registered) = observed.expect("actual Execution::drain before sequence join");
+    assert_eq!(held.remaining, 1, "drain owns held real JoinSet worker");
+    assert!(!held.completed, "actual drain must wait for held worker");
+    assert_eq!(registered, 0, "worker transferred from registration set");
+    assert!(
+        !returned_while_held,
+        "application must await worker completion"
+    );
+    let (finished, registered) = e.drain_snapshot_for_test();
+    assert!(finished.completed, "actual drain completed");
+    assert_eq!(finished.remaining, 0, "actual drained JoinSet empty");
+    assert_eq!(registered, 0, "real replacement JoinSet empty");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        rows(&dir),
+        [(
+            "daemon".into(),
+            "arxd".into(),
+            "refused".into(),
+            Some("shutdown".into())
+        )]
+    );
+}

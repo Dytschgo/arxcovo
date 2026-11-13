@@ -1,6 +1,14 @@
 # Arxcovo progress
 
-## Current state - 2026-11-13
+## Current state - 2026-11-14
+
+- Actual-drain test-only source `1eccbfc` passed Opus high review `c45d35e`, closing SP1/SP2. Published follow-up will retain limitations: single entry snapshot, timeout-release false-pass window, existing tests cover detach_all, and single seam confirmed by source. PA5 and real Runner PA6 remain open. No new full-suite or native claim; exact-head review and five checks remain merge gates.
+- Test-only actual-drain follow-up is complete by Sol high: source `1eccbfc`, evidence `711b11b`, ported unchanged onto merged PR65. Actual transferred/completed JoinSet observations and a real-set-empty accessor target SP1/SP2. Fmt/workspace Clippy, focused tests, two compiled counterfactual kills and final387/3 are credited at original source. Fresh Opus high review is next; PA5/real Runner PA6 remain open, no publication/activation.
+- Last merged PR65 `5ae645e6dc49d551298b32d5f72c871acb007864`, at 2026-11-13 23:06:53Z. Its squash tree equals independently reviewed `45549fe`; all five required checks passed. Main-after-PR65 run `43524629307` succeeded on attempt 1 in 587s (2026-11-13 23:06:55-23:16:42Z). Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Inactive discovery coverage is integrated. Sol high is adding bounded test-only proof of actual drain ordering and an empty tracked worker set; these SP1/SP2 gaps remain open until reviewed. PA5 and real Runner unwind-before-slot-release proof also remain open. No Stage F/G activation or owner operation.
+- Main-after-PR64 run `43521455840` passed attempt1 in619s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
+
+## Historical checkpoint before discovery coverage merge
 
 - Discovery coverage follow-up source `99a1fd7` passed Opus high review `1ad362e`. PA1/PA2/PA4 are covered; PA3 closes the named hook-order mutant only, while observing actual drain completion remains open (SP1). PA5 and real Runner unwind-before-slot-release PA6 proof remain open; fake-port PA6 is partial. Coordinator publishes tests only for exact-head review and hosted gates, without activation.
 - Local inactive discovery coverage follow-up is complete by Sol high: source `99a1fd7`, evidence `52dfcc8`, ported unchanged onto merged E7. Fmt/workspace Clippy, focused49, seven compiled kills and final386/3 are credited at source pin. PA1-PA4 tests added; PA5 and real Runner unwind/store-before-slot-release PA6 proof remain open. Fresh Opus high security review is next, no publication or activation.

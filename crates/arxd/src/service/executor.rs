@@ -159,7 +159,17 @@ impl Executor for Native {
         Report::Unavailable(Unavailable::MechanismUnavailable)
     }
 }
+// Snapshot of the actual JoinSet owned by drain, never an admission barrier.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct DrainSnapshot {
+    pub entered: bool,
+    pub remaining: usize,
+    pub completed: bool,
+}
 pub struct Execution {
+    #[cfg(test)]
+    drain_snapshot: Mutex<DrainSnapshot>,
     #[cfg(test)]
     admission_barrier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     backend: Arc<dyn Executor>,
@@ -195,6 +205,8 @@ impl Execution {
     ) -> Arc<Self> {
         let reason = Arc::new(Mutex::new(Unavailable::MechanismUnavailable));
         Arc::new(Self {
+            #[cfg(test)]
+            drain_snapshot: Mutex::new(DrainSnapshot::default()),
             #[cfg(test)]
             admission_barrier: Mutex::new(None),
             backend: Arc::new(Native {
@@ -303,12 +315,35 @@ impl Execution {
     pub(crate) fn shutdown_token_for_test(&self) -> Cancellation {
         self.shutdown.clone()
     }
+    #[cfg(test)]
+    pub(super) fn drain_snapshot_for_test(&self) -> (DrainSnapshot, usize) {
+        (
+            *self.drain_snapshot.lock().unwrap(),
+            self.workers.lock().unwrap().len(),
+        )
+    }
     pub async fn drain(&self) -> Result<(), Reason> {
         self.shutdown();
         let mut workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        #[cfg(test)]
+        {
+            *self.drain_snapshot.lock().unwrap() = DrainSnapshot {
+                entered: true,
+                remaining: workers.len(),
+                completed: false,
+            };
+        }
         let mut failed = false;
         while let Some(result) = workers.join_next().await {
             failed |= result.is_err();
+        }
+        #[cfg(test)]
+        {
+            *self.drain_snapshot.lock().unwrap() = DrainSnapshot {
+                entered: true,
+                remaining: workers.len(),
+                completed: true,
+            };
         }
         if failed || self.audit_failed.load(Ordering::Acquire) {
             Err(Reason::ExecutionFailed)
