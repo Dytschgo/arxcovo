@@ -2,6 +2,12 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR63 `85209a46972bd0f7c92a4e490ddbf20a99f2bfcb`, at 21:26:18Z. Its squash tree equals independently reviewed `338d12c`; all five required checks passed. Main-after-PR63 run `43510685416` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
+- E6 readiness/in-slot gates are merged and inactive. Sol high is implementing E7 startup discovery and Activity tool-cache lifecycle locally on reviewed E6. Re-pin onto merged E6, independent source/integration review and required checks remain gates before E7 publication/merge. E7 must retain single domain/runner, hardening-before-Ready and no production startup override.
+- Last main-after-PR62 run `43505759245` passed attempt1 in574s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete; production remains MechanismUnavailable; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix, waiver or retry.
+
+## Historical checkpoint before E6 merge
+
 - E6 readiness/in-slot admission source `87957dd` passed independent Opus high review `7814312` (retained `e0b69cb`), with no blockers. Source is unchanged on merged E4 main `f4fb126`; publication now seeks exact-head integration review and all five required hosted checks. Sol high builder full375/3 and11 compiled kills stay credited at the original source pin; no docs-only full repeat is claimed.
 - Review advisories are disclosed in E6 evidence: text-only signal scan/inventory limits, numeric readiness-state coupling, T16 late-writer coverage, pointer-identity domain mutant and untested panic/residue edge. E7 must preserve one domain/runner and hardening-before-Ready while keeping non-standard configs refused. E7 is not built in this slice.
 - Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`; main run `43505759245` passed attempt1 in574s. The E4 native run `43504012486` passed11 kills and all baselines/restoration as UID/euid1001. Its result record is carried forward in docs only. Strict five-check protection unchanged; no bypass.
