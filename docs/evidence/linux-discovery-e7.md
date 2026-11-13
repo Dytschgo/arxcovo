@@ -49,9 +49,10 @@ or E6 merge is claimed here.
   stage_b_tests.rs, residue_tests.rs and disposable.rs. No production Runner
   construction was added. Hierarchy calls added here are test-only; the
   pre-existing pure parse imports in the bridge remain unchanged.
-- W9 waits the actual 10-second drain bound, asserts Store/exit-5 semantics
-  while the fake remains stuck and its row remains started, then releases the
-  fake and joins it. It does not claim interruption or premature completion.
+- Historical W9 at cea3038 used a test-local ten-second timeout and Store
+  fallback. Review4728c3d established that this did not test the production
+  timeout or exit mapping. The correction below replaces it with a short
+  liveness/ownership check; production bounds use the existing paused test.
 
 ## Failure history
 
@@ -152,3 +153,46 @@ The layout is passed into the private wiring factory, so non-Linux standard
 and Linux admin configurations are refused before setup/Ready; a failed
 runner factory also prevents Ready. Readiness cannot be injected from another
 StartupDomain. There is no replacement/reset/rebind/second-runner method.
+
+## First review correction: SB1/PB1
+
+Opus high review4728c3d (retained d6e3f37) required shorter W9 and crate-wide
+source inventory. Sol medium correction `09cc061cc5933c0bd8fd8433868bc73fccaa0c24` changes W9 to a100ms
+timeout asserted as a timeout only, retaining started-row, no-interruption,
+late completion/join and cache assertions. Production10s/Store mapping is
+covered by existing paused-time stuck_drain_is_bounded_and_never_claims_stop_audit,
+which was run. W9 now completes around0.16-0.20s. No production drain change.
+
+The source-inventory test walks every src/**/*.rs without links/reparse
+points, bounds files/bytes, verifies the declarations for reviewed test-only
+files, strips explicit cfg(test) items lexically and allows the two existing
+non-test pure imports. The cfg(test) locate and E6 test SetupFailure imports
+complete the four reviewed pure imports. It forbids remaining Runner::new,
+hierarchy::, start_daemon_discovery and both wiring constructor calls in
+non-test contexts. Positive and negative controls include production after
+a test module. It is a lexical regression fence, not semantic Rust analysis.
+New aliases/macros or changed module wiring still require review.
+
+Two disconnected source probe files (not compiled modules) containing Runner
+and hierarchy calls each caused the actual crate-wide test to fail with
+exit100, and were removed. These are source-inventory controls, not compiled
+production-behavior mutants. The initial inventory implementation failed on
+a cfg(test) closure argument delimiter; this was corrected, not counted as
+a product failure or successful control.
+
+Fresh Windows fmt and locked workspace/all-target Clippy pass. Final restored
+selection10/10 passed in0.452s, aed18f66-c732-4557-8eed-ab997249331f, including
+all8 E7 tests, the new inventory and existing paused drain test. No full-suite
+repeat; original383/3 credit remains at cea3038. The Activity comment was
+moved back from ToolCache. Mutation script now writes explicit UTF-8 LF bytes;
+an LF-only no-op control passes W8, all7 genuine compiled mutants were killed
+and exact restoration passed. No CRLF-only change earns credit. No native action.
+
+Updated correction manifest (committed bytes):
+
+| Path | Git blob | SHA-256 |
+| --- | --- | --- |
+| `crates/arxd/src/exec/stage_b_tests.rs` | `0b1686dca99f64e869c9809600b236cb3c02e3d4` | `6be923963d9846c5a6371aed247f86ec1cf80b4e26d08399a262ca3596209e26` |
+| `crates/arxd/src/service/unix_bridge/tests/e7.rs` | `498fdfa3cbb9d11f243079bba052a0621d2f54fb` | `d6faaabe4c5adc9203410936df58c04aaaaba5ec078832e156bbebe27d6a7dd8` |
+| `crates/arxd/src/store.rs` | `265e3533481e288c691ac6b94b4f94669a75d1cf` | `6bfe7db1b5a32f94a462290444eae04389003263563f9f49dcf0e712636cbcb1` |
+| `scripts/test_discovery_e7_mutations.py` | `1ac80cdf093fda548fe641ba6933824fcfb0c233` | `d66938a2cae43084d9d22e8204e6716f60d6a5a6564abfa6cc2b7663ed525a4a` |
