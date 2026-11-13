@@ -135,3 +135,30 @@ privileged/native/hardware behavior is **unverified on real hardware** by this
 slice. The historical dispatcher privacy flake (reference `65762554`), E_PROTECTION
 and ExecutionFailed remain unknown; no unrelated fix, native retry or diagnosis
 is claimed. No architecture deviation is intended.
+
+## Independent review and current-main publication checkpoint
+
+Opus high review7814312 (retained e0b69cb) passes Standards and Spec, with
+no blockers. All8 source paths remain byte-identical to87957dd; mainf4fb126
+has the same tree as reviewed E4 head9937c16. No extra full-suite run for
+port/report/docs changes. Original full375/3 and11 compiled kills retain
+their original source credit.
+
+PA1 disclosure: hierarchy signal-call denial is a text/token check, not a
+semantic safety proof. Aliased imports, parenthesized calls and raw syscall
+forms can bypass that narrow check; the reviewer found none in current
+production sources. The fake-exclusion list is hand-written, not a complete
+automatic inventory. T16 proves first cause survives later writers, not a
+simultaneous-first-writer race. Domain-rebuild mutation credit is pointer
+identity, not an executable second factory today.
+
+E7 must preserve single-domain/single-runner binding, forbid a second
+factory/domain or shared readiness across domains, refuse non-standard
+configuration and apply hardening refusal before Ready. Runner panic can
+skip the post-call latch; the residue flag still reaches the next in-slot
+gate before another run, but that panic path is not covered by a new test.
+These are retained non-blocking advisories, not claimed tests.
+
+Exact-head independent integration review and hosted gates remain required
+before merge. Production stays inactive, M2 incomplete, native hardware
+unverified. No Stage F/G retry or activation.

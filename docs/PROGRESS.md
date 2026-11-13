@@ -2,6 +2,13 @@
 
 ## Current state - 2026-11-13
 
+- E6 readiness/in-slot admission source `87957dd` passed independent Opus high review `7814312` (retained `e0b69cb`), with no blockers. Source is unchanged on merged E4 main `f4fb126`; publication now seeks exact-head integration review and all five required hosted checks. Sol high builder full375/3 and11 compiled kills stay credited at the original source pin; no docs-only full repeat is claimed.
+- Review advisories are disclosed in E6 evidence: text-only signal scan/inventory limits, numeric readiness-state coupling, T16 late-writer coverage, pointer-identity domain mutant and untested panic/residue edge. E7 must preserve one domain/runner and hardening-before-Ready while keeping non-standard configs refused. E7 is not built in this slice.
+- Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`; main run `43505759245` passed attempt1 in574s. The E4 native run `43504012486` passed11 kills and all baselines/restoration as UID/euid1001. Its result record is carried forward in docs only. Strict five-check protection unchanged; no bypass.
+- M2 incomplete; production stays MechanismUnavailable. Native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown, with no fix, waiver or retry.
+
+## Historical E6 local-review checkpoint
+
 - E6 local readiness/admission implementation is complete by Sol high: source `87957dd`, evidence `9699c8c`, ported unchanged onto merged E4. Fmt/locked workspace Clippy, one final375/3 suite and11 compiled mutation kills are credited at source pin. Fresh Opus high security review is next; no publication or activation, E7 remains separate.
 - Last merged PR62 `f4fb126826ea0aafe3bc28ee4a7c3c1cc2edb730`, at 20:53:55Z. Its squash tree equals independently reviewed `9937c16`; all five required checks and both native evidence jobs passed. Main-after-PR62 run `43505759245` succeeded on attempt 1 in 574s (20:53:58-21:03:32Z). Coordinator OpenAI / gpt-6.1-sol / medium; no gate bypass.
 - E4 native run `43504012486` passed attempt1 in111s as UID/euid1001 with all11 mutation kills, before/after baselines and matching restored fingerprints. Independent Opus completed-evidence comment6864567049 confirms it. This is hosted owned-fixture evidence, not real product-hardware acceptance. No production execution activation.
