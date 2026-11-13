@@ -2,6 +2,12 @@
 
 ## Current state - 2026-11-13
 
+- Last merged PR64 `0a95d2806b197431ae7d7c9cc002fdaadaeb145d`, at 22:42:24Z. Squash tree equals independently reviewed `9f44c0a`; all five required checks passed. Main-after-PR64 run `43521455840` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Inactive Stage E slices E1-E7 are merged. Sol high is strengthening the retained pre-activation test gaps locally; source review and normal gates remain required for that follow-up. Production Unix startup/execution is still inactive; Stage F/G and hardware acceptance are separate outstanding gates.
+- Latest main-after-PR63 run `43510685416` passed attempt1 in632s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete; native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown with no fix, waiver or retry.
+
+## Historical checkpoint before E7 merge
+
 - PR64 exact-head Opus integration PASS (comment6866653579); Ubuntu/macOS, native-evidence, ci-time-budget and agent-review pass, Windows remains pending. Before activation, E7 coverage follow-up must protect ticket allocation at both callers, shutdown readiness, drain ordering, identical setup/bridge Location and panic/residue handling. D7 failed-Locate wiring remains a future inactive/activation contract obligation. No waiver or activation follows from this source PASS.
 - E7 review chain is complete: `4728c3d`, `59c169b`, `ef368d0` and final PASS `dc4a0d6` (retained `a027636`) close SB1/PB1/PB2/PB3. The third inventory correction passed; no provider handoff is required. Coordinator publishes inactive E7 on merged E6 for exact-head review and hosted checks. Production activation and Stage F/G remain gated.
 - E7 inventory correction attempt3 `f059a53` addresses PB3 from `ef368d0`: generic/closure stop boundaries and3 new shapes. Old-boundary and3 real source probes fail, fmt/workspace Clippy/focused11 pass. Narrow Opus recheck pending; a third failed fix requires other-provider correction handoff. No publication/activation.
