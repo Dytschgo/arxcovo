@@ -167,3 +167,29 @@ still match old/new source bytes. The 13-row ledger matches old evidence
 verbatim. Evidence is the only additional path in the final two-commit range.
 `git diff --check` and staged whitespace checks passed for evidence; final
 status is clean after the separate evidence commit.
+
+## First source-review test correction
+
+Coordinator OpenAI / gpt-6.1-sol / medium, 2026-11-13. Source review e77cda7
+(retained 88f4f2f) found masking of locate trust-anchor tests. Test-only commit
+ddc89fc adds invalid bytes before the intact arxd.service/supervisor suffix,
+a multi-line v1/v2 case and a prefixed service name. It also covers maximum
+leaf length, DT_UNKNOWN socket/block/FIFO, mixed-case events with populated
+present, and hardening-line suffixes. Production parser bytes before cfg(test)
+are identical to reviewed 105380f; no implementation behavior changed.
+
+Baseline and restored final focused parser/bridge runs each passed26/26.
+Final fmt and locked workspace/all-target Clippy -D warnings passed. No full
+workspace repeat. Five independent guard edits compiled and failed assertions;
+original bytes restored and checked after each:
+- nul: dd2b5788-dcd6-4299-aa8d-562fc261c2e4
+- backslash: 007943d6-38e8-449d-8c26-67c4d67165d8
+- newline: 21f9a03e-50b9-4708-84bc-a3090fb1046c
+- CR: 4f417f65-7cba-4fbb-847b-dc347036f6f0
+- unit-suffix: 04f327ef-422c-42a3-b6e9-c3e3e25f0409
+
+Final focused run: 16213a53-68dd-4330-96fd-e98213f271e1, 26 passed, 310 filtered/skipped.
+
+The cheap advisory fixtures are added, not credited with new mutation kills
+for those advisories. S1 correction requires fresh independent recheck. No
+publication or native action. Contract PR56 remains a prerequisite.
