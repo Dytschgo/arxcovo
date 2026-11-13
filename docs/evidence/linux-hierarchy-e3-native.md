@@ -223,3 +223,20 @@ Coordinator publishes the reviewed harness for its first hosted execution.
 No native result, skip/pass outcome or mutation kill is claimed before that
 run completes. Merge still requires native evidence plus refreshed exact-head
 integration review and all five required checks. No activation.
+
+## First hosted native evidence result
+
+Run43493588144, attempt1, exact PR61 head231c367, succeeded
+2026-11-13 19:35:04-19:36:35Z (91s workflow elapsed). Root verified the
+API pin/conclusion/times. Independent Opus high exact-head review
+[records the native logs](https://github.com/Dytschgo/arxcovo/pull/61#issuecomment-6863013251):
+UID/euid1001, portable25/25 without skips, baseline-before50.7s and
+baseline-after2.1s, L7/L8 passed on both, eight named mutants killed with
+exit100, restored source pin and matching folder fingerprint. These are
+hosted ordinary-user evidence, not product hardware acceptance. The old
+c45d2a source value above is historical; current SOURCE_SHA and latest pin
+table are authoritative for this exact run.
+
+Exact-head independent integration review passed. Windows required verify
+remains pending at this checkpoint; no merge yet. M2 incomplete and native
+installed/dedicated paths remain **unverified on real hardware**.

@@ -495,6 +495,11 @@ fn inventory() -> Vec<(&'static str, String, String)> {
         ("cgroup", include_str!("cgroup.rs")),
         ("output", include_str!("output.rs")),
         ("shim", include_str!("../unix_shim.rs")),
+        ("shim-rights", include_str!("../unix_shim_rights.rs")),
+        (
+            "shim-rights-linux",
+            include_str!("../unix_shim_rights_linux.rs"),
+        ),
         ("bridge", include_str!("../service/unix_bridge.rs")),
     ] {
         for (mac, literal) in
@@ -634,4 +639,94 @@ fn l6_e3_tokenized_source_inventory_and_mutants() {
         assert!(!e3_source_allowed(mutant), "E3 source mutant rejected");
     }
     assert!(e3_source_allowed("// dup(p)\nlet s = \"kill(p)\";"));
+}
+
+// E4 extends the existing tokenizer/payload policy without a hook exemption.
+fn e4_source_allowed(source: &str) -> bool {
+    if scan(source).is_err() {
+        return false;
+    }
+    let mut t = tokens(source);
+    let boundary = tokens("#[cfg(test)] mod tests {");
+    if let Some(i) = t.windows(boundary.len()).position(|w| w == boundary) {
+        t.truncate(i);
+    }
+    !t.iter().any(|v| {
+        [
+            "Command",
+            "execv",
+            "execvp",
+            "execve",
+            "fexecve",
+            "posix_spawn",
+            "posix_spawnp",
+            "SYS_execve",
+            "SYS_execveat",
+            "syscall",
+            "getenv",
+            "var",
+            "var_os",
+            "vars",
+            "vars_os",
+        ]
+        .contains(&v.as_str())
+    }) && !t
+        .windows(2)
+        .any(|w| (w[0] == "env" || w[0] == "option_env") && w[1] == "!")
+}
+#[test]
+fn s13_e4_tokenized_source_and_bypass_controls() {
+    assert!(
+        e4_source_allowed(include_str!("../unix_shim_rights_linux.rs")),
+        "E4 fixed execution boundary"
+    );
+    for mutant in [
+        "Command::new(p)",
+        "std::process::Command::<T>::new(p)",
+        "execve(p,a,e)",
+        "libc::syscall(libc::SYS_execve,p)",
+        "use std::env::var_os as lookup;",
+        "env!(\"PATH\")",
+        "panic!(\"{p}\")",
+        "set_hook(p)",
+        "r.r#unwrap()",
+        "use std::eprintln as say;",
+    ] {
+        assert!(!e4_source_allowed(mutant), "E4 bypass rejected");
+    }
+}
+
+#[test]
+fn s12_e4_portable_production_pins() {
+    let t = tokens(include_str!("../unix_shim_rights_linux.rs"));
+    for snippet in [
+        "const ANCHOR: &CStr = c\"/\";",
+        "const OWNER: u32 = 0;",
+        "const CANDIDATES: &[&[&CStr]] = &[ &[c\"usr\", c\"bin\", c\"sudo\"], &[c\"usr\", c\"local\", c\"bin\", c\"sudo\"], &[c\"bin\", c\"sudo\"], ];",
+        "const ALIASES: &[&[u8]] = &[b\"usr/bin\", b\"/usr/bin\"];",
+        "const ARGV: &[&CStr] = &[c\"sudo\", c\"-n\", c\"true\"];",
+        "const ENV: &[&CStr] = &[];",
+        "const DEADLINE: Duration = Duration::from_secs(5);",
+        "const NULL: &CStr = c\"/dev/null\";",
+        "const CWD: &CStr = c\"/\";",
+        "#[cfg(not(test))] ANCHOR",
+        "#[cfg(not(test))] OWNER",
+        "#[cfg(not(test))] DEADLINE",
+        "#[cfg(not(test))] let mut values: Vec<_> = ARGV.iter().map(|s| s.as_ptr()).collect();",
+        "#[cfg(not(test))] let mut values: Vec<_> = ENV.iter().map(|s| s.as_ptr()).collect();",
+        "#[cfg(test)] hook: impl FnOnce()",
+        "#[cfg(test)] hook();",
+        "libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC",
+    ] {
+        let pin = tokens(snippet);
+        assert!(t.windows(pin.len()).any(|w| w == pin), "E4 production pin");
+    }
+    let shim = tokens(include_str!("../unix_shim.rs"));
+    let tools = shim.iter().position(|v| v == "TOOLS").unwrap();
+    let append = tokens("rights::append(");
+    let line = shim
+        .windows(append.len())
+        .position(|w| w == append)
+        .unwrap();
+    assert!(tools < line, "rights follow tools");
 }

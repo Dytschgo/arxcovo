@@ -1,4 +1,6 @@
 //! Inactive bridge's standalone Unix child protocol. No service state access.
+#[path = "unix_shim_rights.rs"]
+mod rights;
 #[cfg(unix)]
 use std::{
     ffi::{CString, OsString},
@@ -224,7 +226,7 @@ fn probe() -> i32 {
         }
         output.push(b'\n');
     }
-    if output.len() > 4096 {
+    if !rights::append(&mut output, rights::observe()) {
         return 125;
     }
     if std::io::stdout().lock().write_all(&output).is_err() {
