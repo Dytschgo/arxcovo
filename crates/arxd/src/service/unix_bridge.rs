@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use crate::exec::hierarchy::locate;
+
 trait RunnerPort: Send + Sync {
     fn run(
         &self,
@@ -174,27 +177,6 @@ fn clean_absolute(text: &str) -> bool {
         && !text.starts_with("//")
         && !text.contains(['\0', '\\'])
         && text.split('/').all(|s| s != "." && s != "..")
-}
-fn cgroup_parent(bytes: &[u8]) -> Option<PathBuf> {
-    if bytes.len() > 4096 {
-        return None;
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    let path = text.strip_prefix("0::")?;
-    if !clean_absolute(path) || path.contains(['\n', '\r']) {
-        return None;
-    }
-    let mut parts: Vec<_> = path.split('/').skip(1).collect();
-    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) || parts.pop()? != "supervisor" {
-        return None;
-    }
-    let mut result = PathBuf::from("/sys/fs/cgroup");
-    for part in parts {
-        result.push(part);
-    }
-    result.push("runs");
-    Some(result)
 }
 fn spec(binary: &std::path::Path, request: Option<&Request>) -> exec::RunSpec {
     let (arguments, timeout, output_bytes) = match request {

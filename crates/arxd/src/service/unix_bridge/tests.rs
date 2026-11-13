@@ -206,11 +206,15 @@ fn t1_derivation_factory_once_and_refusals() {
 #[test]
 fn t2_bounded_supervisor_parser() {
     assert_eq!(
-        cgroup_parent(b"0::/system.slice/arxd.service/supervisor\n"),
+        locate(b"0::/system.slice/arxd.service/supervisor\n").map(|l| l.runs()),
         Some("/sys/fs/cgroup/system.slice/arxd.service/runs".into())
     );
     for bytes in [
         b"0::/supervisor".as_slice(),
+        b"0::/a/supervisor",
+        b"0::/system.slice/foo.service/supervisor",
+        b"0::/arxd.service/x/supervisor",
+        b"0::/arxd.service.d/supervisor",
         b"0::/unit",
         b"0::/unit/not-supervisor",
         b"1::/unit/supervisor",
@@ -222,7 +226,7 @@ fn t2_bounded_supervisor_parser() {
         b"0::/a/supervisor\n\n",
         &[b'x'; 4097],
     ] {
-        assert!(cgroup_parent(bytes).is_none());
+        assert!(locate(bytes).is_none());
     }
 }
 #[test]
