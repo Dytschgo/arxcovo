@@ -244,3 +244,20 @@ fixes; if independent recheck fails, hand off correction to the other
 provider with all three reports, without resetting the count.
 
 Current committed scanner blob `1ba51296f1567c96fad348adf2f4763540e76d31`; SHA-256 `07ef5abbe8319e369e5fc30321a2e41b49861519af417c6c5b2101a79f1022eb`.
+
+## Publication checkpoint
+
+Final Opus high recheck dc4a0d6 (retained a027636) approves both axes and
+closes PB3. Earlier drain and braced-boundary findings remain closed.
+Current source is original cea3038 plus reviewed test/inventory corrections
+09cc061, a3e2711 and f059a53. Main85209a4 matches the original E6 parent
+338d12c. No new full-suite run is claimed for corrections/reports: original
+383/3 credit stays at cea3038, seven LF mutation kills at09cc061, and final
+focused11 at f059a53. Nextest control failures exit100; reviewer cargo test
+controls exit101. Neither is a compiler-error kill.
+
+Exact-head independent integration review and all required hosted checks
+remain required before merge. Cache metadata is intentionally visible to
+authorized agents through list_hosts; it contains released response metadata,
+not Evidence or private probe facts. Production startup/native selection
+remains inactive. Stage F/G, M2 acceptance and hardware validation are separate.
