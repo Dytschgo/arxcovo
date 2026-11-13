@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-14
 
+- Test-only actual-drain follow-up is complete by Sol high: source `1eccbfc`, evidence `711b11b`, ported unchanged onto merged PR65. Actual transferred/completed JoinSet observations and a real-set-empty accessor target SP1/SP2. Fmt/workspace Clippy, focused tests, two compiled counterfactual kills and final387/3 are credited at original source. Fresh Opus high review is next; PA5/real Runner PA6 remain open, no publication/activation.
 - Last merged PR65 `5ae645e6dc49d551298b32d5f72c871acb007864`, at 2026-11-13 23:06:53Z. Its squash tree equals independently reviewed `45549fe`; all five required checks passed. Main-after-PR65 run `43524629307` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - Inactive discovery coverage is integrated. Sol high is adding bounded test-only proof of actual drain ordering and an empty tracked worker set; these SP1/SP2 gaps remain open until reviewed. PA5 and real Runner unwind-before-slot-release proof also remain open. No Stage F/G activation or owner operation.
 - Main-after-PR64 run `43521455840` passed attempt1 in619s. Strict five-check protection unchanged; bootstrap exception exhausted. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Dispatcher privacy flake, ExecutionFailed and E_PROTECTION remain unknown without fix, waiver or retry.
