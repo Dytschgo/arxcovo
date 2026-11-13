@@ -144,3 +144,29 @@ have unknown causes; no retry or diagnosis was performed. No owner/service/
 account/cgroup/sys/VM/experiment/private-state/ignored-fixture operation was
 performed. The prepared native tests use owned temporary objects; L8 alone
 reads its own process status. There is no activation or owner approval flow.
+
+## Coordinator L10 fixture correction and review handoff
+
+Sol medium correction `231e6d7f950a642b78f7961e5a9fa48bd632e15d` changes only the Linux L10 symlink
+fixture name from link to memory.max and refreshes the harness source pin.
+A regular memory.max is Control; a symlink must be Refused. This removes
+the source-analysis masking described above; it is NOT a native kill claim.
+Production linux.rs prefix remains identical to eb93620. No authorization
+expansion is needed for a fixture correction within the existing E3 scope.
+The earlier blocker section records the original prepared state only.
+
+Windows portable harness suite: 24 discovered, 23 passed, one symlink-creation
+test explicitly skipped. Fmt passed; L6/P-SCAN 4/4 passed, run
+91efa0dd-91f0-4ea4-a3f0-932e4b76361d. No native or workflow execution.
+All eight mutation fragments still require actual ordinary-user Linux kills.
+Fresh Opus high security review is required BEFORE push/hosted execution.
+
+Current committed source/harness manifest:
+
+| Path | SHA-256 |
+| --- | --- |
+| `crates/arxd/src/exec/hierarchy/linux.rs` | `e5b6ac15d01092a96ea23488f23938f1b897717efe19b5bd3f71e898ef54eaff` |
+| `.github/workflows/e3-native-evidence.yml` | `c5fcb9a47846cdb564071c4e4080a087356076eea412c66ac1fbf4841d0dea0e` |
+| `tools/ci/e3-native/driver.py` | `d7727f88d3f99c57e321707bd397f8ea235bcc3fca22bb4c881fa150975ef22f` |
+| `tools/ci/e3-native/test_driver.py` | `e854b17fd1c4228f84fc47fb26e1acd67cd71a4ad7eb06217d4213179adec3ac` |
+| `tools/ci/e3-native/mutations.jsonl` | `c824820588a406800124352931597e3a220a32b945333e85d3a186612bca3d93` |
