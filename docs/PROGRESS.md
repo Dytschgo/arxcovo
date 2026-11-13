@@ -2,6 +2,7 @@
 
 ## Current state - 2026-11-13
 
+- PR61 head `f32deee` has all five required checks green (CI `43489053601`), plus source-only Opus integration PASS. Merge remains held for native mutation kills and visible L7/L8 pass-or-skip evidence. Sol high is preparing a bounded Ubuntu-only verification harness locally; independent review is required before pushing it. This checkpoint grants no merge or activation.
 - E3 Linux descriptor adapter source review is complete: Opus high `de2cc44` plus read-bound recheck `1de4a5b` (retained `c77683c`) resolve B1 by source analysis. Sol high source `eb93620` and Sol medium Linux-only test correction `c13fc98` are unchanged on merged E2 main `c56b6b5`. Publication seeks hosted evidence; it does not claim native mutation kills or clear merge.
 - Required next evidence: real Linux crate compilation/Clippy, ordinary-user L1-L10 including the new pipe test, native read-limit and other specified mutation kills, exact-head integration review and all five checks. Windows/stub checks do not satisfy those native gates. Production remains MechanismUnavailable.
 - Last merged PR60 `c56b6b5c6af49462f2219a1adc5ff88daffbd774`; main CI `43485836788` passed attempt1 in657s. Protection remains strict with all five checks; no bypass.
