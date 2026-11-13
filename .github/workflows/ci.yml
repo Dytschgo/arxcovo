@@ -18,6 +18,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 12
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
@@ -64,7 +66,7 @@ jobs:
         run: |
           python3 -B -m unittest discover -s tools/ci -p 'test_ubuntu_mirror.py'
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,CI,GITHUB_REPOSITORY /usr/bin/python3 -I -B tools/ci/ubuntu_mirror.py
-      - run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps --only-shell chromium
       - run: npm run smoke
       - name: Electron smoke on Linux
         if: runner.os == 'Linux'

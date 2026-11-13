@@ -5,7 +5,7 @@ import { evaluateEvent, statusPublisher } from './evaluate-budget.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('Invalid repository');
-const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
 const runs = query => api(`actions/workflows/ci.yml/runs?${query}&per_page=100`).workflow_runs;
 const firstAttempt = run => api(`actions/runs/${run.id}/attempts/1`);
 const getMainRun = () => {
