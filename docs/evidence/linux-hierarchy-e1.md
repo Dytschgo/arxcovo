@@ -193,3 +193,13 @@ Final focused run: 16213a53-68dd-4330-96fd-e98213f271e1, 26 passed, 310 filtered
 The cheap advisory fixtures are added, not credited with new mutation kills
 for those advisories. S1 correction requires fresh independent recheck. No
 publication or native action. Contract PR56 remains a prerequisite.
+
+### Filter attribution clarification
+
+Coordinator correction baseline/final used exactly
+`cargo nextest run -p arxd --locked -E 'test(exec::hierarchy) | test(service::unix_bridge)'`:
+26 passed,310 filtered/skipped. The review's broader restored35/35 run adds
+`test(exec::stage_b_tests)` and is credited to reviewer run e79ceb52 only.
+No platform inference or extra coordinator run is claimed. Independent recheck
+f7cacdc closes S1 and supplies the boundary-fixture mutation proofs at its own
+pins. The production parser remains unchanged.
