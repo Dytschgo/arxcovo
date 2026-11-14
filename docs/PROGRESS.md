@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Sol high dedicated telemetry source 2acf69b (retained 5f7a995), evidence a554471 (retained f53f87a), separates frames from stdout/stderr, which go to NUL. Builder fmt, offline compile/Clippy, exact pure producer test and 67 managed assertion mutants passed; evidence prefix preserved. Fresh Grok high review is next. Launch grammar, measured duration, deadlines and native evidence remain OPEN. Final admission refusal/entry/registration unchanged; M2 incomplete, hardware paths **unverified on real hardware**.
+
 - Grok held-manifest review 4d4a1e3 (retained 036334a) accepts source with zero blockers; independently reran source inventory, managed baseline and 62 assertion mutants. Next Sol high source slice is dedicated telemetry pipe only: separate inherited write handle, bounded parent read, discarded stdout/stderr, pure serializer oracle without native writes. Final admission refusal and disabled entry/registration remain. Grammar, deadlines, native environment/nested Job and budget remain OPEN; M2 incomplete, hardware paths **unverified on real hardware**.
 
 - Sol high held-manifest slice 06a257e (retained b4ea46e), evidence 7b2828e (retained d71bdcd), implements held disposition/manifest/source/provenance binding. Builder source inventory and managed baseline pass, with 62 compiled assertion mutants and exact LF restoration; original evidence prefix preserved. Fresh Grok high review is next. Final admission refusal, GATE2_ONLY and disabled registration remain. Transport, grammar, deadlines and native evidence remain OPEN; M2 incomplete, hardware paths **unverified on real hardware**.
