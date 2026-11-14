@@ -69,3 +69,14 @@ Real runner calls are excluded by construction; fake calls are measured at zero.
 This is **nonnative failure evidence**, with **no native nonremovable-leaf claim**.
 Native/hardware paths are **unverified on real hardware**. No A4 credit, A9/U9
 conclusion, crash provenance, Stage F/G closure, real-Runner PA6 or M2 closure.
+
+## Coordinator pin maintenance
+
+The A6 module declaration changes the committed tests.rs bytes pinned by the
+existing S2b evidence job. Coordinator Sol medium refreshed only that one pin
+to committed-LF SHA-256
+`e500e65fcfd42f30d0492bced7ac6911de9e0dc6619e50e87e82cc94aced7eae`;
+all other pins, manifests, guards, restoration logic and workflows are unchanged.
+`python -I -B tools/ci/s2b-native/test_driver.py` passed 11 portable tests.
+No native driver ran; this adds no native credit. This maintenance is outside
+the builder's original three-file delta and is included in independent review.
