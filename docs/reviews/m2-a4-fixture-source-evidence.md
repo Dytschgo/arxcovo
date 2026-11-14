@@ -119,3 +119,18 @@ Other pins, manifest, mutation/restoration guards and workflows are unchanged.
 Portable python -I -B tools/ci/e3-native/test_driver.py: 25 tests,
 one skip, zero failures. This does not execute the A4 helper or Linux fixture.
 Fresh independent source review remains required before publication.
+
+## First hosted Linux compile correction
+
+PR105 head a4d5aa4, run 43655452591 job 132632843533 failed at
+libc::execveat in disposable/a4.rs:354: argv/env were *const *const c_char,
+but pinned libc0.2.191 GNU Linux declares *const *mut c_char. The
+non-required E3 job132632842990 returned closed baseline_failed while building
+the same lib-test crate; no native evidence is credited from that failure.
+Coordinator matched the existing E4 execute call with explicit pointer casts
+for argv and env only; image bytes, argv contents, FD flags and guards unchanged.
+An isolated compile-only Cargo library probe against actual libc=0.2.191 on
+x86_64-unknown-linux-gnu reproduced E0308 before the casts and passed after.
+This requires no SQLite C compiler, links/executes no program, and does not
+prove the entire Arxd Linux configuration compiles. cargo fmt --all -- --check
+and git diff --check passed. Fresh hosted gates and exact-head review pending.

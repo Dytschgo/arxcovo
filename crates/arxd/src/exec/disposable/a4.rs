@@ -354,8 +354,8 @@ fn disposable_linux_a4() {
                 libc::execveat(
                     executable.as_raw_fd(),
                     c"".as_ptr(),
-                    argv.as_ptr(),
-                    env.as_ptr(),
+                    argv.as_ptr().cast(),
+                    env.as_ptr().cast(),
                     libc::AT_EMPTY_PATH,
                 );
             }
