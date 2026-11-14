@@ -1,6 +1,7 @@
 //! Explicit opt-in only: the cross-account test creates/removes one OS account.
 //! Never run on an owner PC, self-hosted runner, or persistent machine.
 use super::*;
+mod a4;
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt, chown},

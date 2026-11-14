@@ -1,5 +1,7 @@
 //! Test-only kernel model. Handles identify objects, not host paths.
 use super::{parse, setup::*};
+#[path = "a4.rs"]
+pub(crate) mod a4;
 #[path = "a5.rs"]
 pub(crate) mod a5;
 use crate::development::Cancellation;
@@ -313,6 +315,21 @@ impl CgroupFs for Fake {
         self.call(operation, |m| {
             if file == "cgroup.kill" && bytes == b"1" {
                 m.killing = Some((d.0, 0));
+                return Ok(());
+            }
+            // A4 fixture-only limits: the model exposes them only after the
+            // parent controller enablement, as the real kernel does.
+            if matches!(file, "memory.max" | "memory.swap.max" | "pids.max") {
+                if !m.control_files(d.0).iter().any(|f| f == file) {
+                    return Err(FsError::Missing);
+                }
+                if !matches!(
+                    (file, bytes),
+                    ("memory.max", b"67108864") | ("memory.swap.max", b"0") | ("pids.max", b"1")
+                ) {
+                    return Err(FsError::Invalid);
+                }
+                m.nodes[d.0].overrides.insert(file.into(), bytes.to_vec());
                 return Ok(());
             }
             if file != "cgroup.subtree_control" {

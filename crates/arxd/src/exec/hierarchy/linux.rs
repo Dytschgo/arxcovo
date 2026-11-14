@@ -99,6 +99,32 @@ fn text(fd: OwnedFd, max: usize) -> FsResult<Vec<u8>> {
     Ok(bytes)
 }
 impl LinuxFs {
+    /// Dormant A4 only. All handles remain owned; no raw descriptor export.
+    #[cfg(test)]
+    pub(crate) fn seed_a4(&self, location: &super::parse::Location) -> FsResult<(Dir, Dir)> {
+        let (runs, leaf) = self.seed_a5(location)?;
+        let unit = super::fake::a5::preflight(self, location)?;
+        super::fake::a4::limits(self, &unit, &runs, &leaf)?;
+        super::fake::a5::empty(self, &leaf)?;
+        Ok((runs, leaf))
+    }
+    #[cfg(test)]
+    pub(crate) fn place_a4(&self, runs: &Dir, leaf: &Dir, pid: u32) -> FsResult<()> {
+        let fresh = self.open_child(runs, b"arx-0-0")?;
+        let inode = |d: &Dir| -> FsResult<(u64, u64)> {
+            let mut s = MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(d.0.as_raw_fd(), s.as_mut_ptr()) } != 0 {
+                return Err(last());
+            }
+            let s = unsafe { s.assume_init() };
+            Ok((s.st_dev, s.st_ino))
+        };
+        if inode(&fresh)? != inode(leaf)? {
+            return Err(FsError::Refused);
+        }
+        super::fake::a5::empty(self, leaf)?;
+        self.write(leaf, "cgroup.procs", pid.to_string().as_bytes())
+    }
     /// Dormant A5 only: no adoption, path input, raw-fd export or setup call.
     #[cfg(test)]
     pub(crate) fn seed_a5(&self, location: &super::parse::Location) -> FsResult<(Dir, Dir)> {
