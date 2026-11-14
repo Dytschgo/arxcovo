@@ -1,9 +1,14 @@
 # Windows main-after-PR71 failure: feedback-loop design proposal
 
-Status: **PROPOSAL, NOT ACCEPTED.** Sol high review and two correction
-reviews are retained; the latest narrow Spec/security corrections need recheck
-before acceptance. The original requirement was independent Sol high review
-before anyone implements it. Implementation and runs are not authorized here.
+Status: **ACCEPTED for bounded local implementation only, 2026-11-14.**
+Coordinator OpenAI / gpt-6.1-sol / medium accepts the corrected contract after
+Sol high review `43bb26d`, Opus correction review `0da16cd` and Grok 4.7 high
+narrow recheck `7acf278` (retained `0ad3dea`), all blockers resolved.
+Allowed: cfg(test)-only diagnostic module and capture wiring, pure tests with
+mock error readers, and pinned compile/non-test artifact inspection. No native
+API test, child launch, native replay, historical retry or CI dispatch is
+allowed by this local assignment. Source review and a separate publication
+scope disposition remain required. Original Opus design authorship is retained.
 Debug phase 1 is not done: no red-capable loop exists for this failure, no
 failing error stage is known, and this document gives no hypothesis or cause
 ranking.
