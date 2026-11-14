@@ -1,4 +1,4 @@
-//! Explicit opt-in only: this test creates/removes one generated OS account.
+//! Explicit opt-in only: the cross-account test creates/removes one OS account.
 //! Never run on an owner PC, self-hosted runner, or persistent machine.
 use super::*;
 use std::{
@@ -444,4 +444,40 @@ fn disposable_linux_a1_a2() {
         assert!(Instant::now() < deadline, "identity hold timed out");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+// Dormant A3 observations only. No setup, service mutation or Runner call.
+// A future independently reviewed driver must establish profile presence/absence
+// for the respective case. The current driver selects neither of these tests.
+fn assert_a3_hardening(expected: hierarchy::parse::Hardening) {
+    use hierarchy::{linux::LinuxFs, setup::CgroupFs};
+    for (key, value) in [
+        ("CI", "true"),
+        ("GITHUB_ACTIONS", "true"),
+        ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ("ARX_DISPOSABLE_EXEC_TEST", "1"),
+    ] {
+        assert_eq!(std::env::var(key).as_deref(), Ok(value));
+    }
+    assert_eq!(unsafe { libc::getuid() }, 0);
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let fs = LinuxFs::system();
+    let membership = fs.proc_cgroup().unwrap();
+    assert_eq!(membership.magic, hierarchy::setup::PROC_MAGIC);
+    assert!(hierarchy::locate(&membership.bytes).is_some());
+    let status = fs.proc_status().unwrap();
+    assert_eq!(status.magic, hierarchy::setup::PROC_MAGIC);
+    assert_eq!(hierarchy::parse::hardening(&status.bytes), expected);
+}
+
+#[test]
+#[ignore = "A3 with unchanged packaged drop-in; fresh disposable hosted Linux only; driver not wired"]
+fn disposable_linux_a3_standard() {
+    assert_a3_hardening(hierarchy::parse::Hardening::Standard);
+}
+
+#[test]
+#[ignore = "A3 without standard drop-in; fresh disposable hosted Linux only; driver not wired"]
+fn disposable_linux_a3_none() {
+    assert_a3_hardening(hierarchy::parse::Hardening::None);
 }

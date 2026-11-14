@@ -436,6 +436,37 @@ mod tests {
         assert_eq!(hardening(&[255]), Hardening::None);
     }
     #[test]
+    fn a3_packaged_profile_status_fixtures() {
+        // Synthetic proc-status data, not observations from a host. R4 uses
+        // only NNP and the bounding set; effective/permitted sets prove nothing.
+        let standard = b"Name:\tarxd\nUid:\t0\t0\t0\t0\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t00000000000000c1\nNoNewPrivs:\t1\nSeccomp:\t2\n";
+        assert_eq!(hardening(standard), Hardening::Standard);
+        let standard = std::str::from_utf8(standard).unwrap();
+        for without_profile in [
+            standard.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+            standard.replace("CapBnd:\t00000000000000c1", "CapBnd:\t000001ffffffffff"),
+            standard
+                .replace("NoNewPrivs:\t1", "NoNewPrivs:\t0")
+                .replace("CapBnd:\t00000000000000c1", "CapBnd:\t000001ffffffffff"),
+            // Matching effective/permitted sets cannot rescue a wrong bound.
+            standard
+                .replace("0000000000000000", "00000000000000c1")
+                .replace("CapBnd:\t00000000000000c1", "CapBnd:\t00000000000000c0"),
+        ] {
+            assert_eq!(hardening(without_profile.as_bytes()), Hardening::None);
+        }
+        // Independent Linux capability ABI mapping for the unchanged package.
+        let profile =
+            include_str!("../../../../../packaging/linux/50-arxcovo-standard-rights.conf");
+        assert!(profile.lines().any(|line| line == "NoNewPrivileges=yes"));
+        assert!(
+            profile
+                .lines()
+                .any(|line| { line == "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN" })
+        );
+        assert_eq!((1_u64 << 7) | (1 << 6) | 1, 0xc1);
+    }
+    #[test]
     fn p7_strict_rights_json() {
         for (value, expected) in [
             ("absent", Sudo::Absent),
