@@ -1557,6 +1557,7 @@ mod native_replay {
     use super::*;
     use diag::Stage;
     use std::cell::RefCell;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Fill {
@@ -2136,6 +2137,46 @@ mod native_replay {
             && r.out == row.out
             && r.err == row.err
     }
+    // Exactly the bytes consumed by the controller. Pure serialization is also
+    // used by native row boundaries; mock checks never call the native sink.
+    fn frame(index: u32, begin: bool, observed: [u32; 7]) -> [u8; 40] {
+        let mut bytes = [0; 40];
+        let fields = [
+            0x32585241,
+            index,
+            u32::from(begin),
+            observed[0],
+            observed[1],
+            observed[2],
+            observed[3],
+            observed[4],
+            observed[5],
+            observed[6],
+        ];
+        for (chunk, value) in bytes.chunks_exact_mut(4).zip(fields) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+    fn emit_frame(index: u32, begin: bool, observed: [u32; 7]) {
+        let bytes = frame(index, begin, observed);
+        let mut written = 0;
+        // Bypass libtest's captured text. Only a future registered wrapper may
+        // enter these functions, with stderr sealed to the controller's pipe.
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    GetStdHandle(STD_ERROR_HANDLE),
+                    bytes.as_ptr(),
+                    40,
+                    &mut written,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written, 40);
+    }
     fn one_row(
         settings: &Settings,
         hash: [u8; 32],
@@ -2144,6 +2185,7 @@ mod native_replay {
         fill: Fill,
         injection: Option<(Stage, u32)>,
     ) {
+        emit_frame(index, true, [0, 0, 0, 1, 0, 0, 0]);
         assert!(diag::empty());
         let (execution, _helper_pins) = prepared_execution(settings, hash); // fresh EVERY row, no discovery.
         assert!(!execution.policy_fixture && !execution.quarantined.load(Ordering::Acquire));
@@ -2200,6 +2242,20 @@ mod native_replay {
                 "unknown cleanup: stop, prohibit reuse"
             );
         }
+        let totals = FIXTURE.with(|s| s.borrow().totals).unwrap_or((0, 0));
+        emit_frame(
+            index,
+            false,
+            [
+                observation.consumed,
+                observation.create_calls,
+                observation.resume_calls,
+                1,
+                totals.0 as u32,
+                totals.1 as u32,
+                0,
+            ],
+        );
     }
     // Canonical global numbering: kernel=0, matrix local 0..33 => 1..34.
     fn matrix_index(local: u32) -> u32 {
@@ -2242,6 +2298,7 @@ mod native_replay {
     }
     // Future filter development::windows::native_replay::kernel_peek_capture.
     fn kernel_peek_capture() {
+        emit_frame(0, true, [0, 0, 0, 1, 0, 0, 0]);
         assert!(diag::empty());
         let (r, o) = diag::observe(|| {
             let _invocation = diag::Invocation::enter();
@@ -2255,6 +2312,11 @@ mod native_replay {
         assert!(record.valid && record.wait.is_none() && record.ms.is_none());
         assert_eq!((o.create_calls, o.resume_calls, o.consumed), (0, 0, 0));
         assert!(diag::empty());
+        emit_frame(
+            0,
+            false,
+            [o.consumed, o.create_calls, o.resume_calls, 1, 0, 0, 0],
+        );
     }
 
     // Closed numeric case record parser for a future controller. No raw diagnostic
@@ -2289,6 +2351,25 @@ mod native_replay {
     #[cfg(test)]
     mod pure {
         use super::*;
+        #[test]
+        fn producer_bytes_have_independent_literal_oracle() {
+            let begin = frame(0, true, [0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(
+                begin,
+                [
+                    65, 82, 88, 50, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                ]
+            );
+            let end = frame(34, false, [0, 1, 1, 1, 1, 1, 0]);
+            assert_eq!(
+                end,
+                [
+                    65, 82, 88, 50, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+                    0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0
+                ]
+            );
+        }
         #[test]
         fn counters_survive_invocation_and_scope_clears_even_on_unwind() {
             assert!(diag::empty());

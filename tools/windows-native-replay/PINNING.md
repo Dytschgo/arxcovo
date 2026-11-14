@@ -1,4 +1,8 @@
-# Gate 2 launch integration plan (PARTIAL SOURCE, NO RUN AUTHORITY)
+# Gate 2 source checkpoints (NO RUN AUTHORITY)
+
+The original partial-plan sections below describe the retained baseline. The
+prepared-adapter follow-up at the end supersedes their source inventory; it
+explicitly lists the current technical blockers. No native execution is enabled.
 
 RunPinned remains absent. HeldFiles.cs now contains native file-pin imports,
 compiled as source only. No check constructs HeldFiles or invokes its imports.
@@ -85,3 +89,44 @@ publication or run. A later reviewed adapter needs all of these concrete pieces:
 
 These are concrete blockers, not completed implementation. M2 incomplete;
 cause unknown; PA6 replay OPEN; runtime UNRUN; unverified on real hardware.
+
+## Prepared adapter follow-up (source only, blocked)
+
+Admission.cs defines a bounded closed JSON schema (65536 bytes, depth 4,
+no extra or duplicate keys, complete closed role set). Its SHA256 is supplied
+externally to Parse, never read from a manifest property. Pins carry exact
+absolute path, external SHA256, 128-bit file identity, exact size and reviewed
+source Git blob. Artifact roles are controller, cargo, helper, libtest,
+selectors, provenance, workspace_lock and helper_lock. The parser also binds
+commit, compiler/Cargo versions, target, profile, debug and features.
+This is build-artifact data, never run authority. No usable manifest is fabricated.
+
+HeldFiles now uses relative NtCreateFile child opens, mandatory FileIdInfo,
+post-hash metadata checks including links==1, and closes the transient shared
+volume-root handle. No copy operation or nlink-2 fallback exists.
+NativeJob prepares suspended direct-libtest launch with an explicit inherited
+handle list, explicit UTF-16 four-value environment and outer kill-on-close Job
+assignment before resume. Toolchain Cargo remains an artifact pin; it is not a
+runtime rebuild command. This grammar change requires independent review.
+OwnedSession owns this Job and its clock across both filters. Rust dormant row
+functions emit frames directly to inherited stderr; stdout is discarded.
+Frame order and complete segment counts are checked independently of Budget.
+
+BLOCKED: Admission.Revalidate unconditionally refuses after holding/verifying
+pins because helper-directory exclusion against concurrent insertion is not
+implemented. No handle-based manifest load is wired, cleanCheckout/blob inputs
+are caller claims rather than independently obtained checkout evidence, role
+aliases are not cross-checked against source/provenance contents, and directory
+pins for temp/SystemRoot are incomplete. The in-memory parser tests prove only
+schema/hash rejection, not those missing admission properties. The dormant
+supervisor has not received a native or independent security review; cleanup
+and success/failure races remain unverified. Its 358-second launch-loop cutoff
+reserves two seconds for cleanup; per-row teardown containment within ten
+seconds still requires a completed supervisor proof. Pure cleanup decision mutants have only mock-state credit; they do not prove
+Job termination ordering or kernel cleanup. UNRUN native APIs.
+
+The three-integration assignment is incomplete. This prepared source is a
+technical-blocker handoff, not run-ready source or acceptance of the changed
+grammar. Environment unselected; nested Job proof UNRUN; costs UNMEASURED.
+M2 incomplete; cause unknown; Phase 1 no focused real red loop; PA6 replay OPEN;
+all hardware paths unverified on real hardware. All earlier gates still apply.

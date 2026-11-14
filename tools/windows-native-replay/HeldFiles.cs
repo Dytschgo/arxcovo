@@ -1,5 +1,5 @@
 // SOURCE ONLY. No public entry point; compiling this file invokes no native API.
-// This is a file-pin primitive, not manifest admission or a process controller.
+// Used only by the dormant manifest adapter. No copy or hardlink fallback.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -40,33 +40,75 @@ internal sealed class HeldFiles : IDisposable {
             return actual==externalExpectedHash;
         }
     }
-    void OpenAncestors(string path) {
-        if(disposed || !ReplayController.LaunchSpec.Absolute(path) || !path.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase)) throw Refused();
-        string current=path.Substring(0,3);
-        string[] pieces=path.Substring(3).Split('\\');
-        for(int i=0;i<pieces.Length;i++) {
-            // Root first, then each parent. Leaf is opened by OpenLeaf.
-            if(i>0) current=Path.Combine(current,pieces[i-1]);
-            var h=CreateFileW(current,0,1,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
-            if(h.IsInvalid) { h.Dispose(); throw Refused(); }
-            ancestors.Add(h);
-            Info info;
-            if(!GetFileInformationByHandle(h,out info) || info.volume!=volume || (info.attributes&0x400)!=0
-                || (info.attributes&0x10)==0 || GetFileType(h)!=1) throw Refused();
-        }
-    }
-    FileStream OpenLeaf(string path,bool create) {
-        OpenAncestors(path);
-        // FILE_SHARE_READ only: a held leaf cannot be overwritten or replaced.
-        // Copy creation retains this exact handle; it is never closed/reopened
-        // between the write, verification, and the caller's eventual teardown.
-        var handle=CreateFileW(path,create?0xc0000000U:0x80000000U,1,IntPtr.Zero,create?1U:3U,0x00200000,IntPtr.Zero);
-        if(handle.IsInvalid) { handle.Dispose(); throw Refused(); }
+    [StructLayout(LayoutKind.Sequential)]
+    struct UnicodeName { internal ushort length, maximum; internal IntPtr buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Attributes { internal int length; internal IntPtr parent, name; internal uint flags; internal IntPtr security, qos; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IoStatus { internal IntPtr status; internal UIntPtr information; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileId { internal ulong volume, low, high; }
+    [DllImport("ntdll.dll", ExactSpelling=true)]
+    static extern int NtCreateFile(out SafeFileHandle handle,uint access,ref Attributes attributes,
+        out IoStatus status,IntPtr allocation,uint fileAttributes,uint share,uint disposition,
+        uint options,IntPtr ea,uint eaLength);
+    [DllImport("kernel32.dll", SetLastError=true, ExactSpelling=true)]
+    static extern bool GetFileInformationByHandleEx(SafeFileHandle file,int kind,out FileId id,uint size);
+    static SafeFileHandle Child(SafeFileHandle parent,string name,bool directory) {
+        IntPtr text=Marshal.StringToHGlobalUni(name), descriptor=IntPtr.Zero;
         try {
-            var stream=new FileStream(handle,create?FileAccess.ReadWrite:FileAccess.Read,4096,false);
+            var u=new UnicodeName {length=checked((ushort)(name.Length*2)),maximum=checked((ushort)(name.Length*2)),buffer=text};
+            descriptor=Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeName>());
+            Marshal.StructureToPtr(u,descriptor,false);
+            var a=new Attributes {length=Marshal.SizeOf<Attributes>(),parent=parent.DangerousGetHandle(),name=descriptor,flags=0x40};
+            IoStatus io; SafeFileHandle child;
+            // OBJ relative, FILE_OPEN, synchronous nonalert, OPEN_REPARSE_POINT;
+            // no name-based reopening and no write/delete sharing.
+            int status=NtCreateFile(out child,0x00100000U | (directory?1U:0x80000000U),ref a,out io,
+                IntPtr.Zero,0,1,1,0x00200020U | (directory?1U:0x40U),IntPtr.Zero,0);
+            if(status<0 || child.IsInvalid) { child.Dispose(); throw Refused(); }
+            return child;
+        } finally { if(descriptor!=IntPtr.Zero) Marshal.FreeHGlobal(descriptor); Marshal.FreeHGlobal(text); }
+    }
+    FileId Identity(SafeFileHandle h) {
+        FileId id;
+        // FileIdInfo is mandatory; unsupported filesystems fail closed.
+        if(!GetFileInformationByHandleEx(h,18,out id,24) || id.volume!=volume || (id.low==0 && id.high==0)) throw Refused();
+        return id;
+    }
+    internal static string IdText(ulong low,ulong high) { return low.ToString("x16")+high.ToString("x16"); }
+    void DirectoryValid(SafeFileHandle h) {
+        Info i;
+        if(!GetFileInformationByHandle(h,out i) || i.volume!=volume || (i.attributes&0x410)!=0x10 || GetFileType(h)!=1) throw Refused();
+        Identity(h);
+    }
+    SafeFileHandle OpenParent(string path) {
+        if(disposed || !ReplayController.LaunchSpec.Absolute(path) || !path.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase)) throw Refused();
+        string[] pieces=path.Substring(3).Split('\\');
+        // Volume root is only a transient bootstrap handle, with full sharing.
+        // It is closed as soon as its first child has been opened.
+        SafeFileHandle parent=CreateFileW(path.Substring(0,3),1,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+        try {
+            if(parent.IsInvalid) throw Refused();
+            DirectoryValid(parent);
+            for(int n=0;n<pieces.Length-1;n++) {
+                var child=Child(parent,pieces[n],true);
+                ancestors.Add(child); DirectoryValid(child);
+                if(n==0) parent.Dispose();
+                parent=child;
+            }
+            return parent;
+        } catch { parent.Dispose(); throw; }
+    }
+    FileStream OpenLeaf(string path) {
+        var parent=OpenParent(path);
+        var handle=Child(parent,Path.GetFileName(path),false);
+        try {
+            var stream=new FileStream(handle,FileAccess.Read,4096,false);
             files.Add(stream); return stream;
         } catch { handle.Dispose(); throw; }
     }
+    internal static bool LinksUnchanged(uint before,uint after) { return before==1 && after==1; }
     Info Inspect(FileStream stream,long limit) {
         Info info;
         if(!GetFileInformationByHandle(stream.SafeFileHandle,out info)) throw Refused();
@@ -74,9 +116,10 @@ internal sealed class HeldFiles : IDisposable {
         if(info.volume!=volume || !MetadataValid(info.attributes,GetFileType(stream.SafeFileHandle),info.links,size,limit)) throw Refused();
         return info;
     }
-    byte[] ReadVerified(FileStream stream,string hash,int limit,ulong expectedId) {
+    byte[] ReadVerified(FileStream stream,string hash,int limit,string expectedId) {
         Info before=Inspect(stream,limit);
-        if((((ulong)before.idHigh<<32)|before.idLow)!=expectedId) throw Refused();
+        FileId first=Identity(stream.SafeFileHandle);
+        if(IdText(first.low,first.high)!=expectedId) throw Refused();
         byte[] bytes=new byte[(int)before.sizeLow];
         stream.Position=0; int read=0;
         while(read<bytes.Length) {
@@ -85,25 +128,18 @@ internal sealed class HeldFiles : IDisposable {
             read+=n;
         }
         if(stream.ReadByte()!=-1 || !HashMatches(bytes,hash,limit)) throw Refused();
-        Info after=Inspect(stream,limit);
+        Info after=Inspect(stream,limit); // includes links==1 AFTER hashing
+        if(!LinksUnchanged(before.links,after.links)) throw Refused();
+        FileId last=Identity(stream.SafeFileHandle);
+        if(first.volume!=last.volume || first.low!=last.low || first.high!=last.high) throw Refused();
         if(before.idHigh!=after.idHigh || before.idLow!=after.idLow || before.sizeLow!=after.sizeLow || before.sizeHigh!=after.sizeHigh) throw Refused();
         return bytes;
     }
     // expected hash and identity MUST come from an externally pinned admission
     // manifest. This primitive never generates, trusts or bootstraps a manifest.
-    internal byte[] ReadPinned(string path,string externalHash,int limit,ulong expectedId) {
-        try { return ReadVerified(OpenLeaf(path,false),externalHash,limit,expectedId); }
+    internal byte[] ReadPinned(string path,string externalHash,int limit,string expectedId) {
+        try { return ReadVerified(OpenLeaf(path),externalHash,limit,expectedId); }
         catch { Dispose(); throw; }
-    }
-    internal void CopyPinned(string source,string destination,string externalHash,int limit,ulong expectedSourceId) {
-        try {
-            // Inspect rejects original Cargo artifacts with nlink=2 BEFORE copy.
-            byte[] bytes=ReadPinned(source,externalHash,limit,expectedSourceId);
-            var copy=OpenLeaf(destination,true);
-            copy.Write(bytes,0,bytes.Length); copy.Flush(true);
-            Info info=Inspect(copy,limit);
-            ReadVerified(copy,externalHash,limit,((ulong)info.idHigh<<32)|info.idLow);
-        } catch { Dispose(); throw; }
     }
     public void Dispose() {
         if(disposed) return;

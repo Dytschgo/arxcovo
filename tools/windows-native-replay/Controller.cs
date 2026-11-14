@@ -1,4 +1,4 @@
-// Gate 2 prepared partial. NO native launcher exists in this revision.
+// Gate 2 source only. PowerShell and registration guards remain unconditional.
 // Pure contracts below cannot grant authority or create a process.
 using System;
 using System.Collections.Concurrent;
@@ -124,15 +124,59 @@ internal static class ReplayController {
             return !failed && !channel.Failed && channel.Empty && budget.Complete && exited && exitCode==0 && active==0;
         }
     }
-    // A future containment adapter must own this session across BOTH filters.
-    // No caller stopwatch or clock callback is accepted by production polling.
-    internal sealed class OwnedSession {
+    // Pure cleanup decision used only after the native termination attempt.
+    internal static bool CleanupConfirmed(bool terminateSucceeded,uint active,bool processExited,long now,long until) {
+        return terminateSucceeded && active==0 && processExited && now<until;
+    }
+    // Created before either launch; sole owner of Job, channel and clock.
+    internal sealed class OwnedSession : IDisposable {
         readonly Stopwatch clock=Stopwatch.StartNew();
         readonly MonitorState state=new MonitorState();
         internal readonly RowChannel channel=new RowChannel();
-        internal bool Poll() { return state.Poll(channel,clock.ElapsedMilliseconds); }
+        readonly FrameDecoder decoder;
+        readonly NativeJob job;
+        static readonly List<NativeJob> unknownOwners=new List<NativeJob>();
+        bool failed, disposed, finished;
+        internal OwnedSession() { decoder=new FrameDecoder(channel); job=new NativeJob(); }
+        internal bool Poll() { return !failed && state.Poll(channel,clock.ElapsedMilliseconds); }
         internal bool Success(bool exited,uint code,uint active) {
             return Poll() && state.Success(channel,exited,code,active);
+        }
+        internal bool Run(Admission admission) {
+            if(finished || failed || disposed) return false;
+            try {
+                for(int filter=0;filter<2;filter++) {
+                    admission.Revalidate();
+                    string[] args={filter==0?LaunchSpec.Kernel:LaunchSpec.Matrix,"--exact","--test-threads=1"};
+                    job.Launch(admission.Libtest,admission.Root,args,admission.Environment(args));
+                    for(;;) {
+                        bool eof; uint code;
+                        if(!job.Pump(decoder,out eof) || !Poll() || clock.ElapsedMilliseconds>=358000) return Abort();
+                        bool exited=job.Exited(out code);
+                        if(exited && eof) {
+                            if(code!=0 || job.Active()!=0 || !decoder.Segment(filter==0?2:70)) return Abort();
+                            while(!channel.Empty) if(!Poll()) return Abort();
+                            if(filter==1 && !Success(true,code,job.Active())) return Abort();
+                            break;
+                        }
+                        Thread.Sleep(1); // only owner waits, no threadpool callback
+                    }
+                    job.Next();
+                }
+                finished=true; return true;
+            } catch { return Abort(); }
+        }
+        bool Abort() {
+            failed=true; channel.Invalidate();
+            if(!job.KillAndConfirm(clock)) {
+                lock(unknownOwners) unknownOwners.Add(job); // keep kill-on-close owner, prohibit reuse
+            } else { job.Dispose(); disposed=true; }
+            return false;
+        }
+        public void Dispose() {
+            if(disposed) return;
+            if(!finished) { Abort(); return; }
+            job.Dispose(); disposed=true;
         }
     }
     // Fixed binary wire grammar: 10 little-endian uint32 fields, 40 bytes.
@@ -153,16 +197,19 @@ internal static class ReplayController {
                 used=0;
                 uint[] v=new uint[10];
                 for(int j=0;j<10;j++) v[j]=(uint)(frame[j*4] | frame[j*4+1]<<8 | frame[j*4+2]<<16 | frame[j*4+3]<<24);
+                if(v[1]!=(uint)(frames/2) || v[2]!=(uint)(1-frames%2)) return Fail();
                 if(++frames>70 || v[0]!=0x32585241 || v[1]>=35 || v[2]>1 || v[3]>1 || v[4]>1 || v[5]>v[4]
                     || v[6]!=1 || v[7]>1 || v[8]>1 || v[9]>10000) return Fail();
                 if(!channel.Publish(new Event((int)v[1],v[2]==1,(int)v[3],(int)v[4],(int)v[5],(int)v[6],(int)v[7],(int)v[8],(int)v[9]))) return Fail();
             }
             return true;
         }
-        internal bool Finish() {
-            if(failed || ended || used!=0 || frames==0) return Fail();
-            ended=true; return true;
+        internal bool Segment(int expected) {
+            if(failed || ended || used!=0 || frames!=expected || (expected!=2 && expected!=70)) return Fail();
+            if(expected==70) ended=true;
+            return true;
         }
+        internal bool Finish() { return Segment(70); }
         bool Fail() { failed=true; channel.Invalidate(); return false; }
     }
     internal sealed class LaunchSpec {
@@ -197,12 +244,10 @@ internal static class ReplayController {
         }
         internal static bool Valid(string app,string cwd,string helper,string temp,string systemRoot,string[] args,IDictionary<string,string> env) {
             if(!Absolute(app) || !Absolute(cwd) || !Absolute(helper) || !Absolute(temp) || !Absolute(systemRoot)) return false;
-            if(!app.EndsWith("\\cargo.exe",StringComparison.OrdinalIgnoreCase)) return false;
-            if(args==null || args.Length!=12) return false;
-            string[] fixedArgs={"test","-p","arxd","--lib","--locked","--offline","--target","x86_64-pc-windows-msvc",null,"--","--exact","--test-threads=1"};
-            // Profile is an immutable build pin, not an ambient environment variable.
-            if(args[8]!=Kernel && args[8]!=Matrix) return false;
-            for(int i=0;i<12;i++) if(i!=8 && args[i]!=fixedArgs[i]) return false;
+            if(!app.EndsWith(".exe",StringComparison.OrdinalIgnoreCase)) return false;
+            if(args==null || args.Length!=3) return false;
+            if(args[0]!=Kernel && args[0]!=Matrix) return false;
+            if(args[1]!="--exact" || args[2]!="--test-threads=1") return false;
             if(env==null || env.Count!=4) return false;
             foreach(var pair in env) {
                 string expected=pair.Key=="PATH" ? helper : pair.Key=="TEMP" || pair.Key=="TMP" ? temp : pair.Key=="SystemRoot" ? systemRoot : null;
@@ -225,6 +270,34 @@ public static class PureControllerChecks {
         for(int i=0;i<10;i++) for(int j=0;j<4;j++) result[i*4+j]=(byte)(fields[i]>>(8*j));
         return result;
     }
+    static string Hash(byte[] b) {
+        using(var sha=System.Security.Cryptography.SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(b)).Replace("-","").ToLowerInvariant();
+    }
+    static bool ManifestAccepted(string json,string expected,string commit,Dictionary<string,string> blobs) {
+        try { Admission.Parse(Encoding.UTF8.GetBytes(json),expected,commit,@"C:\fixture",blobs); return true; }
+        catch(InvalidOperationException) { return false; }
+    }
+    static void ManifestChecks() {
+        string commit=new string('a',40), blob=new string('b',40);
+        var blobs=new Dictionary<string,string>();
+        var pins=new List<object>();
+        foreach(string source in Admission.Sources) {
+            blobs.Add(source,blob);
+            pins.Add(new { role="source:"+source,path=@"C:\fixture\"+source.Replace('/','\\'),sha256=new string('c',64),id128=new string('d',32),size=1,blob=blob });
+        }
+        foreach(string role in new[]{"controller","cargo","helper","libtest","selectors","provenance","workspace_lock","helper_lock"})
+            pins.Add(new { role=role,path=@"C:\fixture\"+role+".bin",sha256=new string('c',64),id128=new string('d',32),size=1,blob="artifact" });
+        var document=new {schema=1,reviewed_commit=commit,root=@"C:\fixture",helper_directory=@"C:\fixture\bin",temp=@"C:\fixture\tmp",system_root=@"C:\fixture\Windows",
+            target="x86_64-pc-windows-msvc",profile="dev",debug="0",features="default",toolchain="1.95.0",compiler_commit="59807616e1fa2540724bfbac14d7976d7e4a3860",cargo_version="1.95.0 (f2d3ce0bd7f24a49f8f72d9000448f8838c4e850)",pins=pins};
+        string json=System.Text.Json.JsonSerializer.Serialize(document);
+        Check(ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),commit,blobs),"manifest valid");
+        Check(!ManifestAccepted(json,new string('f',64),commit,blobs),"manifest external mismatch");
+        string extra=json.Insert(1,"\"extra\":0,");
+        Check(!ManifestAccepted(extra,Hash(Encoding.UTF8.GetBytes(extra)),commit,blobs),"manifest extra");
+        string self=json.Insert(1,"\"sha256\":\""+Hash(Encoding.UTF8.GetBytes(json))+"\",");
+        Check(!ManifestAccepted(self,Hash(Encoding.UTF8.GetBytes(self)),commit,blobs),"manifest self hash");
+        Check(!ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),new string('e',40),blobs),"manifest commit mismatch");
+    }
     // Independent argv reader for the one quoted argument emitted by Quote.
     static string Unquote(string s) {
         Check(s.Length>=2 && s[0]=='"',"quoted start");
@@ -240,9 +313,29 @@ public static class PureControllerChecks {
         throw new Exception("unterminated");
     }
     public static void Run() {
+        ManifestChecks();
+        Check(ReplayController.CleanupConfirmed(true,0,true,1,2),"cleanup zero");
+        Check(!ReplayController.CleanupConfirmed(false,0,true,1,2),"cleanup kill first");
+        Check(!ReplayController.CleanupConfirmed(true,1,true,1,2),"cleanup active");
+        Check(!ReplayController.CleanupConfirmed(true,0,false,1,2),"cleanup process");
+        Check(!ReplayController.CleanupConfirmed(true,0,true,2,2),"cleanup deadline");
+        var partialChannel=new ReplayController.RowChannel();
+        var partial=new ReplayController.FrameDecoder(partialChannel);
+        partial.Feed(Frame(0,1),40); partial.Feed(Frame(0,0),40); partial.Feed(Frame(1,1),1);
+        Check(!partial.Segment(2),"partial EOF");
+        var fullChannel=new ReplayController.RowChannel(); var full=new ReplayController.FrameDecoder(fullChannel);
+        var fullState=new ReplayController.MonitorState();
+        for(uint n=0;n<35;n++) {
+            var first=Frame(n,1); var last=Frame(n,0);
+            last[12]=(byte)(n>=1 && n<=32?1:0); last[16]=(byte)(n>=15?1:0); last[20]=(byte)(n>=19?1:0);
+            Check(full.Feed(first,40) && fullState.Poll(fullChannel,n*2),"stream begin");
+            Check(full.Feed(last,40) && fullState.Poll(fullChannel,n*2+1),"stream end");
+        }
+        Check(full.Finish() && fullState.Success(fullChannel,true,0,0),"stream complete");
         foreach(string arg in new[]{"", "plain", "two words", "Grüezi 世界", @"C:\a b\", "a\"b", "\\\"", "\\\\"})
             Check(Unquote(ReplayController.LaunchSpec.Quote(arg))==arg,"argument escape");
         Check(!HeldFiles.MetadataValid(0,1,2,4,16),"link2 reject");
+        Check(!HeldFiles.LinksUnchanged(1,2),"post hash links");
         Check(!HeldFiles.MetadataValid(0x400,1,1,4,16) && !HeldFiles.MetadataValid(0x10,1,1,4,16)
             && !HeldFiles.MetadataValid(0,2,1,4,16) && !HeldFiles.MetadataValid(0,1,1,17,16),"file bounds");
         Check(HeldFiles.MetadataValid(0,1,1,4,16),"single owned file");
@@ -254,16 +347,16 @@ public static class PureControllerChecks {
         byte[] frame=Frame(0,1);
         Check(decoder.Feed(new byte[]{frame[0]},1),"fragment");
         var tail=new byte[39]; Array.Copy(frame,1,tail,0,39);
-        Check(decoder.Feed(tail,39) && decoder.Finish(),"wire complete");
+        Check(decoder.Feed(tail,39) && !decoder.Finish(),"wire complete");
         var wireState=new ReplayController.MonitorState();
-        Check(wireState.Poll(wireChannel,0) && !wireState.Success(wireChannel,true,0,0),"begin alone incomplete");
+        Check(!wireState.Poll(wireChannel,0) && !wireState.Success(wireChannel,true,0,0),"begin alone incomplete");
         foreach(int fault in new[]{0,1,2,3}) {
             wireChannel=new ReplayController.RowChannel(); decoder=new ReplayController.FrameDecoder(wireChannel);
             frame=Frame(0,1);
             if(fault==0) { frame[0]=0; Check(!decoder.Feed(frame,40),"malformed frame"); }
             if(fault==1) { decoder.Feed(frame,40); decoder.Feed(frame,39); Check(!decoder.Finish(),"partial EOF"); }
             if(fault==2) { frame[28]=2; Check(!decoder.Feed(frame,40),"output overflow"); }
-            if(fault==3) { for(int j=0;j<70;j++) Check(decoder.Feed(frame,40),"wire capacity"); Check(!decoder.Feed(frame,40),"wire overflow"); }
+            if(fault==3) { Check(decoder.Feed(frame,40),"first frame"); Check(!decoder.Feed(frame,40),"duplicate frame"); }
             Check(!new ReplayController.MonitorState().Poll(wireChannel,0),"wire failure latched");
         }
         var state=new ReplayController.MonitorState();
@@ -309,11 +402,11 @@ public static class PureControllerChecks {
         Check(waiting.Poll(empty,9999) && !waiting.Poll(empty,10000),"empty nonblocking deadline");
         string app=@"C:\tools\cargo.exe", cwd=@"C:\fixture", helper=@"C:\fixture\bin", temp=@"C:\fixture\temp", root=@"C:\Windows";
         var env=new Dictionary<string,string>{{"PATH",helper},{"TEMP",temp},{"TMP",temp},{"SystemRoot",root}};
-        string[] args={"test","-p","arxd","--lib","--locked","--offline","--target","x86_64-pc-windows-msvc",ReplayController.LaunchSpec.Kernel,"--","--exact","--test-threads=1"};
+        string[] args={ReplayController.LaunchSpec.Kernel,"--exact","--test-threads=1"};
         Check(ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"launch grammar");
         byte[] block=ReplayController.LaunchSpec.EnvironmentBlock(app,cwd,helper,temp,root,args,env);
         Check(Encoding.Unicode.GetString(block)=="PATH="+helper+"\0SystemRoot="+root+"\0TEMP="+temp+"\0TMP="+temp+"\0\0","exact environment block");
-        args[8]="arbitrary"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"filter reject"); args[8]=ReplayController.LaunchSpec.Kernel;
+        args[0]="arbitrary"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"filter reject"); args[0]=ReplayController.LaunchSpec.Kernel;
         env["OWNER_SECRET"]="synthetic"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"environment reject"); env.Remove("OWNER_SECRET");
         env["PATH"]+=@";C:\other"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"path reject");
         foreach(string path in new[]{"cargo.exe",@"C:\a\..\cargo.exe",@"\\server\cargo.exe",@"C:\a:stream"}) Check(!ReplayController.LaunchSpec.Absolute(path),"absolute reject");

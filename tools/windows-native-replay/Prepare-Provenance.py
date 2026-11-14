@@ -18,6 +18,8 @@ SOURCES = (
     "tools/windows-native-replay/Invoke-BoundedReplay.ps1",
     "tools/windows-native-replay/Controller.cs",
     "tools/windows-native-replay/HeldFiles.cs",
+    "tools/windows-native-replay/NativeJob.cs",
+    "tools/windows-native-replay/Admission.cs",
     "tools/windows-native-replay/Prepare-Provenance.py",
     "tools/windows-native-replay/Check-Source.py",
     "tools/windows-native-replay/selectors.json",

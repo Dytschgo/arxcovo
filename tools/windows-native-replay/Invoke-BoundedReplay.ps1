@@ -11,4 +11,4 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # No Add-Type, process API, cargo command or native registration in this stage.
 # Even a supplied/edited manifest cannot enable this source-preparation entry.
-throw 'GATE2_ONLY: native registration and owned-Job controller are unavailable; execution and environment reuse are blocked.'
+throw 'GATE2_ONLY: native registration and directory-exclusion admission remain blocked; execution and environment reuse are blocked.'
