@@ -1,8 +1,14 @@
 # NEXT M2: bounded Windows native capture and replay scope
 
-Status: **PROPOSED; independent Grok/Muse review and coordinator disposition
-required. No implementation, build, native execution, discovery addition,
-publication or dispatch authority.**
+Status: **ACCEPTED FOR GATE 2 LOCAL PREPARATION ONLY, 2026-11-14.**
+Coordinator OpenAI / gpt-6.1-sol / medium accepts the corrected contract after
+independent Grok reviews `b0b4581`, `b2676a4` and final confirmation `ab115ba`.
+All design blockers are closed. Allowed: source preparation, named compile
+checks and pure tests. Native functions remain undiscoverable: no #[test],
+ignored test, CLI execution, native replay, ordinary-discovery publication or
+CI dispatch is authorized. Fresh source/security review precedes any later
+scope decision. Controller/environment, native evidence and measured CI budget
+remain OPEN; acceptance is not execution authority.
 
 Author: OpenAI / gpt-6.1-sol / high, design sub-agent, 2026-11-14.
 The requested automatic Sol implementation routing is a future routing choice;
