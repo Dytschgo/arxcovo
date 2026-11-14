@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- PR85 merged as `7afea2fdcb17268396fbdb17c36ee8cf991e2ce4` at 2026-11-14 18:13:02Z after five green gates and Grok exact-head PASS `6882018989`; tree equals `2ea6eb9`. Sol high D7b proposal `60584f5` and Grok high review `990fcbd` have zero findings and are prepared for docs-only publication. The candidate may differ from that main only in ADR/review/progress documents; execution and evidence bytes remain unchanged. No run permission exists before review, required gates and coordinator merge. D7a is consumed; no dispatch has occurred under D7b. M2/F/G/PA6 stay open and hardware remains **unverified on real hardware**. Independent activity-ID contract documentation is prepared separately and held until the candidate is consumed. Optional diagnostics remain parked.
+
 - PR84 merged as `faa62c90f3816f2cf93e24261257542e5bce8b98` at 2026-11-14 17:52:44Z after all five gates and Grok exact-head review `6881723962`; squash tree equals `a063ed5`. Scoped activity lookup is delivered. Main-after-PR83 CI `43622125655` passed in 525 seconds.
 - Sol high protected-parent fix `46a1bf9` and Grok high review `0661d2a` pass all axes: stage at fixed `/var/lib`, preserve ancestor and collision guards, align the F0b descriptor walk. The unchanged record from run `43622157531` reproduces the writable `/opt` refusal; regression was red before the fix. Both providers ran 62 mocked tests, 73 assertion kills and four equivalents without credit. Ordinary publication gates are next. D7a remains consumed, no native retry is authorized, and `/var/lib` is **unverified on real hardware**. M2/F/G/PA6 stay open; optional diagnostics remain parked.
 
