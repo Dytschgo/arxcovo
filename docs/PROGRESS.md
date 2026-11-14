@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- D7a correction prepared on clean main8216295: statuspreamble now states the one hosted A1/A2 exception consistently; no unrelated source/evidence change. Main evidence blob02e3a2a and correct committedLFdriverhasha0a1a975 remain untouched. Grok initialreviewb1d9653 found these two publication blockers; fresh narrow correction review next. Userdelegated instruction authorizes reviewedADRroute, not bypass; no dispatch yet. Parallel activity-ID feature026b089 ready for independentreview, held frommerge until one-run candidate fixed/consumed.
+
 - Core M2 A1/A2 acceptance-source alignment source7fa9129/evidence7295dc8 and Grok5fca08f have no blockers for ordinary hosted compilation. Prebuiltignoredtest execs asMainPID under exactpackagedservice/profile and invokesprodsetupbeforechildren; launcheronlycaptureowner. Packaging/manualworkflow/prodsetup/parser/Linuxport unchanged. Local58mockedPython+37pureRusttests,74assertionkills+4equivalents; reviewer reran safePython/mutants and37pureRust. LocalfullLinuxcompileblockedmissingcrossCcompiler; hostedUnixcompile andexact-headreview pending. Incorrectdriverhashcitation corrected to committedLFa0a1a975...26752 withoutsourcechange. No manualrun/nativeacceptance authority orproductionactivation.
 - Last merged PR81 is625eeb062bd89c1b2692b2cc99759a809e69e849 at2026-11-14 14:53:29Z afterall5gates/Grokexactreview; treeequals600fd2a. MainCI43607215309 attempt1 passed477s. ParallelM2stdio/inventory userflows delivered; optionaldiagnostictracksparked. M2/F/G/PA6OPEN/hardware **unverified on real hardware**, historicalE_PROTECTION/main71 causesunknown/no retry.
 
