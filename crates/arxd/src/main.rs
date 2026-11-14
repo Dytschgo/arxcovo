@@ -23,6 +23,12 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "client-config") {
         std::process::exit(arxd::service::owner_cli::main(&args));
     }
+    if args.first().is_some_and(|arg| arg == "mcp-stdio")
+        && (args.len() != 3 || args[1] != "--client-config")
+    {
+        eprintln!("arxd: usage: arxd mcp-stdio --client-config FILE");
+        std::process::exit(2);
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
