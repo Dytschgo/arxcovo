@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Sol high held-manifest slice 06a257e (retained b4ea46e), evidence 7b2828e (retained d71bdcd), implements held disposition/manifest/source/provenance binding. Builder source inventory and managed baseline pass, with 62 compiled assertion mutants and exact LF restoration; original evidence prefix preserved. Fresh Grok high review is next. Final admission refusal, GATE2_ONLY and disabled registration remain. Transport, grammar, deadlines and native evidence remain OPEN; M2 incomplete, hardware paths **unverified on real hardware**.
+
 - Grok review 852b9b1 (retained 66018b2) accepts ExclusiveNames/SystemRoot source slice with zero blockers. Managed baseline and all 45 assertion mutants independently passed; native directory-query semantics remain UNRUN. Next Sol high slice is held manifest binding only: held bytes, externally pinned disposition/commit, Git blob and provenance/lock cross-binding, while retaining final admission refusal. Dedicated transport, accepted grammar, deadline supervisor, environment/nested Job and budget remain OPEN. No publication or native run authority; M2 incomplete, hardware paths **unverified on real hardware**.
 
 - Sol high admission slice 37ff694 / evidence 37286b5 implements ExclusiveNames, separate SystemRoot constraints and Revalidate wiring. Builder reports managed baseline, 45 compiled assertion mutants, inventory and whitespace checks passed; no native API execution. Fresh Grok high review is next. Entry and registration stay disabled; manifest binding, dedicated transport, accepted launch grammar, deadlines, environment/nested Job and budget remain OPEN. M2 incomplete; native paths **unverified on real hardware**.
