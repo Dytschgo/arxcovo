@@ -45,7 +45,16 @@ assert "matrix_index(28 + i as u32)" in code
 assert "matrix_index(32)" in code and "matrix_index(33)" in code
 assert "DllImport" not in controller and "CreateProcess" not in controller and "RunPinned" not in controller
 assert "Func<" not in controller
-print("gate2 map: kernel 0; failures 1..28; peek109 29..32; controls 33..34; native launcher absent")
+assert "return Poll() && state.Success" in controller
+held = (root / "tools/windows-native-replay/HeldFiles.cs").read_text()
+assert "links==1" in held and "create?1U:3U" in held
+assert "CreateProcess" not in held and "Process.Start" not in held
+assert "ReadVerified(OpenLeaf(path,false),externalHash,limit,expectedId)" in held
+assert "copy.Flush(true)" in held and "ReadVerified(copy,externalHash" in held
+assert "GetEnvironmentVariables" not in re.sub(r"//[^\n]*", "", controller)
+entry = (root / "tools/windows-native-replay/Invoke-BoundedReplay.ps1").read_text()
+assert "throw 'GATE2_ONLY:" in entry
+print("gate2 map: kernel 0; failures 1..28; peek109 29..32; controls 33..34; launch absent; held-file imports source only")
 
 assert selectors["filters"][0]["row_indices"] == [0]
 assert selectors["filters"][1]["row_indices"] == list(range(1, 35))

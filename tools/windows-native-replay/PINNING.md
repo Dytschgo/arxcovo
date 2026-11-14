@@ -1,10 +1,33 @@
-# Gate 2 launch integration plan (UNIMPLEMENTED, NO RUN AUTHORITY)
+# Gate 2 launch integration plan (PARTIAL SOURCE, NO RUN AUTHORITY)
 
-This revision removes RunPinned and all controller P/Invoke imports. The managed
-OwnedSession, row channel, Budget and LaunchSpec are pure preparation seams.
-There is no native kill loop or launch adapter, and no claim that these types
-alone enforce a native deadline. PowerShell still refuses unconditionally.
+RunPinned remains absent. HeldFiles.cs now contains native file-pin imports,
+compiled as source only. No check constructs HeldFiles or invokes its imports.
+It opens ancestors root down without following reparse points, restricts leaves
+to an approved root/volume, checks disk/regular-file type, size, identity and
+link count, hashes bytes from held handles and retains handles until disposal.
+CopyPinned refuses a source with link count two before copying, creates a new
+destination with CREATE_NEW, writes/flushes/verifies using the same retained
+handle and FILE_SHARE_READ only. It never closes/reopens that destination for
+verification. There is no copy fallback for a rejected original artifact.
+All these native properties are UNRUN and unverified on real hardware.
+
+The managed wire decoder now accepts bounded fragmented 40-byte numeric frames,
+and latches malformed input, partial EOF and overflow into the row channel.
+This is a byte decoder, not a pipe transport. LaunchSpec has an argument encoder
+and an explicit four-value UTF-16 environment builder. OwnedSession.Success polls
+its own clock immediately before evaluating completion. Pure checks do not
+construct that session. There is still no Job owner, native kill loop, Rust event
+emission, manifest admission or launch adapter. PowerShell refuses unconditionally.
 Do not restore the old string-command/callback/stopwatch launcher.
+
+Remaining integration blocker: no sealed admission object binds a held fixed
+manifest (with externally supplied expected SHA256) to ALL source/build/artifact
+pins and the two launches. HeldFiles accepts individual external pins; that is
+not manifest admission. Directory handles do not prove exclusive helper-directory
+membership. The Cargo grammar also needs a reviewed way to exclude rebuilding
+an unpinned harness under the four-value environment. No manifest or artifact
+snapshot may bootstrap its own expected hash. No run-manifest.json is generated
+by this partial implementation. No claim of a functional controller adapter.
 
 The coordinator must obtain fresh Grok/Muse source/security review before any
 publication or run. A later reviewed adapter needs all of these concrete pieces:
@@ -39,7 +62,8 @@ publication or run. A later reviewed adapter needs all of these concrete pieces:
    TEMP=TMP=the exact pinned disposable temp directory and SystemRoot=the pinned
    approved Windows directory. No inherited environment, owner credentials,
    CARGO_HOME, alternate PATH component or profile lookup. Profile/debug/default
-   features are build pins. No native environment block builder is implemented.
+   features are build pins. The pure environment block builder is implemented;
+   it is not passed to any native launch.
 5. Implement owned bounded telemetry from Rust's actual begin/end row boundaries
    (including kernel 0), with only fixed numeric fields and actual observed
    counters. Current RowChannel is an in-process bounded contract, NOT an IPC

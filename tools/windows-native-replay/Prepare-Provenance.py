@@ -17,6 +17,7 @@ SOURCES = (
     "tools/windows-native-replay/child/src/main.rs",
     "tools/windows-native-replay/Invoke-BoundedReplay.ps1",
     "tools/windows-native-replay/Controller.cs",
+    "tools/windows-native-replay/HeldFiles.cs",
     "tools/windows-native-replay/Prepare-Provenance.py",
     "tools/windows-native-replay/Check-Source.py",
     "tools/windows-native-replay/selectors.json",
