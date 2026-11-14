@@ -1,3 +1,738 @@
+#[cfg(test)]
+macro_rules! drain_at {
+    ($role:ident,$out:expr,$err:expr,$pass:expr,$call:expr) => {{
+        diag::role(diag::Role::$role);
+        diag::totals($out, $err, $pass);
+        $call
+    }};
+}
+#[cfg(not(test))]
+macro_rules! drain_at {
+    ($role:ident,$out:expr,$err:expr,$pass:expr,$call:expr) => {{ $call }};
+}
+
+#[cfg(test)]
+macro_rules! diagnostic { ($($body:tt)*) => {{ $($body)* }}; }
+#[cfg(not(test))]
+macro_rules! diagnostic {
+    ($($body:tt)*) => {{}};
+}
+#[cfg(test)]
+macro_rules! stage {
+    ($stage:expr) => {{
+        if let Some(error) = diag::stage($stage) {
+            diag::capture(|| error, true, None);
+            diagnostic_snapshot();
+            return Err(Reason::ExecutionFailed);
+        }
+    }};
+}
+#[cfg(not(test))]
+macro_rules! stage {
+    ($($body:tt)*) => {{}};
+}
+#[cfg(test)]
+fn diagnostic_failure(valid: bool, wait: Option<u32>) {
+    diag::failure(
+        || unsafe { GetLastError() },
+        valid,
+        wait,
+        diagnostic_snapshot,
+    );
+}
+#[cfg(test)]
+fn diagnostic_snapshot() {
+    let (process, job) = diag::borrowed();
+    diag::enrich(|r| unsafe {
+        // Entry elapsed time remains missing: no added success-path clock API call.
+        let mut count = 0;
+        if GetProcessHandleCount(GetCurrentProcess(), &mut count) != 0 {
+            r.handles = Some(count);
+        }
+        if process != 0 {
+            let wait = WaitForSingleObject(process as HANDLE, 0);
+            if wait != WAIT_FAILED {
+                r.child_wait = Some(wait);
+            }
+            let mut code = 0;
+            if GetExitCodeProcess(process as HANDLE, &mut code) != 0 {
+                r.child_code = Some(code);
+            }
+        }
+        if job != 0 {
+            let mut a: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            if QueryInformationJobObject(
+                job as HANDLE,
+                JobObjectBasicAccountingInformation,
+                (&mut a as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of_val(&a) as u32,
+                null_mut(),
+            ) != 0
+            {
+                r.active = Some(a.ActiveProcesses);
+                r.total = Some(a.TotalProcesses);
+                r.terminated = Some(a.TotalTerminatedProcesses);
+            }
+            let mut v: JOBOBJECT_LIMIT_VIOLATION_INFORMATION = zeroed();
+            if QueryInformationJobObject(
+                job as HANDLE,
+                JobObjectLimitViolationInformation,
+                (&mut v as *mut JOBOBJECT_LIMIT_VIOLATION_INFORMATION).cast(),
+                size_of_val(&v) as u32,
+                null_mut(),
+            ) != 0
+            {
+                r.violation = Some(v.ViolationLimitFlags);
+            }
+        }
+    });
+}
+#[cfg(test)]
+fn run_ok(
+    context: diag::Context,
+    index: u32,
+    execution: &Execution,
+    r: &Request,
+    cancel: &Cancellation,
+) -> ResultData {
+    let _scope = diag::Scope::enter();
+    run_inner(execution, r, cancel, true)
+        .unwrap_or_else(|reason| panic!("{}", diag::line(context, index, reason, diag::record())))
+}
+
+#[cfg(test)]
+mod diag {
+    use super::Reason;
+    use std::cell::RefCell;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Stage {
+        DaemonTokenOpen,
+        DaemonTokenInfo,
+        ChildTokenOpen,
+        ChildTokenInfo,
+        PipeOutCreate,
+        PipeErrCreate,
+        PipeOutNoinherit,
+        PipeErrNoinherit,
+        JobCreate,
+        JobLimits,
+        JobUi,
+        NulOpen,
+        AttrSize,
+        AttrInit,
+        AttrUpdate,
+        CreateProcess,
+        AssignJob,
+        Resume,
+        LoopOutPeek,
+        LoopErrPeek,
+        LoopOutRead,
+        LoopErrRead,
+        FinalOutPeek,
+        FinalErrPeek,
+        FinalOutRead,
+        FinalErrRead,
+        Wait,
+        ExitCode,
+    }
+    impl Stage {
+        pub const ALL: [Self; 28] = [
+            Self::DaemonTokenOpen,
+            Self::DaemonTokenInfo,
+            Self::ChildTokenOpen,
+            Self::ChildTokenInfo,
+            Self::PipeOutCreate,
+            Self::PipeErrCreate,
+            Self::PipeOutNoinherit,
+            Self::PipeErrNoinherit,
+            Self::JobCreate,
+            Self::JobLimits,
+            Self::JobUi,
+            Self::NulOpen,
+            Self::AttrSize,
+            Self::AttrInit,
+            Self::AttrUpdate,
+            Self::CreateProcess,
+            Self::AssignJob,
+            Self::Resume,
+            Self::LoopOutPeek,
+            Self::LoopErrPeek,
+            Self::LoopOutRead,
+            Self::LoopErrRead,
+            Self::FinalOutPeek,
+            Self::FinalErrPeek,
+            Self::FinalOutRead,
+            Self::FinalErrRead,
+            Self::Wait,
+            Self::ExitCode,
+        ];
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::DaemonTokenOpen => "daemon_token_open",
+                Self::DaemonTokenInfo => "daemon_token_info",
+                Self::ChildTokenOpen => "child_token_open",
+                Self::ChildTokenInfo => "child_token_info",
+                Self::PipeOutCreate => "pipe_out_create",
+                Self::PipeErrCreate => "pipe_err_create",
+                Self::PipeOutNoinherit => "pipe_out_noinherit",
+                Self::PipeErrNoinherit => "pipe_err_noinherit",
+                Self::JobCreate => "job_create",
+                Self::JobLimits => "job_limits",
+                Self::JobUi => "job_ui",
+                Self::NulOpen => "nul_open",
+                Self::AttrSize => "attr_size",
+                Self::AttrInit => "attr_init",
+                Self::AttrUpdate => "attr_update",
+                Self::CreateProcess => "create_process",
+                Self::AssignJob => "assign_job",
+                Self::Resume => "resume",
+                Self::LoopOutPeek => "loop_out_peek",
+                Self::LoopErrPeek => "loop_err_peek",
+                Self::LoopOutRead => "loop_out_read",
+                Self::LoopErrRead => "loop_err_read",
+                Self::FinalOutPeek => "final_out_peek",
+                Self::FinalErrPeek => "final_err_peek",
+                Self::FinalOutRead => "final_out_read",
+                Self::FinalErrRead => "final_err_read",
+                Self::Wait => "wait",
+                Self::ExitCode => "exit_code",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub enum Context {
+        SlotReuse,
+        Unduplicable,
+        Tree,
+        Overflow,
+        Handles,
+        Cancel,
+        Shutdown,
+        Fresh,
+        Fail,
+        Echo,
+        Cwd,
+        Direct,
+        Leak,
+    }
+    impl Context {
+        fn label(self) -> &'static str {
+            match self {
+                Self::SlotReuse => "slot_reuse",
+                Self::Unduplicable => "unduplicable",
+                Self::Tree => "tree",
+                Self::Overflow => "overflow",
+                Self::Handles => "handles",
+                Self::Cancel => "cancel",
+                Self::Shutdown => "shutdown",
+                Self::Fresh => "fresh",
+                Self::Fail => "fail",
+                Self::Echo => "echo",
+                Self::Cwd => "cwd",
+                Self::Direct => "direct",
+                Self::Leak => "leak",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub enum Role {
+        Daemon,
+        Child,
+        Out,
+        Err,
+        LoopOut,
+        LoopErr,
+        FinalOut,
+        FinalErr,
+    }
+    #[derive(Clone, Copy)]
+    pub enum Op {
+        TokenOpen,
+        TokenInfo,
+        PipeCreate,
+        PipeNoinherit,
+        Peek,
+        Read,
+    }
+    pub fn resolve(role: Role, op: Op) -> Stage {
+        use {Op::*, Role::*};
+        match (role, op) {
+            (Daemon, TokenOpen) => Stage::DaemonTokenOpen,
+            (Daemon, TokenInfo) => Stage::DaemonTokenInfo,
+            (Child, TokenOpen) => Stage::ChildTokenOpen,
+            (Child, TokenInfo) => Stage::ChildTokenInfo,
+            (Out, PipeCreate) => Stage::PipeOutCreate,
+            (Err, PipeCreate) => Stage::PipeErrCreate,
+            (Out, PipeNoinherit) => Stage::PipeOutNoinherit,
+            (Err, PipeNoinherit) => Stage::PipeErrNoinherit,
+            (LoopOut, Peek) => Stage::LoopOutPeek,
+            (LoopOut, Read) => Stage::LoopOutRead,
+            (LoopErr, Peek) => Stage::LoopErrPeek,
+            (LoopErr, Read) => Stage::LoopErrRead,
+            (FinalOut, Peek) => Stage::FinalOutPeek,
+            (FinalOut, Read) => Stage::FinalOutRead,
+            (FinalErr, Peek) => Stage::FinalErrPeek,
+            (FinalErr, Read) => Stage::FinalErrRead,
+            _ => panic!("invalid diagnostic role"),
+        }
+    }
+    #[derive(Clone, Copy, Default)]
+    pub struct Record {
+        pub stage: Option<Stage>,
+        pub error: Option<u32>,
+        pub valid: bool,
+        pub wait: Option<u32>,
+        pub ms: Option<u64>,
+        pub out: Option<u64>,
+        pub err: Option<u64>,
+        pub pass: Option<u32>,
+        pub handles: Option<u32>,
+        pub child_wait: Option<u32>,
+        pub child_code: Option<u32>,
+        pub active: Option<u32>,
+        pub total: Option<u32>,
+        pub terminated: Option<u32>,
+        pub violation: Option<u32>,
+    }
+    #[derive(Default)]
+    struct State {
+        scoped: bool,
+        running: bool,
+        armed: Option<(Stage, u32)>,
+        captured: Option<Record>,
+        pending: Option<Stage>,
+        role: Option<Role>,
+        // Borrowed handles are excluded from Record and formatting.
+        process: usize,
+        job: usize,
+        out: Option<u64>,
+        err: Option<u64>,
+        pass: Option<u32>,
+        calls: u32,
+    }
+    thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
+    pub struct Scope(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Scope {
+        pub fn enter() -> Self {
+            STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                assert!(!s.scoped && !s.running, "nested diagnostic scope");
+                *s = State {
+                    scoped: true,
+                    ..State::default()
+                };
+            });
+            Self(std::marker::PhantomData)
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            STATE.with(|s| *s.borrow_mut() = State::default());
+        }
+    }
+    pub struct Invocation(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Invocation {
+        pub fn enter() -> Self {
+            STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                assert!(!s.running, "reentrant diagnostic invocation");
+                s.running = true;
+                s.captured = None;
+                s.pending = None;
+                s.role = None;
+                s.process = 0;
+                s.job = 0;
+                s.out = None;
+                s.err = None;
+                s.pass = None;
+                s.calls = 0;
+            });
+            Self(std::marker::PhantomData)
+        }
+    }
+    impl Drop for Invocation {
+        fn drop(&mut self) {
+            STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.scoped {
+                    s.running = false;
+                    s.pending = None;
+                    s.role = None;
+                    s.process = 0;
+                    s.job = 0;
+                    s.armed = None;
+                } else {
+                    *s = State::default();
+                }
+            });
+        }
+    }
+    #[allow(dead_code)] // Future separately authorized replay only; no native replay tests here.
+    pub fn arm(stage: Stage, error: u32) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            assert!(s.scoped && !s.running);
+            s.armed = Some((stage, error));
+        });
+    }
+    pub fn role(role: Role) {
+        STATE.with(|s| s.borrow_mut().role = Some(role));
+    }
+    pub fn operation(op: Op) -> Stage {
+        STATE.with(|s| resolve(s.borrow().role.expect("diagnostic role"), op))
+    }
+    pub fn stage(stage: Stage) -> Option<u32> {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.pending = Some(stage);
+            if s.running && s.armed.is_some_and(|a| a.0 == stage) {
+                s.armed.take().map(|a| a.1)
+            } else {
+                None
+            }
+        })
+    }
+    pub fn handles(process: usize, job: usize) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.process = process;
+            s.job = job;
+        });
+    }
+    pub fn borrowed() -> (usize, usize) {
+        STATE.with(|s| {
+            let s = s.borrow();
+            (s.process, s.job)
+        })
+    }
+    pub fn totals(out: u64, err: u64, pass: Option<u32>) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.out = Some(out);
+            s.err = Some(err);
+            s.pass = pass;
+        });
+    }
+    pub fn create_call() {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.calls = s.calls.saturating_add(1);
+        });
+    }
+    #[allow(dead_code)] // Available to future native assertions, no native proof earned here.
+    pub fn create_calls() -> u32 {
+        STATE.with(|s| s.borrow().calls)
+    }
+    pub fn capture(reader: impl FnOnce() -> u32, valid: bool, wait: Option<u32>) {
+        let error = reader(); // First, before TLS, snapshots or cleanup.
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.running && s.captured.is_none() {
+                s.captured = Some(Record {
+                    stage: s.pending,
+                    error: Some(error),
+                    valid,
+                    wait,
+                    ms: None,
+                    out: s.out,
+                    err: s.err,
+                    pass: s.pass,
+                    ..Record::default()
+                });
+            }
+        });
+    }
+    pub fn failure(
+        reader: impl FnOnce() -> u32,
+        valid: bool,
+        wait: Option<u32>,
+        observe: impl FnOnce(),
+    ) {
+        capture(reader, valid, wait);
+        observe();
+    }
+    pub fn enrich(f: impl FnOnce(&mut Record)) {
+        if let Some(mut r) = record() {
+            f(&mut r);
+            STATE.with(|s| s.borrow_mut().captured = Some(r));
+        }
+    }
+    pub fn record() -> Option<Record> {
+        STATE.with(|s| s.borrow().captured)
+    }
+    fn n<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map_or_else(|| "-".into(), |v| v.to_string())
+    }
+    pub fn line(context: Context, index: u32, reason: Reason, record: Option<Record>) -> String {
+        let r = if reason == Reason::ExecutionFailed {
+            record.unwrap_or_default()
+        } else {
+            Record::default()
+        };
+        format!(
+            "c={} r={} s={} i={} e={} v={} w={} ms={} o={} d={} p={} h={} cw={} cc={} ja={} jt={} jk={} jv={}",
+            context.label(),
+            reason.as_str(),
+            r.stage.map_or("-", Stage::label),
+            index,
+            n(r.error),
+            u8::from(r.valid),
+            n(r.wait),
+            n(r.ms),
+            n(r.out),
+            n(r.err),
+            n(r.pass),
+            n(r.handles),
+            n(r.child_wait),
+            n(r.child_code),
+            n(r.active),
+            n(r.total),
+            n(r.terminated),
+            n(r.violation)
+        )
+    }
+
+    #[cfg(test)]
+    mod pure {
+        use super::*;
+        // Independent accepted baseline inventory, not generated from Stage::ALL.
+        const MANIFEST: &[(u32, &[&str])] = &[
+            (64, &["daemon_token_info", "child_token_info"]),
+            (89, &["daemon_token_open", "child_token_open"]),
+            (221, &["job_create"]),
+            (231, &["job_limits"]),
+            (240, &["job_ui"]),
+            (286, &["pipe_out_create", "pipe_err_create"]),
+            (289, &["pipe_out_noinherit", "pipe_err_noinherit"]),
+            (
+                324,
+                &[
+                    "loop_out_peek",
+                    "loop_err_peek",
+                    "final_out_peek",
+                    "final_err_peek",
+                ],
+            ),
+            (
+                329,
+                &[
+                    "loop_out_read",
+                    "loop_err_read",
+                    "final_out_read",
+                    "final_err_read",
+                ],
+            ),
+            (414, &["nul_open"]),
+            (420, &["attr_size"]),
+            (423, &["attr_init"]),
+            (430, &["attr_update"]),
+            (448, &["create_process"]),
+            (471, &["assign_job"]),
+            (478, &["resume"]),
+            (508, &["wait"]),
+            (512, &["exit_code"]),
+        ];
+        fn mapping_valid(labels: &[&str]) -> bool {
+            let mut expected: Vec<_> = MANIFEST
+                .iter()
+                .flat_map(|(_, v)| v.iter().copied())
+                .collect();
+            let mut actual = labels.to_vec();
+            expected.sort();
+            actual.sort();
+            actual == expected
+        }
+        #[test]
+        fn independent_mapping_and_module_mutants() {
+            assert_eq!(MANIFEST.len(), 18);
+            let labels: Vec<_> = Stage::ALL.iter().map(|s| s.label()).collect();
+            assert!(mapping_valid(&labels));
+            for i in 0..labels.len() {
+                let mut deleted = labels.clone();
+                deleted.remove(i);
+                assert!(!mapping_valid(&deleted));
+                let mut mislabeled = labels.clone();
+                mislabeled[i] = "wrong";
+                assert!(!mapping_valid(&mislabeled));
+            }
+            assert_eq!(
+                resolve(Role::Daemon, Op::TokenOpen).label(),
+                "daemon_token_open"
+            );
+            assert_eq!(
+                resolve(Role::Daemon, Op::TokenInfo).label(),
+                "daemon_token_info"
+            );
+            assert_eq!(
+                resolve(Role::Child, Op::TokenOpen).label(),
+                "child_token_open"
+            );
+            assert_eq!(
+                resolve(Role::Child, Op::TokenInfo).label(),
+                "child_token_info"
+            );
+            assert_eq!(
+                resolve(Role::Out, Op::PipeCreate).label(),
+                "pipe_out_create"
+            );
+            assert_eq!(
+                resolve(Role::Err, Op::PipeCreate).label(),
+                "pipe_err_create"
+            );
+            assert_eq!(
+                resolve(Role::Out, Op::PipeNoinherit).label(),
+                "pipe_out_noinherit"
+            );
+            assert_eq!(
+                resolve(Role::Err, Op::PipeNoinherit).label(),
+                "pipe_err_noinherit"
+            );
+            assert_eq!(resolve(Role::LoopOut, Op::Peek).label(), "loop_out_peek");
+            assert_eq!(resolve(Role::LoopOut, Op::Read).label(), "loop_out_read");
+            assert_eq!(resolve(Role::LoopErr, Op::Peek).label(), "loop_err_peek");
+            assert_eq!(resolve(Role::LoopErr, Op::Read).label(), "loop_err_read");
+            assert_eq!(resolve(Role::FinalOut, Op::Peek).label(), "final_out_peek");
+            assert_eq!(resolve(Role::FinalOut, Op::Read).label(), "final_out_read");
+            assert_eq!(resolve(Role::FinalErr, Op::Peek).label(), "final_err_peek");
+            assert_eq!(resolve(Role::FinalErr, Op::Read).label(), "final_err_read");
+        }
+        #[test]
+        fn lifecycle_one_shot_unwind_and_counter() {
+            {
+                let _scope = Scope::enter();
+                arm(Stage::Resume, 55);
+                {
+                    let _run = Invocation::enter();
+                    assert!(record().is_none());
+                    assert_eq!(stage(Stage::Wait), None);
+                    assert_eq!(stage(Stage::Resume), Some(55));
+                    assert_eq!(stage(Stage::Resume), None);
+                    create_call();
+                    assert_eq!(create_calls(), 1);
+                    assert!(std::panic::catch_unwind(Invocation::enter).is_err());
+                    capture(|| 55, true, None);
+                    assert_eq!(record().unwrap().error, Some(55));
+                }
+                assert_eq!(record().unwrap().error, Some(55));
+                {
+                    let _run = Invocation::enter();
+                    assert!(record().is_none());
+                }
+            }
+            assert!(record().is_none());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _scope = Scope::enter();
+                    let _run = Invocation::enter();
+                    capture(|| 7, true, None);
+                    panic!("synthetic unwind");
+                })
+                .is_err()
+            );
+            assert!(record().is_none());
+            assert!(!STATE.with(|s| s.borrow().running));
+        }
+        #[test]
+        fn error_reader_precedes_mock_cleanup_and_preserves_first() {
+            let _scope = Scope::enter();
+            let _run = Invocation::enter();
+            stage(Stage::Wait);
+            let mock = std::cell::Cell::new(123u32);
+            failure(|| mock.get(), true, Some(u32::MAX), || mock.set(999)); // Pure mock cleanup/error clobber, no Win32 call.
+            capture(|| mock.get(), true, None);
+            assert_eq!(record().unwrap().error, Some(123));
+            assert_eq!(record().unwrap().wait, Some(u32::MAX));
+            assert_eq!(mock.get(), 999);
+        }
+        #[test]
+        fn complete_format_bounds_indices_validity_and_privacy() {
+            let max = Record {
+                stage: Some(Stage::PipeErrNoinherit),
+                error: Some(u32::MAX),
+                valid: true,
+                wait: Some(u32::MAX),
+                ms: Some(u64::MAX),
+                out: Some(u64::MAX),
+                err: Some(u64::MAX),
+                pass: Some(u32::MAX),
+                handles: Some(u32::MAX),
+                child_wait: Some(u32::MAX),
+                child_code: Some(u32::MAX),
+                active: Some(u32::MAX),
+                total: Some(u32::MAX),
+                terminated: Some(u32::MAX),
+                violation: Some(u32::MAX),
+            };
+            for stage in Stage::ALL {
+                for context in [
+                    Context::SlotReuse,
+                    Context::Unduplicable,
+                    Context::Tree,
+                    Context::Overflow,
+                    Context::Handles,
+                    Context::Cancel,
+                    Context::Shutdown,
+                    Context::Fresh,
+                    Context::Fail,
+                    Context::Echo,
+                    Context::Cwd,
+                    Context::Direct,
+                    Context::Leak,
+                ] {
+                    let line = line(
+                        context,
+                        u32::MAX,
+                        Reason::ExecutionFailed,
+                        Some(Record {
+                            stage: Some(stage),
+                            ..max
+                        }),
+                    );
+                    assert!(line.len() <= 384, "{} {}", line.len(), line);
+                    assert!(line.contains("i=4294967295 e=4294967295 v=1"));
+                }
+            }
+            for index in [3, 7] {
+                assert_eq!(
+                    line(Context::Leak, index, Reason::ExecutionFailed, None),
+                    format!(
+                        "c=leak r=execution_failed s=- i={index} e=- v=0 w=- ms=- o=- d=- p=- h=- cw=- cc=- ja=- jt=- jk=- jv=-"
+                    )
+                );
+            }
+            for reason in [
+                Reason::InvalidArguments,
+                Reason::IdentityMismatch,
+                Reason::CleanupUnconfirmed,
+            ] {
+                let text = line(Context::Leak, 7, reason, Some(max));
+                assert!(text.contains(&format!("r={} s=- i=7 e=- v=0", reason.as_str())));
+            }
+            let text = line(
+                Context::Unduplicable,
+                7,
+                Reason::ExecutionFailed,
+                Some(Record {
+                    valid: false,
+                    ..max
+                }),
+            );
+            assert!(text.contains("v=0"));
+            // Synthetic private payloads cannot be supplied to this typed interface.
+            for payload in [
+                r"C:\private\sentinel",
+                "--secret-argv",
+                "S-1-5-21-SECRET",
+                "ENV_SECRET=abc",
+                "raw-output-secret",
+                "0xdeadbeef",
+                "Local\\private-event",
+            ] {
+                assert!(!text.contains(payload));
+            }
+        }
+    }
+}
 use super::*;
 use std::{
     ffi::c_void,
@@ -22,6 +757,7 @@ impl Drop for Handle {
 }
 fn ok(n: i32) -> std::result::Result<(), Reason> {
     if n == 0 {
+        diagnostic!(diagnostic_failure(true, None));
         Err(Reason::ExecutionFailed)
     } else {
         Ok(())
@@ -61,6 +797,7 @@ unsafe fn info(
             return Err(Reason::PreflightFailed);
         }
         let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+        stage!(diag::operation(diag::Op::TokenInfo));
         ok(GetTokenInformation(
             token,
             class,
@@ -86,6 +823,7 @@ unsafe fn sid_bytes(s: PSID) -> std::result::Result<Vec<u8>, Reason> {
 fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
     unsafe {
         let mut token = null_mut();
+        stage!(diag::operation(diag::Op::TokenOpen));
         ok(OpenProcessToken(process, TOKEN_QUERY, &mut token))?;
         let token = Handle(token);
         let u = info(token.0, TokenUser)?;
@@ -132,6 +870,7 @@ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
     }
 }
 pub(super) fn preflight() -> std::result::Result<(), Reason> {
+    diagnostic!(diag::role(diag::Role::Daemon));
     let f = facts(unsafe { GetCurrentProcess() })?;
     policy(&f).map_err(|_| Reason::PreflightFailed)
 }
@@ -216,11 +955,14 @@ impl Drop for Job {
 impl Job {
     fn new(l: &Limits) -> std::result::Result<Self, Reason> {
         unsafe {
+            stage!(diag::Stage::JobCreate);
             let h = CreateJobObjectW(null(), null());
             if h.is_null() {
+                diagnostic!(diagnostic_failure(true, None));
                 return Err(Reason::ExecutionFailed);
             }
             let job = Self(Handle(h));
+            diagnostic!(diag::handles(0, h as usize));
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                 | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
@@ -228,6 +970,7 @@ impl Job {
                 | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
             limits.BasicLimitInformation.ActiveProcessLimit = l.pids;
             limits.JobMemoryLimit = l.memory_bytes;
+            stage!(diag::Stage::JobLimits);
             ok(SetInformationJobObject(
                 h,
                 JobObjectExtendedLimitInformation,
@@ -237,6 +980,7 @@ impl Job {
             let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
                 UIRestrictionsClass: 0xff, /* all eight UI limits */
             };
+            stage!(diag::Stage::JobUi);
             ok(SetInformationJobObject(
                 h,
                 JobObjectBasicUIRestrictions,
@@ -283,9 +1027,11 @@ fn pipe() -> std::result::Result<(Handle, Handle), Reason> {
             bInheritHandle: 1,
         };
         let (mut r, mut w) = (null_mut(), null_mut());
+        stage!(diag::operation(diag::Op::PipeCreate));
         ok(CreatePipe(&mut r, &mut w, &sa, 0))?;
         let r = Handle(r);
         let w = Handle(w);
+        stage!(diag::operation(diag::Op::PipeNoinherit));
         ok(SetHandleInformation(r.0, HANDLE_FLAG_INHERIT, 0))?;
         Ok((r, w))
     }
@@ -317,15 +1063,26 @@ impl Captured {
 fn drain(h: HANDLE, c: &mut Captured, limit: usize) -> std::result::Result<bool, Reason> {
     unsafe {
         let mut available = 0;
-        if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
-            if GetLastError() == ERROR_BROKEN_PIPE {
+        #[cfg(test)]
+        if let Some(error) = diag::stage(diag::operation(diag::Op::Peek)) {
+            if error == ERROR_BROKEN_PIPE {
                 return Ok(c.total > limit as u64);
             }
+            diag::failure(|| error, true, None, diagnostic_snapshot);
+            return Err(Reason::ExecutionFailed);
+        }
+        if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
+            let error = GetLastError();
+            if error == ERROR_BROKEN_PIPE {
+                return Ok(c.total > limit as u64);
+            }
+            diagnostic!(diag::failure(|| error, true, None, diagnostic_snapshot));
             return Err(Reason::ExecutionFailed);
         }
         if available > 0 {
             let mut b = [0u8; 4096];
             let mut n = 0;
+            stage!(diag::operation(diag::Op::Read));
             ok(ReadFile(
                 h,
                 b.as_mut_ptr(),
@@ -362,8 +1119,13 @@ fn run_inner(
     cancel: &Cancellation,
     fixture: bool,
 ) -> std::result::Result<ResultData, Reason> {
+    #[cfg(test)]
+    let _invocation = diag::Invocation::enter();
     #[cfg_attr(not(test), allow(unused_mut))]
-    let mut daemon = facts(unsafe { GetCurrentProcess() })?;
+    let mut daemon = {
+        diagnostic!(diag::role(diag::Role::Daemon));
+        facts(unsafe { GetCurrentProcess() })?
+    };
     // The only bypass is a unit-test call; no binary/config/CLI can select it.
     if !(cfg!(test) && fixture) {
         policy(&daemon).map_err(|_| Reason::PreflightFailed)?;
@@ -392,7 +1154,9 @@ fn run_inner(
     if command.len() > 32767 {
         return Err(Reason::InvalidArguments);
     }
+    diagnostic!(diag::role(diag::Role::Out));
     let (out_r, out_w) = pipe()?;
+    diagnostic!(diag::role(diag::Role::Err));
     let (err_r, err_w) = pipe()?;
     let job = Job::new(&settings.limits)?;
     unsafe {
@@ -401,6 +1165,7 @@ fn run_inner(
             lpSecurityDescriptor: null_mut(),
             bInheritHandle: 1,
         };
+        stage!(diag::Stage::NulOpen);
         let nul = Handle(CreateFileW(
             wide(std::ffi::OsStr::new("NUL")).as_ptr(),
             GENERIC_READ,
@@ -411,15 +1176,19 @@ fn run_inner(
             null_mut(),
         ));
         if nul.0 == INVALID_HANDLE_VALUE {
+            diagnostic!(diagnostic_failure(true, None));
             return Err(Reason::ExecutionFailed);
         }
         let mut handles = [nul.0, out_w.0, err_w.0];
         let mut size = 0;
+        stage!(diag::Stage::AttrSize);
         InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
         if size == 0 || size > 65536 {
+            diagnostic!(diagnostic_failure(false, None));
             return Err(Reason::ExecutionFailed);
         }
         let mut buf = vec![0usize; size.div_ceil(size_of::<usize>())];
+        stage!(diag::Stage::AttrInit);
         ok(InitializeProcThreadAttributeList(
             buf.as_mut_ptr().cast(),
             1,
@@ -427,6 +1196,7 @@ fn run_inner(
             &mut size,
         ))?;
         let mut attributes = Attributes { buf };
+        stage!(diag::Stage::AttrUpdate);
         ok(UpdateProcThreadAttribute(
             attributes.buf.as_mut_ptr().cast(),
             0,
@@ -445,6 +1215,8 @@ fn run_inner(
         startup.lpAttributeList = attributes.buf.as_mut_ptr().cast();
         let mut pi: PROCESS_INFORMATION = zeroed();
         let env = environment(settings);
+        stage!(diag::Stage::CreateProcess);
+        diagnostic!(diag::create_call());
         ok(CreateProcessW(
             wide(exe.as_os_str()).as_ptr(),
             command.as_mut_ptr(),
@@ -462,19 +1234,26 @@ fn run_inner(
         ))?;
         let process = Handle(pi.hProcess);
         let thread = Handle(pi.hThread);
+        diagnostic!(diag::handles(process.0 as usize, job.0.0 as usize));
         drop(out_w);
         drop(err_w);
         drop(nul);
         let result = (|| {
+            stage!(diag::Stage::AssignJob);
             if AssignProcessToJobObject(job.0.0, process.0) == 0 {
+                diagnostic!(diag::capture(|| GetLastError(), true, None));
                 TerminateProcess(process.0, 1);
+                diagnostic!(diagnostic_snapshot());
                 return Err(Reason::ExecutionFailed);
             }
+            diagnostic!(diag::role(diag::Role::Child));
             let child = facts(process.0)?;
             if child.user != daemon.user || (!(cfg!(test) && fixture) && policy(&child).is_err()) {
                 return Err(Reason::IdentityMismatch);
             }
+            stage!(diag::Stage::Resume);
             if ResumeThread(thread.0) == u32::MAX {
+                diagnostic!(diagnostic_failure(true, None));
                 return Err(Reason::ExecutionFailed);
             }
             let start = Instant::now();
@@ -482,9 +1261,19 @@ fn run_inner(
             let mut stderr = Captured::default();
             let mut reason = StopReason::Exited;
             loop {
-                if drain(out_r.0, &mut stdout, r.output_bytes)?
-                    || drain(err_r.0, &mut stderr, r.output_bytes)?
-                {
+                if drain_at!(
+                    LoopOut,
+                    stdout.total,
+                    stderr.total,
+                    None,
+                    drain(out_r.0, &mut stdout, r.output_bytes)
+                )? || drain_at!(
+                    LoopErr,
+                    stdout.total,
+                    stderr.total,
+                    None,
+                    drain(err_r.0, &mut stderr, r.output_bytes)
+                )? {
                     reason = StopReason::OutputLimit;
                     break;
                 }
@@ -500,24 +1289,38 @@ fn run_inner(
                     reason = StopReason::Timeout;
                     break;
                 }
+                stage!(diag::Stage::Wait);
                 let wait = WaitForSingleObject(process.0, 10);
                 if wait == WAIT_OBJECT_0 {
                     break;
                 }
                 if wait != WAIT_TIMEOUT {
+                    diagnostic!(diagnostic_failure(wait == WAIT_FAILED, Some(wait)));
                     return Err(Reason::ExecutionFailed);
                 }
             }
             let mut code = 0;
+            stage!(diag::Stage::ExitCode);
             ok(GetExitCodeProcess(process.0, &mut code))?;
             let cleanup = job.stop();
             if !cleanup {
                 return Err(Reason::CleanupUnconfirmed);
             }
             // Bounded final read: pipes cannot hold us open, even if a handle escaped.
-            for _ in 0..32 {
-                let overflow = drain(out_r.0, &mut stdout, r.output_bytes)?
-                    | drain(err_r.0, &mut stderr, r.output_bytes)?;
+            for _pass in 0..32 {
+                let overflow = drain_at!(
+                    FinalOut,
+                    stdout.total,
+                    stderr.total,
+                    Some(_pass),
+                    drain(out_r.0, &mut stdout, r.output_bytes)
+                )? | drain_at!(
+                    FinalErr,
+                    stdout.total,
+                    stderr.total,
+                    Some(_pass),
+                    drain(err_r.0, &mut stderr, r.output_bytes)
+                )?;
                 if overflow && reason == StopReason::Exited {
                     reason = StopReason::OutputLimit;
                 }
@@ -805,7 +1608,13 @@ pub(crate) mod tests {
         e.settings
             .environment
             .insert("ARX_UNIT_REUSE".into(), "1".into());
-        let result = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        let result = run_ok(
+            diag::Context::SlotReuse,
+            0,
+            &e,
+            &r,
+            &Cancellation::default(),
+        );
         assert!(result.cleanup_confirmed && result.matches_current_user);
         assert_eq!(result.stop_reason, StopReason::Exited);
         assert_eq!(result.exit_code, Some(0), "stderr={}", result.stderr);
@@ -823,7 +1632,13 @@ pub(crate) mod tests {
         e.settings
             .environment
             .insert("ARX_UNIT_UNDUPLICABLE".into(), "1".into());
-        let result = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        let result = run_ok(
+            diag::Context::Unduplicable,
+            0,
+            &e,
+            &r,
+            &Cancellation::default(),
+        );
         assert!(result.cleanup_confirmed && result.matches_current_user);
         assert_eq!(result.stop_reason, StopReason::Exited);
         assert_eq!(result.exit_code, Some(0), "stderr={}", result.stderr);
@@ -875,8 +1690,20 @@ pub(crate) mod tests {
             if action == "shutdown" {
                 e.shutdown.cancel();
             }
-            let result =
-                run_inner(&e, &r, &cancel, true).unwrap_or_else(|r| panic!("{action}: {r:?}"));
+            let result = run_ok(
+                match action {
+                    "tree" => diag::Context::Tree,
+                    "overflow" => diag::Context::Overflow,
+                    "handles" => diag::Context::Handles,
+                    "cancel" => diag::Context::Cancel,
+                    "shutdown" => diag::Context::Shutdown,
+                    _ => unreachable!(),
+                },
+                0,
+                &e,
+                &r,
+                &cancel,
+            );
             assert!(result.cleanup_confirmed);
             assert!(result.matches_current_user);
             let expected = match action {
@@ -944,7 +1771,13 @@ pub(crate) mod tests {
         assert_eq!(e.capability()["reason"], "quarantined");
         // Control: the same settings without the fault run the child to completion.
         let fresh = fixture_execution(e.settings.clone());
-        let done = run_inner(&fresh, &r, &Cancellation::default(), true).unwrap();
+        let done = run_ok(
+            diag::Context::Fresh,
+            0,
+            &fresh,
+            &r,
+            &Cancellation::default(),
+        );
         assert_eq!(done.exit_code, Some(0));
         assert!(touched.exists());
         assert!(!fresh.quarantined.load(Ordering::Acquire));
@@ -953,17 +1786,17 @@ pub(crate) mod tests {
     fn results_count_dropped_output_and_report_nonzero_exit() {
         let (_dir, e, mut r) = fixture("overflow");
         r.output_bytes = 100;
-        let o = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        let o = run_ok(diag::Context::Overflow, 0, &e, &r, &Cancellation::default());
         assert_eq!(o.stop_reason, StopReason::OutputLimit);
         assert_eq!(o.exit_code, None);
         assert!(o.stdout.len() <= 100 && o.stdout_dropped_bytes > 0);
         assert_eq!(o.stderr_dropped_bytes, 0);
         let (_dir, e, r) = fixture("fail");
-        let o = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        let o = run_ok(diag::Context::Fail, 0, &e, &r, &Cancellation::default());
         assert_eq!((o.stop_reason, o.exit_code), (StopReason::Exited, Some(7)));
         assert_eq!(outcome(&o), Outcome::Failed);
         let (_dir, e, r) = fixture("echo");
-        let o = run_inner(&e, &r, &Cancellation::default(), true).unwrap();
+        let o = run_ok(diag::Context::Echo, 0, &e, &r, &Cancellation::default());
         assert!(o.stdout.contains("ARX-ECHO-MARKER <workspace>"));
         assert!(o.stdout.contains("<sid>") && !o.stdout.contains("S-1-5-21"));
         let root = e.settings.workspace.to_string_lossy().to_ascii_lowercase();
@@ -1006,7 +1839,7 @@ pub(crate) mod tests {
         // so each refusal below is caused by the reparse component alone.
         let mut good = r.clone();
         good.cwd = "outside\\sub".into();
-        let ok = run_inner(&e, &good, &Cancellation::default(), true).unwrap();
+        let ok = run_ok(diag::Context::Cwd, 0, &e, &good, &Cancellation::default());
         assert_eq!(
             (ok.stop_reason, ok.exit_code),
             (StopReason::Exited, Some(0))
@@ -1051,7 +1884,7 @@ pub(crate) mod tests {
         via.settings
             .environment
             .insert("PATH".into(), tools.to_str().unwrap().into());
-        let direct = run_inner(&via, &r, &Cancellation::default(), true).unwrap();
+        let direct = run_ok(diag::Context::Direct, 0, &via, &r, &Cancellation::default());
         assert_eq!(direct.exit_code, Some(0));
         // Pre-spawn refusals never quarantine: nothing was started.
         assert!(!e.quarantined.load(Ordering::Acquire));
@@ -1065,11 +1898,10 @@ pub(crate) mod tests {
         unsafe {
             assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut before), 0);
         }
-        for _ in 0..8 {
+        for index in 0..8 {
             let (_dir, e, r) = fixture("overflow");
             assert!(
-                run_inner(&e, &r, &Cancellation::default(), true)
-                    .unwrap()
+                run_ok(diag::Context::Leak, index, &e, &r, &Cancellation::default())
                     .cleanup_confirmed
             );
         }
