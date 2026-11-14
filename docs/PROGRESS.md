@@ -2,7 +2,9 @@
 
 ## Current state - 2026-11-14
 
-- Last merged PR68 `47ff894f27f9a9275b320ad2da519e70e6117349`, 2026-11-14 00:36:00Z. Squash tree equals independently reviewed `13e03ce`; all five required checks passed. Its first PR CI attempt `43533996953` succeeded in 572s. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass. Main-after-PR68 run `43535275394` is pending and tracked explicitly.
+- S2b local source `efe8e55` and evidence `a7d445c` by Sol medium are ready for Opus high review. Builder fmt/workspace all-target Clippy, focus/inventory checks and final 392 passed / 3 skipped are credited at source. Three portable mutants compiled and failed intended assertions with exact restoration. Linux U-a execution plus drop-store and Group-forgotten mutants remain unrun and required; no native credit or publication yet. Production inactive, real-Runner PA6 OPEN, M2 incomplete.
+
+- Last merged PR68 `47ff894f27f9a9275b320ad2da519e70e6117349`, 2026-11-14 00:36:00Z. Squash tree equals independently reviewed `13e03ce`; all five required checks passed. Its first PR CI attempt `43533996953` succeeded in 572s. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass. Main-after-PR68 run `43535275394` passed attempt 1 in 577s (2026-11-14 00:36:03-00:45:40Z), verified from first-attempt API metadata.
 - S2a inactive panic-path containment latch is merged. S2b local real-Group Drop/bridge decomposition and distinct pre-admitted readiness/residue gate tests are next on this merged base, following the accepted proposal. Real-Runner PA6 remains OPEN; no root/cgroupfs proof, A13 acceptance, experiment or activation is authorized.
 - Main-after-PR67 run `43533088974` passed attempt 1 in 674s (2026-11-14 00:16:39-00:27:53Z), verified through first-attempt API metadata. M2 remains incomplete; production remains MechanismUnavailable. Native, installed and dedicated paths are **unverified on real hardware**. Historical privacy flake, E_PROTECTION and ExecutionFailed remain unknown without fix or retry.
 
