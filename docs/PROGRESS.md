@@ -2,6 +2,14 @@
 
 ## Current state - 2026-11-14
 
+- Last merged PR72 `e3f70ef56007ce689d58e4c7fe024e456a80d997`, 2026-11-14 03:00:41Z. Squash tree equals independently reviewed `ea5ff86`; all five required checks passed. First PR CI attempt `43548468237` succeeded in 507s. Main-after-PR72 run `43549344532` is in progress and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- F0b bounded conditional refusal transport is integrated; source review requested test/evidence corrections, then recheck closed both blockers. Final evidence: 66 selected safe tests, 23 legacy and 36 F0b assertion kills, four equivalents, 757/2447-byte bounds. Real-record replay and real-Runner PA6 remain OPEN; no experiment/native acceptance or activation.
+- Prior main71 Windows failure `43545244266` remains unresolved: ExecutionFailed in overflow-fixture handle loop, no stage/error trace. New green PR CI is not a diagnosis or fix; no rerun was issued. Corrected Windows diagnostic proposal remains unaccepted pending Grok 4.7 high recheck.
+- Owner routing: Sol continues implementation automatically if Opus reaches usage limits; use Muse or Grok for independent review. Cross-provider merge gates stay required. F2 undispatched; no historical retry. M2 incomplete; production MechanismUnavailable and hardware paths **unverified on real hardware**.
+
+## Historical checkpoint before F0b merge
+
+
 - F0b clean publication is based on merged PR71 `a9ec0ac`, without Windows diagnostic docs. Source `b59410f` (retained `2333e1b`) and test-only correction `d649f6c` (retained `36b1d6d`) pass Opus high source review/recheck `0c3aa33` / `04c49c0` (retained `b71cd2c` / `ca9a96e`), no blockers. Local 66 selected tests, 23 legacy kills, 36 F0b kills and four equivalents are exact-pin evidence; no CLI/native credit. Sizes 757/2447 bytes. Coordinator publishes for exact-head review and normal CI; main Windows ExecutionFailed remains unresolved with no rerun. F2 undispatched, real-record replay/real-Runner PA6 OPEN, M2 incomplete and hardware paths **unverified on real hardware**.
 
 - Required-CI F0 discovery correction `a6f7605` (retained `4bc26ac`) passes Opus high review `0d14a00` (retained `b6d40c2`), no blockers. Exact command passed 47 tests in bash and pwsh; workflow Node checks 3/3. Coordinator publishes only the single-pattern CI change plus supporting review/progress; F0b design is kept on a separate local branch and queued for Sol high review. Hosted checks remain required; no experiment authority.
