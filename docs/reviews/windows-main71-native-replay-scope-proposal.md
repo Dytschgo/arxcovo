@@ -88,30 +88,36 @@ described below. All requests use timeout_s=1, output_bytes=8192, pids=16,
 memory_bytes=512 MiB, fresh cancellation and fresh Execution. Error 55 is a
 chosen synthetic error, never a reported kernel result.
 
-| Origin / API | Required labels (one error-55 case each) | Deterministic route / input | Actual create calls per case |
-| --- | --- | --- | --- |
-| 89 OpenProcessToken | daemon_token_open | first daemon facts, before policy/spawn | 0 |
-| 64 GetTokenInformation | daemon_token_info | daemon facts, first info call | 0 |
-| 286 CreatePipe | pipe_out_create, pipe_err_create | valid owned cwd/tool; out then err pipe | 0 |
-| 289 SetHandleInformation | pipe_out_noinherit, pipe_err_noinherit | respective pipe created, noinherit marker | 0 |
-| 221 CreateJobObjectW | job_create | both pipes ready | 0 |
-| 231 SetInformationJobObject | job_limits | unnamed Job created | 0 |
-| 240 SetInformationJobObject | job_ui | memory/process/kill limits installed | 0 |
-| 414 CreateFileW | nul_open | Job ready, before NUL open | 0 |
-| 420 attribute-size predicate | attr_size | before size probe; e=55, v=0, w=- | 0 |
-| 423 InitializeProcThreadAttributeList | attr_init | bounded valid size obtained | 0 |
-| 430 UpdateProcThreadAttribute | attr_update | list initialized | 0 |
-| 448 CreateProcessW | create_process | handle list ready, injection before actual counter/API | 0 |
-| 471 AssignProcessToJobObject | assign_job | S created suspended, not assigned; outer termination required | 1 |
-| 89 OpenProcessToken | child_token_open | S suspended and assigned, before token open | 1 |
-| 64 GetTokenInformation | child_token_info | S suspended and assigned, first child info | 1 |
-| 478 ResumeThread | resume | S suspended, assigned, identity equality/policy passed | 1 |
-| 324 PeekNamedPipe | loop_out_peek, loop_err_peek | S resumed; L prefill at first loop pair; out below limit so err reachable | 1 |
-| 329 ReadFile | loop_out_read, loop_err_read | L prefill; actual corresponding peek must report >=1 byte | 1 |
-| 508 WaitForSingleObject | wait | S resumed, empty successful loop drains; no cancel/shutdown/overflow; injection before first wait, w=4294967295 v=1 | 1 |
-| 512 GetExitCodeProcess | exit_code | S resumed; normal wait-exit or bounded request timeout reaches marker | 1 |
-| 324 PeekNamedPipe | final_out_peek, final_err_peek | successful loop, exit-code and confirmed Job stop; F prefill at pass 0 | 1 |
-| 329 ReadFile | final_out_read, final_err_read | F prefill after confirmed stop; actual corresponding peek >=1 byte | 1 |
+| Origin / API | Required label | Deterministic route / input | Actual create calls | Pass | Pre-read stdout | Pre-read stderr |
+| --- | --- | --- | ---: | --- | ---: | ---: |
+| 89 OpenProcessToken | daemon_token_open | first daemon facts, before policy/spawn | 0 | missing | missing | missing |
+| 64 GetTokenInformation | daemon_token_info | daemon facts, first info call | 0 | missing | missing | missing |
+| 286 CreatePipe | pipe_out_create | valid owned cwd/tool; out then err pipe | 0 | missing | missing | missing |
+| 286 CreatePipe | pipe_err_create | valid owned cwd/tool; out then err pipe | 0 | missing | missing | missing |
+| 289 SetHandleInformation | pipe_out_noinherit | respective pipe created, noinherit marker | 0 | missing | missing | missing |
+| 289 SetHandleInformation | pipe_err_noinherit | respective pipe created, noinherit marker | 0 | missing | missing | missing |
+| 221 CreateJobObjectW | job_create | both pipes ready | 0 | missing | missing | missing |
+| 231 SetInformationJobObject | job_limits | unnamed Job created | 0 | missing | missing | missing |
+| 240 SetInformationJobObject | job_ui | memory/process/kill limits installed | 0 | missing | missing | missing |
+| 414 CreateFileW | nul_open | Job ready, before NUL open | 0 | missing | missing | missing |
+| 420 attribute-size predicate | attr_size | before size probe; e=55, v=0, w=- | 0 | missing | missing | missing |
+| 423 InitializeProcThreadAttributeList | attr_init | bounded valid size obtained | 0 | missing | missing | missing |
+| 430 UpdateProcThreadAttribute | attr_update | list initialized | 0 | missing | missing | missing |
+| 448 CreateProcessW | create_process | handle list ready, injection before actual counter/API | 0 | missing | missing | missing |
+| 471 AssignProcessToJobObject | assign_job | S created suspended, not assigned; outer termination required | 1 | missing | missing | missing |
+| 89 OpenProcessToken | child_token_open | S suspended and assigned, before token open | 1 | missing | missing | missing |
+| 64 GetTokenInformation | child_token_info | S suspended and assigned, first child info | 1 | missing | missing | missing |
+| 478 ResumeThread | resume | S suspended, assigned, identity equality/policy passed | 1 | missing | missing | missing |
+| 324 PeekNamedPipe | loop_out_peek | S resumed; L prefill at first loop pair; out below limit so err reachable | 1 | missing | 0 | 0 |
+| 324 PeekNamedPipe | loop_err_peek | S resumed; L prefill at first loop pair; out below limit so err reachable | 1 | missing | 1 | 0 |
+| 329 ReadFile | loop_out_read | L prefill; actual corresponding peek must report >=1 byte | 1 | missing | 0 | 0 |
+| 329 ReadFile | loop_err_read | L prefill; actual corresponding peek must report >=1 byte | 1 | missing | 1 | 0 |
+| 508 WaitForSingleObject | wait | S resumed, empty successful loop drains; no cancel/shutdown/overflow; injection before first wait, w=4294967295 v=1 | 1 | missing | 0 | 0 |
+| 512 GetExitCodeProcess | exit_code | S resumed; normal wait-exit or bounded request timeout reaches marker | 1 | missing | 0 | 0 |
+| 324 PeekNamedPipe | final_out_peek | successful loop, exit-code and confirmed Job stop; F prefill at pass 0 | 1 | 0 | 0 | 0 |
+| 324 PeekNamedPipe | final_err_peek | successful loop, exit-code and confirmed Job stop; F prefill at pass 0 | 1 | 0 | 1 | 0 |
+| 329 ReadFile | final_out_read | F prefill after confirmed stop; actual corresponding peek >=1 byte | 1 | 0 | 0 | 0 |
+| 329 ReadFile | final_err_read | F prefill after confirmed stop; actual corresponding peek >=1 byte | 1 | 0 | 1 | 0 |
 
 There are 14 zero-create cases, four suspended-child cases and ten resumed-child
 cases. That totals **28 cases / 14 children**, not 28 children. Every earlier
@@ -491,8 +497,9 @@ literal 28-row table, never derived from captured records or selectors):
 | final_out_peek, final_out_read | 0 | 0 | 0 |
 | final_err_peek, final_err_read | 0 | 1 | 0 |
 
-The other twenty error-55 rows have missing pass/totals because no drain
-snapshot is supplied there. Each peek109/control row has no failure record
+The eighteen error-55 rows through resume have missing pass/totals.
+Wait and exit_code retain the prior empty loop snapshot: pass missing,
+stdout/stderr totals 0/0. Missing is None, never numeric zero. Each peek109/control row has no failure record
 and final successful stream totals 1/1, no drops. A later authorized build
 must reject any mismatch rather than regenerating this oracle from output.
 All prefill bytes are X; expected totals are defined by deterministic single

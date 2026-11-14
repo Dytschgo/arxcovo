@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Grok recheck `b2676a4` (retained `0872975`) passed Standards/security but found wait/exit_code oracle totals and missing table columns. Coordinator corrected those rows to pass=None, totals=0/0, and expanded the table into 28 explicit labels with pass/totals columns. Eighteen pre-drain rows remain all missing. Proposal remains unaccepted pending narrow recheck; no code/run authority.
+
 - Grok scope review `b0b4581` (retained `d63ae19`) requested five Windows native-replay contract corrections. Sol medium specified independent pass/totals oracle, surviving consumption/resume counters, exact helper-only PATH/hash, duplicate-before-drop ordering and fresh Execution per row. Gate 2 now excludes all native test registration/discovery. Proposal unaccepted; controller/environment and measured budget remain OPEN; fresh independent recheck is next. No code or native run authorized.
 
 - Bounded Windows native-replay scope proposal `d863c10` (retained `88986fa`) by Sol high is under Grok high independent review. It grants no execution, implementation or discovery authority. Deterministic 28-label fixture/controller safety, exact pins and native CI budget remain design gates; review completion is awaited. M2 incomplete, cause unknown, hardware paths **unverified on real hardware**.
