@@ -88,3 +88,46 @@ Safe mutation verification: `python -I tools/unix-exec-validation/mutation_check
 It executes the real mutated driver functions through the same mocked regressions,
 never provisioning accounts, services or real cgroups. Ordinary CI also runs the
 pure tests; the manual workflow guards, pins and default-off variable are unchanged.
+
+
+### F0 local artifact/replay mechanism (no dispatch authorization)
+
+`protected(path, site)` uses 13 fixed call-site tokens. The shared pure
+`decide(triples)` preserves the historical link / owner-zero / write-mask
+predicate and conjunct order. Regular files remain permitted. Triples are
+ordered; a record must end at its first refusal. At most 32 observations per
+refusal are retained; overflow refuses rather than producing truncated evidence.
+
+`replay(line)` accepts only an ASCII JSON line including its newline within
+4096 bytes, with exact schema/version and fields. Duplicate fields, invalid
+types, unknown tokens, inconsistent predecessor/refusal order and oversized
+input/output are refused. Provenance carries matching reviewed source/workflow
+SHAs and bounded decimal run/attempt association inside that same line. This
+association is supplied by the existing gates, not cryptographic attestation.
+
+The outer `run` entry emits one validated line with separate first/final
+exceptions, conservative mutation boundary and cleanup disposition. Arbitrary
+exceptions become `E_RUNTIME` without formatting their payloads. Cleanup still
+fails closed; an unconfirmed environment cannot be reused. Existing workflow
+fences and subprocess output suppression are unchanged.
+
+Limit: internal service/harness/fixture-check processes do not transport their
+structured exceptions to the outer process. Their suppressed failures remain
+an outer generic error, not a fabricated protection trace. Mutation reports the
+outer attempted staging/service boundary, not proof of account/cgroup progress.
+Those transport/observation questions need fresh independent review before any
+future diagnostic proposal. No native contract compatibility is established.
+
+Safe synthetic mechanism tests (no filesystem observations, native commands,
+provisioning or system driver execution):
+
+```
+python -I -B -c "import sys,unittest; sys.path.insert(0,'tools/unix-exec-validation'); import test_driver; r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.F0Mechanism)); sys.exit(not r.wasSuccessful())"
+```
+
+No retained real refusal line exists. The real-record replay gate remains
+OPEN; synthetic tests are mechanism evidence only. No hypothesis, historical
+reproduction, fix, retry or dispatch is claimed. A new source SHA does not
+authorize an experiment. Fresh Opus high security review, parent merge/repin
+and normal gates are required before publication. M2 remains incomplete,
+real-Runner PA6 OPEN, and hardware paths **unverified on real hardware**.

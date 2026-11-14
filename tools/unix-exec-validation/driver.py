@@ -47,13 +47,130 @@ def plan(run):
     return Path('/opt/arx-ci-' + run), 'arx-ci-' + run + '.service'
 
 
-def protected(path):
+# F0 mechanism only: no experiment is authorized by this instrumentation.
+SITES = ('cg_preflight', 'cleanup_capture', 'cleanup_base', 'service_stage',
+         'service_cg', 'service_runs', 'capture_base', 'harness_stage',
+         'harness_binary', 'run_parent', 'run_artifact', 'run_cleanup', 'installed')
+PHASES = ('initial', 'final')
+MUTATIONS = ('none', 'staged', 'account', 'service', 'cgroup')
+CLEANUPS = ('confirmed', 'unconfirmed', 'not_reached')
+MAX_TRIPLES = 32
+MAX_LINE = 4096
+feedback_phase = 'initial'
+feedback_mutation = 'none'
+feedback_cleanup = 'not_reached'
+feedback_first = None
+
+
+def triples_valid(triples):
+    require(type(triples) is list and 1 <= len(triples) <= MAX_TRIPLES, 'E_RECORD')
+    for t in triples:
+        require(type(t) is list and len(t) == 3, 'E_RECORD')
+        require(type(t[0]) is str and t[0] in ('dir', 'link', 'other') and
+                type(t[1]) is bool and type(t[2]) is int and
+                t[2] in (0, 2, 16, 18), 'E_RECORD')
+
+
+def decide(triples):
+    """Pure historical predicate; other (including regular files) stays allowed."""
+    triples_valid(triples)
+    for ordinal, (kind, owner_zero, write_bits) in enumerate(triples):
+        for conjunct, failed in (('link', kind == 'link'),
+                                   ('owner', not owner_zero), ('write', write_bits != 0)):
+            if failed:
+                return ordinal, conjunct
+    return None
+
+
+class Refusal(RuntimeError):
+    def __init__(self, site, phase, triples):
+        require(site in SITES and phase in PHASES, 'E_RECORD')
+        result = decide(triples)
+        require(result is not None and result[0] == len(triples) - 1, 'E_RECORD')
+        self.record = dict(code='E_PROTECTION', site=site, phase=phase,
+                           ordinal=result[0], kind=triples[-1][0],
+                           owner_zero=triples[-1][1], write_bits=triples[-1][2],
+                           predecessors=[list(t) for t in triples[:-1]])
+        super().__init__('E_PROTECTION')
+
+
+def exception_record(error):
+    # Never stringify an arbitrary payload, even a RuntimeError payload.
+    if type(error) is Refusal:
+        return dict(error.record)
+    return dict(code='E_RUNTIME')
+
+
+def validate_record(record):
+    require(type(record) is dict and set(record) ==
+            {'schema', 'version', 'provenance', 'first', 'final', 'mutation', 'cleanup'}, 'E_RECORD')
+    require(record['schema'] == 'unix-protection-f0' and type(record['schema']) is str and
+            type(record['version']) is int and record['version'] == 1, 'E_RECORD')
+    p = record['provenance']
+    require(type(p) is dict and set(p) == {'source_sha', 'workflow_sha', 'run', 'attempt'}, 'E_RECORD')
+    for key in ('source_sha', 'workflow_sha'):
+        require(type(p[key]) is str and re.fullmatch('[0-9a-f]{40}', p[key]), 'E_RECORD')
+    require(p['source_sha'] == p['workflow_sha'], 'E_RECORD')
+    for key in ('run', 'attempt'):
+        require(type(p[key]) is str and re.fullmatch('[1-9][0-9]{0,19}', p[key]), 'E_RECORD')
+    require(type(record['mutation']) is str and record['mutation'] in MUTATIONS and
+            type(record['cleanup']) is str and record['cleanup'] in CLEANUPS, 'E_RECORD')
+    for key in ('first', 'final'):
+        e = record[key]
+        if e is None:
+            continue
+        require(type(e) is dict, 'E_RECORD')
+        if e == {'code': 'E_RUNTIME'}:
+            continue
+        require(set(e) == {'code', 'site', 'phase', 'ordinal', 'kind', 'owner_zero',
+                           'write_bits', 'predecessors'}, 'E_RECORD')
+        require(e['code'] == 'E_PROTECTION' and type(e['site']) is str and e['site'] in SITES and
+                type(e['phase']) is str and e['phase'] in PHASES and
+                type(e['ordinal']) is int and type(e['predecessors']) is list, 'E_RECORD')
+        triples = e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]]
+        result = decide(triples)
+        require(result is not None and result[0] == e['ordinal'] == len(triples) - 1, 'E_RECORD')
+    return record
+
+
+def encode_record(record):
+    validate_record(record)
+    line = json.dumps(record, separators=(',', ':'), ensure_ascii=True) + '\n'
+    require(len(line.encode('ascii')) <= MAX_LINE, 'E_RECORD_BOUND')
+    return line
+
+
+def replay(line):
+    require(type(line) is str and len(line) <= MAX_LINE and line.isascii() and
+            line.endswith('\n') and line.count('\n') == 1, 'E_RECORD_BOUND')
+    def pairs(items):
+        out = {}
+        for key, value in items:
+            require(key not in out, 'E_RECORD')
+            out[key] = value
+        return out
+    try:
+        record = json.loads(line, object_pairs_hook=pairs)
+        validate_record(record)
+    except (ValueError, TypeError, RecursionError, KeyError):
+        raise RuntimeError('E_RECORD') from None
+    return {key: decide(e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]])
+            for key in ('first', 'final') if (e := record[key]) and e['code'] == 'E_PROTECTION'}
+
+
+def protected(path, site):
     """Match library ancestor checks; never resolve away a link."""
+    require(site in SITES, 'E_SITE')
     require(path.is_absolute() and '..' not in path.parts, 'E_PATH')
-    for item in [*reversed(path.parents), path]:
+    items = [*reversed(path.parents), path]
+    require(len(items) <= MAX_TRIPLES, 'E_RECORD_BOUND')
+    triples = []
+    for item in items:
         s = item.lstat()
-        require(not stat.S_ISLNK(s.st_mode) and s.st_uid == 0 and
-                not s.st_mode & 0o022, 'E_PROTECTION')
+        kind = 'link' if stat.S_ISLNK(s.st_mode) else 'dir' if stat.S_ISDIR(s.st_mode) else 'other'
+        triples.append([kind, s.st_uid == 0, s.st_mode & 0o022])
+        if decide(triples) is not None:
+            raise Refusal(site, feedback_phase, triples)
 
 
 def call(args, **kw):
@@ -96,7 +213,7 @@ def copy_tree(src, dst, exclude=()):
 
 def cg_preflight():
     require(Path('/run/systemd/system').is_dir(), 'E_SYSTEMD')
-    protected(Path('/sys/fs/cgroup'))
+    protected(Path('/sys/fs/cgroup'), 'cg_preflight')
     fs = subprocess.check_output(['/usr/bin/stat', '-f', '-c', '%T', '/sys/fs/cgroup'],
                                  env=SAFE_ENV, timeout=5).strip()
     require(fs == b'cgroup2fs', 'E_CGROUP2')
@@ -141,7 +258,7 @@ def fixture_cleanup(stage):
     capture = stage / 'harness-pid'
     if not capture.exists():
         return
-    protected(capture)
+    protected(capture, 'cleanup_capture')
     pid = capture.read_text()
     require(re.fullmatch('[1-9][0-9]{0,9}', pid), 'E_PID')
     name = 'arxexec' + pid
@@ -151,7 +268,7 @@ def fixture_cleanup(stage):
     except KeyError:
         account = None
     if base.exists() or base.is_symlink():
-        protected(base)
+        protected(base, 'cleanup_base')
         require((stage / 'fixture-directory').exists(), 'E_QUARANTINE_PATH_UNCAPTURED')
         captured = json.loads((stage / 'fixture-directory').read_text())
         require([base.stat().st_dev, base.stat().st_ino] == captured, 'E_FIXTURE_INODE')
@@ -198,11 +315,11 @@ def drain_output(source, target, exceeded, limit=1024 * 1024):
 
 def service(stage, run):
     # Only entered from our protected transient unit, never a local CLI shortcut.
-    protected(stage)
+    protected(stage, 'service_stage')
     _, unit = plan(run)
     cg = Path('/sys/fs/cgroup') / Path('/proc/self/cgroup').read_text().strip().split('0::')[-1].lstrip('/')
     require(cg == Path('/sys/fs/cgroup/system.slice') / unit, 'E_UNIT_CGROUP')
-    protected(cg)
+    protected(cg, 'service_cg')
     require({'memory', 'pids'} <= set((cg / 'cgroup.controllers').read_text().split()), 'E_DELEGATION')
     control = cg / 'control'
     control.mkdir(mode=0o700)  # exclusive: never reuse another group's child
@@ -211,7 +328,7 @@ def service(stage, run):
     (cg / 'cgroup.subtree_control').write_text('+memory +pids')
     delegated = cg / 'runs'
     delegated.mkdir(mode=0o700)
-    protected(delegated)
+    protected(delegated, 'service_runs')
     (delegated / 'cgroup.subtree_control').write_text('+memory +pids')
     require(not (delegated / 'cgroup.procs').read_text().strip(), 'E_INTERNAL_TASKS')
     env = {**cargo_env(stage), 'CI': 'true', 'GITHUB_ACTIONS': 'true',
@@ -270,7 +387,7 @@ def capture_fixture(stage):
     base = Path('/var/lib') / name
     directory = stage / 'fixture-directory'
     if not directory.exists() and base.exists():
-        protected(base)
+        protected(base, 'capture_base')
         s = base.stat()
         directory.write_text(json.dumps([s.st_dev, s.st_ino]))
     captured = stage / 'fixture-identity'
@@ -286,10 +403,10 @@ def capture_fixture(stage):
 def harness(stage, args):
     import pwd
     import grp
-    protected(stage)
+    protected(stage, 'harness_stage')
     binary = (stage / 'artifact').read_text()
     require(args == [binary, TEST, '--ignored', '--exact'], 'E_TEST_ARGS')
-    protected(Path(binary))
+    protected(Path(binary), 'harness_binary')
     pid = str(os.getpid())
     name = 'arxexec' + pid
     require(not os.path.lexists('/var/lib/' + name), 'E_FIXTURE_COLLISION')
@@ -305,15 +422,17 @@ def harness(stage, args):
 
 
 def run(env):
+    global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')
     cg_preflight()  # read-only; no retry or global controller writes
     stage, unit = plan(run_id)
-    protected(stage.parent)
+    protected(stage.parent, 'run_parent')
     # Refuse unit collisions before taking ownership of this generated name.
     state = subprocess.check_output(['/usr/bin/systemctl', 'show', unit, '-p', 'LoadState', '--value'],
                                     env=SAFE_ENV, timeout=5).strip()
     require(state == b'not-found', 'E_UNIT_COLLISION')
+    feedback_mutation = 'staged'  # conservative: mutation may begin
     stage.mkdir(mode=0o700)
     unit_created = False
     try:
@@ -343,8 +462,9 @@ def run(env):
         require(len(artifacts) == 1, 'E_ARTIFACT')
         artifact = Path(artifacts[0])
         require(artifact.is_relative_to(stage / 'source/target/debug/deps'), 'E_ARTIFACT_PATH')
-        protected(artifact)
+        protected(artifact, 'run_artifact')
         (stage / 'artifact').write_text(str(artifact))
+        feedback_mutation = 'service'
         unit_created = True  # name reserved by absence; finally stops even start failure
         result = subprocess.run(['/usr/bin/systemd-run', '--quiet', '--wait', '--collect',
                                  '--unit=' + unit, '--property=Delegate=yes',
@@ -355,8 +475,13 @@ def run(env):
                                 env=SAFE_ENV, timeout=165, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         require(result.returncode == 0 and (stage / 'passed').exists(), 'E_SERVICE_OR_TEST')
-        print('harness: 1 passed; observed UID asserted internally (not emitted)')
+
+    except Exception as error:
+        feedback_first = exception_record(error)
+        raise
     finally:
+        feedback_phase = 'final'
+        feedback_cleanup = 'unconfirmed'
         if unit_created:
             # Stopping our captured unit kills descendants; never kill host hierarchy.
             subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=20,
@@ -364,10 +489,10 @@ def run(env):
             cg = Path('/sys/fs/cgroup/system.slice') / unit
             require(not cg.exists(), 'E_QUARANTINE_CGROUP')
         fixture_cleanup(stage)
-        protected(stage)
+        protected(stage, 'run_cleanup')
         require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
         shutil.rmtree(stage)
-        print('cleanup: confirmed')
+        feedback_cleanup = 'confirmed'
 
 
 def main():
@@ -385,7 +510,7 @@ def main():
     require(len(sys.argv) >= 3, 'E_ARGS')
     stage, _ = plan(sys.argv[2])
     require(Path(__file__) == stage / 'source/tools/unix-exec-validation/driver.py', 'E_INSTALLED')
-    protected(Path(__file__))
+    protected(Path(__file__), 'installed')
     if mode == 'service' and len(sys.argv) == 3:
         service(stage, sys.argv[2])
     elif mode == 'fixture-check' and len(sys.argv) == 3:
@@ -399,15 +524,35 @@ def main():
         raise RuntimeError('E_MODE')
 
 
-if __name__ == '__main__':
+def feedback_line(env, first, final):
+    # Gate validates the association; this envelope is association, not attestation.
+    gate(env, 'linux')
+    return encode_record(dict(schema='unix-protection-f0', version=1,
+        provenance=dict(source_sha=env['ARX_REVIEWED_SHA'], workflow_sha=env['ARX_WORKFLOW_SHA'],
+                        run=env['GITHUB_RUN_ID'], attempt=env['GITHUB_RUN_ATTEMPT']),
+        first=first, final=final, mutation=feedback_mutation, cleanup=feedback_cleanup))
+
+
+def entry():
+    error = None
     try:
         main()
-    except Exception as error:
-        # Never expose arbitrary exception text, paths, cargo output or environment.
-        code = str(error) if isinstance(error, RuntimeError) and re.fullmatch(r'E_[A-Z_]+', str(error)) else 'E_RUNTIME'
-        if isinstance(error, OSError):
-            code = 'E_OS_' + str(error.errno or 0)
-        elif isinstance(error, subprocess.TimeoutExpired):
-            code = 'E_COMMAND_TIMEOUT'
-        print('unix experiment refused/failed: ' + code, file=sys.stderr)
-        sys.exit(1)
+    except Exception as caught:
+        error = caught
+    # Only the outer run owns public feedback. Internal modes remain suppressed
+    # by the existing parent subprocess collectors; no extra public lines.
+    if sys.argv[1:] == ['run']:
+        try:
+            final = exception_record(error) if error is not None else None
+            print(feedback_line(os.environ, feedback_first or final, final), end='')
+        except Exception:
+            code = 'E_PLATFORM' if type(error) is RuntimeError and error.args == ('E_PLATFORM',) else 'E_RECORD'
+            print('unix experiment refused/failed: ' + code, file=sys.stderr)
+            return 1
+    elif error is not None:
+        print('unix experiment refused/failed: E_RUNTIME', file=sys.stderr)
+    return 1 if error is not None else 0
+
+
+if __name__ == '__main__':
+    sys.exit(entry())
