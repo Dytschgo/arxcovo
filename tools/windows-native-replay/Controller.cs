@@ -287,7 +287,7 @@ public static class PureControllerChecks {
         }
         foreach(string role in new[]{"controller","cargo","helper","libtest","selectors","provenance","workspace_lock","helper_lock"})
             pins.Add(new { role=role,path=@"C:\fixture\"+role+".bin",sha256=new string('c',64),id128=new string('d',32),size=1,blob="artifact" });
-        var document=new {schema=1,reviewed_commit=commit,root=@"C:\fixture",helper_directory=@"C:\fixture\bin",temp=@"C:\fixture\tmp",system_root=@"C:\fixture\Windows",
+        var document=new {schema=1,reviewed_commit=commit,root=@"C:\fixture",helper_directory=@"C:\fixture\bin",temp=@"C:\fixture\tmp",system_root=@"C:\Windows",
             target="x86_64-pc-windows-msvc",profile="dev",debug="0",features="default",toolchain="1.95.0",compiler_commit="59807616e1fa2540724bfbac14d7976d7e4a3860",cargo_version="1.95.0 (f2d3ce0bd7f24a49f8f72d9000448f8838c4e850)",pins=pins};
         string json=System.Text.Json.JsonSerializer.Serialize(document);
         Check(ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),commit,blobs),"manifest valid");
@@ -297,6 +297,10 @@ public static class PureControllerChecks {
         string self=json.Insert(1,"\"sha256\":\""+Hash(Encoding.UTF8.GetBytes(json))+"\",");
         Check(!ManifestAccepted(self,Hash(Encoding.UTF8.GetBytes(self)),commit,blobs),"manifest self hash");
         Check(!ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),new string('e',40),blobs),"manifest commit mismatch");
+        string nested=json.Replace(System.Text.Json.JsonSerializer.Serialize(@"C:\Windows"),System.Text.Json.JsonSerializer.Serialize(@"C:\fixture\Windows"));
+        Check(!ManifestAccepted(nested,Hash(Encoding.UTF8.GetBytes(nested)),commit,blobs),"admission: parser nested Windows");
+        string outside=json.Replace(System.Text.Json.JsonSerializer.Serialize(@"C:\fixture\controller.bin"),System.Text.Json.JsonSerializer.Serialize(@"C:\outside\controller.bin"));
+        Check(!ManifestAccepted(outside,Hash(Encoding.UTF8.GetBytes(outside)),commit,blobs),"admission: parser outside artifact");
     }
     // Independent argv reader for the one quoted argument emitted by Quote.
     static string Unquote(string s) {
@@ -314,6 +318,7 @@ public static class PureControllerChecks {
     }
     public static void Run() {
         ManifestChecks();
+        AdmissionPureChecks.Run();
         Check(ReplayController.CleanupConfirmed(true,0,true,1,2),"cleanup zero");
         Check(!ReplayController.CleanupConfirmed(false,0,true,1,2),"cleanup kill first");
         Check(!ReplayController.CleanupConfirmed(true,1,true,1,2),"cleanup active");
@@ -410,5 +415,86 @@ public static class PureControllerChecks {
         env["OWNER_SECRET"]="synthetic"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"environment reject"); env.Remove("OWNER_SECRET");
         env["PATH"]+=@";C:\other"; Check(!ReplayController.LaunchSpec.Valid(app,cwd,helper,temp,root,args,env),"path reject");
         foreach(string path in new[]{"cargo.exe",@"C:\a\..\cargo.exe",@"\\server\cargo.exe",@"C:\a:stream"}) Check(!ReplayController.LaunchSpec.Absolute(path),"absolute reject");
+    }
+}
+
+// Pure injected metadata/query boundary. No HeldFiles instance or native effect.
+
+internal static class AdmissionPureChecks {
+    static void Check(bool value,string label) { if(!value) throw new Exception("admission: "+label); }
+    static HeldFiles.DirectoryEntry E(string n,uint a=0,ulong id=3,uint tag=0) {
+        return new HeldFiles.DirectoryEntry(n,a,tag,id,0);
+    }
+    static HeldFiles.DirectoryEntry[] Names(string leaf) { return new[]{E(".",16,1),E("..",16,2),E(leaf)}; }
+    sealed class Directory : IAdmissionDirectory {
+        internal HeldFiles.DirectoryEntry[] First,Second;
+        internal int Scans,Reads;
+        internal bool BadSize;
+        internal Directory(string leaf) { First=Names(leaf); Second=Names(leaf); }
+        public HeldFiles.DirectoryEntry[] Scan() { return ++Scans==1?First:Second; }
+        public byte[] ReadLeaf(Admission.Pin pin) { Reads++; return new byte[BadSize?0:pin.size]; }
+    }
+    sealed class Files : IAdmissionFiles {
+        internal readonly Directory Helper=new Directory("cargo.exe"),Image=new Directory("libtest.exe");
+        internal int Environment,Reads;
+        internal bool BadSource;
+        public IAdmissionDirectory ExclusiveDirectory(string path) {
+            if(path==@"C:\fixture\bin") return Helper;
+            if(path==@"C:\fixture\image") return Image;
+            throw new Exception("unexpected synthetic directory");
+        }
+        public byte[] ReadPinned(string p,string h,int n,string id) { Reads++; return new byte[]{BadSource?(byte)13:(byte)0}; }
+        public void HoldEnvironment(string temp,string system) { Environment++; }
+    }
+    static List<Admission.Pin> Pins() {
+        return new List<Admission.Pin> {
+            new Admission.Pin {role="helper",path=@"C:\fixture\bin\cargo.exe",size=1,id="00000000000000030000000000000000"},
+            new Admission.Pin {role="libtest",path=@"C:\fixture\image\libtest.exe",size=1,id="00000000000000030000000000000000"},
+            new Admission.Pin {role="source:sample",path=@"C:\fixture\sample",size=1}
+        };
+    }
+    static bool Refused(Files f,List<Admission.Pin> pins=null,string root=@"C:\fixture",string system=@"C:\Windows") {
+        try { Admission.RevalidatePins(f,pins??Pins(),root,@"C:\fixture\bin",@"C:\fixture\tmp",system); return false; }
+        catch(InvalidOperationException) { return true; }
+    }
+    internal static void Run() {
+        Check(HeldFiles.ExclusiveNames(Names("cargo.exe"),"cargo.exe"),"names valid");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("cargo.exe"),E("extra.dll")},"cargo.exe"),"extra DLL");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16)},"cargo.exe"),"missing leaf");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("cargo.exe"),E("cargo.exe")},"cargo.exe"),"repeated leaf");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("cargo.exe",0x400)},"cargo.exe"),"reparse name");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("cargo.exe",0,3,1)},"cargo.exe"),"reparse tag");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("wrong.exe")},"cargo.exe"),"wrong leaf");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("cargo.exe",16)},"cargo.exe"),"directory leaf");
+        Check(!HeldFiles.ExclusiveNames(new[]{E("."),E("..",16),E("cargo.exe")},"cargo.exe"),"dot type");
+        Check(!HeldFiles.ExclusiveNames(new[]{E(".",16),E("..",16),E("cargo.exe",0,0)},"cargo.exe"),"zero id");
+        var names=Names("cargo.exe");
+        Check(HeldFiles.SameScan(names,new[]{names[2],names[0],names[1]}),"set order");
+        Check(!HeldFiles.SameScan(names,new[]{E(".",16,1),E("..",16,2),E("cargo.exe",0,4)}),"changed id");
+        Check(!HeldFiles.SameScan(names,new[]{E(".",16,1),E("..",16,2),E("cargo.exe",1)}),"changed attributes");
+        Check(!HeldFiles.SameScan(names,new[]{E(".",16,1),E("..",16,2),new HeldFiles.DirectoryEntry("cargo.exe",0,0,3,1)}),"changed high id");
+        var f=new Files();
+        Check(!Refused(f) && f.Helper.Scans==2 && f.Image.Scans==2 && f.Helper.Reads==1 && f.Image.Reads==1 && f.Environment==1 && f.Reads==1,"revalidate complete");
+        f=new Files(); f.Helper.First=new[]{E(".",16),E("..",16),E("extra.dll")};
+        Check(Refused(f) && f.Helper.Reads==0,"first scan wired");
+        f=new Files(); f.Image.Second=new[]{E(".",16),E("..",16),E("extra.dll")}; Check(Refused(f),"image scan wired");
+        f=new Files(); f.Helper.Second=new[]{E(".",16,4),E("..",16,2),E("cargo.exe")}; Check(Refused(f),"changed scans wired");
+        f=new Files(); f.Helper.BadSize=true; Check(Refused(f),"leaf size wired");
+        var pins=Pins(); pins[1].id=new string('e',32); Check(Refused(new Files(),pins),"leaf id wired");
+        f=new Files(); f.BadSource=true; Check(Refused(f),"source LF wired");
+        Check(Admission.SystemRootSeparate(@"C:\fixture",@"C:\fixture\bin",@"C:\fixture\tmp",@"C:\Windows",new[]{@"C:\fixture\source",@"C:\fixture\image\libtest.exe"}),"external Windows");
+        Check(Refused(new Files(),root:@"C:\"),"volume root");
+        Check(Refused(new Files(),system:@"C:\fixture\Windows"),"nested Windows");
+        Check(Refused(new Files(),system:@"C:\fixture"),"equal Windows");
+        Check(!Admission.SystemRootSeparate(@"C:\Windows\fixture",@"C:\Windows\fixture\bin",@"C:\Windows\fixture\tmp",@"C:\Windows",new string[0]),"workspace under Windows");
+        pins=Pins(); pins[2].path=@"C:\outside\source"; Check(Refused(new Files(),pins),"outside source");
+        pins=Pins(); pins[1].path=@"C:\outside\libtest.exe"; Check(Refused(new Files(),pins),"outside artifact");
+        Check(!Admission.SystemRootSeparate(@"C:\fixture",@"C:\outside\bin",@"C:\fixture\tmp",@"C:\Windows",new string[0]),"outside helper");
+        Check(!Admission.SystemRootSeparate(@"C:\fixture",@"C:\fixture\bin",@"C:\outside\tmp",@"C:\Windows",new string[0]),"outside temp");
+        Check(!Admission.SystemRootSeparate(@"C:\fixture",@"C:\fixture\bin",@"C:\fixture\tmp",@"C:\Windows",new[]{@"C:\fixture\a\..\escape"}),"unsafe path");
+        bool final=false;
+        try { Admission.RevalidateBoundary(new Files(),Pins(),@"C:\fixture",@"C:\fixture\bin",@"C:\fixture\tmp",@"C:\Windows"); }
+        catch(InvalidOperationException e) { final=e.Message=="remaining admission gates unproved"; }
+        Check(final,"final refusal");
     }
 }

@@ -1,6 +1,13 @@
 # Compiles native imports as source only. Run() never constructs HeldFiles or
 # OwnedSession and calls no native import, process API or wall-clock reader.
 $ErrorActionPreference = 'Stop'
+$fixedNames = @('Controller.cs','HeldFiles.cs','NativeJob.cs','Admission.cs','Test-PureController.ps1')
+$fixedHashes = @{}
+foreach($name in $fixedNames) {
+    $bytes = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name))
+    if($bytes.Contains([byte]13)) { throw 'expected exact LF source' }
+    $fixedHashes[$name] = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
 $path = Join-Path $PSScriptRoot 'Controller.cs'
 $before = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 $source = [IO.File]::ReadAllText($path)
@@ -36,13 +43,39 @@ $mutants = @(
     @('frame-complete', 'frames!=expected', 'false'),
     @('frame-order', 'if(v[1]!=(uint)(frames/2) || v[2]!=(uint)(1-frames%2)) return Fail();', 'if(v[1]>1000) return Fail();'),
     @('manifest-self-field', 'Need(set.Remove(p.Name));', 'if(p.Name!="sha256" || names.Length==6) Need(set.Remove(p.Name));'),
-    @('clock-order', 'last = elapsedMs;', 'last = 0;')
+    @('clock-order', 'last = elapsedMs;', 'last = 0;'),
+    @('names-extra', 'if(entries==null || entries.Length!=3', 'if(entries!=null && entries.Length==4) return true; if(entries==null || entries.Length!=3'),
+    @('names-repeat', 'if(entries==null || entries.Length!=3', 'if(entries!=null && entries.Length==3 && entries[1].Name==entries[2].Name) return true; if(entries==null || entries.Length!=3'),
+    @('names-missing', 'if(entries==null || entries.Length!=3', 'if(entries!=null && entries.Length==2) return true; if(entries==null || entries.Length!=3'),
+    @('names-reparse', '(e.Attributes&0x400)!=0', 'false'),
+    @('names-tag', 'e.ReparseTag!=0', 'false'),
+    @('names-leaf', 'names.Contains(leaf)', 'true'),
+    @('names-type', '(e.Attributes&0x10)!=0', 'false'),
+    @('names-dot-type', '(e.Attributes&0x10)==0', '(e.Attributes&0x10)==0x80000000'),
+    @('names-id', '(e.Low==0 && e.High==0)', 'false'),
+    @('scan-id', 'a.Low==b.Low', 'true'),
+    @('scan-wire', '&& HeldFiles.SameScan(first,second)', ''),
+    @('scan-first-wire', 'Need(HeldFiles.ExclusiveNames(first,leaf));', ''),
+    @('scan-second-wire', 'var second=directory.Scan();', 'var second=first;'),
+    @('leaf-id-wire', 'Need(HeldFiles.IdText(entry.Low,entry.High)==pin.id);', '{}'),
+    @('leaf-size-wire', 'Need(directory.ReadLeaf(pin).Length==pin.size);', 'directory.ReadLeaf(pin);'),
+    @('root-volume', 'if(!ReplayController.LaunchSpec.Absolute(root) || !Inside(root,helper)', 'if(root!=null && root.Length==3) return true; if(!ReplayController.LaunchSpec.Absolute(root) || !Inside(root,helper)'),
+    @('root-nested', '|| Inside(root,system)', ''),
+    @('root-equal', '|| string.Equals(root,system,StringComparison.OrdinalIgnoreCase)', ''),
+    @('root-parent', '|| Inside(system,root)', ''),
+    @('root-pins', 'if(!Inside(root,path)) return false;', 'if(path==null) return false;'),
+    @('root-helper', '!Inside(root,helper)', 'helper==null'),
+    @('root-temp', '!Inside(root,temp)', 'temp==null'),
+    @('root-wire', 'Need(SystemRootSeparate(root,helper,temp,system,pins.ConvertAll(p=>p.path)));', ''),
+    @('final-refusal', 'throw new InvalidOperationException("remaining admission gates unproved");', 'return;')
 )
 $i=0
 foreach($m in $mutants) {
     $i++
     if(-not $source.Contains($m[1])) { throw 'mutant target missing' }
-    $variant=$source.Replace($m[1],$m[2]).Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i")
+    $mutated=$source.Replace($m[1],$m[2])
+    if($m[0] -eq 'names-leaf') { $mutated=$mutated.Replace('e.Name!=leaf','false') }
+    $variant=$mutated.Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i")
     $bytes=[Text.Encoding]::UTF8.GetBytes($variant)
     "mutant LF SHA256 $($m[0]): $([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant())"
     # Compilation errors terminate here: they never count as assertion kills.
@@ -52,7 +85,7 @@ foreach($m in $mutants) {
     try { $type.GetMethod('Run').Invoke($null,@()) }
     catch {
         $failure=$_.Exception.GetBaseException()
-        if($failure.GetType() -ne [System.Exception] -or $failure.Message -notin @('end','begin alone incomplete','missing all rows','empty nonblocking deadline','no first event','filter reject','path reject','held pin mismatch','link2 reject','argument escape','quoted end','unterminated','partial EOF','output overflow','poll clock regression','manifest extra','manifest external mismatch','manifest commit mismatch','stream end','stream begin','stream complete','cleanup kill first','cleanup active','cleanup deadline','post hash links','wire complete','duplicate frame','manifest self hash')) { throw }
+        if($failure.GetType() -ne [System.Exception] -or (-not $failure.Message.StartsWith('admission: ') -and $failure.Message -notin @('end','begin alone incomplete','missing all rows','empty nonblocking deadline','no first event','filter reject','path reject','held pin mismatch','link2 reject','argument escape','quoted end','unterminated','partial EOF','output overflow','poll clock regression','manifest extra','manifest external mismatch','manifest commit mismatch','stream end','stream begin','stream complete','cleanup kill first','cleanup active','cleanup deadline','post hash links','wire complete','duplicate frame','manifest self hash'))) { throw }
         $killed=$true
     }
     if(-not $killed) { throw "survived: $($m[0])" }
@@ -62,3 +95,10 @@ if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $before) { throw
 if((Get-FileHash -LiteralPath $heldPath -Algorithm SHA256).Hash -ne $heldBefore) { throw 'held file source bytes changed' }
 "unchanged LF source SHA256: $before"
 "unchanged LF held file SHA256: $heldBefore"
+
+foreach($name in $fixedNames) {
+    $bytes = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name))
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    if($hash -ne $fixedHashes[$name] -or $bytes.Contains([byte]13)) { throw 'exact LF restore mismatch' }
+    "exact LF unchanged $name $hash"
+}

@@ -5,6 +5,15 @@ using System.Text;
 using System.Text.Json;
 using System.IO;
 
+internal interface IAdmissionFiles {
+    byte[] ReadPinned(string path,string hash,int limit,string id);
+    IAdmissionDirectory ExclusiveDirectory(string path);
+    void HoldEnvironment(string temp,string systemRoot);
+}
+internal interface IAdmissionDirectory {
+    HeldFiles.DirectoryEntry[] Scan();
+    byte[] ReadLeaf(Admission.Pin pin);
+}
 internal sealed class Admission : IDisposable {
     internal sealed class Pin {
         internal string role,path,sha256,id,blob;
@@ -49,7 +58,7 @@ internal sealed class Admission : IDisposable {
             Need(Text(e,"root",240)==root && ReplayController.LaunchSpec.Absolute(root));
             Need(Text(e,"target",64)=="x86_64-pc-windows-msvc" && Text(e,"profile",8)=="dev" && Text(e,"debug",1)=="0" && Text(e,"features",16)=="default");
             Need(Text(e,"toolchain",16)=="1.95.0" && Text(e,"compiler_commit",40)=="59807616e1fa2540724bfbac14d7976d7e4a3860" && Text(e,"cargo_version",80)=="1.95.0 (f2d3ce0bd7f24a49f8f72d9000448f8838c4e850)");
-            foreach(string key in new[]{"helper_directory","temp","system_root"}) Need(Inside(root,Text(e,key,240)));
+            Need(SystemRootSeparate(root,Text(e,"helper_directory",240),Text(e,"temp",240),Text(e,"system_root",240),new string[0]));
             var roles=new HashSet<string>(StringComparer.Ordinal);
             foreach(string source in Sources) roles.Add("source:"+source);
             foreach(string role in new[]{"controller","cargo","helper","libtest","selectors","provenance","workspace_lock","helper_lock"}) roles.Add(role);
@@ -70,7 +79,7 @@ internal sealed class Admission : IDisposable {
             return result;
         }
     }
-    static bool Inside(string root,string p) { return ReplayController.LaunchSpec.Absolute(p) && p.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase); }
+    internal static bool Inside(string root,string p) { return ReplayController.LaunchSpec.Absolute(p) && p.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase); }
     internal Admission(HeldFiles held,byte[] manifest,string externalSha,string commit,string root,IDictionary<string,string> blobs,bool cleanCheckout) {
         Need(cleanCheckout); this.held=held; Root=root;
         pins=Parse(manifest,externalSha,commit,root,blobs);
@@ -81,16 +90,49 @@ internal sealed class Admission : IDisposable {
         Need(pins.Find(p=>p.role=="helper").path==helper+"\\cargo.exe");
         Revalidate();
     }
-    internal void Revalidate() {
+    internal static bool SystemRootSeparate(string root,string helper,string temp,string system,IEnumerable<string> paths) {
+        if(!ReplayController.LaunchSpec.Absolute(root) || !Inside(root,helper) || !Inside(root,temp)
+            || !ReplayController.LaunchSpec.Absolute(system) || string.Equals(root,system,StringComparison.OrdinalIgnoreCase)
+            || Inside(root,system) || Inside(system,root) || paths==null) return false;
+        foreach(string path in paths) if(!Inside(root,path)) return false;
+        return true;
+    }
+    internal static void RevalidatePins(IAdmissionFiles files,List<Pin> pins,string root,string helper,string temp,string system) {
+        Need(files!=null && pins!=null);
+        Need(SystemRootSeparate(root,helper,temp,system,pins.ConvertAll(p=>p.path)));
+        Pin helperPin=pins.Find(p=>p.role=="helper"), image=pins.Find(p=>p.role=="libtest");
+        Need(helperPin!=null && image!=null && helperPin.path==helper+"\\cargo.exe");
+        string imageDirectory=Path.GetDirectoryName(image.path);
+        // Each executable directory has exactly one pinned leaf. Sharing a directory
+        // would require a different allowlist contract and is refused here.
+        Need(!string.Equals(helper,imageDirectory,StringComparison.OrdinalIgnoreCase));
+        VerifyExclusive(files.ExclusiveDirectory(helper),helperPin);
+        VerifyExclusive(files.ExclusiveDirectory(imageDirectory),image);
+        files.HoldEnvironment(temp,system);
         foreach(var p in pins) {
-            byte[] bytes=held.ReadPinned(p.path,p.sha256,p.size,p.id);
+            if(p==helperPin || p==image) continue;
+            byte[] bytes=files.ReadPinned(p.path,p.sha256,p.size,p.id);
             Need(bytes.Length==p.size);
             if(p.role.StartsWith("source:",StringComparison.Ordinal)) Need(Array.IndexOf(bytes,(byte)13)<0);
         }
-        // Directory membership cannot currently be sealed against concurrent
-        // insertion by this adapter. Fail before any process launch until the
-        // handle-based directory exclusion is implemented and independently reviewed.
-        throw new InvalidOperationException("helper directory exclusion unproved");
+    }
+    static void VerifyExclusive(IAdmissionDirectory directory,Pin pin) {
+        var first=directory.Scan();
+        string leaf=Path.GetFileName(pin.path);
+        Need(HeldFiles.ExclusiveNames(first,leaf));
+        Need(directory.ReadLeaf(pin).Length==pin.size);
+        var second=directory.Scan();
+        Need(HeldFiles.ExclusiveNames(second,leaf) && HeldFiles.SameScan(first,second));
+        foreach(var entry in second) if(entry.Name==leaf) Need(HeldFiles.IdText(entry.Low,entry.High)==pin.id);
+    }
+    internal void Revalidate() {
+        RevalidateBoundary(held,pins,Root,helper,temp,systemRoot);
+    }
+    internal static void RevalidateBoundary(IAdmissionFiles files,List<Pin> pins,string root,string helper,string temp,string system) {
+        RevalidatePins(files,pins,root,helper,temp,system);
+        // Native query semantics remain UNRUN. Binding, transport, grammar and
+        // deadline supervision are separate unfinished gates, never caller flags.
+        throw new InvalidOperationException("remaining admission gates unproved");
     }
     internal byte[] Environment(string[] args) {
         var env=new Dictionary<string,string>{{"PATH",helper},{"TEMP",temp},{"TMP",temp},{"SystemRoot",systemRoot}};

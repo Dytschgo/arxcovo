@@ -56,7 +56,13 @@ assert "0x80404" in job and "flags=0x2000" in job
 assert job.index("AssignProcessToJobObject(job,process)") < job.index("ResumeThread(thread)!=1")
 assert "TerminateJobObject(job,1)" in job and "WaitForSingleObject(process,0)" in job
 assert "emit_frame(index, true" in code and "emit_frame(0, true" in code
-assert "helper directory exclusion unproved" in (root / "tools/windows-native-replay/Admission.cs").read_text()
+admission = (root / "tools/windows-native-replay/Admission.cs").read_text()
+assert "remaining admission gates unproved" in admission
+assert "RevalidateBoundary(held,pins,Root,helper,temp,systemRoot)" in admission
+assert "HeldFiles.ExclusiveNames(first,leaf)" in admission and "HeldFiles.SameScan(first,second)" in admission
+assert "NtQueryDirectoryFile" in held and "1024,60,true" in held
+assert "Directory.Enumerate" not in held and "FindFirstFile" not in held
+# Structural inventory only; managed assertions exercise the decisions.
 entry = (root / "tools/windows-native-replay/Invoke-BoundedReplay.ps1").read_text()
 assert "throw 'GATE2_ONLY:" in entry
 print("gate2 map: kernel 0; failures 1..28; peek109 29..32; controls 33..34; dormant adapter admission blocked; native imports source only")
