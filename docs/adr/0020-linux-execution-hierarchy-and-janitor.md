@@ -697,23 +697,23 @@ These five requirements bind subsequent small source slices:
    it spawns the helper only through the E4-reviewed descriptor-bound
    fork+execveat spawn shape against a validated executable descriptor (no
    PATH, no `Command`, stdio on `/dev/null`), and the helper image alone
-   performs the blocked wait. No libtest/std/transitive post-fork lifetime
-   exists, so the linked-closure proof obligation of the [prior fork-branch
+   performs the blocked wait. After successful exec, no parent
+   libtest/std/transitive waiting lifetime remains, so the linked-closure proof obligation of the [prior fork-branch
    correction](../reviews/m2-a4-single-task-helper-proposal.md) (reachable
    at-fork enumeration, inherited-FD table, errno-accessor verification across
    the whole test binary) is superseded for the waiting child; parent-image
    at-fork exposure across the spawn window rests exactly on the
    already-accepted E4 probe basis, stated here rather than re-proven. The
    [blocker resolution](../reviews/m2-a4-runtime-blocker-resolution.md) pins
-   the helper's complete closure: one source file using only direct
+   the helper source contract: one source file using only direct
    async-signal-safe close/clock_gettime/poll/read/write/_exit, no thread or
    process creation, no fork/exec call, no atfork registration, with build
-   command, SHA-256 and symbol inventory recorded there. Only the native
-   ignored fixture may spawn this helper; pure tests use a separate mock seam.
+   command, SHA-256 and symbol inventory required in source-slice evidence
+   before use. Only the native ignored fixture may spawn this helper; pure tests use a separate mock seam.
    The parent verifies the pinned SHA-256 and size before spawn and spawns
-   nothing on mismatch. Only the two handshake fds are inherited non-CLOEXEC
-   (every other fd CLOEXEC); the absolute monotonic deadline and the two fd
-   numbers travel as fixed bounded-decimal argv under a strict parser.
+   nothing on mismatch. Apart from stdio redirected to `/dev/null`, only the
+   two handshake fds survive exec; unrelated descriptors must be CLOEXEC. The
+   absolute monotonic deadline and the two fd numbers travel as fixed bounded-decimal argv under a strict parser.
    Errors/EOF/expiry are fixed failure exits and EINTR-only retries recompute
    a saturating monotonic remainder, never extending the absolute deadline.
    Spawn happens outside the limited leaf; migration and an actual

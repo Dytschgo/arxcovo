@@ -22,7 +22,7 @@ practically discharge that proof:
   `lib/rustlib/src/rust/library` source tree (re-checked read-only on this
   host: that path is absent), so no complete matching libtest/std source
   closure exists to review handler bodies against.
-- The locked `libc` 0.9.2 declaration of `__errno_location` is an extern
+- The locked `libc` 0.2.191 declaration of `__errno_location` is an extern
   declaration, not the loaded Linux libc implementation; no sysroot or loaded
   libc identity is established. `signal-hook-registry` evidence covers one
   crate's guard, not the inherited handler set at the fixture's fork point.
@@ -73,9 +73,9 @@ and a hosted binary-forensics pipeline (optional audit infrastructure).
   S8/S13 precedent). No new post-fork Rust branch is added. Parent-image
   atfork exposure across that window is exactly the already-accepted E4 basis,
   disclosed in D9a, not a new proof.
-- **Handoff contract.** Only the two handshake fds are inherited non-CLOEXEC
-  (every other fd CLOEXEC); the absolute monotonic deadline and the two fd
-  numbers travel as fixed bounded-decimal argv under a strict parser. The
+- **Handoff contract.** Apart from stdio redirected to `/dev/null`, only the
+  two handshake fds survive exec; unrelated descriptors must be CLOEXEC. The
+  absolute monotonic deadline and the two fd numbers travel as fixed bounded-decimal argv under a strict parser. The
   helper sends one fixed ready byte, waits on the release pipe with
   EINTR-only retries that recompute a saturating monotonic remainder without
   extending the deadline, and `_exit`s with fixed codes otherwise.
@@ -100,7 +100,8 @@ takes effect only after Sol independent review plus green required checks and
 coordinator merge. Implementation (helper source/build pin, fixture spawn
 slice) needs its own small reviewed PRs under normal Sol-builds /
 different-provider-review routing; native A4 execution still needs a separate
-bounded disposition and acceptance review. The brief's A4 bullets need a
-conforming follow-up edit outside this bounded scope, as does PROGRESS.
+bounded disposition and acceptance review. The brief's A4 requirement remains unchanged: it delegates helper provenance and
+limits to D9a rather than prescribing a helper image. PROGRESS records this
+implementation-shape change separately.
 No A4, M2, full F/G or PA6 acceptance is granted here; native, installed and
 dedicated paths remain **unverified on real hardware**.
