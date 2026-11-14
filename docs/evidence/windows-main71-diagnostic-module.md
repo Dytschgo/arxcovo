@@ -231,3 +231,26 @@ in the compilation/test categories. Old Lab Manager and agent-windows-test were
 not accessed. No babysitter operation was performed. Required independent source
 review and green merge gates remain outstanding; this partial source must not be
 represented as complete contract acceptance.
+
+## Coordinator publication disposition after Grok source review
+
+Review `2fac595` (retained `c85e75b`) found no capture-source blocker and
+ran the final source's four pure diag::pure tests successfully, plus fmt
+and package all-target Clippy. Earlier precursor-only and missing-ms blocker
+statements are historical: disposition `19e7463` accepts ms=- rather than a
+new success-path clock call. Final source blob remains 0f61e58a.
+
+Coordinator authorizes a normal capture-only PR and its existing required CI.
+No native replay test, fixture invocation, test-discovery change, manual rerun,
+threshold change or experiment is added. Existing native tests keep their
+normal assertions and safety fences; only failure reporting changes.
+This is a publication-scope disposition, not a claim that pure tests prove
+native capture or that a new source SHA authorizes a historical retry.
+
+SP1 and SP2 remain blockers before any future native replay: counters must be
+read inside an explicitly owned outer Scope before it drops, and wait/attr-size
+injection must match real validity/raw-wait semantics. No replay is run or
+credited here. Actual site reachability, native cleanup/capture, error ordering
+in execution, counter observations and historical cause remain unverified.
+The next natural CI failure may supply a diagnostic line; green CI would
+not prove the earlier incident fixed. M2 and real-Runner PA6 remain OPEN.

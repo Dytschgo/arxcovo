@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Windows diagnostic capture source `cf915a4` (retained `b9aa125`) passes independent Grok 4.7 high review `2fac595` (retained `c85e75b`) with no capture-source blocker. Final-source pure tests 4/4, fmt and package all-target Clippy passed. Coordinator authorizes capture-only publication and existing required CI, with no new native tests, replay, manual rerun or discovery change. Future replay blockers SP1/SP2 remain explicit; native capture/incident cause are unverified, no fix claimed. Missing ms accepted under success-path fence; fresh exact-head review and five checks remain merge gates.
+
 - Windows diagnostic source `cf915a4` (retained `b9aa125`), evidence `e696717` (retained `3d39d87`), is prepared for independent Grok review. Final fmt/Clippy/non-test compile are builder evidence; four pure tests ran only on a precursor, not the final pin. Coordinator accepts missing elapsed field ms=- to preserve no new native calls on success and unchanged timeout clocks; no timing value is fabricated. Final pure-test rerun and source/security review remain required. No native replay/run/CI dispatch authorized; main incident unresolved.
 
 - Grok 4.7 high recheck `7acf278` (retained `0ad3dea`) passes Standards/Spec/security and closes the Windows diagnostic contract blockers. Coordinator Sol medium accepts bounded local cfg(test) implementation, pure mocked tests and pinned compile/artifact inspection only. Sol high implementation is next; no native API tests, child launch, replay, historical retry or CI dispatch authorized. Source review/publication scope remain gates. Phase 1 has no focused failure reproducer; incident remains unresolved.
