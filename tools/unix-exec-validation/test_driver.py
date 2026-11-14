@@ -522,9 +522,14 @@ class A1A2(unittest.TestCase):
         stage = Path('/var/lib/arx-ci-123-1')
         artifact = str(stage / 'source/target/debug/deps/arxd-abc')
         self.assertEqual(driver.plan('123-1')[1], 'arxd.service')
-        self.assertEqual(driver.test_argv(artifact), [artifact,
-            'exec::disposable::disposable_linux_a1_a2', '--ignored', '--exact',
-            '--test-threads=1', '--color=never'])
+        for selected in (
+            'exec::disposable::disposable_linux_a1_a2',
+            'exec::disposable::disposable_linux_a3_standard',
+            'exec::disposable::disposable_linux_a3_none',
+        ):
+            with self.subTest(selected=selected), patch.object(driver, 'TEST', selected):
+                self.assertEqual(driver.test_argv(artifact), [artifact, selected,
+                    '--ignored', '--exact', '--test-threads=1', '--color=never'])
         self.assertEqual(driver.fixture_override(stage, '123-1').splitlines(), [
             '[Service]', 'ExecStart=',
             'ExecStart=/usr/bin/python3 -I ' + str(stage / 'source/tools/unix-exec-validation/driver.py') + ' service 123-1',
