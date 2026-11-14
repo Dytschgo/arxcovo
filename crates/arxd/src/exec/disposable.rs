@@ -379,3 +379,69 @@ for pid in children:
     );
     drop(fixture);
 }
+
+#[test]
+#[ignore = "production setup + fixed packaged service; fresh disposable hosted Linux only"]
+fn disposable_linux_a1_a2() {
+    use hierarchy::{linux::LinuxFs, setup::Clock};
+    use std::{io::Read, os::unix::fs::OpenOptionsExt, time::Instant};
+    for (key, value) in [
+        ("CI", "true"),
+        ("GITHUB_ACTIONS", "true"),
+        ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ("ARX_DISPOSABLE_EXEC_TEST", "1"),
+    ] {
+        assert_eq!(std::env::var(key).as_deref(), Ok(value));
+    }
+    assert_eq!(unsafe { libc::getuid() }, 0);
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    // The selected ignored test is the only running test; umask changes no rights.
+    assert_eq!(unsafe { libc::umask(0o077) }, 0o077);
+    struct Monotonic(Instant);
+    impl Clock for Monotonic {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+        fn sleep(&self, duration: Duration) {
+            std::thread::sleep(duration);
+        }
+    }
+    let clock = Monotonic(Instant::now());
+    assert!(!Path::new("identity-ack").exists());
+    assert!(hierarchy::fake::prepare_a1a2(
+        &LinuxFs::system(),
+        &clock,
+        &Cancellation::default()
+    ));
+    let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
+    crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();
+    // Outer checks MainPID/executable/placement now, then releases us. The libtest
+    // summary cannot exist until after this function returns.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("identity-ack")
+        {
+            Ok(file) => {
+                use std::os::unix::fs::MetadataExt;
+                let info = file.metadata().unwrap();
+                assert!(
+                    info.is_file()
+                        && info.uid() == 0
+                        && info.mode() & 0o777 == 0o600
+                        && info.nlink() == 1
+                );
+                let mut bytes = Vec::new();
+                file.take(2).read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"1");
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => panic!("ack refused"),
+        }
+        assert!(Instant::now() < deadline, "identity hold timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

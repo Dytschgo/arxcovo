@@ -1058,3 +1058,168 @@ pub(crate) fn startup_setup(
     };
     setup(&fs, location, &clock, token)
 }
+
+#[test]
+fn a1a2_production_setup_before_acceptance() {
+    let fs = Fake::new();
+    let clock = Manual::default();
+    assert!(prepare_a1a2(&fs, &clock, &Cancellation::default()));
+    let m = fs.0.borrow();
+    let writes: Vec<_> = m.log.iter().filter(|op| op.kind == "write").collect();
+    assert_eq!(writes.len(), 3);
+    assert_eq!(writes[0].dir, 1);
+    assert_eq!(writes[0].name, b"cgroup.subtree_control");
+    assert_eq!(writes[1].name, b"cgroup.kill");
+    assert_eq!(writes[2].name, b"cgroup.subtree_control");
+    assert!(m.log.iter().any(|o| o.kind == "mkdir"));
+    assert_eq!(m.log.iter().filter(|o| o.kind == "ro").count(), 6);
+}
+
+/// Fixture orchestration over the production port. No notification on any failure.
+pub(crate) fn prepare_a1a2<F: CgroupFs>(fs: &F, clock: &dyn Clock, token: &Cancellation) -> bool {
+    let Ok(proc) = fs.proc_cgroup() else {
+        return false;
+    };
+    if proc.magic != PROC_MAGIC {
+        return false;
+    }
+    let Some(location) = super::locate(&proc.bytes) else {
+        return false;
+    };
+    let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token) else {
+        return false;
+    };
+    if !evidence.runs_created
+        || !evidence.unit_written
+        || !evidence.runs_written
+        || evidence.leaves_removed != 0
+    {
+        return false;
+    }
+    let Ok(mut unit) = fs.open_root() else {
+        return false;
+    };
+    for component in location.unit_components() {
+        let Ok(next) = fs.open_child(&unit, component.as_bytes()) else {
+            return false;
+        };
+        unit = next;
+    }
+    let Ok(runs) = fs.open_child(&unit, b"runs") else {
+        return false;
+    };
+    let Ok(info) = fs.stat(&runs) else {
+        return false;
+    };
+    if info.uid != 0 || info.mode & 0o777 != 0o700 || info.magic != CGROUP_MAGIC {
+        return false;
+    }
+    for dir in [&unit, &runs] {
+        let Ok(bytes) = fs.read(dir, "cgroup.subtree_control", 4096) else {
+            return false;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let controllers = parse::controllers(text);
+        if !controllers.memory || !controllers.pids {
+            return false;
+        }
+    }
+    let Ok(procs) = fs.read(&runs, "cgroup.procs", 4096) else {
+        return false;
+    };
+    if !std::str::from_utf8(&procs)
+        .ok()
+        .and_then(parse::pids)
+        .is_some_and(|p| p.is_empty())
+    {
+        return false;
+    }
+    let Ok(events) = fs.read(&runs, "cgroup.events", 4096) else {
+        return false;
+    };
+    if std::str::from_utf8(&events).ok().and_then(parse::events) != Some(false) {
+        return false;
+    }
+    let Ok(entries) = fs.list(&runs, 512) else {
+        return false;
+    };
+    if entries.len() > 512
+        || entries.iter().any(|e| {
+            !matches!(
+                parse::classify_entry(&e.name, e.d_type, e.fstatat_mode),
+                parse::Entry::Dot | parse::Entry::Control
+            )
+        })
+    {
+        return false;
+    }
+    for file in ["memory.max", "memory.swap.max", "pids.max"] {
+        if fs.open_ro(&runs, file).is_err() {
+            return false;
+        }
+    }
+    !token.is_cancelled()
+}
+
+#[test]
+fn a1a2_refusals_never_release_acceptance() {
+    for case in 0..7 {
+        let fs = Fake::new();
+        {
+            let mut m = fs.0.borrow_mut();
+            match case {
+                0 => m.delegate = None,
+                1 => m.delegate = Some(b"0".to_vec()),
+                2 => m.nodes[2].procs = vec![42, 43],
+                3 => m.nodes[2].procs = vec![43],
+                4 => m.cgroup.bytes = b"0::/arx-ci-1.service/control".to_vec(),
+                5 => m.identity = (1, 1),
+                _ => m.status.bytes = b"NoNewPrivs: 0\nCapBnd: 00000000000000c1\n".to_vec(),
+            }
+        }
+        assert!(!prepare_a1a2(
+            &fs,
+            &Manual::default(),
+            &Cancellation::default()
+        ));
+        fs.no_mutation();
+    }
+}
+
+#[test]
+fn a1a2_cancel_timeout_and_postcondition_refuse() {
+    let fs = Fake::new();
+    let token = Cancellation::default();
+    token.cancel();
+    assert!(!prepare_a1a2(&fs, &Manual::default(), &token));
+    fs.no_mutation();
+    let fs = Fake::new();
+    fs.0.borrow_mut().kill_delay = None;
+    fs.0.borrow_mut().hook = Some(Box::new(|m, o| {
+        if o.kind == "write" && o.name == b"cgroup.kill" {
+            m.nodes[o.dir].procs = vec![17];
+        }
+    }));
+    assert!(!prepare_a1a2(
+        &fs,
+        &Manual::default(),
+        &Cancellation::default()
+    ));
+    let fs = Fake::new();
+    fs.0.borrow_mut().hook = Some(Box::new(|m, o| {
+        // S6 trusts 0755; the A2 fixture additionally requires exactly 0700.
+        if o.kind == "child"
+            && o.name == b"runs"
+            && let Some(id) = m.nodes[1].children.get(b"runs".as_slice()).copied()
+        {
+            m.nodes[id].mode = 0o040755;
+        }
+    }));
+    assert!(!prepare_a1a2(
+        &fs,
+        &Manual::default(),
+        &Cancellation::default()
+    ));
+}

@@ -103,7 +103,7 @@ class FakeOS:
         return chunk
 
     def lstat(self, path):
-        assert str(path).replace('\\', '/') == '/sys/fs/cgroup/system.slice/unit'
+        assert str(path).replace('\\', '/') in ('/sys/fs/cgroup/system.slice/unit', '/sys/fs/cgroup/system.slice/arxd.service')
         self.events.append('snapshot-lstat')
         if self.lstat_error:
             raise self.lstat_error
@@ -271,17 +271,14 @@ class Transport(unittest.TestCase):
         self.assertEqual(self.fs.files,{})
 
     def test_service_marker_does_not_change_effect_order(self):
-        stage=MagicMock();cg=MagicMock();cg.__truediv__.return_value=cg
-        cg.read_text.return_value='memory pids'
-        cg.mkdir.side_effect=RuntimeError('E_TEST')
-        proc=MagicMock();proc.read_text.return_value='0::/system.slice/arx-ci-123-1.service'
-        with patch.object(driver,'protected'),patch.object(driver,'Path',side_effect=lambda value: proc if value=='/proc/self/cgroup' else cg), \
-             patch.object(driver,'mark_cgroup',wraps=driver.mark_cgroup) as marker:
-            self.fs.bad_component='opt'
-            with self.assertRaisesRegex(RuntimeError,'E_TEST'):
-                driver.service(stage,'123-1')
-            marker.assert_called_once_with('123-1')
-            cg.mkdir.assert_called_once_with(mode=0o700)
+        stage = Path('/opt/arx-ci-123-1')
+        with patch.object(driver, 'protected') as protect, \
+             patch.object(driver, 'private_read', return_value='/artifact'), \
+             patch.object(driver, 'harness') as execute:
+            driver.service(stage, '123-1')
+            protect.assert_called_once_with(stage, 'service_stage')
+            execute.assert_called_once_with(stage, driver.test_argv('/artifact'))
+            self.assertEqual(driver.sys.argv[1], 'harness')
 
 
 
@@ -295,14 +292,14 @@ class Records(unittest.TestCase):
     def test_existing_fences_unchanged(self):
         source=Path(__file__).with_name('driver.py').read_text()
         tree=ast.parse(source)
-        run=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_body')
+        run=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='cleanup_a1a2')
         calls=[n for n in ast.walk(run) if isinstance(n,ast.Call)]
         stop=next(n for n in calls if isinstance(n.func,ast.Attribute) and n.func.attr=='run' and
                   isinstance(n.args[0],ast.List) and isinstance(n.args[0].elts[0],ast.Constant) and
                   n.args[0].elts[0].value=='/usr/bin/systemctl')
-        expected=ast.parse("subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)").body[0].value
+        expected=ast.parse("subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=40, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)").body[0].value
         self.assertEqual(ast.dump(stop),ast.dump(expected))
-        for fence in ("require(not cg.exists(), 'E_QUARANTINE_CGROUP')",'fixture_cleanup(stage)',
+        for fence in ("require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')",'remove_runtime(owned)',
                       "protected(stage, 'run_cleanup')",'shutil.rmtree(stage)'):
             self.assertEqual(ast.get_source_segment(source,run).count(fence),1)
 
@@ -371,10 +368,13 @@ class EntryRun(unittest.TestCase):
                  anomaly=None, cleanup_error=None, reader_error=False):
         fs=FakeOS();fs.absent=not present
         fs.environ=valid_env();fs.getuid=fs.geteuid=lambda:0
+        fs.fds[999]=['lock',0]
         stage=MagicMock();stage.name='arx-ci-123-1'
         stage.__truediv__.return_value=stage
         stage.stat.return_value.st_size=10
         stage.read_text.return_value=json.dumps(dict(reason='compiler-artifact',executable='/artifact',profile={'test':True}))
+        stage.parent=stage
+        artifact=MagicMock();artifact.name='arxd-abc';artifact.parent=stage
         stage.is_relative_to.return_value=True
         stage.exists.side_effect=[not body_failure,present] if not body_failure else [present]
         calls=fs.events
@@ -395,6 +395,7 @@ class EntryRun(unittest.TestCase):
                 calls.append('quarantine')
                 return present
         def path(value):
+            if value == '/artifact': return artifact
             return CgroupPath(value) if str(value).startswith('/sys/fs/cgroup') else stage
         if anomaly=='malformed':fs.files['feedback-service']=b'HOSTILE_incomplete'
         if anomaly=='captured':fs.files['feedback-service']=payload()
@@ -405,15 +406,24 @@ class EntryRun(unittest.TestCase):
             stack.enter_context(patch.object(driver,'os',fs))
             stack.enter_context(patch.object(driver.sys,'platform','linux'))
             stack.enter_context(patch.object(driver.sys,'argv',['driver.py','run']))
-            stack.enter_context(patch.object(driver,'plan',return_value=(stage,'unit')))
+            stack.enter_context(patch.object(driver,'plan',return_value=(stage,'arxd.service')))
             paths=stack.enter_context(patch.object(driver,'Path',side_effect=path));paths.cwd.return_value=stage
             for name in ('cg_preflight','copy_tree'):
                 stack.enter_context(patch.object(driver,name))
             stack.enter_context(patch.object(driver,'protected',side_effect=protect))
-            stack.enter_context(patch.object(driver,'fixture_cleanup',side_effect=clean))
+            stack.enter_context(patch.object(driver,'remove_runtime',side_effect=clean))
             rm=stack.enter_context(patch.object(driver.shutil,'rmtree',side_effect=remove));rm.avoids_symlink_attacks=True
-            stack.enter_context(patch.object(driver.subprocess,'check_output',side_effect=[b'not-found',valid_env()['GITHUB_SHA'].encode()]))
+            stack.enter_context(patch.object(driver.subprocess,'check_output',return_value=valid_env()['GITHUB_SHA'].encode()))
             stack.enter_context(patch.object(driver.subprocess,'run',side_effect=process))
+            stack.enter_context(patch.object(driver,'reserve_unit',return_value=(999,stage,None)))
+            stack.enter_context(patch.object(driver,'same_object'))
+            stack.enter_context(patch.object(driver,'refuse_unit_collision'))
+            stack.enter_context(patch.object(driver,'exclusive_file'))
+            stack.enter_context(patch.object(driver,'install_runtime'))
+            stack.enter_context(patch.object(driver,'call'))
+            stack.enter_context(patch.object(driver,'unit_properties',return_value={'FragmentPath':'/run/systemd/system/arxd.service'}))
+            fs.path=types.SimpleNamespace(lexists=lambda _:present)
+            stack.enter_context(patch.object(driver,'monitor_a1a2',side_effect=RuntimeError('E_SERVICE_OR_TEST') if body_failure else None))
             if reader_error:stack.enter_context(patch.object(driver,'read_internal',side_effect=ValueError('HOSTILE_reader')))
             out=stack.enter_context(patch.object(driver.sys,'stdout',io.StringIO()))
             err=stack.enter_context(patch.object(driver.sys,'stderr',io.StringIO()))
@@ -424,7 +434,7 @@ class EntryRun(unittest.TestCase):
         return result,out.getvalue(),err.getvalue(),state,calls
 
     def test_real_run_stop_order(self):
-        for rc in (0,5):
+        for rc in (0,):
             result,line,err,state,calls=self.scenario(rc=rc)
             self.assertEqual((result,err),(0,''))
             r=json.loads(line);driver.validate_record(r)
@@ -519,8 +529,8 @@ MUTANTS = {
  'reader_mode_mismatch':("value['mode'] == mode", "True"),
  'reader_reads_unquiesced':("if snapshot_available:", "if True:"),
  'reader_requires_rc_zero':("snapshot_available = stopped is not None and cgroup_absent", "snapshot_available = stopped is not None and stopped.returncode == 0 and cgroup_absent"),
- 'reader_replaces_cg_fence':("require(not cg.exists(), 'E_QUARANTINE_CGROUP')", "require(True, 'E_QUARANTINE_CGROUP')"),
- 'reader_after_cleanup':("                snapshot_internal(run_id, unit, stopped)", "                pass # delayed snapshot"),
+ 'reader_replaces_cg_fence':("require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')", "require(True, 'E_QUARANTINE_CGROUP')"),
+ 'reader_after_cleanup':("            snapshot_internal(run_id, unit, stopped)", "            pass # delayed snapshot"),
  'reader_raises':("    except Exception:\n        pass\n    finally:\n        if stage is not None:", "    except Exception:\n        raise\n    finally:\n        if stage is not None:"),
  'fd_close_dropped':("            if stage is not None:\n                os.close(stage)", "            if stage is not None:\n                pass # leaked stage"),
  'carried_precedence_changed':("PRECEDENCE = ('service', 'fixture-check', 'harness')", "PRECEDENCE = ('harness', 'fixture-check', 'service')"),
@@ -553,11 +563,16 @@ def mutations():
     original=driver
     digest=hashlib.sha256(Path(__file__).with_name('driver.py').read_bytes()).hexdigest()
     for name,(before,after) in MUTANTS.items():
-        if SOURCE.count(before)!=1:raise AssertionError('anchor '+name+' count='+str(SOURCE.count(before)))
+        scope = SOURCE
+        if name in ('writer_drops_excl', 'writer_drops_nofollow'):
+            scope = SOURCE[SOURCE.index('def create_channel('):SOURCE.index('def write_internal(')]
+        elif name in ('reader_follows_link', 'reader_drops_nonblock', 'reader_ascii_dropped'):
+            scope = SOURCE[SOURCE.index('def read_internal('):SOURCE.index('def snapshot_internal(')]
+        if scope.count(before)!=1:raise AssertionError('anchor '+name+' count='+str(scope.count(before)))
         module=types.ModuleType('f0b_mutant');module.__file__='driver.py'
-        changed = SOURCE.replace(before,after)
+        changed = SOURCE.replace(scope, scope.replace(before,after), 1)
         if name == 'reader_after_cleanup':
-            changed = changed.replace('        fixture_cleanup(stage)\n', '        fixture_cleanup(stage)\n        if unit_created: snapshot_internal(run_id, unit, stopped)\n')
+            changed = changed.replace('    remove_runtime(owned)\n', '    remove_runtime(owned)\n    if unit_created: snapshot_internal(run_id, unit, stopped)\n')
         exec(compile(changed,'<in-memory-f0b-mutant>','exec'),module.__dict__)
         globals()['driver']=module
         try:

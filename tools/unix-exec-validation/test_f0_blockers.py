@@ -9,6 +9,7 @@ import sys
 import types
 import unittest
 from unittest.mock import MagicMock, patch
+from contextlib import ExitStack
 import driver
 from test_driver import valid_env
 
@@ -19,11 +20,13 @@ class F0Blockers(unittest.TestCase):
         for key, val in [('phase', 'initial'), ('first', None), ('mutation', 'none'), ('cleanup', 'not_reached'), ('internal', None)]:
             self.enterContext(patch.object(driver, 'feedback_' + key, val))
 
-    def scenario(self, body=None, cleanup=None, pre=None, service=False, success=False, artifact_refusal=False):
+    def scenario(self, body=None, cleanup=None, pre=None, service=False, success=False, artifact_refusal=False, collision=False, start_error=False, install_error=False):
         stage = MagicMock()
         stage.__truediv__.return_value = stage
         stage.stat.return_value.st_size = 10
         stage.read_text.return_value = json.dumps(dict(reason='compiler-artifact', executable='/artifact', profile={'test': True}))
+        stage.parent = stage
+        stage.name = 'arxd-abc'
         stage.is_relative_to.return_value = True
         stage.exists.side_effect = [True, False] if success else None
         stage.exists.return_value = False
@@ -33,37 +36,78 @@ class F0Blockers(unittest.TestCase):
         def snapshot(*_):
             driver.feedback_internal = dict.fromkeys(driver.PRECEDENCE, 'absent')
             driver.feedback_internal.update(carried=None, refusal=None)
+        events = []
+        results = iter([types.SimpleNamespace(returncode=0), types.SimpleNamespace(returncode=0)] if service or success else body or [types.SimpleNamespace(returncode=0 if artifact_refusal else 1)])
+        def process(argv, **kw):
+            events.append('stop' if argv[0] == '/usr/bin/systemctl' else 'build')
+            return next(results)
         def clean(_):
             self.assertEqual(driver.feedback_phase, 'final', 'cleanup phase must be final')
             self.assertEqual(driver.feedback_cleanup, 'unconfirmed', 'cleanup confirmation must follow removal')
             if cleanup:
                 raise cleanup
-        with patch.object(driver, 'plan', return_value=(stage, 'unit')), \
-             patch.object(driver, 'Path', return_value=stage) as paths, \
-             patch.object(driver.os, 'getuid', return_value=0, create=True), \
-             patch.object(driver.os, 'geteuid', return_value=0, create=True), \
-             patch.object(driver, 'snapshot_internal', side_effect=snapshot), patch.object(driver, 'cg_preflight'), patch.object(driver, 'protected', side_effect=protect), \
-             patch.object(driver, 'copy_tree'), patch.object(driver, 'fixture_cleanup', side_effect=clean), \
-             patch.object(driver.shutil, 'rmtree') as remove, \
-             patch.object(driver.subprocess, 'check_output', side_effect=[b'not-found', valid_env()['GITHUB_SHA'].encode()]), \
-             patch.object(driver.subprocess, 'run', side_effect=([types.SimpleNamespace(returncode=0), types.SimpleNamespace(returncode=0 if success else 1), types.SimpleNamespace(returncode=0)] if service or success else body or [types.SimpleNamespace(returncode=0 if artifact_refusal else 1)])), \
-             patch.dict(driver.os.environ, valid_env(), clear=True), \
-             patch.object(driver.sys, 'argv', ['driver.py', 'run']), \
-             patch.object(driver.sys, 'stdout', new_callable=io.StringIO) as out, \
-             patch.object(driver.sys, 'stderr', new_callable=io.StringIO) as err:
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(driver, 'plan', return_value=(stage, 'arxd.service')))
+            paths = stack.enter_context(patch.object(driver, 'Path', return_value=stage))
+            stack.enter_context(patch.object(driver.os, 'getuid', return_value=0, create=True))
+            stack.enter_context(patch.object(driver.os, 'geteuid', return_value=0, create=True))
+            stack.enter_context(patch.object(driver, 'snapshot_internal', side_effect=snapshot))
+            stack.enter_context(patch.object(driver, 'cg_preflight'))
+            stack.enter_context(patch.object(driver, 'protected', side_effect=protect))
+            stack.enter_context(patch.object(driver, 'copy_tree'))
+            stack.enter_context(patch.object(driver, 'remove_runtime', side_effect=clean))
+            remove = stack.enter_context(patch.object(driver.shutil, 'rmtree'))
+            stack.enter_context(patch.object(driver.subprocess, 'check_output', return_value=valid_env()['GITHUB_SHA'].encode()))
+            stack.enter_context(patch.object(driver.subprocess, 'run', side_effect=process))
+            stack.enter_context(patch.object(driver, 'reserve_unit', return_value=(77, stage, None)))
+            stack.enter_context(patch.object(driver, 'refuse_unit_collision', side_effect=RuntimeError('E_UNIT_COLLISION') if collision else None))
+            stack.enter_context(patch.object(driver, 'same_object'))
+            stack.enter_context(patch.object(driver, 'exclusive_file'))
+            stack.enter_context(patch.object(driver, 'install_runtime', side_effect=RuntimeError('E_OS') if install_error else lambda *a:events.append('install')))
+            stack.enter_context(patch.object(driver, 'call', side_effect=lambda argv: (_ for _ in ()).throw(RuntimeError('E_COMMAND_FAILED')) if start_error and 'start' in argv else events.append('start') if 'start' in argv else None))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            stack.enter_context(patch.object(driver.os.path, 'lexists', return_value=False))
+            stack.enter_context(patch.object(driver, 'unit_properties', return_value={'FragmentPath':'/run/systemd/system/arxd.service'}))
+            stack.enter_context(patch.object(driver, 'monitor_a1a2', side_effect=None if success else RuntimeError('E_SERVICE_OR_TEST')))
+            stack.enter_context(patch.dict(driver.os.environ, valid_env(), clear=True))
+            stack.enter_context(patch.object(driver.sys, 'argv', ['driver.py', 'run']))
+            out = stack.enter_context(patch.object(driver.sys, 'stdout', new_callable=io.StringIO))
+            err = stack.enter_context(patch.object(driver.sys, 'stderr', new_callable=io.StringIO))
             paths.cwd.return_value = stage
             remove.avoids_symlink_attacks = True
-            self.assertEqual(driver.entry(), int(not success or cleanup is not None or artifact_refusal))
+            self.assertEqual(driver.entry(), int(not success or cleanup is not None or artifact_refusal or collision or start_error or install_error))
+            if collision:
+                self.assertEqual(events, [])
+            elif install_error:
+                self.assertEqual(events, ['build'])
+            elif start_error:
+                self.assertEqual(events, ['build','install','stop'])
+            elif service or success:
+                self.assertEqual(events, ['build','install','start','stop'])
+            elif not pre:
+                self.assertEqual(events, ['build'])
             self.assertEqual(err.getvalue(), '')
             line = out.getvalue()
             driver.replay(line)
             record = json.loads(line)
-            self.assertEqual(remove.call_count, int(not cleanup and not pre))
+            self.assertEqual(remove.call_count, int(not cleanup and not pre and not collision and not install_error))
             self.assertEqual(record['schema'], 'unix-protection-f0')
             self.assertEqual(record['version'], 2)
             e = valid_env()
             self.assertEqual(record['provenance'], dict(source_sha=e['ARX_REVIEWED_SHA'], workflow_sha=e['ARX_WORKFLOW_SHA'], run=e['GITHUB_RUN_ID'], attempt=e['GITHUB_RUN_ATTEMPT']))
             return record
+
+    def test_collision_before_creation_and_start_failure(self):
+        r = self.scenario(collision=True)
+        self.assertEqual((r['mutation_lower_bound'], r['cleanup']), ('none','not_reached'))
+        self.assertEqual(r['first'], {'code':'E_UNIT_COLLISION'})
+        r = self.scenario(service=True, start_error=True)
+        self.assertEqual(r['first'], {'code':'E_COMMAND_FAILED'})
+        self.assertEqual(r['cleanup'], 'confirmed')
+        r = self.scenario(service=True, install_error=True)
+        self.assertEqual(r['first'], {'code':'E_OS'})
+        self.assertEqual(r['final'], {'code':'E_QUARANTINE_CGROUP'})
+        self.assertEqual(r['cleanup'], 'unconfirmed')
 
     def test_run_orderings(self):
         for body_code, service in [('E_BUILD', False), ('E_SERVICE_OR_TEST', True)]:
@@ -189,7 +233,7 @@ class F0Blockers(unittest.TestCase):
                 self.assertIn('stderr', keys)
                 if node.func.attr != 'check_output': self.assertIn('stdout', keys)
         self.assertEqual(len(sites), 13)
-        self.assertEqual(set(sites), set(driver.SITES))
+        self.assertEqual(set(sites), set(driver.SITES) - {'service_cg', 'service_runs'})
 
 SOURCE = Path(__file__).with_name('driver.py').read_text()
 
