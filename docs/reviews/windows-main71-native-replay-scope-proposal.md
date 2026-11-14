@@ -132,25 +132,32 @@ Propose a narrow cfg(test) stream fixture, reviewed separately before use:
   `tools/windows-native-replay/child/Cargo.toml`. It has its own pinned lockfile,
   no external dependencies, no libtest harness output, no child spawning, no
   reads of identity/private data and only silent exit 0. Copy its reviewed
-  executable into each owned temp workspace as `cargo.exe`, resolved through
-  the existing configured PATH/tool path checks. Do not use cmd/PowerShell as
+  executable as cargo.exe in one owned fixture directory whose only executable
+  is that hashed helper. PATH is exactly that one directory, arguments are
+  empty, and the resolved bytes must match the reviewed hash before every row.
+  Keep this helper outside workspace members and preserve all configured tool
+  and path checks. Real Cargo must never be selectable. Do not use cmd/PowerShell as
   the fixture child. Exact helper bytes and lockfile pins are mandatory later.
 - Only while the explicit fixture guard is active, retain one non-inheritable
-  duplicate of each existing stdout/stderr writer in the parent. The child's
+  duplicate of each existing stdout/stderr writer in the parent, AFTER the
+  inheritance list is sealed and BEFORE the original writer drops at baseline
+  1371-1372. Taking duplicates after those drops is forbidden. The child's
   inheritance list remains exactly NUL/stdout/stderr; retained duplicates are
   never inherited. Originals still drop at the original point. This is **new
   fixture-only handle/native activity**, not diagnostic instrumentation and
   not allowed by the accepted dormant capture contract alone. Separate review
   must accept it or reject this route. Non-fixture tests and non-test builds
   must acquire no new handles/calls or evaluate fixture arguments.
+- Prefill is enabled ONLY for eight stream failure rows, four peek-109 rows
+  and the two controls. All other rows have empty streams and no prefill.
 - L cases: immediately before the first loop drain pair, synchronously write
-  exactly one fixed synthetic byte into each original stream through those
+  exactly one fixed synthetic byte X into each original stream through those
   retained writers. Write completion and byte count are asserted before either
   peek. No other bytes are produced by S. The first out drain can consume at
   most one byte, far below 8192, so it cannot short-circuit err. Both peek and
   read cases use the same prefill, with injection at their selected site.
 - F cases: do not seed during the loop. Only after the existing `job.stop()`
-  has returned true, immediately before final pass 0, write one fixed byte to
+  has returned true, immediately before final pass 0, write one fixed byte X to
   each stream. These bytes cannot have been consumed during the loop. Assert
   write counts, real peek availability and pass=0. Keep the original 32 passes
   and bitwise final drain operation. Do not bypass stop, skip drains or change
@@ -193,7 +200,11 @@ The current Observation alone does **not** prove consumed exactly once: invocati
 drop clears armed state even if it was never consumed. Separately reviewed
 cfg(test) instrumentation must count only successful `armed.take()` consumption
 and attempted native ResumeThread calls at the actual site after injection.
-Copy these fixed counters before Scope drop, preserving clear-on-unwind and
+Consumption and resume counters must survive Invocation::drop just as
+create_calls does; Invocation must not clear them with armed state. Copy them
+before Scope drop, then Scope clears all state, including on unwind. Peek109
+counts as consumed although no failure record is stored. Resume increment is
+AFTER its injection return and immediately BEFORE actual ResumeThread. Preserve
 non-reentrancy. Do not add native counter operations. Require consumed=1 for
 every injected row, 0 for controls; a second consume in the same invocation
 cannot occur. Pending/armed empty after drop is not consumption evidence.
@@ -244,7 +255,10 @@ allowed after the existing assignment/token checks, and S makes no descendants.
 Never use tree/handles/overflow fixtures to inflate process counts. Existing
 kill-on-close, process/memory/UI limits, terminate/Job.stop/quarantine order and
 all refusal paths remain unchanged. Each post-create error quarantines its
-Execution; never clear/reuse that Execution for another case.
+Execution; construct a fresh Execution for EVERY row, never clear/reuse one.
+Direct run_inner does not read quarantine on entry, so a second direct call is
+not a quarantine refusal test. Any such assertion must separately use work;
+no additional work call is included in this matrix or its child budget.
 
 The existing error cleanup ignores its outer Job.stop result; return of
 ExecutionFailed does not itself establish confirmed cleanup. Proposed fixture
@@ -429,10 +443,10 @@ Gates, in order:
    This sub-agent does not delegate it. Coordinator records acceptance or gaps.
 2. Coordinator separately authorizes bounded Sol implementation preparation and
    named compile/pure checks, with no native execution or ordinary-discovery
-   publication. Any isolated native test registration must itself be explicitly
-   included in that preparation disposition before mutation; otherwise prepare
-   fixture functions only. Registration is not execution authority and its
-   unpublished branch must not trigger unapproved CI.
+   publication. Gate 2 permits functions the harness does not discover only:
+   no #[test] native registration, ignored-test registration or new discovery
+   entry. Registration needs a separate scope decision. The unpublished branch
+   must not trigger unapproved CI.
    Obtain a different-provider source/security review of helper, pipe hooks,
    counters, constructor, controller and provenance driver at their final SHA.
    No release hook, policy bypass or changed cleanup decision may slip through.
@@ -462,3 +476,31 @@ owner/account/service/VM/private-state inspection, installation, CI dispatch,
 subagent, source edit or PROGRESS edit. M2 is **incomplete**, real-Runner PA6
 record/replay remains **OPEN**, and native/installed/dedicated paths are
 **unverified on real hardware**. No incident fix or acceptance is claimed.
+
+## Correction following Grok review b0b4581
+
+Status remains proposed, unaccepted. Coordinator Sol medium corrects
+SP-ORACLE, SP-COUNTER, SE-IMAGE, SE-DUP and SE-REUSE above. No code or run
+is authorized. Independent error-55 stream oracle (values copied into the
+literal 28-row table, never derived from captured records or selectors):
+
+| Labels | Pass | Pre-read stdout total | Pre-read stderr total |
+| --- | --- | ---: | ---: |
+| loop_out_peek, loop_out_read | missing | 0 | 0 |
+| loop_err_peek, loop_err_read | missing | 1 | 0 |
+| final_out_peek, final_out_read | 0 | 0 | 0 |
+| final_err_peek, final_err_read | 0 | 1 | 0 |
+
+The other twenty error-55 rows have missing pass/totals because no drain
+snapshot is supplied there. Each peek109/control row has no failure record
+and final successful stream totals 1/1, no drops. A later authorized build
+must reject any mismatch rather than regenerating this oracle from output.
+All prefill bytes are X; expected totals are defined by deterministic single
+byte writes and out-before-err order, not observations made by the fixture.
+
+No approved disposable standard-account controller is named yet. Choosing it,
+proving nested-Job containment, final source/helper hashes and measuring the
+non-replay CI share remain OPEN decisions before native authority. The extra
+parent writer duplicates are proposed fixture-only exceptions pending review;
+accepting their design never authorizes compile or execution. All historical
+failure and no-retry rules remain unchanged.

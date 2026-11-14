@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Grok scope review `b0b4581` (retained `d63ae19`) requested five Windows native-replay contract corrections. Sol medium specified independent pass/totals oracle, surviving consumption/resume counters, exact helper-only PATH/hash, duplicate-before-drop ordering and fresh Execution per row. Gate 2 now excludes all native test registration/discovery. Proposal unaccepted; controller/environment and measured budget remain OPEN; fresh independent recheck is next. No code or native run authorized.
+
 - Bounded Windows native-replay scope proposal `d863c10` (retained `88986fa`) by Sol high is under Grok high independent review. It grants no execution, implementation or discovery authority. Deterministic 28-label fixture/controller safety, exact pins and native CI budget remain design gates; review completion is awaited. M2 incomplete, cause unknown, hardware paths **unverified on real hardware**.
 
 - Last merged PR74 `aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`, 2026-11-14 05:47:59Z. Squash tree equals independently reviewed `fc099b0`; all five required checks passed, first PR CI attempt `43562334337` succeeded in 468s. Main-after-PR74 run `43563255749` passed attempt 1 in 614s (2026-11-14 05:48:01-05:58:15Z), verified from first-attempt API metadata. No incident-fix or native-replay credit. Coordinator Sol medium; no bypass. SP1/SP2 dormant seam corrections integrated, not native evidence.
