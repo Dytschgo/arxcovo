@@ -572,6 +572,11 @@ pub(super) async fn pa6_panic_residue_report_and_gate() {
         residue.load(Ordering::Acquire),
         "residue remains visible after the failed response"
     );
+    assert_eq!(
+        b.preflight(),
+        Err(Unavailable::MechanismUnavailable),
+        "S2a latch precedes any next gate"
+    );
     // Exercise the bridge's next in-slot gate, independently of Execution's G latch.
     assert!(matches!(
         b.run(
@@ -582,11 +587,10 @@ pub(super) async fn pa6_panic_residue_report_and_gate() {
         Report::Unavailable(Unavailable::MechanismUnavailable)
     ));
     assert_eq!(b.readiness.check(), Err(Unavailable::MechanismUnavailable));
-    residue.store(false, Ordering::Release);
     assert_eq!(
         b.preflight(),
         Err(Unavailable::MechanismUnavailable),
-        "terminal latch survives cleared residue"
+        "terminal latch remains set"
     );
     for _ in 0..4 {
         refused(call(&e, &a, false).await, Unavailable::Quarantined);
@@ -602,4 +606,74 @@ pub(super) async fn pa6_panic_residue_report_and_gate() {
         "panic payload withheld from activity"
     );
     e.drain().await.unwrap();
+}
+
+// Called only by the normal T10 parent-owned child, with fixed panic diagnostics.
+pub(super) fn s2a_panic_latch_before_return() {
+    for residue_on in [false, true] {
+        for first_rights in [false, true] {
+            let state = ready();
+            let during = state.clone();
+            let residue = Arc::new(AtomicBool::new(false));
+            let flag = residue.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let b = UnixBridge::new(
+                &Layout::for_test(Platform::Linux),
+                &config(),
+                Some("/owned-synthetic/runs".into()),
+                |_| {
+                    Ok(Box::new(Port {
+                        calls: calls.clone(),
+                        residue: residue.clone(),
+                        step: Box::new(move |_, _, _| {
+                            if first_rights {
+                                during.latch(Cause::Rights);
+                            }
+                            if residue_on {
+                                flag.store(true, Ordering::Release);
+                            }
+                            panic!("ARX-S2A-FIXED-PANIC");
+                        }),
+                    }))
+                },
+                Box::new(|| Ok(())),
+                state.clone(),
+            );
+            assert!(
+                matches!(
+                    b.run(
+                        Some(&request()),
+                        &Cancellation::default(),
+                        &Cancellation::default()
+                    ),
+                    Report::Failed {
+                        creation: Creation::Unknown
+                    }
+                ),
+                "S2a panic report remains Failed Unknown"
+            );
+            // Read readiness immediately: no next run/gate can mask a missing catch latch.
+            let expected = if first_rights {
+                Err(Unavailable::RightsMismatch)
+            } else if residue_on {
+                Err(Unavailable::MechanismUnavailable)
+            } else {
+                Ok(())
+            };
+            assert_eq!(
+                state.check(),
+                expected,
+                "S2a immediate latch and first cause"
+            );
+            assert_eq!(
+                b.preflight(),
+                expected,
+                "S2a ordinary preflight after panic"
+            );
+            state.set_ready();
+            assert_eq!(state.check(), expected, "S2a state stays monotone");
+            assert_eq!(residue.load(Ordering::Acquire), residue_on);
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+        }
+    }
 }

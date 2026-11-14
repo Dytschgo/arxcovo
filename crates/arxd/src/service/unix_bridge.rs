@@ -153,9 +153,18 @@ impl Executor for UnixBridge {
     ) -> Report {
         match catch_unwind(AssertUnwindSafe(|| self.body(request, cancel, shutdown))) {
             Ok(report) => report,
-            Err(_payload) => Report::Failed {
-                creation: Creation::Unknown,
-            },
+            Err(_payload) => {
+                if self
+                    .runner
+                    .as_ref()
+                    .is_ok_and(|runner| runner.cleanup_residue())
+                {
+                    self.readiness.latch(Cause::Containment);
+                }
+                Report::Failed {
+                    creation: Creation::Unknown,
+                }
+            }
         }
     }
 }
