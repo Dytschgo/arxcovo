@@ -798,8 +798,8 @@ class A1A2(unittest.TestCase):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
 
-    def test_source_default_remains_a3_none(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a3_none')
+    def test_source_selection_is_a5(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a5')
 
     def test_closed_mapping(self):
         # Independent expectations: never obtain the cases/profile from the driver.
