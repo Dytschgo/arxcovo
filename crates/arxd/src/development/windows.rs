@@ -20,10 +20,12 @@ macro_rules! diagnostic {
 #[cfg(test)]
 macro_rules! stage {
     ($stage:expr) => {{
-        if let Some(error) = diag::stage($stage) {
-            diag::capture(|| error, true, None);
-            diagnostic_snapshot();
-            return Err(Reason::ExecutionFailed);
+        let stage = $stage;
+        if let Some(error) = diag::stage(stage) {
+            if diag::capture_injected(stage, error) {
+                diagnostic_snapshot();
+                return Err(Reason::ExecutionFailed);
+            }
         }
     }};
 }
@@ -330,6 +332,23 @@ mod diag {
             STATE.with(|s| *s.borrow_mut() = State::default());
         }
     }
+    #[derive(Clone, Copy)]
+    pub struct Observation {
+        pub record: Option<Record>,
+        pub create_calls: u32,
+    }
+    // Future replay callers must arm and invoke directly inside this closure,
+    // not call run_ok (which owns a separate, non-nestable Scope).
+    // Copy the bounded result before the owning Scope resets all TLS on drop.
+    pub fn observe<T>(f: impl FnOnce() -> T) -> (T, Observation) {
+        let _scope = Scope::enter();
+        let result = f();
+        let observation = Observation {
+            record: record(),
+            create_calls: create_calls(),
+        };
+        (result, observation)
+    }
     pub struct Invocation(std::marker::PhantomData<std::rc::Rc<()>>);
     impl Invocation {
         pub fn enter() -> Self {
@@ -391,6 +410,23 @@ mod diag {
                 None
             }
         })
+    }
+    // Synthetic metadata models the selected failure, never an actual API result.
+    // Attr-size is a size predicate, so its last-error observation is invalid.
+    // Wait models WAIT_FAILED exclusively, making last-error valid in that case.
+    pub fn capture_injected(stage: Stage, error: u32) -> bool {
+        if error == 109
+            && matches!(
+                stage,
+                Stage::LoopOutPeek | Stage::LoopErrPeek | Stage::FinalOutPeek | Stage::FinalErrPeek
+            )
+        {
+            return false;
+        }
+        let valid = stage != Stage::AttrSize;
+        let wait = (stage == Stage::Wait).then_some(u32::MAX); // WAIT_FAILED
+        capture(|| error, valid, wait);
+        true
     }
     pub fn handles(process: usize, job: usize) {
         STATE.with(|s| {
@@ -595,6 +631,100 @@ mod diag {
             assert_eq!(resolve(Role::FinalOut, Op::Read).label(), "final_out_read");
             assert_eq!(resolve(Role::FinalErr, Op::Peek).label(), "final_err_peek");
             assert_eq!(resolve(Role::FinalErr, Op::Read).label(), "final_err_read");
+        }
+        #[test]
+        fn scoped_observation_survives_invocation_but_clears_tls() {
+            let (value, observation) = observe(|| {
+                let _run = Invocation::enter();
+                create_call();
+                create_call();
+                stage(Stage::CreateProcess);
+                capture(|| 55, true, None);
+                7
+            });
+            assert_eq!(value, 7);
+            assert_eq!(observation.create_calls, 2);
+            assert_eq!(observation.record.unwrap().error, Some(55));
+            assert_eq!(
+                observation.record.unwrap().stage,
+                Some(Stage::CreateProcess)
+            );
+            assert_eq!(create_calls(), 0);
+            assert!(record().is_none());
+            let (_, next) = observe(|| {
+                let _run = Invocation::enter();
+            });
+            assert_eq!(next.create_calls, 0);
+            assert!(next.record.is_none());
+            assert!(
+                std::panic::catch_unwind(|| observe(|| {
+                    let _run = Invocation::enter();
+                    create_call();
+                    panic!("synthetic observation unwind");
+                }))
+                .is_err()
+            );
+            assert_eq!(create_calls(), 0);
+            assert!(record().is_none());
+        }
+        #[test]
+        fn injected_metadata_all_stages_and_broken_pipe() {
+            let cases = [
+                (Stage::DaemonTokenOpen, true, None, false),
+                (Stage::DaemonTokenInfo, true, None, false),
+                (Stage::ChildTokenOpen, true, None, false),
+                (Stage::ChildTokenInfo, true, None, false),
+                (Stage::PipeOutCreate, true, None, false),
+                (Stage::PipeErrCreate, true, None, false),
+                (Stage::PipeOutNoinherit, true, None, false),
+                (Stage::PipeErrNoinherit, true, None, false),
+                (Stage::JobCreate, true, None, false),
+                (Stage::JobLimits, true, None, false),
+                (Stage::JobUi, true, None, false),
+                (Stage::NulOpen, true, None, false),
+                (Stage::AttrSize, false, None, false),
+                (Stage::AttrInit, true, None, false),
+                (Stage::AttrUpdate, true, None, false),
+                (Stage::CreateProcess, true, None, false),
+                (Stage::AssignJob, true, None, false),
+                (Stage::Resume, true, None, false),
+                (Stage::LoopOutPeek, true, None, true),
+                (Stage::LoopErrPeek, true, None, true),
+                (Stage::LoopOutRead, true, None, false),
+                (Stage::LoopErrRead, true, None, false),
+                (Stage::FinalOutPeek, true, None, true),
+                (Stage::FinalErrPeek, true, None, true),
+                (Stage::FinalOutRead, true, None, false),
+                (Stage::FinalErrRead, true, None, false),
+                (Stage::Wait, true, Some(0xffff_ffff), false),
+                (Stage::ExitCode, true, None, false),
+            ];
+            assert_eq!(cases.len(), 28);
+            assert_eq!(cases.map(|c| c.0), Stage::ALL);
+            for (selected, valid, wait, broken_pipe_success) in cases {
+                for error in [55, 109] {
+                    let (failed, observation) = observe(|| {
+                        arm(selected, error);
+                        let _run = Invocation::enter();
+                        let injected = stage(selected).unwrap();
+                        assert_eq!(stage(selected), None); // consumed once
+                        capture_injected(selected, injected)
+                    });
+                    assert_eq!(failed, !(error == 109 && broken_pipe_success));
+                    if failed {
+                        let r = observation.record.unwrap();
+                        assert_eq!(
+                            (r.stage, r.error, r.valid, r.wait),
+                            (Some(selected), Some(error), valid, wait),
+                            "{selected:?}"
+                        );
+                    } else {
+                        assert!(observation.record.is_none());
+                    }
+                    assert_eq!(observation.create_calls, 0); // bookkeeping only
+                    assert!(record().is_none());
+                }
+            }
         }
         #[test]
         fn lifecycle_one_shot_unwind_and_counter() {
@@ -1064,12 +1194,15 @@ fn drain(h: HANDLE, c: &mut Captured, limit: usize) -> std::result::Result<bool,
     unsafe {
         let mut available = 0;
         #[cfg(test)]
-        if let Some(error) = diag::stage(diag::operation(diag::Op::Peek)) {
-            if error == ERROR_BROKEN_PIPE {
-                return Ok(c.total > limit as u64);
+        {
+            let stage = diag::operation(diag::Op::Peek);
+            if let Some(error) = diag::stage(stage) {
+                if !diag::capture_injected(stage, error) {
+                    return Ok(c.total > limit as u64);
+                }
+                diagnostic_snapshot();
+                return Err(Reason::ExecutionFailed);
             }
-            diag::failure(|| error, true, None, diagnostic_snapshot);
-            return Err(Reason::ExecutionFailed);
         }
         if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
             let error = GetLastError();
