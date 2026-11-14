@@ -310,3 +310,13 @@ each merge four token classes; they do not identify the exact class.
 The output field vocabulary described in the review is a design inventory,
 not an already implemented field layout. Review questions 3/4/6 are resolved
 as conditional requirements above, not fresh requests or run authorization.
+
+## Coordinator elapsed-field disposition
+
+The no-new-native-calls-on-success fence takes precedence over entry-relative
+elapsed timing. Existing timeout clocks must not move or change. Emit ms=-
+when no existing observation can supply it without a new success-path call;
+do not fabricate zero or call a clock at entry. This deliberately narrows
+the observation set and leaves entry elapsed time unavailable. It does not
+weaken error/stage/index capture, production fences or the native-run ban.
+Source review must assess the actual implementation against this disposition.
