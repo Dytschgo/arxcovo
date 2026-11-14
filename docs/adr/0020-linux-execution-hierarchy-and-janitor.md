@@ -702,7 +702,18 @@ These five requirements bind subsequent small source slices:
    are fixed failure exits and EINTR never extends the deadline. Only the native
    ignored fixture may call this wrapper; pure tests use a separate mock seam.
    The [helper correction](../reviews/m2-a4-single-task-helper-proposal.md)
-   binds task/migration checks, descriptor passivity and review requirements.
+   binds task/migration checks, descriptor passivity and review requirements,
+   including its four source-review clarifications and pipe ownership table.
+   Enumerate reachable at-fork handlers and prove none or each async-signal-safe;
+   unknown handlers block acceptance. Parent-created CLOEXEC pipes have fixed
+   ownership; child closes only their opposite ends and leaves unrelated inherited
+   FDs open-but-unused until _exit, with no FD enumeration or dependent EOF claim.
+   No std wrappers, unwrap/expect, implicit Drop/panic/allocation, locks, Rust TLS
+   or callbacks are reachable. Only an immediate scalar libc errno read to identify
+   EINTR is permitted under a verified async-signal-safe accessor/handler contract;
+   unknown safety blocks acceptance. EINTR-only retries recompute a saturating
+   monotonic remainder, never extending the absolute deadline. Fork is outside the
+   limited leaf; migration and an actual one-task/membership check precede release.
    The helper takes no commands, opens no network/storage and runs no probes.
    The fixture
    exclusively creates the leaf and writes memory.max=64 MiB, memory.swap.max=0
