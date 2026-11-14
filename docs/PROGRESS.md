@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- S1 local implementation by OpenAI / gpt-6.1-sol / medium is ready for independent Opus high source review: `be19717` (retained `3caa8d0`), evidence `7822b61` (retained `79e1a80`). Fmt, locked workspace all-target Clippy, 36 bridge tests, two inventory tests, final 389 passed / 3 skipped and five compiled assertion-killed mutants are builder evidence at the original source pin. Production bytes match after cfg(test) stripping; no Linux or hardware credit. No publication yet; M2 remains incomplete and activation/experiments remain unauthorized.
+
 - Coordinator OpenAI / gpt-6.1-sol / medium accepts bounded local S1/S2a/S2b/F0 preparation after Sol high design review `9b62dd2` and Opus high delta recheck `29e2d03` (retained `b4f78a4`), both blockers resolved. S1 failed-Locate/live-check implementation is next, independently reviewed before publication. Distinct-token and observed-gate limitations are explicit. No dispatch, historical retry, A13 acceptance, activation or owner step is authorized; real-Runner PA6 remains OPEN. Earlier unaccepted checkpoints below are superseded by this disposition.
 
 - Opus high correction recheck `ae05533` (retained `f757b3a`) requested one narrow Spec correction: prerequisite D6 merge order, distinct in-slot readiness/residue mutants, and release only after the slot is free. Coordinator Sol medium revised the proposal and clarified the single-line envelope, revision credit and missing-location/check precedence. Narrow recheck remains required; proposal unaccepted and no implementation/dispatch authorized.
