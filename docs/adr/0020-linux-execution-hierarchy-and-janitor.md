@@ -666,6 +666,69 @@ pinned-identity match, never directly from bridge output.
   reset, and no owner command is added. The owner restarts the service with
   existing owner tooling.
 
+### D9a. Bounded A4/A6 acceptance scope (2026-11-14)
+
+This amendment changes acceptance coverage only. It becomes effective after
+independent review, required checks and coordinator merge. It grants no native
+run, retry, activation or milestone acceptance. The [proposal](../reviews/m2-a4-a6-practical-acceptance-proposal.md)
+and [independent contract review](../reviews/m2-a4-a6-practical-contract-muse-review.md)
+record the rationale and the explicit reduction from the original A4/A6 scenarios.
+Package, production cleanup, deadlines, readiness and restart-only recovery stay
+unchanged. Actual installed systemd teardown remains unobserved here.
+
+**A4:** On an unchanged packaged Standard disposable unit, production startup
+setup kills one fixture-preseeded, bounded populated leaf, confirms emptiness and
+removes it before execution admission. Native cleanup and injected-port readiness
+ordering are separate evidence. Prior-MainPID SIGKILL provenance is excluded;
+crash lifecycle and directory removal are not established by A4. A9/U9 remains
+independently required. No historical crash-survivor credit is implied.
+
+**A6:** Deterministic injected-port LeafRemoval, KillTimeout and VerifyFailed
+outcomes from production setup must latch quarantined, refuse execution and
+persist the refusal. This is non-native failure evidence; native nonremovable-leaf
+induction is not claimed. LeafStructure/KillInterface retain their existing
+Setup/mechanism-unavailable mapping; the three janitor failures retain quarantine.
+
+These five requirements bind subsequent small source slices:
+
+1. The A4 helper is a fixed test-only executable re-entry with one waiting
+   behavior, never a shell or caller-selected command. It takes no commands,
+   forks nothing, opens no network/storage and runs no probes. The fixture
+   exclusively creates the leaf and writes memory.max=64 MiB, memory.swap.max=0
+   and pids.max=1 before placing the helper there. Preparatory controller writes
+   are an explicit fixture exception, not production setup. The helper starts
+   blocked on a handshake and has a 15-second absolute lifetime.
+2. Only S7's runs/cgroup.kill write may kill on the acceptance path. The seeder
+   never writes cgroup.kill. Failure cleanup may kill only after acceptance has
+   already failed, with distinct attribution. Early death or expiry fails the
+   test; an already-empty leaf earns no A4 credit. An omitted-kill mutant must
+   fail the native acceptance assertions.
+3. The spawning parent survives S7, holds the child identity and reaps it with
+   waitpid after setup, requiring SIGKILL death before the helper deadline.
+   Before the single setup call, confirm live helper membership, populated=1,
+   empty runs procs and sole MainPID in supervisor, with more than six seconds
+   of helper lifetime remaining. Preserve the production five-second kill bound.
+4. Reuse A5's trusted no-follow descriptor pattern: mkdir_runs must return
+   Created, never adopt; exclusively create literal arx-0-0 and reject links,
+   foreign/replaced objects, nested or unknown leaves. Keep 4096-byte reads,
+   512-record/64-child lists and 1 MiB capture. Require exactly one removal,
+   runs_created=false, unit_written=true, runs_written=true, literal leaf absence
+   and fresh S9 before READY. Historical A1/A2/A5 assertions stay unchanged.
+5. A6 joins actual production setup over the injected port to readiness latch,
+   executor refusal with zero runner calls, committed quarantined activity and
+   refusal of subsequent requests in the same domain. Inject Busy at the validated
+   leaf rmdir, population beyond five seconds and fresh verification residue as
+   separate cases; preserve shutdown's Stopping outcome. Component tests alone
+   do not satisfy this join. Mutants must expose swallowed removal failure,
+   skipped verification and early Ready.
+
+No chmod/mount/migration-race/uninterruptible-workload trick, general restart
+harness, second setup substitute, manual pre-removal or new selector API is
+included. Source review and required checks remain mandatory; native A4 execution
+requires a separate bounded disposition and acceptance review. M2, remaining
+Stage F, Stage G and real-Runner PA6 stay open; installed/dedicated paths remain
+**unverified on real hardware**.
+
 ### D10. Staging and pins
 
 - Production pins (tests in the brief): `Execution::configured` contains
