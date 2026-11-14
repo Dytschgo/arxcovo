@@ -1029,4 +1029,5 @@ fn wiring_location(
     locate(&file.bytes)
 }
 
+mod a6;
 mod s2b;
