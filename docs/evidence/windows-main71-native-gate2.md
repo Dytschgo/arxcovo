@@ -939,3 +939,255 @@ Evidence-write ledger: apply_patch refused to decode the pre-existing evidence
 file as UTF-8 (invalid byte at offset 39689). No write occurred. Appended this
 note as UTF-8 bytes without rewriting the pre-existing byte prefix; exact prefix
 equality was checked. This is an evidence encoding issue, not a source/test fix.
+
+## Held-manifest binding slice — 2026-11-14 (source only)
+
+Builder: OpenAI / gpt-6.1-sol / high, implementation sub-agent. No subagents.
+Source commit: 06a257ee57e0fc604ac5dc69ba4665565ec24dde.
+Initial HEAD: 7dc9134 (clean). Cwd equalled Git top; worktree Git directory
+and common directory differed (isolated linked checkout). Read AGENTS,
+KICKOFF, engineering skill/profile/behavior safeguards, accepted native scope,
+PINNING, and both requested Grok reviews. No PROGRESS/design/review/CI/workflow,
+Rust/root Cargo/policy edits. Source delta only the five named replay files.
+
+Baseline: admission 37ff6946532fcef93e28de3aea39582d13c4a6f5,
+exclusive-name source retained 77e5dcb0f2be8c5bd076d6880f65e47b19b9d5e6.
+Review objects 984d345c71ea91dfce069c2000da2caa1f8556d4 (retained620b3be)
+and 852b9b133b70739f3c9c6bf75df431ea09413f91 (retained66018b2).
+Initial git diff 77e5dcb -- tools/windows-native-replay was empty:
+source unchanged since the review. No source baseline silently replaced.
+
+Dataflow: coordinator external disposition SHA256 + id -> held fixed
+tools/windows-native-replay/run-disposition.json (<=65536) -> strict pinned
+manifest hash/id/size and reviewed commit/blob mapping -> held fixed
+run-manifest.json -> held source/artifact bytes -> Git SHA1 blob framing,
+LF, provenance and exact lock/selectors aliases -> private copied Facts.
+Both documents require runtime_authority:false. Provenance additionally
+requires native_executed:false. The trusted disposition attests the commit
+and its mapping; this slice does not read/validate a Git commit object.
+The root hash is FUTURE coordinator input external to both documents, never
+invented permission. No real manifest, disposition, provenance or environment
+was generated. Parser-only fixtures still accept bytes for isolated schema
+tests; admission's constructor has no byte/blob-map/cleanCheckout overload.
+
+Every required role remains closed and hash/size/id-bound. Provenance's
+source_sha256 checks the SAME held source bytes used for Git SHA1.
+Workspace/helper locks and selectors require exact corresponding source
+paths, ids, sizes, SHA256 and bytes. Other path aliases refuse. Id format is
+exactly 32 lowercase hex/nonzero; literal qword-order and independent
+hello-LF Git blob oracles are present. Native HeldFiles implementation is
+unchanged: bounded relative opens, type/reparse/volume/identity/link1 checks
+before and after hashing, retained ancestors/leaves, and both complete
+exclusive scans remain. These are SOURCE claims, not kernel proof.
+
+Callgraph inspected before managed execution: PureControllerChecks.Run ->
+existing synthetic parser/clock/frame/metadata oracles, AdmissionPureChecks
+mock directory interface, BindingPureChecks.Fixture -> Admission.Bind ->
+Fixture.ReadPinned/Dir.Scan/Dir.ReadLeaf/HoldEnvironment plus in-memory
+JSON/hash/schema/blob/provenance/alias checks. No HeldFiles/Admission/
+OwnedSession/NativeJob instance is constructed by Run. GitBlob uses SHA1
+ASCII framing plus bytes, not a caller dictionary assertion. No native
+imports, filesystem admission, wall-clock reader, process API, provenance
+utility or Rust fixture are executed by these pure checks. The PowerShell
+test harness reads fixed source and compiles in memory; Check-Source.py
+reads fixed repository source/selectors only.
+
+Tests: strict/malformed/duplicate/unknown document and role fixtures, missing
+and unknown source maps, externally pinned hash mismatch, held-byte mismatch,
+blob mismatch despite both documents agreeing, commit mismatch, provenance
+source/helper/commit/authority/native claims, lock/selectors path/id/byte
+aliases, forbidden role alias, limits, lowercase/length/zero ids, LF refusal,
+immutable fact copies, actual binder complete read/scan counts. Existing
+directory/path/link/type and final-refusal controls are retained.
+62 compiled mutants (45 retained + 17 binding controls) assertion-killed.
+Compiler errors NEVER count as kills. binding-held-manifest mutates the
+shared held-read hash guard: an isolated same-size direct held-read assertion
+kills it; Parse also independently hashes the manifest.
+
+Actual validation commands:
+- python tools/windows-native-replay/Check-Source.py — exit 0, inventory/map/
+  binding output, 28 oracle rows, 5 pure Rust registrations, 0 native
+  registrations/callers, selectors disabled. No Rust tests executed.
+- pwsh -NoProfile -File tools/windows-native-replay/Test-PureController.ps1 —
+  final exit 0; managed baseline green; all 62 mutants compiled and killed;
+  exact LF unchanged checks passed for five inputs. Final full output below.
+- git diff --check — exit 0 before source commit.
+- Read-only git cwd/top/status/history/rev-parse/diff inspections; scoped
+  git add and source commit. No time/version/budget measurement claim.
+
+Failure ledger (not reset; distinct issues, no three same-issue failures):
+1. First compilation: CS0128 duplicate local leaf. Renamed byte array to
+   leafBytes; next compile succeeded. One correction.
+2. First compiled baseline: binding manifest limit assertion failed because
+   fixture Seal overwrote the bad size. Split SealDisposition/SealManifest;
+   baseline passed. One correction.
+3. Mutant compile: BindingPureChecks type already exists. Added that test
+   class to per-mutant rename list; compilation succeeded. One correction.
+4. New binding-held-manifest mutant survived: the remaining size/Parse hash
+   guards already rejected the mock corruption. Added a direct same-size
+   held-read hash assertion; next/full final run killed it. One correction.
+Expected mutant assertion kills are negative controls, not failed fixes.
+
+Runtime UNRUN. No entry, provenance, native API/file-admission, native fixture,
+controller/helper/child launch, run_inner, ordinary discovery/Rust test,
+clock/process effect, network/install/GitHub/CI/dispatch/account/service/VM/
+owner/private-state operation. GATE2_ONLY, selectors=false, no OwnedSession
+construction in Run, and final remaining-admission-gates refusal remain.
+Transport/grammar/deadline gaps and all prior gates are open. Fresh Grok/Muse
+source/security review required BEFORE publication; no publication/merge here.
+M2 incomplete; main71 cause unknown/no retry; Phase 1 no native redloop;
+PA6 OPEN; all hardware paths unverified on real hardware.
+
+Prefix preservation: preexisting 64796 bytes SHA256
+096747fd5fcccc0f2db43326f6985d4ea8d2188f9cde78774a3770a02e2fb767,
+byte offset39689 = 0x96. Append is binary UTF-8/LF; prefix verified byte-for-byte
+against that length/hash, including 0x96. No encoding rewrite.
+
+### Exact source pins (LF file bytes and Git blob framing)
+
+| File | LF SHA256 | Git blob |
+| --- | --- | --- |
+| Admission.cs | b6c1aa6b39d618a85e2183988cc95b44c965dfbb44670b2c2c4382d336754289 | f26127281e627d3cca76312846a18243206cd063 |
+| Controller.cs | 0941fa6fb8add01470e87e7084d753acc8b967ffd76c2f0bc621bee24cc1075a | 77080352f9061522de94efca18cb9137371203e0 |
+| HeldFiles.cs | 9470b8f11a37ad22ecc7eb28926de444d0c8d5cd6e25e64b9e0131459ada1643 | 9526c04b368664ee23e6a6efbb27e554cf5b10b9 |
+| NativeJob.cs | f934f165408a9a879090da129f95122a75d2bcd5831ac5bb60cb1063f39a36d4 | 5fa8efba3012d51815f49fb9a38d23a1804f2059 |
+| Test-PureController.ps1 | 2e9b07ff121769509e65797c285f262cb255938d0a4f17b643b900c46d17cb30 | df6e4c8ce9cb8a846c4d37f72ab46be319e7bb1c |
+| Check-Source.py | b3e9075a8dceed2c38ae4d6a032322f3d8dd1c77c7fbfa48200415593e3cef18 | f90717b6331a786fd108446d417359a50a0284ca |
+| PINNING.md | cc0472cf5d1e82b2280a9915a04802a5b72876bcfa19340e179bac4354890bfa | 630581e2c7269608ff5c66d3b454a18586ac60ab |
+
+### Final managed output (exact hashes; LF normalized output)
+
+```text
+managed pure baseline: pass
+mutant LF SHA256 index: 36ee13e10410937963e5c71b1a731289b5c9a0b82a43913906f50de87728847a
+assertion-killed: index
+mutant LF SHA256 complete: 6ddebe6dd08c042797c878c29ca3515f20293da24d7567490b687c5f8d7315b9
+assertion-killed: complete
+mutant LF SHA256 timeout: faeec85535bda0742d321a26eaf4ed3c671540eb3c7233d94412e152ef563fef
+assertion-killed: timeout
+mutant LF SHA256 arguments: 83ff2ea34656d11fce177d9ab55e1602e2bf2fffa5de9c4ebc4f57c25df6eece
+assertion-killed: arguments
+mutant LF SHA256 environment: a1609c0e22a4ccfbc5b4cbc2d5cb9a3cc76f3e507899f82faffb243b3e391cf9
+assertion-killed: environment
+mutant LF SHA256 held-pin: 7ba95c9e0f99893bc24ebe2273dd9f21413f6a2195c2f1c74c08b2286ec5824b
+assertion-killed: held-pin
+mutant LF SHA256 link2: 88e92069aa7ee89178c7a67e66b18e679250fecb477dfdb09c9899aa5e6cabe5
+assertion-killed: link2
+mutant LF SHA256 argument-escape: dd0953851ec74378d5d6d8bab947dc6018ae557d98c3473bbf6199935a93efa6
+assertion-killed: argument-escape
+mutant LF SHA256 frame-eof: d405759f94f59dabeaaee7498ec74748c580f0e607ce5a1377147bad0987be26
+assertion-killed: frame-eof
+mutant LF SHA256 frame-output: b9baec6e02959137a111084a1f99f1214afa3d19d12551e8ba8dd060ddbff7b2
+assertion-killed: frame-output
+mutant LF SHA256 manifest-extra: 708f7122fe6e5ed890e5408f9ed428ba1a8f976682271b2abb9e105742219caf
+assertion-killed: manifest-extra
+mutant LF SHA256 manifest-external: 30055780c577bddf71d994f201e8efd0eba9ef38d8638905495009bb577cb41e
+assertion-killed: manifest-external
+mutant LF SHA256 manifest-commit: acefd3ec9867bb56a14dbb60a4e5fffb2e02a0d549d8840c42f46c0c3d8f7d11
+assertion-killed: manifest-commit
+mutant LF SHA256 cleanup-kill-first: e310a8e444489d95ac69ecfdb30bab3ce20090f04a49caba62262d7d2ca6a348
+assertion-killed: cleanup-kill-first
+mutant LF SHA256 cleanup-active: b60b5c8fe6e69afbf1a8b6edfeb73ce98520ce8d2f609c078298439a93f79968
+assertion-killed: cleanup-active
+mutant LF SHA256 cleanup-deadline: 5b90c7a84e82b88fc308ae30ab9c1565a4f3ebd5da4cc5e6a8bdf5eb0d8d7228
+assertion-killed: cleanup-deadline
+mutant LF SHA256 post-hash-links: a27b269ee425c6ccbe3bd49b7876d79c60f0abf9605a823a62d560d5c28ea7c3
+assertion-killed: post-hash-links
+mutant LF SHA256 frame-complete: 9b0650898795bddbaedc7e9ff0a587da20edd4d390edf89d1019671b1a98c324
+assertion-killed: frame-complete
+mutant LF SHA256 frame-order: febe49ac7ebe17aac5bb4a2d0f48262c5c96c5d9350281c5fdea03bcd78a5987
+assertion-killed: frame-order
+mutant LF SHA256 manifest-self-field: a7e197a217eefb3bd19602c7164fff8dd1d404382f70d1ac953c14dd7ec1c30f
+assertion-killed: manifest-self-field
+mutant LF SHA256 clock-order: d3de6976b2992ac55acf5c33576aee789a6ded922e07c5964345be9df892c4c2
+assertion-killed: clock-order
+mutant LF SHA256 names-extra: d9ea5da8a2eefa1d824a4663014811ed7d272b80265cb84d0aeed21bf5e92aa8
+assertion-killed: names-extra
+mutant LF SHA256 names-repeat: 3973858c5492f0a21039fc5b2e009554699e1ae7b13c53fccb6e0dfc91a3b8c5
+assertion-killed: names-repeat
+mutant LF SHA256 names-missing: 55abc5e956042c72e789e2985519fbd3b63a2cb29cee278274b84902e533bef6
+assertion-killed: names-missing
+mutant LF SHA256 names-reparse: 00634a707a9b32f2d2a0c5a627054c75e20c811a7a8c074c5b3c6c770fe913bc
+assertion-killed: names-reparse
+mutant LF SHA256 names-tag: d88b44326ff2fc32be9b41d14ece45dec57cdae91ebb20d26e68f79cafe5001b
+assertion-killed: names-tag
+mutant LF SHA256 names-leaf: 61f97d6eaadaf8098697d01b45af6a6169fbb35c5b4b89d9871c9e22360e0c81
+assertion-killed: names-leaf
+mutant LF SHA256 names-type: d81ccea644aa749d97c056832c4976bf6cd8c4e3d441c7f09ef486e3c4762a14
+assertion-killed: names-type
+mutant LF SHA256 names-dot-type: d7969304072add73f0214e9155baecd87b7656e75b19326cd16bd6869dd96181
+assertion-killed: names-dot-type
+mutant LF SHA256 names-id: 95aee1e9eeb4ce82c865e4e5124f62320173137fda1b259a39eaef4f453282c4
+assertion-killed: names-id
+mutant LF SHA256 scan-id: 46a3136934f6c7e0284d967fe8d14882c1ae3e2c7d9f0c309471912918bdba79
+assertion-killed: scan-id
+mutant LF SHA256 scan-wire: cdef654c2c34ca12ba8527c3d411a3708dd3b6a51fd6bbeb12bf4b250950dcc5
+assertion-killed: scan-wire
+mutant LF SHA256 scan-first-wire: 3d4821489f59f9abb7410e6e7639dfd789f6978fee38c8874f75663e45e83c69
+assertion-killed: scan-first-wire
+mutant LF SHA256 scan-second-wire: f61105f82075ed39dcdbe47124751194dff4f105e6495a0b4a24bd8c142d784b
+assertion-killed: scan-second-wire
+mutant LF SHA256 leaf-id-wire: 1df923ef92d1c788bf9af718453d9f91d400c1242d60bb1a3585daa992b00ac9
+assertion-killed: leaf-id-wire
+mutant LF SHA256 leaf-size-wire: e46414279de458e8ffe2525db521e2de8bf49ee222013e82a7e665f9976722a3
+assertion-killed: leaf-size-wire
+mutant LF SHA256 root-volume: 7d0715ce62868208f4bdbb7a6eea471d286e7c9dd8beab0519c80aa5ffbc5b33
+assertion-killed: root-volume
+mutant LF SHA256 root-nested: 618489fbae4e5b8155aa7790504a0057113216f2a41b36e0b64be052250320b9
+assertion-killed: root-nested
+mutant LF SHA256 root-equal: b0a8d8e7c7cc3a11172108d649b06c57e44fd011ac6d826a7ec3916d1fd55929
+assertion-killed: root-equal
+mutant LF SHA256 root-parent: e92ddba26191068c0539a6e0c8f0498f4a3f1831097d09143b1272279b51b327
+assertion-killed: root-parent
+mutant LF SHA256 root-pins: b4e0f5ce1ccb4eda6aa98518ef9deefb41935f68c1e0ced6532a2c392d1eb52c
+assertion-killed: root-pins
+mutant LF SHA256 root-helper: f40a12f44bdbd8435fd1d412b1c46dd00366d966f10cd55150928177887fcd0f
+assertion-killed: root-helper
+mutant LF SHA256 root-temp: a1b7f2b1099455f0194ae8445361d2883ee2f2c43425ec18d5564809f893c10d
+assertion-killed: root-temp
+mutant LF SHA256 root-wire: 087451c4c3ebec05eb979e8353e762c81f014cb7ffa359a3ad2022c26f5bc78d
+assertion-killed: root-wire
+mutant LF SHA256 binding-root-hash: 1f867eed8d467b68d4666f331e41c4e70059e784ef77f4cba080c51f247d288a
+assertion-killed: binding-root-hash
+mutant LF SHA256 binding-held-manifest: 84e61621c1d199c133248d2ce26af3747cc5a53d80d1b0ebeeb2b2142129e790
+assertion-killed: binding-held-manifest
+mutant LF SHA256 binding-git-bytes: d7ad9e843b838bec19a52e517ebfaa263f5d5fc7d0189459c8d02c3ce11b5779
+assertion-killed: binding-git-bytes
+mutant LF SHA256 binding-reviewed-blob: d2030f4b85c8758451a28ecd2bde4457419de861453d5a4e4b6f5c113e3d2c46
+assertion-killed: binding-reviewed-blob
+mutant LF SHA256 binding-git-frame: 0859388c43bae8748d19a2358f1d3f3b2823d155293f2732cea0e94b2b842e79
+assertion-killed: binding-git-frame
+mutant LF SHA256 binding-provenance-source: f256ca2096616bc7c17650d0a8c5e9071b53d79c57f5de442c5c4c129936c4b8
+assertion-killed: binding-provenance-source
+mutant LF SHA256 binding-provenance-commit: 4fd44c7cf46c242026cf1b6030d49e30ee1c0eb469f5b4a58f50d82dbe9d63b8
+assertion-killed: binding-provenance-commit
+mutant LF SHA256 binding-provenance-helper: abdab5363a549e0d8f295fbdabeed7c89b1a058f1a870a7831ff7a0d958e6c09
+assertion-killed: binding-provenance-helper
+mutant LF SHA256 binding-manifest-authority: 96ac5645691e46639aa6fea584c287793c14dfab6443ae2053206c47cead25d4
+assertion-killed: binding-manifest-authority
+mutant LF SHA256 binding-disposition-authority: 902d57acfd6fdc48b158e2989819caf6957671822bb83c7d651d86f19d9a42e5
+assertion-killed: binding-disposition-authority
+mutant LF SHA256 binding-provenance-authority: db9fb141795acb3388633d0b370b48090d07b54ffb8b57292363f0748924eb75
+assertion-killed: binding-provenance-authority
+mutant LF SHA256 binding-provenance-native: 35dbb1bc89519c10c70f0cc3b30fb45fb1dc346c890ee6689ba04306a4e5461f
+assertion-killed: binding-provenance-native
+mutant LF SHA256 binding-alias-path: 3d95aa698bca3a3193a6fbd41e032b218900dff72aeeabd8086b819154d179ad
+assertion-killed: binding-alias-path
+mutant LF SHA256 binding-lock-bytes: 13475f2bad2166a3eb456692e1abbafc32c505df0b0169e480708393b75e18fd
+assertion-killed: binding-lock-bytes
+mutant LF SHA256 binding-role-alias: e34b13ff8b5a4590852c6c48c964240b2d90c1ddc26ecdb650eb26d3c18bc7a7
+assertion-killed: binding-role-alias
+mutant LF SHA256 binding-qword-order: c3ee77218642f85969b74fd7feabdf85bfded8543efdc14174292bb56ac9e836
+assertion-killed: binding-qword-order
+mutant LF SHA256 binding-facts-copy: 77dc1ce6541fa24fcb0112bce16bb51ed83ea4f20ad3e800338da270469432a1
+assertion-killed: binding-facts-copy
+mutant LF SHA256 final-refusal: 43b7905b47aa8cf80b33ba5a9c08954677c23bfe98c1431e230cf27636736ae6
+assertion-killed: final-refusal
+unchanged LF source SHA256: 0941FA6FB8ADD01470E87E7084D753ACC8B967FFD76C2F0BC621BEE24CC1075A
+unchanged LF held file SHA256: 9470B8F11A37AD22ECC7EB28926DE444D0C8D5CD6E25E64B9E0131459ADA1643
+exact LF unchanged Controller.cs 0941fa6fb8add01470e87e7084d753acc8b967ffd76c2f0bc621bee24cc1075a
+exact LF unchanged HeldFiles.cs 9470b8f11a37ad22ecc7eb28926de444d0c8d5cd6e25e64b9e0131459ada1643
+exact LF unchanged NativeJob.cs f934f165408a9a879090da129f95122a75d2bcd5831ac5bb60cb1063f39a36d4
+exact LF unchanged Admission.cs b6c1aa6b39d618a85e2183988cc95b44c965dfbb44670b2c2c4382d336754289
+exact LF unchanged Test-PureController.ps1 2e9b07ff121769509e65797c285f262cb255938d0a4f17b643b900c46d17cb30
+```
