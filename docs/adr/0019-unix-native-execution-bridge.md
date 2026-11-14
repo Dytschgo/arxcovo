@@ -8,11 +8,13 @@ with the retained independent Sol high reviews, and the Sol validator-test
 correction with its retained independent Opus high recheck. See the
 [correction recheck](../reviews/0019-validator-correction-opus-recheck.md).
 
-This accepts the staged design only. It grants no production constructor,
-native execution, owner operation, experiment retry or M2 acceptance.
-Stages B-D still require separate implementation reviews and green CI;
-cgroup setup/cleanup and the E_PROTECTION diagnosis remain separate gates.
-The existing no-retry rule and every activation gate remain in force.
+The staged architecture remains inactive and grants no production constructor
+or M2 acceptance. D7a below adds one narrowly scoped hosted A1/A2 execution
+exception, effective only after its independent review, required checks and
+coordinator merge. All other native execution and historical retries remain
+unauthorized. The historical E_PROTECTION diagnosis is unresolved; D7a
+expressly disposes of that prerequisite for its single run only. Every other
+implementation, native-acceptance and production-activation gate remains.
 
 ## Historical proposal and clarification checkpoints
 
@@ -225,8 +227,58 @@ review closed; independent implementation reviews of D1–D5 and the bridge;
 green hosted gates; the separately reviewed Linux cgroup setup and janitor
 slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
-acceptance. Its failure site and cleanup state are unknown, and no retry is
-authorized.
+acceptance. Its failure site and cleanup state remain unknown. That historical
+run and its environment must not be retried or reused. The bounded A1/A2
+exception below is the only newly permitted execution.
+
+### D7a. One reviewed disposable A1/A2 run (2026-11-14)
+
+This amendment follows the owner's delegated instruction to use the normal
+reviewed ADR path rather than require another owner confirmation for a bounded
+hosted acceptance run. It becomes effective only after different-provider
+review and all required checks pass and the coordinator merges it.
+
+The coordinator may execute **one** new A1/A2-only run through the existing
+`unix-execution-experiment.yml` workflow on a fresh GitHub-hosted Ubuntu 24.04
+runner. This is an explicit, narrow disposition of the historical-diagnosis
+prerequisite for that run; a new SHA alone grants no permission. It neither
+reproduces nor diagnoses run `43091339273`, whose cause and cleanup remain
+unknown and whose entire environment remains excluded.
+
+The candidate is the first main squash commit containing this amendment. Its
+execution-related source, fixture, driver, workflow, packaged unit and standard
+profile must be byte-identical to reviewed main
+`82162956839740753a0b97a790c04b76784e7c9a`; only this reviewed ADR and its
+supporting review/progress documents may differ. The coordinator must verify
+that condition and pin the actual full main SHA before dispatch. A source or
+workflow difference, or main advancing to another candidate, requires a new
+reviewed execution disposition; it cannot consume this grant by substitution.
+
+All existing technical gates remain: manual trigger, exact repository and
+owner actor/triggering actor, main ref, source/workflow/reviewed SHA equality,
+read-only workflow credentials, a fresh disposable environment, packaged
+standard hardening, fixed-unit collision refusal, bounded output/lifetime and
+owned-only cleanup. The workflow and its permissions are unchanged. The
+coordinator may set `UNIX_EXECUTION_REVIEWED_SHA` to the verified candidate,
+dispatch once, and clear it in a finally-style step after that run completes
+or fails (or dispatch is rejected). No further owner confirmation is required
+for those three operations. No payment, account provisioning, owner-PC access,
+owner-host administration or static-VM action is included.
+
+Only `exec::disposable::disposable_linux_a1_a2` is selected. It checks the
+packaged hierarchy and production setup before children; it performs no
+account provisioning, cross-account command, shim or rights probe. No other
+native case, A13, production constructor, Stage G activation or later milestone
+is enabled. An A1/A2 pass accepts only those two cases, not full Stage F,
+real-Runner PA6 or M2.
+
+Stop on failure or uncertain cleanup, retain the existing bounded sanitized
+record, exclude the environment, and do not dispatch again. There is no
+automatic retry and no reusable run permission. After the one dispatch has
+been accepted, the grant is consumed regardless of job outcome. An explicit
+owner answer arriving before dispatch takes precedence over this delegated
+instruction. Hardware and installed/dedicated paths receive only the evidence
+actually observed; no owner-machine acceptance is implied.
 
 ## Contract clarifications (2026-11-12)
 
