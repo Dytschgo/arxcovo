@@ -350,3 +350,122 @@ Final local identity verification: b2dec92 and retained 4518385 review blobs bot
 failed because unquoted `^{tree}` was parsed by PowerShell; quoted Git arguments
 then verified all four identities. No source/build/test retry followed that shell
 syntax correction. Final porcelain was empty before this evidence append.
+
+## Controller-source partial, 2026-11-14
+
+Builder OpenAI / gpt-6.1-sol / high, implementation sub-agent, no delegation.
+Initial isolated worktree cwd equalled Git top level; porcelain was empty;
+per-worktree Git directory differed from the common directory. Initial HEAD
+`065123cffab4683f26b334084157ab172ec854e7`. Read AGENTS, KICKOFF, PINNING,
+accepted native proposal, retained controller recheck through
+`git show 2e6259a:docs/reviews/windows-main71-native-controller-contract-grok-recheck.md`,
+prior Gate 2 review and scope/oracle/boundary reviews. The named retained recheck
+is in local history, not a file at this checkout's HEAD. No review file changed.
+
+Source commit: `b4ef99bea9d328c0e1129da1e2eae63ffb578dce`.
+**PARTIAL, not a functional controller adapter and not run-ready.** This is a
+local unpublished source checkpoint. No new SHA grants native authority.
+
+Implemented source: HeldFiles opens/holds root-down non-following ancestor and
+leaf handles, restricts paths to a supplied root/volume, checks type, identity,
+length and link count, reads/hashes through the held stream, and copies a verified
+source using CREATE_NEW and one retained read/write handle with FILE_SHARE_READ.
+Copy verification never reopens its destination, and the original nlink=2
+artifact is refused before copying. No native file operation was exercised.
+The write-capable copy handle is private to the primitive and retained through
+disposal. These are source properties awaiting independent security review.
+
+Managed additions: fixed 40-byte fragmented-frame decoder with a bounded feed,
+numeric bounds and failure latching into RowChannel; argument escaping with an
+independent pure reader; exact sorted four-value UTF-16 double-NUL environment;
+monotonic last-poll bookkeeping; owned-clock Poll immediately before Success.
+The wire decoder has no native transport. Existing row/count oracle stays literal.
+
+Concrete unfinished integration:
+
+- No fixed externally hash-pinned manifest admission, full source/build/artifact
+  binding, immutable admission object or runtime dirty-checkout validation.
+  Individual externally supplied file pins are not that manifest. No manifest
+  bootstrap or generated run-manifest.json was added.
+- Held directories do not prove exclusive helper-directory membership. There is
+  no closed bounded list of admitted files held through a full session.
+- The retained Cargo grammar can rebuild an unpinned harness under the four-value
+  environment; no reviewed direct-libtest replacement or rebuild exclusion exists.
+- Rust begin/end emission and native pipe transport remain absent. Kernel 0 and
+  matrix 1..34 stay undiscovered; no Rust file or product fence changed.
+- OwnedSession still does not own a Job. Assign-before-resume, independent kill
+  control, bounded TerminateJob/zero-active confirmation and unknown-cleanup reuse
+  prohibition have no native adapter. No pure Job-failure mutants were added.
+
+These are missing implementation, not evidence that native work is safe. The
+selected environment remains **UNSELECTED**, nested-Job proof **OPEN**, native
+runtime **UNRUN**, and 300/360/60 allocation **UNMEASURED**. M2 **incomplete**;
+Phase 1 has no focused native failure loop; cause **unknown**; PA6 replay **OPEN**;
+native/installed/dedicated paths **unverified on real hardware**.
+
+Actual checks:
+
+```powershell
+./tools/windows-native-replay/Test-PureController.ps1
+python tools/windows-native-replay/Check-Source.py
+git diff --check
+```
+
+Final managed run: baseline passed and all eleven compiled mutants assertion-killed:
+index, complete, timeout, arguments, environment, held-pin, link2, argument-escape,
+frame-eof, frame-output, clock-order. The pure Run call graph was inspected first:
+arrays, dictionaries, strings, SHA256, synthetic times, mock byte frames, metadata
+scalars and in-memory queues only. It constructs neither OwnedSession nor HeldFiles;
+no P/Invoke, process or real-clock call occurs. Add-Type compiles the native imports
+but never constructs or invokes the native adapter. The extra environment key,
+begin-without-end, wrong counters, duplicate/order, malformed/overflow, EOF and
+deadline cases are pure evidence only. Controller and HeldFiles exact LF hashes
+were unchanged after in-memory mutations. No compile failure received kill credit.
+
+Failure ledger: managed invocation 1 passed baseline/index then rejected the newly
+earlier `begin alone incomplete` assertion for the complete mutant. A Python edit
+command failed with SyntaxError before changing files; invocation 2 repeated the
+same assertion. An applied allow-list correction fixed it. Invocation 3 reached
+argument-escape and rejected its `quoted end` assertion; that expected assertion
+was then allowed. Invocation 4 exposed a surviving EOF mutant: a partial first
+frame also failed the independent zero-frames check. Added complete-frame then
+partial-trailing-frame coverage. Invocation 5 killed EOF/output mutants but the
+clock mutation did not compile (CS0649); no credit. Replaced that mutation with
+an assignment to zero, preserving compilability. Invocation 6 passed all eleven.
+No native fix attempts or native failure loop occurred. A PINNING patch initially
+failed context matching without changing files; the corrected patch applied.
+
+Source inventory passed: 28 oracle rows, four existing pure Rust tests, zero
+native registrations/callers, selectors disabled. This text inventory is not a
+call-graph proof. git diff --check passed. No Rust tests, Rust compilation, fmt,
+Clippy or helper build were run in this pass because Rust/helper source did not
+change. No provenance main/artifact hash run was performed. Earlier artifact
+hashes are not refreshed evidence for this source commit.
+
+Source hash inventory below was computed with a bounded Python read of the fixed
+SOURCES tuple (AST literal extraction); all files <=2 MiB, CR count zero. Git blob
+IDs use SHA1 of `blob <length>\0<bytes>`; the two changed C# blobs were also checked
+with git rev-parse. This is a source inventory, **not** an authorization manifest.
+
+| Source | Git blob | LF SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/development/windows.rs` | `c949e47dae5ac6998d6f406b250c761a43ab9d89` | `48499b5014da7106513f5bd190c0de6300f0e71ce7086c9a70620c7db5980895` |
+| `Cargo.lock` | `1c5c0fcf2b577f89ed998826ddf6608338b4b523` | `1ebaf3af25f462da12eb8e8f7cfff3803deb180dd4c1f294be67bef3f3a7e4cc` |
+| `rust-toolchain.toml` | `3417ee590341edc47a046d94e77ee9bee2b33bf4` | `97aab3493c1fb14fe9a21c760433577f434714f5725bbb176e67048dde581afe` |
+| `tools/windows-native-replay/child/Cargo.toml` | `6d36690a7b1d4406339de7b63d753de4db44a091` | `e6d25788c0611c605743e738d3d185222bfacbd503bdbcc2f22a9db255eb49c8` |
+| `tools/windows-native-replay/child/Cargo.lock` | `dbf05ddef24026e55c6e87b9a38a7c7899412b9d` | `f4e0e27cc75747f2ad09ac4bccda3e0d1cbf34df174e9584074e56957377cd22` |
+| `tools/windows-native-replay/child/src/main.rs` | `cd5b7c59da062c25118665b2f164769265545e7c` | `f2cb904fca9f0e8bab8a6ca13b7b88dbea5b769b871c014621e51f01f7a5fb32` |
+| `tools/windows-native-replay/Invoke-BoundedReplay.ps1` | `3eb27afad8fa72acf161cb83b0de85daf9863d10` | `954f3090c7ea3edb7fcbd7685461a3b3500848addc0ae53813bc62efaef8e9e6` |
+| `tools/windows-native-replay/Controller.cs` | `57b165d30bad70cce6e603d9c676657665679a83` | `6f9ee1c136f59c95ef0c2d5ea34a23dec3ab9bd3e629f01bbe629cba21f5d6de` |
+| `tools/windows-native-replay/HeldFiles.cs` | `e9d888627b253ec273b49b965f4e814e7430a43e` | `c23c4046033bbe566a02f7a32ddd1fc253be3722cf541387aa83e6315a8c8bde` |
+| `tools/windows-native-replay/Prepare-Provenance.py` | `10b16f1bc958d247bc595273eca2008f715836e3` | `bce03583e848cb3c1d62018b94a1eeb8ed84a1b371720683cf562ff600b92b6c` |
+| `tools/windows-native-replay/Check-Source.py` | `d744e3fcf818f2569445cad47ba6a0f08f5da7d3` | `cd1fa4ed0ee8ec412dd011e4a3d382e462e138fa85e453a733cae406e0631d5f` |
+| `tools/windows-native-replay/selectors.json` | `41a9499660e8b0b40b21bd021f56ba45d760474a` | `e9aa9e6f405c2142d392096926830f0ba5b59be1a8ef46409d75d1513eab9b23` |
+| `tools/windows-native-replay/Test-PureController.ps1` | `b131931064ad1acf679640e71adc8cb1d417ccd2` | `707d002382db3dd231a13e1915df6a49571b4639f7463393287174087167e522` |
+| `tools/windows-native-replay/PINNING.md` | `694b1ea7d7f04a8ee717c5705ff4eadea9f98f18` | `01fdb31e107fb3fff27184067783ce8f7f5ec7345c23290bde9f6a47c8d748aa` |
+
+No controller/helper/native launch, native file-identity API test, normal Rust
+test/full suite, CLI, account/service/VM/private-state operation, install, owner
+admin action, old Lab Manager access, GitHub/network, push/PR/CI/dispatch or
+subagents. PowerShell remains GATE2_ONLY. No workflow, root Cargo, policy, ADR,
+proposal, review or PROGRESS edit. Independent review remains pending.
