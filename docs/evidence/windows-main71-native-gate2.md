@@ -212,3 +212,141 @@ pinned file. Root Cargo/workflow/CI/policy/ADR/proposal/review/PROGRESS untouche
 - M2 remains **incomplete**, cause **unknown**, Phase 1 has **no focused real red
   loop**, real-Runner PA6 record/replay remains **OPEN**. No cause fix or acceptance.
   Native, installed and dedicated paths are **unverified on real hardware**.
+
+
+## Gate 2 retained-review correction — prepared partial, 2026-11-14
+
+Builder: OpenAI / gpt-6.1-sol / high. Initial clean HEAD
+`33f5f4e9be3fde99a7badeee45b3b98a92dc6649`; cwd equalled top level, Git directory
+was per-worktree and distinct from common Git directory. Read AGENTS, KICKOFF,
+full accepted proposal, retained Grok review and prior evidence. Retained review
+`4518385` corresponds to supplied `b2dec92`; source `beb590c`/`3eedb77` and evidence
+`a04aaf6`/`afcf804` identities are recorded in that review. No assumption of native
+authorization follows from this Windows host or its current account.
+
+Source correction commit: `c1f1255aea3f8b6857688d75e61acbc69868a89a`.
+This appended evidence is committed separately after that source commit.
+
+### Changes and limits
+
+ST-INDEX: selectors.json row_map is the canonical 35-row schedule; C# carries a
+source-checker-verified projection. Rust matrix_index now maps local 0..33 to
+1..34: kernel 0, failures 1..28, peek109 29..32, controls 33..34. The checker
+verifies filter row sets, map projections and 35/20/16 budgets. Existing native
+assertions and independent 28-label oracle remain intact. A pure Rust boundary
+test rejects index 34. Native begin/end emission is STILL ABSENT.
+
+The unsafe dormant RunPinned and its P/Invoke imports were removed rather than
+left available behind an informal instruction. No native launcher exists now.
+SE-DEADLINE/SE-COMPLETE are prepared as managed contracts: OwnedSession starts
+and owns Stopwatch internally; MonitorState polls one event at a time from a
+sealed bounded nonblocking RowChannel, with no caller callback or stopwatch.
+Tests use only synthetic numeric times, never OwnedSession. Complete plus exit 0,
+zero active processes, an empty channel and no failure are required for modeled
+success. Missing/duplicate/out-of-order/malformed events, overflow and unknown
+cleanup fail closed in this model. The native kill-before-return and no-reuse
+adapter DOES NOT EXIST, so these are NOT closed native integration findings.
+
+SE-INHERIT: LaunchSpec checks drive-absolute paths, the exact 12-element Cargo
+argument vector and exactly PATH/TEMP/TMP/SystemRoot; PATH is one helper directory.
+It is a pure grammar validator, not an immutable validated launch object. No
+Unicode native environment block, quoting encoder or immutable held-handle pin
+implementation exists. PINNING.md specifies fixed manifest identity, exact
+source/tool/helper/controller/libtest/selector/report pins, no reparse/hardlinks,
+held ancestor/leaf handles, file-ID/hash TOCTOU fences, Unicode environment,
+telemetry ownership and termination integration. These remain concrete blockers.
+
+**PREPARED PARTIAL — NOT RUN-READY.** The PowerShell entry still unconditionally
+throws. No source registration, launch/API test or native execution occurred.
+Fresh Grok/Muse source/security recheck is required before any publication/run;
+this implementation sub-agent was forbidden to delegate it and did not do so.
+
+### Checks actually run
+
+Rust 1.95.0, commit 59807616e1fa2540724bfbac14d7976d7e4a3860, LLVM 22.1.2;
+Cargo 1.95.0 (f2d3ce0bd 2026-03-21). Default features, dev/test unoptimized,
+x86_64-pc-windows-msvc, CARGO_PROFILE_DEV_DEBUG=0, locked/offline. No install.
+
+```powershell
+$env:CARGO_PROFILE_DEV_DEBUG='0'
+rustc -Vv
+cargo -V
+cargo fmt --all -- --check
+cargo fmt --manifest-path tools/windows-native-replay/child/Cargo.toml -- --check
+cargo clippy -p arxd --all-targets --locked --offline --target x86_64-pc-windows-msvc -- -D warnings
+cargo build --manifest-path tools/windows-native-replay/child/Cargo.toml --locked --offline --target x86_64-pc-windows-msvc --target-dir target/windows-native-replay-child
+cargo test -p arxd --lib --locked --offline --target x86_64-pc-windows-msvc development::windows::diag::pure:: -- --test-threads=1
+cargo test -p arxd --lib --locked --offline --target x86_64-pc-windows-msvc development::windows::native_replay::pure:: -- --test-threads=1
+python tools/windows-native-replay/Check-Source.py
+& tools/windows-native-replay/Test-PureController.ps1
+python tools/windows-native-replay/Prepare-Provenance.py c1f1255aea3f8b6857688d75e61acbc69868a89a
+git diff --check
+```
+
+All checks above passed except Prepare-Provenance.py, which correctly refused
+`provenance unavailable`: the compiler-produced helper has link count 2. No
+hardlink rejection was relaxed, no helper was copied or launched. All source
+inputs individually passed bounded_hash; this is still only snapshot evidence.
+The current compiled helper is NOT eligible as a pinned launch file. A reviewed
+copy-and-hold implementation is required. Its hash below records build identity
+only. Parser.ParseFile of Invoke-BoundedReplay.ps1 returned zero parse errors;
+that script was never invoked. Add-Type compiled C# during managed pure checks.
+
+After inspecting the pure code and transitive managed/TLS/parser paths, final
+exact Rust filters passed 6 and 4 tests (360 and 362 filtered out, 0 failed,
+0 ignored). No Win32 call, process or real clock is reachable in those selected
+pure tests. Managed checks cover independent index boundaries, all rows,
+partial/open/empty completion, exit accounting, duplicate/order/overflow,
+unknown cleanup, row and independent global expiry, empty channel deadline,
+and argument/environment/path rejection. They never construct OwnedSession.
+
+Five in-memory C# counterfactuals compiled and were assertion-killed: row 15
+create count changed; completion requirement removed; timeout >= changed to >;
+arbitrary filter allowed; PATH equality removed. Compilation errors are never
+counted as kills. Variants were compiled with unique type names; original files
+were never overwritten. The final LF Controller SHA256 was unchanged and CR=0.
+These are pure negative controls, NOT native timeout/marker/cleanup evidence.
+
+Failure history (same builder/effort): one C# CS1009 test-string escaping error
+was corrected once; one mutation runner stopped on the expected assertion
+because PowerShell wrapped TargetInvocationException, corrected once to inspect
+the underlying exception and fixed allowed assertion labels. Then all five
+variants passed the kill check. No same issue reached three failed fixes. The
+provenance hardlink refusal remains deliberately unresolved, without retries.
+
+### Source pins after correction
+
+| Source | Git blob | LF SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/development/windows.rs` | `c949e47dae5ac6998d6f406b250c761a43ab9d89` | `48499b5014da7106513f5bd190c0de6300f0e71ce7086c9a70620c7db5980895` |
+| `tools/windows-native-replay/Check-Source.py` | `064ff0d945e59859e4139f41e5f30a031ba1d5dc` | `21ec56c1a44874eb9f0ec5ebf432d6db4478609b970ff46a0af03e04f43151f7` |
+| `tools/windows-native-replay/Controller.cs` | `73569217b56b6b8ca7bbdd85bc981ccc7f713e31` | `76ad429af198533a1155170a150680b06cf82c24b1fc4a2524d8dab7906806c5` |
+| `tools/windows-native-replay/PINNING.md` | `c60ef5fc4e2c4a7a478d89154c57497ca0b14709` | `b42faab8236b893c9bcbd6e21118d0e142e1ecfa5466173dfede11c6243879f3` |
+| `tools/windows-native-replay/Prepare-Provenance.py` | `d3a6183316a530df64231bf49a446cd6a54978d1` | `2355e11e15e79791c64d9a8cdcd7917144e47dc57effbb713c4f5db7b0566370` |
+| `tools/windows-native-replay/Test-PureController.ps1` | `b4944109e3c1ea9c08799491af6f41704a926b40` | `430922256f5054be171b1e7343617616f1499bce7df061fc8d6dc98d5c93a5c5` |
+| `tools/windows-native-replay/selectors.json` | `41a9499660e8b0b40b21bd021f56ba45d760474a` | `e9aa9e6f405c2142d392096926830f0ba5b59be1a8ef46409d75d1513eab9b23` |
+
+Build artifact snapshots (never native-run):
+
+- `target/windows-native-replay-child/x86_64-pc-windows-msvc/debug/windows-native-replay-child.exe` SHA256 `78b1e0c96e4668ef674142822c7487fcec3697ec83182789d66940b4d80bd91b`.
+- `target/x86_64-pc-windows-msvc/debug/deps/arxd-5547724799c07633.exe` SHA256 `8b23624184adc6ffd2c297b8c79eede324891d6e0bc364544c7a1447a727780b`.
+
+Budgets **UNMEASURED** (300/360/60 allocation); native runtime **UNRUN**. No
+nested-Job result, selected disposable standard-account environment, immutable
+runtime manifest/held identity adapter or native telemetry. Unknown cleanup must
+stop reuse; no PID/name kill, enumeration or broad cleanup was added/performed.
+No workflow/CI/root Cargo/policy/proposal/review/PROGRESS edit, GitHub/network,
+install, CI dispatch, push, PR, subagent, owner/account/service/VM/private-state
+operation, old Lab Manager access or babysitter operation occurred.
+
+M2 remains **incomplete**, cause **unknown**, PA6 replay **OPEN**; no historical
+retry, cause fix or acceptance. Native/dedicated/installed paths remain
+**unverified on real hardware**.
+
+Final local identity verification: b2dec92 and retained 4518385 review blobs both
+`ad3aee74e06fb1ab62217426eb01797c80f3d608`; 3eedb77/beb590c trees both
+`8ee82d5639eed05f4cc39f4756702530aed53f12`; afcf804/a04aaf6 trees both
+`9f65e6643b6485eff648cbe72918bed87fe35921`. One read-only rev-parse initially
+failed because unquoted `^{tree}` was parsed by PowerShell; quoted Git arguments
+then verified all four identities. No source/build/test retry followed that shell
+syntax correction. Final porcelain was empty before this evidence append.
