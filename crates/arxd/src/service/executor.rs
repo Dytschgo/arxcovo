@@ -276,6 +276,10 @@ impl Execution {
         )
     }
     #[cfg(test)]
+    pub(super) fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
     pub(super) fn preflight_for_test(&self) -> Result<(), Unavailable> {
         self.preflight()
     }

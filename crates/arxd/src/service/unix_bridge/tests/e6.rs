@@ -1,10 +1,10 @@
 use super::*;
 use crate::exec::hierarchy::setup::SetupFailure;
 use std::sync::atomic::AtomicBool;
-struct Port {
-    step: Box<Step>,
-    residue: Arc<AtomicBool>,
-    calls: Arc<AtomicUsize>,
+pub(super) struct Port {
+    pub(super) step: Box<Step>,
+    pub(super) residue: Arc<AtomicBool>,
+    pub(super) calls: Arc<AtomicUsize>,
 }
 impl RunnerPort for Port {
     fn cleanup_residue(&self) -> bool {
@@ -53,10 +53,10 @@ fn domain(
         r,
     )
 }
-fn activity(dir: &tempfile::TempDir) -> Arc<Activity> {
+pub(super) fn activity(dir: &tempfile::TempDir) -> Arc<Activity> {
     Arc::new(Activity::open_service_fixture(dir.path()).unwrap())
 }
-async fn call(
+pub(super) async fn call(
     e: &Arc<Execution>,
     a: &Arc<Activity>,
     discovery: bool,
@@ -78,7 +78,7 @@ async fn call(
     )
     .await
 }
-fn refused(out: Result<Value, crate::service::executor::Failure>, token: Unavailable) {
+pub(super) fn refused(out: Result<Value, crate::service::executor::Failure>, token: Unavailable) {
     assert!(
         out.err().is_some_and(|f| f.execution_reason == Some(token)),
         "fixed refusal"

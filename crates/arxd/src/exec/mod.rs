@@ -18,6 +18,14 @@ pub(crate) mod hierarchy;
 
 #[cfg(target_os = "linux")]
 mod cgroup;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct TestGroup(#[allow(dead_code)] cgroup::Group);
+#[cfg(all(test, target_os = "linux"))]
+impl TestGroup {
+    pub(crate) fn owned(base: &tempfile::TempDir, residue: Arc<AtomicBool>) -> Self {
+        Self(cgroup::Group::owned_test_group(base, residue))
+    }
+}
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod output;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
