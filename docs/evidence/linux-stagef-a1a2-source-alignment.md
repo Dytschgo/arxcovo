@@ -60,7 +60,7 @@ Checks run on the source commit (all local, offline where applicable):
 - `cargo fmt --all -- --check` and `git diff --check`: pass.
 - AST equality against the starting source confirms unchanged F0/F0b closed
   tokens, site inventory, modes, precedence and bounds. Driver SHA256 after
-  final mutant checks: `bec6460b9609339fe54ff01df9e13591c3eeed00706e303af07a176c4a5259c2`.
+  final mutant checks: `a0a1a975520fe4d23e32aaf9f8b5e27d9af99b1808413c01b7a73aeaf5426752`.
 
 The audited Python suite is `mutation_check.safe_suite()`: Guards excluding its
 CLI subprocess case, A1A2, CgroupScan (walk/lstat fully mocked), F0Blockers and
@@ -94,3 +94,8 @@ Historical run 43091339273 has unknown cleanup; its entire environment is
 excluded from reuse. No diagnosis, historical retry or native authority follows
 from this commit or a NEW_SHA. M2/F/G and real-Runner PA6 remain OPEN;
 **unverified on real hardware**. Optional Windows/launchd tracks stay parked.
+
+Publication correction: the driver hash above is the committed LF content hash
+(blob c0f4f9ff487878293ab31f5c74ed16f1f842cda8), independently recomputed by
+the reviewer and coordinator. The earlier bec6460b citation was incorrect.
+No source bytes or test credits changed.
