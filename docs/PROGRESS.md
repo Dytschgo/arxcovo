@@ -2711,3 +2711,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 ## Policy regression after feasibility merge
 
 - Codex / gpt-6.1-sol / medium incorporated actual #10 main `b5e6556`, preserving published history. Node policy/budget/auto-merge source and tests remain byte-identical to independently reviewed 23d839e. This parent adds research/setup documentation only; the prior 18-test and await-removal mutation evidence applies without a repeated run. Current state remains first with one queue priority. Independent exact-head recheck and all required gates remain necessary; no feature PR, native activation or experiment retry.
+
+## A5 closed driver mapping checkpoint - 2026-11-14
+
+Sol high source `2a4d9d3` and independent Muse high review `59f2780` accept the four-value closed test mapping with A5 deriving Standard. Actual TEST remains A3 None. Both providers passed 76 audited mocked tests, 29 Python assertion kills, three pure Rust baselines/four compiled kills, F0 23 kills, F0b 36 kills/four equivalents and six exact pure Rust filters; source hashes unchanged. Initial errored mutants/baseline failures earn no credit. Publishing through exact-head review and normal gates; PR95 pin maintenance proceeds independently in disjoint source files. No A5 execution authority; M2/A4/A5/remaining F/G/PA6 open, hardware paths **unverified on real hardware**.

@@ -13,6 +13,12 @@ import test_f0_blockers
 import test_f0b_transport
 
 CASES = [
+ ('select A5 by default', "TEST = 'exec::disposable::disposable_linux_a3_none'", "TEST = 'exec::disposable::disposable_linux_a5'", 'test_source_default_remains_a3_none'),
+ ('omit closed A5', "'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')", "'exec::disposable::disposable_linux_a4'), 'E_TEST_ARGS')", 'test_closed_mapping'),
+ ('A5 without Standard', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST not in ('exec::disposable::disposable_linux_a3_none', 'exec::disposable::disposable_linux_a5')", 'test_closed_mapping'),
+ ('A5 argv selects A3', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return [binary, 'exec::disposable::disposable_linux_a3_none' if TEST == 'exec::disposable::disposable_linux_a5' else TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_closed_mapping'),
+ ('admit arbitrary disposable names', "require(TEST in (", "require(TEST.startswith('exec::disposable::disposable_linux_') or TEST in (", 'test_closed_selection_before_effects'),
+ ('summary uses historical None', "f'test {TEST} ... ok'", "'test exec::disposable::disposable_linux_a3_none ... ok'", 'test_all_four_exact_summaries'),
  ('restore writable parent', "return Path('/var/lib/arx-ci-' + run), 'arxd.service'", "return Path('/opt/arx-ci-' + run), 'arxd.service'", 'test_native_writable_parent_regression'),
  ('skip parent protection', "protected(stage.parent, 'run_parent')", 'pass', 'test_parent_checked_before_exclusive_stage_creation'),
  ('reuse staging directory', 'stage.mkdir(mode=0o700)', 'stage.mkdir(mode=0o700, exist_ok=True)', 'test_parent_checked_before_exclusive_stage_creation'),
@@ -98,6 +104,11 @@ def rust_mutants():
     parse = parse.replace('use crate::service::{config::Rights, preflight::ExecutionUnavailable};\n', '').replace('use serde::Deserialize;\n', '')
     cancellation = types_source[types_source.index('#[derive(Clone, Default)]'):types_source.index('\n}', types_source.index('impl Cancellation'))+2]
     prefix = fake[:fake.index('#[test]')]
+    # This existing stdin harness selects only A1/A2; omit the separately
+    # housed A5 model module instead of resolving its relative path from stdin.
+    a5_module = '#[path = "a5.rs"]\npub(crate) mod a5;\n'
+    assert prefix.count(a5_module) == 1, 'A5 module anchor'
+    prefix = prefix.replace(a5_module, '')
     focused = fake[fake.index('#[test]\nfn a1a2_production_setup_before_acceptance'):]
     source = ('#![allow(dead_code)]\nmod development { use std::sync::{Arc,atomic::{AtomicBool,Ordering}};\n' + cancellation +
               '\n}\nmod hierarchy { pub(crate) use parse::locate;\nmod parse {\n' + parse +

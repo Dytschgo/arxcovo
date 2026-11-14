@@ -526,6 +526,7 @@ class A1A2(unittest.TestCase):
             'exec::disposable::disposable_linux_a1_a2',
             'exec::disposable::disposable_linux_a3_standard',
             'exec::disposable::disposable_linux_a3_none',
+            'exec::disposable::disposable_linux_a5',
         ):
             with self.subTest(selected=selected), patch.object(driver, 'TEST', selected):
                 self.assertEqual(driver.test_argv(artifact), [artifact, selected,
@@ -713,10 +714,19 @@ class A1A2(unittest.TestCase):
         self.assertEqual(events, ['build', 'attribution', 'start', 'monitor', 'attribution', 'stop'])
 
     def test_closed_selection_before_effects(self):
-        for value in ('', 'exec::disposable::disposable_linux_cross_account', driver.TEST + 'x'):
+        for value in ('', 'exec::disposable::disposable_linux_cross_account',
+                      'exec::disposable::disposable_linux_a4',
+                      'exec::disposable::disposable_linux_a5_none',
+                      'exec::disposable::disposable_linux_a5_standard',
+                      'exec::disposable::disposable_linux_a5x',
+                      'exec::disposable::disposable_linux_a5\n', driver.TEST + 'x'):
             with patch.object(driver, 'TEST', value), \
                  patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('probe')), \
                  patch.object(driver, 'cg_preflight', side_effect=AssertionError('probe')):
+                with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                    driver.standard_profile()
+                with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                    driver.test_argv('/binary')
                 with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
                     driver.run_body(valid_env())
                 with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
@@ -728,7 +738,7 @@ class A1A2(unittest.TestCase):
         unit = (package / 'arxd.service').read_bytes()
         profile = (package / '50-arxcovo-standard-rights.conf').read_bytes()
         root = Path('/run/systemd/system')
-        for name, present in [('a1_a2', True), ('a3_standard', True), ('a3_none', False)]:
+        for name, present in [('a1_a2', True), ('a3_standard', True), ('a3_none', False), ('a5', True)]:
             with self.subTest(name=name), ExitStack() as stack:
                 selected = 'exec::disposable::disposable_linux_' + name
                 stack.enter_context(patch.object(driver, 'TEST', selected))
@@ -772,7 +782,7 @@ class A1A2(unittest.TestCase):
             driver.verify_runtime(stage, '123-1', props)
 
     def test_exact_runtime_attribution(self):
-        for name in ('a1_a2', 'a3_standard', 'a3_none'):
+        for name in ('a1_a2', 'a3_standard', 'a3_none', 'a5'):
             self.attribution(name)
             for kwargs in (dict(change={'DropInPaths':''}),
                            dict(change={'DropInPaths':'/foreign/identical.conf'}),
@@ -787,6 +797,60 @@ class A1A2(unittest.TestCase):
         for tasks in (b'', b'42\n43\n', b'43\n', b'42 '):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
+
+    def test_source_default_remains_a3_none(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a3_none')
+
+    def test_closed_mapping(self):
+        # Independent expectations: never obtain the cases/profile from the driver.
+        for selected, present in (
+            ('exec::disposable::disposable_linux_a1_a2', True),
+            ('exec::disposable::disposable_linux_a3_standard', True),
+            ('exec::disposable::disposable_linux_a3_none', False),
+            ('exec::disposable::disposable_linux_a5', True),
+        ):
+            with self.subTest(selected=selected), patch.object(driver, 'TEST', selected):
+                try:
+                    profile = driver.standard_profile()
+                    argv = driver.test_argv('/binary')
+                except RuntimeError as error:
+                    self.fail('closed mapping refused: ' + selected + ': ' + str(error))
+                self.assertIs(profile, present)
+                self.assertEqual(argv, ['/binary', selected, '--ignored', '--exact',
+                                        '--test-threads=1', '--color=never'])
+
+    def test_a5_reuses_existing_fences(self):
+        # These helpers mock every host effect; A5 adds no lifecycle of its own.
+        with patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'):
+            self.test_ack_before_exit_before_summary()
+            self.test_mainpid_and_placement_required()
+            self.test_sole_supervisor_pid_required()
+            self.test_exit_requires_ack_and_real_success()
+            self.test_overflow_while_held_refuses()
+            self.test_deadline_required()
+            self.test_launcher_exec_and_single_capture_owner()
+            self.test_runtime_attribution_lifecycle()
+            self.test_reservation_is_exclusive_nonblocking()
+            self.test_collision_refuses_before_mutation()
+            self.test_cleanup_cannot_stop_another_unit()
+            self.test_cleanup_replacement_quarantines()
+
+    def test_all_four_exact_summaries(self):
+        selections = ('exec::disposable::disposable_linux_a1_a2',
+                      'exec::disposable::disposable_linux_a3_standard',
+                      'exec::disposable::disposable_linux_a3_none',
+                      'exec::disposable::disposable_linux_a5')
+        stage = unittest.mock.MagicMock()
+        (stage / 'test-output').stat.return_value.st_size = 100
+        for selected in selections:
+            with self.subTest(selected=selected), patch.object(driver, 'TEST', selected):
+                self.test_exact_summary()
+                for other in selections:
+                    if other == selected:
+                        continue
+                    text = f'test {other} ... ok\ntest result: ok. 1 passed; 0 failed;'
+                    with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+                        driver.verify_test_result(stage, 0)
 
     def test_exit_requires_ack_and_real_success(self):
         for states, kwargs in [(['inactive'], {}), (['active','failed'], {'result':'exit-code'}),
@@ -860,7 +924,10 @@ class A1A2(unittest.TestCase):
         with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
             driver.verify_test_result(stage, 1)
         with patch.object(driver, 'private_read', return_value=text):
-            driver.verify_test_result(stage, 0)
+            try:
+                driver.verify_test_result(stage, 0)
+            except RuntimeError as error:
+                self.fail('exact selected summary refused: ' + str(error))
 
 
 if __name__ == '__main__':
