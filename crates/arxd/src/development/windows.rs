@@ -311,6 +311,8 @@ mod diag {
         err: Option<u64>,
         pass: Option<u32>,
         calls: u32,
+        consumed: u32,
+        resumes: u32,
     }
     thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
     pub struct Scope(std::marker::PhantomData<std::rc::Rc<()>>);
@@ -336,6 +338,8 @@ mod diag {
     pub struct Observation {
         pub record: Option<Record>,
         pub create_calls: u32,
+        pub consumed: u32,
+        pub resume_calls: u32,
     }
     // Future replay callers must arm and invoke directly inside this closure,
     // not call run_ok (which owns a separate, non-nestable Scope).
@@ -346,6 +350,8 @@ mod diag {
         let observation = Observation {
             record: record(),
             create_calls: create_calls(),
+            consumed: STATE.with(|s| s.borrow().consumed),
+            resume_calls: STATE.with(|s| s.borrow().resumes),
         };
         (result, observation)
     }
@@ -365,6 +371,8 @@ mod diag {
                 s.err = None;
                 s.pass = None;
                 s.calls = 0;
+                s.consumed = 0;
+                s.resumes = 0;
             });
             Self(std::marker::PhantomData)
         }
@@ -405,7 +413,10 @@ mod diag {
             let mut s = s.borrow_mut();
             s.pending = Some(stage);
             if s.running && s.armed.is_some_and(|a| a.0 == stage) {
-                s.armed.take().map(|a| a.1)
+                s.armed.take().map(|a| {
+                    s.consumed += 1;
+                    a.1
+                })
             } else {
                 None
             }
@@ -448,6 +459,29 @@ mod diag {
             s.err = Some(err);
             s.pass = pass;
         });
+    }
+    pub fn resume_call() {
+        STATE.with(|s| s.borrow_mut().resumes += 1);
+    }
+    #[allow(dead_code)] // Gate 2 fixture and pure bookkeeping only.
+    pub fn empty() -> bool {
+        STATE.with(|s| {
+            let s = s.borrow();
+            !s.scoped
+                && !s.running
+                && s.armed.is_none()
+                && s.captured.is_none()
+                && s.pending.is_none()
+                && s.role.is_none()
+                && s.process == 0
+                && s.job == 0
+                && s.calls == 0
+                && s.consumed == 0
+                && s.resumes == 0
+                && s.out.is_none()
+                && s.err.is_none()
+                && s.pass.is_none()
+        })
     }
     pub fn create_call() {
         STATE.with(|s| {
@@ -1339,6 +1373,9 @@ fn run_inner(
             null_mut(),
             null(),
         ))?;
+        // The list is sealed; fixture duplicates cannot enter child inheritance.
+        #[cfg(test)]
+        let mut replay_writers = native_replay::retain_if_active(&out_w, &err_w)?;
         let mut startup: STARTUPINFOEXW = zeroed();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -1385,6 +1422,7 @@ fn run_inner(
                 return Err(Reason::IdentityMismatch);
             }
             stage!(diag::Stage::Resume);
+            diagnostic!(diag::resume_call());
             if ResumeThread(thread.0) == u32::MAX {
                 diagnostic!(diagnostic_failure(true, None));
                 return Err(Reason::ExecutionFailed);
@@ -1394,6 +1432,10 @@ fn run_inner(
             let mut stderr = Captured::default();
             let mut reason = StopReason::Exited;
             loop {
+                diagnostic!(native_replay::prefill(
+                    &mut replay_writers,
+                    native_replay::Fill::Loop
+                )?);
                 if drain_at!(
                     LoopOut,
                     stdout.total,
@@ -1436,9 +1478,14 @@ fn run_inner(
             stage!(diag::Stage::ExitCode);
             ok(GetExitCodeProcess(process.0, &mut code))?;
             let cleanup = job.stop();
+            diagnostic!(native_replay::stop_result(cleanup));
             if !cleanup {
                 return Err(Reason::CleanupUnconfirmed);
             }
+            diagnostic!(native_replay::prefill(
+                &mut replay_writers,
+                native_replay::Fill::Final
+            )?);
             // Bounded final read: pipes cannot hold us open, even if a handle escaped.
             for _pass in 0..32 {
                 let overflow = drain_at!(
@@ -1458,6 +1505,7 @@ fn run_inner(
                     reason = StopReason::OutputLimit;
                 }
             }
+            diagnostic!(native_replay::totals(stdout.total, stderr.total));
             Ok(ResultData {
                 execution_mode: MODE,
                 claim: CLAIM,
@@ -1489,13 +1537,881 @@ fn run_inner(
             })
         })();
         if result.is_err() {
-            TerminateProcess(process.0, 1);
-            job.stop();
+            let _replay_terminate = TerminateProcess(process.0, 1);
+            diagnostic!(native_replay::terminate_result(_replay_terminate != 0));
+            let _replay_stop = job.stop();
+            diagnostic!(native_replay::stop_result(_replay_stop));
             execution.quarantined.store(true, Ordering::Release);
         }
+        diagnostic!(native_replay::cleanup(&process, &job));
         result
     }
 }
+
+// Gate 2: deliberately no native #[test], ignored registration, CLI or dispatcher.
+// These functions compile but have no discovery entry. All native helpers below
+// require the explicit same-thread guard; ordinary tests acquire no extra handles.
+#[cfg(test)]
+#[allow(dead_code)]
+mod native_replay {
+    use super::*;
+    use diag::Stage;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Fill {
+        Empty,
+        Loop,
+        Final,
+    }
+    #[derive(Clone, Copy)]
+    struct Row {
+        label: &'static str,
+        origin: u32,
+        stage: Stage,
+        fill: Fill,
+        creates: u32,
+        resumes: u32,
+        pass: Option<u32>,
+        out: Option<u64>,
+        err: Option<u64>,
+        valid: bool,
+        wait: Option<u32>,
+    }
+    // Independent literal accepted table. Never derive expected values from TLS,
+    // Stage::ALL, resolve(), selected fill, actual output or captured records.
+    macro_rules! row {
+        ($label:literal,$origin:literal,$stage:ident,$fill:ident,$c:literal,$r:literal,$p:expr,$o:expr,$e:expr,$v:literal,$w:expr) => {
+            Row {
+                label: $label,
+                origin: $origin,
+                stage: Stage::$stage,
+                fill: Fill::$fill,
+                creates: $c,
+                resumes: $r,
+                pass: $p,
+                out: $o,
+                err: $e,
+                valid: $v,
+                wait: $w,
+            }
+        };
+    }
+    const ORACLE: [Row; 28] = [
+        row!(
+            "daemon_token_open",
+            89,
+            DaemonTokenOpen,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "daemon_token_info",
+            64,
+            DaemonTokenInfo,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "pipe_out_create",
+            286,
+            PipeOutCreate,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "pipe_err_create",
+            286,
+            PipeErrCreate,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "pipe_out_noinherit",
+            289,
+            PipeOutNoinherit,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "pipe_err_noinherit",
+            289,
+            PipeErrNoinherit,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "job_create",
+            221,
+            JobCreate,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "job_limits",
+            231,
+            JobLimits,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "job_ui", 240, JobUi, Empty, 0, 0, None, None, None, true, None
+        ),
+        row!(
+            "nul_open", 414, NulOpen, Empty, 0, 0, None, None, None, true, None
+        ),
+        row!(
+            "attr_size",
+            420,
+            AttrSize,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            false,
+            None
+        ),
+        row!(
+            "attr_init",
+            423,
+            AttrInit,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "attr_update",
+            430,
+            AttrUpdate,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "create_process",
+            448,
+            CreateProcess,
+            Empty,
+            0,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "assign_job",
+            471,
+            AssignJob,
+            Empty,
+            1,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "child_token_open",
+            89,
+            ChildTokenOpen,
+            Empty,
+            1,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "child_token_info",
+            64,
+            ChildTokenInfo,
+            Empty,
+            1,
+            0,
+            None,
+            None,
+            None,
+            true,
+            None
+        ),
+        row!(
+            "resume", 478, Resume, Empty, 1, 0, None, None, None, true, None
+        ),
+        row!(
+            "loop_out_peek",
+            324,
+            LoopOutPeek,
+            Loop,
+            1,
+            1,
+            None,
+            Some(0),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "loop_err_peek",
+            324,
+            LoopErrPeek,
+            Loop,
+            1,
+            1,
+            None,
+            Some(1),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "loop_out_read",
+            329,
+            LoopOutRead,
+            Loop,
+            1,
+            1,
+            None,
+            Some(0),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "loop_err_read",
+            329,
+            LoopErrRead,
+            Loop,
+            1,
+            1,
+            None,
+            Some(1),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "wait",
+            508,
+            Wait,
+            Empty,
+            1,
+            1,
+            None,
+            Some(0),
+            Some(0),
+            true,
+            Some(4294967295)
+        ),
+        row!(
+            "exit_code",
+            512,
+            ExitCode,
+            Empty,
+            1,
+            1,
+            None,
+            Some(0),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "final_out_peek",
+            324,
+            FinalOutPeek,
+            Final,
+            1,
+            1,
+            Some(0),
+            Some(0),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "final_err_peek",
+            324,
+            FinalErrPeek,
+            Final,
+            1,
+            1,
+            Some(0),
+            Some(1),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "final_out_read",
+            329,
+            FinalOutRead,
+            Final,
+            1,
+            1,
+            Some(0),
+            Some(0),
+            Some(0),
+            true,
+            None
+        ),
+        row!(
+            "final_err_read",
+            329,
+            FinalErrRead,
+            Final,
+            1,
+            1,
+            Some(0),
+            Some(1),
+            Some(0),
+            true,
+            None
+        ),
+    ];
+    #[derive(Default)]
+    struct FixtureState {
+        active: bool,
+        fill: Option<Fill>,
+        stop: Option<bool>,
+        cleanup: Option<bool>,
+        terminated: Option<bool>,
+        totals: Option<(u64, u64)>,
+    }
+    thread_local! { static FIXTURE: RefCell<FixtureState> = RefCell::new(FixtureState::default()); }
+    struct Guard(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Guard {
+        fn enter(fill: Fill) -> Self {
+            FIXTURE.with(|s| {
+                assert!(!s.borrow().active, "nested fixture");
+                *s.borrow_mut() = FixtureState {
+                    active: true,
+                    fill: Some(fill),
+                    ..FixtureState::default()
+                };
+            });
+            Self(std::marker::PhantomData)
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FIXTURE.with(|s| *s.borrow_mut() = FixtureState::default());
+        }
+    }
+    pub(super) struct Writers {
+        out: Handle,
+        err: Handle,
+        fill: Fill,
+        seeded: bool,
+    }
+    pub(super) fn retain_if_active(
+        out: &Handle,
+        err: &Handle,
+    ) -> std::result::Result<Option<Writers>, Reason> {
+        let fill = FIXTURE.with(|s| {
+            let s = s.borrow();
+            s.active.then_some(s.fill).flatten()
+        });
+        let Some(fill) = fill else { return Ok(None) };
+        if fill == Fill::Empty {
+            return Ok(None);
+        }
+        fn duplicate(h: &Handle) -> std::result::Result<Handle, Reason> {
+            unsafe {
+                let mut copy = null_mut();
+                // FALSE inheritance; no change to the sealed NUL/out/err list.
+                if DuplicateHandle(
+                    GetCurrentProcess(),
+                    h.0,
+                    GetCurrentProcess(),
+                    &mut copy,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                ) == 0
+                {
+                    return Err(Reason::ExecutionFailed);
+                }
+                Ok(Handle(copy))
+            }
+        }
+        Ok(Some(Writers {
+            out: duplicate(out)?,
+            err: duplicate(err)?,
+            fill,
+            seeded: false,
+        }))
+    }
+    pub(super) fn prefill(w: &mut Option<Writers>, phase: Fill) -> std::result::Result<(), Reason> {
+        let Some(w) = w else { return Ok(()) };
+        if w.seeded || w.fill != phase {
+            return Ok(());
+        }
+        assert!(FIXTURE.with(|s| s.borrow().active));
+        // Final hook is reachable only after the original stop returned true.
+        if phase == Fill::Final && !FIXTURE.with(|s| s.borrow().stop == Some(true)) {
+            return Err(Reason::CleanupUnconfirmed);
+        }
+        for h in [&w.out, &w.err] {
+            let mut n = 0;
+            if unsafe { WriteFile(h.0, b"X".as_ptr(), 1, &mut n, null_mut()) } == 0 || n != 1 {
+                return Err(Reason::ExecutionFailed);
+            }
+        }
+        w.seeded = true;
+        Ok(())
+    }
+    pub(super) fn terminate_result(ok: bool) {
+        FIXTURE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.active {
+                s.terminated = Some(ok);
+            }
+        });
+    }
+    pub(super) fn stop_result(ok: bool) {
+        FIXTURE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.active {
+                s.stop = Some(ok);
+            }
+        });
+    }
+    pub(super) fn totals(out: u64, err: u64) {
+        FIXTURE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.active {
+                s.totals = Some((out, err));
+            }
+        });
+    }
+    pub(super) fn cleanup(process: &Handle, job: &Job) {
+        if !FIXTURE.with(|s| s.borrow().active) {
+            return;
+        }
+        // Borrow original owned handles before they drop. No duplication, PID open,
+        // extra cleanup or extra wait budget. Unknown observation stops the matrix.
+        let confirmed = unsafe {
+            let mut a: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            let exited = WaitForSingleObject(process.0, 0) == WAIT_OBJECT_0;
+            let queried = QueryInformationJobObject(
+                job.0.0,
+                JobObjectBasicAccountingInformation,
+                (&mut a as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of_val(&a) as u32,
+                null_mut(),
+            ) != 0;
+            exited && queried && a.ActiveProcesses == 0
+        };
+        FIXTURE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.cleanup = Some(confirmed && s.stop == Some(true) && s.terminated != Some(false));
+        });
+    }
+    // Bounded hash read; pin holds every ancestor/leaf against reparse substitution.
+    // Caller supplies reviewed helper hash; future controller must verify its provenance.
+    fn prepared_execution(
+        settings: &Settings,
+        expected: [u8; 32],
+    ) -> (Execution, Vec<std::fs::File>) {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        settings.validate().expect("fixture settings");
+        let bin = settings.workspace.join("bin");
+        assert_eq!(
+            settings.environment.get("PATH").map(String::as_str),
+            bin.to_str()
+        );
+        assert!(
+            settings
+                .environment
+                .keys()
+                .all(|k| matches!(k.as_str(), "PATH" | "TEMP" | "TMP" | "SystemRoot"))
+        );
+        assert_eq!(settings.limits.pids, 16);
+        assert_eq!(settings.limits.memory_bytes, 512 * 1024 * 1024);
+        let exe = bin.join("cargo.exe");
+        let _pins = pin(&exe).expect("fixture pins");
+        let entries = std::fs::read_dir(&bin)
+            .expect("fixture directory")
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "fixture directory must contain only helper"
+        );
+        assert_eq!(entries[0].as_ref().expect("fixture entry").path(), exe);
+        let mut bytes = Vec::new();
+        std::fs::File::open(&exe)
+            .expect("fixture helper")
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .expect("helper read");
+        assert!(bytes.len() <= 16 * 1024 * 1024);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(&bytes)),
+            expected,
+            "helper hash"
+        );
+        assert_eq!(resolve(settings, "cargo").expect("fixture resolve").0, exe);
+        (Execution::build(settings.clone(), false), _pins)
+    }
+    fn matches_failure(row: Row, reason: Reason, o: diag::Observation) -> bool {
+        let Some(r) = o.record else { return false };
+        reason == Reason::ExecutionFailed
+            && o.consumed == 1
+            && o.create_calls == row.creates
+            && o.resume_calls == row.resumes
+            && r.stage == Some(row.stage)
+            && r.error == Some(55)
+            && r.valid == row.valid
+            && r.wait == row.wait
+            && r.ms.is_none()
+            && r.pass == row.pass
+            && r.out == row.out
+            && r.err == row.err
+    }
+    fn one_row(
+        settings: &Settings,
+        hash: [u8; 32],
+        index: u32,
+        row: Option<Row>,
+        fill: Fill,
+        injection: Option<(Stage, u32)>,
+    ) {
+        assert!(diag::empty());
+        let (execution, _helper_pins) = prepared_execution(settings, hash); // fresh EVERY row, no discovery.
+        assert!(!execution.policy_fixture && !execution.quarantined.load(Ordering::Acquire));
+        let _guard = Guard::enter(fill);
+        let request = Request {
+            tool: "cargo".into(),
+            args: vec![],
+            cwd: String::new(),
+            timeout_s: 1,
+            output_bytes: 8192,
+        };
+        let (result, observation) = diag::observe(|| {
+            if let Some((stage, error)) = injection {
+                diag::arm(stage, error);
+            }
+            run_inner(&execution, &request, &Cancellation::default(), false)
+        });
+        assert!(diag::empty());
+        if let Some(row) = row {
+            let reason = result.err().expect("expected synthetic failure");
+            assert!(
+                matches_failure(row, reason, observation),
+                "{}",
+                diag::line(diag::Context::Direct, index, reason, observation.record)
+            );
+        } else {
+            let result = result.unwrap_or_else(|r| {
+                panic!(
+                    "{}",
+                    diag::line(diag::Context::Fresh, index, r, observation.record)
+                )
+            });
+            assert!(observation.record.is_none());
+            assert_eq!(
+                (
+                    observation.create_calls,
+                    observation.resume_calls,
+                    observation.consumed
+                ),
+                (1, 1, u32::from(injection.is_some()))
+            );
+            assert!(result.cleanup_confirmed);
+            assert_eq!((&*result.stdout, &*result.stderr), ("X", "X"));
+            assert_eq!(
+                (result.stdout_dropped_bytes, result.stderr_dropped_bytes),
+                (0, 0)
+            );
+            assert_eq!(FIXTURE.with(|s| s.borrow().totals), Some((1, 1)));
+        }
+        if observation.create_calls > 0 {
+            assert_eq!(
+                FIXTURE.with(|s| s.borrow().cleanup),
+                Some(true),
+                "unknown cleanup: stop, prohibit reuse"
+            );
+        }
+    }
+    // Future filter development::windows::native_replay::bounded_matrix.
+    // NO registration in Gate 2. An external controller must enforce deadlines.
+    fn bounded_matrix(settings: &Settings, hash: [u8; 32]) {
+        for (i, row) in ORACLE.into_iter().enumerate() {
+            one_row(
+                settings,
+                hash,
+                i as u32,
+                Some(row),
+                row.fill,
+                Some((row.stage, 55)),
+            );
+        }
+        for (i, (stage, fill)) in [
+            (Stage::LoopOutPeek, Fill::Loop),
+            (Stage::LoopErrPeek, Fill::Loop),
+            (Stage::FinalOutPeek, Fill::Final),
+            (Stage::FinalErrPeek, Fill::Final),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            one_row(
+                settings,
+                hash,
+                28 + i as u32,
+                None,
+                fill,
+                Some((stage, 109)),
+            );
+        }
+        one_row(settings, hash, 32, None, Fill::Loop, None);
+        one_row(settings, hash, 33, None, Fill::Final, None);
+    }
+    // Future filter development::windows::native_replay::kernel_peek_capture.
+    fn kernel_peek_capture() {
+        assert!(diag::empty());
+        let (r, o) = diag::observe(|| {
+            let _invocation = diag::Invocation::enter();
+            diag::role(diag::Role::LoopOut);
+            drain(null_mut(), &mut Captured::default(), 8192)
+        });
+        assert_eq!(r, Err(Reason::ExecutionFailed));
+        let record = o.record.expect("kernel record");
+        assert_eq!(record.stage, Some(Stage::LoopOutPeek));
+        assert_eq!(record.error, Some(6));
+        assert!(record.valid && record.wait.is_none() && record.ms.is_none());
+        assert_eq!((o.create_calls, o.resume_calls, o.consumed), (0, 0, 0));
+        assert!(diag::empty());
+    }
+
+    // Closed numeric case record parser for a future controller. No raw diagnostic
+    // output, paths, elapsed entry clocks or handles can enter this grammar.
+    fn parse_case(line: &str) -> Option<[u64; 8]> {
+        if line.len() > 128 || !line.is_ascii() {
+            return None;
+        }
+        let mut values = [0; 8];
+        let mut fields = line.split(' ');
+        for v in &mut values {
+            let field = fields.next()?;
+            if field.is_empty() || field.len() > 10 || !field.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            *v = field.parse().ok()?;
+        }
+        if fields.next().is_some()
+            || values[0] >= 35
+            || values[1] > 1
+            || values[2] > 1
+            || values[3] > 1
+            || values[4] != 1
+            || values[5] > 1
+            || values[6] > 1
+            || values[7] > 10000
+        {
+            return None;
+        }
+        Some(values)
+    }
+    #[cfg(test)]
+    mod pure {
+        use super::*;
+        #[test]
+        fn counters_survive_invocation_and_scope_clears_even_on_unwind() {
+            assert!(diag::empty());
+            let (_, o) = diag::observe(|| {
+                diag::arm(Stage::Resume, 55);
+                let _i = diag::Invocation::enter();
+                assert_eq!(diag::stage(Stage::Wait), None);
+                assert_eq!(diag::stage(Stage::Resume), Some(55));
+                assert_eq!(diag::stage(Stage::Resume), None);
+                diag::create_call();
+            });
+            assert_eq!((o.create_calls, o.resume_calls, o.consumed), (1, 0, 1));
+            assert!(diag::empty());
+            let (_, captured) = diag::observe(|| {
+                diag::arm(Stage::AttrSize, 55);
+                let _i = diag::Invocation::enter();
+                assert_eq!(diag::stage(Stage::AttrSize), Some(55));
+                assert!(diag::capture_injected(Stage::AttrSize, 55));
+            });
+            let r = captured.record.unwrap();
+            assert_eq!((r.pass, r.out, r.err), (None, None, None));
+            assert!(!r.valid);
+            let (_, o) = diag::observe(|| {
+                diag::arm(Stage::LoopOutPeek, 109);
+                let _i = diag::Invocation::enter();
+                let error = diag::stage(Stage::LoopOutPeek).unwrap();
+                assert!(!diag::capture_injected(Stage::LoopOutPeek, error));
+                diag::resume_call();
+            });
+            assert_eq!((o.consumed, o.resume_calls), (1, 1));
+            assert!(o.record.is_none());
+            let _ = std::panic::catch_unwind(|| {
+                diag::observe(|| {
+                    let _i = diag::Invocation::enter();
+                    panic!("synthetic");
+                })
+            });
+            assert!(diag::empty());
+        }
+        #[test]
+        fn oracle_counts_missing_zero_and_literal_bindings() {
+            let labels = ORACLE
+                .map(|r| r.label)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(labels.len(), 28);
+            for r in ORACLE {
+                assert_eq!(r.label, r.stage.label());
+                assert!(r.origin > 0);
+            }
+            assert_eq!(ORACLE.iter().filter(|r| r.creates == 0).count(), 14);
+            assert_eq!(ORACLE.iter().filter(|r| r.resumes == 1).count(), 10);
+            assert_eq!(ORACLE.iter().filter(|r| r.fill != Fill::Empty).count(), 8);
+            assert!(
+                ORACLE[..18]
+                    .iter()
+                    .all(|r| r.pass.is_none() && r.out.is_none() && r.err.is_none())
+            );
+            for i in [22, 23] {
+                assert_eq!((ORACLE[i].out, ORACLE[i].err), (Some(0), Some(0)));
+            }
+        }
+        #[test]
+        fn mocked_failure_and_contract_mutants() {
+            for row in ORACLE {
+                let r = diag::Record {
+                    stage: Some(row.stage),
+                    error: Some(55),
+                    valid: row.valid,
+                    wait: row.wait,
+                    pass: row.pass,
+                    out: row.out,
+                    err: row.err,
+                    ..diag::Record::default()
+                };
+                let o = diag::Observation {
+                    record: Some(r),
+                    create_calls: row.creates,
+                    resume_calls: row.resumes,
+                    consumed: 1,
+                };
+                assert!(matches_failure(row, Reason::ExecutionFailed, o));
+                for bad in [
+                    diag::Observation { consumed: 0, ..o },
+                    diag::Observation {
+                        create_calls: 2,
+                        ..o
+                    },
+                    diag::Observation {
+                        resume_calls: 2,
+                        ..o
+                    },
+                    diag::Observation { record: None, ..o },
+                    diag::Observation {
+                        record: Some(diag::Record { out: Some(99), ..r }),
+                        ..o
+                    },
+                    diag::Observation {
+                        record: Some(diag::Record { stage: None, ..r }),
+                        ..o
+                    },
+                ] {
+                    assert!(!matches_failure(row, Reason::ExecutionFailed, bad));
+                }
+            }
+        }
+        #[test]
+        fn controller_rejects_unknown_cleanup_extra_counts_and_private_payloads() {
+            assert_eq!(
+                parse_case("34 0 0 0 1 0 0 10000"),
+                Some([34, 0, 0, 0, 1, 0, 0, 10000])
+            );
+            for s in [
+                "35 0 0 0 1 0 0 1",
+                "0 2 0 0 1 0 0 1",
+                "0 1 1 1 0 1 1 1",
+                "0 1 1 1 1 1 1 10001",
+                "0 1 1 1 1 1 1 1 extra",
+                "0 1 1 1 1 1 1 -1",
+                "0  1 1 1 1 1 1 1",
+                r"C:\private\sentinel",
+            ] {
+                assert!(parse_case(s).is_none());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

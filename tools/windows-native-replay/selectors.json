@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "registration_enabled": false,
+  "target": "x86_64-pc-windows-msvc",
+  "profile": "dev",
+  "debug": "0",
+  "features": "default",
+  "toolchain": "1.95.0",
+  "case_timeout_seconds": 10,
+  "global_timeout_seconds": 360,
+  "expected_cases": 35,
+  "expected_children": 20,
+  "expected_resumes": 16,
+  "filters": [
+    {
+      "name": "development::windows::native_replay::kernel_peek_capture",
+      "cases": 1,
+      "children": 0,
+      "resumes": 0
+    },
+    {
+      "name": "development::windows::native_replay::bounded_matrix",
+      "cases": 34,
+      "children": 20,
+      "resumes": 16
+    }
+  ]
+}
