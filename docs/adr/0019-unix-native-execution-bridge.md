@@ -9,13 +9,13 @@ correction with its retained independent Opus high recheck. See the
 [correction recheck](../reviews/0019-validator-correction-opus-recheck.md).
 
 The staged architecture remains inactive and grants no production constructor
-or M2 acceptance. D7a is consumed. D7b below proposes one fresh hosted A1/A2
-execution of the corrected protected-parent source; no run permission exists
-until independent Grok review, all required checks and coordinator merge.
-All other native execution and historical retries remain unauthorized. The
-historical E_PROTECTION diagnosis is unresolved; D7b expressly disposes of
-that prerequisite for its single run only. Every other
-implementation, native-acceptance and production-activation gate remains.
+or M2 acceptance. D7a and D7b are consumed; A1/A2 acceptance is limited to
+recorded hosted run `43627472312`. D7c proposes two fixed fresh-host A3 cases
+in order; no run permission exists before its independent Muse review, all
+required gates and coordinator merge. All other native execution and historical
+retries remain unauthorized. The historical E_PROTECTION diagnosis remains
+unresolved and its environment excluded. Every other implementation,
+native-acceptance and production-activation gate remains.
 
 ## Historical proposal and clarification checkpoints
 
@@ -229,8 +229,8 @@ green hosted gates; the separately reviewed Linux cgroup setup and janitor
 slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
-run and its environment must not be retried or reused. D7a is consumed; only
-D7b proposes a fresh bounded A1/A2 execution, subject to its publication gates.
+run and its environment must not be retried or reused. D7a and D7b are
+consumed; only D7c proposes the two fixed A3 cases, subject to its gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
 
@@ -291,10 +291,13 @@ actually observed; no owner-machine acceptance is implied.
 
 ### D7b. One corrected protected-parent A1/A2 run (2026-11-14)
 
-**Proposed; no run permission until independent Grok review, all normal
-required gates (including `agent-review` and `ci-time-budget`) and coordinator
-merge.** The owner delegates this proportionate reviewed ADR route without
-repeated owner confirmations for a disposable hosted runner.
+**Historical; consumed.** PR #86 merged as
+`1e9d8818de1e337b1402ca7e2b71ac02456b82f3`; accepted dispatch
+`43627472312`, attempt 1, consumed this grant. Its successful A1/A2 evidence
+and confirmed cleanup were independently accepted in the
+[Muse evidence review](../reviews/m2-a1a2-hosted-evidence-muse-review.md);
+the reviewed-SHA variable was verified absent. The terms below record that
+grant, not current permission. D7c does not renew it or reuse its environment.
 
 Run `43622157531` localized the fresh refusal to root-owned `/opt` with
 group/other write bits `0o022`, before mutation. The [source correction](../evidence/linux-stagef-protected-parent-fix.md)
@@ -346,6 +349,100 @@ production constructors and activation receive no credit or permission and
 remain open/inactive. `/var/lib` and installed/dedicated paths remain
 **unverified on real hardware** except for evidence actually observed in a
 future authorized run; optional diagnostics remain parked.
+
+### D7c. Two fixed source-selected A3 cases (2026-11-14)
+
+**Proposed; no execution permission before independent Muse exact-head review,
+all five required gates (including `agent-review` and `ci-time-budget`) and
+coordinator merge.** The owner's delegated proportionate ADR route covers both
+fixed cases in this one reviewed disposition, without another policy amendment
+or owner confirmation for each hosted runner. Source preparation is accepted
+by the [plan review](../reviews/m2-stagef-a3-driver-plan-muse-review.md) and
+[source review](../reviews/m2-stagef-a3-driver-source-muse-review.md), not native
+acceptance. PR #90 main `fba8b3c993b3d173125525c760ee2dc7234e3cfa`
+(tree equal to `744f957`; five gates and Muse exact-head PASS `6883050524`
+reported by the coordinator) is the immutable source baseline.
+
+1. **Standard:** the sole candidate is the first main squash containing D7c
+   and `TEST = 'exec::disposable::disposable_linux_a3_standard'`. Compared with
+   that full PR #90 main SHA, only this one TEST line in
+   `tools/unix-exec-validation/driver.py`, the reviewed selection-regression
+   corrections in `test_driver.py` and `mutation_check.py`, this ADR and supporting
+   review/progress documents may differ. Those test-only corrections pin all three
+   closed argv selections and a wrong-selection mutant independently of the source
+   default. No other runtime byte may change. The unchanged packaged standard
+   profile must be present.
+2. **None:** eligible only after Standard's successful result is independently
+   verified and accepted, with confirmed owned cleanup and verified variable
+   absence. Its sole candidate is the first subsequent independently reviewed,
+   five-gates-green, coordinator-merged main squash changing only that TEST line
+   to `exec::disposable::disposable_linux_a3_none` plus supporting review/progress
+   documents, compared with the pinned Standard squash. None omits the entire
+   standard profile; no weakening drop-in is allowed. D7c covers this second
+   fixed case without a further policy amendment.
+
+For each candidate the coordinator must verify the exact permitted diff and pin
+its **actual full main squash SHA**, never the source baseline or branch head.
+No arbitrary other change, intervening main candidate or source substitution is
+permitted. Workflow, Cargo, package, production code and historical evidence/hash
+bytes stay unchanged. A guard-test failure cannot be waived to fit this scope.
+
+After that case's gates only, set `UNIX_EXECUTION_REVIEWED_SHA` to its pinned
+SHA and use the unchanged manual `unix-execution-experiment.yml` once on a
+separate fresh GitHub-hosted Ubuntu 24.04 invocation. Each case has at most
+**one accepted dispatch**, consumed regardless of outcome. Preserve exactly
+`Dytschgo/arxcovo`, actor and triggering actor `Dytschgo`, `refs/heads/main`,
+and `GITHUB_SHA == ARX_REVIEWED_SHA == ARX_WORKFLOW_SHA` equal to that variable;
+read-only credentials and all existing workflow fences remain. No workflow/CLI
+input, selector, extra workflow or general execution framework is introduced.
+Clear the variable in a finally-style operation after each completed or failed
+run or rejected dispatch, and verify absence. These bounded operations require
+no repeated owner confirmation once this amendment is effective.
+
+Retain exact package/runtime attribution, sole MainPID/supervisor checks,
+protected staging, shared reservation, collisions, bounded output/lifetime and
+owned-only cleanup. Accept each case only from its exact selected test-ok,
+one-pass/zero-failure summary, real systemd success/zero exit and confirmed
+cleanup, with existing bounded sanitized evidence. Stop both cases on any
+failure, rejected dispatch, unknown result or uncertain cleanup; exclude the
+environment and do not retry automatically. None is ineligible on any such
+Standard outcome. The historical `43091339273` environment and all consumed
+D7a/D7b environments remain excluded; neither is retried or diagnosed here.
+
+No account provisioning, cross-account probe, owner-PC access, owner admin,
+production activation, static VM or backup action is authorized. Only the
+observed A3 case receives credit; M2, full Stage F, Stage G and real-Runner
+PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
+
+Local preparation evidence (Sol high, 2026-11-14): imported
+`mutation_check.safe_suite()` via Python with `tools/unix-exec-validation` on
+`sys.path` and bytecode writes disabled; no CLI/native/filesystem/provisioning
+cases or ignored fixtures were run (only source/package/evidence reads).
+72 tests ran: 71 passed, `A1A2.test_launch_contract` failed because its literal
+still expects A1/A2. The `wrong test` mutant anchor also has zero source matches
+(required one). The initial preparation was blocked: a minimal correction needed
+`test_driver.py` to pin each closed selection independently and
+`mutation_check.py` to retain an assertion-killed wrong-selection mutant against
+the selected default; neither may be weakened to accepting any selection.
+The coordinator subsequently corrected those two test files and explicitly
+included them in Standard's reviewed candidate diff above. The original failed
+run earns no validation credit; the corrected finite checks are recorded below. Direct imported F0/F0b `mutations()` calls passed: 23 and 36
+assertion kills respectively, four equivalents uncredited, driver hash unchanged
+during checks. `git diff --check` passed. Independent Muse review remains required.
+
+Corrected coordinator validation (Sol medium):
+`python -B tools/unix-exec-validation/mutation_check.py` passed 72 audited
+mocked tests, 23 Python assertion kills, three pure Rust tests and four compiled
+Rust assertion kills. Separate `test_f0_blockers.py --mutants` and
+`test_f0b_transport.py --mutants` passed 23 and 36 assertion kills respectively;
+four equivalents get no credit. All three commands left the selected driver
+SHA-256 unchanged at
+`88cc51ddf0b229e45f6c00f79ed03bcca978ee35d3b4e01306c1b210f5b1a028`.
+The launch-contract test patches each of the three literal accepted selections
+and checks the exact argv; the wrong-selection mutant changes that argv to the
+excluded cross-account test. Neither relies on a hard-coded A1/A2 default.
+No native operation or dispatch ran. These corrected checks supersede the
+failed preparation run above and do not grant execution permission.
 
 ## Contract clarifications (2026-11-12)
 

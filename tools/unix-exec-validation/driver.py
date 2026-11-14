@@ -10,7 +10,7 @@ import sys
 import time
 import threading
 
-TEST = 'exec::disposable::disposable_linux_a1_a2'
+TEST = 'exec::disposable::disposable_linux_a3_standard'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 
