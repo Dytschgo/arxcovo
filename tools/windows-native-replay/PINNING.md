@@ -27,8 +27,8 @@ Do not restore the old string-command/callback/stopwatch launcher.
 Remaining integration blocker: no sealed admission object binds a held fixed
 manifest (with externally supplied expected SHA256) to ALL source/build/artifact
 pins and the two launches. HeldFiles accepts individual external pins; that is
-not manifest admission. Directory handles do not prove exclusive helper-directory
-membership. The Cargo grammar also needs a reviewed way to exclude rebuilding
+not manifest admission. Two complete held-directory scans and the held sole leaf implement source
+admission for both executable directories; kernel semantics remain UNRUN. The Cargo grammar also needs a reviewed way to exclude rebuilding
 an unpinned harness under the four-value environment. No manifest or artifact
 snapshot may bootstrap its own expected hash. No run-manifest.json is generated
 by this partial implementation. No claim of a functional controller adapter.
@@ -112,13 +112,10 @@ OwnedSession owns this Job and its clock across both filters. Rust dormant row
 functions emit frames directly to inherited stderr; stdout is discarded.
 Frame order and complete segment counts are checked independently of Budget.
 
-BLOCKED: Admission.Revalidate unconditionally refuses after holding/verifying
-pins because helper-directory exclusion against concurrent insertion is not
-implemented. No handle-based manifest load is wired, cleanCheckout/blob inputs
-are caller claims rather than independently obtained checkout evidence, role
-aliases are not cross-checked against source/provenance contents, and directory
-pins for temp/SystemRoot are incomplete. The in-memory parser tests prove only
-schema/hash rejection, not those missing admission properties. The dormant
+BLOCKED: Admission.Revalidate still unconditionally refuses. The held binder
+below supersedes the old caller-byte/cleanCheckout/blob-map admission path.
+Directory membership and separate SystemRoot checks are implemented in source,
+not proven against a kernel. The dormant
 supervisor has not received a native or independent security review; cleanup
 and success/failure races remain unverified. Its 358-second launch-loop cutoff
 reserves two seconds for cleanup; per-row teardown containment within ten
@@ -130,3 +127,46 @@ technical-blocker handoff, not run-ready source or acceptance of the changed
 grammar. Environment unselected; nested Job proof UNRUN; costs UNMEASURED.
 M2 incomplete; cause unknown; Phase 1 no focused real red loop; PA6 replay OPEN;
 all hardware paths unverified on real hardware. All earlier gates still apply.
+
+## Held manifest binding follow-up (source only, not kernel proof)
+
+Admission.Bind is the dataflow used by the dormant constructor and Revalidate.
+The coordinator must supply an externally trusted SHA256 and nonzero lowercase
+32-hex identity for fixed `tools/windows-native-replay/run-disposition.json`.
+That hash is outside BOTH documents. It is future coordinator input, not a
+permission, generated self-hash, environment selection, or signature checked by
+this code. No real disposition, manifest or provenance is generated here.
+
+The held disposition read is at most 65536 bytes, closed schema/depth 4:
+`schema:1`, `runtime_authority:false`, `reviewed_commit` (40 lowercase hex),
+`root`, `manifest:{sha256,id128,size}`, `source_blobs:{<every Sources path>:<Git
+SHA1>}`. The externally trusted disposition attests the reviewed commit's blob
+mapping; the binder does not invoke Git or claim to verify a commit object.
+The fixed run-manifest.json is read only through IAdmissionFiles.ReadPinned at
+its disposition-bound hash, identity and exact size (1..65536). Its closed schema
+also requires `runtime_authority:false`; neither document can grant execution.
+
+Every pin is held-read and hashed, with exact sizes. Source bytes must have no
+CR and be at most 2 MiB; Git SHA1 is computed over ASCII `blob {length}\0` then
+those exact bytes and compared with BOTH the manifest and disposition. Artifact
+roles controller/cargo/helper/libtest/selectors/provenance/workspace_lock/
+helper_lock remain mandatory. The provenance is at most 65536 bytes, closed
+schema 1, matching source_commit_claim, runtime_authority:false,
+native_executed:false, exact source_sha256 map and matching helper_sha256.
+All provenance source hashes refer to the same held bytes used for Git SHA1.
+Workspace/helper locks and selectors must match the corresponding source role
+in exact path, identity, size, hash AND bytes. Other role path aliases refuse.
+File ids are exactly 32 lowercase hex, nonzero, first qword then second as in
+HeldFiles.IdText; a literal pure oracle fixes the order.
+
+The returned Facts retain private copied pins and expose only detached copies.
+No caller blob dictionary, cleanCheckout boolean or public mutable flag can
+replace binding in Admission. Pure mocks exercise this same binder; they do
+not exercise HeldFiles, native opens or directory queries. Both exclusive
+scans and all native metadata/reparse/link-count checks remain in place.
+Revalidate rebinds and still ends in `remaining admission gates unproved`.
+GATE2_ONLY and selectors=false remain. Run does not construct OwnedSession.
+Dedicated transport, accepted launch grammar, deadline waiter/supervisor,
+registration, environment selection and runtime proof remain outside this slice.
+Fresh Grok/Muse review is required before publication. M2 incomplete; main71
+cause unknown/no retry; Phase 1 no native redloop; PA6 OPEN; hardware unverified.

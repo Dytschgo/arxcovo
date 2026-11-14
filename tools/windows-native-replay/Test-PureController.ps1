@@ -58,7 +58,7 @@ $mutants = @(
     @('scan-first-wire', 'Need(HeldFiles.ExclusiveNames(first,leaf));', ''),
     @('scan-second-wire', 'var second=directory.Scan();', 'var second=first;'),
     @('leaf-id-wire', 'Need(HeldFiles.IdText(entry.Low,entry.High)==pin.id);', '{}'),
-    @('leaf-size-wire', 'Need(directory.ReadLeaf(pin).Length==pin.size);', 'directory.ReadLeaf(pin);'),
+    @('leaf-size-wire', 'Need(leafBytes.Length==pin.size);', '{}'),
     @('root-volume', 'if(!ReplayController.LaunchSpec.Absolute(root) || !Inside(root,helper)', 'if(root!=null && root.Length==3) return true; if(!ReplayController.LaunchSpec.Absolute(root) || !Inside(root,helper)'),
     @('root-nested', '|| Inside(root,system)', ''),
     @('root-equal', '|| string.Equals(root,system,StringComparison.OrdinalIgnoreCase)', ''),
@@ -67,6 +67,23 @@ $mutants = @(
     @('root-helper', '!Inside(root,helper)', 'helper==null'),
     @('root-temp', '!Inside(root,temp)', 'temp==null'),
     @('root-wire', 'Need(SystemRootSeparate(root,helper,temp,system,pins.ConvertAll(p=>p.path)));', ''),
+    @('binding-root-hash', 'HeldFiles.HashMatches(disposition,externalDispositionSha,65536)', 'true'),
+    @('binding-held-manifest', 'b.Length==size && HeldFiles.HashMatches(b,hash,size)', 'b.Length==size'),
+    @('binding-git-bytes', 'GitBlob(bytes[p.role])==p.blob', 'true'),
+    @('binding-reviewed-blob', 'p.blob==Text(blobs,source,40)', 'true'),
+    @('binding-git-frame', '"blob "+bytes.Length.ToString(CultureInfo.InvariantCulture)+"\0"', '""'),
+    @('binding-provenance-source', 'HeldFiles.HashMatches(bytes["source:"+source],Text(hashes,source,64),67108864)', 'true'),
+    @('binding-provenance-commit', 'Text(pe,"source_commit_claim",40)==commit', 'true'),
+    @('binding-provenance-helper', 'HeldFiles.HashMatches(bytes["helper"],Text(pe,"helper_sha256",64),67108864)', 'true'),
+    @('binding-manifest-authority', 'e.GetProperty("runtime_authority").ValueKind==JsonValueKind.False);', 'true);'),
+    @('binding-disposition-authority', 'e.GetProperty("runtime_authority").ValueKind==JsonValueKind.False && Text(e,"root",240)==root', 'Text(e,"root",240)==root'),
+    @('binding-provenance-authority', 'pe.GetProperty("runtime_authority").ValueKind==JsonValueKind.False', 'true'),
+    @('binding-provenance-native', 'pe.GetProperty("native_executed").ValueKind==JsonValueKind.False', 'true'),
+    @('binding-alias-path', 'a.path==b.path && a.id==b.id', 'a.id==b.id'),
+    @('binding-lock-bytes', 'a.size==b.size && a.sha256==b.sha256 && Equal(bytes[a.role],bytes[b.role])', 'true'),
+    @('binding-role-alias', 'Need(Array.IndexOf(allowed,pair)>=0 || Array.IndexOf(allowed,reverse)>=0);', '{}'),
+    @('binding-qword-order', 'low.ToString("x16")+high.ToString("x16")', 'high.ToString("x16")+low.ToString("x16")'),
+    @('binding-facts-copy', 'return ClonePins(values);', 'return values;'),
     @('final-refusal', 'throw new InvalidOperationException("remaining admission gates unproved");', 'return;')
 )
 $i=0
@@ -75,7 +92,7 @@ foreach($m in $mutants) {
     if(-not $source.Contains($m[1])) { throw 'mutant target missing' }
     $mutated=$source.Replace($m[1],$m[2])
     if($m[0] -eq 'names-leaf') { $mutated=$mutated.Replace('e.Name!=leaf','false') }
-    $variant=$mutated.Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i")
+    $variant=$mutated.Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i").Replace('BindingPureChecks',"BindingPureChecks$i")
     $bytes=[Text.Encoding]::UTF8.GetBytes($variant)
     "mutant LF SHA256 $($m[0]): $([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant())"
     # Compilation errors terminate here: they never count as assertion kills.

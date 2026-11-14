@@ -74,3 +74,12 @@ for f in selectors["filters"]:
     assert len(subset) == f["cases"]
     assert sum(r["creates"] for r in subset) == f["children"]
     assert sum(r["resumes"] for r in subset) == f["resumes"]
+
+# Source-only binding inventory; semantics are exercised by managed mocks.
+assert "cleanCheckout" not in admission and "reviewedBlobs" not in admission
+assert "byte[] manifest=Read(files,basePath+\"run-manifest.json\"" in admission
+assert "run-disposition.json" in admission and "SHA1.Create()" in admission
+assert "GitBlob(bytes[p.role])==p.blob" in admission
+assert "BindingPureChecks.Run();" in controller
+assert "new OwnedSession(" not in controller.split("public static void Run()", 1)[1]
+print("gate2 binding: externally pinned disposition -> held manifest -> held source Git/provenance/aliases; runtime refused")

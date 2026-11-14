@@ -273,34 +273,36 @@ public static class PureControllerChecks {
     static string Hash(byte[] b) {
         using(var sha=System.Security.Cryptography.SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(b)).Replace("-","").ToLowerInvariant();
     }
-    static bool ManifestAccepted(string json,string expected,string commit,Dictionary<string,string> blobs) {
-        try { Admission.Parse(Encoding.UTF8.GetBytes(json),expected,commit,@"C:\fixture",blobs); return true; }
+    static bool ManifestAccepted(string json,string expected,string commit) {
+        try { Admission.Parse(Encoding.UTF8.GetBytes(json),expected,commit,@"C:\fixture"); return true; }
         catch(InvalidOperationException) { return false; }
     }
     static void ManifestChecks() {
         string commit=new string('a',40), blob=new string('b',40);
-        var blobs=new Dictionary<string,string>();
         var pins=new List<object>();
         foreach(string source in Admission.Sources) {
-            blobs.Add(source,blob);
             pins.Add(new { role="source:"+source,path=@"C:\fixture\"+source.Replace('/','\\'),sha256=new string('c',64),id128=new string('d',32),size=1,blob=blob });
         }
         foreach(string role in new[]{"controller","cargo","helper","libtest","selectors","provenance","workspace_lock","helper_lock"})
             pins.Add(new { role=role,path=@"C:\fixture\"+role+".bin",sha256=new string('c',64),id128=new string('d',32),size=1,blob="artifact" });
-        var document=new {schema=1,reviewed_commit=commit,root=@"C:\fixture",helper_directory=@"C:\fixture\bin",temp=@"C:\fixture\tmp",system_root=@"C:\Windows",
+        var document=new {schema=1,runtime_authority=false,reviewed_commit=commit,root=@"C:\fixture",helper_directory=@"C:\fixture\bin",temp=@"C:\fixture\tmp",system_root=@"C:\Windows",
             target="x86_64-pc-windows-msvc",profile="dev",debug="0",features="default",toolchain="1.95.0",compiler_commit="59807616e1fa2540724bfbac14d7976d7e4a3860",cargo_version="1.95.0 (f2d3ce0bd7f24a49f8f72d9000448f8838c4e850)",pins=pins};
         string json=System.Text.Json.JsonSerializer.Serialize(document);
-        Check(ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),commit,blobs),"manifest valid");
-        Check(!ManifestAccepted(json,new string('f',64),commit,blobs),"manifest external mismatch");
+        Check(ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),commit),"manifest valid");
+        Check(!ManifestAccepted(json,new string('f',64),commit),"manifest external mismatch");
         string extra=json.Insert(1,"\"extra\":0,");
-        Check(!ManifestAccepted(extra,Hash(Encoding.UTF8.GetBytes(extra)),commit,blobs),"manifest extra");
+        Check(!ManifestAccepted(extra,Hash(Encoding.UTF8.GetBytes(extra)),commit),"manifest extra");
         string self=json.Insert(1,"\"sha256\":\""+Hash(Encoding.UTF8.GetBytes(json))+"\",");
-        Check(!ManifestAccepted(self,Hash(Encoding.UTF8.GetBytes(self)),commit,blobs),"manifest self hash");
-        Check(!ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),new string('e',40),blobs),"manifest commit mismatch");
+        Check(!ManifestAccepted(self,Hash(Encoding.UTF8.GetBytes(self)),commit),"manifest self hash");
+        Check(!ManifestAccepted(json,Hash(Encoding.UTF8.GetBytes(json)),new string('e',40)),"manifest commit mismatch");
+        foreach(string badId in new[]{new string('A',32),new string('a',31),new string('a',33),new string('0',32)}) {
+            string bad=json.Replace(new string('d',32),badId);
+            Check(!ManifestAccepted(bad,Hash(Encoding.UTF8.GetBytes(bad)),commit),"admission: parser id format");
+        }
         string nested=json.Replace(System.Text.Json.JsonSerializer.Serialize(@"C:\Windows"),System.Text.Json.JsonSerializer.Serialize(@"C:\fixture\Windows"));
-        Check(!ManifestAccepted(nested,Hash(Encoding.UTF8.GetBytes(nested)),commit,blobs),"admission: parser nested Windows");
+        Check(!ManifestAccepted(nested,Hash(Encoding.UTF8.GetBytes(nested)),commit),"admission: parser nested Windows");
         string outside=json.Replace(System.Text.Json.JsonSerializer.Serialize(@"C:\fixture\controller.bin"),System.Text.Json.JsonSerializer.Serialize(@"C:\outside\controller.bin"));
-        Check(!ManifestAccepted(outside,Hash(Encoding.UTF8.GetBytes(outside)),commit,blobs),"admission: parser outside artifact");
+        Check(!ManifestAccepted(outside,Hash(Encoding.UTF8.GetBytes(outside)),commit),"admission: parser outside artifact");
     }
     // Independent argv reader for the one quoted argument emitted by Quote.
     static string Unquote(string s) {
@@ -319,6 +321,7 @@ public static class PureControllerChecks {
     public static void Run() {
         ManifestChecks();
         AdmissionPureChecks.Run();
+        BindingPureChecks.Run();
         Check(ReplayController.CleanupConfirmed(true,0,true,1,2),"cleanup zero");
         Check(!ReplayController.CleanupConfirmed(false,0,true,1,2),"cleanup kill first");
         Check(!ReplayController.CleanupConfirmed(true,1,true,1,2),"cleanup active");
@@ -337,7 +340,7 @@ public static class PureControllerChecks {
             Check(full.Feed(last,40) && fullState.Poll(fullChannel,n*2+1),"stream end");
         }
         Check(full.Finish() && fullState.Success(fullChannel,true,0,0),"stream complete");
-        foreach(string arg in new[]{"", "plain", "two words", "Grüezi 世界", @"C:\a b\", "a\"b", "\\\"", "\\\\"})
+        foreach(string arg in new[]{"", "plain", "two words", "GrÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¼ezi ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¤ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢", @"C:\a b\", "a\"b", "\\\"", "\\\\"})
             Check(Unquote(ReplayController.LaunchSpec.Quote(arg))==arg,"argument escape");
         Check(!HeldFiles.MetadataValid(0,1,2,4,16),"link2 reject");
         Check(!HeldFiles.LinksUnchanged(1,2),"post hash links");
@@ -496,5 +499,146 @@ internal static class AdmissionPureChecks {
         try { Admission.RevalidateBoundary(new Files(),Pins(),@"C:\fixture",@"C:\fixture\bin",@"C:\fixture\tmp",@"C:\Windows"); }
         catch(InvalidOperationException e) { final=e.Message=="remaining admission gates unproved"; }
         Check(final,"final refusal");
+    }
+}
+
+// Synthetic held-read implementation. No filesystem/native/clock/process calls.
+internal static class BindingPureChecks {
+    const string Root=@"C:\fixture", Id="00000000000000030000000000000000";
+    const string Base=Root+@"\tools\windows-native-replay\";
+    static void Check(bool b,string name) { if(!b) throw new Exception("admission: binding "+name); }
+    static string Hash(byte[] b) { using(var h=System.Security.Cryptography.SHA256.Create()) return Convert.ToHexString(h.ComputeHash(b)).ToLowerInvariant(); }
+    static System.Text.Json.Nodes.JsonNode Node(object o) { return System.Text.Json.Nodes.JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(o)); }
+    static byte[] Bytes(System.Text.Json.Nodes.JsonNode n) { return Encoding.UTF8.GetBytes(n.ToJsonString()); }
+    sealed class Fixture : IAdmissionFiles {
+        internal readonly Dictionary<string,byte[]> Data=new Dictionary<string,byte[]>(StringComparer.Ordinal);
+        internal System.Text.Json.Nodes.JsonNode Manifest,Disposition,Provenance;
+        internal string Trust;
+        internal int Reads,Scans;
+        internal string BadRead;
+        internal readonly Dictionary<string,byte[]> Later=new Dictionary<string,byte[]>();
+        readonly HashSet<string> Seen=new HashSet<string>();
+        internal Fixture() {
+            var pins=new List<object>(); var blobs=new Dictionary<string,string>(); var hashes=new Dictionary<string,string>();
+            foreach(string source in Admission.Sources) {
+                byte[] b=Encoding.UTF8.GetBytes("sample\n"); string path=Root+"\\"+source.Replace('/','\\');
+                Data.Add(path,b); blobs.Add(source,Admission.GitBlob(b)); hashes.Add(source,Hash(b));
+                pins.Add(new {role="source:"+source,path=path,sha256=Hash(b),id128=Id,size=b.Length,blob=Admission.GitBlob(b)});
+            }
+            Provenance=Node(new {schema=1,source_commit_claim=new string('a',40),runtime_authority=false,native_executed=false,source_sha256=hashes,helper_sha256=Hash(new byte[]{1,2})});
+            foreach(string role in new[]{"controller","cargo","helper","libtest","selectors","provenance","workspace_lock","helper_lock"}) {
+                string path=Root+"\\"+role+".bin";
+                if(role=="helper") path=Root+@"\bin\cargo.exe";
+                if(role=="libtest") path=Root+@"\image\libtest.exe";
+                if(role=="workspace_lock") path=Root+@"\Cargo.lock";
+                if(role=="helper_lock") path=Base+@"child\Cargo.lock";
+                if(role=="selectors") path=Base+"selectors.json";
+                byte[] b=Data.ContainsKey(path)?Data[path]:role=="provenance"?Bytes(Provenance):new byte[]{1,2};
+                Data[path]=b;
+                pins.Add(new {role=role,path=path,sha256=Hash(b),id128=Id,size=b.Length,blob="artifact"});
+            }
+            Manifest=Node(new {schema=1,runtime_authority=false,reviewed_commit=new string('a',40),root=Root,helper_directory=Root+@"\bin",temp=Root+@"\tmp",system_root=@"C:\Windows",
+                target="x86_64-pc-windows-msvc",profile="dev",debug="0",features="default",toolchain="1.95.0",compiler_commit="59807616e1fa2540724bfbac14d7976d7e4a3860",cargo_version="1.95.0 (f2d3ce0bd7f24a49f8f72d9000448f8838c4e850)",pins=pins});
+            Disposition=Node(new {schema=1,runtime_authority=false,reviewed_commit=new string('a',40),root=Root,manifest=new {sha256="",id128=Id,size=1},source_blobs=blobs});
+            Seal();
+        }
+        internal System.Text.Json.Nodes.JsonNode Pin(string role) {
+            foreach(var p in Manifest["pins"].AsArray()) if((string)p["role"]==role) return p;
+            throw new Exception("fixture role");
+        }
+        internal void Seal() {
+            byte[] p=Bytes(Provenance); Data[Root+@"\provenance.bin"]=p;
+            Pin("provenance")["sha256"]=Hash(p); Pin("provenance")["size"]=p.Length;
+            SealManifest();
+        }
+        internal void SealManifest() {
+            byte[] m=Bytes(Manifest); Data[Base+"run-manifest.json"]=m;
+            Disposition["manifest"]["sha256"]=Hash(m); Disposition["manifest"]["size"]=m.Length;
+            SealDisposition();
+        }
+        internal void SealDisposition() { byte[] d=Bytes(Disposition); Data[Base+"run-disposition.json"]=d; Trust=Hash(d); }
+        public byte[] ReadPinned(string path,string hash,int limit,string id) {
+            Reads++;
+            if(id!=Id || !Data.ContainsKey(path)) throw new InvalidOperationException("synthetic held read refused");
+            byte[] b=Data[path];
+            if(!Seen.Add(path) && Later.ContainsKey(path)) b=Later[path];
+            if(path==BadRead) return new byte[]{9};
+            if(b.Length>limit) throw new InvalidOperationException("synthetic bound refused");
+            return (byte[])b.Clone();
+        }
+        sealed class Dir : IAdmissionDirectory {
+            readonly Fixture f; readonly string path;
+            internal Dir(Fixture f,string path) { this.f=f; this.path=path; }
+            public HeldFiles.DirectoryEntry[] Scan() {
+                f.Scans++; return new[]{new HeldFiles.DirectoryEntry(".",16,0,1,0),new HeldFiles.DirectoryEntry("..",16,0,2,0),new HeldFiles.DirectoryEntry(System.IO.Path.GetFileName(path),0,0,3,0)};
+            }
+            public byte[] ReadLeaf(Admission.Pin p) { return f.ReadPinned(p.path,p.sha256,p.size,p.id); }
+        }
+        public IAdmissionDirectory ExclusiveDirectory(string path) {
+            if(path==Root+@"\bin") return new Dir(this,path+@"\cargo.exe");
+            if(path==Root+@"\image") return new Dir(this,path+@"\libtest.exe");
+            throw new InvalidOperationException("synthetic directory refused");
+        }
+        public void HoldEnvironment(string temp,string system) { Check(temp==Root+@"\tmp" && system==@"C:\Windows","environment"); }
+        internal Admission.Facts Bind() { return Admission.Bind(this,Trust,Id,Root); }
+    }
+    static void Reject(string name,Action<Fixture> change,bool seal=true) {
+        var f=new Fixture(); change(f); if(seal) f.Seal(); bool refused=false;
+        try { f.Bind(); }
+        catch(InvalidOperationException) { refused=true; }
+        catch(System.Text.Json.JsonException) { refused=true; }
+        catch(FormatException) { refused=true; }
+        catch(KeyNotFoundException) { refused=true; }
+        Check(refused,name);
+    }
+    internal static void Run() {
+        // Independent Git oracle, not computed by the fixture's blob routine.
+        Check(Admission.GitBlob(Encoding.ASCII.GetBytes("hello\n"))=="ce013625030ba8dba906f756967f9e9ca394464a","git framing");
+        Check(HeldFiles.IdText(0x0123456789abcdef,0xfedcba9876543210)=="0123456789abcdeffedcba9876543210","qword order");
+        var readFixture=new Fixture(); bool hashRefused=false;
+        try { Admission.Read(readFixture,Root+@"\Cargo.lock",new string('f',64),7,Id); }
+        catch(InvalidOperationException) { hashRefused=true; }
+        Check(hashRefused,"held read hash");
+        var f=new Fixture(); var facts=f.Bind();
+        Check(facts.Commit==new string('a',40) && f.Scans==4 && f.Reads==Admission.Sources.Length+10,"complete held flow");
+        var copy=facts.CopyPins(); copy[0].sha256="changed"; copy.Clear();
+        Check(facts.CopyPins().Count==Admission.Sources.Length+8,"immutable facts");
+        Reject("root hash",x=>x.Trust=new string('f',64),false);
+        Reject("held manifest hash",x=>x.BadRead=Base+"run-manifest.json");
+        Reject("held source hash",x=>x.BadRead=Root+@"\Cargo.lock");
+        Reject("held helper hash",x=>x.BadRead=Root+@"\bin\cargo.exe");
+        Reject("blob bytes",x=> { x.Pin("source:Cargo.lock")["blob"]=new string('b',40); x.Disposition["source_blobs"]["Cargo.lock"]=new string('b',40); });
+        Reject("reviewed blob",x=>x.Disposition["source_blobs"]["Cargo.lock"]=new string('b',40));
+        Reject("commit",x=>x.Manifest["reviewed_commit"]=new string('b',40));
+        Reject("bad commit",x=>x.Disposition["reviewed_commit"]="main");
+        Reject("provenance commit",x=>x.Provenance["source_commit_claim"]=new string('b',40));
+        Reject("provenance source",x=>x.Provenance["source_sha256"]["Cargo.lock"]=new string('b',64));
+        Reject("provenance helper",x=>x.Provenance["helper_sha256"]=new string('b',64));
+        Reject("manifest authority",x=>x.Manifest["runtime_authority"]=true);
+        Reject("disposition authority",x=>x.Disposition["runtime_authority"]=true);
+        Reject("provenance authority",x=>x.Provenance["runtime_authority"]=true);
+        Reject("native claim",x=>x.Provenance["native_executed"]=true);
+        foreach(string role in new[]{"workspace_lock","helper_lock","selectors"}) {
+            Reject("alias "+role,x=> { var p=x.Pin(role); string path=Root+"\\alias.bin"; x.Data[path]=x.Data[(string)p["path"]]; p["path"]=path; });
+            Reject("alias id "+role,x=>x.Pin(role)["id128"]=new string('e',32));
+        }
+        Reject("lock bytes",x=> { var p=x.Pin("workspace_lock"); byte[] b={9}; p["sha256"]=Hash(b); p["size"]=1; x.Later[Root+@"\Cargo.lock"]=b; });
+        Reject("source CR",x=> { byte[] b={13}; var p=x.Pin("source:Cargo.lock"); x.Data[Root+@"\Cargo.lock"]=b; p["sha256"]=Hash(b); p["size"]=1; p["blob"]=Admission.GitBlob(b); x.Disposition["source_blobs"]["Cargo.lock"]=Admission.GitBlob(b); });
+        Reject("provenance limit",x=> { x.Pin("provenance")["size"]=65537; x.SealManifest(); },false);
+        Reject("role alias",x=>x.Pin("controller")["path"]=x.Pin("cargo")["path"].DeepClone());
+        foreach(string id in new[]{new string('0',32),new string('A',32),new string('a',31),new string('a',33)}) Reject("id format",x=>x.Pin("controller")["id128"]=id);
+        Reject("unknown manifest",x=>x.Manifest["extra"]=0);
+        Reject("unknown disposition",x=>x.Disposition["extra"]=0);
+        Reject("unknown provenance",x=>x.Provenance["extra"]=0);
+        Reject("unknown role",x=>x.Pin("controller")["role"]="unknown");
+        Reject("duplicate role",x=>x.Pin("controller")["role"]="cargo");
+        Reject("missing source blob",x=>x.Disposition["source_blobs"].AsObject().Remove("Cargo.lock"));
+        Reject("unknown source hash",x=>x.Provenance["source_sha256"]["unknown"]=new string('b',64));
+        Reject("manifest limit",x=> { x.Disposition["manifest"]["size"]=65537; x.SealDisposition(); },false);
+        Reject("duplicate disposition key",x=> { byte[] b=Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(x.Data[Base+"run-disposition.json"]).Insert(1,"\"schema\":1,")); x.Data[Base+"run-disposition.json"]=b; x.Trust=Hash(b); },false);
+        Reject("duplicate manifest key",x=> { byte[] b=Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(x.Data[Base+"run-manifest.json"]).Insert(1,"\"schema\":1,")); x.Data[Base+"run-manifest.json"]=b; x.Disposition["manifest"]["sha256"]=Hash(b); x.Disposition["manifest"]["size"]=b.Length; x.SealDisposition(); },false);
+        Reject("duplicate provenance key",x=> { byte[] b=Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(x.Data[Root+@"\provenance.bin"]).Insert(1,"\"schema\":1,")); x.Data[Root+@"\provenance.bin"]=b; x.Pin("provenance")["sha256"]=Hash(b); x.Pin("provenance")["size"]=b.Length; x.SealManifest(); },false);
+        Reject("malformed disposition",x=> { byte[] b=Encoding.UTF8.GetBytes("{"); x.Data[Base+"run-disposition.json"]=b; x.Trust=Hash(b); },false);
+        Reject("malformed manifest",x=> { byte[] b=Encoding.UTF8.GetBytes("{"); x.Data[Base+"run-manifest.json"]=b; x.Disposition["manifest"]["sha256"]=Hash(b); x.Disposition["manifest"]["size"]=1; byte[] d=Bytes(x.Disposition); x.Data[Base+"run-disposition.json"]=d; x.Trust=Hash(d); },false);
     }
 }
