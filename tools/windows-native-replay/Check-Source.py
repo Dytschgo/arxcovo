@@ -29,3 +29,28 @@ assert sum(f["resumes"] for f in selectors["filters"]) == 16
 helper = (root / "tools/windows-native-replay/child/src/main.rs").read_text()
 assert re.sub(r"//[^\n]*", "", helper).strip() == "fn main() {}"
 print("gate2 source inventory: 28 oracle rows; 4 pure tests; 0 native registrations/callers; selectors disabled")
+
+# selectors.json is the canonical global schedule. C# is a checked projection;
+# Rust supplies the same indices without deriving the independent label oracle.
+rows = selectors["row_map"]
+assert len(rows) == 35
+for i, row in enumerate(rows):
+    assert row == dict(index=i, kind="kernel" if i == 0 else "failure" if i <= 28 else "peek109" if i <= 32 else "control",
+                       consumed=int(1 <= i <= 32), creates=int(i >= 15), resumes=int(i >= 19))
+controller = (root / "tools/windows-native-replay/Controller.cs").read_text()
+projection = re.findall(r"new Row\((\d+),(\d+),(\d+)\), // (\d+)", controller)
+assert projection == [(str(r["consumed"]), str(r["creates"]), str(r["resumes"]), str(r["index"])) for r in rows]
+assert "local + 1" in code and "matrix_index(i as u32)" in code
+assert "matrix_index(28 + i as u32)" in code
+assert "matrix_index(32)" in code and "matrix_index(33)" in code
+assert "DllImport" not in controller and "CreateProcess" not in controller and "RunPinned" not in controller
+assert "Func<" not in controller
+print("gate2 map: kernel 0; failures 1..28; peek109 29..32; controls 33..34; native launcher absent")
+
+assert selectors["filters"][0]["row_indices"] == [0]
+assert selectors["filters"][1]["row_indices"] == list(range(1, 35))
+for f in selectors["filters"]:
+    subset = [rows[i] for i in f["row_indices"]]
+    assert len(subset) == f["cases"]
+    assert sum(r["creates"] for r in subset) == f["children"]
+    assert sum(r["resumes"] for r in subset) == f["resumes"]

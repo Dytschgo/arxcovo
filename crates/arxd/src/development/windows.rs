@@ -2201,6 +2201,11 @@ mod native_replay {
             );
         }
     }
+    // Canonical global numbering: kernel=0, matrix local 0..33 => 1..34.
+    fn matrix_index(local: u32) -> u32 {
+        assert!(local < 34);
+        local + 1
+    }
     // Future filter development::windows::native_replay::bounded_matrix.
     // NO registration in Gate 2. An external controller must enforce deadlines.
     fn bounded_matrix(settings: &Settings, hash: [u8; 32]) {
@@ -2208,7 +2213,7 @@ mod native_replay {
             one_row(
                 settings,
                 hash,
-                i as u32,
+                matrix_index(i as u32),
                 Some(row),
                 row.fill,
                 Some((row.stage, 55)),
@@ -2226,14 +2231,14 @@ mod native_replay {
             one_row(
                 settings,
                 hash,
-                28 + i as u32,
+                matrix_index(28 + i as u32),
                 None,
                 fill,
                 Some((stage, 109)),
             );
         }
-        one_row(settings, hash, 32, None, Fill::Loop, None);
-        one_row(settings, hash, 33, None, Fill::Final, None);
+        one_row(settings, hash, matrix_index(32), None, Fill::Loop, None);
+        one_row(settings, hash, matrix_index(33), None, Fill::Final, None);
     }
     // Future filter development::windows::native_replay::kernel_peek_capture.
     fn kernel_peek_capture() {
@@ -2325,6 +2330,10 @@ mod native_replay {
         }
         #[test]
         fn oracle_counts_missing_zero_and_literal_bindings() {
+            assert_eq!((matrix_index(0), matrix_index(27)), (1, 28));
+            assert_eq!((matrix_index(28), matrix_index(31)), (29, 32));
+            assert_eq!((matrix_index(32), matrix_index(33)), (33, 34));
+            assert!(std::panic::catch_unwind(|| matrix_index(34)).is_err());
             let labels = ORACLE
                 .map(|r| r.label)
                 .into_iter()

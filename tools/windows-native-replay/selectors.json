@@ -16,13 +16,299 @@
       "name": "development::windows::native_replay::kernel_peek_capture",
       "cases": 1,
       "children": 0,
-      "resumes": 0
+      "resumes": 0,
+      "row_indices": [
+        0
+      ]
     },
     {
       "name": "development::windows::native_replay::bounded_matrix",
       "cases": 34,
       "children": 20,
-      "resumes": 16
+      "resumes": 16,
+      "row_indices": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34
+      ]
+    }
+  ],
+  "row_map": [
+    {
+      "index": 0,
+      "kind": "kernel",
+      "consumed": 0,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 1,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 2,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 3,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 4,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 5,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 6,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 7,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 8,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 9,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 10,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 11,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 12,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 13,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 14,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 0,
+      "resumes": 0
+    },
+    {
+      "index": 15,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 0
+    },
+    {
+      "index": 16,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 0
+    },
+    {
+      "index": 17,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 0
+    },
+    {
+      "index": 18,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 0
+    },
+    {
+      "index": 19,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 20,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 21,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 22,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 23,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 24,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 25,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 26,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 27,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 28,
+      "kind": "failure",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 29,
+      "kind": "peek109",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 30,
+      "kind": "peek109",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 31,
+      "kind": "peek109",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 32,
+      "kind": "peek109",
+      "consumed": 1,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 33,
+      "kind": "control",
+      "consumed": 0,
+      "creates": 1,
+      "resumes": 1
+    },
+    {
+      "index": 34,
+      "kind": "control",
+      "consumed": 0,
+      "creates": 1,
+      "resumes": 1
     }
   ]
 }

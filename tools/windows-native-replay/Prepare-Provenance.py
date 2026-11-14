@@ -20,6 +20,8 @@ SOURCES = (
     "tools/windows-native-replay/Prepare-Provenance.py",
     "tools/windows-native-replay/Check-Source.py",
     "tools/windows-native-replay/selectors.json",
+    "tools/windows-native-replay/Test-PureController.ps1",
+    "tools/windows-native-replay/PINNING.md",
 )
 
 
@@ -33,6 +35,8 @@ def bounded_hash(relative, limit):
         path = path / component
         if path.is_symlink() or path.is_junction() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
             raise ValueError("unsafe provenance path")
+    if path.stat().st_nlink != 1:
+        raise ValueError("hardlinked provenance input")
     with path.open("rb") as stream:
         data = stream.read(limit + 1)
     if len(data) > limit:
