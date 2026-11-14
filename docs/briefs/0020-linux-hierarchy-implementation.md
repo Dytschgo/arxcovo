@@ -599,12 +599,19 @@ owner's machine:
 - **A2** After setup: unit and `runs/` `subtree_control` include
   `memory pids`; `runs/` is root-owned `0700`; S9 files exist.
 - **A3** R4 hardening reads `standard` with the drop-in and `none` without it.
-- **A4** The janitor kills a leftover populated leaf (planted by a prior
-  instance whose main process received SIGKILL), removes it, and execution
-  becomes available only afterwards.
+- **A4** Under unchanged packaged Standard hardening, production setup kills
+  one bounded fixture-preseeded populated leaf, confirms emptiness and removes
+  it before execution admission. This is native present-residue mechanism
+  evidence, not prior-MainPID SIGKILL provenance or crash-lifecycle evidence.
+  ADR 0020 D9a binds helper provenance, limits, sole-S7 kill attribution, parent
+  identity/reap ownership and no-adoption rules. A9/U9 stays independently required.
 - **A5** An orphan empty leaf present at start is removed.
-- **A6** A janitor failure surfaces as `quarantined`; induce it with a leaf
-  that is not removable, if a safe induction exists.
+- **A6** Injected-port LeafRemoval, KillTimeout and VerifyFailed outcomes from
+  actual production setup must latch quarantine, refuse execution with zero
+  runner calls, persist quarantined activity and refuse same-domain recovery.
+  Preserve shutdown-Stopping. This is explicitly non-native failure evidence,
+  not a native nonremovable-leaf claim; ADR 0020 D9a requires the end-to-end join
+  and mutation checks. Production mappings and restart-only recovery are unchanged.
 - **A7** R5 with an installed `sudo` and a NOPASSWD rule for the build
   account: under the runner's NNP the result is `exit_nonzero`. Without the
   rule, also `exit_nonzero`. Neither is `exit_zero`. This shows the fence,
