@@ -456,12 +456,12 @@ all five required gates (three platform `verify` checks, `ci-time-budget`,
 ADR route authorizes this planning; it bypasses none of those gates. Once
 effective, the bounded operations below need no repeated owner confirmation.
 
-PR #96 mapping is pending main merge at reviewed head
-`71c590daabb0d7f9a1ef5d47df0aa233a0121c72`, with Muse exact refresh
-`6884475968` reported by the coordinator. The execution baseline is that
-reviewed tree, conditional on the coordinator verifying that the eventual
-PR #96 main squash is tree-equal to it and pinning that actual full baseline
-SHA before candidate publication. No PR #96 main squash SHA is assumed here.
+PR #96 merged as `c7f44ecf74a19ebd6cda4ab5700a1eef7ae7426a` at
+2026-11-14 21:37:02Z after all five required gates and Muse exact refresh
+`6884475968`. The coordinator verified that the squash tree equals reviewed head
+`71c590daabb0d7f9a1ef5d47df0aa233a0121c72`. That actual full main squash is the
+immutable execution baseline; the conditional baseline check reviewed by Muse
+is now satisfied before candidate publication.
 The accepted [plan](../reviews/m2-stagef-a4a5-janitor-plan.md),
 [seeder recheck](../reviews/m2-stagef-a5-seeder-plan-muse-recheck.md),
 [source review](../reviews/m2-stagef-a5-source-muse-review.md) and
