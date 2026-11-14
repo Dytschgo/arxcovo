@@ -23,7 +23,8 @@ def require(ok, code):
 def standard_profile():
     require(TEST in ('exec::disposable::disposable_linux_a1_a2',
                      'exec::disposable::disposable_linux_a3_standard',
-                     'exec::disposable::disposable_linux_a3_none'), 'E_TEST_ARGS')
+                     'exec::disposable::disposable_linux_a3_none',
+                     'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')
     return TEST != 'exec::disposable::disposable_linux_a3_none'
 
 
