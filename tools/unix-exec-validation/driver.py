@@ -10,7 +10,7 @@ import sys
 import time
 import threading
 
-TEST = 'exec::disposable::disposable_linux_cross_account'
+TEST = 'exec::disposable::disposable_linux_a1_a2'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 
@@ -44,7 +44,7 @@ def gate(env, platform):
 
 def plan(run):
     require(re.fullmatch(r'[1-9][0-9]{0,19}-[1-9][0-9]{0,19}', run), 'E_ID')
-    return Path('/opt/arx-ci-' + run), 'arx-ci-' + run + '.service'
+    return Path('/opt/arx-ci-' + run), 'arxd.service'
 
 
 # F0 mechanism only: no experiment is authorized by this instrumentation.
@@ -458,6 +458,11 @@ def cg_preflight():
     require(fs == b'cgroup2fs', 'E_CGROUP2')
     require({'memory', 'pids'} <= set(Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()),
             'E_CONTROLLERS')
+    version = subprocess.check_output(['/usr/bin/systemctl', '--version'], env=SAFE_ENV,
+        timeout=5, stderr=subprocess.DEVNULL).splitlines()[0].split()
+    require(len(version) >= 2 and version[1].isdigit() and int(version[1]) >= 254, 'E_SYSTEMD')
+    kernel = re.match(r'([0-9]+)\.([0-9]+)', os.uname().release)
+    require(kernel is not None and tuple(map(int, kernel.groups())) >= (5, 14), 'E_SYSTEMD')
     cg_scan()
 
 
@@ -552,63 +557,109 @@ def drain_output(source, target, exceeded, limit=1024 * 1024):
             exceeded.set()
 
 
+def test_argv(binary):
+    return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']
+
+
+def test_env(notify):
+    require(bool(notify), 'E_SERVICE_OR_TEST')
+    return dict(CI='true', GITHUB_ACTIONS='true', RUNNER_ENVIRONMENT='github-hosted',
+                ARX_DISPOSABLE_EXEC_TEST='1', NOTIFY_SOCKET=notify)
+
+
+def fixture_override(stage, run):
+    require(plan(run)[0] == stage, 'E_PATH')
+    return ('[Service]\nExecStart=\nExecStart=/usr/bin/python3 -I ' +
+            str(stage / 'source/tools/unix-exec-validation/driver.py') +
+            ' service ' + run + '\nRestart=no\nRuntimeMaxSec=140\n')
+
+
+def exclusive_file(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        with os.fdopen(os.dup(fd), 'wb') as out:
+            out.write(data)
+        return info
+    finally:
+        os.close(fd)
+
+
+def private_read(path, bound=4096):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                info.st_size <= bound, 'E_PATH')
+        data = os.read(fd, bound + 1)
+        require(len(data) <= bound, 'E_PATH')
+        return data.decode('ascii')
+    finally:
+        os.close(fd)
+
+
 def service(stage, run):
-    # Only entered from our protected transient unit, never a local CLI shortcut.
     protected(stage, 'service_stage')
-    _, unit = plan(run)
-    cg = Path('/sys/fs/cgroup') / Path('/proc/self/cgroup').read_text().strip().split('0::')[-1].lstrip('/')
-    require(cg == Path('/sys/fs/cgroup/system.slice') / unit, 'E_UNIT_CGROUP')
-    protected(cg, 'service_cg')
-    require({'memory', 'pids'} <= set((cg / 'cgroup.controllers').read_text().split()), 'E_DELEGATION')
-    control = cg / 'control'
-    mark_cgroup(run)
-    control.mkdir(mode=0o700)  # exclusive: never reuse another group's child
-    (control / 'cgroup.procs').write_text(str(os.getpid()))
-    require(not (cg / 'cgroup.procs').read_text().strip(), 'E_INTERNAL_TASKS')
-    (cg / 'cgroup.subtree_control').write_text('+memory +pids')
-    delegated = cg / 'runs'
-    delegated.mkdir(mode=0o700)
-    protected(delegated, 'service_runs')
-    (delegated / 'cgroup.subtree_control').write_text('+memory +pids')
-    require(not (delegated / 'cgroup.procs').read_text().strip(), 'E_INTERNAL_TASKS')
-    env = {**cargo_env(stage), 'CI': 'true', 'GITHUB_ACTIONS': 'true',
-           'RUNNER_ENVIRONMENT': 'github-hosted', 'ARX_DISPOSABLE_EXEC_TEST': '1',
-           'ARX_EXEC_CGROUP_PARENT': str(delegated),
-           'ARX_EXEC_GUARD_DRIVER': str(stage / 'source/tools/unix-exec-validation/driver.py'),
-           'ARX_EXEC_RUN_ID': run,
-           'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER': str(stage / 'runner')}
-    with (stage / 'test-output').open('xb') as out:
-        child = subprocess.Popen(['/usr/bin/timeout', '--signal=KILL', '120s'] +
-                                 command(stage) + ['--', '--ignored', '--exact'],
-                                 cwd=stage / 'source', env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        exceeded = threading.Event()
-        reader = threading.Thread(target=drain_output, args=(child.stdout, out, exceeded), daemon=True)
-        reader.start()
-        deadline = time.monotonic() + 120
-        try:
-            while child.poll() is None:
-                capture_fixture(stage)
-                require(not exceeded.is_set(), 'E_TEST_LOG')
-                require(time.monotonic() < deadline, 'E_TEST_TIMEOUT')
-                time.sleep(0.01)
-            capture_fixture(stage)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
-            reader.join(timeout=5)
-            require(not reader.is_alive(), 'E_OUTPUT_DRAIN')
-            child.stdout.close()
-        require(not exceeded.is_set(), 'E_TEST_LOG')
-    verify_test_result(stage, child.returncode)
-    (stage / 'passed').write_text('1')
+    require(plan(run)[0] == stage, 'E_PATH')
+    binary = private_read(stage / 'artifact')
+    # Same process, next existing feedback channel; no new token or transport.
+    sys.argv[1] = 'harness'
+    harness(stage, test_argv(binary))
+
+
+def unit_properties():
+    data = subprocess.check_output(['/usr/bin/systemctl', 'show', 'arxd.service',
+        '-p', 'LoadState,Id,Names,FragmentPath,DropInPaths,MainPID,ActiveState,Result,ExecMainStatus'],
+        env=SAFE_ENV, timeout=5, stderr=subprocess.DEVNULL)
+    require(len(data) <= 16384, 'E_UNIT_COLLISION')
+    return dict(line.split('=', 1) for line in data.decode('ascii').splitlines() if '=' in line)
+
+
+def capture_size(stage):
+    try:
+        info = (stage / 'test-output').lstat()
+    except FileNotFoundError:
+        return 0
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1, 'E_TEST_LOG')
+    return info.st_size
+
+
+def monitor_a1a2(stage, artifact):
+    deadline = time.monotonic() + 120
+    acknowledged = False
+    while True:
+        require(time.monotonic() < deadline, 'E_TEST_TIMEOUT')
+        require(capture_size(stage) <= 1024 * 1024, 'E_TEST_LOG')
+        state = unit_properties()
+        if state['ActiveState'] == 'active' and not acknowledged:
+            pid = private_read(stage / 'harness-pid')
+            require(re.fullmatch('[1-9][0-9]{0,9}', pid), 'E_PID')
+            require(state['MainPID'] == pid, 'E_SERVICE_OR_TEST')
+            require(os.readlink('/proc/' + pid + '/exe') == artifact, 'E_ARTIFACT')
+            # procfs reads are separately bounded; these are not private stage files.
+            fd = os.open('/proc/' + pid + '/cgroup', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                membership = os.read(fd, 4097)
+            finally:
+                os.close(fd)
+            require(membership == b'0::/system.slice/arxd.service/supervisor\n', 'E_UNIT_CGROUP')
+            exclusive_file(stage / 'identity-ack', b'1')
+            acknowledged = True
+        if state['ActiveState'] in ('inactive', 'failed'):
+            require(acknowledged and state['Result'] == 'success' and
+                    state['ExecMainStatus'] == '0', 'E_SERVICE_OR_TEST')
+            verify_test_result(stage, 0)
+            return
+        time.sleep(0.01)
 
 
 def verify_test_result(stage, returncode):
     require((stage / 'test-output').stat().st_size <= 1024 * 1024, 'E_TEST_LOG')
-    text = (stage / 'test-output').read_text(errors='replace')
-    passed = f'test {TEST} ... ok' in text and '1 passed; 0 failed' in text
+    text = private_read(stage / 'test-output', 1024 * 1024)
+    passed = (text.splitlines().count(f'test {TEST} ... ok') == 1 and
+              re.findall(r'^test result: ok\. ([0-9]+) passed; ([0-9]+) failed;', text, re.M) == [('1', '0')])
     require(returncode == 0 and passed and (stage / 'harness-pid').exists(), 'E_TEST')
 
 
@@ -641,24 +692,83 @@ def capture_fixture(stage):
 
 
 def harness(stage, args):
-    import pwd
-    import grp
     protected(stage, 'harness_stage')
-    binary = (stage / 'artifact').read_text()
-    require(args == [binary, TEST, '--ignored', '--exact'], 'E_TEST_ARGS')
-    protected(Path(binary), 'harness_binary')
-    pid = str(os.getpid())
-    name = 'arxexec' + pid
-    require(not os.path.lexists('/var/lib/' + name), 'E_FIXTURE_COLLISION')
-    for lookup in (pwd.getpwnam, grp.getgrnam):
-        try:
-            lookup(name)
-        except KeyError:
-            continue
-        raise RuntimeError('E_ACCOUNT_COLLISION')
-    with (stage / 'harness-pid').open('x') as f:
-        f.write(pid)
-    os.execve(binary, args, dict(os.environ))
+    binary = private_read(stage / 'artifact')
+    require(args == test_argv(binary), 'E_TEST_ARGS')
+    artifact = Path(binary)
+    require(artifact.parent == stage / 'source/target/debug/deps' and
+            re.fullmatch(r'arxd-[0-9a-f]+', artifact.name), 'E_ARTIFACT_PATH')
+    protected(artifact, 'harness_binary')
+    info = artifact.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o111, 'E_ARTIFACT')
+    env = test_env(os.environ.get('NOTIFY_SOCKET'))
+    exclusive_file(stage / 'harness-pid', str(os.getpid()).encode('ascii'))
+    fd = os.open(stage / 'test-output', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                 os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+    os.chdir(stage)
+    mark_cgroup(stage.name.removeprefix('arx-ci-'))
+    os.execve(binary, args, env)
+
+
+def same_object(path, info):
+    now = path.lstat()
+    require((now.st_dev, now.st_ino, now.st_mode, now.st_uid) ==
+            (info.st_dev, info.st_ino, info.st_mode, info.st_uid), 'E_FIXTURE_INODE')
+
+
+def refuse_unit_collision():
+    props = unit_properties()
+    require(props.get('LoadState') == 'not-found' and not props.get('FragmentPath') and
+            not props.get('DropInPaths') and props.get('Id') == 'arxd.service' and
+            set(props.get('Names', '').split()) <= {'arxd.service'}, 'E_UNIT_COLLISION')
+    # All manager search paths, including linked aliases and generator output.
+    paths = subprocess.check_output(['/usr/bin/systemd-analyze', 'unit-paths'],
+        env=SAFE_ENV, timeout=5, stderr=subprocess.DEVNULL)
+    require(len(paths) <= 16384, 'E_UNIT_COLLISION')
+    for root in paths.decode('ascii').splitlines():
+        require(root.startswith('/'), 'E_UNIT_COLLISION')
+        for name in ('arxd.service', 'arxd.service.d'):
+            require(not os.path.lexists(Path(root) / name), 'E_UNIT_COLLISION')
+    require(not os.path.lexists('/run/arxcovo'), 'E_UNIT_COLLISION')
+    count = 0
+    for root, dirs, files in os.walk('/sys/fs/cgroup', followlinks=False):
+        count += len(dirs) + len(files)
+        require(count <= 20000, 'E_CGROUP_SCAN_BOUND')
+        require('arxd.service' not in dirs + files, 'E_UNIT_COLLISION')
+
+
+def install_runtime(stage, run, owned):
+    root = Path('/run/systemd/system')
+    protected(root, 'service_stage')
+    for target, source in ((root / 'arxd.service', 'arxd.service'),):
+        info = exclusive_file(target, (stage / 'source/packaging/linux' / source).read_bytes())
+        owned.append((target, info))
+    drop = root / 'arxd.service.d'
+    drop.mkdir(mode=0o700)
+    owned.append((drop, drop.lstat()))
+    for name, data in (
+        ('50-arxcovo-standard-rights.conf', (stage / 'source/packaging/linux/50-arxcovo-standard-rights.conf').read_bytes()),
+        ('90-disposable-a1a2.conf', fixture_override(stage, run).encode('ascii'))):
+        target = drop / name
+        owned.append((target, exclusive_file(target, data)))
+
+
+def remove_runtime(owned):
+    # Validate the whole set before removing any part. Never remove replacements.
+    for path, info in owned:
+        same_object(path, info)
+    for path, info in reversed(owned):
+        if stat.S_ISDIR(info.st_mode):
+            path.rmdir()
+        else:
+            path.unlink()
+    if owned:
+        call(['/usr/bin/systemctl', 'daemon-reload'])
 
 
 def run(env):
@@ -673,6 +783,21 @@ def run(env):
         raise
 
 
+def reserve_unit():
+    import fcntl
+    lock = Path('/run/arxcovo-disposable-a1a2.lock')
+    protected(lock.parent, 'run_parent')
+    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_RDWR, 0o600)
+    lock_info = os.fstat(fd)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        # Keep the reservation on uncertainty; never unlock a competing owner.
+        os.close(fd)
+        raise
+    return fd, lock, lock_info
+
+
 def run_body(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
@@ -680,14 +805,19 @@ def run_body(env):
     cg_preflight()  # read-only; no retry or global controller writes
     stage, unit = plan(run_id)
     protected(stage.parent, 'run_parent')
-    # Refuse unit collisions before taking ownership of this generated name.
-    state = subprocess.check_output(['/usr/bin/systemctl', 'show', unit, '-p', 'LoadState', '--value'],
-                                    env=SAFE_ENV, timeout=5, stderr=subprocess.DEVNULL).strip()
-    require(state == b'not-found', 'E_UNIT_COLLISION')
-    feedback_mutation = 'staged'  # conservative: mutation may begin
-    stage.mkdir(mode=0o700)
+    # Exclusive fixed-name reservation. A collision owns nothing and cleans nothing.
+    fd, lock, lock_info = reserve_unit()
+    owned = []
     unit_created = False
+    stage_created = False
+    stage_info = None
+    installation_pending = False
     try:
+        refuse_unit_collision()
+        feedback_mutation = 'staged'
+        stage.mkdir(mode=0o700)
+        stage_created = True
+        stage_info = stage.lstat()
         source = Path.cwd()
         require(subprocess.check_output(['/usr/bin/git', '-c', 'safe.directory=' + str(source), 'rev-parse', 'HEAD'], env=SAFE_ENV,
                                         timeout=5, stderr=subprocess.DEVNULL).decode().strip() == env['GITHUB_SHA'], 'E_CHECKOUT')
@@ -697,9 +827,6 @@ def run_body(env):
         (stage / 'cargo').mkdir(mode=0o700)
         copy_tree(Path('/home/runner/.cargo/registry'), stage / 'cargo/registry')
         driver = stage / 'source/tools/unix-exec-validation/driver.py'
-        (stage / 'runner').write_text('#!/bin/sh\nexec /usr/bin/python3 -I ' + str(driver) +
-                                    ' harness ' + run_id + ' "$@"\n')
-        (stage / 'runner').chmod(0o700)
         build_env = cargo_env(stage)
         # Build before the 120s harness bound, with no fixture account yet.
         with (stage / 'build-output').open('xb') as out:
@@ -713,20 +840,18 @@ def run_body(env):
                      and j.get('executable') and j.get('profile', {}).get('test')]
         require(len(artifacts) == 1, 'E_ARTIFACT')
         artifact = Path(artifacts[0])
-        require(artifact.is_relative_to(stage / 'source/target/debug/deps'), 'E_ARTIFACT_PATH')
+        require(artifact.parent == stage / 'source/target/debug/deps' and
+                re.fullmatch(r'arxd-[0-9a-f]+', artifact.name), 'E_ARTIFACT_PATH')
         protected(artifact, 'run_artifact')
-        (stage / 'artifact').write_text(str(artifact))
+        exclusive_file(stage / 'artifact', str(artifact).encode('ascii'))
+        installation_pending = True
+        install_runtime(stage, run_id, owned)
+        installation_pending = False
         feedback_mutation = 'service'
-        unit_created = True  # name reserved by absence; finally stops even start failure
-        result = subprocess.run(['/usr/bin/systemd-run', '--quiet', '--wait', '--collect',
-                                 '--unit=' + unit, '--property=Delegate=yes',
-                                 '--slice=system.slice',
-                                 '--property=RuntimeMaxSec=140', '--property=TimeoutStopSec=10',
-                                 '--property=KillMode=control-group', '--property=UMask=0077',
-                                 '/usr/bin/python3', '-I', str(driver), 'service', run_id],
-                                env=SAFE_ENV, timeout=165, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-        require(result.returncode == 0 and (stage / 'passed').exists(), 'E_SERVICE_OR_TEST')
+        unit_created = True  # exact files captured; stop even when start fails
+        call(['/usr/bin/systemctl', 'daemon-reload'])
+        call(['/usr/bin/systemctl', 'start', '--no-block', unit])
+        monitor_a1a2(stage, str(artifact))
 
     except Exception as error:
         feedback_first = exception_record(error)
@@ -734,21 +859,43 @@ def run_body(env):
     finally:
         feedback_phase = 'final'
         feedback_cleanup = 'unconfirmed'
-        if unit_created:
-            # Stopping our captured unit kills descendants; never kill host hierarchy.
-            stopped = None
-            try:
-                stopped = subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=20,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            finally:
-                snapshot_internal(run_id, unit, stopped)
-            cg = Path('/sys/fs/cgroup/system.slice') / unit
-            require(not cg.exists(), 'E_QUARANTINE_CGROUP')
-        fixture_cleanup(stage)
+        try:
+            require(not installation_pending, 'E_QUARANTINE_CGROUP')
+            if stage_created or owned:
+                cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned)
+            else:
+                feedback_cleanup = 'not_reached'
+        finally:
+            # Keep the reservation on uncertain cleanup: this environment cannot be reused.
+            if feedback_cleanup == 'confirmed' or (not stage_created and not owned):
+                same_object(lock, lock_info)
+                lock.unlink()
+            os.close(fd)
+
+
+def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned):
+    global feedback_cleanup
+    if unit_created:
+        require(unit == 'arxd.service', 'E_UNIT_COLLISION')
+        for path, info in owned:
+            same_object(path, info)
+        require(unit_properties().get('FragmentPath') == '/run/systemd/system/arxd.service', 'E_UNIT_COLLISION')
+        stopped = None
+        try:
+            stopped = subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=40,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            require(stopped.returncode == 0, 'E_QUARANTINE_CGROUP')
+        finally:
+            snapshot_internal(run_id, unit, stopped)
+        cg = Path('/sys/fs/cgroup/system.slice') / unit
+        require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')
+    remove_runtime(owned)
+    if stage_created:
+        same_object(stage, stage_info)
         protected(stage, 'run_cleanup')
         require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
         shutil.rmtree(stage)
-        feedback_cleanup = 'confirmed'
+    feedback_cleanup = 'confirmed'
 
 
 def main():

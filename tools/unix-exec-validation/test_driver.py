@@ -48,7 +48,7 @@ def workflow_contract(text):
 class Guards(unittest.TestCase):
     def test_allowed_plan(self):
         run = driver.gate(valid_env(), 'linux')
-        self.assertEqual(driver.plan(run), (Path('/opt/arx-ci-123-1'), 'arx-ci-123-1.service'))
+        self.assertEqual(driver.plan(run), (Path('/opt/arx-ci-123-1'), 'arxd.service'))
 
     def test_every_gate_missing_or_changed_refuses(self):
         for key in valid_env():
@@ -141,15 +141,12 @@ class Guards(unittest.TestCase):
                 driver.gate(env, 'linux')
 
     def test_time_bounds_and_finally_are_present(self):
-        tree = ast.parse((ROOT / 'tools/unix-exec-validation/driver.py').read_text())
+        source = (ROOT / 'tools/unix-exec-validation/driver.py').read_text()
+        tree = ast.parse(source)
         run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_body')
         self.assertTrue(any(isinstance(n, ast.Try) and n.finalbody for n in ast.walk(run)))
-        source = (ROOT / 'tools/unix-exec-validation/driver.py').read_text()
         self.assertIn('deadline = time.monotonic() + 120', source)
-        self.assertIn("['/usr/bin/timeout', '--signal=KILL', '120s']", source)
         self.assertIn('RuntimeMaxSec=140', source)
-        self.assertIn('KillMode=control-group', source)
-        self.assertIn("write_text('+memory +pids')", source)
 
 
 
@@ -248,49 +245,11 @@ class RuntimeGuards(unittest.TestCase):
         with patch.dict(sys.modules, {'pwd': SimpleNamespace(getpwnam=lambda _: (_ for _ in ()).throw(KeyError()))}):
             self.refuse_cleanup('E_GROUP_ORPHAN')
 
-    def test_harness_exact_argv_and_collisions(self):
-        binary = str(self.stage / 'binary')
-        (self.stage / 'artifact').write_text(binary)
-        for args in ([binary], [binary, driver.TEST, '--ignored'],
-                     [binary, driver.TEST, '--ignored', '--exact', '--nocapture']):
-            with patch.object(driver.os, 'execve', side_effect=AssertionError('exec')):
-                with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
-                    driver.harness(self.stage, args)
-        with self.assertRaisesRegex(RuntimeError, 'E_ACCOUNT_COLLISION'):
-            driver.harness(self.stage, [binary, driver.TEST, '--ignored', '--exact'])
 
     def test_fixture_path_protection_failure_is_quarantined(self):
         with patch.object(driver, 'protected', side_effect=RuntimeError('E_PROTECTION')):
             self.refuse_cleanup('E_PROTECTION')
 
-    def test_harness_positive_and_path_collision(self):
-        binary = str(self.stage / 'binary')
-        (self.stage / 'artifact').write_text(binary)
-        args = [binary, driver.TEST, '--ignored', '--exact']
-        with patch.object(driver.os.path, 'lexists', return_value=True), patch.object(driver.os, 'execve') as execute:
-            with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_COLLISION'):
-                driver.harness(self.stage, args)
-            execute.assert_not_called()
-        (self.stage / 'harness-pid').unlink()
-        def missing(_):
-            raise KeyError()
-        with patch.dict(sys.modules, {'pwd': SimpleNamespace(getpwnam=missing), 'grp': SimpleNamespace(getgrnam=missing)}), patch.object(driver.os.path, 'lexists', return_value=False), patch.object(driver.os, 'execve') as execute:
-            driver.harness(self.stage, args)
-            execute.assert_called_once_with(binary, args, dict(os.environ))
-            self.assertEqual((self.stage / 'harness-pid').read_text(), str(os.getpid()))
-
-    def test_zero_test_success_is_failure(self):
-        output = self.stage / 'test-output'
-        output.write_text('test result: ok. 0 passed; 0 failed;')
-        with self.assertRaisesRegex(RuntimeError, 'E_TEST'):
-            driver.verify_test_result(self.stage, 0)
-        output.write_text(f'test {driver.TEST} ... ok\ntest result: ok. 1 passed; 0 failed;')
-        driver.verify_test_result(self.stage, 0)
-        with self.assertRaisesRegex(RuntimeError, 'E_TEST'):
-            driver.verify_test_result(self.stage, 1)
-        output.write_bytes(b'x' * (1024 * 1024 + 1))
-        with self.assertRaisesRegex(RuntimeError, 'E_TEST_LOG'):
-            driver.verify_test_result(self.stage, 0)
 
 
 class CgroupScan(unittest.TestCase):
@@ -470,6 +429,173 @@ class F0Mechanism(unittest.TestCase):
                 self.assertEqual(driver.entry(), 1)
                 self.assertEqual(out.getvalue().count('\n'), 1)
                 driver.replay(out.getvalue())
+
+
+
+class A1A2(unittest.TestCase):
+    """Pure plans and mocked lifecycle only; no host filesystem or process probes."""
+    def test_launch_contract(self):
+        stage = Path('/opt/arx-ci-123-1')
+        artifact = str(stage / 'source/target/debug/deps/arxd-abc')
+        self.assertEqual(driver.plan('123-1')[1], 'arxd.service')
+        self.assertEqual(driver.test_argv(artifact), [artifact,
+            'exec::disposable::disposable_linux_a1_a2', '--ignored', '--exact',
+            '--test-threads=1', '--color=never'])
+        self.assertEqual(driver.fixture_override(stage, '123-1').splitlines(), [
+            '[Service]', 'ExecStart=',
+            'ExecStart=/usr/bin/python3 -I ' + str(stage / 'source/tools/unix-exec-validation/driver.py') + ' service 123-1',
+            'Restart=no', 'RuntimeMaxSec=140'])
+        self.assertEqual(driver.test_env('@notify'), dict(CI='true', GITHUB_ACTIONS='true',
+            RUNNER_ENVIRONMENT='github-hosted', ARX_DISPOSABLE_EXEC_TEST='1', NOTIFY_SOCKET='@notify'))
+
+    def monitor(self, states, size=0, pid='42', actual='42', exe=None, placement=None, ticks=None):
+        stage = Path('/opt/arx-ci-123-1')
+        artifact = str(stage / 'source/target/debug/deps/arxd-abc')
+        events = []
+        def read(path, *args):
+            if path.name == 'harness-pid': return pid
+            if path.name == 'cgroup': return placement or '0::/system.slice/arxd.service/supervisor\n'
+            raise AssertionError('unexpected read')
+        with patch.object(driver, 'unit_properties', side_effect=[dict(ActiveState=s,
+                MainPID=actual, Result='success', ExecMainStatus='0') for s in states]), \
+             patch.object(driver, 'private_read', side_effect=read), \
+             patch.object(driver, 'capture_size', return_value=size), \
+             patch.object(driver.os, 'readlink', return_value=exe or artifact), \
+             patch.object(driver.os, 'O_NOFOLLOW', 0x20000, create=True), \
+             patch.object(driver.os, 'O_CLOEXEC', 0x80000, create=True), \
+             patch.object(driver.os, 'open', return_value=77), \
+             patch.object(driver.os, 'read', return_value=(placement or '0::/system.slice/arxd.service/supervisor\n').encode()), \
+             patch.object(driver.os, 'close'), \
+             patch.object(driver, 'exclusive_file', side_effect=lambda p,b: events.append(p.name)), \
+             patch.object(driver, 'verify_test_result', side_effect=lambda *a: events.append('summary')), \
+             patch.object(driver.time, 'monotonic', side_effect=ticks or ([0] + list(range(1,1000)))), \
+             patch.object(driver.time, 'sleep'):
+            driver.monitor_a1a2(stage, artifact)
+        return events
+
+    def test_ack_before_exit_before_summary(self):
+        self.assertEqual(self.monitor(['active', 'inactive']), ['identity-ack', 'summary'])
+
+    def test_mainpid_and_placement_required(self):
+        for kwargs in (dict(actual='43'), dict(exe='/other'), dict(placement='0::/other/supervisor\n')):
+            with self.subTest(kwargs=kwargs), self.assertRaises(RuntimeError):
+                self.monitor(['active', 'inactive'], **kwargs)
+
+    def test_overflow_while_held_refuses(self):
+        with self.assertRaisesRegex(RuntimeError, 'E_TEST_LOG'):
+            self.monitor(['active'], size=1024*1024+1)
+
+    def test_deadline_required(self):
+        with self.assertRaisesRegex(RuntimeError, 'E_TEST_TIMEOUT'):
+            self.monitor(['activating','inactive'], ticks=[0,121,122])
+
+    def test_zero_tests_refused(self):
+        stage = unittest.mock.MagicMock()
+        (stage / 'test-output').stat.return_value.st_size = 100
+        (stage / 'test-output').read_text.return_value = 'test result: ok. 0 passed; 0 failed;'
+        with patch.object(driver, 'private_read', return_value='test result: ok. 0 passed; 0 failed;'), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+            driver.verify_test_result(stage, 0)
+
+    def test_build_failure_before_install(self):
+        # build/install ordering is covered through run_body by F0Blockers.
+        with patch.object(driver, 'private_read', return_value='not-an-artifact'), \
+             patch.object(driver, 'protected'), patch.object(driver.os, 'execve') as execute:
+            with self.assertRaises(RuntimeError):
+                driver.harness(Path('/opt/arx-ci-123-1'), ['wrong'])
+            execute.assert_not_called()
+
+    def test_collision_refuses_before_mutation(self):
+        with patch.object(driver, 'unit_properties', return_value={'LoadState':'loaded', 'Id':'arxd.service'}), \
+             patch.object(driver.subprocess, 'check_output') as command, \
+             patch.object(driver.os.path, 'lexists', return_value=False), \
+             patch.object(driver.os, 'walk', return_value=[]) as walk:
+            with self.assertRaisesRegex(RuntimeError, 'E_UNIT_COLLISION'):
+                driver.refuse_unit_collision()
+            command.assert_not_called()
+            walk.assert_not_called()
+
+    def test_cleanup_cannot_stop_another_unit(self):
+        with patch.object(driver.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as stop, \
+             patch.object(driver, 'unit_properties', return_value={'FragmentPath':'/run/systemd/system/arxd.service'}), \
+             patch.object(driver, 'snapshot_internal'), patch.object(driver, 'remove_runtime'), \
+             patch.object(driver.os.path, 'lexists', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'E_UNIT_COLLISION'):
+                driver.cleanup_a1a2('123-1', 'other.service', None, False, None, True, [])
+            stop.assert_not_called()
+
+    def test_cleanup_replacement_quarantines(self):
+        owned = [(Path('/run/systemd/system/arxd.service'), object())]
+        with patch.object(driver, 'same_object', side_effect=RuntimeError('E_FIXTURE_INODE')), \
+             patch.object(driver.subprocess, 'run') as stop, \
+             patch.object(driver, 'remove_runtime') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_INODE'):
+                driver.cleanup_a1a2('123-1', 'arxd.service', None, False, None, True, owned)
+            stop.assert_not_called()
+            remove.assert_not_called()
+
+    def test_launcher_exec_and_single_capture_owner(self):
+        stage = Path('/opt/arx-ci-123-1')
+        binary = str(stage / 'source/target/debug/deps/arxd-abc')
+        artifact = unittest.mock.MagicMock()
+        artifact.parent = stage / 'source/target/debug/deps'
+        artifact.name = 'arxd-abc'
+        artifact.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o700)
+        events = []
+        with ExitStack() as stack:
+            for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+                stack.enter_context(patch.object(driver.os, flag, 0x80000, create=True))
+            stack.enter_context(patch.object(driver, 'Path', return_value=artifact))
+            stack.enter_context(patch.object(driver, 'protected'))
+            stack.enter_context(patch.object(driver, 'private_read', return_value=binary))
+            created = stack.enter_context(patch.object(driver, 'exclusive_file', side_effect=lambda *a:events.append('pid')))
+            opened = stack.enter_context(patch.object(driver.os, 'open', side_effect=lambda *a:events.append('capture') or 77))
+            stack.enter_context(patch.object(driver.os, 'dup2', side_effect=lambda *a:events.append('dup')))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            stack.enter_context(patch.object(driver.os, 'chdir'))
+            stack.enter_context(patch.object(driver, 'mark_cgroup'))
+            execute = stack.enter_context(patch.object(driver.os, 'execve', side_effect=lambda *a:events.append('exec')))
+            process = stack.enter_context(patch.object(driver.subprocess, 'run'))
+            stack.enter_context(patch.dict(driver.os.environ, {'NOTIFY_SOCKET':'@notify','HOSTILE':'secret'}, clear=True))
+            args = driver.test_argv(binary)
+            driver.harness(stage, args)
+            self.assertEqual(events, ['pid','capture','dup','dup','exec'])
+            execute.assert_called_once_with(binary, args, driver.test_env('@notify'))
+            process.assert_not_called()
+            self.assertEqual(opened.call_args.args[0], stage / 'test-output')
+            self.assertTrue(opened.call_args.args[1] & os.O_EXCL)
+            self.assertTrue(opened.call_args.args[1] & driver.os.O_NOFOLLOW)
+            self.assertEqual(opened.call_args.args[2], 0o600)
+
+    def test_reservation_is_exclusive_nonblocking(self):
+        lock = unittest.mock.MagicMock()
+        flock = unittest.mock.MagicMock(LOCK_EX=2, LOCK_NB=4)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {'fcntl':flock}))
+            for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+                stack.enter_context(patch.object(driver.os, flag, 0x80000, create=True))
+            stack.enter_context(patch.object(driver, 'Path', return_value=lock))
+            stack.enter_context(patch.object(driver, 'protected'))
+            opened = stack.enter_context(patch.object(driver.os, 'open', return_value=77))
+            stack.enter_context(patch.object(driver.os, 'fstat', return_value='identity'))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            self.assertEqual(driver.reserve_unit(), (77,lock,'identity'))
+            self.assertTrue(opened.call_args.args[1] & os.O_EXCL)
+            flock.flock.assert_called_once_with(77, 6)
+            opened.side_effect = FileExistsError()
+            flock.flock.reset_mock()
+            with self.assertRaises(FileExistsError):driver.reserve_unit()
+            flock.flock.assert_not_called()
+
+    def test_exact_summary(self):
+        stage = unittest.mock.MagicMock()
+        (stage / 'test-output').stat.return_value.st_size = 100
+        for summary in ('0 passed; 0 failed;', '11 passed; 0 failed;', '1 passed; 1 failed;'):
+            text = f'test {driver.TEST} ... ok\ntest result: ok. {summary}'
+            with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+                driver.verify_test_result(stage, 0)
+        text = f'test {driver.TEST} ... ok\ntest result: ok. 1 passed; 0 failed;'
+        with patch.object(driver, 'private_read', return_value=text):
+            driver.verify_test_result(stage, 0)
 
 
 if __name__ == '__main__':
