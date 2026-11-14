@@ -112,3 +112,10 @@ Updated current hashes (supersede matching earlier rows):
 - `tools/ci/s2b-native/driver.py`: `f7ed1dfd296ff0cb69d92eb4b2ac675a6d18031e1ce2ca26302a0b2795d9fd65`
 - `tools/ci/s2b-native/test_driver.py`: `9eff03de41890654c0cdb6f4f1d80b0fb54b6f1cebe73e5bea507cbf56be4057`
 - `crates/arxd/src/service/unix_bridge.rs`: `323fa965a041c4ad53c99d149f810e031d886cc09e83089d26c82d27b49026d1`
+
+The first coordinator portable check failed `manifest_schema`: prepending the
+bridge pin changed the original mutation-target index. Appending the dependency
+pin preserves the reviewed target order and fixes that regression. This failure
+earned no evidence credit. Final portable suite: 11 passed.
+
+Updated driver SHA-256: `c6556fec6f2301105727baba86f0d404f6a7fc6ccb8acb89a5ebb557c699a595`.
