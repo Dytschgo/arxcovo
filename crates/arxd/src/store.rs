@@ -331,8 +331,21 @@ impl Activity {
     }
     /// Caller must use its own committed read id; SQL bounds both rows and values.
     pub fn list(&self, principal: &str, read_id: i64, args: &ListActivity) -> Result<ActivityPage> {
+        self.list_filtered(principal, read_id, args, None)
+    }
+    /// Exact IDs share all pagination visibility and bounded decoding fences.
+    pub(crate) fn list_filtered(
+        &self,
+        principal: &str,
+        read_id: i64,
+        args: &ListActivity,
+        activity_id: Option<i64>,
+    ) -> Result<ActivityPage> {
         validate_principal(principal)?;
         args.validate()?;
+        if activity_id.is_some_and(|id| id <= 0 || args.before_id.is_some()) {
+            anyhow::bail!("invalid activity arguments");
+        }
         let db = self
             .db
             .lock()
@@ -355,12 +368,13 @@ impl Activity {
         .concat();
         // No arbitrary text/blob is ever loaded into Rust, even from a tampered DB.
         let columns = names.iter().map(|(n,_)| format!("CASE WHEN typeof({n})='text' AND length(CAST({n} AS BLOB))<=184 THEN {n} WHEN typeof({n}) IN ('null','integer') THEN {n} ELSE NULL END, typeof({n}), length(CAST({n} AS BLOB))")).collect::<Vec<_>>().join(",");
-        let mut stmt = db.prepare(&format!("SELECT {columns}, class IN ('read','action','lifecycle') FROM activity WHERE actor_kind='agent' AND principal=?1 AND id<?2 AND (?3=1 OR class<>'read') ORDER BY id DESC LIMIT ?4"))?;
+        let mut stmt = db.prepare(&format!("SELECT {columns}, class IN ('read','action','lifecycle') FROM activity WHERE actor_kind='agent' AND principal=?1 AND id<?2 AND (?3=1 OR class<>'read') AND (?5 IS NULL OR id=?5) ORDER BY id DESC LIMIT ?4"))?;
         let mut rows = stmt.query(params![
             principal,
             args.before_id.unwrap_or(read_id).min(read_id),
             args.include_reads,
-            args.limit + 1
+            args.limit + 1,
+            activity_id
         ])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
