@@ -52,7 +52,7 @@ fn bridge(
     UnixBridge::new(
         &Layout::for_test(Platform::Linux),
         &config(),
-        "/synthetic/unit/runs".into(),
+        Some("/synthetic/unit/runs".into()),
         |_| Ok(Box::new(FakePort(Box::new(step)))),
         Box::new(|| Ok(())),
         ready(),
@@ -190,7 +190,7 @@ fn t1_derivation_factory_once_and_refusals() {
     let b = UnixBridge::new(
         &l,
         &c,
-        "/x".into(),
+        Some("/x".into()),
         |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakePort(Box::new(|_, _, _| Ok(result())))))
@@ -695,7 +695,7 @@ async fn t8_private_inputs_all_phases_inner() {
         let b = UnixBridge::new(
             &layout,
             &c,
-            PathBuf::from(format!("/synthetic/{MARKER}/runs")),
+            Some(PathBuf::from(format!("/synthetic/{MARKER}/runs"))),
             |owner| {
                 assert_eq!(owner.account, MARKER);
                 assert!(owner.workspace.to_str().unwrap().contains(MARKER));
@@ -852,7 +852,7 @@ fn t1_preflight_order_stored_refusal_and_readiness() {
     let b = UnixBridge::new(
         &l,
         &c,
-        "/fake/runs".into(),
+        Some("/fake/runs".into()),
         |_| Err(Unavailable::PreflightFailed),
         Box::new(move || {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -1016,3 +1016,13 @@ impl TestRights for String {
 mod e6;
 
 mod e7;
+
+fn wiring_location(
+    file: exec::hierarchy::setup::FsResult<exec::hierarchy::setup::ProcFile>,
+) -> Option<exec::hierarchy::parse::Location> {
+    let file = file.ok()?;
+    if file.magic != exec::hierarchy::setup::PROC_MAGIC {
+        return None;
+    }
+    locate(&file.bytes)
+}

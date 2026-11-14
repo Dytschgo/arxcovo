@@ -59,12 +59,15 @@ impl UnixBridge {
     fn new(
         layout: &Layout,
         config: &ServiceConfig,
-        parent: PathBuf,
+        parent: Option<PathBuf>,
         factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
         check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
         readiness: Readiness,
     ) -> Self {
-        let runner = derive(layout, config, parent).and_then(factory);
+        let runner = parent
+            .ok_or(Unavailable::MechanismUnavailable)
+            .and_then(|parent| derive(layout, config, parent))
+            .and_then(factory);
         Self {
             binary: layout.binary().into(),
             runner,
@@ -365,7 +368,8 @@ impl StartupDomain {
     fn new(
         layout: &Layout,
         config: &ServiceConfig,
-        location: exec::hierarchy::parse::Location,
+        location: Option<exec::hierarchy::parse::Location>,
+        check: impl Fn() -> Result<(), Unavailable> + Send + Sync + 'static,
         factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
         setup: impl FnOnce(
             &exec::hierarchy::parse::Location,
@@ -375,38 +379,47 @@ impl StartupDomain {
         + 'static,
     ) -> Self {
         let readiness = Readiness::pending();
+        if location.is_none() {
+            readiness.fail(Cause::Setup);
+        }
         let state = readiness.clone();
         let constructed = std::cell::Cell::new(false);
         let domain = AdmissionDomain::new(
             layout,
             config,
-            location.runs(),
+            location.as_ref().map(|location| location.runs()),
             |owner| {
                 let runner = factory(owner);
                 constructed.set(runner.is_ok());
                 runner
             },
-            Box::new(|| Ok(())),
+            Box::new(check),
             readiness,
         );
         let valid = constructed.get();
         Self {
             domain,
             readiness: state.clone(),
-            setup: std::sync::Mutex::new(Some(Box::new(move |stop| {
-                if !valid {
-                    state.fail(Cause::Setup);
-                    return false;
-                }
-                match setup(&location, &stop) {
-                    exec::hierarchy::setup::SetupOutcome::Ready(_) if !stop.is_cancelled() => {
-                        state.set_ready()
+            setup: std::sync::Mutex::new(location.map(|location| {
+                Box::new(move |stop| {
+                    if !valid {
+                        state.fail(Cause::Setup);
+                        return false;
                     }
-                    exec::hierarchy::setup::SetupOutcome::Ready(_) => state.fail(Cause::Stopped),
-                    exec::hierarchy::setup::SetupOutcome::Unavailable(f) => state.fail(f.into()),
-                }
-                state.check().is_ok()
-            }))),
+                    match setup(&location, &stop) {
+                        exec::hierarchy::setup::SetupOutcome::Ready(_) if !stop.is_cancelled() => {
+                            state.set_ready()
+                        }
+                        exec::hierarchy::setup::SetupOutcome::Ready(_) => {
+                            state.fail(Cause::Stopped)
+                        }
+                        exec::hierarchy::setup::SetupOutcome::Unavailable(f) => {
+                            state.fail(f.into())
+                        }
+                    }
+                    state.check().is_ok()
+                }) as StartupSetup
+            })),
         }
     }
 }
@@ -422,7 +435,7 @@ impl AdmissionDomain {
     fn new(
         layout: &Layout,
         config: &ServiceConfig,
-        parent: PathBuf,
+        parent: Option<PathBuf>,
         factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
         check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
         readiness: Readiness,

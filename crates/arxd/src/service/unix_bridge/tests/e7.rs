@@ -108,13 +108,18 @@ fn app(
     value["limits"]["memory_bytes"] = json!(16777216);
     value["limits"]["max_concurrent_runs"] = json!(2);
     let config = parse(value, &FakeResolver::default()).unwrap();
-    let location = locate(b"0::/arxd.service/supervisor\n").unwrap();
+    let location = wiring_location(Ok(exec::hierarchy::setup::ProcFile {
+        magic: exec::hierarchy::setup::PROC_MAGIC,
+        bytes: b"0::/arxd.service/supervisor\n".to_vec(),
+    }))
+    .unwrap();
     let expected_parent = location.runs();
     let setup_components = location.unit_components().to_vec();
     let d = Arc::new(StartupDomain::new(
         &Layout::for_test(Platform::Linux),
         &config,
-        location,
+        Some(location),
+        live_check(config.clone()),
         move |owner| {
             assert_eq!(owner.cgroup_parent, Some(expected_parent));
             count.fetch_add(1, Ordering::AcqRel);
@@ -522,7 +527,7 @@ fn w8_production_and_domain_source_pins() {
         include_str!("e7.rs")
             .matches(concat!("StartupDomain", "::new("))
             .count(),
-        3
+        4
     );
     let e = include_str!("../../executor.rs");
     let configured = e
@@ -541,6 +546,7 @@ fn w8_production_and_domain_source_pins() {
         .nth(1)
         .unwrap();
     assert_eq!(wiring.matches("AdmissionDomain::new(").count(), 1);
+    assert!(!wiring.contains("|| Ok(())"));
     assert_eq!(wiring.matches("Readiness::pending()").count(), 1);
     assert!(!wiring.contains("Runner::new("));
     let handle = include_str!("../../unix_bridge.rs")
@@ -575,7 +581,8 @@ async fn w2_nonstandard_and_hardening_fail_before_ready() {
         let domain = StartupDomain::new(
             &Layout::for_test(platform),
             &c,
-            locate(b"0::/arxd.service/supervisor\n").unwrap(),
+            Some(locate(b"0::/arxd.service/supervisor\n").unwrap()),
+            live_check(c.clone()),
             |_| panic!("nonstandard factory must not run"),
             |_, _| panic!("nonstandard setup must not run"),
         );
@@ -600,7 +607,8 @@ async fn w2_nonstandard_and_hardening_fail_before_ready() {
     let domain = StartupDomain::new(
         &Layout::for_test(Platform::Linux),
         &config(),
-        locate(b"0::/arxd.service/supervisor\n").unwrap(),
+        Some(locate(b"0::/arxd.service/supervisor\n").unwrap()),
+        live_check(config()),
         |_| {
             Ok(Box::new(FakePort(Box::new(|_, _, _| {
                 panic!("hardening port must not run")
@@ -782,4 +790,161 @@ async fn sp1_sp2_actual_drain_precedes_sequence_and_empties_workers() {
             Some("shutdown".into())
         )]
     );
+}
+
+fn live_check(config: ServiceConfig) -> impl Fn() -> Result<(), Unavailable> + Send + Sync {
+    let layout = Layout::for_test(Platform::Linux);
+    move || config.execution_preflight(&layout, &FakeResolver::default())
+}
+
+mod s1 {
+    use super::*;
+    use crate::exec::hierarchy::setup::{FsError, FsResult, PROC_MAGIC, ProcFile};
+    fn file(bytes: &[u8], magic: u64) -> FsResult<ProcFile> {
+        Ok(ProcFile {
+            bytes: bytes.to_vec(),
+            magic,
+        })
+    }
+    fn domain(
+        location: Option<exec::hierarchy::parse::Location>,
+        refused: bool,
+        factories: Arc<AtomicUsize>,
+        checks: Arc<AtomicUsize>,
+        setups: Arc<AtomicUsize>,
+    ) -> StartupDomain {
+        let config = config();
+        let live = live_check(config.clone());
+        StartupDomain::new(
+            &Layout::for_test(Platform::Linux),
+            &config,
+            location,
+            move || {
+                checks.fetch_add(1, Ordering::AcqRel);
+                if refused {
+                    Err(Unavailable::AccountIdentityChanged)
+                } else {
+                    live()
+                }
+            },
+            move |_| {
+                factories.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(FakePort(Box::new(|_, _, _| {
+                    panic!("S1 Runner must not run")
+                }))))
+            },
+            move |location, stop| {
+                setups.fetch_add(1, Ordering::AcqRel);
+                crate::exec::hierarchy::fake::startup_setup(
+                    location,
+                    stop,
+                    false,
+                    false,
+                    Arc::new(|_| {}),
+                )
+            },
+        )
+    }
+    #[tokio::test]
+    async fn l_a_missing_location_matrix() {
+        for input in [
+            file(b"", PROC_MAGIC),
+            file(b"1:memory:/arxd.service/supervisor\n", PROC_MAGIC),
+            file(b"0::/wrong.service/supervisor\n", PROC_MAGIC),
+            file(&vec![b'x'; 4097], PROC_MAGIC),
+            file(b"0::/arxd.service/supervisor\n", 0),
+            Err(FsError::Io),
+        ] {
+            let location = wiring_location(input);
+            assert!(location.is_none(), "L-a Locate refuses");
+            let factories = Arc::new(AtomicUsize::new(0));
+            let setups = Arc::new(AtomicUsize::new(0));
+            let d = Arc::new(domain(
+                location,
+                false,
+                factories.clone(),
+                Arc::default(),
+                setups.clone(),
+            ));
+            assert_eq!(factories.load(Ordering::Acquire), 0, "L-a no factory");
+            assert!(d.setup.lock().unwrap().is_none(), "L-a setup consumed");
+            assert_eq!(
+                d.domain.handle().preflight_for_test(),
+                Err(Unavailable::MechanismUnavailable)
+            );
+            let state = d.readiness.clone();
+            let e = d.domain.handle();
+            let dir = private_temp();
+            let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+            let mut app = ServiceApplication::discovery_fixture(
+                TestHooks {
+                    domain: d,
+                    seam: Arc::new(|_| {}),
+                },
+                a.clone(),
+            );
+            app.start_discovery();
+            assert!(rows(&dir).is_empty(), "L-a no daemon rows");
+            let id = a.start_dedicated("alpha", "discover_tools").unwrap();
+            assert_eq!(
+                e.dispatch(None, a, id).await.unwrap_err().execution_reason,
+                Some(Unavailable::MechanismUnavailable)
+            );
+            assert_eq!(
+                rows(&dir),
+                [(
+                    "agent".into(),
+                    "alpha".into(),
+                    "refused".into(),
+                    Some("preflight_failed".into())
+                )]
+            );
+            assert_eq!(setups.load(Ordering::Acquire), 0, "L-a no setup or janitor");
+            state.set_ready();
+            assert!(state.check().is_err(), "L-a never Ready");
+            done(&mut app).await;
+            e.drain().await.unwrap();
+        }
+    }
+    #[test]
+    fn l_b_live_check_first_with_and_without_location() {
+        for located in [true, false] {
+            let factories = Arc::new(AtomicUsize::new(0));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let setups = Arc::new(AtomicUsize::new(0));
+            let location = if located {
+                wiring_location(file(b"0::/arxd.service/supervisor\n", PROC_MAGIC))
+            } else {
+                None
+            };
+            let d = domain(
+                location,
+                true,
+                factories.clone(),
+                checks.clone(),
+                setups.clone(),
+            );
+            for n in 1..=2 {
+                assert_eq!(
+                    d.domain.handle().preflight_for_test(),
+                    Err(Unavailable::AccountIdentityChanged),
+                    "L-b live check token FIRST only"
+                );
+                assert_eq!(checks.load(Ordering::Acquire), n, "L-b check is live");
+            }
+            assert_eq!(factories.load(Ordering::Acquire), usize::from(located));
+            assert!(d.readiness.check().is_err(), "L-b pending until setup");
+            assert_eq!(setups.load(Ordering::Acquire), 0);
+            if located {
+                assert!(d.setup.lock().unwrap().take().unwrap()(
+                    Cancellation::default()
+                ));
+                assert!(d.readiness.check().is_ok());
+                assert_eq!(
+                    d.domain.handle().preflight_for_test(),
+                    Err(Unavailable::AccountIdentityChanged)
+                );
+            }
+        }
+    }
 }
