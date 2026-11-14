@@ -15,10 +15,6 @@ d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
 
 
-def status(kind, name, binary="arxd"):
-    binary = "arxd::unix_shim" if binary == "unix_shim" else binary
-    return f"    {kind} [   0.015s] ( 1/11) {binary} {name}\n"
-
 
 class HarnessTests(unittest.TestCase):
     def setUp(self):

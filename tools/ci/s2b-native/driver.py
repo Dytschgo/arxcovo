@@ -12,12 +12,12 @@ import sys
 import threading
 import time
 
-PINS = {'crates/arxd/src/exec/cgroup.rs': '64d4cb8c48e516d5fdcd92f85fe2c9c9abb028ee55251929e95824c16211d121', 'crates/arxd/src/exec/mod.rs': 'f8d425f7a57a309b7e10c29b4609f2c0c75002a33bc1eb0c00e04cd47dd3f9b4', 'crates/arxd/src/service/executor.rs': '45da7396dc926ad40b18a5fab1ff2fd898c3d0577b8cd13d91eba1a7205cf5ed', 'crates/arxd/src/service/unix_bridge/tests.rs': 'b2e0c0efc24feb46555fee12413edf79c8afe22d0221908fde59238a597a780d', 'crates/arxd/src/service/unix_bridge/tests/e6.rs': 'f26d1ed0778c5b24495f46bde26b8248f046aedfbcae07440857453bf17dabb1', 'crates/arxd/src/service/unix_bridge/tests/s2b.rs': '6eb93098dfda74ae52e751a07f69fd9252417184d65d6064cb6a26270643e089'}
+PINS = {'crates/arxd/src/service/unix_bridge.rs': '323fa965a041c4ad53c99d149f810e031d886cc09e83089d26c82d27b49026d1', 'crates/arxd/src/exec/cgroup.rs': '64d4cb8c48e516d5fdcd92f85fe2c9c9abb028ee55251929e95824c16211d121', 'crates/arxd/src/exec/mod.rs': 'f8d425f7a57a309b7e10c29b4609f2c0c75002a33bc1eb0c00e04cd47dd3f9b4', 'crates/arxd/src/service/executor.rs': '45da7396dc926ad40b18a5fab1ff2fd898c3d0577b8cd13d91eba1a7205cf5ed', 'crates/arxd/src/service/unix_bridge/tests.rs': 'b2e0c0efc24feb46555fee12413edf79c8afe22d0221908fde59238a597a780d', 'crates/arxd/src/service/unix_bridge/tests/e6.rs': 'f26d1ed0778c5b24495f46bde26b8248f046aedfbcae07440857453bf17dabb1', 'crates/arxd/src/service/unix_bridge/tests/s2b.rs': '6eb93098dfda74ae52e751a07f69fd9252417184d65d6064cb6a26270643e089'}
 TARGETS = tuple(PINS)
 MANIFEST = "tools/ci/s2b-native/mutations.jsonl"
 MANIFEST_SHA = '28f05948ca4aace6944fbe8c77676e8f702575042cf77d9c9c176096ac5b0f94'
 WORKFLOW = ".github/workflows/s2b-native-evidence.yml"
-WORKFLOW_SHA = '40fb88d0ec96c28f4d4aa10d5f0cedc3fce778d913c0f24394ec255f28db346f'
+WORKFLOW_SHA = '3097257cbc463e1b85a4845fc529f3df8af5c0db768db00d1b3a259aa81ad418'
 TEST = "service::unix_bridge::tests::s2b::s2b_real_group_unwinds_before_bridge_returns"
 LIMIT = 2 * 1024 * 1024
 class GuardError(Exception):

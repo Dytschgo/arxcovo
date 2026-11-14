@@ -5,12 +5,13 @@ on:
       - 'crates/arxd/src/exec/cgroup.rs'
       - 'crates/arxd/src/exec/mod.rs'
       - 'crates/arxd/src/service/executor.rs'
+      - 'crates/arxd/src/service/unix_bridge.rs'
       - 'crates/arxd/src/service/unix_bridge/tests.rs'
       - 'crates/arxd/src/service/unix_bridge/tests/e6.rs'
       - 'crates/arxd/src/service/unix_bridge/tests/s2b.rs'
       - '.github/workflows/s2b-native-evidence.yml'
       - 'tools/ci/s2b-native/**'
-      - 'docs/evidence/linux-rights-probe-s2b-native.md'
+      - 'docs/evidence/linux-unwind-local-s2b-native.md'
 permissions:
   contents: read
 jobs:

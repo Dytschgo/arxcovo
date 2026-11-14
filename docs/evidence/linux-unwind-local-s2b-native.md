@@ -86,3 +86,29 @@ remains inactive. No old Lab Manager state or protected VM was touched.
 - `crates/arxd/src/service/unix_bridge/tests.rs`: `b2e0c0efc24feb46555fee12413edf79c8afe22d0221908fde59238a597a780d`
 - `crates/arxd/src/service/unix_bridge/tests/e6.rs`: `f26d1ed0778c5b24495f46bde26b8248f046aedfbcae07440857453bf17dabb1`
 - `crates/arxd/src/service/unix_bridge/tests/s2b.rs`: `6eb93098dfda74ae52e751a07f69fd9252417184d65d6064cb6a26270643e089`
+
+## Coordinator review disposition
+
+Opus high review `7d20762` (retained `b7a6dba`) found no blockers.
+Sol medium corrected the copied evidence path filter, added the dependent
+`unix_bridge.rs` to the source pins and path filter, and removed the unused
+portable-test status helper. The earlier six-source count is historical;
+there are now seven source pins. Classifier fixtures are hand-written samples
+of the expected nextest format, not captured output; the review separately
+validated the parser against real nextest 0.9.151 from a throwaway crate.
+
+Coordinator explicitly accepts the remaining disclosed limitations for this
+bounded disposable hosted verification: six guard-removal test gaps, generic
+named-test failure attribution without inner assertion text, process-group
+cleanup edge cases bounded by the job timeout, and cleanup/interrupt reporting
+limits. Production guards remain present; these are not exemptions from source
+pins, restoration or native result gates. Mutation credit will be named-test
+failure only, not proof of the inner assertion location. No native execution
+or kill is claimed here. Real-Runner PA6 remains OPEN.
+
+Updated current hashes (supersede matching earlier rows):
+
+- `.github/workflows/s2b-native-evidence.yml`: `3097257cbc463e1b85a4845fc529f3df8af5c0db768db00d1b3a259aa81ad418`
+- `tools/ci/s2b-native/driver.py`: `f7ed1dfd296ff0cb69d92eb4b2ac675a6d18031e1ce2ca26302a0b2795d9fd65`
+- `tools/ci/s2b-native/test_driver.py`: `9eff03de41890654c0cdb6f4f1d80b0fb54b6f1cebe73e5bea507cbf56be4057`
+- `crates/arxd/src/service/unix_bridge.rs`: `323fa965a041c4ad53c99d149f810e031d886cc09e83089d26c82d27b49026d1`
