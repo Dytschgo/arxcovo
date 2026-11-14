@@ -684,3 +684,258 @@ nested Job proof UNRUN; 300/360/60 and actual native costs UNMEASURED.
 M2 is **incomplete**; main71 cause **unknown**; no historical retry; Phase 1
 has no focused real red loop; real-Runner PA6 replay **OPEN**. This is prepared
 code with explicit technical blockers, not a completed adapter or incident fix.
+
+## ExclusiveNames / SystemRootSeparate source slice — 2026-11-14
+
+Provider/effort/outcome: OpenAI Sol high; bounded implementation completed in
+source, with native proof UNRUN. Fresh Grok/Muse review is still required.
+No delegation, publication, push, or PR. This is not native run clearance.
+
+### Checkout and scope pins
+
+Initial cwd equalled Git top level; the Git directory was an isolated worktree
+directory under the common Git directory. Initial porcelain was empty.
+Initial head: `9b52b042856c9e0876c45280c1d559170539c07d`;
+initial tree: `cdac7f0d3c941b62deb4993c8f830c766cd35eb3`.
+Retained review: `620b3be91ee90dc957b8e03b6f0b53177b6e77a0`
+(user identifies original `984d345`; no historical replay).
+Accepted proposal blob: `366876f711595c14bde42763e2a263cfe44ca9c2`.
+Source commit: `37ff6946532fcef93e28de3aea39582d13c4a6f5`;
+source tree: `1674e02f43c7f913d931cd585ea10898222d8946`.
+Source commit changes only the five admission/held-file/pure-test/source-check
+files below. No Rust, manifest/Git-blob binder, provenance writer, grammar,
+NativeJob, workflow, CI, root Cargo, policy, design, review or PROGRESS edit.
+
+Read before editing: AGENTS, KICKOFF, accepted native proposal, full adapter
+integration review (including SP-EXCLUDE, SP-SYSROOT and Next implementation
+slice), PINNING, Admission, HeldFiles, Controller, test runner and source
+inventory. The engineering skill and its selected profile/behavior safeguards
+were read; the task's narrower authorization governs.
+
+### Implemented source and limits
+
+ExclusiveNames accepts precisely dot, dotdot and one expected regular leaf,
+with distinct names, nonzero 128-bit IDs, proper directory type on dot entries,
+and no reparse attribute or tag. SameScan compares the complete name, attributes,
+reparse tag and 128-bit ID sets independent of enumeration order.
+
+Revalidate calls RevalidateBoundary, which calls RevalidatePins. The latter
+opens the helper directory and launched-image directory through the injected
+file/query interface; production uses HeldFiles, pure checks use only synthetic
+metadata. Each directory must have exactly its own one pinned executable.
+Sharing the two executable directories is refused under this one-leaf contract.
+Each proof scans, validates names, opens/reads the leaf relative to that same
+directory, scans again, validates names again, compares the sets, and checks the
+enumerated leaf ID against the pin. All other file pins retain their existing
+hash/length/identity/link checks and sources retain LF enforcement.
+
+HeldFiles caches relative-opened directory handles. Child directory access
+remains FILE_LIST_DIRECTORY|SYNCHRONIZE, share read only, FILE_DIRECTORY_FILE,
+FILE_OPEN_REPARSE_POINT and synchronous nonalert I/O. The transient full-share
+volume-root bootstrap closes after the first child; it is never retained in
+the cache. Share read fences ADD_FILE but does not enumerate names, freeze an
+unheld sibling, or fence DELETE_CHILD / WRITE_ATTRIBUTES. It is not treated as
+exclusion proof by itself. No path listing or query fallback exists.
+
+Production Scan uses NtQueryDirectoryFile class 60
+(FILE_ID_EXTD_DIR_INFORMATION), single record, 1024-byte buffer, at most four
+calls per scan: three expected entries plus STATUS_NO_MORE_FILES. Restart is
+set on the first call of each scan. Unsupported query, partial/overflow result,
+unsafe size, extra entry or failure to exhaust refuses. Names, type/reparse
+flags and both ID qwords from the actual records feed the predicates. The
+relative leaf handle uses share read only and remains retained alongside the
+directories; mandatory FileIdInfo and strict links==1 before AND after hashing
+are unchanged. No hardlink/copy/reparse/share weakening or fallback was added.
+
+SystemRootSeparate now permits disposable C:\fixture, helper C:\fixture\bin,
+temp C:\fixture\tmp and external C:\Windows. It refuses a volume-root
+workspace, equal/nested SystemRoot, a workspace under SystemRoot, and unsafe
+or external helper/temp/source/artifact paths. Parse uses this predicate and
+still confines every source/artifact pin to the disposable root. The old
+C:\fixture\Windows acceptance fixture is replaced. HeldFiles separately
+requires an externally approved exact SystemRoot path and nonzero 128-bit
+directory ID; it opens that directory without following reparses and verifies
+volume/type/identity, holding it separately. Temp is also held inside the root.
+
+Handle lifetime is retention until owner disposal, never a scan-local using
+block. Current admission always throws before a process exists. Future launch
+ownership must retain Admission/HeldFiles until process exit AND zero Job active
+count; this slice does not establish that supervisor/lifetime behavior against
+a real process. Native directory share, enumeration completeness/record layout,
+SystemRoot opening, file identity and lifetime through confirmed death are all
+**UNRUN, unverified on real hardware**. No API experiment was authorized.
+The final overall refusal remains `remaining admission gates unproved`.
+No usable Admission/OwnedSession run is enabled.
+
+### Executed checks and call graph
+
+Commands actually run (repository-relative):
+
+- `Get-Location`, `git rev-parse --show-toplevel`,
+  `git rev-parse --git-dir`, `git status --short`, `git log -4 --oneline`;
+  fixed source/document reads and bounded rg searches.
+- `git rev-parse HEAD`, `git rev-parse 'HEAD^{tree}'`;
+  Python fixed-file SHA256/CR counts and `git rev-parse HEAD:<path>` pins.
+- `pwsh -NoProfile -File tools/windows-native-replay/Test-PureController.ps1`
+  five invocations: three interrupted negative-control runs, then two complete
+  passing runs, with the final run against the committed source bytes.
+- `python tools/windows-native-replay/Check-Source.py` twice, both exit 0:
+  28 oracle rows, five pure Rust registrations, zero native registration/callers,
+  selectors disabled; this is structural inventory, not native proof.
+- `git diff --check` repeatedly, all exit 0. Diff/stat inspection, explicit
+  five-file staging and the conventional source commit above.
+
+Before managed execution, inspected Run and its helpers: synthetic JSON and
+hashing, literal frames, synthetic elapsed values and metadata only. The new
+AdmissionPureChecks invokes the production predicates, RevalidatePins and
+RevalidateBoundary through mock IAdmissionFiles/IAdmissionDirectory. Mock
+methods only return arrays/bytes or count calls. They never instantiate
+HeldFiles, Admission, OwnedSession or NativeJob, read a clock, open/query a
+file, run provenance, or invoke any native API. Defining DllImport during
+Add-Type is compilation only. Path operations in the decision path are lexical.
+No native effects are reachable from either pure Run method.
+
+Final managed run: baseline pass, all **45** separately renamed/compiled
+mutants assertion-killed, exit 0, tool wall time 8.71s. Add-Type used the
+PowerShell 7 reference assemblies; no SDK install/network or version probing.
+Compiler errors are fatal, never assertion kills. Source files are never
+modified by mutation: variants live in memory, use distinct type names, and
+all five compiled/runner source files are checked for exact byte SHA256 and
+zero CR before and after. This is an exact LF unchanged check, stronger than a
+rewrite-based restore. Check-Source is separately pinned below.
+
+Coverage includes extra DLL, missing/repeated/wrong/reparse leaf, reparse tag,
+dot/leaf types, zero ID, changed low/high IDs and attributes, set reordering;
+both executable directory scan wiring, changed scans, relative-leaf result
+size/ID, source LF, unsafe roots and helper/temp/source/artifact pins; parser
+external Windows acceptance, nested Windows/outside artifact refusal; and the
+remaining unconditional admission refusal. It gives no native safety credit.
+
+### Failure ledger (retained)
+
+1. Read-only Git pin command initially used unquoted HEAD^{tree}; PowerShell
+   mangled that argument and Git exited 1 with ambiguous argument. Corrected
+   once to quoted `'HEAD^{tree}'`, which returned the initial tree above.
+2. Managed run 1: baseline passed; names-leaf mutant
+   `42f14ded2b712cdfc7adc35fbcceb92e2e86e5b4d7fd7f65ccd19246b7c6600a`
+   survived because final membership redundantly enforces the expected leaf.
+   Corrected the semantic mutant to disable both leaf checks; no production
+   guard was weakened. Tool wall time 5.68s, exit 1.
+3. Managed run 2: baseline passed; dot-type mutant was a literal false branch,
+   causing Add-Type CS0162 unreachable-code failure. Not an assertion kill.
+   Changed only the mutant to a nonconstant impossible attribute comparison.
+   Tool wall time 5.68s, exit 1.
+4. Managed run 3: baseline passed; leaf-ID mutant deleted the entire body of
+   an if under foreach, producing Add-Type CS1525. Not an assertion kill.
+   Replaced the deleted statement with an empty block. Tool wall time 6.90s,
+   exit 1.
+5. Managed run 4: baseline and all 45 mutants passed/killed, exit 0, 8.39s.
+   Then folded the new pure helper into already-pinned Controller.cs, added
+   parser/scan assertions and clarified directory sharing comments; final run
+   5 baseline/all 45 killed and exact LF checks passed, exit 0, 8.71s.
+
+These are distinct negative-control definition issues, not three failed fixes
+of one production issue; no ledger reset or fourth same-issue attempt.
+Extra/missing/repeated and volume-root mutants deliberately inject acceptance
+of forbidden snapshots because deleting one redundant local check alone does
+not remove the complete semantic guard. Wrong-leaf disables both redundant
+checks. Every mutant still compiles and fails a production assertion in the
+final run. The new changed-scan wiring fixture changes the dot entry ID so the
+leaf-pin equality cannot mask loss of the scan-comparison guard.
+All failures used pure data; cleanup disposition: no native handles/processes.
+
+### Final source pins
+
+Every row has CR count 0; SHA256 is over exact LF bytes at the source commit.
+
+| Path | Git blob | LF SHA256 |
+| --- | --- | --- |
+| `tools/windows-native-replay/Admission.cs` | `dd8d58903469ac438c51c98f42597985058e6990` | `9ee0b8a9df333e03a84caf2793ea983305202a89c44e662980d83ec216002ded` |
+| `tools/windows-native-replay/HeldFiles.cs` | `9526c04b368664ee23e6a6efbb27e554cf5b10b9` | `9470b8f11a37ad22ecc7eb28926de444d0c8d5cd6e25e64b9e0131459ada1643` |
+| `tools/windows-native-replay/Controller.cs` | `9039215000a5ac9fbcae35bd1bb8300a6c840d27` | `9b902a15898cb4e0155821e17b181fdbe36191870a8590000aa4ef92423808d5` |
+| `tools/windows-native-replay/Test-PureController.ps1` | `e83263cc2f1095f272a166259bd74815b1a48df6` | `9e20bcc726d31205be55c6b7b7e467f867a1e61fc1d40d303099da3bf6e7e729` |
+| `tools/windows-native-replay/Check-Source.py` | `aca568d8c501b1fa340b74f68770c8637fea370e` | `4bef03b97b6a0b470bd09a2056c5ff3bd65915639c9037f08c294dc8cf34e75c` |
+| `tools/windows-native-replay/NativeJob.cs` | `5fa8efba3012d51815f49fb9a38d23a1804f2059` | `f934f165408a9a879090da129f95122a75d2bcd5831ac5bb60cb1063f39a36d4` |
+| `tools/windows-native-replay/Invoke-BoundedReplay.ps1` | `a4c88570d6012ae356c9b4f1e71b2f0d0d76acba` | `29dc8f9f6468d9c03d9defe65381f6f13064ee354aa7637309c0a50b98b6fb33` |
+| `tools/windows-native-replay/selectors.json` | `41a9499660e8b0b40b21bd021f56ba45d760474a` | `e9aa9e6f405c2142d392096926830f0ba5b59be1a8ef46409d75d1513eab9b23` |
+| `tools/windows-native-replay/PINNING.md` | `8bba98fbe889474cdf4c167c9049d9168384809d` | `1675770695a0aeb0348b66ad38b87994a035badc0c142d728eb8af2cd110f56b` |
+| `docs/reviews/windows-main71-native-replay-scope-proposal.md` | `366876f711595c14bde42763e2a263cfe44ca9c2` | `38301eec15029b58db8cbf42d2df22fdba6f337dc1fac7404585700d9aa3c5e2` |
+| `docs/reviews/windows-main71-adapter-integration-grok-review.md` | `8ae1393db2f6a9b167ca397a8aff0585cf43f2ec` | `73d73c8df19eed5d92c5cc2170e971d2857ead0f38475259c0dd1c2030f239db` |
+| `Cargo.lock` | `1c5c0fcf2b577f89ed998826ddf6608338b4b523` | `1ebaf3af25f462da12eb8e8f7cfff3803deb180dd4c1f294be67bef3f3a7e4cc` |
+| `tools/windows-native-replay/child/Cargo.lock` | `dbf05ddef24026e55c6e87b9a38a7c7899412b9d` | `f4e0e27cc75747f2ad09ac4bccda3e0d1cbf34df174e9584074e56957377cd22` |
+
+### Final compiled mutation pins
+
+These hashes include deterministic type-name isolation in the actual compiled
+LF bundle. Every row below was assertion-killed in final run 5.
+
+| Mutant | Compiled LF SHA256 |
+| --- | --- |
+| index | `0d07d75be68a7f315acd25b3a7e1ee3f92b3654247da424a346f3c7760829a11` |
+| complete | `c50d0b0845b1eb87845cead5097c14e20d947b55e929b0a3c223d911ed005622` |
+| timeout | `b8ff1b87a80190b0e0a7a6f14290b40d03b9c4b8f0e40cd15fa0017116a10838` |
+| arguments | `b582c81f527be0d1d41c1d0d037b787cc878a9732f61569648bf8b4b19d31116` |
+| environment | `94c8ed41517511a0b0d5b1885346937f870baeeac42776249ae823b1705b8d43` |
+| held-pin | `4fb80d703f895b27d99a23851191ffa359f6480e7194bf0b5eb4971fc433b032` |
+| link2 | `5b2de72a63689f46f66cfb711c82628e8d5b72cd808fba0d8c41c24857ba2481` |
+| argument-escape | `7ade46717839b1025b39abd0d2ee090eba4f1d05112ef0b4d47f32a4718499c0` |
+| frame-eof | `b2bf01fd6c9f5ae68c6f81e4fb1becad3132d420aaabfde8c85f568fc3899f9e` |
+| frame-output | `446962c37761bed8716e2647bcd89df4a0f6c22475463b9d523f2903ac84569a` |
+| manifest-extra | `4771f249cd40b156beaf297e2a81516f6a52e7afb7081d52c2c4f0625e185d20` |
+| manifest-external | `2a38499de3ac0f5b4d3e56288fc716683a94f3443b87ad8495532bb4ce94f75a` |
+| manifest-commit | `ae6a4ea4a76250037baa335ec4bc7200094f722681510af7fabeba759a545d35` |
+| cleanup-kill-first | `ead375c99849cc872b7966da1bacf17ba530c5c624d65b931faef754aa46219f` |
+| cleanup-active | `7eb240897d74696ce8576d1f0d81743b788aca0e359b7167a6e7280d024bb8c0` |
+| cleanup-deadline | `e3d11c3abf8cb4e8165a0d1a778c150fd80b75a93759ed1633c69af9b11006bb` |
+| post-hash-links | `4b0be2b2724369a2a2087b2d40292993c467d8ba99ed41a83af1d199c9627391` |
+| frame-complete | `fb53d103092855fe4327b97f11b48ecb5f8c7ba14dfc2733bc6ceb711b12c750` |
+| frame-order | `b17f5be6fe840148c278c82b670030d98bd0972c3c4c376711fd9f0ee92e0977` |
+| manifest-self-field | `ae0208a0a8d7c4d96c99d5efbfc8a49d5172804bd5982292465e6cc6bf89b432` |
+| clock-order | `08d8ec1361481058a4c34c1747a0c50e8d6a526846875b76d20f4d7c9c4d26ea` |
+| names-extra | `5afd918b392a5ba0413efbaf5a8b4ec1cc15df27d145a43566dc6293453540d1` |
+| names-repeat | `8abd214b2440d15545275e3ac2c45c0edb6ea92aea6fb8048754e292ea5e1ddb` |
+| names-missing | `684906ab4b6e470315b82fe9f560b8cc1357180dc032e712e9848f5492dc5eea` |
+| names-reparse | `1576c8921a69ac617c9aa6ccd1f35d82c79dcd4e9272ba9df5c32252a2388a62` |
+| names-tag | `5e00ba8032848f95a1fb46e88c854d3cd2c7c9686f124a87fde01b229c2e342b` |
+| names-leaf | `af947a7d80e7d780e470aad3d198746c199aa9a46b000cc4bf7118c80967f05a` |
+| names-type | `a55ffaf2a9630cdac4adc8734f3b01aee2740814c4cd9aaf63dc676c9263ceaf` |
+| names-dot-type | `52ca2b211197f455060a91c4d169ee28ca0c3cde12a07d78a52fec6079d94327` |
+| names-id | `e68f345c19446d751138afdbb3e49ad45f1121cae6d2f7a3133dd1536c0d22b0` |
+| scan-id | `0c637376ef99a3bd55699d71671a6b49a8f233183fb1cb7920db3f50717dd20e` |
+| scan-wire | `de8bb896e49c1e1b020cc4bd5cf49522bdc9926e9fdb9390833aa51dc7f2f908` |
+| scan-first-wire | `c38d7c3593fcfed4730e28f7d43cab8b9bf47952a4e72eb7c5f99068d2f45bfb` |
+| scan-second-wire | `166320f0b456a60f391e9afac980ce99596a17c845d30e2af4a1c9ab64143099` |
+| leaf-id-wire | `b770a41e0b40a361f9521597d20631f58ae3c94b5614566f65464d7aa50938d6` |
+| leaf-size-wire | `1c15f81dd817fad499ae88e880fb1696dc7fb8d91327efc5e130bc04cc848f78` |
+| root-volume | `e7e6b9c3edaf5e7b710690e7495d5328fae70b6ec5ce94b4be701ccb247f0485` |
+| root-nested | `efeb95018ec7022639cef6179e7ff6c50a559aad9707b6aa7ceaf5cb609734a1` |
+| root-equal | `9f3933821f987b6d23b9e11142600b246910f7e3aaca5f2eff271312ca5eede0` |
+| root-parent | `72be711ffe010d0f5446763235aa04246c5a0cc19de366e2371c61cbdbceeb1f` |
+| root-pins | `be4f574f7f08b355ccba1db0cfab8edcb265ed697d86f33df97f53fadb8b964e` |
+| root-helper | `5e2cf5db250bff927452e214445c6eb06c2f2888db02274493d77eca334d4c4e` |
+| root-temp | `0f92a8e1f857198a8057e4f16fcd33003a6637db03f022257f0d79fff379c994` |
+| root-wire | `ecf6ff39aaddc5187395db10286a2078f61a26a561477eb8aa5ccc370e49cad5` |
+| final-refusal | `cc27faa6738ccc038ab8bfe237b8b3881e85b2401229e21007f8d9a7ca1edd75` |
+
+Not run: native/runtime APIs, controller/helper/child launch, PowerShell entry,
+run_inner, native fixture, native or ordinary/full/discovery Rust tests, CLI,
+filesystem/process/system/private-state inspection, provenance preparation,
+install/network/GitHub/CI/dispatch, owner/admin/VM/account/service actions.
+No Rust edit or Cargo/fmt command was needed. Gate 2 entry remains GATE2_ONLY;
+registration_enabled remains false, with no test/ignored/CLI native entry.
+
+Remaining gates: fresh independent Grok/Muse source review; held fixed manifest
+and Git-blob/provenance/lock binding; dedicated telemetry transport; accepted
+launch grammar; deadline waiter/supervisor including synchronous-call limits;
+separate selected standard-account environment/nested Job proof, bounded native
+authorization, measured 300/360/60 and full-job budget; separate publication and
+required-check/coordinator merge gates. None is cleared by this source slice.
+
+M2 **incomplete**; main71 cause **unknown**, no historical retry; Phase 1 has no
+focused native red loop; real-Runner PA6 replay **OPEN**; all hardware paths
+**unverified on real hardware**. Native proof **UNRUN**.
+
+Evidence-write ledger: apply_patch refused to decode the pre-existing evidence
+file as UTF-8 (invalid byte at offset 39689). No write occurred. Appended this
+note as UTF-8 bytes without rewriting the pre-existing byte prefix; exact prefix
+equality was checked. This is an evidence encoding issue, not a source/test fix.
