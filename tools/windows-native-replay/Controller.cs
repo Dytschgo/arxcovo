@@ -51,6 +51,7 @@ internal static class ReplayController {
         new Row(0,1,1), // 34
     };
     internal struct Event {
+        // durationMs=0 is a reserved legacy field, NOT a runtime measurement.
         internal int index, consumed, creates, resumes, clean, stdout, stderr, durationMs;
         internal bool begin;
         internal Event(int index, bool begin, int consumed=0, int creates=0,
@@ -154,7 +155,7 @@ internal static class ReplayController {
                         if(!job.Pump(decoder,out eof) || !Poll() || clock.ElapsedMilliseconds>=358000) return Abort();
                         bool exited=job.Exited(out code);
                         if(exited && eof) {
-                            if(code!=0 || job.Active()!=0 || !decoder.Segment(filter==0?2:70)) return Abort();
+                            if(code!=0 || job.Active()!=0 || !decoder.ClosedSegment(filter==0?2:70)) return Abort();
                             while(!channel.Empty) if(!Poll()) return Abort();
                             if(filter==1 && !Success(true,code,job.Active())) return Abort();
                             break;
@@ -179,6 +180,23 @@ internal static class ReplayController {
             job.Dispose(); disposed=true;
         }
     }
+    // Native boundary is injected only for in-memory checks. Each poll peeks once
+    // and reads at most available bytes/4096. Sole reader prevents a peek/read
+    // race with another consumer. No callback, wait, retry or blocking empty read.
+    internal interface ITelemetryRead {
+        bool Peek(out uint available,out bool eof);
+        bool Read(byte[] bytes,int count,out uint read);
+    }
+    internal static bool PumpTelemetry(ITelemetryRead pipe,byte[] buffer,FrameDecoder decoder,out bool eof) {
+        eof=false; uint available;
+        if(pipe==null || buffer==null || buffer.Length!=4096 || decoder==null) return false;
+        if(!pipe.Peek(out available,out eof)) return decoder.TransportFailure();
+        if(eof) return available==0 ? decoder.PipeEof() : decoder.TransportFailure();
+        if(available==0) return true;
+        int count=(int)Math.Min(available,4096u); uint read;
+        if(!pipe.Read(buffer,count,out read) || read==0 || read>(uint)count) return decoder.TransportFailure();
+        return decoder.Feed(buffer,(int)read);
+    }
     // Fixed binary wire grammar: 10 little-endian uint32 fields, 40 bytes.
     // magic, index, begin, consumed, creates, resumes, clean, stdout, stderr, ms.
     // Single producer only; neither feed nor finish ever waits for input.
@@ -186,7 +204,7 @@ internal static class ReplayController {
         readonly RowChannel channel;
         readonly byte[] frame=new byte[40];
         int used, frames;
-        bool failed, ended;
+        bool failed, ended, kernelEof;
         internal FrameDecoder(RowChannel channel) { this.channel=channel; }
         internal bool Failed { get { return failed; } }
         internal bool Feed(byte[] bytes,int count) {
@@ -209,6 +227,12 @@ internal static class ReplayController {
             if(expected==70) ended=true;
             return true;
         }
+        internal bool ClosedSegment(int expected) { return !failed && used==0 && frames==expected && (expected==2?kernelEof:ended); }
+        internal bool PipeEof() {
+            if(frames==2 && !kernelEof) { kernelEof=true; return Segment(2); }
+            return frames==70 ? Segment(70) : Fail();
+        }
+        internal bool TransportFailure() { return Fail(); }
         internal bool Finish() { return Segment(70); }
         bool Fail() { failed=true; channel.Invalidate(); return false; }
     }
@@ -322,6 +346,7 @@ public static class PureControllerChecks {
         ManifestChecks();
         AdmissionPureChecks.Run();
         BindingPureChecks.Run();
+        TransportPureChecks.Run();
         Check(ReplayController.CleanupConfirmed(true,0,true,1,2),"cleanup zero");
         Check(!ReplayController.CleanupConfirmed(false,0,true,1,2),"cleanup kill first");
         Check(!ReplayController.CleanupConfirmed(true,1,true,1,2),"cleanup active");
@@ -640,5 +665,79 @@ internal static class BindingPureChecks {
         Reject("duplicate provenance key",x=> { byte[] b=Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(x.Data[Root+@"\provenance.bin"]).Insert(1,"\"schema\":1,")); x.Data[Root+@"\provenance.bin"]=b; x.Pin("provenance")["sha256"]=Hash(b); x.Pin("provenance")["size"]=b.Length; x.SealManifest(); },false);
         Reject("malformed disposition",x=> { byte[] b=Encoding.UTF8.GetBytes("{"); x.Data[Base+"run-disposition.json"]=b; x.Trust=Hash(b); },false);
         Reject("malformed manifest",x=> { byte[] b=Encoding.UTF8.GetBytes("{"); x.Data[Base+"run-manifest.json"]=b; x.Disposition["manifest"]["sha256"]=Hash(b); x.Disposition["manifest"]["size"]=1; byte[] d=Bytes(x.Disposition); x.Data[Base+"run-disposition.json"]=d; x.Trust=Hash(d); },false);
+    }
+}
+
+// These mocks exercise the actual poll/decoder seam, never NativeJob or imports.
+internal static class TransportPureChecks {
+    static void Check(bool ok,string label) { if(!ok) throw new Exception("transport: "+label); }
+    sealed class Reader : ReplayController.ITelemetryRead {
+        internal byte[] Bytes=new byte[0];
+        internal int Offset,Peeks,Reads,Limit=4096;
+        internal bool Broken,ReadError,Zero,Overread,PeekError;
+        public bool Peek(out uint available,out bool eof) {
+            Peeks++; available=(uint)(Bytes.Length-Offset); eof=Broken && available==0; return !PeekError;
+        }
+        public bool Read(byte[] bytes,int count,out uint read) {
+            Reads++; Check(count<=4096 && count<=Bytes.Length-Offset,"bounded read");
+            read=(uint)(Zero?0:Math.Min(count,Limit));
+            Array.Copy(Bytes,Offset,bytes,0,(int)read); Offset+=(int)read;
+            if(Overread) read=(uint)count+1;
+            return !ReadError;
+        }
+    }
+    // Independent literal wire oracle: do not call the Rust or managed serializer.
+    static byte[] Pair(int index) {
+        byte[] begin={65,82,88,50,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        var end=(byte[])begin.Clone(); begin[4]=(byte)index; end[4]=(byte)index; end[8]=0;
+        end[12]=(byte)(index>=1 && index<=32?1:0); end[16]=(byte)(index>=15?1:0); end[20]=(byte)(index>=19?1:0);
+        var result=new byte[80]; Array.Copy(begin,result,40); Array.Copy(end,0,result,40,40); return result;
+    }
+    internal static void Run() {
+        var buffer=new byte[4096]; var channel=new ReplayController.RowChannel();
+        var decoder=new ReplayController.FrameDecoder(channel); var state=new ReplayController.MonitorState();
+        var empty=new Reader(); bool eof;
+        Check(ReplayController.PumpTelemetry(empty,buffer,decoder,out eof) && !eof && empty.Reads==0 && empty.Peeks==1,"empty never reads");
+        // Fragmented kernel, then a different matrix reader with the SAME decoder.
+        int polls=0;
+        for(int segment=0;segment<2;segment++) {
+            var bytes=new List<byte>();
+            for(int i=segment==0?0:1;i<(segment==0?1:35);i++) bytes.AddRange(Pair(i));
+            var r=new Reader {Bytes=bytes.ToArray(),Limit=7,Broken=true};
+            do {
+                Check(ReplayController.PumpTelemetry(r,buffer,decoder,out eof),"complete pump");
+                Check(state.Poll(channel,++polls),"ordered poll");
+            } while(!eof);
+            while(!channel.Empty) Check(state.Poll(channel,++polls),"drain");
+            Check(decoder.ClosedSegment(segment==0?2:70),"segment EOF");
+        }
+        Check(state.Success(channel,true,0,0),"complete session");
+        Check(!decoder.Feed(Pair(34),80),"trailing frames");
+        for(int fault=0;fault<9;fault++) {
+            channel=new ReplayController.RowChannel(); decoder=new ReplayController.FrameDecoder(channel);
+            var r=new Reader {Bytes=Pair(0),Broken=true};
+            if(fault==0) r.Bytes=new byte[0]; // missing
+            if(fault==1) Array.Resize(ref r.Bytes,79); // partial EOF
+            if(fault==2) r.Bytes[0]=0; // raw text / magic
+            if(fault==3) r.Bytes[44]=1; // wrong index
+            if(fault==4) r.Bytes[48]=1; // duplicate begin
+            if(fault==5) r.ReadError=true;
+            if(fault==6) r.Zero=true;
+            if(fault==7) r.Overread=true;
+            if(fault==8) r.PeekError=true;
+            bool ok=true;
+            if(fault==7) {
+                Check(!ReplayController.PumpTelemetry(r,buffer,decoder,out eof) && channel.Empty,"overread immediate rejection");
+                continue;
+            }
+            for(int i=0;i<3 && ok;i++) ok=ReplayController.PumpTelemetry(r,buffer,decoder,out eof);
+            Check(!ok && decoder.Failed && channel.Failed,"reject fault "+fault);
+        }
+        channel=new ReplayController.RowChannel(); decoder=new ReplayController.FrameDecoder(channel);
+        for(int i=0;i<70;i++) Check(channel.Publish(new ReplayController.Event(0,true)),"fill");
+        Check(!ReplayController.PumpTelemetry(new Reader {Bytes=Pair(0)},buffer,decoder,out eof) && channel.Failed,"overflow");
+        channel=new ReplayController.RowChannel(); decoder=new ReplayController.FrameDecoder(channel);
+        var large=new Reader {Bytes=new byte[8192]};
+        Check(!ReplayController.PumpTelemetry(large,buffer,decoder,out eof) && large.Offset==4096 && large.Reads==1,"one bounded read");
     }
 }

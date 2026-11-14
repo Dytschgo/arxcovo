@@ -109,7 +109,8 @@ handle list, explicit UTF-16 four-value environment and outer kill-on-close Job
 assignment before resume. Toolchain Cargo remains an artifact pin; it is not a
 runtime rebuild command. This grammar change requires independent review.
 OwnedSession owns this Job and its clock across both filters. Rust dormant row
-functions emit frames directly to inherited stderr; stdout is discarded.
+functions now take a dedicated typed telemetry writer; both raw harness streams
+are discarded to NUL (see the dedicated transport follow-up below).
 Frame order and complete segment counts are checked independently of Budget.
 
 BLOCKED: Admission.Revalidate still unconditionally refuses. The held binder
@@ -170,3 +171,46 @@ Dedicated transport, accepted launch grammar, deadline waiter/supervisor,
 registration, environment selection and runtime proof remain outside this slice.
 Fresh Grok/Muse review is required before publication. M2 incomplete; main71
 cause unknown/no retry; Phase 1 no native redloop; PA6 OPEN; hardware unverified.
+
+
+## Dedicated telemetry transport follow-up (source only)
+
+Supersedes item 5's missing IPC adapter and the old stderr transport inventory.
+NativeJob creates one telemetry pipe, clears inheritance on its sole parent
+reader, and prepares exactly three unique inherited handles in the attribute
+allowlist: NUL stdin, shared NUL stdout/stderr, and a separate telemetry writer.
+Both raw harness streams go directly to the null device and are never decoded.
+The parent writer copy closes in finally before EOF observation, including on
+launch failure. NativeJob owns the reader until Next/Dispose. Its read adapter
+performs one PeekNamedPipe and at most one ReadFile of min(available,4096) per
+poll; an empty peek never reads. There is one reader and no read callback.
+ERROR_BROKEN_PIPE is EOF, all other peek/read errors fail closed. The injected
+boundary checks zero/oversize reads, fragmented frames, partial/missing EOF,
+order, duplicates, overflow, exact segment completeness and final trailing data.
+The same decoder/channel/session spans kernel 0 then matrix 1..34.
+
+Rust's cfg(test) fixture takes an explicit Telemetry<NativeWriter> parameter.
+NativeWriter takes sole ownership of a Handle, refuses invalid/std handles and
+non-pipes, verifies inheritance and clears it BEFORE any fixture helper can
+launch. It closes through Handle's destructor on failure/unwind/return; there
+is no duplicate or production field. emit_frame uses that writer only, with a
+single exact 40-byte write; short/error writes latch failure and do not retry.
+The serializer stays pure with independent literal byte assertions. The pure
+producer check calls emit_frame with a mock writer for begin/end and failure
+counts; no WriteFile is reachable from that check.
+
+External handle delivery is still proposed and UNWIRED. No CLI argument,
+environment variable, libtest registration or discovery entry was added. The
+four-variable environment grammar is unchanged. RequireTelemetryBinding throws
+before CreateProcessW even if admission were bypassed; it marks the separate
+SP-GRAMMAR disposition needed to connect a future internal wrapper. The source
+transport is complete within this explicit boundary; it is not launch-ready.
+Revalidate's final refusal, GATE2_ONLY and disabled selectors remain in force.
+No Run constructs OwnedSession. Fresh Grok/Muse review is required at final
+source/evidence pins before publication. This builder does not delegate it.
+
+Duration remains OPEN: the legacy frame ms value 0 is reserved, never a measured
+runtime. No entry/row clock was added and no supervisor race/deadline fix is
+claimed. Environment selection, nested Job compatibility and budget are UNRUN.
+M2 incomplete; main71 cause unknown; no historical retry; Phase 1 no focused
+native red loop; PA6 OPEN; **unverified on real hardware**.

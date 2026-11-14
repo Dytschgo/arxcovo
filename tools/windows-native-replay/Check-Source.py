@@ -55,7 +55,7 @@ job = (root / "tools/windows-native-replay/NativeJob.cs").read_text()
 assert "0x80404" in job and "flags=0x2000" in job
 assert job.index("AssignProcessToJobObject(job,process)") < job.index("ResumeThread(thread)!=1")
 assert "TerminateJobObject(job,1)" in job and "WaitForSingleObject(process,0)" in job
-assert "emit_frame(index, true" in code and "emit_frame(0, true" in code
+assert "emit_frame(channel, index, true" in code and "emit_frame(channel, 0, true" in code
 admission = (root / "tools/windows-native-replay/Admission.cs").read_text()
 assert "remaining admission gates unproved" in admission
 assert "RevalidateBoundary(held,pins,Root,helper,temp,systemRoot)" in admission
@@ -83,3 +83,18 @@ assert "GitBlob(bytes[p.role])==p.blob" in admission
 assert "BindingPureChecks.Run();" in controller
 assert "new OwnedSession(" not in controller.split("public static void Run()", 1)[1]
 print("gate2 binding: externally pinned disposition -> held manifest -> held source Git/provenance/aliases; runtime refused")
+
+assert "ReadPipe(error" not in job and "ReadPipe(output" not in job
+assert "output=discard.DangerousGetHandle(),error=discard.DangerousGetHandle()" in job
+assert "input.DangerousGetHandle(),discard.DangerousGetHandle(),telemetryWrite.DangerousGetHandle()" in job
+assert "RequireTelemetryBinding();" in job and "telemetry launch binding grammar unreviewed" in job
+assert "PumpTelemetry(reader,buffer,decoder,out eof)" in job
+assert "Math.Min(available,4096u)" in controller and "decoder.PipeEof()" in controller
+producer = code.split("fn emit_frame",1)[1].split("fn one_row",1)[0]
+assert "GetStdHandle" not in producer and "WriteFile" not in producer
+assert "WriteFile(self.0.0" in code
+assert "SetHandleInformation(handle.0, HANDLE_FLAG_INHERIT, 0)" in code
+serializer = code.split("fn frame(",1)[1].split("trait FrameWrite",1)[0]
+assert "WriteFile" not in serializer
+assert "TransportPureChecks.Run();" in controller
+print("dedicated telemetry source: separate writer allowlist; NUL raw streams; bounded mockable read; typed fixture writer; external grammar unwired")

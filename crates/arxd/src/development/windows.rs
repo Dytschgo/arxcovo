@@ -1557,7 +1557,9 @@ mod native_replay {
     use super::*;
     use diag::Stage;
     use std::cell::RefCell;
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Fill {
@@ -2158,26 +2160,58 @@ mod native_replay {
         }
         bytes
     }
-    fn emit_frame(index: u32, begin: bool, observed: [u32; 7]) {
-        let bytes = frame(index, begin, observed);
-        let mut written = 0;
-        // Bypass libtest's captured text. Only a future registered wrapper may
-        // enter these functions, with stderr sealed to the controller's pipe.
-        assert_ne!(
+    // Explicit owned channel, private to cfg(test). No stdio fallback, env lookup,
+    // CLI registration or production backend field. External delivery is UNWIRED.
+    trait FrameWrite {
+        fn write_frame(&mut self, bytes: &[u8; 40]) -> Option<u32>;
+    }
+    struct Telemetry<W> {
+        writer: W,
+        failed: bool,
+    }
+    struct NativeWriter(Handle);
+    impl NativeWriter {
+        // Caller transfers sole ownership of the inherited dedicated write handle.
+        // Handle closes on validation failure, panic, or normal scope exit. The parent
+        // closes its copy immediately after launch; fixtures never duplicate it.
+        fn from_inherited(handle: Handle) -> Self {
+            assert!(!handle.0.is_null() && handle.0 != INVALID_HANDLE_VALUE);
             unsafe {
-                WriteFile(
-                    GetStdHandle(STD_ERROR_HANDLE),
-                    bytes.as_ptr(),
-                    40,
-                    &mut written,
-                    null_mut(),
-                )
-            },
-            0
-        );
-        assert_eq!(written, 40);
+                assert_ne!(handle.0, GetStdHandle(STD_INPUT_HANDLE));
+                assert_ne!(handle.0, GetStdHandle(STD_OUTPUT_HANDLE));
+                assert_ne!(handle.0, GetStdHandle(STD_ERROR_HANDLE));
+                assert_eq!(GetFileType(handle.0), FILE_TYPE_PIPE);
+                let mut flags = 0;
+                assert_ne!(GetHandleInformation(handle.0, &mut flags), 0);
+                assert_ne!(flags & HANDLE_FLAG_INHERIT, 0);
+                // Before any run_inner/helper launch: never inherit to grandchildren.
+                assert_ne!(SetHandleInformation(handle.0, HANDLE_FLAG_INHERIT, 0), 0);
+            }
+            Self(handle)
+        }
+    }
+    impl FrameWrite for NativeWriter {
+        fn write_frame(&mut self, bytes: &[u8; 40]) -> Option<u32> {
+            let mut written = 0;
+            (unsafe { WriteFile(self.0.0, bytes.as_ptr(), 40, &mut written, null_mut()) } != 0)
+                .then_some(written)
+        }
+    }
+    fn emit_frame<W: FrameWrite>(
+        channel: &mut Telemetry<W>,
+        index: u32,
+        begin: bool,
+        observed: [u32; 7],
+    ) -> bool {
+        if channel.failed {
+            return false;
+        }
+        // One bounded write. Short/error writes latch failure; never retry fragments.
+        channel.failed = channel.writer.write_frame(&frame(index, begin, observed)) != Some(40);
+        !channel.failed
     }
     fn one_row(
+        channel: &mut Telemetry<NativeWriter>,
         settings: &Settings,
         hash: [u8; 32],
         index: u32,
@@ -2185,7 +2219,7 @@ mod native_replay {
         fill: Fill,
         injection: Option<(Stage, u32)>,
     ) {
-        emit_frame(index, true, [0, 0, 0, 1, 0, 0, 0]);
+        assert!(emit_frame(channel, index, true, [0, 0, 0, 1, 0, 0, 0]));
         assert!(diag::empty());
         let (execution, _helper_pins) = prepared_execution(settings, hash); // fresh EVERY row, no discovery.
         assert!(!execution.policy_fixture && !execution.quarantined.load(Ordering::Acquire));
@@ -2243,7 +2277,8 @@ mod native_replay {
             );
         }
         let totals = FIXTURE.with(|s| s.borrow().totals).unwrap_or((0, 0));
-        emit_frame(
+        assert!(emit_frame(
+            channel,
             index,
             false,
             [
@@ -2253,9 +2288,9 @@ mod native_replay {
                 1,
                 totals.0 as u32,
                 totals.1 as u32,
-                0,
+                0, // Reserved; duration measurement remains OPEN.
             ],
-        );
+        ));
     }
     // Canonical global numbering: kernel=0, matrix local 0..33 => 1..34.
     fn matrix_index(local: u32) -> u32 {
@@ -2264,9 +2299,10 @@ mod native_replay {
     }
     // Future filter development::windows::native_replay::bounded_matrix.
     // NO registration in Gate 2. An external controller must enforce deadlines.
-    fn bounded_matrix(settings: &Settings, hash: [u8; 32]) {
+    fn bounded_matrix(channel: &mut Telemetry<NativeWriter>, settings: &Settings, hash: [u8; 32]) {
         for (i, row) in ORACLE.into_iter().enumerate() {
             one_row(
+                channel,
                 settings,
                 hash,
                 matrix_index(i as u32),
@@ -2285,6 +2321,7 @@ mod native_replay {
         .enumerate()
         {
             one_row(
+                channel,
                 settings,
                 hash,
                 matrix_index(28 + i as u32),
@@ -2293,12 +2330,28 @@ mod native_replay {
                 Some((stage, 109)),
             );
         }
-        one_row(settings, hash, matrix_index(32), None, Fill::Loop, None);
-        one_row(settings, hash, matrix_index(33), None, Fill::Final, None);
+        one_row(
+            channel,
+            settings,
+            hash,
+            matrix_index(32),
+            None,
+            Fill::Loop,
+            None,
+        );
+        one_row(
+            channel,
+            settings,
+            hash,
+            matrix_index(33),
+            None,
+            Fill::Final,
+            None,
+        );
     }
     // Future filter development::windows::native_replay::kernel_peek_capture.
-    fn kernel_peek_capture() {
-        emit_frame(0, true, [0, 0, 0, 1, 0, 0, 0]);
+    fn kernel_peek_capture(channel: &mut Telemetry<NativeWriter>) {
+        assert!(emit_frame(channel, 0, true, [0, 0, 0, 1, 0, 0, 0]));
         assert!(diag::empty());
         let (r, o) = diag::observe(|| {
             let _invocation = diag::Invocation::enter();
@@ -2312,11 +2365,12 @@ mod native_replay {
         assert!(record.valid && record.wait.is_none() && record.ms.is_none());
         assert_eq!((o.create_calls, o.resume_calls, o.consumed), (0, 0, 0));
         assert!(diag::empty());
-        emit_frame(
+        assert!(emit_frame(
+            channel,
             0,
             false,
             [o.consumed, o.create_calls, o.resume_calls, 1, 0, 0, 0],
-        );
+        ));
     }
 
     // Closed numeric case record parser for a future controller. No raw diagnostic
@@ -2369,6 +2423,46 @@ mod native_replay {
                     0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0
                 ]
             );
+            struct MockWriter {
+                bytes: Vec<u8>,
+                result: Option<u32>,
+                calls: usize,
+            }
+            impl FrameWrite for MockWriter {
+                fn write_frame(&mut self, bytes: &[u8; 40]) -> Option<u32> {
+                    self.calls += 1;
+                    self.bytes.extend_from_slice(bytes);
+                    self.result
+                }
+            }
+            let mut channel = Telemetry {
+                writer: MockWriter {
+                    bytes: vec![],
+                    result: Some(40),
+                    calls: 0,
+                },
+                failed: false,
+            };
+            assert!(emit_frame(&mut channel, 34, false, [0, 1, 1, 1, 1, 1, 0]));
+            assert_eq!(channel.writer.bytes, end);
+            assert_eq!(channel.writer.calls, 1);
+            channel.writer.bytes.clear();
+            assert!(emit_frame(&mut channel, 0, true, [0, 0, 0, 1, 0, 0, 0]));
+            assert_eq!(channel.writer.bytes, begin);
+            assert_eq!(channel.writer.calls, 2);
+            for result in [None, Some(0), Some(39), Some(41)] {
+                let mut channel = Telemetry {
+                    writer: MockWriter {
+                        bytes: vec![],
+                        result,
+                        calls: 0,
+                    },
+                    failed: false,
+                };
+                assert!(!emit_frame(&mut channel, 0, true, [0, 0, 0, 1, 0, 0, 0]));
+                assert!(!emit_frame(&mut channel, 0, true, [0, 0, 0, 1, 0, 0, 0]));
+                assert_eq!(channel.writer.calls, 1);
+            }
         }
         #[test]
         fn counters_survive_invocation_and_scope_clears_even_on_unwind() {

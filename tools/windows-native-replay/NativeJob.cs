@@ -38,7 +38,23 @@ internal sealed class NativeJob : IDisposable {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(SafeFileHandle process,out uint code);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool PeekNamedPipe(SafeFileHandle pipe,IntPtr data,uint size,IntPtr read,out uint available,IntPtr left);
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(SafeFileHandle pipe,byte[] bytes,uint size,out uint read,IntPtr overlapped);
-    SafeFileHandle job,process,thread,output,error;
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string path,uint access,uint share,ref Security security,uint creation,uint flags,IntPtr template);
+    SafeFileHandle job,process,thread,telemetry;
+    sealed class PipeReader : ReplayController.ITelemetryRead {
+        readonly SafeFileHandle pipe;
+        internal PipeReader(SafeFileHandle pipe) { this.pipe=pipe; }
+        public bool Peek(out uint available,out bool eof) {
+            eof=false;
+            if(PeekNamedPipe(pipe,IntPtr.Zero,0,IntPtr.Zero,out available,IntPtr.Zero)) return true;
+            eof=Marshal.GetLastWin32Error()==109;
+            if(eof) available=0; // failed API output is not a byte count
+            return eof;
+        }
+        public bool Read(byte[] bytes,int count,out uint read) {
+            return ReadFile(pipe,bytes,(uint)count,out read,IntPtr.Zero);
+        }
+    }
+    PipeReader reader;
     readonly byte[] buffer=new byte[4096];
     bool disposed;
     internal NativeJob() {
@@ -51,28 +67,44 @@ internal sealed class NativeJob : IDisposable {
         if(!QueryInformationJobObject(job,1,out info,Marshal.SizeOf<Accounting>(),IntPtr.Zero)) throw new InvalidOperationException("job query refused");
         return info.active;
     }
-    static void Pipe(out SafeFileHandle read,out SafeFileHandle write,bool inheritRead) {
+    static void Pipe(out SafeFileHandle read,out SafeFileHandle write) {
         var s=new Security {size=Marshal.SizeOf<Security>(),inherit=1};
-        if(!CreatePipe(out read,out write,ref s,4096)) throw new InvalidOperationException("pipe refused");
-        if(!SetHandleInformation(inheritRead?write:read,1,0)) { read.Dispose(); write.Dispose(); throw new InvalidOperationException("inheritance refused"); }
+        if(!CreatePipe(out read,out write,ref s,4096)) {
+            read?.Dispose(); write?.Dispose(); throw new InvalidOperationException("pipe refused");
+        }
+        if(read.IsInvalid || write.IsInvalid) {
+            read.Dispose(); write.Dispose(); throw new InvalidOperationException("invalid pipe refused");
+        }
+        if(!SetHandleInformation(read,1,0)) { read.Dispose(); write.Dispose(); throw new InvalidOperationException("inheritance refused"); }
     }
     internal void Launch(string app,string cwd,string[] args,byte[] env) {
         if(disposed || process!=null || Active()!=0) throw new InvalidOperationException("session reuse refused");
-        SafeFileHandle input=null,inputWrite=null,outWrite=null,errWrite=null;
+        SafeFileHandle input=null,discard=null,telemetryWrite=null;
         IntPtr list=IntPtr.Zero, values=IntPtr.Zero; bool initialized=false;
         try {
-            Pipe(out input,out inputWrite,true); Pipe(out output,out outWrite,false); Pipe(out error,out errWrite,false);
+            // NUL is the sink for BOTH raw harness streams. Neither is decoded.
+            var security=new Security {size=Marshal.SizeOf<Security>(),inherit=1};
+            input=CreateFileW("NUL",0x80000000,3,ref security,3,0,IntPtr.Zero);
+            discard=CreateFileW("NUL",0x40000000,3,ref security,3,0,IntPtr.Zero);
+            if(input.IsInvalid || discard.IsInvalid) throw new InvalidOperationException("null streams refused");
+            Pipe(out telemetry,out telemetryWrite);
+            reader=new PipeReader(telemetry);
             IntPtr size=IntPtr.Zero;
             InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref size);
             if(size.ToInt64()<=0 || size.ToInt64()>65536) throw new InvalidOperationException("attribute size refused");
             list=Marshal.AllocHGlobal(size); values=Marshal.AllocHGlobal(3*IntPtr.Size);
             if(!InitializeProcThreadAttributeList(list,1,0,ref size)) throw new InvalidOperationException("attribute list refused");
             initialized=true;
-            Marshal.Copy(new[]{input.DangerousGetHandle(),outWrite.DangerousGetHandle(),errWrite.DangerousGetHandle()},0,values,3);
+            Marshal.Copy(new[]{input.DangerousGetHandle(),discard.DangerousGetHandle(),telemetryWrite.DangerousGetHandle()},0,values,3);
             if(!UpdateProcThreadAttribute(list,0,(UIntPtr)0x20002,values,(IntPtr)(3*IntPtr.Size),IntPtr.Zero,IntPtr.Zero)) throw new InvalidOperationException("handle list refused");
-            var startup=new Startup {size=Marshal.SizeOf<Startup>(),flags=0x100,input=input.DangerousGetHandle(),output=outWrite.DangerousGetHandle(),error=errWrite.DangerousGetHandle(),attributes=list};
+            var startup=new Startup {size=Marshal.SizeOf<Startup>(),flags=0x100,input=input.DangerousGetHandle(),output=discard.DangerousGetHandle(),error=discard.DangerousGetHandle(),attributes=list};
             var command=new StringBuilder(ReplayController.LaunchSpec.Quote(app));
             foreach(string arg in args) command.Append(' ').Append(ReplayController.LaunchSpec.Quote(arg));
+            // Exactly three unique handles: NUL input, shared NUL output/error,
+            // dedicated telemetry writer. Reader and Job are never inherited.
+            // No argv/env slot conveys this value today. A future reviewed wrapper
+            // must take ownership and clear INHERIT before any fixture child.
+            RequireTelemetryBinding();
             ProcessInfo info;
             if(!CreateProcessW(app,command,IntPtr.Zero,IntPtr.Zero,true,0x80404,env,cwd,ref startup,out info)) throw new InvalidOperationException("launch refused");
             process=new SafeFileHandle(info.process,true); thread=new SafeFileHandle(info.thread,true);
@@ -88,23 +120,15 @@ internal sealed class NativeJob : IDisposable {
             if(initialized) DeleteProcThreadAttributeList(list);
             if(list!=IntPtr.Zero) Marshal.FreeHGlobal(list);
             if(values!=IntPtr.Zero) Marshal.FreeHGlobal(values);
-            input?.Dispose(); inputWrite?.Dispose(); outWrite?.Dispose(); errWrite?.Dispose();
+            // Parent writer closes on success AND failure, before EOF is observed.
+            input?.Dispose(); discard?.Dispose(); telemetryWrite?.Dispose();
         }
     }
-    bool ReadPipe(SafeFileHandle pipe,ReplayController.FrameDecoder decoder,out bool eof) {
-        eof=false; uint available;
-        if(!PeekNamedPipe(pipe,IntPtr.Zero,0,IntPtr.Zero,out available,IntPtr.Zero)) {
-            if(Marshal.GetLastWin32Error()==109) { eof=true; return true; }
-            return false;
-        }
-        if(available==0) return true;
-        uint read;
-        if(!ReadFile(pipe,buffer,Math.Min(available,4096),out read,IntPtr.Zero) || read==0) return false;
-        return decoder==null || decoder.Feed(buffer,(int)read); // raw stdout discarded
+    static void RequireTelemetryBinding() {
+        throw new InvalidOperationException("telemetry launch binding grammar unreviewed");
     }
     internal bool Pump(ReplayController.FrameDecoder decoder,out bool eof) {
-        bool ignored;
-        return ReadPipe(output,null,out ignored) & ReadPipe(error,decoder,out eof);
+        return ReplayController.PumpTelemetry(reader,buffer,decoder,out eof);
     }
     internal bool Exited(out uint code) {
         code=0; uint wait=WaitForSingleObject(process,0);
@@ -112,7 +136,7 @@ internal sealed class NativeJob : IDisposable {
         if(wait!=0 || !GetExitCodeProcess(process,out code)) throw new InvalidOperationException("exit query refused");
         return true;
     }
-    internal void Next() { process.Dispose(); thread.Dispose(); output.Dispose(); error.Dispose(); process=null; thread=null; output=null; error=null; }
+    internal void Next() { process.Dispose(); thread.Dispose(); telemetry.Dispose(); process=null; thread=null; telemetry=null; reader=null; }
     internal bool KillAndConfirm(System.Diagnostics.Stopwatch clock) {
         // Termination precedes all unknown-cleanup outcomes, including query errors.
         bool killed=TerminateJobObject(job,1);
@@ -129,6 +153,6 @@ internal sealed class NativeJob : IDisposable {
     // or second launch is permitted. Kill-on-close is never cleared.
     public void Dispose() {
         if(disposed) return; disposed=true;
-        process?.Dispose(); thread?.Dispose(); output?.Dispose(); error?.Dispose(); job.Dispose();
+        process?.Dispose(); thread?.Dispose(); telemetry?.Dispose(); job.Dispose();
     }
 }
