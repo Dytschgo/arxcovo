@@ -179,3 +179,27 @@ F0b follow-up is needed before any F2 complete-capture claim. No new SHA
 supplies experiment authority. M2 incomplete; real-Runner PA6 OPEN;
 real-record replay OPEN; hardware paths **unverified on real hardware**.
 Ready for fresh Opus high independent source recheck, not publication/merge.
+
+## ST-B2 test-only correction — 2026-11-14
+
+Coordinator OpenAI / gpt-6.1-sol / medium added seven valid-JSON replay cases
+isolating the six nonredundant cross-field rules and the closed-code rule,
+plus a valid-gate run-mode record-validation failure asserting empty stdout
+and exactly fixed E_RECORD stderr. Driver source is unchanged.
+The first edit script rejected its own insertion anchor before writing any
+file; the corrected script applied the tests. No failed test was hidden.
+
+The same documented safe subset passed 32 tests (0.205s); the in-memory
+mutation runner passed its baseline and killed all 23 compiled mutants by
+assertion failures, with no errors. The eight additions are xf_success,
+xf_confirmed, xf_none, xf_not_reached, xf_first_phase, xf_final_phase,
+validator_codes_any_str and fallback_always_gate_ok. Cross-field cases use
+subtest indices 0-6; fallback has its own named test. The redundant first-null
+clause receives no kill credit. No source bytes are written by mutation runs.
+
+Correction to earlier restoration evidence: `6f029b37...` was the builder's
+CRLF working-copy hash, not the committed LF blob. Current unchanged driver
+raw bytes and committed blob SHA-256 both equal
+`34a7111cb5d2c02993c6ba4836f0cff893b99e4b5b0564818372eaaf7de66021`.
+
+Current test_f0_blockers.py SHA-256: `7bcd744737cd5b3376e59d62103815e897079df50bdfff971b4ce697a2e29bdd`.

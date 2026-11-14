@@ -121,6 +121,27 @@ class F0Blockers(unittest.TestCase):
             r = self.valid(); r.update(change)
             with self.assertRaises(RuntimeError): driver.encode_record(r)
 
+    def test_isolated_replay_cross_fields(self):
+        cases = []
+        r = self.valid(); r['mutation'] = 'staged'; cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}); cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation='none', cleanup='unconfirmed'); cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation='staged', cleanup='not_reached'); cases.append(r)
+        refusal = driver.Refusal('run_cleanup', 'final', [['link', True, 0]]).record
+        r = self.valid(); r.update(first=dict(refusal), final=dict(refusal), cleanup='unconfirmed'); cases.append(r)
+        initial = driver.Refusal('run_parent', 'initial', [['link', True, 0]]).record
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final=initial, cleanup='unconfirmed'); cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_NOT_A_CODE'}, final={'code': 'E_NOT_A_CODE'}); cases.append(r)
+        for index, record in enumerate(cases):
+            with self.subTest(case=index), self.assertRaisesRegex(RuntimeError, '^E_RECORD$'):
+                driver.replay(json.dumps(record, separators=(',', ':')) + '\n')
+
+    def test_valid_gate_invalid_record_fallback(self):
+        with patch.dict(driver.os.environ, valid_env(), clear=True), patch.object(driver.sys, 'argv', ['driver.py', 'run']), patch.object(driver, 'main'), patch.object(driver.sys, 'stdout', new_callable=io.StringIO) as out, patch.object(driver.sys, 'stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(driver.entry(), 1)
+            self.assertEqual(out.getvalue(), '')
+            self.assertEqual(err.getvalue(), 'unix experiment refused/failed: E_RECORD\n')
+
     def test_protected_phase_site_bound(self):
         path = MagicMock(); path.is_absolute.return_value = True; path.parts = (); path.parents = []
         path.lstat.return_value = types.SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=12)
@@ -185,6 +206,14 @@ MUTANTS = {
     'entry_first_is_final': ("feedback_first, final), end='')", "final, final), end='')"),
     'refusal_exact_type_relaxed': ("type(error) is Refusal", "isinstance(error, Refusal)"),
     'site_token_unchecked': ("require(site in SITES, 'E_SITE')", "require(True, 'E_SITE')"),
+    'xf_success': ("require(first is None and cleanup == 'confirmed' and mutation == 'service', 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_confirmed': ("require(first == final, 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_none': ("require(cleanup == 'not_reached', 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_not_reached': ("require(first == final and final is not None, 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_first_phase': ("require(first['phase'] == 'initial', 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_final_phase': ("require((final['phase'] == 'final' and cleanup == 'unconfirmed') or\n                (final['phase'] == 'initial' and first == final), 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'validator_codes_any_str': ("and e['code'] in CODES:", ':'),
+    'fallback_always_gate_ok': ("code = 'E_RECORD'\n            print", "code = 'E_RUNTIME'\n            print"),
 }
 
 
