@@ -2,6 +2,9 @@
 
 ## Current state - 2026-11-14
 
+- Last merged PR74 `aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`, 2026-11-14 05:47:59Z. Squash tree equals independently reviewed `fc099b0`; all five required checks passed, first PR CI attempt `43562334337` succeeded in 468s. Fresh main CI pending. Coordinator Sol medium; no bypass. SP1/SP2 dormant seam corrections integrated, not native evidence.
+- Next actionable M2 preparation is a read-only bounded Windows native-replay scope plan: deterministic inputs for 28 labels, exact source/commands/environment, child/cleanup/time/privacy limits and authority boundaries, then Grok/Muse review. No native execution, historical retry or new discovery test authorized by preparing the plan. Incident cause and native acceptance remain OPEN; no idle handoff without an awaited task.
+
 - SP1/SP2 dormant Windows replay seams pass independent Grok 4.7 high review `25e4309`: source `a65e784`, six pure tests and seven compiled assertion-killed mutations credited at source. Coordinator publishes a clean branch with redacted evidence only; the original owner-path evidence commit is excluded. No native replay/run or historical retry; native coverage and main71 cause remain unverified. Normal exact-head review and five checks remain required; M2 incomplete.
 
 - Windows diagnostic capture source `cf915a4` (retained `b9aa125`) passes independent Grok 4.7 high review `2fac595` (retained `c85e75b`) with no capture-source blocker. Final-source pure tests 4/4, fmt and package all-target Clippy passed. Coordinator authorizes capture-only publication and existing required CI, with no new native tests, replay, manual rerun or discovery change. Future replay blockers SP1/SP2 remain explicit; native capture/incident cause are unverified, no fix claimed. Missing ms accepted under success-path fence; fresh exact-head review and five checks remain merge gates.
