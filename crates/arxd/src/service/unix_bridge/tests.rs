@@ -607,6 +607,7 @@ fn t10_reexec_diagnostics() {
         let text = String::from_utf8_lossy(&combined);
         assert!(!text.contains(MARKER));
         assert!(!text.contains("3141592653"), "identity marker withheld");
+        assert_eq!(text.matches("ARX-S2A-FIXED-PANIC").count(), 4);
         for fixed in [
             "ARX-PA6-FIXED-PANIC",
             "ARX-T10-FIXED-PANIC",
@@ -627,6 +628,7 @@ fn t10_fixture() {
         t8_private_inputs_all_phases_inner().await;
         t4_phase_matrix_and_panic_finish_inner().await;
         e6::pa6_panic_residue_report_and_gate().await;
+        e6::s2a_panic_latch_before_return();
     });
 }
 async fn t4_phase_matrix_and_panic_finish_inner() {
