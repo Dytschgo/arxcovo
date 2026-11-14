@@ -3,7 +3,7 @@ import ast
 import io
 import threading
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import unittest
@@ -48,7 +48,7 @@ def workflow_contract(text):
 class Guards(unittest.TestCase):
     def test_allowed_plan(self):
         run = driver.gate(valid_env(), 'linux')
-        self.assertEqual(driver.plan(run), (Path('/opt/arx-ci-123-1'), 'arxd.service'))
+        self.assertEqual(driver.plan(run), (Path('/var/lib/arx-ci-123-1'), 'arxd.service'))
 
     def test_every_gate_missing_or_changed_refuses(self):
         for key in valid_env():
@@ -434,8 +434,92 @@ class F0Mechanism(unittest.TestCase):
 
 class A1A2(unittest.TestCase):
     """Pure plans and mocked lifecycle only; no host filesystem or process probes."""
+    def parent_attempt(self, bad=None, mode=None, uid=0):
+        events = []
+        def metadata(path):
+            events.append(('check', str(path), driver.feedback_mutation))
+            return SimpleNamespace(st_uid=uid if str(path) == bad else 0,
+                st_mode=mode if str(path) == bad else stat.S_IFDIR | 0o755)
+        def mkdir(path, **kwargs):
+            events.append(('mkdir', str(path), kwargs))
+            raise FileExistsError('mock exclusive collision')
+        lock = unittest.mock.MagicMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(driver, 'Path', PurePosixPath))
+            stack.enter_context(patch.object(PurePosixPath, 'lstat', metadata, create=True))
+            stack.enter_context(patch.object(PurePosixPath, 'mkdir', mkdir, create=True))
+            stack.enter_context(patch.object(driver.sys, 'platform', 'linux'))
+            for name in ('getuid', 'geteuid'):
+                stack.enter_context(patch.object(driver.os, name, return_value=0, create=True))
+            for key, value in [('phase', 'initial'), ('mutation', 'none'), ('first', None), ('cleanup', 'not_reached')]:
+                stack.enter_context(patch.object(driver, 'feedback_' + key, value))
+            stack.enter_context(patch.object(driver, 'cg_preflight'))
+            reserve = stack.enter_context(patch.object(driver, 'reserve_unit', return_value=(77, lock, None)))
+            stack.enter_context(patch.object(driver, 'refuse_unit_collision'))
+            stack.enter_context(patch.object(driver, 'same_object'))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            effects = [stack.enter_context(patch.object(owner, name)) for owner, name in
+                       ((driver, 'copy_tree'), (driver, 'cleanup_a1a2'), (driver, 'install_runtime'),
+                        (driver.subprocess, 'run'), (driver.subprocess, 'check_output'))]
+            with self.assertRaises(driver.Refusal if bad else FileExistsError):
+                driver.run_body(valid_env())
+            for effect in effects:
+                effect.assert_not_called()
+            self.assertEqual(reserve.call_count, 0 if bad else 1)
+            self.assertEqual(driver.feedback_cleanup, 'not_reached')
+        return events
+
+    def test_parent_checked_before_exclusive_stage_creation(self):
+        self.assertEqual(self.parent_attempt(), [
+            ('check', '/', 'none'), ('check', '/var', 'none'), ('check', '/var/lib', 'none'),
+            ('mkdir', '/var/lib/arx-ci-123-1', {'mode': 0o700})])
+
+    def test_new_parent_keeps_every_ancestor_guard(self):
+        for path in ('/', '/var', '/var/lib'):
+            for mode, uid in ((stat.S_IFLNK | 0o755, 0), (stat.S_IFDIR | 0o755, 12),
+                              (stat.S_IFDIR | 0o775, 0), (stat.S_IFDIR | 0o757, 0)):
+                with self.subTest(path=path, mode=mode, uid=uid):
+                    events = self.parent_attempt(path, mode, uid)
+                    self.assertEqual(events[-1], ('check', path, 'none'))
+                    self.assertTrue(all(e[0] == 'check' for e in events))
+
+    def test_no_staging_parent_override(self):
+        env = valid_env()
+        env.update(ARX_STAGE_PARENT='/owner', HOME='/owner')
+        self.assertEqual(driver.plan(driver.gate(env, 'linux'))[0], Path('/var/lib/arx-ci-123-1'))
+        with self.assertRaises(TypeError):
+            driver.plan('123-1', '/owner')
+        for run in ('/owner', '../123-1', '123-1/owner'):
+            with self.assertRaisesRegex(RuntimeError, 'E_ID'):
+                driver.plan(run)
+
+    def test_native_writable_parent_regression(self):
+        # Real closed F0 record, not a synthetic pass or historical-run diagnosis.
+        line = (ROOT / 'docs/evidence/linux-stagef-a1a2-run-43622157531.json').read_text()
+        self.assertEqual(driver.replay(line), {'first': (1, 'write'), 'final': (1, 'write')})
+        record = json.loads(line)
+        self.assertEqual(record['provenance']['run'], '43622157531')
+        self.assertEqual((record['mutation_lower_bound'], record['cleanup']), ('none', 'not_reached'))
+        seen = []
+        def metadata(path):
+            seen.append(str(path))
+            return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | (0o777 if str(path) == '/opt' else 0o755))
+        with patch.object(PurePosixPath, 'lstat', metadata, create=True):
+            with self.assertRaises(driver.Refusal) as caught:
+                driver.protected(PurePosixPath('/opt'), 'run_parent')
+            self.assertEqual(caught.exception.record, record['first'])
+            seen.clear()
+            with patch.object(driver, 'Path', PurePosixPath):
+                stage, _ = driver.plan('43622157531-1')
+            try:
+                driver.protected(stage.parent, 'run_parent')
+            except driver.Refusal:
+                self.fail('planned staging parent reproduces the observed writable /opt refusal')
+        self.assertEqual(seen, ['/', '/var', '/var/lib'])
+        self.assertEqual(str(stage), '/var/lib/arx-ci-43622157531-1')
+
     def test_launch_contract(self):
-        stage = Path('/opt/arx-ci-123-1')
+        stage = Path('/var/lib/arx-ci-123-1')
         artifact = str(stage / 'source/target/debug/deps/arxd-abc')
         self.assertEqual(driver.plan('123-1')[1], 'arxd.service')
         self.assertEqual(driver.test_argv(artifact), [artifact,
@@ -449,7 +533,7 @@ class A1A2(unittest.TestCase):
             RUNNER_ENVIRONMENT='github-hosted', ARX_DISPOSABLE_EXEC_TEST='1', NOTIFY_SOCKET='@notify'))
 
     def monitor(self, states, size=0, pid='42', actual='42', exe=None, placement=None, ticks=None):
-        stage = Path('/opt/arx-ci-123-1')
+        stage = Path('/var/lib/arx-ci-123-1')
         artifact = str(stage / 'source/target/debug/deps/arxd-abc')
         events = []
         def read(path, *args):
@@ -501,7 +585,7 @@ class A1A2(unittest.TestCase):
         with patch.object(driver, 'private_read', return_value='not-an-artifact'), \
              patch.object(driver, 'protected'), patch.object(driver.os, 'execve') as execute:
             with self.assertRaises(RuntimeError):
-                driver.harness(Path('/opt/arx-ci-123-1'), ['wrong'])
+                driver.harness(Path('/var/lib/arx-ci-123-1'), ['wrong'])
             execute.assert_not_called()
 
     def test_collision_refuses_before_mutation(self):
@@ -534,7 +618,7 @@ class A1A2(unittest.TestCase):
             remove.assert_not_called()
 
     def test_launcher_exec_and_single_capture_owner(self):
-        stage = Path('/opt/arx-ci-123-1')
+        stage = Path('/var/lib/arx-ci-123-1')
         binary = str(stage / 'source/target/debug/deps/arxd-abc')
         artifact = unittest.mock.MagicMock()
         artifact.parent = stage / 'source/target/debug/deps'

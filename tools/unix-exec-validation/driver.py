@@ -44,7 +44,7 @@ def gate(env, platform):
 
 def plan(run):
     require(re.fullmatch(r'[1-9][0-9]{0,19}-[1-9][0-9]{0,19}', run), 'E_ID')
-    return Path('/opt/arx-ci-' + run), 'arxd.service'
+    return Path('/var/lib/arx-ci-' + run), 'arxd.service'
 
 
 # F0 mechanism only: no experiment is authorized by this instrumentation.
@@ -252,7 +252,7 @@ def open_stage(run_id):
     try:
         stage, _ = plan(run_id)
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        for name in ('/', 'opt', stage.name):
+        for name in ('/', 'var', 'lib', stage.name):
             child = os.open(name, flags, dir_fd=fd)
             parent, fd = fd, child
             if parent is not None:

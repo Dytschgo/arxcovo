@@ -13,8 +13,11 @@ import test_f0_blockers
 import test_f0b_transport
 
 CASES = [
+ ('restore writable parent', "return Path('/var/lib/arx-ci-' + run), 'arxd.service'", "return Path('/opt/arx-ci-' + run), 'arxd.service'", 'test_native_writable_parent_regression'),
+ ('skip parent protection', "protected(stage.parent, 'run_parent')", 'pass', 'test_parent_checked_before_exclusive_stage_creation'),
+ ('reuse staging directory', 'stage.mkdir(mode=0o700)', 'stage.mkdir(mode=0o700, exist_ok=True)', 'test_parent_checked_before_exclusive_stage_creation'),
  ('build after start', '        build_env = cargo_env(stage)', "        call(['/usr/bin/systemctl', 'start', '--no-block', unit])\n        build_env = cargo_env(stage)", 'F0Blockers.test_run_orderings'),
- ('fixed unit', "return Path('/opt/arx-ci-' + run), 'arxd.service'", "return Path('/opt/arx-ci-' + run), 'other.service'", 'test_launch_contract'),
+ ('fixed unit', "return Path('/var/lib/arx-ci-' + run), 'arxd.service'", "return Path('/var/lib/arx-ci-' + run), 'other.service'", 'test_launch_contract'),
  ('wrong test', "TEST = 'exec::disposable::disposable_linux_a1_a2'", "TEST = 'exec::disposable::disposable_linux_cross_account'", 'test_launch_contract'),
  ('fork instead of exec', 'os.execve(binary, args, env)', 'subprocess.run(args, env=env)', 'test_launcher_exec_and_single_capture_owner'),
  ('cargo in unit', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return ['/usr/bin/cargo', TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_launch_contract'),
