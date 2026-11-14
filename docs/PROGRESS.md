@@ -2,6 +2,20 @@
 
 ## Current state - 2026-11-14
 
+- F0 replay test recheck `2b07953` passes Standards/Spec and closes ST-B2; original source blockers are closed by `93b1194`. Opus independently ran 32 safe tests, all 23 compiled assertion-killed mutants and case-isolation probes. Coordinator publishes only the bounded local feedback mechanism for exact-head review/normal gates. Optional finer-grained success-cleanup mutation gap and prior advisories are retained. Internal capture F0b and real-record replay remain OPEN; no diagnosis, dispatch, historical retry or activation is authorized.
+
+- F0 original blockers closed by source correction `93b1194`; Opus high recheck `d608f5c` (retained `7397353`) found test-only ST-B2. Coordinator Sol medium added isolated cross-field/closed-code/fallback cases: safe subset 32 passed, all 23 compiled in-memory mutants assertion-killed; driver unchanged. Fresh narrow recheck is next. No publication, real-record replay, dispatch or activation.
+
+- F0 independent Opus high review `4220dd7` (retained `9c64c66`) requested changes: meaningful run/entry transition and bound tests, allowlisted fixed error codes with first/final semantics, and suppression of three raw stderr paths. Sol medium is correcting these locally before fresh recheck/publication. Internal cross-process capture remains a separately bounded follow-up; no real-record replay, diagnosis, dispatch or retry is claimed.
+
+- Last merged PR69 `9f97a2d08170a2c756b73fad9079334f66570bc0`, 2026-11-14 01:24:40Z. Squash tree equals independently reviewed `f55db98`; all five required checks passed. First PR CI attempt `43539239212` passed in 585s. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass. Main-after-PR69 run `43540427812` passed attempt 1 in 592s (2026-11-14 01:24:43-01:34:35Z), verified from first-attempt API metadata.
+- S2b local decomposition is integrated. Hosted nonroot native run `43539239495`, attempt 1: UID/euid 1001, U-a before/after baselines passed without skips, both drop-store and test-Group-forgotten mutations killed with exit 100, restored fingerprint verified. Opus exact-head confirmation comment `6869194636` passes. This earns local Group/bridge decomposition credit only; real-Runner PA6 remains OPEN and A13 unaccepted.
+- F0 local bounded refusal/replay preparation by Sol medium source `2c93991` (retained `a872fa2`), evidence `5775b40` (retained `378e6b8`) is under Opus high security review. Safe Python mechanism tests: 22 passed at source. Cross-process exception transport remains explicitly incomplete; real-record replay stays OPEN. No diagnosis, historical retry, dispatch or activation is authorized.
+- Main-after-PR68 run `43535275394` passed attempt 1 in 577s. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Privacy flake, E_PROTECTION and ExecutionFailed remain unknown.
+
+## Historical checkpoint before S2b merge
+
+
 - S2b native harness passes Opus high review `7d20762` (retained `b7a6dba`) and narrow pin/path recheck `3ee9618`. Coordinator Sol medium corrected dependency pins and explicit mutation targets; two failed portable checks are retained, final 11/11 passes. Source remains reviewed `efe8e55`, production unchanged. Publication is for first hosted nonroot U-a and two native mutation checks only; merge waits native evidence, exact-head review and all five required checks. Accepted harness limits are recorded in evidence; real-Runner PA6 stays OPEN, no experiment/activation.
 
 - S2b passes Opus high source/security review `d94b176` (retained `e71fc59`), no blockers on either axis. Reviewer independently ran three portable tests, six assertion-killed portable mutants and Linux-target typecheck (not native execution). Linux U-a nonroot pass-versus-skip and two native Group mutation failures remain merge gates. Coordinator is preparing a bounded non-required native verification job for fresh review before publication. Real-Runner PA6 remains OPEN; no activation or experiment.

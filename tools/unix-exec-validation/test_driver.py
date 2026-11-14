@@ -142,7 +142,7 @@ class Guards(unittest.TestCase):
 
     def test_time_bounds_and_finally_are_present(self):
         tree = ast.parse((ROOT / 'tools/unix-exec-validation/driver.py').read_text())
-        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_body')
         self.assertTrue(any(isinstance(n, ast.Try) and n.finalbody for n in ast.walk(run)))
         source = (ROOT / 'tools/unix-exec-validation/driver.py').read_text()
         self.assertIn('deadline = time.monotonic() + 120', source)
@@ -365,6 +365,112 @@ class CopyGuards(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'E_COPY_TYPE'):
                     driver.copy_tree(Path('source'), Path(temp) / 'copy')
                 self.assertEqual(opened.call_count, 1)  # root only, never bad child
+
+class F0Mechanism(unittest.TestCase):
+    """Synthetic mechanism credit only. No filesystem observation or reproduction."""
+    def setUp(self):
+        for name, value in (('feedback_phase', 'initial'), ('feedback_mutation', 'staged'),
+                            ('feedback_cleanup', 'unconfirmed'), ('feedback_first', None)):
+            self.enterContext(patch.object(driver, name, value))
+        self.enterContext(patch.object(driver.sys, 'platform', 'linux'))
+
+    def refusal(self, phase='initial'):
+        return driver.Refusal('run_parent', phase, [['dir', True, 0], ['other', False, 2]])
+
+    def record(self):
+        return json.loads(driver.feedback_line(valid_env(), driver.exception_record(self.refusal()), driver.exception_record(self.refusal('final'))))
+
+    def test_real_predicate_and_order(self):
+        for kind in ('dir', 'other'):
+            self.assertIsNone(driver.decide([[kind, True, 0]]))
+        for triple, conjunct in ((['link', False, 18], 'link'), (['other', False, 18], 'owner'),
+                                  (['dir', True, 2], 'write')):
+            self.assertEqual(driver.decide([['dir', True, 0], triple]), (1, conjunct))
+        self.assertIsNone(driver.decide([['dir', True, 0]] * 32))
+        with self.assertRaises(RuntimeError):
+            driver.decide([['dir', True, 0]] * 33)
+
+    def test_protected_uses_real_predicate_without_filesystem(self):
+        path = SimpleNamespace(is_absolute=lambda: True, parts=(), parents=[])
+        path.lstat = lambda: SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+        driver.protected(path, 'run_parent')
+        path.lstat = lambda: SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=123)
+        with self.assertRaises(driver.Refusal) as raised:
+            driver.protected(path, 'run_parent')
+        self.assertEqual(raised.exception.record['kind'], 'link')
+        self.assertEqual(raised.exception.record['write_bits'], 18)
+
+    def test_both_exception_orderings_replay(self):
+        for first, final in ((self.refusal(), RuntimeError('private')),
+                             (RuntimeError('private'), self.refusal('final'))):
+            line = driver.feedback_line(valid_env(), driver.exception_record(first), driver.exception_record(final))
+            result = driver.replay(line)
+            self.assertEqual(result, {'first' if type(first) is driver.Refusal else 'final': (1, 'owner')})
+            self.assertNotIn('private', line)
+            self.assertLessEqual(len(line.encode('ascii')), 4096)
+
+    def test_hostile_payload_never_formatted(self):
+        class Hostile(RuntimeError):
+            def __str__(self):
+                raise AssertionError('payload formatted')
+        self.assertEqual(driver.exception_record(Hostile()), {'code': 'E_RUNTIME'})
+        self.assertEqual(driver.exception_record(RuntimeError('E_PRIVATE')), {'code': 'E_RUNTIME'})
+
+    def test_unknown_fields_all_levels(self):
+        for target in ('outer', 'provenance', 'first'):
+            r = self.record()
+            (r if target == 'outer' else r[target])['unknown'] = 'private'
+            with self.assertRaises(RuntimeError):
+                driver.encode_record(r)
+
+    def test_types_and_values(self):
+        r = self.record()
+        for key in r:
+            for bad in ([], {}, True, 0, 'unknown'):
+                copy = self.record(); copy[key] = bad
+                with self.subTest(key=key, bad=bad), self.assertRaises((RuntimeError, TypeError)):
+                    driver.encode_record(copy)
+        for key in r['provenance']:
+            for bad in ('', 'x'*41, '0', 1, True, [], {}):
+                copy = self.record(); copy['provenance'][key] = bad
+                with self.assertRaises(RuntimeError):
+                    driver.encode_record(copy)
+        for key, bad in (('ordinal', True), ('ordinal', -1), ('site', 'unknown'),
+                         ('phase', 'unknown'), ('kind', 'file'), ('owner_zero', 0),
+                         ('write_bits', True), ('write_bits', 1), ('predecessors', [])):
+            copy = self.record(); copy['first'][key] = bad
+            with self.assertRaises(RuntimeError):
+                driver.encode_record(copy)
+
+    def test_bounds_and_malformed(self):
+        for triples in ([], [['dir', True, 0]]*33, [['dir', True]], [['dir', True, 0, 0]],
+                        [['dir', 1, 0]], [['dir', True, 32]], [['unknown', True, 0]]):
+            with self.assertRaises(RuntimeError):
+                driver.decide(triples)
+        for line in ('{}', '{}\n\n', 'x'*4096+'\n', '{}\nprivate', '{"a":1,"a":2}\n',
+                     '[]\n', 'null\n', '[['*1000+'\n', '\u00e4\n'):
+            with self.assertRaises(RuntimeError):
+                driver.replay(line)
+        with patch.object(driver, 'MAX_LINE', 10), self.assertRaises(RuntimeError):
+            driver.encode_record(self.record())
+        r = self.record(); r['first']['predecessors'] = [['link', True, 0]]
+        with self.assertRaises(RuntimeError):
+            driver.encode_record(r)
+
+    def test_entry_fixed_failure_exit_and_single_line(self):
+        for first, final in ((self.refusal(), RuntimeError('private')), (RuntimeError('private'), self.refusal('final'))):
+            def mocked_main():
+                driver.feedback_first = driver.exception_record(first)
+                raise final
+            with patch.object(driver, 'main', side_effect=mocked_main), \
+                 patch.object(driver, 'feedback_first', None), \
+                 patch.dict(driver.os.environ, valid_env(), clear=True), \
+                 patch.object(driver.sys, 'argv', ['driver.py', 'run']), \
+                 patch.object(driver.sys, 'stdout', new_callable=io.StringIO) as out:
+                self.assertEqual(driver.entry(), 1)
+                self.assertEqual(out.getvalue().count('\n'), 1)
+                driver.replay(out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
