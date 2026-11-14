@@ -691,9 +691,31 @@ Setup/mechanism-unavailable mapping; the three janitor failures retain quarantin
 
 These five requirements bind subsequent small source slices:
 
-1. The A4 helper is a fixed test-only executable re-entry with one waiting
-   behavior, never a shell or caller-selected command. It takes no commands,
-   forks nothing, opens no network/storage and runs no probes. The fixture
+1. The A4 helper is one fixed test-only post-fork waiting branch, never a
+   shell, executable re-entry or caller-selected command. The ignored parent
+   fixture forks exactly one single-task child; that child forks nothing and
+   creates no threads. Its divergent post-fork call graph uses only fixed stack
+   state and direct async-signal-safe close/clock_gettime/poll/read/write/_exit
+   calls, with no allocation, Rust I/O, formatting, panic/unwind, destructors,
+   locks, environment access or callbacks. Parent-prepared fixed pipes and an
+   absolute monotonic deadline govern handshake and waiting; errors/EOF/expiry
+   are fixed failure exits and EINTR never extends the deadline. Only the native
+   ignored fixture may call this wrapper; pure tests use a separate mock seam.
+   The [helper correction](../reviews/m2-a4-single-task-helper-proposal.md)
+   binds task/migration checks, descriptor passivity and review requirements,
+   including its four source-review clarifications and pipe ownership table.
+   Enumerate reachable at-fork handlers and prove none or each async-signal-safe;
+   unknown handlers block acceptance. Parent-created CLOEXEC pipes have fixed
+   ownership; child closes only their opposite ends and leaves unrelated inherited
+   FDs open-but-unused until _exit, with no FD enumeration or dependent EOF claim.
+   No std wrappers, unwrap/expect, implicit Drop/panic/allocation, locks, Rust TLS
+   or callbacks are reachable. Only an immediate scalar libc errno read to identify
+   EINTR is permitted under a verified async-signal-safe accessor/handler contract;
+   unknown safety blocks acceptance. EINTR-only retries recompute a saturating
+   monotonic remainder, never extending the absolute deadline. Fork is outside the
+   limited leaf; migration and an actual one-task/membership check precede release.
+   The helper takes no commands, opens no network/storage and runs no probes.
+   The fixture
    exclusively creates the leaf and writes memory.max=64 MiB, memory.swap.max=0
    and pids.max=1 before placing the helper there. Preparatory controller writes
    are an explicit fixture exception, not production setup. The helper starts
