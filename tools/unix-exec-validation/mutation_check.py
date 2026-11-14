@@ -13,7 +13,7 @@ import test_f0_blockers
 import test_f0b_transport
 
 CASES = [
- ('select A5 by default', "TEST = 'exec::disposable::disposable_linux_a3_none'", "TEST = 'exec::disposable::disposable_linux_a5'", 'test_source_default_remains_a3_none'),
+ ('restore historical None selection', "TEST = 'exec::disposable::disposable_linux_a5'", "TEST = 'exec::disposable::disposable_linux_a3_none'", 'test_source_selection_is_a5'),
  ('omit closed A5', "'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')", "'exec::disposable::disposable_linux_a4'), 'E_TEST_ARGS')", 'test_closed_mapping'),
  ('A5 without Standard', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST not in ('exec::disposable::disposable_linux_a3_none', 'exec::disposable::disposable_linux_a5')", 'test_closed_mapping'),
  ('A5 argv selects A3', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return [binary, 'exec::disposable::disposable_linux_a3_none' if TEST == 'exec::disposable::disposable_linux_a5' else TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_closed_mapping'),
