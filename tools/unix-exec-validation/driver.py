@@ -52,7 +52,7 @@ SITES = ('cg_preflight', 'cleanup_capture', 'cleanup_base', 'service_stage',
          'service_cg', 'service_runs', 'capture_base', 'harness_stage',
          'harness_binary', 'run_parent', 'run_artifact', 'run_cleanup', 'installed')
 PHASES = ('initial', 'final')
-MUTATIONS = ('none', 'staged', 'account', 'service', 'cgroup')
+MUTATIONS = ('none', 'staged', 'service', 'cgroup', 'account')
 CLEANUPS = ('confirmed', 'unconfirmed', 'not_reached')
 CODES = ('E_ACCOUNT_COLLISION', 'E_ARGS', 'E_ARTIFACT', 'E_ARTIFACT_PATH', 'E_BUILD', 'E_BUILD_LOG', 'E_CGROUP2', 'E_CGROUP_FIXTURE_OWNER', 'E_CGROUP_SCAN_BOUND', 'E_CGROUP_UNIT_OWNER', 'E_CGROUP_WRITABLE_HIERARCHY', 'E_CHECKOUT', 'E_CONTROLLERS', 'E_COPY_RACE', 'E_COPY_TYPE', 'E_DELEGATION', 'E_FIXTURE_COLLISION', 'E_FIXTURE_INODE', 'E_FIXTURE_UID', 'E_GROUP_ORPHAN', 'E_ID', 'E_INSTALLED', 'E_INTERNAL_TASKS', 'E_MODE', 'E_OUTPUT_DRAIN', 'E_PATH', 'E_PID', 'E_PLATFORM', 'E_QUARANTINE_CGROUP', 'E_QUARANTINE_PATH_UNCAPTURED', 'E_QUARANTINE_UID_UNCAPTURED', 'E_RECORD', 'E_RECORD_BOUND', 'E_RMTREE', 'E_ROOT', 'E_RUNTIME', 'E_SERVICE_OR_TEST', 'E_SHA', 'E_SHA_FORMAT', 'E_SITE', 'E_SYSTEMD', 'E_TEST', 'E_TEST_ARGS', 'E_TEST_LOG', 'E_TEST_TIMEOUT', 'E_UID_LIVE', 'E_UNIT_CGROUP', 'E_UNIT_COLLISION', 'E_GATE_CI', 'E_GATE_GITHUB_ACTIONS', 'E_GATE_RUNNER_ENVIRONMENT', 'E_GATE_RUNNER_OS', 'E_GATE_GITHUB_EVENT_NAME', 'E_GATE_GITHUB_REPOSITORY', 'E_GATE_GITHUB_ACTOR', 'E_GATE_GITHUB_TRIGGERING_ACTOR', 'E_GATE_GITHUB_REF', 'E_COMMAND_TIMEOUT', 'E_COMMAND_FAILED', 'E_OS')
 MAX_TRIPLES = 32
@@ -61,6 +61,8 @@ feedback_phase = 'initial'
 feedback_mutation = 'none'
 feedback_cleanup = 'not_reached'
 feedback_first = None
+feedback_internal = None
+internal_trusted = False
 
 
 def triples_valid(triples):
@@ -112,11 +114,23 @@ def exception_record(error):
     return dict(code='E_RUNTIME')
 
 
+def validate_refusal(e):
+    require(set(e) == {'code', 'site', 'phase', 'ordinal', 'kind', 'owner_zero',
+                       'write_bits', 'predecessors'}, 'E_RECORD')
+    require(e['code'] == 'E_PROTECTION' and type(e['site']) is str and e['site'] in SITES and
+            type(e['phase']) is str and e['phase'] in PHASES and
+            type(e['ordinal']) is int and type(e['predecessors']) is list, 'E_RECORD')
+    triples = e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]]
+    result = decide(triples)
+    require(result is not None and result[0] == e['ordinal'] == len(triples) - 1, 'E_RECORD')
+    return e
+
+
 def validate_record(record):
     require(type(record) is dict and set(record) ==
-            {'schema', 'version', 'provenance', 'first', 'final', 'mutation', 'cleanup'}, 'E_RECORD')
+            {'schema', 'version', 'provenance', 'first', 'final', 'mutation_lower_bound', 'cleanup', 'internal'}, 'E_RECORD')
     require(record['schema'] == 'unix-protection-f0' and type(record['schema']) is str and
-            type(record['version']) is int and record['version'] == 1, 'E_RECORD')
+            type(record['version']) is int and record['version'] == 2, 'E_RECORD')
     p = record['provenance']
     require(type(p) is dict and set(p) == {'source_sha', 'workflow_sha', 'run', 'attempt'}, 'E_RECORD')
     for key in ('source_sha', 'workflow_sha'):
@@ -124,7 +138,7 @@ def validate_record(record):
     require(p['source_sha'] == p['workflow_sha'], 'E_RECORD')
     for key in ('run', 'attempt'):
         require(type(p[key]) is str and re.fullmatch('[1-9][0-9]{0,19}', p[key]), 'E_RECORD')
-    require(type(record['mutation']) is str and record['mutation'] in MUTATIONS and
+    require(type(record['mutation_lower_bound']) is str and record['mutation_lower_bound'] in MUTATIONS and
             type(record['cleanup']) is str and record['cleanup'] in CLEANUPS, 'E_RECORD')
     for key in ('first', 'final'):
         e = record[key]
@@ -133,18 +147,16 @@ def validate_record(record):
         require(type(e) is dict, 'E_RECORD')
         if set(e) == {'code'} and type(e['code']) is str and e['code'] in CODES:
             continue
-        require(set(e) == {'code', 'site', 'phase', 'ordinal', 'kind', 'owner_zero',
-                           'write_bits', 'predecessors'}, 'E_RECORD')
-        require(e['code'] == 'E_PROTECTION' and type(e['site']) is str and e['site'] in SITES and
-                type(e['phase']) is str and e['phase'] in PHASES and
-                type(e['ordinal']) is int and type(e['predecessors']) is list, 'E_RECORD')
-        triples = e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]]
-        result = decide(triples)
-        require(result is not None and result[0] == e['ordinal'] == len(triples) - 1, 'E_RECORD')
+        validate_refusal(e)
     first, final = record['first'], record['final']
-    mutation, cleanup = record['mutation'], record['cleanup']
+    mutation, cleanup = record['mutation_lower_bound'], record['cleanup']
+    internal = record['internal']
+    require((internal is None) == (mutation in ('none', 'staged')), 'E_RECORD')
+    if internal is not None:
+        validate_internal_summary(internal)
     if final is None:
-        require(first is None and cleanup == 'confirmed' and mutation == 'service', 'E_RECORD')
+        require(first is None and cleanup == 'confirmed' and mutation in ('service', 'cgroup', 'account') and
+                all(internal[m] == 'absent' for m in PRECEDENCE), 'E_RECORD')
     if cleanup == 'confirmed':
         require(first == final, 'E_RECORD')
     if mutation == 'none':
@@ -184,6 +196,205 @@ def replay(line):
         raise RuntimeError('E_RECORD') from None
     return {key: decide(e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]])
             for key in ('first', 'final') if (e := record[key]) and e['code'] == 'E_PROTECTION'}
+
+
+CHANNELS = {'service': 'feedback-service', 'harness': 'feedback-harness',
+            'fixture-check': 'feedback-fixture-check'}
+INTERNAL_SITES = {'service': ('service_stage', 'service_cg', 'service_runs', 'capture_base'),
+                  'harness': ('harness_stage', 'harness_binary'),
+                  'fixture-check': ('capture_base',)}
+PRECEDENCE = ('service', 'fixture-check', 'harness')
+STATUSES = ('absent', 'malformed', 'captured', 'unknown')
+MAX_INTERNAL = 1024
+
+
+def canonical(value):
+    return (json.dumps(value, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+
+
+def unique_pairs(items):
+    out = {}
+    for key, value in items:
+        require(key not in out, 'E_RECORD')
+        out[key] = value
+    return out
+
+
+def internal_refusal(mode, refusal):
+    validate_refusal(refusal)
+    require(refusal['site'] in INTERNAL_SITES[mode] and refusal['phase'] == 'initial', 'E_RECORD')
+
+
+def validate_internal(value, mode):
+    require(type(value) is dict and set(value) == {'schema', 'version', 'mode', 'refusal'}, 'E_RECORD')
+    require(type(value['schema']) is str and value['schema'] == 'unix-protection-f0-internal' and
+            type(value['version']) is int and value['version'] == 1 and
+            type(value['mode']) is str and value['mode'] == mode, 'E_RECORD')
+    internal_refusal(mode, value['refusal'])
+    return dict(schema=value['schema'], version=1, mode=mode,
+                refusal={k: value['refusal'][k] for k in
+                         ('code', 'site', 'phase', 'ordinal', 'kind', 'owner_zero', 'write_bits', 'predecessors')})
+
+
+def validate_internal_summary(value):
+    require(type(value) is dict and set(value) == {*PRECEDENCE, 'carried', 'refusal'}, 'E_RECORD')
+    require(all(type(value[m]) is str and value[m] in STATUSES for m in PRECEDENCE), 'E_RECORD')
+    require(all(value[m] == 'unknown' for m in PRECEDENCE) or
+            all(value[m] != 'unknown' for m in PRECEDENCE), 'E_RECORD')
+    carried = next((m for m in PRECEDENCE if value[m] == 'captured'), None)
+    require(value['carried'] == carried and (value['refusal'] is None) == (carried is None), 'E_RECORD')
+    if carried is not None:
+        internal_refusal(carried, value['refusal'])
+
+
+def open_stage(run_id):
+    fd = None
+    try:
+        stage, _ = plan(run_id)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        for name in ('/', 'opt', stage.name):
+            child = os.open(name, flags, dir_fd=fd)
+            parent, fd = fd, child
+            if parent is not None:
+                os.close(parent)
+            info = os.fstat(fd)
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+                    info.st_mode & 0o022 == 0, 'E_RECORD')
+        require(info.st_mode & 0o077 == 0, 'E_RECORD')
+        result, fd = fd, None
+        return result
+    except Exception:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def create_channel(run_id, name, data):
+    stage = fd = None
+    try:
+        stage = open_stage(run_id)
+        if stage is None:
+            return
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=stage)
+        os.fchmod(fd, 0o600)
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                info.st_nlink == 1 and info.st_size == 0, 'E_RECORD')
+        if data is not None:
+            require(os.write(fd, data) == len(data), 'E_RECORD')
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            if stage is not None:
+                os.close(stage)
+
+
+def write_internal(error):
+    try:
+        mode = sys.argv[1]
+        if not internal_trusted or mode not in CHANNELS or type(error) is not Refusal:
+            return
+        internal_refusal(mode, error.record)
+        value = dict(schema='unix-protection-f0-internal', version=1, mode=mode, refusal=error.record)
+        data = canonical(validate_internal(value, mode))
+        require(len(data) <= MAX_INTERNAL, 'E_RECORD')
+        create_channel(sys.argv[2], CHANNELS[mode], data)
+    except Exception:
+        pass
+
+
+def mark_cgroup(run_id):
+    try:
+        create_channel(run_id, 'progress-cgroup', None)
+    except Exception:
+        pass
+
+
+def read_internal(stage, mode):
+    fd = None
+    try:
+        try:
+            fd = os.open(CHANNELS[mode], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=stage)
+        except FileNotFoundError:
+            return 'absent', None
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode), 'E_RECORD')
+        require(info.st_uid == 0, 'E_RECORD')
+        require(stat.S_IMODE(info.st_mode) == 0o600, 'E_RECORD')
+        require(info.st_nlink == 1, 'E_RECORD')
+        require(0 < info.st_size <= MAX_INTERNAL, 'E_RECORD')
+        data = b''
+        while len(data) < MAX_INTERNAL + 1:
+            chunk = os.read(fd, MAX_INTERNAL + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        require(len(data) == info.st_size and len(data) <= MAX_INTERNAL, 'E_RECORD')
+        line = data.decode('ascii')
+        require(line.endswith('\n') and line.count('\n') == 1, 'E_RECORD')
+        value = validate_internal(json.loads(line, object_pairs_hook=unique_pairs), mode)
+        require(canonical(value) == data, 'E_RECORD')
+        return 'captured', value['refusal']
+    except Exception:
+        return 'malformed', None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def snapshot_internal(run_id, unit, stopped):
+    # Conditional snapshot within the existing containment assumption only.
+    global feedback_internal, feedback_mutation
+    feedback_internal = dict.fromkeys(PRECEDENCE, 'unknown')
+    feedback_internal.update(carried=None, refusal=None)
+    stage = None
+    try:
+        cgroup_absent = False
+        if stopped is not None:
+            try:
+                os.lstat(Path('/sys/fs/cgroup/system.slice') / unit)
+            except FileNotFoundError:
+                cgroup_absent = True
+            except Exception:
+                pass
+        snapshot_available = stopped is not None and cgroup_absent
+        stage = open_stage(run_id)
+        if stage is None:
+            return
+        for name, bound in (('progress-cgroup', 'cgroup'), ('fixture-identity', 'account')):
+            try:
+                info = os.stat(name, dir_fd=stage, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_uid == 0:
+                    if MUTATIONS.index(bound) > MUTATIONS.index(feedback_mutation):
+                        feedback_mutation = bound
+            except Exception:
+                pass
+        if snapshot_available:
+            value = {}
+            for mode in PRECEDENCE:
+                status, refusal = read_internal(stage, mode)
+                value[mode] = status
+                if status == 'captured' and 'carried' not in value:
+                    value.update(carried=mode, refusal=refusal)
+            value.setdefault('carried', None)
+            value.setdefault('refusal', None)
+            feedback_internal = value
+    except Exception:
+        pass
+    finally:
+        if stage is not None:
+            try:
+                os.close(stage)
+            except Exception:
+                pass
 
 
 def protected(path, site):
@@ -350,6 +561,7 @@ def service(stage, run):
     protected(cg, 'service_cg')
     require({'memory', 'pids'} <= set((cg / 'cgroup.controllers').read_text().split()), 'E_DELEGATION')
     control = cg / 'control'
+    mark_cgroup(run)
     control.mkdir(mode=0o700)  # exclusive: never reuse another group's child
     (control / 'cgroup.procs').write_text(str(os.getpid()))
     require(not (cg / 'cgroup.procs').read_text().strip(), 'E_INTERNAL_TASKS')
@@ -450,7 +662,8 @@ def harness(stage, args):
 
 
 def run(env):
-    global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
+    global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first, feedback_internal
+    feedback_internal = None
     feedback_phase, feedback_mutation, feedback_cleanup, feedback_first = 'initial', 'none', 'not_reached', None
     try:
         return run_body(env)
@@ -523,8 +736,12 @@ def run_body(env):
         feedback_cleanup = 'unconfirmed'
         if unit_created:
             # Stopping our captured unit kills descendants; never kill host hierarchy.
-            subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=20,
+            stopped = None
+            try:
+                stopped = subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=20,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            finally:
+                snapshot_internal(run_id, unit, stopped)
             cg = Path('/sys/fs/cgroup/system.slice') / unit
             require(not cg.exists(), 'E_QUARANTINE_CGROUP')
         fixture_cleanup(stage)
@@ -535,6 +752,8 @@ def run_body(env):
 
 
 def main():
+    global internal_trusted
+    internal_trusted = False
     require(len(sys.argv) >= 2, 'E_MODE')
     mode = sys.argv[1]
     if mode in ('guard', 'run'):
@@ -550,6 +769,7 @@ def main():
     stage, _ = plan(sys.argv[2])
     require(Path(__file__) == stage / 'source/tools/unix-exec-validation/driver.py', 'E_INSTALLED')
     protected(Path(__file__), 'installed')
+    internal_trusted = True
     if mode == 'service' and len(sys.argv) == 3:
         service(stage, sys.argv[2])
     elif mode == 'fixture-check' and len(sys.argv) == 3:
@@ -566,10 +786,10 @@ def main():
 def feedback_line(env, first, final):
     # Gate validates the association; this envelope is association, not attestation.
     gate(env, sys.platform)
-    return encode_record(dict(schema='unix-protection-f0', version=1,
+    return encode_record(dict(schema='unix-protection-f0', version=2,
         provenance=dict(source_sha=env['ARX_REVIEWED_SHA'], workflow_sha=env['ARX_WORKFLOW_SHA'],
                         run=env['GITHUB_RUN_ID'], attempt=env['GITHUB_RUN_ATTEMPT']),
-        first=first, final=final, mutation=feedback_mutation, cleanup=feedback_cleanup))
+        first=first, final=final, mutation_lower_bound=feedback_mutation, cleanup=feedback_cleanup, internal=feedback_internal))
 
 
 def entry():
@@ -595,6 +815,7 @@ def entry():
             print('unix experiment refused/failed: ' + code, file=sys.stderr)
             return 1
     elif error is not None:
+        write_internal(error)
         print('unix experiment refused/failed: ' + exception_record(error)['code'], file=sys.stderr)
     return 1 if error is not None else 0
 

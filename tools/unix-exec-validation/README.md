@@ -112,12 +112,43 @@ exceptions become `E_RUNTIME` without formatting their payloads. Cleanup still
 fails closed; an unconfirmed environment cannot be reused. Existing workflow
 fences remain unchanged; all outer subprocess stderr is explicitly suppressed.
 
-Limit: internal service/harness/fixture-check processes do not transport their
-structured exceptions to the outer process. Their suppressed failures remain
-the fixed outer E_SERVICE_OR_TEST code, without a protection trace. Mutation reports the
-outer attempted staging/service boundary, not proof of account/cgroup progress.
-Those transport/observation questions need fresh independent review before any
-future diagnostic proposal. No native contract compatibility is established.
+F0b emits/replays **version 2 only**, with `mutation_lower_bound` and
+`internal`. Synthetic v1 input is rejected; no retained real v1 line exists.
+Three fixed stage files carry at most 1024 bytes each; the complete outer
+line remains bounded to 4096 bytes including its newline. Files use a root-down
+descriptor-relative NOFOLLOW walk, a private root-owned stage, EXCL creation,
+CLOEXEC, root-owned regular 0600 files and nlink 1. The first creator wins;
+later same-mode refusals are lost. A short write becomes malformed.
+
+| Internal site | Conditional capture |
+| --- | --- |
+| installed | Never captured: the channel ancestry is not yet trusted |
+| service_stage, harness_stage | Only if the subsequent independent stage walk passes; stable trust failures cannot write |
+| service_cg, service_runs | Escaping exact initial Refusal and successful writer |
+| capture_base | Escaping exact initial Refusal; service-finally masking and first-creator loss remain gaps |
+| harness_binary | Escaping exact initial Refusal before exec |
+
+The snapshot follows stop (including a raised stop), before the unchanged
+quarantine and cleanup fences. Only stop-returned plus cgroup lstat
+FileNotFoundError permits channel reads; rc 0 and rc 5 are treated alike.
+This is conditional evidence within the existing containment assumption,
+**unverified on real hardware**. It proves neither escaped-root coverage nor
+atomic consistency, immutability or complete capture. Other outcomes give all
+three statuses `unknown`, with no feedback-channel opens. Bounded reads reject
+special files, invalid metadata, duplicate keys and noncanonical payloads.
+`absent` means no validated file was found; **absent is not success** and does
+not mean no refusal occurred. Non-Refusal errors, termination and masked
+exceptions can remain uncaptured. The single carried payload uses service,
+fixture-check, harness display precedence, never chronology or causation.
+
+Progress is an existence-only lower bound: none < staged < service < cgroup <
+account. Root-owned regular progress-cgroup metadata means the service reached
+the line before control.mkdir; fixture-identity metadata means capture saw an
+account. Contents are never opened by this snapshot. Neither proves creation,
+completion or cleanup. Missing/unsafe markers cannot prove no mutation.
+Unknown/malformed/captured statuses never themselves raise progress. On apparent
+success, any such status gives only fixed E_RECORD stderr and exit 1, preserving
+actual first/final and cleanup state. Existing failures retain their semantics.
 
 Safe synthetic mechanism tests (no filesystem observations, native commands,
 provisioning or system driver execution):
@@ -140,15 +171,28 @@ python -I -B -c "import sys,unittest; sys.path.insert(0,'tools/unix-exec-validat
 python -I -B -c "import sys; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0_blockers as t; t.mutations()"
 ```
 
-The bounded runner compiles 15 independent mutations in memory, requires a
+The legacy bounded runner compiles 23 independent mutations in memory, requires a
 named assertion failure for each (compile errors earn no credit), restores the
 module binding, and verifies the raw source SHA-256. It never writes mutations.
 Success replaces the old harness/cleanup markers: first=null, final=null,
-mutation=service and cleanup=confirmed in one validated line. first is the
+mutation_lower_bound at least service, three absent statuses and cleanup=confirmed in one validated line. first is the
 original body exception (including pre-try failures), or null; final is the
 escaping exception. Cleanup-only failure keeps first=null.
 If association gates fail, the sole output is the closed fallback stderr line
 `unix experiment refused/failed: <code>`. Record failures use E_RECORD.
 BaseException, process termination and workflow cancellation may emit no record
-and cannot prove cleanup. Internal capture at the seven service/harness/fixture
-sites remains uncovered; separate F0b work is needed before any F2 coverage claim.
+and cannot prove cleanup. Internal coverage remains conditional as listed above; installed is never captured.
+
+
+F0b mocked regressions and in-memory candidate ledger:
+
+```
+python -I -B -c "import sys,unittest; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0b_transport as t; unittest.main(t)"
+python -I -B -c "import sys; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0b_transport as t; t.mutations()"
+```
+
+Every credited mutation requires a green baseline, exact-once anchor, successful
+compile, zero test errors and named assertion failures; source bytes stay
+unchanged. Equivalents receive no kill credit. See the F0b evidence ledger for
+executed commands, maxima, migration and limitations. Fresh Opus high source/
+security review is still required before publication. F2 remains undispatched.
