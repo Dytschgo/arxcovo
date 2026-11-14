@@ -9,11 +9,12 @@ correction with its retained independent Opus high recheck. See the
 [correction recheck](../reviews/0019-validator-correction-opus-recheck.md).
 
 The staged architecture remains inactive and grants no production constructor
-or M2 acceptance. D7a below adds one narrowly scoped hosted A1/A2 execution
-exception, effective only after its independent review, required checks and
-coordinator merge. All other native execution and historical retries remain
-unauthorized. The historical E_PROTECTION diagnosis is unresolved; D7a
-expressly disposes of that prerequisite for its single run only. Every other
+or M2 acceptance. D7a is consumed. D7b below proposes one fresh hosted A1/A2
+execution of the corrected protected-parent source; no run permission exists
+until independent Grok review, all required checks and coordinator merge.
+All other native execution and historical retries remain unauthorized. The
+historical E_PROTECTION diagnosis is unresolved; D7b expressly disposes of
+that prerequisite for its single run only. Every other
 implementation, native-acceptance and production-activation gate remains.
 
 ## Historical proposal and clarification checkpoints
@@ -228,10 +229,18 @@ green hosted gates; the separately reviewed Linux cgroup setup and janitor
 slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
-run and its environment must not be retried or reused. The bounded A1/A2
-exception below is the only newly permitted execution.
+run and its environment must not be retried or reused. D7a is consumed; only
+D7b proposes a fresh bounded A1/A2 execution, subject to its publication gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
+
+**Historical; consumed.** The terms below record the original grant, not
+current permission. PR #83 merged as
+`f01da6f425cc8d9d3ee8c304ab8112017618da44`; accepted dispatch
+`43622157531`, attempt 1, consumed it. The [unchanged run record](../evidence/linux-stagef-a1a2-run-43622157531.json)
+reports `E_PROTECTION/run_parent/initial` before mutation (`none`), cleanup
+`not_reached`. The reviewed-SHA variable was cleared and verified absent in
+the closed disposition. D7b does not renew D7a or reuse that environment.
 
 This amendment follows the owner's delegated instruction to use the normal
 reviewed ADR path rather than require another owner confirmation for a bounded
@@ -279,6 +288,64 @@ been accepted, the grant is consumed regardless of job outcome. An explicit
 owner answer arriving before dispatch takes precedence over this delegated
 instruction. Hardware and installed/dedicated paths receive only the evidence
 actually observed; no owner-machine acceptance is implied.
+
+### D7b. One corrected protected-parent A1/A2 run (2026-11-14)
+
+**Proposed; no run permission until independent Grok review, all normal
+required gates (including `agent-review` and `ci-time-budget`) and coordinator
+merge.** The owner delegates this proportionate reviewed ADR route without
+repeated owner confirmations for a disposable hosted runner.
+
+Run `43622157531` localized the fresh refusal to root-owned `/opt` with
+group/other write bits `0o022`, before mutation. The [source correction](../evidence/linux-stagef-protected-parent-fix.md)
+uses fixed `/var/lib/arx-ci-<run>-<attempt>` without weakening ancestor,
+collision or cleanup guards. Its [independent Grok source/security review](../reviews/m2-stagef-protected-parent-grok-review.md)
+passed; PR #85 passed normal gates and merged as
+`7afea2fdcb17268396fbdb17c36ee8cf991e2ce4`. This is the first targeted
+correction of that localized refusal, not a retry or diagnosis of historical
+run `43091339273`. That historical run's failure site and cleanup remain
+unknown; its entire environment remains excluded. The D7a environment is
+also excluded. Source-review and publication success confer no native credit.
+
+The sole candidate is the **first main squash containing D7b**. Compared with
+reviewed main `7afea2fdcb17268396fbdb17c36ee8cf991e2ce4`, only this ADR and
+supporting review/progress documents may differ. Execution-related source,
+fixture, driver, workflow, packaged unit and standard profile must be
+byte-identical; evidence and its hashes must remain unchanged. The coordinator
+must verify this comparison and pin the actual full main squash SHA, not a
+branch head or the source-baseline SHA. A source/workflow difference or main
+advancing to another candidate requires a new reviewed disposition; no
+substitution consumes this grant.
+
+After those gates only, the coordinator may set `UNIX_EXECUTION_REVIEWED_SHA`
+to that exact full candidate SHA, dispatch the existing
+`unix-execution-experiment.yml` **once** on a fresh GitHub-hosted Ubuntu 24.04
+runner, and clear the variable in a finally-style step after completion,
+failure or rejected dispatch, verifying absence. No further owner confirmation
+is required for these operations. An explicit owner answer arriving before
+dispatch takes precedence. An accepted dispatch consumes the grant regardless
+of job outcome; rejection grants no automatic retry.
+
+All existing technical fences remain unchanged: manual trigger, exact
+repository and owner actor/triggering actor, main ref,
+source/workflow/reviewed-SHA equality, read-only credentials, packaged standard
+hardening, protected ancestors, fixed-unit and staging collision refusal,
+owned-only cleanup, and bounded reads, output and lifetime. There is no parent
+override, fallback, guard relaxation or workflow/permission change.
+
+Only `exec::disposable::disposable_linux_a1_a2` may run. It checks the packaged
+hierarchy and setup before children; no account provisioning, cross-account
+command, shim, rights probe, A13 or other native case is included. No payment,
+owner-PC access, owner administration, account action, static VM or backup
+deletion is authorized. Stop on failure or uncertain cleanup, retain the
+existing bounded sanitized record, exclude the environment and do not dispatch
+again. There is no automatic retry or reusable permission.
+
+Any pass accepts only A1/A2. M2, full Stage F, Stage G, real-Runner PA6,
+production constructors and activation receive no credit or permission and
+remain open/inactive. `/var/lib` and installed/dedicated paths remain
+**unverified on real hardware** except for evidence actually observed in a
+future authorized run; optional diagnostics remain parked.
 
 ## Contract clarifications (2026-11-12)
 
