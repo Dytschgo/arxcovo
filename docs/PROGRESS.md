@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Grok held-pin/decoder review `a4ddbf8` accepts partial source only: managed baseline and eleven assertion mutants pass; native launch remains GATE2_ONLY. Remaining exact integration is externally pinned fixed run-manifest admission with parent-relative held opens/128-bit identity/link recheck, real begin/end Rust row frames across one session, and that session owning the outer Job/deadline termination. Sol high source completion is next; no native run authorized. Environment/nested Job proof/measured budget remain OPEN.
+
 - Grok controller recheck `2e6259a` accepts local unpublished preparation: row numbering fixed, unsafe launch holes closed by removal, ten pure tests and five managed assertion mutants passed. Native run-readiness NOT cleared. Next bounded source task implements held-file immutable launch pins, real nonblocking telemetry and owned-Job kill integration; compile/pure tests only. Environment selection, nested-Job proof, measured budget and native authorization remain OPEN. No controller/helper launch or historical retry.
 
 - Gate2 source `3eedb77` (retained `beb590c`), evidence `afcf804` (retained `a04aaf6`), received Grok review `b2dec92`: dormant Rust contract holds, but controller run-readiness NOT cleared. Fix ST-INDEX row numbering, SE-DEADLINE owned clocks/nonblocking telemetry, SE-COMPLETE ledger completion and SE-INHERIT exact bound command/environment. Immutable launch pins, disposable standard-account environment, nested Job proof and measured budget remain gates. Sol high correction is next with compile/pure checks only; no controller/helper/native run.
