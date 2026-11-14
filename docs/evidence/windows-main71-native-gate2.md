@@ -469,3 +469,218 @@ test/full suite, CLI, account/service/VM/private-state operation, install, owner
 admin action, old Lab Manager access, GitHub/network, push/PR/CI/dispatch or
 subagents. PowerShell remains GATE2_ONLY. No workflow, root Cargo, policy, ADR,
 proposal, review or PROGRESS edit. Independent review remains pending.
+
+
+## Three-integration assignment: prepared technical-blocker handoff, 2026-11-14
+
+Provider: OpenAI / gpt-6.1-sol / high, implementation sub-agent, no delegation.
+**INCOMPLETE. This is not the requested completed three-integration source.**
+Fresh independent source review is still required. No run readiness, native
+permission, publication, PR or CI admission is claimed.
+
+Initial HEAD `ded6dbc716b2991b294f07384655b29c396edbe5` was clean; cwd equalled
+Git top level in an isolated linked worktree (separate worktree Git directory
+under the common Git directory). Retained accepted partial source `6af00cb`
+and Grok held-pin/decoder review were the baseline. Read AGENTS, KICKOFF,
+accepted native scope proposal, PINNING, feedback proposal and recent main71
+reviews. User restrictions override general progress/delegation instructions.
+No PROGRESS, proposal, review, ADR, policy, workflow or root Cargo edits.
+
+Source commit: `eac5a6d2006d5b3242d3ea5460a049755cc071aa`.
+
+Prepared changes:
+
+- Admission.cs compiles a closed bounded JSON parser: external manifest SHA256,
+  fixed keys/roles, full commit/source blob inputs, LF SHA256, 128-bit ids,
+  bounds, fixed toolchain/profile/target and artifact roles. Tests reject extra
+  keys, mismatched external hash/commit and a root self-hash field. There is no
+  usable run-manifest.json and no self-generated admission pin.
+- HeldFiles uses parent-relative NtCreateFile child opens, mandatory FileIdInfo,
+  link-count checks before/after hash, transient shared volume-root bootstrap
+  closed after the first child, and no hardlink-two/copy fallback.
+- Actual dormant Rust row functions emit begin/end frames: kernel 0, matrix
+  1..34. Serializer has independent literal byte oracles. No native registration,
+  ignored registration or caller was added. End frames follow row assertions;
+  a panic withholds completion. C# decoder checks frame order and exact segment
+  counts 2/70, in addition to MonitorState/Budget accounting.
+- NativeJob contains the dormant suspended direct-libtest launcher, explicit
+  inherited handle list, four-value UTF-16 environment, Job assignment before
+  resume, zero-time process queries and bounded pipe polling without callbacks
+  or task-pool readers. OwnedSession owns the started clock, channel, decoder
+  and Job across both filters. Abort attempts owned-Job termination before
+  confirmation; unconfirmed Job owners are retained, never reused.
+- Direct libtest grammar replaces Cargo runtime rebuild grammar in the dormant
+  adapter. Toolchain Cargo remains a manifest artifact role. This source choice
+  requires independent review and grants no discovery authority.
+
+### Concrete source blockers, not deferred native evidence
+
+1. Admission.Revalidate deliberately throws `helper directory exclusion unproved`
+   after retaining/verifying input files. Current directory handles do not prove
+   exclusive helper-directory membership against concurrent insertion. A
+   handle-based exclusion mechanism and corresponding pure contract checks are
+   missing. Do not remove this throw on the strength of a directory listing.
+2. Manifest bytes are parsed in memory; a fixed held-manifest loader with
+   externally supplied manifest identity/hash is not wired. cleanCheckout and
+   reviewed blob map remain caller inputs. Artifact role aliases and provenance
+   contents are not cross-bound to the exact source roles. Temp/SystemRoot
+   directory pins are incomplete; the parser currently requires SystemRoot to
+   be under the disposable root, which also needs reconciliation with a usable
+   selected-environment layout. No build manifest confers permission.
+3. Telemetry shares inherited stderr with possible harness diagnostics. Invalid
+   bytes fail closed, but a dedicated telemetry-only transport plus separate
+   raw-stderr discard is not complete. Frames currently carry duration 0;
+   that is not an observed runtime duration. No producer call-site omission
+   mutant or actual row execution has been verified.
+4. Job ownership/race source needs further review and correction: no independent
+   proof of cleanup paths after launch/assignment failures, bounded confirmation
+   and final-success race. The 358-second cutoff reserves two seconds globally,
+   but per-row ten-second teardown accounting is incomplete. In-memory cleanup
+   predicate tests do not prove native termination ordering or handle cleanup.
+   This is missing implementation, not a reason to run a forbidden experiment.
+
+These source gaps require a subsequent implementation handoff. They are not
+owner-only administrative blockers. The new source is retained behind both the
+unconditional PowerShell GATE2_ONLY refusal and registration_enabled=false.
+Admission itself also refuses. No further source claim is inferred from compile.
+
+### Actual checks and call-graph boundary
+
+Before running managed checks, inspected PureControllerChecks.Run: string/JSON
+parsing, SHA256 on synthetic supplied bytes, in-memory queues, numeric synthetic
+clock values, metadata predicates and synthetic frame decoding. It never
+constructs Admission, HeldFiles, OwnedSession or NativeJob; no P/Invoke,
+Stopwatch, process operation, native sink, file or environment inspection is
+reachable from Run. The PowerShell runner reads source/compiler reference
+assemblies and compiles all imports, without invoking them.
+
+Rust exact pure filters were inspected: frame serialization, diag bookkeeping,
+literal oracle checks and synthetic parser/observation checks only. They never
+call emit_frame, native row functions, run_inner, prepared_execution, clocks or
+native APIs. No ordinary Rust test filter or full suite was used.
+
+Commands run (all Cargo work offline/locked; CARGO_PROFILE_DEV_DEBUG=0):
+
+```powershell
+python tools/windows-native-replay/Check-Source.py
+pwsh -NoProfile -File tools/windows-native-replay/Test-PureController.ps1
+cargo fmt --all
+cargo fmt --all -- --check
+cargo clippy -p arxd --all-targets --locked --offline --target x86_64-pc-windows-msvc -- -D warnings
+```
+
+Final outcomes: source inventory PASS (28 literal rows, five pure tests,
+zero native registrations/callers, selectors disabled); managed baseline PASS
+and **21 compiled mutants assertion-killed**; fmt check PASS; Clippy PASS
+(final run 3.13s, package targets compiled, none executed).
+
+Five separate commands used this exact prefix:
+`cargo test -p arxd --lib --locked --offline --target x86_64-pc-windows-msvc`
+and suffix `-- --exact --test-threads=1`, with these exact filters:
+
+- `development::windows::native_replay::pure::producer_bytes_have_independent_literal_oracle`
+- `development::windows::native_replay::pure::counters_survive_invocation_and_scope_clears_even_on_unwind`
+- `development::windows::native_replay::pure::oracle_counts_missing_zero_and_literal_bindings`
+- `development::windows::native_replay::pure::mocked_failure_and_contract_mutants`
+- `development::windows::native_replay::pure::controller_rejects_unknown_cleanup_extra_counts_and_private_payloads`
+
+Each selected exactly one test: PASS, 366 filtered out, harness 0.00s.
+Initial build 37.91s; subsequent commands 0.24–0.29s. Restored producer test
+was rerun after the mutation below: PASS, compile 3.92s. This is pure credit,
+not native row count, child safety or cost evidence.
+
+Toolchain: rustc 1.95.0, compiler commit
+`59807616e1fa2540724bfbac14d7976d7e4a3860`, host/target
+x86_64-pc-windows-msvc, LLVM 22.1.2; cargo 1.95.0
+`f2d3ce0bd` (2026-03-21). Default features; dev debug=0.
+Managed compiler: installed PowerShell 7 in-memory Add-Type using its .NET
+reference assemblies. No helper build or executable was run.
+
+### Failure ledger and mutation limits
+
+- Initial Add-Type attempt failed compilation because specifying only the JSON
+  reference excluded ConcurrentQueue's assembly. Corrected to installed compiler
+  reference assemblies; imports compiled successfully. Compile error gets no
+  mutation credit.
+- Initial Rust check (`cargo check -p arxd --tests --locked --offline --target
+  x86_64-pc-windows-msvc`) failed with missing GetStdHandle/STD_ERROR_HANDLE
+  imports in the new cfg(test) module. Added imports; subsequent Clippy compiled
+  all targets successfully. The cargo-check command itself was not rerun and is
+  not claimed green.
+- Two fmt checks initially reported new-block/import ordering differences;
+  cargo fmt corrected them. Final fmt check passed.
+- First frame-eof mutant survived because its old fixture did not isolate a
+  partial second segment. Added a two-frame/partial-next-byte test; final mutant
+  compiled and failed the partial-EOF assertion.
+- Adding full mock-stream checks made the index mutant fail at `stream end`;
+  added that precise expected assertion to the runner's allowed kill labels.
+- Initial self-field mutant accidentally changed pin-object key parsing and
+  failed `manifest valid`; no intended self-hash credit for that attempt.
+  Restricted mutation to the root schema; final compiled mutant failed
+  `manifest self hash` as intended.
+- Rust producer begin-flag inversion: LF SHA256
+  `2f7856b932f10d1883cff5bdee52e24eede4d4774ec0b3abae0aa3a1c6c85252`.
+  Actual pure serializer compiled; literal byte oracle assertion-failed (exit
+  101), then original bytes restored and exact pure test passed. No omission
+  or kernel-row proof is claimed. This does not call WriteFile.
+
+No failure reached three same-issue failed fixes. No fourth attempt, delegation
+or historical retry was made. Managed mutant hashes below refer to the actual
+compiled LF bundle including deterministic type-name isolation; compiler errors
+are fatal and never accepted as assertion kills.
+
+| Managed mutant | Compiled LF bundle SHA256 |
+| --- | --- |
+| index | `22611b2ca42bdb02333f8c1d72dd633d1a46aa2ca8ec51722a45915a27c3594d` |
+| complete | `023f5cfcc5b066e5e3de127814ca467212a9feb1ab0e79c5dcedded11fa6c7c4` |
+| timeout | `c17fcf4e069ab65b2432235261bc1237c1286cb0abb40be18a343689a0855314` |
+| arguments | `8cef1a27b6103eb6fdc1487024c2b4ec9effa37c08360eae1aa93df004addc65` |
+| environment | `15e1357115d1c094dfae2e7142d6d05856b093212131fec2526ada3e89344e77` |
+| held-pin | `d59a5190675b7a53e5b2d92c8fe906e9e8097c15c794bc3a1b90a3b7a67eeb72` |
+| link2 | `5d5162d6469b8f131932d1e14227baaf2d419b09d608b7cb3e66a57ccaab2fab` |
+| argument-escape | `bc05463610924438c8dd896af4140706fa1707503a4e58a19009b79dbd79058f` |
+| frame-eof | `8842233eab4962bfb3760e139ee7546edb41e08b9698deebdf9892eb711e031e` |
+| frame-output | `78fef5f3bb4ecb83d79490ec2e837edce5b1606aeab16b59bc7113e5b3885e28` |
+| manifest-extra | `681d937dd1a24d8301487ae03ad580a2ddccbeafc43ebb2c5524666dd078cd37` |
+| manifest-external | `f73c2963a1c9220558501af8acf4eb96651f7e5a970f35e825381f3864900e84` |
+| manifest-commit | `3b9ffaded072a448a3ea83ec920335eedffc7c8d8d53d9d70ee08ab71401dcf6` |
+| cleanup-kill-first | `5d4e2f0a25556ff9b383df1a8c02e4c914c1031ec009a576334e517b203f6cdb` |
+| cleanup-active | `249796a3b9a0a0cf46463d482357f5b8ef3f41ea412846359df85e542ed0c375` |
+| cleanup-deadline | `c4680e11beb51d5eca51fb5fedcdff1797e8ea9c1537603eaafc74349814f2ba` |
+| post-hash-links | `26195ca439cbfd1e82c9cda162b2aabcaeeef6e24b1e9f5c4ca0d5f4ee05da15` |
+| frame-complete | `830fc6534c77a5848925fceb3ef9db6d636db48d8a90cb7cce53a198a441f8e9` |
+| frame-order | `cd2117124911a027e43b42fc50f7b89313249dfe55a426fcaf8c6d1725a753ba` |
+| manifest-self-field | `42c6ddd2bdae46c7f82e3a3e9c6cc4cdefc7bbb756f65b2cc8472d795c63cb2e` |
+| clock-order | `ff915d8da68e4bc352d217eddb8a217927f145166440c38bada6f56e1b717c34` |
+
+### Source pins at the source commit
+
+All listed source bytes are LF, CR count zero.
+
+| Path | Git blob | LF SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/development/windows.rs` | `81cf50b7c2a3e0da39c825dac9afc61fc0b568d0` | `ef82d058b73dc272b297fdddea9e31d7189cef8a5fded9dbf36af2789ceba81c` |
+| `tools/windows-native-replay/Admission.cs` | `df8de5fcf9934d817c3f9366cb62b29b3b30499d` | `33d01b5ebe97a4bd8e189d4a4479ef43432c17ff0c14d77cc56b3a37beb2cef6` |
+| `tools/windows-native-replay/Check-Source.py` | `58cdffa88484ec37edbd30bedf1414a654c4d71e` | `940e844dbb6af2eb98cc66fd551dcaaeb80807bfa51f8bc60ddbe549b0af53ff` |
+| `tools/windows-native-replay/Controller.cs` | `ac13134483facb791d921d7eaaa2ab2015a37f42` | `74bf6b57e85c7feda4525f8e175f0a97a027373e7b469d61b3094e5548a52c00` |
+| `tools/windows-native-replay/HeldFiles.cs` | `47177e878d309a9f6d22e77f830556a94cc1384d` | `8c83e825a03c4bbd182ca4fbc19697b454b91fbb0eba9645d8ed054b6212da0d` |
+| `tools/windows-native-replay/Invoke-BoundedReplay.ps1` | `a4c88570d6012ae356c9b4f1e71b2f0d0d76acba` | `29dc8f9f6468d9c03d9defe65381f6f13064ee354aa7637309c0a50b98b6fb33` |
+| `tools/windows-native-replay/NativeJob.cs` | `5fa8efba3012d51815f49fb9a38d23a1804f2059` | `f934f165408a9a879090da129f95122a75d2bcd5831ac5bb60cb1063f39a36d4` |
+| `tools/windows-native-replay/PINNING.md` | `8bba98fbe889474cdf4c167c9049d9168384809d` | `1675770695a0aeb0348b66ad38b87994a035badc0c142d728eb8af2cd110f56b` |
+| `tools/windows-native-replay/Prepare-Provenance.py` | `cbc1ddc275b5543741b7f517699d7e7a8a3120a9` | `1b0f44ef0eb368cc4d47dd343df813fa3b52ef3e0d62ff23fa9b8711596785ee` |
+| `tools/windows-native-replay/selectors.json` | `41a9499660e8b0b40b21bd021f56ba45d760474a` | `e9aa9e6f405c2142d392096926830f0ba5b59be1a8ef46409d75d1513eab9b23` |
+| `tools/windows-native-replay/Test-PureController.ps1` | `d5514815c0a61899cf20ce42913a9def81e1ff2e` | `d9098c121fec71bfbfa9e1aefb791f2ddccdfd11fe168ec6e75f9f43226b7f32` |
+| `Cargo.lock` | `1c5c0fcf2b577f89ed998826ddf6608338b4b523` | `1ebaf3af25f462da12eb8e8f7cfff3803deb180dd4c1f294be67bef3f3a7e4cc` |
+| `tools/windows-native-replay/child/Cargo.lock` | `dbf05ddef24026e55c6e87b9a38a7c7899412b9d` | `f4e0e27cc75747f2ad09ac4bccda3e0d1cbf34df174e9584074e56957377cd22` |
+
+Native APIs/controller/helper/process launch/run_inner/native fixture/ordinary
+Rust tests/full suite/CLI/account/service/VM/owner private state/process or system
+inspection/install/network/GitHub/push/PR/CI/dispatch/subagents: NOT RUN.
+No provenance artifact preparation command was executed. All native containment,
+128-bit identity semantics, namespace exclusion, nested Job behavior and real
+cleanup remain **UNRUN, unverified on real hardware**. Environment unselected;
+nested Job proof UNRUN; 300/360/60 and actual native costs UNMEASURED.
+
+M2 is **incomplete**; main71 cause **unknown**; no historical retry; Phase 1
+has no focused real red loop; real-Runner PA6 replay **OPEN**. This is prepared
+code with explicit technical blockers, not a completed adapter or incident fix.
