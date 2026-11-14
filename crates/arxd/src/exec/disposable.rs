@@ -384,7 +384,7 @@ for pid in children:
 #[ignore = "production setup + fixed packaged service; fresh disposable hosted Linux only"]
 fn disposable_linux_a1_a2() {
     use hierarchy::{linux::LinuxFs, setup::Clock};
-    use std::{io::Read, os::unix::fs::OpenOptionsExt, time::Instant};
+    use std::time::Instant;
     for (key, value) in [
         ("CI", "true"),
         ("GITHUB_ACTIONS", "true"),
@@ -415,6 +415,11 @@ fn disposable_linux_a1_a2() {
     ));
     let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
     crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();
+    hold_identity_ack();
+}
+
+fn hold_identity_ack() {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt, time::Instant};
     // Outer checks MainPID/executable/placement now, then releases us. The libtest
     // summary cannot exist until after this function returns.
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -447,8 +452,8 @@ fn disposable_linux_a1_a2() {
 }
 
 // Dormant A3 observations only. No setup, service mutation or Runner call.
-// A future independently reviewed driver must establish profile presence/absence
-// for the respective case. The current driver selects neither of these tests.
+// The driver establishes profile presence/absence and runtime attribution.
+// Its preparation default selects neither of these tests.
 fn assert_a3_hardening(expected: hierarchy::parse::Hardening) {
     use hierarchy::{linux::LinuxFs, setup::CgroupFs};
     for (key, value) in [
@@ -471,13 +476,21 @@ fn assert_a3_hardening(expected: hierarchy::parse::Hardening) {
 }
 
 #[test]
-#[ignore = "A3 with unchanged packaged drop-in; fresh disposable hosted Linux only; driver not wired"]
+#[ignore = "A3 with unchanged packaged drop-in; fresh disposable hosted Linux only; source selection required"]
 fn disposable_linux_a3_standard() {
+    assert!(!Path::new("identity-ack").exists());
     assert_a3_hardening(hierarchy::parse::Hardening::Standard);
+    let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
+    crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();
+    hold_identity_ack();
 }
 
 #[test]
-#[ignore = "A3 without standard drop-in; fresh disposable hosted Linux only; driver not wired"]
+#[ignore = "A3 without standard drop-in; fresh disposable hosted Linux only; source selection required"]
 fn disposable_linux_a3_none() {
+    assert!(!Path::new("identity-ack").exists());
     assert_a3_hardening(hierarchy::parse::Hardening::None);
+    let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
+    crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();
+    hold_identity_ack();
 }

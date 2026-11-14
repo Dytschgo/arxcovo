@@ -18,7 +18,7 @@ CASES = [
  ('reuse staging directory', 'stage.mkdir(mode=0o700)', 'stage.mkdir(mode=0o700, exist_ok=True)', 'test_parent_checked_before_exclusive_stage_creation'),
  ('build after start', '        build_env = cargo_env(stage)', "        call(['/usr/bin/systemctl', 'start', '--no-block', unit])\n        build_env = cargo_env(stage)", 'F0Blockers.test_run_orderings'),
  ('fixed unit', "return Path('/var/lib/arx-ci-' + run), 'arxd.service'", "return Path('/var/lib/arx-ci-' + run), 'other.service'", 'test_launch_contract'),
- ('wrong test', "TEST = 'exec::disposable::disposable_linux_a1_a2'", "TEST = 'exec::disposable::disposable_linux_cross_account'", 'test_launch_contract'),
+ ('wrong test', "TEST = 'exec::disposable::disposable_linux_a1_a2'", "TEST = 'exec::disposable::disposable_linux_a3_standard'", 'test_launch_contract'),
  ('fork instead of exec', 'os.execve(binary, args, env)', 'subprocess.run(args, env=env)', 'test_launcher_exec_and_single_capture_owner'),
  ('cargo in unit', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return ['/usr/bin/cargo', TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_launch_contract'),
  ('broaden override', r'Restart=no\nRuntimeMaxSec=140', r'Restart=always\nRuntimeMaxSec=140', 'test_launch_contract'),
@@ -27,6 +27,16 @@ CASES = [
  ('omit deadline', "require(time.monotonic() < deadline, 'E_TEST_TIMEOUT')", "require(True, 'E_TEST_TIMEOUT')", 'test_deadline_required'),
  ('cleanup another unit', "require(unit == 'arxd.service', 'E_UNIT_COLLISION')", "require(True, 'E_UNIT_COLLISION')", 'test_cleanup_cannot_stop_another_unit'),
  ('bypass collision', "props.get('LoadState') == 'not-found'", 'True', 'test_collision_refuses_before_mutation'),
+ ('swap profile', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST == 'exec::disposable::disposable_linux_a3_none'", 'test_profile_pairings_and_install_bytes'),
+ ('omit profile', '    if present:\n        files.append', '    if False:\n        files.append', 'test_profile_pairings_and_install_bytes'),
+ ('skip exact drop-ins', "props.get('DropInPaths') == expected", 'True', 'test_exact_runtime_attribution'),
+ ('skip byte comparison', "private_read(path).encode('ascii') == data", 'True', 'test_exact_runtime_attribution'),
+ ('skip sole PID', "require(tasks == (pid + '\\n').encode('ascii'), 'E_UNIT_CGROUP')", "require(True, 'E_UNIT_CGROUP')", 'test_sole_supervisor_pid_required'),
+ ('skip held attribution', "            verify_runtime(stage, stage.name.removeprefix('arx-ci-'), state)", '            pass', 'test_ack_before_exit_before_summary'),
+ ('skip prestart attribution', '        verify_runtime(stage, run_id)\n        call', '        pass\n        call', 'test_runtime_attribution_lifecycle'),
+ ('skip cleanup attribution', '        verify_runtime(stage, run_id)\n        stopped', '        pass\n        stopped', 'test_runtime_attribution_lifecycle'),
+ ('skip cleanup identity', '        for path, info in owned:\n            same_object(path, info)', '        for path, info in owned:\n            pass', 'test_cleanup_replacement_quarantines'),
+
 ]
 
 def run_case(module, name):
@@ -105,13 +115,14 @@ def rust_mutants():
         def compile_run(code):
             built = subprocess.run(['rustc','--edition=2024','--test','-','-o',str(exe)], input=code, text=True, capture_output=True, timeout=60)
             assert built.returncode == 0, built.stderr
-            return subprocess.run([str(exe),'a1a2_','--test-threads=1'], capture_output=True, text=True, timeout=20)
+            return [subprocess.run([str(exe),'hierarchy::fake::'+test,'--exact','--test-threads=1'], capture_output=True, text=True, timeout=20) for test in ('a1a2_production_setup_before_acceptance', 'a1a2_refusals_never_release_acceptance', 'a1a2_cancel_timeout_and_postcondition_refuse')]
         baseline = compile_run(source)
-        assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+        assert all(r.returncode == 0 and '1 passed; 0 failed' in r.stdout for r in baseline), [(r.stdout,r.stderr) for r in baseline]
         print('Rust pure baseline: 3 passed')
         for label, before, after, test in mutants:
             assert source.count(before) == 1, 'Rust anchor: ' + label
-            result = compile_run(source.replace(before,after))
+            results = compile_run(source.replace(before,after))
+            result = next(r for r in results if ('hierarchy::fake::'+test+' ...') in r.stdout)
             assert result.returncode == 101 and 'panicked at' in result.stdout and 'assertion' in result.stdout and ('hierarchy::fake::'+test+' ... FAILED') in result.stdout, 'no assertion credit: '+label+' '+result.stdout+result.stderr
             print('KILLED '+label+' assertion='+test)
     assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths] == fingerprints
