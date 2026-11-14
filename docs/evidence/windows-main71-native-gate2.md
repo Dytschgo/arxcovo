@@ -1478,3 +1478,250 @@ exact LF unchanged NativeJob.cs 7e15dbf388a128a24ae3fd39b5f680b5917ea281f588d703
 exact LF unchanged Admission.cs b6c1aa6b39d618a85e2183988cc95b44c965dfbb44670b2c2c4382d336754289
 exact LF unchanged Test-PureController.ps1 0ed3aadde962784dee601c12cfe01992bb84ac80805867a6486e87e3b0a0df11
 ```
+
+
+## Supervisor deadlines source-only evidence (2026-11-14)
+
+Provider/effort/outcome: OpenAI gpt-6.1-sol / high / local source slice and
+managed deterministic checks complete; fresh independent Grok review pending.
+No subagents, publication, PR, CI, registration or native execution.
+
+Entry cwd equalled Git top; clean porcelain; linked isolated worktree gitdir.
+Read AGENTS, KICKOFF, engineering skill and behavior safeguards, accepted native
+scope, PINNING, dedicated-telemetry review and integration SP-DEADLINE.
+Task-specific scope superseded general progress/delegation instructions.
+
+Source commit: `d381cacd77fba7d95f6530f2eb6012d25cc6b250`
+Source tree: `70b95b5e0607b45079e2b31bb79d969a86feb9eb`
+Parent: `fb680ea6bd09e5f8624baf5d914d0fa96bc793c6`
+Source changes: Controller/NativeJob, managed pure/mutation suite, structural
+source checker, PINNING only. No Rust change required.
+
+Callgraph inspected BEFORE managed execution: PureControllerChecks.Run calls
+in-memory admission/binding/transport checks and SupervisorPureChecks.Run.
+SupervisorPureChecks uses the actual Supervisor/MonitorState/Budget/RowChannel,
+with synthetic elapsed values, explicit Created/Assigned/operation-completion
+observations and deterministic scheduling. No OwnedSession, NativeJob or
+HeldFiles construction, wall-clock reads, real threads, native imports, file
+admission, provenance execution, controller/helper/child launch or run_inner
+is reachable from these checks. Imports are compiled only. Existing mock
+admission paths exercise in-memory interfaces and preserve the final refusal.
+
+New scenarios cover blocked launch and assignment, late unassigned suspended
+creation and late assignment refusing resume, assignment failure latching,
+one-shot assigned resume admission, termination reserve, retained last-row
+cap, teardown cap equality, global clamp, telemetry/final-success races,
+outstanding-operation exclusion, kill-before-cleanup, no reuse, full ledger,
+exit/active observations and a fresh final poll. This proves modeled state
+transitions, not Windows thread scheduling, atomic kernel resume behavior,
+Job semantics, actual cleanup or runtime timing. PINNING states the limit for
+arbitrary blocked kernel calls: fail/unknown and retain ownership, never claim
+complete cleanup inside a finite cap or that a thread can be killed.
+
+Performed on the exact source above:
+- `python tools/windows-native-replay/Check-Source.py`: exit 0.
+- `pwsh -NoProfile -File tools/windows-native-replay/Test-PureController.ps1`:
+  exit 0; managed baseline pass; 78 separately compiled mutants assertion-killed
+  with named failures; seven exact LF source hash/unchanged checks passed.
+- `git diff --check` and staged diff check: exit 0.
+
+Development observations, not counted as passing evidence: the first structural
+check retained an obsolete constructor string and was updated for the owned
+channel. One mutant initially caused CS0414 (unused killIssued), which did NOT
+count as a kill; keeping a syntactic read let it compile. That compiled mutant
+then survived because the pending-operation condition masked the kill flag.
+An independent zero-outstanding kill-before-cleanup case fixed the test gap.
+Later source changes warranted the final full managed rerun recorded below.
+Mutants are compiled in memory; original files are never replaced, and exact
+LF hashes are checked after execution. No compilation failure counts as an
+assertion kill. No three-failed-fixes handoff threshold was reached.
+
+Admission final refusal, RequireTelemetryBinding throw, GATE2_ONLY and disabled
+registration remain. Handle delivery/argv/env grammar, producer duration,
+environment selection and native registration are unchanged and unsolved.
+Native behavior UNRUN; environment/nested Job/budget unmeasured/unselected;
+M2 incomplete; main71 cause unknown; no historical retry; Phase 1 no native
+red loop; real-runner PA6 OPEN; **unverified on real hardware**.
+
+Existing evidence preserved byte-for-byte, including invalid 0x96 bytes:
+prefix length `100633`, SHA256 `cd8c28a493db92282a0c07c7da45c0e59a6d297df7fc57f68cc1e532c3ee9fc7`,
+0x96 count `1`. This block was appended as bytes.
+
+Exact final structural output:
+```text
+gate2 source inventory: 28 oracle rows; 5 pure tests; 0 native registrations/callers; selectors disabled
+gate2 map: kernel 0; failures 1..28; peek109 29..32; controls 33..34; dormant adapter admission blocked; native imports source only
+gate2 binding: externally pinned disposition -> held manifest -> held source Git/provenance/aliases; runtime refused
+dedicated telemetry source: separate writer allowlist; NUL raw streams; bounded mockable read; typed fixture writer; external grammar unwired
+supervisor source: one owned clock; failure-only waiter; absolute teardown cap; synthetic machine checks
+```
+
+Exact final managed output:
+```text
+managed pure baseline: pass
+mutant LF SHA256 supervisor-global-cap: d680c72c3b4cffd57e26b547dc359c481abe0c7b336dd9f914978a174ab2c4c7
+assertion-killed: supervisor-global-cap: supervisor: global teardown clamp
+mutant LF SHA256 supervisor-resume-failure: dfcc99395ef73c1a5b206040676e93256b06083476e4fe89be14dc976e81c6bc
+assertion-killed: supervisor-resume-failure: supervisor: late completion cannot resume
+mutant LF SHA256 supervisor-resume-assignment: 618bbd42fc4d7c668111c53cc441d1b656a65ca2ba2e8fc6f0e9ca4143503a59
+assertion-killed: supervisor-resume-assignment: supervisor: unassigned cannot resume
+mutant LF SHA256 supervisor-assignment-latch: 21663e6e2c806d009e89ead6f05372c22f85d9a5b632921a259b7cfbfc28fdd5
+assertion-killed: supervisor-assignment-latch: supervisor: containment irrevocable
+mutant LF SHA256 supervisor-resume-once: f6783b068ff8833c54bb25f78875968502ce085309877f84430c295b4ceed04c
+assertion-killed: supervisor-resume-once: supervisor: resume only once
+mutant LF SHA256 supervisor-reserve: 5cb87d7d8d3437114ec849893893090ffc4729566bcfe116d1fb1ab3ed04a1b8
+assertion-killed: supervisor-reserve: supervisor: launch stuck
+mutant LF SHA256 supervisor-late: cf7773c245e761f8950a747aac0611de12a6b26d60611dbfd7d9a4f6297504a7
+assertion-killed: supervisor-late: supervisor: no resume on failure
+mutant LF SHA256 supervisor-operation: 5d2f05efcdcdf4aa883964acff26cacea9581eb4a0d0ca05b5379050326a3d45
+assertion-killed: supervisor-operation: supervisor: outstanding prevents cleanup
+mutant LF SHA256 supervisor-kill: 5f437a5542cd05f162981a21a36fbaee849fb4b4ddb2f4c485dcb8eb83c547ee
+assertion-killed: supervisor-kill: supervisor: kill precedes empty cleanup
+mutant LF SHA256 supervisor-final-operation: 0cd4204aafa683e2077c64ed96d0d3ffa2da16d52ae7ad7a731b99f13dfd5c07
+assertion-killed: supervisor-final-operation: supervisor: final outstanding race
+mutant LF SHA256 supervisor-final-poll: 9746edaafef6990a7b4ff6e5fe46c20a65ceeeea2d93fa2af187b0132559177b
+assertion-killed: supervisor-final-poll: supervisor: last row cannot succeed late
+mutant LF SHA256 transport-empty: 47bf0fae2e8c151f0807db1e07387ecdb1feaa36555c4aab79ef7a38e0bcf251
+assertion-killed: transport-empty: transport: empty never reads
+mutant LF SHA256 transport-cap: 0176aa2c0e70ca2af433cc068ec804579bddeee1d5ac5e47941f8ff8ae8d228f
+assertion-killed: transport-cap: transport: bounded read
+mutant LF SHA256 transport-read: 45e3e00e91afea206f84e663aee40192b35c1bc2b85d0779885734f06a134b73
+assertion-killed: transport-read: transport: reject fault 6
+mutant LF SHA256 transport-short: a5173580d03dea3fcfd91db931ac40d5737dc7c8a3e03c1398545e599dcbaf5f
+assertion-killed: transport-short: transport: overread immediate rejection
+mutant LF SHA256 transport-eof: e24f5861d5f552071cb40fcd98b7fa5e47937e11871e6f1cc99d4aa26870d1ad
+assertion-killed: transport-eof: transport: segment EOF
+mutant LF SHA256 index: cec58ea27c6b69e0295d14570b094065e2c07f1322bd6082cf72dcaf0d246225
+assertion-killed: index: transport: ordered poll
+mutant LF SHA256 complete: 801357a183a1dfd98e3f56d5ff005d7264663578b9abb461c63523ada21a64a3
+assertion-killed: complete: supervisor: full ledger required
+mutant LF SHA256 timeout: 8c4ab2e03bfa42d88ff60d5d01072a999962200b4f62c8baa4049d55a89eab42
+assertion-killed: timeout: no first event
+mutant LF SHA256 arguments: 882a0b1677bf1b494e5005b347cd0d95eebccd774ef53a5992c85fd2acd83e17
+assertion-killed: arguments: filter reject
+mutant LF SHA256 environment: df6232fa5f51135f8c784e4a140e645a7c7903f242ba874bd9b338acc13a3482
+assertion-killed: environment: path reject
+mutant LF SHA256 held-pin: 02b6b286fa1335d948b9a801185d7cd4218e56d97bec342eb5f9e0ebe065de99
+assertion-killed: held-pin: manifest external mismatch
+mutant LF SHA256 link2: 7834bfc27dc00b3ea1e38d9f6bb21db8e282c3462fe3a2d0101a479e0c381aa2
+assertion-killed: link2: link2 reject
+mutant LF SHA256 argument-escape: 10acc7fe73905fb3f52b2a1827eb2a5d8a3c904124ec0e30c8cd800638c46ce5
+assertion-killed: argument-escape: quoted end
+mutant LF SHA256 frame-eof: 8e84fc5914307e4a575c63d6215729486bd0152766e62769e1940246836fa278
+assertion-killed: frame-eof: partial EOF
+mutant LF SHA256 frame-output: e3d10762c32b4a1708b1e06497c342c95fef007f8b60e700cfb4c1ee409e8004
+assertion-killed: frame-output: output overflow
+mutant LF SHA256 manifest-extra: 04bf792e64bb62cd8a28f3453ba005223aa0ce9ec9861d61ddab3bc7ebfec49b
+assertion-killed: manifest-extra: manifest extra
+mutant LF SHA256 manifest-external: c125f6f0c3b1d65fce7e93e981b9c59f9fd044f3a1d75b88f5b2a515bec55192
+assertion-killed: manifest-external: manifest external mismatch
+mutant LF SHA256 manifest-commit: afefb369f4c0df589cf4c781ff0aff8643529518cecd870610aedf1f80b64c1c
+assertion-killed: manifest-commit: manifest commit mismatch
+mutant LF SHA256 cleanup-kill-first: 8c0cdaf1abcf373036f2308e30db597d9f6d644332bde2ea6d88cd1a352dbe67
+assertion-killed: cleanup-kill-first: supervisor: cleanup observations
+mutant LF SHA256 cleanup-active: 2c1fa1f80491545fd2cc15d645f01d609288f9cdd22144ac54131c6c0df1f2af
+assertion-killed: cleanup-active: supervisor: cleanup observations
+mutant LF SHA256 cleanup-deadline: 441771ccc594f91ce10fc23cbbd0293e377b38574bff111e9417766acdf15ffb
+assertion-killed: cleanup-deadline: supervisor: teardown cap
+mutant LF SHA256 post-hash-links: 8413b5b33b7de0285a02444c0655b2262f0f0e7b053227b74228f8543e80b68f
+assertion-killed: post-hash-links: post hash links
+mutant LF SHA256 frame-complete: eb10ae98c249c4a89a9d7f933d9a491be98902d3dc628f9a97b597348f3594b4
+assertion-killed: frame-complete: wire complete
+mutant LF SHA256 frame-order: 0cdc9604b94c662c263baf0eabeede08695aa37b12fe665a8047e61ac82f387a
+assertion-killed: frame-order: duplicate frame
+mutant LF SHA256 manifest-self-field: bfec6ca833d85a204ff349d1dbe27ceeed9253c84226eef463f03827b3aa2542
+assertion-killed: manifest-self-field: manifest self hash
+mutant LF SHA256 clock-order: ecdb7b89d4cc5a53f1f45c97699fd4faa8f823fe0bcdd932a99c469b275d858e
+assertion-killed: clock-order: poll clock regression
+mutant LF SHA256 names-extra: 7ea46cf301f8a06a7c111ca715c0cbecedf90062f3adb1ae0831430e1a82a6a7
+assertion-killed: names-extra: admission: extra DLL
+mutant LF SHA256 names-repeat: 5953a66f2583c6eb7cb636f4d108dee96fb7e17f031cb82f58f902852a348d23
+assertion-killed: names-repeat: admission: repeated leaf
+mutant LF SHA256 names-missing: 780f7db1e4a3c0c5d230ee6ba16f0c2c05ec0749eb5f9e71ce8d01b9639f2ffb
+assertion-killed: names-missing: admission: missing leaf
+mutant LF SHA256 names-reparse: 895484aca7f1d4c1d8603f3e5150c8cb5f94ff943ef235020118764f344187ba
+assertion-killed: names-reparse: admission: reparse name
+mutant LF SHA256 names-tag: db36c2bbc108826891cfe71b801a6f92d66e29468187bb46277bdccee13b3aa3
+assertion-killed: names-tag: admission: reparse tag
+mutant LF SHA256 names-leaf: 4e765ad45cc1474ed6097ec1841c1d90e37dd3d14fbcf6ebe4879c1aeb7e6bfe
+assertion-killed: names-leaf: admission: wrong leaf
+mutant LF SHA256 names-type: 6ed829b7d8598b47296cceb734f9ae8d64eca027731a2a84122faefe304e09ef
+assertion-killed: names-type: admission: directory leaf
+mutant LF SHA256 names-dot-type: 908436d7d6987a6e3d940fe2c1dca625662ec2f928f4c7e6fd1856a7dfc621d7
+assertion-killed: names-dot-type: admission: dot type
+mutant LF SHA256 names-id: 58e73dcb6f5fcad7c9179f3317db94242f9fc66aea695ea356965ebf3b1349a5
+assertion-killed: names-id: admission: zero id
+mutant LF SHA256 scan-id: 72f4ae71e283472fc51e29d2300ef28023d5350fa6fc11f50d7ee1117210eee9
+assertion-killed: scan-id: admission: changed id
+mutant LF SHA256 scan-wire: 5c866681c381a3b6d7aab2901bef5e136419c4fd99cb824b4c9628f8144ce7a4
+assertion-killed: scan-wire: admission: changed scans wired
+mutant LF SHA256 scan-first-wire: 9d9e9da9da95b338407f5f53c9e89602d6018456cfc78a16dcc1ba088a654c1a
+assertion-killed: scan-first-wire: admission: first scan wired
+mutant LF SHA256 scan-second-wire: e5afd67817a0569aa4335ec9968f1a20925ed69d21afba79e026e303e64b9acc
+assertion-killed: scan-second-wire: admission: revalidate complete
+mutant LF SHA256 leaf-id-wire: 41296b592ef07d00342ef0f27435cc351a0b92d4156174bdb345be7ac9d99294
+assertion-killed: leaf-id-wire: admission: leaf id wired
+mutant LF SHA256 leaf-size-wire: 9244ad567043c6b7280b107b8b1aab4a46040f925fd05d7c6791e3547e7fa933
+assertion-killed: leaf-size-wire: admission: leaf size wired
+mutant LF SHA256 root-volume: 8386aa348167736c9439701aeb581527908a35a79715d12be295fa11dce72387
+assertion-killed: root-volume: admission: volume root
+mutant LF SHA256 root-nested: 3b890f545d294e51c5c006c51f3b498b998188fbeb8118d0cb1b3483714ba737
+assertion-killed: root-nested: admission: parser nested Windows
+mutant LF SHA256 root-equal: c5b4b8f13674ba60c51bb50bf952c267418118a729c34c51d007175ee710c995
+assertion-killed: root-equal: admission: equal Windows
+mutant LF SHA256 root-parent: 05ad17ccd504ae3b2c09474ede4dd69ec9eefd41a5a038b3a640709ee7077748
+assertion-killed: root-parent: admission: workspace under Windows
+mutant LF SHA256 root-pins: 95ac918e3a64f77ebf9efe981be873c3599955f52b2af6c90838bb703e3c8133
+assertion-killed: root-pins: admission: outside source
+mutant LF SHA256 root-helper: 902063a72ca13291f07f54b4772946e1271a3d543dda5f54ba83104c2ceac7fa
+assertion-killed: root-helper: admission: outside helper
+mutant LF SHA256 root-temp: 91db50bd5787f1a2bae5076972aec1a4001e775f24659501f72b3bce8487a0f5
+assertion-killed: root-temp: admission: outside temp
+mutant LF SHA256 root-wire: ab06bd7430d7cb7ab95c41d2ac7b70434f7cb1c096fda06f6a0236c9d2df8a3a
+assertion-killed: root-wire: admission: volume root
+mutant LF SHA256 binding-root-hash: ee899046c558d7d8a9705c6ff09ae6679d589929d9d5f7f7a43f1fbfb08a75cb
+assertion-killed: binding-root-hash: admission: binding root hash
+mutant LF SHA256 binding-held-manifest: 5eb2dfdc833965a2a580a802927c1602579a1074b0674a4b4815fbdf5d21cbcd
+assertion-killed: binding-held-manifest: admission: binding held read hash
+mutant LF SHA256 binding-git-bytes: e95b72ff5ef7d1937e6c99643ea92e3be3e26a9f6c0d185ce667cc866dbf6925
+assertion-killed: binding-git-bytes: admission: binding blob bytes
+mutant LF SHA256 binding-reviewed-blob: 30913b9abb82997caffedb05cf0ea9537f31b9016bc2a8f3a7b642a5344c8521
+assertion-killed: binding-reviewed-blob: admission: binding reviewed blob
+mutant LF SHA256 binding-git-frame: 8b5a4435537053f0236defdd8ba321d327dd0777ede9304b42060322c98e95bb
+assertion-killed: binding-git-frame: admission: binding git framing
+mutant LF SHA256 binding-provenance-source: f3b412b1d163ab8a368738ea5c8d617449e713c59fb00b9ab456aa49e9b065b9
+assertion-killed: binding-provenance-source: admission: binding provenance source
+mutant LF SHA256 binding-provenance-commit: 3e999a1b65bab8980cad7f88cd706f260427b5ad1419b8bbcbee39de10209e67
+assertion-killed: binding-provenance-commit: admission: binding provenance commit
+mutant LF SHA256 binding-provenance-helper: 7697fb9b189ad2c7551fcaa25fcba4e6fb2a78f78aa6b6438d27a69d0ec3cc26
+assertion-killed: binding-provenance-helper: admission: binding provenance helper
+mutant LF SHA256 binding-manifest-authority: 575de62edcedf63e9e4b48642abf5842bed5993753da563131c8a6fd5a716be4
+assertion-killed: binding-manifest-authority: admission: binding manifest authority
+mutant LF SHA256 binding-disposition-authority: 61c83c85045691d2ec4d4a881f1ea13b413b1bcf847bdb9dcaf42200d1da9195
+assertion-killed: binding-disposition-authority: admission: binding disposition authority
+mutant LF SHA256 binding-provenance-authority: d49eb7ba413497fbefb48c626e7a7537815981c3ac72bbbf3ab1274106ea2635
+assertion-killed: binding-provenance-authority: admission: binding provenance authority
+mutant LF SHA256 binding-provenance-native: 18d88e9afbaec5129999f7bac02ea1292cff8dbce2015a09a60b63dd3f183737
+assertion-killed: binding-provenance-native: admission: binding native claim
+mutant LF SHA256 binding-alias-path: 9bdba1921275aac5c48735235300bec67acf8d2290ea3ada973cd28d88be5d05
+assertion-killed: binding-alias-path: admission: binding alias workspace_lock
+mutant LF SHA256 binding-lock-bytes: f8382cb72469de540bc9c05dd8d92f098d1fe3d192e39d692dc333281ce04c23
+assertion-killed: binding-lock-bytes: admission: binding lock bytes
+mutant LF SHA256 binding-role-alias: 4bcd248ef41309b496599406aa534636e28721abace9fbfb825f8bb7b54e1305
+assertion-killed: binding-role-alias: admission: binding role alias
+mutant LF SHA256 binding-qword-order: 5dc4a2001b2724bd8865dbadd9cd27d1bb8cfa97e6ff8f558c589a33d689c4bf
+assertion-killed: binding-qword-order: admission: revalidate complete
+mutant LF SHA256 binding-facts-copy: 4b6b162390f367233d26c79b6bc3a24475001aebd491bf51266b161c51756439
+assertion-killed: binding-facts-copy: admission: binding immutable facts
+mutant LF SHA256 final-refusal: e84f3d67a1787e926c687320e42056997cebb351a9c8a3f56a98807bc1640d93
+assertion-killed: final-refusal: admission: final refusal
+unchanged LF source SHA256: D1155DCCE5464270A1F98FC08FCFE116365E355694220D9EEB9D835824F4FDA5
+unchanged LF held file SHA256: 9470B8F11A37AD22ECC7EB28926DE444D0C8D5CD6E25E64B9E0131459ADA1643
+exact LF unchanged Controller.cs d1155dcce5464270a1f98fc08fcfe116365e355694220d9eeb9d835824f4fda5
+exact LF unchanged HeldFiles.cs 9470b8f11a37ad22ecc7eb28926de444d0c8d5cd6e25e64b9e0131459ada1643
+exact LF unchanged NativeJob.cs 7c41bca70616f2ed6a0aeed5d30ff9700d1e9a2586b0a3e8771bd1d5665efab7
+exact LF unchanged Admission.cs b6c1aa6b39d618a85e2183988cc95b44c965dfbb44670b2c2c4382d336754289
+exact LF unchanged Test-PureController.ps1 f13089b413634559d69c948215cfb20e467c5534a89cced9a010aa13ee0037fe
+exact LF unchanged Check-Source.py ffe03dc462928c0746ba4bdea0dfcfa4d0a6e196441e962390cff91977aeb0ff
+exact LF unchanged PINNING.md be261f32e527efd333c66c994d5f621cccc44e2731500186edf9a76bd647b725
+```
