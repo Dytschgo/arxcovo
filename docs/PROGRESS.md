@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Grok controller recheck `2e6259a` accepts local unpublished preparation: row numbering fixed, unsafe launch holes closed by removal, ten pure tests and five managed assertion mutants passed. Native run-readiness NOT cleared. Next bounded source task implements held-file immutable launch pins, real nonblocking telemetry and owned-Job kill integration; compile/pure tests only. Environment selection, nested-Job proof, measured budget and native authorization remain OPEN. No controller/helper launch or historical retry.
+
 - Gate2 source `3eedb77` (retained `beb590c`), evidence `afcf804` (retained `a04aaf6`), received Grok review `b2dec92`: dormant Rust contract holds, but controller run-readiness NOT cleared. Fix ST-INDEX row numbering, SE-DEADLINE owned clocks/nonblocking telemetry, SE-COMPLETE ledger completion and SE-INHERIT exact bound command/environment. Immutable launch pins, disposable standard-account environment, nested Job proof and measured budget remain gates. Sol high correction is next with compile/pure checks only; no controller/helper/native run.
 
 - Grok final oracle confirmation `ab115ba` closes SP-ORACLE; native replay design now has zero blockers. Coordinator accepts Gate 2 local source/compile/pure-test preparation only. Sol high implementation is next; native functions must remain undiscoverable/unexecuted and no PR may trigger new native tests. Fresh independent source review, controller/environment selection, exact native-run scope and measured CI budget remain OPEN. No historical retry, owner step or native execution authorized.
