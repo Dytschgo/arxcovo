@@ -94,3 +94,88 @@ and normal gates before publication. This sub-agent performed no review
 request, subagent, GitHub operation, push, PR, CI, dispatch, settings, secret,
 account/service/cgroup/VM/owner/private-state operation. Unknown or unconfirmed
 cleanup environments must not be reused.
+
+## F0 review blocker corrections — 2026-11-14
+
+OpenAI / gpt-6.1-sol / medium, implementation sub-agent, no subagents.
+Initial cwd equalled isolated Git top level and status was clean at
+`9c64c6660a82956afff0cd1bff01055d227b7492`.
+Source commit: `93b1194cb9efc3101dec8c0e5779f87edc1b7d95`.
+Read AGENTS, KICKOFF, accepted proposal, full independent F0 review,
+debug skill and active profile, and ADR0019 D7/C2. No diagnosis, hypothesis,
+historical reproduction or real-record replay credit is claimed.
+
+ST-B1: new test_f0_blockers drives real entry/main/run with runtime effects
+mocked in memory: pre-try refusal; build/service failures with successful or
+failed cleanup; cleanup-only failure; success; and distinct initial/final
+protection refusals. It checks provenance, exception records, attempted
+mutation and cleanup tokens, and confirmation timing before deletion.
+Protected phase/site/bound tests use synthetic objects, without filesystem
+stats. Valid JSON counterfactuals isolate duplicate keys, whitespace-padded
+input bound, SHA equality and ASCII transport. ASCII rejection is pinned to
+E_RECORD_BOUND so a later schema rejection cannot earn credit. An AST guard
+pins 13 distinct sites and explicit stderr sinks (check_output owns stdout).
+
+SP-B1: closed CODES inventories existing fixed require/raise codes and gate
+keys; exact RuntimeError with one exact str argument is allowlisted. Arbitrary
+payload formatting is never used. Command timeout/failure have fixed codes;
+all OSError instances, including unknown errno, map to fixed E_OS (no dynamic
+errno or payload). Body first and escaping final remain distinct, including
+null first on cleanup-only failure. Pre-try errors are captured by a resetting
+run wrapper; run_body retains the unchanged finally cleanup fences. Strict
+cross-field validation rejects inconsistent success, no-mutation, not-reached,
+confirmed-cleanup and refusal-phase records. Valid gate failures emit their
+fixed gate code, not E_RECORD. Feedback association uses the real platform.
+
+SP-B2: all three outer check_output stderr streams now use DEVNULL. The only
+fallback output is a fixed-code stderr line when association/encoding cannot
+produce a validated record. No raw logs are emitted.
+
+Actual final-source validation (both exit 0):
+
+```
+python -I -B -c "import sys,unittest; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0_blockers as t,test_driver as d; s=unittest.defaultTestLoader.loadTestsFromTestCase(t.F0Blockers); s.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(d.F0Mechanism)); s.addTests(x for x in unittest.defaultTestLoader.loadTestsFromTestCase(d.Guards) if x._testMethodName != 'test_cli_wrong_platform_refuses'); s.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(d.CgroupScan)); r=unittest.TextTestRunner().run(s); sys.exit(not r.wasSuccessful())"
+python -I -B -c "import sys; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0_blockers as t; t.mutations()"
+```
+
+30 tests passed in 0.212s after source commit. All 15 mutants compiled and
+were killed by named assertions; baseline must pass before mutation execution:
+
+- run_drops_first_capture, run_drops_final_phase, cleanup_confirmed_early,
+  mutation_staged_dropped, entry_first_is_final: test_run_orderings and
+  test_cleanup_only_and_refusal (also test_success_and_both_refusals).
+- mutation_service_dropped: test_run_orderings, test_success_and_both_refusals.
+- protected_ignores_phase, protected_bound_dropped, conjunct_owner_first,
+  site_token_unchecked: test_protected_phase_site_bound.
+- replay_dup_keys_allowed, replay_input_bound_dropped, replay_ascii_dropped,
+  sha_equality_dropped: test_counterfactuals.
+- refusal_exact_type_relaxed: test_closed_codes.
+
+The runner restores the original module binding in finally, writes no mutant
+source, and checks raw-byte SHA-256 unchanged:
+`6f029b376b67d0630f7ab1e177f92bc814ccdbf2e21af24112ed6900e0649031`.
+Compile errors and test errors receive no kill credit. git diff --check passed.
+
+Failure history: initial isolated-script invocation could not import driver;
+used explicit sys.path in the documented -c command. First mutation pass found
+missing final-phase assertion; next found site refusal accepted via a second
+fence; added exact phase and E_SITE guards. Next exposed text-normalized versus
+raw-byte hash comparison; corrected to raw bytes. The safe legacy AST test
+needed run_body after wrapper extraction. Added both-refusal case initially
+stopped at mocked E_BUILD; corrected its mock build result and added a mandatory
+green baseline before mutants. Final selected tests and all mutants pass.
+These were separate test-harness defects, not three failed fixes of one issue;
+no historical failure counters are reset.
+
+Only permitted tooling source/tests/README and this evidence appendix changed.
+Existing reviews/proposal/PROGRESS/workflow/Rust/native fixture/policy/Cargo
+were not edited. No CLI driver/native/runtime-filesystem/provisioning fixture,
+existing mutation_check, Cargo, stat observation, host probe, account/service,
+cgroup, VM, private state, network, GitHub, push, PR, CI or dispatch was used.
+The seven internal sites remain uncaptured: installed, service_stage,
+service_cg, service_runs, capture_base, harness_stage, harness_binary.
+E_SERVICE_OR_TEST preserves only the outer fixed classification; separate
+F0b follow-up is needed before any F2 complete-capture claim. No new SHA
+supplies experiment authority. M2 incomplete; real-Runner PA6 OPEN;
+real-record replay OPEN; hardware paths **unverified on real hardware**.
+Ready for fresh Opus high independent source recheck, not publication/merge.
