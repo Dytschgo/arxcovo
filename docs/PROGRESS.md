@@ -2,6 +2,9 @@
 
 ## Current state - 2026-11-14
 
+- Sol inventory/discovery source472c342+8b2387f and Grok combinedreview956b697 have zero findings. ActualMCP discovery->inventory nowreports cached releasedtools, and developmentproducer marks fullycompleted eligible results before post-audit caching; failure/partial/cancel/storagefailurekeepspriorcache, lateststartwins, nullobservedidentity/currentexecutionfacts honest. Reviewer9development+3MCPtests/fmt/lockedofflineClippy/nocachegolden pass. Fresh exact-head publication review and normal gates pending, no executoractivation/installedacceptance.
+- Last merged PR80 bdd0c4ac93215b880785e0e2e2aee3730fc04126 at2026-11-14 14:32:43Z, allfivegates/Grokexactheadpassed, treeequalsfb728f1. MainCI43605415896 running/uncredited. Parallel delivery prioritizes existingM2 userflows with proportionate automated fences; no new confirmations. M2/PA6/LinuxF/GOPEN, optionalWindowsharness/launchdprofiletracksparked, hardware **unverified on real hardware**.
+
 - Parallel M2 delivery under user priority steering: Sol stdio setup fix be10b78, Grok review b1ba726 (zero findings), prepared for publication. Malformed arguments now fixed usage stderr/exit2 before runtime, stdoutempty; validgrammar/config/auth unchanged. Binary regression red-before/green-after, twoCLItests/focusedofflineClippy/fmt passed independently. This fixes an existing setup UX defect, not authenticated or installed acceptance. Inventory/discovery completion proceeds separately, no new confirmation flow or optional hardening.
 - Last merged PR79 is6b0aadbd55396ee738b5b0509f574427af192718 at2026-11-14 13:51:07Z, allfivegates/Grokexactheadpassed and squash treea39540d. MainCI43601831286 attempt1 passed623s. OptionalWindows replay and launchd-profile evidence tracks are parked; launchdUnknown, M2/PA6/LinuxF/GOPEN, hardware **unverified on real hardware**.
 

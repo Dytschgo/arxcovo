@@ -2,6 +2,8 @@ use crate::store::{Activity, ListActivity};
 use rmcp::{ErrorData, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde_json::json;
 use std::sync::Arc;
+#[cfg(test)]
+mod discovery_tests;
 #[derive(Clone)]
 pub struct Inventory {
     pub execution: Option<Arc<crate::development::Execution>>,
@@ -28,7 +30,7 @@ impl ServerHandler for Inventory {
             tools: vec![
                 Tool::new(
                     "list_hosts",
-                    "Observed local facts and configured execution capability",
+                    "Observed local facts, current execution capability and prior released tool inventory; cached discovery does not imply execution availability",
                     Arc::new(
                         json!({"type":"object","properties":{},"additionalProperties":false})
                             .as_object()
@@ -83,7 +85,9 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
-        let observation = if self.activity.dedicated.is_some() && label == "discover_tools" {
+        let observation = if label == "discover_tools"
+            && (self.activity.dedicated.is_some() || self.execution.is_some())
+        {
             Some(
                 self.activity
                     .discovery_observation()
@@ -211,6 +215,9 @@ impl ServerHandler for Inventory {
                 _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
             }
             .map_err(|r| ErrorData::internal_error(r.as_str(), None))?;
+            if let Some(observation) = observation {
+                self.activity.cache_discovery(observation, &result);
+            }
             return Ok(
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())]).into(),
             );
@@ -276,6 +283,9 @@ impl ServerHandler for Inventory {
             "not_configured"
         });
         if let Some(cache) = self.activity.tool_cache() {
+            // A released prior observation is available even while execution is
+            // unavailable. Preserve the no-cache rendering and execution facts.
+            value["hosts"][0]["tool_discovery"] = json!("cached");
             value["hosts"][0]["tools"] = cache.tools;
             value["hosts"][0]["tools_observed_at"] = json!(cache.observed_at_ms);
             value["hosts"][0]["last_observed_identity"] = cache.observed_identity;
