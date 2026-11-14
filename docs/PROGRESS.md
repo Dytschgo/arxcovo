@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- S2b native harness passes Opus high review `7d20762` (retained `b7a6dba`) and narrow pin/path recheck `3ee9618`. Coordinator Sol medium corrected dependency pins and explicit mutation targets; two failed portable checks are retained, final 11/11 passes. Source remains reviewed `efe8e55`, production unchanged. Publication is for first hosted nonroot U-a and two native mutation checks only; merge waits native evidence, exact-head review and all five required checks. Accepted harness limits are recorded in evidence; real-Runner PA6 stays OPEN, no experiment/activation.
+
 - S2b passes Opus high source/security review `d94b176` (retained `e71fc59`), no blockers on either axis. Reviewer independently ran three portable tests, six assertion-killed portable mutants and Linux-target typecheck (not native execution). Linux U-a nonroot pass-versus-skip and two native Group mutation failures remain merge gates. Coordinator is preparing a bounded non-required native verification job for fresh review before publication. Real-Runner PA6 remains OPEN; no activation or experiment.
 
 - S2b local source `efe8e55` and evidence `a7d445c` by Sol medium are ready for Opus high review. Builder fmt/workspace all-target Clippy, focus/inventory checks and final 392 passed / 3 skipped are credited at source. Three portable mutants compiled and failed intended assertions with exact restoration. Linux U-a execution plus drop-store and Group-forgotten mutants remain unrun and required; no native credit or publication yet. Production inactive, real-Runner PA6 OPEN, M2 incomplete.
