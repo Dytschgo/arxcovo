@@ -451,6 +451,57 @@ fn hold_identity_ack() {
     }
 }
 
+#[test]
+#[ignore = "A5 + unchanged Standard package; fresh disposable hosted Linux only; unselected"]
+fn disposable_linux_a5() {
+    use hierarchy::{
+        fake::a5,
+        linux::LinuxFs,
+        setup::{CgroupFs, Clock, PROC_MAGIC},
+    };
+    use std::time::Instant;
+    for (key, value) in [
+        ("CI", "true"),
+        ("GITHUB_ACTIONS", "true"),
+        ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ("ARX_DISPOSABLE_EXEC_TEST", "1"),
+    ] {
+        assert_eq!(std::env::var(key).as_deref(), Ok(value));
+    }
+    assert_eq!(unsafe { libc::getuid() }, 0);
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert_eq!(unsafe { libc::umask(0o077) }, 0o077);
+    struct Monotonic(Instant);
+    impl Clock for Monotonic {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+        fn sleep(&self, duration: Duration) {
+            std::thread::sleep(duration);
+        }
+    }
+    assert!(!Path::new("identity-ack").exists());
+    let fs = LinuxFs::system();
+    let proc = fs.proc_cgroup().unwrap();
+    assert_eq!(proc.magic, PROC_MAGIC);
+    let location = hierarchy::locate(&proc.bytes).unwrap();
+    let (runs, leaf) = fs.seed_a5(&location).unwrap();
+    // finish invokes production setup exactly once; exact evidence + fresh S9
+    // and literal absence must all pass before notification/identity hold.
+    assert!(a5::finish(
+        &fs,
+        &Monotonic(Instant::now()),
+        &Cancellation::default()
+    ));
+    a5::empty(&fs, &runs).unwrap();
+    // Keep both descriptors alive through the postconditions, including the
+    // unlinked leaf. No fixture removal can substitute for the janitor.
+    drop((runs, leaf));
+    let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
+    crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();
+    hold_identity_ack();
+}
+
 // Dormant A3 observations only. No setup, service mutation or Runner call.
 // The driver establishes profile presence/absence and runtime attribution.
 // Its preparation default selects neither of these tests.
