@@ -45,3 +45,30 @@ rewritten to match a later diagnostic.
 Run `python -m unittest discover -s tools/ci -p test_observe_manager.py`.
 Three tests use ordinary Python child processes on Unix to verify output caps,
 timeout and exit/EOF handling; they skip on Windows. None invokes a manager.
+
+## Prepared fixed macOS absence observation (not wired into CI)
+
+`observe_launchd_absence.py` is a separate preparation for ADR 0014's absence
+evidence gate. Fresh independent Grok source review is required before any
+publication or hosted execution. This preparation runs no collector CLI.
+
+Its only command is `/bin/launchctl print system/com.arxcovo.arxd`, with null
+stdin, no shell, cwd `/`, and a cleared environment containing only fixed
+PATH, LANG and LC_ALL. It never queries an Apple control or another service.
+Two seconds of query polling and at most one second of cleanup replace this
+diagnostic's older six-second/combined-cap design; production is unchanged.
+Separate stdout/stderr limits are 65536/4096 bytes, aggregate 69632. Both EOFs
+and a real exit code are necessary; failure is never absence.
+
+Only fixed facts, the real numeric exit code, EOF/truncation flags, and strictly
+formatted public OS/runner/source metadata are emitted. No diagnostic bytes,
+private-output hashes or artifacts are emitted. One exact synthetic candidate
+is represented by its fixed ID; it is not a compatibility fixture. Every
+observation remains `Unknown`, with `fixture_credit: false`. Unknown or loaded
+output is unsupported. See the evidence document for the exact allowlist,
+provenance limits and proposed replacement of the existing macOS step.
+
+Pure tests (all transport/time/host dependencies mocked):
+`python -B -m unittest discover -s tools/ci -p test_observe_launchd_absence.py`.
+Do not run broad discovery for this preparation: the older manager suite has
+ordinary-child tests. No native capture or installed acceptance is claimed.
