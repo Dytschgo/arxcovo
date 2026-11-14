@@ -866,6 +866,8 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
         ("service/unix_bridge/tests.rs", "mod a6;"),
         ("service/unix_bridge/tests.rs", "mod e6;"),
         ("service/unix_bridge/tests.rs", "mod e7;"),
+        // A8 is inline in the already test-only, inventoried E7 source.
+        ("service/unix_bridge/tests/e7.rs", "mod a8 {"),
     ] {
         let source = tokens(&std::fs::read_to_string(root.join(parent)).unwrap());
         let required = tokens(declaration);

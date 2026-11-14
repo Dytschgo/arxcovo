@@ -797,6 +797,191 @@ fn live_check(config: ServiceConfig) -> impl Fn() -> Result<(), Unavailable> + S
     move || config.execution_preflight(&layout, &FakeResolver::default())
 }
 
+// A8's nonnative join: run the real host lifecycle around the existing injected
+// application. Only environment startup and the listener are replaced; discovery,
+// setup/readiness, dispatch, audit, stop and drain remain the actual code paths.
+mod a8 {
+    use super::*;
+    use crate::service::{Host, Reporter, Shutdown, State};
+
+    struct LifecycleFixture<'a> {
+        app: App,
+        dir: &'a tempfile::TempDir,
+        request: Shutdown,
+        gate: Arc<Gate>,
+        calls: Arc<AtomicUsize>,
+        state: Readiness,
+        expected: Result<(), Unavailable>,
+    }
+    impl Application for LifecycleFixture<'_> {
+        async fn load_config(&mut self) -> Result<(), ExitCode> {
+            Ok(()) // E7 fixture already owns synthetic configuration and store.
+        }
+        async fn verify_layout(&mut self) -> Result<(), ExitCode> {
+            Ok(())
+        }
+        async fn open_store(&mut self) -> Result<(), ExitCode> {
+            Ok(())
+        }
+        async fn service_start(&mut self) -> Result<(), ExitCode> {
+            self.app.service_start().await
+        }
+        async fn bind(&mut self, _: Shutdown) -> Result<(), ExitCode> {
+            Ok(()) // No socket, service manager or native identity operations.
+        }
+        async fn preflight(&mut self) {}
+        fn start_discovery(&mut self) {
+            self.app.start_discovery();
+        }
+        async fn serve(&mut self) -> Result<(), ExitCode> {
+            self.gate.reached().await;
+            let pending = self.state.check();
+            let before = rows(self.dir);
+            let calls = self.calls.load(Ordering::Acquire);
+            self.gate.open(); // Release before assertions, including on failure.
+            assert_eq!(pending, Err(Unavailable::MechanismUnavailable));
+            assert!(before.is_empty(), "no discovery row before Ready");
+            assert_eq!(calls, 0, "no probe before Ready");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.app.discovery_finished_for_test() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded startup discovery completion");
+            assert_eq!(self.state.check(), self.expected);
+            // A second call after completion must not start another sequence.
+            self.app.start_discovery();
+            self.request.cancel();
+            std::future::pending().await
+        }
+        fn stop_accepting(&mut self) -> Result<(), ExitCode> {
+            self.app.stop_accepting()
+        }
+        async fn drain(&mut self) -> Result<(), ExitCode> {
+            self.app.drain().await
+        }
+        async fn service_stop(&mut self) -> Result<(), ExitCode> {
+            self.app.service_stop().await
+        }
+        fn release(&mut self) -> Result<(), ExitCode> {
+            self.app.release()
+        }
+    }
+    #[derive(Default)]
+    struct Reports(Vec<State>);
+    impl Reporter for Reports {
+        fn report(&mut self, state: State, code: ExitCode) -> Result<(), ExitCode> {
+            assert_eq!(code, ExitCode::Clean);
+            self.0.push(state);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_ready_discovery_persisted_once_or_absent_on_setup_failure() {
+        for (failure, waiting, expected) in [
+            (false, false, Ok(())),
+            (true, false, Err(Unavailable::MechanismUnavailable)),
+            (false, true, Err(Unavailable::Quarantined)),
+        ] {
+            let dir = private_temp();
+            let gate = Arc::new(Gate::default());
+            let setup_gate = gate.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let (app, activity, _, allocations, state) = app(
+                &dir,
+                failure,
+                waiting,
+                Arc::new(move |point| {
+                    if point == "setup" {
+                        setup_gate.hold();
+                    }
+                }),
+                move |spec, _, _| {
+                    assert_eq!(spec.arguments, ["tool-probe"]);
+                    count.fetch_add(1, Ordering::AcqRel);
+                    Ok(probe())
+                },
+            );
+            let request = Shutdown::default();
+            let mut fixture = LifecycleFixture {
+                app,
+                dir: &dir,
+                request: request.clone(),
+                gate,
+                calls: calls.clone(),
+                state,
+                expected,
+            };
+            let mut reports = Reports::default();
+            let code = tokio::time::timeout(
+                Duration::from_secs(10),
+                Host::run(&mut fixture, request, &mut reports),
+            )
+            .await
+            .expect("bounded host lifecycle");
+            assert_eq!(code, ExitCode::Clean);
+            // Heartbeats may repeat pending states on a slow worker.
+            reports.0.dedup();
+            assert_eq!(
+                reports.0,
+                [
+                    State::Starting,
+                    State::Running,
+                    State::Stopping,
+                    State::Stopped
+                ]
+            );
+            assert_eq!(allocations.load(Ordering::Acquire), 1);
+            assert_eq!(calls.load(Ordering::Acquire), usize::from(expected.is_ok()));
+            drop(fixture);
+            drop(activity);
+            // Reopen after application release: inspect every persisted row, so
+            // a wrong tool, actor, principal or mode cannot hide behind a filter.
+            let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+            let persisted: Vec<Value> = db.prepare(
+                "SELECT actor_kind,principal,class,tool,outcome,identity_mode,finished_at_ms IS NOT NULL FROM activity ORDER BY id LIMIT 8",
+            ).unwrap().query_map([], |r| Ok(json!([
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?,
+                r.get::<_, bool>(6)?,
+            ]))).unwrap().map(Result::unwrap).collect();
+            let mut wanted = vec![json!([
+                "daemon",
+                "arxd",
+                "lifecycle",
+                "service_start",
+                "succeeded",
+                null,
+                true
+            ])];
+            if expected.is_ok() {
+                wanted.push(json!([
+                    "daemon",
+                    "arxd",
+                    "action",
+                    "discover_tools",
+                    "succeeded",
+                    "dedicated_account",
+                    true
+                ]));
+            }
+            wanted.push(json!([
+                "daemon",
+                "arxd",
+                "lifecycle",
+                "service_stop",
+                "succeeded",
+                null,
+                true
+            ]));
+            assert_eq!(persisted, wanted);
+        }
+    }
+}
+
 mod s1 {
     use super::*;
     use crate::exec::hierarchy::setup::{FsError, FsResult, PROC_MAGIC, ProcFile};
