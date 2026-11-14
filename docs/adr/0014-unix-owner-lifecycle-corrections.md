@@ -575,3 +575,30 @@ Windows):
     restarts every 10 s.
 - **Protected SQLite first start as root.**
 - **Windows start-type alignment** (decision 1).
+
+## Launchd empty-profile addendum (2026-11-14)
+
+Coordinator-authorized first slice of the retained Sol proposal and independent
+Grok design review: the production accept-set is empty. Every bounded borrowed
+observation returns `Unknown`; no delimiters, diagnostic bytes, exit-code
+constant, state vocabulary, or nonempty compatibility profile is introduced.
+This supersedes decision 3's exit-only absence candidate. A future absence
+proof requires a reviewed exit code AND the entire stdout/stderr tuple, both
+streams at EOF and neither truncated. Exit 113 alone proves nothing.
+
+A future loaded profile must establish system domain, fixed label, fixed plist
+path, and fixed program/argv identity. The plist path alone is insufficient.
+On macOS every `Ours` state, including Stopped and Failed, blocks Installable
+and fails Unloaded; only Absent passes. Linux predicates are unchanged.
+Pure macOS status succeeds only for (Absent artifact, Absent registration),
+(Identical, Absent), and (Identical, Ours(Running)), yielding not-installed,
+stopped, and running respectively. Every other pair returns Manager.
+
+Only the macOS read-only query captures both streams (65536/4096 bytes,
+EOF/completeness and truncation independently, 10-second deadline, fair bounded
+nonblocking reads). Capture failure attempts kill and at most one second of
+reaping; cleanup never establishes absence. Linux and mutating wrappers retain
+all existing behavior and environment, including SYSTEMD_PAGER=cat and
+SYSTEMD_COLORS=0. Plan operations are unchanged. Native capture, compatibility,
+installed lifecycle and dedicated execution remain separate gates, **unverified
+on real hardware**. No owner step or production executor activation is granted.

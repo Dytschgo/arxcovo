@@ -79,7 +79,10 @@ impl Query {
         }
         Ok(())
     }
-    fn active(self) -> bool {
+    fn active(self, platform: Platform) -> bool {
+        if platform == Platform::Macos {
+            return matches!(self, Self::Ours(_));
+        }
         matches!(
             self,
             Self::Ours(
@@ -102,14 +105,14 @@ impl Query {
             return Err(Error::Layout);
         }
         match expectation {
-            Expect::Installable if self.active() => Err(Error::Active),
+            Expect::Installable if self.active(platform) => Err(Error::Active),
             Expect::Installed
                 if primary != Artifact::Identical
                     || (platform == Platform::Linux && self == Self::Absent) =>
             {
                 Err(Error::NotInstalled)
             }
-            Expect::Unloaded if self.active() => Err(Error::Manager),
+            Expect::Unloaded if self.active(platform) => Err(Error::Manager),
             _ => Ok(()),
         }
     }
@@ -121,6 +124,14 @@ impl Query {
             Gate::NotLoaded => self == Self::Absent,
             Gate::ArtifactPresent => primary == Artifact::Identical,
         })
+    }
+    pub fn macos_status(self, primary: Artifact) -> Result<Status, Error> {
+        match (primary, self) {
+            (Artifact::Absent, Self::Absent) => Ok(Status::NotInstalled),
+            (Artifact::Identical, Self::Absent) => Ok(Status::Stopped),
+            (Artifact::Identical, Self::Ours(State::Running)) => Ok(Status::Running),
+            _ => Err(Error::Manager),
+        }
     }
     pub fn linux_status(self, primary: Artifact) -> Result<Status, Error> {
         self.safe(primary)?;
@@ -195,7 +206,24 @@ pub fn systemd(success: bool, stdout: &[u8]) -> Query {
 }
 /// No native fixture currently establishes launchd's output grammar, absence
 /// exit status or state vocabulary. Do not infer any of them from an exit code.
-pub fn launchd(_success: bool, _stdout: &[u8]) -> Query {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LaunchdTermination {
+    Exited(i32),
+    Signalled,
+    Incomplete,
+}
+/// Borrowed capture boundary. Deliberately no Debug/Display of private streams.
+pub struct LaunchdObservation<'a> {
+    pub termination: LaunchdTermination,
+    pub stdout: &'a [u8],
+    pub stderr: &'a [u8],
+    pub stdout_complete: bool,
+    pub stderr_complete: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+/// Empty accept-set: no output grammar or absence tuple has been reviewed.
+pub fn launchd(_observation: LaunchdObservation<'_>) -> Query {
     Query::Unknown
 }
 
@@ -260,12 +288,8 @@ mod tests {
         ] {
             assert_eq!(systemd(true, &output(load, state, path, dropin)), want);
         }
-        for success in [false, true] {
-            for bytes in [&b""[..], &b"path = /foreign"[..], &good[..]] {
-                assert_eq!(launchd(success, bytes), Query::Unknown);
-            }
-        }
     }
+
     #[test]
     fn not_found_cannot_hide_an_active_or_transitioning_unit() {
         for active in [
@@ -403,5 +427,133 @@ mod tests {
                 .token(),
             "not-installed"
         );
+    }
+}
+
+#[cfg(test)]
+mod empty_profile_tests {
+    use super::*;
+    const STATES: [State; 7] = [
+        State::Running,
+        State::Reloading,
+        State::Starting,
+        State::Stopping,
+        State::Stopped,
+        State::Failed,
+        State::Loaded,
+    ];
+    #[test]
+    fn pure_empty_profile_every_observation_unknown() {
+        for termination in [
+            LaunchdTermination::Exited(0),
+            LaunchdTermination::Exited(1),
+            LaunchdTermination::Exited(113),
+            LaunchdTermination::Signalled,
+            LaunchdTermination::Incomplete,
+        ] {
+            for stdout in [
+                b"".as_slice(),
+                b"synthetic absence",
+                b"state = running",
+                &[255, 0],
+                &[b'x'; 65537],
+            ] {
+                for stderr in [b"".as_slice(), b"synthetic absence", &[b'x'; 4097]] {
+                    for flags in 0..16 {
+                        let q = launchd(LaunchdObservation {
+                            termination,
+                            stdout,
+                            stderr,
+                            stdout_complete: flags & 1 != 0,
+                            stderr_complete: flags & 2 != 0,
+                            stdout_truncated: flags & 4 != 0,
+                            stderr_truncated: flags & 8 != 0,
+                        });
+                        assert!(
+                            q == Query::Unknown,
+                            "empty-profile-refuses-every-observation"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn pure_macos_state_and_status_matrix() {
+        let mut queries = vec![Query::Absent, Query::Unknown, Query::Foreign];
+        queries.extend(STATES.map(Query::Ours));
+        for q in queries {
+            for a in [Artifact::Absent, Artifact::Identical, Artifact::Foreign] {
+                let expected = match (a, q) {
+                    (Artifact::Absent, Query::Absent) => Ok(Status::NotInstalled),
+                    (Artifact::Identical, Query::Absent) => Ok(Status::Stopped),
+                    (Artifact::Identical, Query::Ours(State::Running)) => Ok(Status::Running),
+                    _ => Err(Error::Manager),
+                };
+                assert_eq!(q.macos_status(a), expected, "exhaustive-macos-status");
+            }
+        }
+        for state in STATES {
+            let q = Query::Ours(state);
+            for a in [Artifact::Absent, Artifact::Identical] {
+                assert_eq!(
+                    q.expect(Expect::Installable, a, Platform::Macos),
+                    Err(Error::Active),
+                    "mac-all-ours-block-install"
+                );
+                assert_eq!(
+                    q.expect(Expect::Unloaded, a, Platform::Macos),
+                    Err(Error::Manager),
+                    "mac-all-ours-block-unloaded"
+                );
+                assert_eq!(q.gate(Gate::Loaded, a), Ok(true));
+                assert_eq!(q.gate(Gate::NotLoaded, a), Ok(false));
+                let inactive = matches!(state, State::Stopped | State::Failed);
+                assert_eq!(
+                    q.expect(Expect::Installable, a, Platform::Linux),
+                    if inactive { Ok(()) } else { Err(Error::Active) }
+                );
+                assert_eq!(
+                    q.expect(Expect::Unloaded, a, Platform::Linux),
+                    if inactive {
+                        Ok(())
+                    } else {
+                        Err(Error::Manager)
+                    }
+                );
+            }
+        }
+        for q in [Query::Unknown, Query::Foreign] {
+            for platform in [Platform::Linux, Platform::Macos] {
+                for expectation in [
+                    Expect::Installable,
+                    Expect::Installed,
+                    Expect::NotForeign,
+                    Expect::Unloaded,
+                ] {
+                    assert!(
+                        q.expect(expectation, Artifact::Identical, platform)
+                            .is_err(),
+                        "uncertain-expect-refuses"
+                    );
+                }
+            }
+            for gate in [
+                Gate::Always,
+                Gate::Loaded,
+                Gate::NotLoaded,
+                Gate::ArtifactPresent,
+            ] {
+                assert!(
+                    q.gate(gate, Artifact::Identical).is_err(),
+                    "uncertain-gate-refuses"
+                );
+            }
+        }
+        for a in [Artifact::Absent, Artifact::Identical] {
+            for e in [Expect::Installable, Expect::Unloaded] {
+                assert_eq!(Query::Absent.expect(e, a, Platform::Macos), Ok(()));
+            }
+        }
     }
 }
