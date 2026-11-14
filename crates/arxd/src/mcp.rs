@@ -3,6 +3,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, model::*, service::RequestConte
 use serde_json::json;
 use std::sync::Arc;
 #[cfg(test)]
+mod activity_tests;
+#[cfg(test)]
 mod discovery_tests;
 #[derive(Clone)]
 pub struct Inventory {
@@ -40,16 +42,18 @@ impl ServerHandler for Inventory {
                 ),
                 Tool::new(
                     "list_activity",
-                    "Durable activity visible to the authenticated agent",
+                    "Durable activity visible to the authenticated agent; activity_id selects zero or one row and is mutually exclusive with before_id. Read rows require include_reads",
                     Arc::new(
                         json!({
                             "type":"object",
                             "properties":{
                                 "limit":{"type":"integer","minimum":1,"maximum":50,"default":20},
                                 "before_id":{"type":"integer","minimum":1},
+                                "activity_id":{"type":"integer","minimum":1,"maximum":9223372036854775807_i64},
                                 "include_reads":{"type":"boolean","default":false}
                             },
-                            "additionalProperties":false
+                            "additionalProperties":false,
+                            "not":{"required":["activity_id","before_id"]}
                         })
                         .as_object()
                         .unwrap()
@@ -223,12 +227,19 @@ impl ServerHandler for Inventory {
             );
         }
         if label == "list_activity" {
+            let mut args = args;
+            let activity_id = args.remove("activity_id");
+            let activity_id = activity_id.map(serde_json::from_value::<i64>).transpose();
             let parsed = if args.values().any(serde_json::Value::is_null) {
                 None
             } else {
                 serde_json::from_value::<ListActivity>(args.into()).ok()
             }
-            .filter(|a| a.validate().is_ok());
+            .filter(|a| {
+                a.validate().is_ok()
+                    && matches!(&activity_id, Ok(None) | Ok(Some(1..)))
+                    && !(matches!(&activity_id, Ok(Some(_))) && a.before_id.is_some())
+            });
             let Some(args) = parsed else {
                 self.activity
                     .finish(id, "rejected")
@@ -240,7 +251,7 @@ impl ServerHandler for Inventory {
             };
             let page = self
                 .activity
-                .list(&principal.0, id, &args)
+                .list_filtered(&principal.0, id, &args, activity_id.unwrap())
                 .map_err(|_| unavailable())?;
             self.activity
                 .finish(id, "succeeded")
