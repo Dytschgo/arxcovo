@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- F0 replay test recheck `2b07953` passes Standards/Spec and closes ST-B2; original source blockers are closed by `93b1194`. Opus independently ran 32 safe tests, all 23 compiled assertion-killed mutants and case-isolation probes. Coordinator publishes only the bounded local feedback mechanism for exact-head review/normal gates. Optional finer-grained success-cleanup mutation gap and prior advisories are retained. Internal capture F0b and real-record replay remain OPEN; no diagnosis, dispatch, historical retry or activation is authorized.
+
 - F0 original blockers closed by source correction `93b1194`; Opus high recheck `d608f5c` (retained `7397353`) found test-only ST-B2. Coordinator Sol medium added isolated cross-field/closed-code/fallback cases: safe subset 32 passed, all 23 compiled in-memory mutants assertion-killed; driver unchanged. Fresh narrow recheck is next. No publication, real-record replay, dispatch or activation.
 
 - F0 independent Opus high review `4220dd7` (retained `9c64c66`) requested changes: meaningful run/entry transition and bound tests, allowlisted fixed error codes with first/final semantics, and suppression of three raw stderr paths. Sol medium is correcting these locally before fresh recheck/publication. Internal cross-process capture remains a separately bounded follow-up; no real-record replay, diagnosis, dispatch or retry is claimed.
