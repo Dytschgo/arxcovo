@@ -40,6 +40,7 @@ internal sealed class NativeJob : IDisposable {
     [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(SafeFileHandle pipe,byte[] bytes,uint size,out uint read,IntPtr overlapped);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string path,uint access,uint share,ref Security security,uint creation,uint flags,IntPtr template);
     SafeFileHandle job,process,thread,telemetry;
+    readonly System.Collections.Generic.List<SafeFileHandle> retired=new System.Collections.Generic.List<SafeFileHandle>();
     sealed class PipeReader : ReplayController.ITelemetryRead {
         readonly SafeFileHandle pipe;
         internal PipeReader(SafeFileHandle pipe) { this.pipe=pipe; }
@@ -57,7 +58,27 @@ internal sealed class NativeJob : IDisposable {
     PipeReader reader;
     readonly byte[] buffer=new byte[4096];
     bool disposed;
-    internal NativeJob() {
+    readonly object lifetime=new object();
+    internal bool Disposed { get { return Volatile.Read(ref disposed); } }
+    int cancelled;
+    readonly ReplayController.Supervisor supervisor;
+    void CheckCancelled() {
+        if(Volatile.Read(ref cancelled)==0 && supervisor.ContinueOperation) return;
+        // A late CreateProcess/Assign completion remains suspended. Job kill is
+        // not a persistent admission fence: explicitly terminate the owned handle.
+        Cancel(); throw new InvalidOperationException("late launch refused");
+    }
+    internal void Cancel() {
+        Interlocked.Exchange(ref cancelled,1);
+        lock(lifetime) {
+            if(disposed) return; // closed kill-on-close owner, no outstanding launch
+            TerminateJobObject(job,1); // always before owned unassigned cleanup
+            var owned=Volatile.Read(ref process);
+            if(owned!=null) TerminateProcess(owned,1);
+        }
+    }
+    internal NativeJob(ReplayController.Supervisor supervisor) {
+        this.supervisor=supervisor;
         job=CreateJobObjectW(IntPtr.Zero,IntPtr.Zero);
         var limits=new Limits { basic=new BasicLimits { flags=0x2000 } }; // kill on close; never breakaway
         if(job.IsInvalid || !SetInformationJobObject(job,9,ref limits,Marshal.SizeOf<Limits>())) { job.Dispose(); throw new InvalidOperationException("containment refused"); }
@@ -78,7 +99,7 @@ internal sealed class NativeJob : IDisposable {
         if(!SetHandleInformation(read,1,0)) { read.Dispose(); write.Dispose(); throw new InvalidOperationException("inheritance refused"); }
     }
     internal void Launch(string app,string cwd,string[] args,byte[] env) {
-        if(disposed || process!=null || Active()!=0) throw new InvalidOperationException("session reuse refused");
+        if(Volatile.Read(ref cancelled)!=0 || disposed || process!=null || Active()!=0) throw new InvalidOperationException("session reuse refused");
         SafeFileHandle input=null,discard=null,telemetryWrite=null;
         IntPtr list=IntPtr.Zero, values=IntPtr.Zero; bool initialized=false;
         try {
@@ -105,17 +126,24 @@ internal sealed class NativeJob : IDisposable {
             // No argv/env slot conveys this value today. A future reviewed wrapper
             // must take ownership and clear INHERIT before any fixture child.
             RequireTelemetryBinding();
+            CheckCancelled();
             ProcessInfo info;
             if(!CreateProcessW(app,command,IntPtr.Zero,IntPtr.Zero,true,0x80404,env,cwd,ref startup,out info)) throw new InvalidOperationException("launch refused");
-            process=new SafeFileHandle(info.process,true); thread=new SafeFileHandle(info.thread,true);
+            thread=new SafeFileHandle(info.thread,true);
+            Volatile.Write(ref process,new SafeFileHandle(info.process,true));
+            if(!supervisor.Created()) { Cancel(); throw new InvalidOperationException("late create refused"); }
+            CheckCancelled();
             // Child remains suspended on nested-Job incompatibility. Explicitly
             // terminate the one owned unassigned process; never resume it.
-            if(!AssignProcessToJobObject(job,process)) {
+            bool assigned=AssignProcessToJobObject(job,process);
+            if(!supervisor.Assigned(assigned)) {
                 TerminateJobObject(job,1); TerminateProcess(process,1);
                 throw new InvalidOperationException("nested containment refused");
             }
+            CheckCancelled();
+            if(!supervisor.AuthorizeResume()) { Cancel(); throw new InvalidOperationException("resume authorization refused"); }
             if(ResumeThread(thread)!=1) throw new InvalidOperationException("resume refused");
-        } catch { TerminateJobObject(job,1); throw; }
+        } catch { Cancel(); throw; }
         finally {
             if(initialized) DeleteProcThreadAttributeList(list);
             if(list!=IntPtr.Zero) Marshal.FreeHGlobal(list);
@@ -136,23 +164,36 @@ internal sealed class NativeJob : IDisposable {
         if(wait!=0 || !GetExitCodeProcess(process,out code)) throw new InvalidOperationException("exit query refused");
         return true;
     }
-    internal void Next() { process.Dispose(); thread.Dispose(); telemetry.Dispose(); process=null; thread=null; telemetry=null; reader=null; }
-    internal bool KillAndConfirm(System.Diagnostics.Stopwatch clock) {
+    internal void Next() {
+        if(Volatile.Read(ref cancelled)!=0 || supervisor.Failed) throw new InvalidOperationException("failed reuse refused");
+        // Retain every handle while the failure-only waiter may hold a snapshot.
+        // At this point exit/EOF/active-zero were observed; no native close here.
+        retired.Add(process); retired.Add(thread); retired.Add(telemetry);
+        Interlocked.Exchange(ref process,null); thread=null; telemetry=null; reader=null;
+    }
+    internal bool KillAndConfirm(System.Diagnostics.Stopwatch clock,long until) {
+        until=ReplayController.ConfirmationDeadline(until);
         // Termination precedes all unknown-cleanup outcomes, including query errors.
+        Interlocked.Exchange(ref cancelled,1);
         bool killed=TerminateJobObject(job,1);
         if(process!=null) TerminateProcess(process,1); // owned suspended assign-failure child
-        long until=Math.Min(360000,clock.ElapsedMilliseconds+2000);
-        do {
+        while(clock.ElapsedMilliseconds<until) {
             try { if(ReplayController.CleanupConfirmed(killed,Active(),process==null || WaitForSingleObject(process,0)==0,clock.ElapsedMilliseconds,until)) return true; }
             catch(InvalidOperationException) { }
             Thread.Sleep(1);
-        } while(clock.ElapsedMilliseconds<until);
+        }
         return false;
     }
     // If confirmation fails the session retains this owner; no remaining rows
     // or second launch is permitted. Kill-on-close is never cleared.
     public void Dispose() {
-        if(disposed) return; disposed=true;
-        process?.Dispose(); thread?.Dispose(); telemetry?.Dispose(); job.Dispose();
+        // Only native lifetime/kill operations share this gate. Supervisor failure
+        // latching never waits on it. A blocked close cannot confer success.
+        lock(lifetime) {
+            if(disposed) return;
+            process?.Dispose(); thread?.Dispose(); telemetry?.Dispose();
+            foreach(var handle in retired) handle?.Dispose();
+            job.Dispose(); disposed=true;
+        }
     }
 }

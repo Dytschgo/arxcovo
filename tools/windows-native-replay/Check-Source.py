@@ -44,8 +44,8 @@ assert "local + 1" in code and "matrix_index(i as u32)" in code
 assert "matrix_index(28 + i as u32)" in code
 assert "matrix_index(32)" in code and "matrix_index(33)" in code
 assert "Func<" not in controller
-assert "return Poll() && state.Success" in controller
-assert "readonly NativeJob job" in controller and "new FrameDecoder(channel)" in controller
+assert "if(!Poll(now) || operations!=0 || !monitor.Success" in controller
+assert "readonly NativeJob job" in controller and "new FrameDecoder(supervisor.Channel)" in controller
 assert "v[1]!=(uint)(frames/2)" in controller and "frames!=expected" in controller
 held = (root / "tools/windows-native-replay/HeldFiles.cs").read_text()
 assert "links==1" in held and "NtCreateFile" in held and "parent=parent.DangerousGetHandle()" in held
@@ -98,3 +98,22 @@ serializer = code.split("fn frame(",1)[1].split("trait FrameWrite",1)[0]
 assert "WriteFile" not in serializer
 assert "TransportPureChecks.Run();" in controller
 print("dedicated telemetry source: separate writer allowlist; NUL raw streams; bounded mockable read; typed fixture writer; external grammar unwired")
+
+assert "ConfirmationDeadline(supervisor.Deadline)" in controller
+assert "clock.ElapsedMilliseconds+2000" not in job
+assert "SupervisorPureChecks.Run();" in controller
+supervisor_pure = controller.split("internal static class SupervisorPureChecks {", 1)[1]
+for forbidden in ("NativeJob", "Stopwatch", "Thread", "Task", "System.IO", "Admission", "HeldFiles"):
+    assert forbidden not in supervisor_pure
+waiter = controller.split("void FailureWait()", 1)[1].split("internal bool Run(Admission", 1)[0]
+assert "Finish(" not in waiter and "Poll(" not in waiter
+assert "job.Cancel()" in waiter and "supervisor.Fail()" in waiter
+assert job.count("CheckCancelled();") >= 3
+print("supervisor source: one owned clock; failure-only waiter; absolute teardown cap; synthetic machine checks")
+
+assert job.index("supervisor.Created()") < job.index("AssignProcessToJobObject(job,process)")
+assert job.index("supervisor.Assigned(assigned)") < job.index("supervisor.AuthorizeResume()") < job.index("ResumeThread(thread)!=1")
+
+owner_run = controller.split("internal bool Run(Admission admission)", 1)[1].split("bool Abort()", 1)[0]
+assert owner_run.index("job.Dispose(); closed=true;") < owner_run.index("supervisor.Finish(clock.ElapsedMilliseconds,true,0,0)")
+assert "lock(lifetime)" in job and "Volatile.Read(ref disposed)" in job
