@@ -62,7 +62,7 @@ The ten-minute job bounds a 360-second build, a 120-second exact Cargo invocatio
 and a transient service with 140-second runtime plus ten-second stop timeout.
 The service output is drained through a bounded 1 MiB collector; overflow fails
 the test. No inherited RLIMIT_FSIZE restricts Cargo/rustc artifact writes. Public evidence is restricted to fixed
-success/cleanup lines or allowlisted error codes. Raw build/test output stays
+a validated F0 line or fixed fallback error codes. Raw build/test output stays
 root-private and is not uploaded; no panic text or environment is printed.
 
 Primary references checked during preparation:
@@ -106,14 +106,15 @@ SHAs and bounded decimal run/attempt association inside that same line. This
 association is supplied by the existing gates, not cryptographic attestation.
 
 The outer `run` entry emits one validated line with separate first/final
-exceptions, conservative mutation boundary and cleanup disposition. Arbitrary
+exceptions, conservative mutation boundary and cleanup disposition. Closed fixed RuntimeError codes and command timeout/failure codes are retained;
+OS errors use E_OS. Other arbitrary
 exceptions become `E_RUNTIME` without formatting their payloads. Cleanup still
 fails closed; an unconfirmed environment cannot be reused. Existing workflow
-fences and subprocess output suppression are unchanged.
+fences remain unchanged; all outer subprocess stderr is explicitly suppressed.
 
 Limit: internal service/harness/fixture-check processes do not transport their
 structured exceptions to the outer process. Their suppressed failures remain
-an outer generic error, not a fabricated protection trace. Mutation reports the
+the fixed outer E_SERVICE_OR_TEST code, without a protection trace. Mutation reports the
 outer attempted staging/service boundary, not proof of account/cgroup progress.
 Those transport/observation questions need fresh independent review before any
 future diagnostic proposal. No native contract compatibility is established.
@@ -131,3 +132,23 @@ reproduction, fix, retry or dispatch is claimed. A new source SHA does not
 authorize an experiment. Fresh Opus high security review, parent merge/repin
 and normal gates are required before publication. M2 remains incomplete,
 real-Runner PA6 OPEN, and hardware paths **unverified on real hardware**.
+
+F0 blocker regression checks (all runtime effects mocked in memory):
+
+```
+python -I -B -c "import sys,unittest; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0_blockers as t; unittest.main(t)"
+python -I -B -c "import sys; sys.path.insert(0,'tools/unix-exec-validation'); import test_f0_blockers as t; t.mutations()"
+```
+
+The bounded runner compiles 15 independent mutations in memory, requires a
+named assertion failure for each (compile errors earn no credit), restores the
+module binding, and verifies the raw source SHA-256. It never writes mutations.
+Success replaces the old harness/cleanup markers: first=null, final=null,
+mutation=service and cleanup=confirmed in one validated line. first is the
+original body exception (including pre-try failures), or null; final is the
+escaping exception. Cleanup-only failure keeps first=null.
+If association gates fail, the sole output is the closed fallback stderr line
+`unix experiment refused/failed: <code>`. Record failures use E_RECORD.
+BaseException, process termination and workflow cancellation may emit no record
+and cannot prove cleanup. Internal capture at the seven service/harness/fixture
+sites remains uncovered; separate F0b work is needed before any F2 coverage claim.

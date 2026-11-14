@@ -54,6 +54,7 @@ SITES = ('cg_preflight', 'cleanup_capture', 'cleanup_base', 'service_stage',
 PHASES = ('initial', 'final')
 MUTATIONS = ('none', 'staged', 'account', 'service', 'cgroup')
 CLEANUPS = ('confirmed', 'unconfirmed', 'not_reached')
+CODES = ('E_ACCOUNT_COLLISION', 'E_ARGS', 'E_ARTIFACT', 'E_ARTIFACT_PATH', 'E_BUILD', 'E_BUILD_LOG', 'E_CGROUP2', 'E_CGROUP_FIXTURE_OWNER', 'E_CGROUP_SCAN_BOUND', 'E_CGROUP_UNIT_OWNER', 'E_CGROUP_WRITABLE_HIERARCHY', 'E_CHECKOUT', 'E_CONTROLLERS', 'E_COPY_RACE', 'E_COPY_TYPE', 'E_DELEGATION', 'E_FIXTURE_COLLISION', 'E_FIXTURE_INODE', 'E_FIXTURE_UID', 'E_GROUP_ORPHAN', 'E_ID', 'E_INSTALLED', 'E_INTERNAL_TASKS', 'E_MODE', 'E_OUTPUT_DRAIN', 'E_PATH', 'E_PID', 'E_PLATFORM', 'E_QUARANTINE_CGROUP', 'E_QUARANTINE_PATH_UNCAPTURED', 'E_QUARANTINE_UID_UNCAPTURED', 'E_RECORD', 'E_RECORD_BOUND', 'E_RMTREE', 'E_ROOT', 'E_RUNTIME', 'E_SERVICE_OR_TEST', 'E_SHA', 'E_SHA_FORMAT', 'E_SITE', 'E_SYSTEMD', 'E_TEST', 'E_TEST_ARGS', 'E_TEST_LOG', 'E_TEST_TIMEOUT', 'E_UID_LIVE', 'E_UNIT_CGROUP', 'E_UNIT_COLLISION', 'E_GATE_CI', 'E_GATE_GITHUB_ACTIONS', 'E_GATE_RUNNER_ENVIRONMENT', 'E_GATE_RUNNER_OS', 'E_GATE_GITHUB_EVENT_NAME', 'E_GATE_GITHUB_REPOSITORY', 'E_GATE_GITHUB_ACTOR', 'E_GATE_GITHUB_TRIGGERING_ACTOR', 'E_GATE_GITHUB_REF', 'E_COMMAND_TIMEOUT', 'E_COMMAND_FAILED', 'E_OS')
 MAX_TRIPLES = 32
 MAX_LINE = 4096
 feedback_phase = 'initial'
@@ -98,6 +99,16 @@ def exception_record(error):
     # Never stringify an arbitrary payload, even a RuntimeError payload.
     if type(error) is Refusal:
         return dict(error.record)
+    if type(error) is RuntimeError and len(error.args) == 1:
+        code = error.args[0]
+        if type(code) is str and code in CODES:
+            return dict(code=code)
+    if type(error) is subprocess.TimeoutExpired:
+        return dict(code='E_COMMAND_TIMEOUT')
+    if type(error) is subprocess.CalledProcessError:
+        return dict(code='E_COMMAND_FAILED')
+    if isinstance(error, OSError):
+        return dict(code='E_OS')
     return dict(code='E_RUNTIME')
 
 
@@ -120,7 +131,7 @@ def validate_record(record):
         if e is None:
             continue
         require(type(e) is dict, 'E_RECORD')
-        if e == {'code': 'E_RUNTIME'}:
+        if set(e) == {'code'} and type(e['code']) is str and e['code'] in CODES:
             continue
         require(set(e) == {'code', 'site', 'phase', 'ordinal', 'kind', 'owner_zero',
                            'write_bits', 'predecessors'}, 'E_RECORD')
@@ -130,6 +141,23 @@ def validate_record(record):
         triples = e['predecessors'] + [[e['kind'], e['owner_zero'], e['write_bits']]]
         result = decide(triples)
         require(result is not None and result[0] == e['ordinal'] == len(triples) - 1, 'E_RECORD')
+    first, final = record['first'], record['final']
+    mutation, cleanup = record['mutation'], record['cleanup']
+    if final is None:
+        require(first is None and cleanup == 'confirmed' and mutation == 'service', 'E_RECORD')
+    if cleanup == 'confirmed':
+        require(first == final, 'E_RECORD')
+    if mutation == 'none':
+        require(cleanup == 'not_reached', 'E_RECORD')
+    if cleanup == 'not_reached':
+        require(first == final and final is not None, 'E_RECORD')
+    if final is not None and first is None:
+        require(cleanup == 'unconfirmed' and mutation != 'none', 'E_RECORD')
+    if first and first.get('code') == 'E_PROTECTION':
+        require(first['phase'] == 'initial', 'E_RECORD')
+    if final and final.get('code') == 'E_PROTECTION':
+        require((final['phase'] == 'final' and cleanup == 'unconfirmed') or
+                (final['phase'] == 'initial' and first == final), 'E_RECORD')
     return record
 
 
@@ -215,7 +243,7 @@ def cg_preflight():
     require(Path('/run/systemd/system').is_dir(), 'E_SYSTEMD')
     protected(Path('/sys/fs/cgroup'), 'cg_preflight')
     fs = subprocess.check_output(['/usr/bin/stat', '-f', '-c', '%T', '/sys/fs/cgroup'],
-                                 env=SAFE_ENV, timeout=5).strip()
+                                 env=SAFE_ENV, timeout=5, stderr=subprocess.DEVNULL).strip()
     require(fs == b'cgroup2fs', 'E_CGROUP2')
     require({'memory', 'pids'} <= set(Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()),
             'E_CONTROLLERS')
@@ -423,6 +451,17 @@ def harness(stage, args):
 
 def run(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
+    feedback_phase, feedback_mutation, feedback_cleanup, feedback_first = 'initial', 'none', 'not_reached', None
+    try:
+        return run_body(env)
+    except Exception as error:
+        if feedback_cleanup == 'not_reached':
+            feedback_first = exception_record(error)
+        raise
+
+
+def run_body(env):
+    global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')
     cg_preflight()  # read-only; no retry or global controller writes
@@ -430,7 +469,7 @@ def run(env):
     protected(stage.parent, 'run_parent')
     # Refuse unit collisions before taking ownership of this generated name.
     state = subprocess.check_output(['/usr/bin/systemctl', 'show', unit, '-p', 'LoadState', '--value'],
-                                    env=SAFE_ENV, timeout=5).strip()
+                                    env=SAFE_ENV, timeout=5, stderr=subprocess.DEVNULL).strip()
     require(state == b'not-found', 'E_UNIT_COLLISION')
     feedback_mutation = 'staged'  # conservative: mutation may begin
     stage.mkdir(mode=0o700)
@@ -438,7 +477,7 @@ def run(env):
     try:
         source = Path.cwd()
         require(subprocess.check_output(['/usr/bin/git', '-c', 'safe.directory=' + str(source), 'rev-parse', 'HEAD'], env=SAFE_ENV,
-                                        timeout=5).decode().strip() == env['GITHUB_SHA'], 'E_CHECKOUT')
+                                        timeout=5, stderr=subprocess.DEVNULL).decode().strip() == env['GITHUB_SHA'], 'E_CHECKOUT')
         # Fixed hosted-runner tool locations; no user supplied paths or config.
         copy_tree(source, stage / 'source', ('.git', 'target', 'node_modules', '__pycache__'))
         copy_tree(Path('/home/runner/.rustup/toolchains') / TOOLCHAIN, stage / 'rust')
@@ -526,7 +565,7 @@ def main():
 
 def feedback_line(env, first, final):
     # Gate validates the association; this envelope is association, not attestation.
-    gate(env, 'linux')
+    gate(env, sys.platform)
     return encode_record(dict(schema='unix-protection-f0', version=1,
         provenance=dict(source_sha=env['ARX_REVIEWED_SHA'], workflow_sha=env['ARX_WORKFLOW_SHA'],
                         run=env['GITHUB_RUN_ID'], attempt=env['GITHUB_RUN_ATTEMPT']),
@@ -543,14 +582,20 @@ def entry():
     # by the existing parent subprocess collectors; no extra public lines.
     if sys.argv[1:] == ['run']:
         try:
+            gate(os.environ, sys.platform)
             final = exception_record(error) if error is not None else None
-            print(feedback_line(os.environ, feedback_first or final, final), end='')
-        except Exception:
-            code = 'E_PLATFORM' if type(error) is RuntimeError and error.args == ('E_PLATFORM',) else 'E_RECORD'
+            print(feedback_line(os.environ, feedback_first, final), end='')
+        except Exception as record_error:
+            try:
+                gate(os.environ, sys.platform)
+            except Exception as gate_error:
+                code = exception_record(gate_error)['code']
+            else:
+                code = 'E_RECORD'
             print('unix experiment refused/failed: ' + code, file=sys.stderr)
             return 1
     elif error is not None:
-        print('unix experiment refused/failed: E_RUNTIME', file=sys.stderr)
+        print('unix experiment refused/failed: ' + exception_record(error)['code'], file=sys.stderr)
     return 1 if error is not None else 0
 
 

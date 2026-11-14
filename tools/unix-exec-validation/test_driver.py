@@ -142,7 +142,7 @@ class Guards(unittest.TestCase):
 
     def test_time_bounds_and_finally_are_present(self):
         tree = ast.parse((ROOT / 'tools/unix-exec-validation/driver.py').read_text())
-        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+        run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_body')
         self.assertTrue(any(isinstance(n, ast.Try) and n.finalbody for n in ast.walk(run)))
         source = (ROOT / 'tools/unix-exec-validation/driver.py').read_text()
         self.assertIn('deadline = time.monotonic() + 120', source)
@@ -368,11 +368,17 @@ class CopyGuards(unittest.TestCase):
 
 class F0Mechanism(unittest.TestCase):
     """Synthetic mechanism credit only. No filesystem observation or reproduction."""
+    def setUp(self):
+        for name, value in (('feedback_phase', 'initial'), ('feedback_mutation', 'staged'),
+                            ('feedback_cleanup', 'unconfirmed'), ('feedback_first', None)):
+            self.enterContext(patch.object(driver, name, value))
+        self.enterContext(patch.object(driver.sys, 'platform', 'linux'))
+
     def refusal(self, phase='initial'):
         return driver.Refusal('run_parent', phase, [['dir', True, 0], ['other', False, 2]])
 
     def record(self):
-        return json.loads(driver.feedback_line(valid_env(), driver.exception_record(self.refusal()), None))
+        return json.loads(driver.feedback_line(valid_env(), driver.exception_record(self.refusal()), driver.exception_record(self.refusal('final'))))
 
     def test_real_predicate_and_order(self):
         for kind in ('dir', 'other'):
