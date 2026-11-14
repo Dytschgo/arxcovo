@@ -532,7 +532,7 @@ class A1A2(unittest.TestCase):
         self.assertEqual(driver.test_env('@notify'), dict(CI='true', GITHUB_ACTIONS='true',
             RUNNER_ENVIRONMENT='github-hosted', ARX_DISPOSABLE_EXEC_TEST='1', NOTIFY_SOCKET='@notify'))
 
-    def monitor(self, states, size=0, pid='42', actual='42', exe=None, placement=None, ticks=None):
+    def monitor(self, states, size=0, pid='42', actual='42', exe=None, placement=None, ticks=None, tasks=b'42\n', result='success', status='0'):
         stage = Path('/var/lib/arx-ci-123-1')
         artifact = str(stage / 'source/target/debug/deps/arxd-abc')
         events = []
@@ -541,14 +541,15 @@ class A1A2(unittest.TestCase):
             if path.name == 'cgroup': return placement or '0::/system.slice/arxd.service/supervisor\n'
             raise AssertionError('unexpected read')
         with patch.object(driver, 'unit_properties', side_effect=[dict(ActiveState=s,
-                MainPID=actual, Result='success', ExecMainStatus='0') for s in states]), \
+                MainPID=actual, Result=result, ExecMainStatus=status) for s in states]), \
+             patch.object(driver, 'verify_runtime', side_effect=lambda *a: events.append('attribution')), \
              patch.object(driver, 'private_read', side_effect=read), \
              patch.object(driver, 'capture_size', return_value=size), \
              patch.object(driver.os, 'readlink', return_value=exe or artifact), \
              patch.object(driver.os, 'O_NOFOLLOW', 0x20000, create=True), \
              patch.object(driver.os, 'O_CLOEXEC', 0x80000, create=True), \
              patch.object(driver.os, 'open', return_value=77), \
-             patch.object(driver.os, 'read', return_value=(placement or '0::/system.slice/arxd.service/supervisor\n').encode()), \
+             patch.object(driver.os, 'read', side_effect=[(placement or '0::/system.slice/arxd.service/supervisor\n').encode(), tasks]), \
              patch.object(driver.os, 'close'), \
              patch.object(driver, 'exclusive_file', side_effect=lambda p,b: events.append(p.name)), \
              patch.object(driver, 'verify_test_result', side_effect=lambda *a: events.append('summary')), \
@@ -558,7 +559,7 @@ class A1A2(unittest.TestCase):
         return events
 
     def test_ack_before_exit_before_summary(self):
-        self.assertEqual(self.monitor(['active', 'inactive']), ['identity-ack', 'summary'])
+        self.assertEqual(self.monitor(['active', 'inactive']), ['attribution', 'identity-ack', 'summary'])
 
     def test_mainpid_and_placement_required(self):
         for kwargs in (dict(actual='43'), dict(exe='/other'), dict(placement='0::/other/supervisor\n')):
@@ -599,7 +600,8 @@ class A1A2(unittest.TestCase):
             walk.assert_not_called()
 
     def test_cleanup_cannot_stop_another_unit(self):
-        with patch.object(driver.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as stop, \
+        with patch.object(driver, 'verify_runtime'), \
+             patch.object(driver.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as stop, \
              patch.object(driver, 'unit_properties', return_value={'FragmentPath':'/run/systemd/system/arxd.service'}), \
              patch.object(driver, 'snapshot_internal'), patch.object(driver, 'remove_runtime'), \
              patch.object(driver.os.path, 'lexists', return_value=False):
@@ -609,7 +611,8 @@ class A1A2(unittest.TestCase):
 
     def test_cleanup_replacement_quarantines(self):
         owned = [(Path('/run/systemd/system/arxd.service'), object())]
-        with patch.object(driver, 'same_object', side_effect=RuntimeError('E_FIXTURE_INODE')), \
+        with patch.object(driver, 'verify_runtime'), \
+             patch.object(driver, 'same_object', side_effect=RuntimeError('E_FIXTURE_INODE')), \
              patch.object(driver.subprocess, 'run') as stop, \
              patch.object(driver, 'remove_runtime') as remove:
             with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_INODE'):
@@ -670,6 +673,175 @@ class A1A2(unittest.TestCase):
             with self.assertRaises(FileExistsError):driver.reserve_unit()
             flock.flock.assert_not_called()
 
+    def test_runtime_attribution_lifecycle(self):
+        stage = unittest.mock.MagicMock()
+        stage.__truediv__.return_value = stage
+        stage.parent = stage
+        stage.name = 'arxd-abc'
+        stage.stat.return_value.st_size = 10
+        stage.read_text.return_value = json.dumps(dict(reason='compiler-artifact', executable='/artifact', profile={'test':True}))
+        events = []
+        with ExitStack() as stack:
+            for name, value in [('phase','initial'), ('mutation','none'), ('cleanup','not_reached'), ('first',None), ('internal',None)]:
+                stack.enter_context(patch.object(driver, 'feedback_' + name, value))
+            stack.enter_context(patch.object(driver.sys, 'platform', 'linux'))
+            stack.enter_context(patch.object(driver, 'plan', return_value=(stage, 'arxd.service')))
+            stack.enter_context(patch.object(driver, 'Path', return_value=stage))
+            for name in ('getuid', 'geteuid'):
+                stack.enter_context(patch.object(driver.os, name, return_value=0, create=True))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            stack.enter_context(patch.object(driver.os.path, 'lexists', return_value=False))
+            stack.enter_context(patch.object(driver, 'reserve_unit', return_value=(77, stage, None)))
+            for name in ('cg_preflight', 'protected', 'copy_tree', 'refuse_unit_collision', 'same_object', 'exclusive_file', 'install_runtime', 'snapshot_internal', 'remove_runtime'):
+                stack.enter_context(patch.object(driver, name))
+            remove = stack.enter_context(patch.object(driver.shutil, 'rmtree'))
+            remove.avoids_symlink_attacks = True
+            stack.enter_context(patch.object(driver.subprocess, 'check_output', return_value=valid_env()['GITHUB_SHA'].encode()))
+            def process(argv, **kwargs):
+                events.append('stop' if argv[0] == '/usr/bin/systemctl' else 'build')
+                return SimpleNamespace(returncode=0)
+            stack.enter_context(patch.object(driver.subprocess, 'run', side_effect=process))
+            stack.enter_context(patch.object(driver, 'call', side_effect=lambda argv: events.append('start') if 'start' in argv else None))
+            stack.enter_context(patch.object(driver, 'verify_runtime', side_effect=lambda *a: events.append('attribution')))
+            stack.enter_context(patch.object(driver, 'monitor_a1a2', side_effect=lambda *a: events.append('monitor')))
+            driver.run_body(valid_env())
+        self.assertEqual(events, ['build', 'attribution', 'start', 'monitor', 'attribution', 'stop'])
+
+    def test_closed_selection_before_effects(self):
+        for value in ('', 'exec::disposable::disposable_linux_cross_account', driver.TEST + 'x'):
+            with patch.object(driver, 'TEST', value), \
+                 patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('probe')), \
+                 patch.object(driver, 'cg_preflight', side_effect=AssertionError('probe')):
+                with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                    driver.run_body(valid_env())
+                with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                    driver.main()
+
+    def test_profile_pairings_and_install_bytes(self):
+        stage = Path('/var/lib/arx-ci-123-1')
+        package = ROOT / 'packaging/linux'
+        unit = (package / 'arxd.service').read_bytes()
+        profile = (package / '50-arxcovo-standard-rights.conf').read_bytes()
+        root = Path('/run/systemd/system')
+        for name, present in [('a1_a2', True), ('a3_standard', True), ('a3_none', False)]:
+            with self.subTest(name=name), ExitStack() as stack:
+                selected = 'exec::disposable::disposable_linux_' + name
+                stack.enter_context(patch.object(driver, 'TEST', selected))
+                stack.enter_context(patch.object(Path, 'read_bytes', lambda p: profile if p.name.startswith('50-') else unit))
+                stack.enter_context(patch.object(driver, 'protected'))
+                mkdir = stack.enter_context(patch.object(Path, 'mkdir'))
+                stack.enter_context(patch.object(Path, 'lstat', return_value='dir-identity'))
+                write = stack.enter_context(patch.object(driver, 'exclusive_file', return_value='file-identity'))
+                owned = []
+                driver.install_runtime(stage, '123-1', owned)
+                expected = [(root / 'arxd.service', unit)]
+                if present:
+                    expected.append((root / 'arxd.service.d/50-arxcovo-standard-rights.conf', profile))
+                expected.append((root / 'arxd.service.d/90-disposable-a1a2.conf', driver.fixture_override(stage, '123-1').encode('ascii')))
+                self.assertEqual([c.args for c in write.call_args_list], expected)
+                self.assertEqual([p for p, _ in owned], [root / 'arxd.service', root / 'arxd.service.d'] + [p for p, _ in expected[1:]])
+                mkdir.assert_called_once_with(mode=0o700)
+                self.assertEqual(driver.standard_profile(), present)
+                self.assertEqual(driver.test_argv('/binary')[1], selected)
+
+    def attribution(self, name='a3_standard', change=None, disk_extra=False, bad_bytes=False, mode=0o700):
+        stage = Path('/var/lib/arx-ci-123-1')
+        root = Path('/run/systemd/system')
+        names = ['90-disposable-a1a2.conf']
+        if name != 'a3_none': names.insert(0, '50-arxcovo-standard-rights.conf')
+        props = dict(LoadState='loaded', Id='arxd.service', Names='arxd.service',
+                     FragmentPath='/run/systemd/system/arxd.service',
+                     DropInPaths=' '.join('/run/systemd/system/arxd.service.d/' + n for n in names))
+        props.update(change or {})
+        disk = [root / 'arxd.service.d' / n for n in names]
+        if disk_extra: disk.append(root / 'arxd.service.d/foreign.conf')
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_' + name))
+            stack.enter_context(patch.object(Path, 'read_bytes', return_value=b'package'))
+            stack.enter_context(patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=0)))
+            stack.enter_context(patch.object(Path, 'iterdir', return_value=iter(disk)))
+            def read(p):
+                if bad_bytes: return 'changed'
+                return driver.fixture_override(stage, '123-1') if p.name.startswith('90-') else 'package'
+            stack.enter_context(patch.object(driver, 'private_read', side_effect=read))
+            driver.verify_runtime(stage, '123-1', props)
+
+    def test_exact_runtime_attribution(self):
+        for name in ('a1_a2', 'a3_standard', 'a3_none'):
+            self.attribution(name)
+            for kwargs in (dict(change={'DropInPaths':''}),
+                           dict(change={'DropInPaths':'/foreign/identical.conf'}),
+                           dict(change={'Names':'arxd.service alias.service'}),
+                           dict(change={'Id':'alias.service'}),
+                           dict(change={'FragmentPath':'/foreign/arxd.service'}),
+                           dict(disk_extra=True), dict(bad_bytes=True), dict(mode=0o755)):
+                with self.subTest(name=name, kwargs=kwargs), self.assertRaisesRegex(RuntimeError, 'E_UNIT_COLLISION'):
+                    self.attribution(name, **kwargs)
+
+    def test_sole_supervisor_pid_required(self):
+        for tasks in (b'', b'42\n43\n', b'43\n', b'42 '):
+            with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
+                self.monitor(['active', 'inactive'], tasks=tasks)
+
+    def test_exit_requires_ack_and_real_success(self):
+        for states, kwargs in [(['inactive'], {}), (['active','failed'], {'result':'exit-code'}),
+                               (['active','inactive'], {'status':'1'})]:
+            with self.assertRaisesRegex(RuntimeError, 'E_SERVICE_OR_TEST'):
+                self.monitor(states, **kwargs)
+
+    def test_private_runtime_read_metadata(self):
+        for mode, uid, links, size in [(0o600,0,1,4), (0o644,0,1,4),
+                                        (0o600,1,1,4), (0o600,0,2,4), (0o600,0,1,4097)]:
+            with ExitStack() as stack:
+                for flag in ('O_NOFOLLOW', 'O_NONBLOCK', 'O_CLOEXEC'):
+                    stack.enter_context(patch.object(driver.os, flag, 0x80000, create=True))
+                opened = stack.enter_context(patch.object(driver.os, 'open', return_value=77))
+                stack.enter_context(patch.object(driver.os, 'fstat', return_value=SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=uid, st_nlink=links, st_size=size)))
+                read = stack.enter_context(patch.object(driver.os, 'read', return_value=b'unit'))
+                closed = stack.enter_context(patch.object(driver.os, 'close'))
+                if (mode, uid, links, size) == (0o600,0,1,4):
+                    self.assertEqual(driver.private_read(Path('/runtime')), 'unit')
+                    read.assert_called_once_with(77, 4097)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'E_PATH'):
+                        driver.private_read(Path('/runtime'))
+                    read.assert_not_called()
+                self.assertTrue(opened.call_args.args[1] & driver.os.O_NOFOLLOW)
+                closed.assert_called_once_with(77)
+
+    def test_runtime_exclusive_file_mode(self):
+        with ExitStack() as stack:
+            for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+                stack.enter_context(patch.object(driver.os, flag, 0x80000, create=True))
+            opened = stack.enter_context(patch.object(driver.os, 'open', return_value=77))
+            stack.enter_context(patch.object(driver.os, 'fstat', return_value='identity'))
+            stack.enter_context(patch.object(driver.os, 'dup', return_value=78))
+            sink = unittest.mock.MagicMock()
+            stack.enter_context(patch.object(driver.os, 'fdopen', return_value=sink))
+            closed = stack.enter_context(patch.object(driver.os, 'close'))
+            self.assertEqual(driver.exclusive_file(Path('/runtime'), b'bytes'), 'identity')
+            self.assertEqual(opened.call_args.args[2], 0o600)
+            for flag in (os.O_EXCL, driver.os.O_NOFOLLOW, os.O_CREAT):
+                self.assertTrue(opened.call_args.args[1] & flag)
+            sink.__enter__.return_value.write.assert_called_once_with(b'bytes')
+            closed.assert_called_once_with(77)
+
+    def test_remove_validates_entire_set_before_deleting(self):
+        first, second = unittest.mock.MagicMock(), unittest.mock.MagicMock()
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600)
+        with patch.object(driver, 'same_object', side_effect=[None, RuntimeError('E_FIXTURE_INODE')]), \
+             patch.object(driver, 'call') as reload:
+            with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_INODE'):
+                driver.remove_runtime([(first, info), (second, info)])
+            first.unlink.assert_not_called()
+            second.unlink.assert_not_called()
+            reload.assert_not_called()
+
+    def test_capture_mode_and_nlink(self):
+        for mode, uid, links in [(0o644,0,1), (0o600,1,1), (0o600,0,2)]:
+            with patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=uid, st_nlink=links)), self.assertRaisesRegex(RuntimeError, 'E_TEST_LOG'):
+                driver.capture_size(Path('/stage'))
+
     def test_exact_summary(self):
         stage = unittest.mock.MagicMock()
         (stage / 'test-output').stat.return_value.st_size = 100
@@ -678,6 +850,10 @@ class A1A2(unittest.TestCase):
             with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
                 driver.verify_test_result(stage, 0)
         text = f'test {driver.TEST} ... ok\ntest result: ok. 1 passed; 0 failed;'
+        with patch.object(driver, 'private_read', return_value=text.replace(driver.TEST, 'wrong')), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+            driver.verify_test_result(stage, 0)
+        with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+            driver.verify_test_result(stage, 1)
         with patch.object(driver, 'private_read', return_value=text):
             driver.verify_test_result(stage, 0)
 

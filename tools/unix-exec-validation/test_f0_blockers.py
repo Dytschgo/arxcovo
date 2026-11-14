@@ -63,6 +63,7 @@ class F0Blockers(unittest.TestCase):
             stack.enter_context(patch.object(driver, 'refuse_unit_collision', side_effect=RuntimeError('E_UNIT_COLLISION') if collision else None))
             stack.enter_context(patch.object(driver, 'same_object'))
             stack.enter_context(patch.object(driver, 'exclusive_file'))
+            stack.enter_context(patch.object(driver, 'verify_runtime'))
             stack.enter_context(patch.object(driver, 'install_runtime', side_effect=RuntimeError('E_OS') if install_error else lambda *a:events.append('install')))
             stack.enter_context(patch.object(driver, 'call', side_effect=lambda argv: (_ for _ in ()).throw(RuntimeError('E_COMMAND_FAILED')) if start_error and 'start' in argv else events.append('start') if 'start' in argv else None))
             stack.enter_context(patch.object(driver.os, 'close'))

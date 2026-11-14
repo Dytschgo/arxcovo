@@ -20,6 +20,13 @@ def require(ok, code):
         raise RuntimeError(code)
 
 
+def standard_profile():
+    require(TEST in ('exec::disposable::disposable_linux_a1_a2',
+                     'exec::disposable::disposable_linux_a3_standard',
+                     'exec::disposable::disposable_linux_a3_none'), 'E_TEST_ARGS')
+    return TEST != 'exec::disposable::disposable_linux_a3_none'
+
+
 def identity(env):
     for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
         require(re.fullmatch(r'[1-9][0-9]{0,19}', env.get(key, '')), 'E_ID')
@@ -558,6 +565,7 @@ def drain_output(source, target, exceeded, limit=1024 * 1024):
 
 
 def test_argv(binary):
+    standard_profile()
     return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']
 
 
@@ -634,6 +642,7 @@ def monitor_a1a2(stage, artifact):
         require(capture_size(stage) <= 1024 * 1024, 'E_TEST_LOG')
         state = unit_properties()
         if state['ActiveState'] == 'active' and not acknowledged:
+            verify_runtime(stage, stage.name.removeprefix('arx-ci-'), state)
             pid = private_read(stage / 'harness-pid')
             require(re.fullmatch('[1-9][0-9]{0,9}', pid), 'E_PID')
             require(state['MainPID'] == pid, 'E_SERVICE_OR_TEST')
@@ -645,6 +654,13 @@ def monitor_a1a2(stage, artifact):
             finally:
                 os.close(fd)
             require(membership == b'0::/system.slice/arxd.service/supervisor\n', 'E_UNIT_CGROUP')
+            fd = os.open('/sys/fs/cgroup/system.slice/arxd.service/supervisor/cgroup.procs',
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                tasks = os.read(fd, 4097)
+            finally:
+                os.close(fd)
+            require(tasks == (pid + '\n').encode('ascii'), 'E_UNIT_CGROUP')
             exclusive_file(stage / 'identity-ack', b'1')
             acknowledged = True
         if state['ActiveState'] in ('inactive', 'failed'):
@@ -743,6 +759,7 @@ def refuse_unit_collision():
 
 
 def install_runtime(stage, run, owned):
+    standard_profile()
     root = Path('/run/systemd/system')
     protected(root, 'service_stage')
     for target, source in ((root / 'arxd.service', 'arxd.service'),):
@@ -751,11 +768,39 @@ def install_runtime(stage, run, owned):
     drop = root / 'arxd.service.d'
     drop.mkdir(mode=0o700)
     owned.append((drop, drop.lstat()))
-    for name, data in (
-        ('50-arxcovo-standard-rights.conf', (stage / 'source/packaging/linux/50-arxcovo-standard-rights.conf').read_bytes()),
-        ('90-disposable-a1a2.conf', fixture_override(stage, run).encode('ascii'))):
-        target = drop / name
+    for target, data in runtime_files(stage, run)[1:]:
         owned.append((target, exclusive_file(target, data)))
+
+
+def runtime_files(stage, run):
+    present = standard_profile()
+    root = Path('/run/systemd/system')
+    package = stage / 'source/packaging/linux'
+    files = [(root / 'arxd.service', (package / 'arxd.service').read_bytes())]
+    if present:
+        files.append((root / 'arxd.service.d/50-arxcovo-standard-rights.conf',
+                      (package / '50-arxcovo-standard-rights.conf').read_bytes()))
+    files.append((root / 'arxd.service.d/90-disposable-a1a2.conf',
+                  fixture_override(stage, run).encode('ascii')))
+    return files
+
+
+def verify_runtime(stage, run, state=None):
+    files = runtime_files(stage, run)
+    props = unit_properties() if state is None else state
+    # systemctl show renders this space-separated, ordered list without brackets.
+    expected = ' '.join(path.as_posix() for path, _ in files[1:])
+    require(props.get('LoadState') == 'loaded' and props.get('Id') == 'arxd.service' and
+            props.get('Names') == 'arxd.service' and
+            props.get('FragmentPath') == '/run/systemd/system/arxd.service' and
+            props.get('DropInPaths') == expected, 'E_UNIT_COLLISION')
+    drop = Path('/run/systemd/system/arxd.service.d')
+    info = drop.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+            stat.S_IMODE(info.st_mode) == 0o700, 'E_UNIT_COLLISION')
+    require(set(drop.iterdir()) == {path for path, _ in files[1:]}, 'E_UNIT_COLLISION')
+    for path, data in files:
+        require(private_read(path).encode('ascii') == data, 'E_UNIT_COLLISION')
 
 
 def remove_runtime(owned):
@@ -800,6 +845,7 @@ def reserve_unit():
 
 def run_body(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
+    standard_profile()
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')
     cg_preflight()  # read-only; no retry or global controller writes
@@ -850,6 +896,7 @@ def run_body(env):
         feedback_mutation = 'service'
         unit_created = True  # exact files captured; stop even when start fails
         call(['/usr/bin/systemctl', 'daemon-reload'])
+        verify_runtime(stage, run_id)
         call(['/usr/bin/systemctl', 'start', '--no-block', unit])
         monitor_a1a2(stage, str(artifact))
 
@@ -879,7 +926,7 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
         require(unit == 'arxd.service', 'E_UNIT_COLLISION')
         for path, info in owned:
             same_object(path, info)
-        require(unit_properties().get('FragmentPath') == '/run/systemd/system/arxd.service', 'E_UNIT_COLLISION')
+        verify_runtime(stage, run_id)
         stopped = None
         try:
             stopped = subprocess.run(['/usr/bin/systemctl', 'stop', unit], env=SAFE_ENV, timeout=40,
@@ -901,6 +948,7 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
 def main():
     global internal_trusted
     internal_trusted = False
+    standard_profile()
     require(len(sys.argv) >= 2, 'E_MODE')
     mode = sys.argv[1]
     if mode in ('guard', 'run'):

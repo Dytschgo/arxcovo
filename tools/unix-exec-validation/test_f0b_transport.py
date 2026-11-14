@@ -419,6 +419,7 @@ class EntryRun(unittest.TestCase):
             stack.enter_context(patch.object(driver,'same_object'))
             stack.enter_context(patch.object(driver,'refuse_unit_collision'))
             stack.enter_context(patch.object(driver,'exclusive_file'))
+            stack.enter_context(patch.object(driver, 'verify_runtime'))
             stack.enter_context(patch.object(driver,'install_runtime'))
             stack.enter_context(patch.object(driver,'call'))
             stack.enter_context(patch.object(driver,'unit_properties',return_value={'FragmentPath':'/run/systemd/system/arxd.service'}))
