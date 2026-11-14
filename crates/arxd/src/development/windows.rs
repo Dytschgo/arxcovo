@@ -429,7 +429,14 @@ mod diag {
         if error == 109
             && matches!(
                 stage,
-                Stage::LoopOutPeek | Stage::LoopErrPeek | Stage::FinalOutPeek | Stage::FinalErrPeek
+                Stage::LoopOutPeek
+                    | Stage::LoopErrPeek
+                    | Stage::FinalOutPeek
+                    | Stage::FinalErrPeek
+                    | Stage::LoopOutRead
+                    | Stage::LoopErrRead
+                    | Stage::FinalOutRead
+                    | Stage::FinalErrRead
             )
         {
             return false;
@@ -724,12 +731,12 @@ mod diag {
                 (Stage::Resume, true, None, false),
                 (Stage::LoopOutPeek, true, None, true),
                 (Stage::LoopErrPeek, true, None, true),
-                (Stage::LoopOutRead, true, None, false),
-                (Stage::LoopErrRead, true, None, false),
+                (Stage::LoopOutRead, true, None, true),
+                (Stage::LoopErrRead, true, None, true),
                 (Stage::FinalOutPeek, true, None, true),
                 (Stage::FinalErrPeek, true, None, true),
-                (Stage::FinalOutRead, true, None, false),
-                (Stage::FinalErrRead, true, None, false),
+                (Stage::FinalOutRead, true, None, true),
+                (Stage::FinalErrRead, true, None, true),
                 (Stage::Wait, true, Some(0xffff_ffff), false),
                 (Stage::ExitCode, true, None, false),
             ];
@@ -1225,44 +1232,73 @@ impl Captured {
 }
 /// Returns true once the stream has produced more than `limit` bytes.
 fn drain(h: HANDLE, c: &mut Captured, limit: usize) -> std::result::Result<bool, Reason> {
-    unsafe {
-        let mut available = 0;
-        #[cfg(test)]
-        {
-            let stage = diag::operation(diag::Op::Peek);
-            if let Some(error) = diag::stage(stage) {
-                if !diag::capture_injected(stage, error) {
-                    return Ok(c.total > limit as u64);
-                }
-                diagnostic_snapshot();
-                return Err(Reason::ExecutionFailed);
+    drain_io(
+        c,
+        limit,
+        || unsafe {
+            let mut available = 0;
+            #[cfg(test)]
+            if let Some(error) = diag::stage(diag::operation(diag::Op::Peek)) {
+                return Err(error);
             }
-        }
-        if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
-            let error = GetLastError();
-            if error == ERROR_BROKEN_PIPE {
-                return Ok(c.total > limit as u64);
+            if PeekNamedPipe(h, null_mut(), 0, null_mut(), &mut available, null_mut()) == 0 {
+                Err(GetLastError())
+            } else {
+                Ok(available)
             }
-            diagnostic!(diag::failure(|| error, true, None, diagnostic_snapshot));
+        },
+        |b, available| unsafe {
+            let mut n = 0;
+            #[cfg(test)]
+            if let Some(error) = diag::stage(diag::operation(diag::Op::Read)) {
+                return Err(error);
+            }
+            if ReadFile(h, b.as_mut_ptr(), available, &mut n, null_mut()) == 0 {
+                Err(GetLastError())
+            } else {
+                Ok(n)
+            }
+        },
+        |_error| {
+            diagnostic!(diag::failure(|| _error, true, None, diagnostic_snapshot));
+        },
+    )
+}
+
+// The production drain algorithm; callers supply I/O and failure capture so pure
+// regressions can exercise closure between peek and read without native handles.
+fn drain_io(
+    c: &mut Captured,
+    limit: usize,
+    peek: impl FnOnce() -> Result<u32, u32>,
+    read: impl FnOnce(&mut [u8], u32) -> Result<u32, u32>,
+    failure: impl FnOnce(u32),
+) -> std::result::Result<bool, Reason> {
+    let available = match peek() {
+        Ok(available) => available,
+        Err(ERROR_BROKEN_PIPE) => return Ok(c.total > limit as u64),
+        Err(error) => {
+            failure(error);
             return Err(Reason::ExecutionFailed);
         }
-        if available > 0 {
-            let mut b = [0u8; 4096];
-            let mut n = 0;
-            stage!(diag::operation(diag::Op::Read));
-            ok(ReadFile(
-                h,
-                b.as_mut_ptr(),
-                available.min(4096),
-                &mut n,
-                null_mut(),
-            ))?;
-            let keep = (limit + REDACTION_MARGIN).saturating_sub(c.bytes.len());
-            c.bytes.extend_from_slice(&b[..(n as usize).min(keep)]);
-            c.total += u64::from(n);
-        }
-        Ok(c.total > limit as u64)
+    };
+    if available > 0 {
+        let mut b = [0u8; 4096];
+        let n = match read(&mut b, available.min(4096)) {
+            Ok(n) => n,
+            // The writer may close after peek. Like peek's broken pipe, this
+            // is EOF; preserve prior bytes and the existing overflow verdict.
+            Err(ERROR_BROKEN_PIPE) => return Ok(c.total > limit as u64),
+            Err(error) => {
+                failure(error);
+                return Err(Reason::ExecutionFailed);
+            }
+        };
+        let keep = (limit + REDACTION_MARGIN).saturating_sub(c.bytes.len());
+        c.bytes.extend_from_slice(&b[..(n as usize).min(keep)]);
+        c.total += u64::from(n);
     }
+    Ok(c.total > limit as u64)
 }
 pub(super) fn run(
     execution: &Execution,
@@ -2599,6 +2635,114 @@ mod native_replay {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    // Mock-only callgraph: drain_io -> these closures / Captured arithmetic.
+    // Never calls drain, diagnostic_snapshot, run_inner or a native fixture.
+    #[test]
+    fn drain_read_broken_pipe_preserves_overflow() {
+        let mut c = Captured {
+            bytes: b"kept".to_vec(),
+            total: 12288,
+        };
+        let mut read_calls = 0;
+        let mut failures = Vec::new();
+        let result = drain_io(
+            &mut c,
+            8192,
+            || Ok(4096),
+            |b, requested| {
+                read_calls += 1;
+                assert_eq!((b.len(), requested), (4096, 4096));
+                // An unsuccessful read must not append buffer contents.
+                b.fill(b'x');
+                Err(ERROR_BROKEN_PIPE)
+            },
+            |error| failures.push(error),
+        );
+        assert_eq!(read_calls, 1);
+        assert_eq!(result, Ok(true));
+        assert!(failures.is_empty());
+        assert_eq!(c.bytes, b"kept");
+        assert_eq!(c.total, 12288);
+        assert_eq!(c.dropped(8192), 4096);
+    }
+    #[test]
+    fn drain_eof_and_errors_are_distinct() {
+        for total in [0, 8192, 12288] {
+            for at_read in [false, true] {
+                for error in [
+                    ERROR_BROKEN_PIPE,
+                    ERROR_ACCESS_DENIED,
+                    ERROR_INVALID_HANDLE,
+                    55,
+                ] {
+                    let mut c = Captured {
+                        bytes: b"kept".to_vec(),
+                        total,
+                    };
+                    let mut failures = Vec::new();
+                    let mut reads = 0;
+                    let result = drain_io(
+                        &mut c,
+                        8192,
+                        || if at_read { Ok(1) } else { Err(error) },
+                        |_, requested| {
+                            reads += 1;
+                            assert_eq!(requested, 1);
+                            Err(error)
+                        },
+                        |error| failures.push(error),
+                    );
+                    assert_eq!(reads, usize::from(at_read));
+                    if error == ERROR_BROKEN_PIPE {
+                        assert_eq!(result, Ok(total > 8192));
+                        assert!(failures.is_empty());
+                    } else {
+                        assert_eq!(result, Err(Reason::ExecutionFailed));
+                        assert_eq!(failures, [error]);
+                    }
+                    assert_eq!(c.total, total);
+                    assert_eq!(c.bytes, b"kept");
+                }
+            }
+        }
+    }
+    #[test]
+    fn drain_success_retains_bounds_and_counts() {
+        let mut c = Captured::default();
+        for _ in 0..4 {
+            let result = drain_io(
+                &mut c,
+                8192,
+                || Ok(32768),
+                |b, requested| {
+                    assert_eq!(requested, 4096);
+                    b.fill(b'x');
+                    Ok(requested)
+                },
+                |_| panic!("successful read reported as failure"),
+            );
+            assert_eq!(result, Ok(c.total > 8192));
+        }
+        assert_eq!(c.total, 16384);
+        assert_eq!(c.bytes, vec![b'x'; 12288]);
+        assert_eq!(c.dropped(8192), 8192);
+        for available in [0, 17] {
+            assert_eq!(
+                drain_io(
+                    &mut c,
+                    8192,
+                    || Ok(available),
+                    |_, requested| {
+                        assert_eq!(requested, 17);
+                        Ok(0)
+                    },
+                    |_| panic!("empty read reported as failure"),
+                ),
+                Ok(true)
+            );
+            assert_eq!((c.total, c.bytes.len()), (16384, 12288));
+        }
+    }
     #[test]
     fn token_policy_refuses_every_unsafe_fact() {
         let mut f = Facts {
