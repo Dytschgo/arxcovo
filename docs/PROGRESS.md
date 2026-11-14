@@ -2,6 +2,11 @@
 
 ## Current state - 2026-11-14
 
+- Required-CI F0 discovery correction `a6f7605` (retained `4bc26ac`) passes Opus high review `0d14a00` (retained `b6d40c2`), no blockers. Exact command passed 47 tests in bash and pwsh; workflow Node checks 3/3. Coordinator publishes only the single-pattern CI change plus supporting review/progress; F0b design is kept on a separate local branch and queued for Sol high review. Hosted checks remain required; no experiment authority.
+
+- Last merged PR70 `affaec91b83d3a3c06a67dc796578a98972c0c2b`, 2026-11-14 02:03:13Z. Squash tree equals independently reviewed `f0baed4`; all five required checks passed and first PR CI attempt `43543080320` succeeded in 538s. Fresh main CI pending. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
+- Separate CI correction expands the existing pure Unix guard test discovery from test_driver.py to test_*.py, including the F0 blocker regressions in required checks. It matches the manual workflow guard discovery and changes no privileged step, policy, protection or product source. Fresh Opus high review and hosted checks remain required. F0b transport design remains pending independent design review; no experiment/activation.
+
 - F0 replay test recheck `2b07953` passes Standards/Spec and closes ST-B2; original source blockers are closed by `93b1194`. Opus independently ran 32 safe tests, all 23 compiled assertion-killed mutants and case-isolation probes. Coordinator publishes only the bounded local feedback mechanism for exact-head review/normal gates. Optional finer-grained success-cleanup mutation gap and prior advisories are retained. Internal capture F0b and real-record replay remain OPEN; no diagnosis, dispatch, historical retry or activation is authorized.
 
 - F0 original blockers closed by source correction `93b1194`; Opus high recheck `d608f5c` (retained `7397353`) found test-only ST-B2. Coordinator Sol medium added isolated cross-field/closed-code/fallback cases: safe subset 32 passed, all 23 compiled in-memory mutants assertion-killed; driver unchanged. Fresh narrow recheck is next. No publication, real-record replay, dispatch or activation.

@@ -34,7 +34,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.151
       - name: Pure Unix experiment guards (no provisioning)
-        run: python -I -m unittest discover -s tools/unix-exec-validation -p test_driver.py
+        run: python -I -m unittest discover -s tools/unix-exec-validation -p 'test_*.py'
       - name: Bounded read-only Unix manager observations
         if: runner.os != 'Windows'
         run: |
