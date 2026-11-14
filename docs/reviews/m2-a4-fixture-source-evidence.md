@@ -108,3 +108,14 @@ reachable only from the ignored Linux A4 fixture; no ordinary test calls them.
   adapter/spawn source has **not** been Linux type-checked, linked or run here.
 
 No native acceptance, installed service behavior or hardware claim follows.
+
+## Coordinator integration
+
+PR104 merged as c87387ea6d5680b9347d43f88b8d280884d26353 at
+2026-11-14T23:46:15Z after all five gates; squash tree equals reviewed 240fce1.
+The coordinator refreshed only E3 SOURCE_SHA to the exact committed LF hash
+75b174ac10c7c3dd3be5984f507ba891ae4dccd953c49dfb12327007c0b907bd.
+Other pins, manifest, mutation/restoration guards and workflows are unchanged.
+Portable python -I -B tools/ci/e3-native/test_driver.py: 25 tests,
+one skip, zero failures. This does not execute the A4 helper or Linux fixture.
+Fresh independent source review remains required before publication.
