@@ -1,4 +1,13 @@
 use super::*;
+impl Execution {
+    pub(crate) fn probe_fixture(
+        probe: impl Fn(&Request, &Cancellation) -> Result<ResultData, Reason> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let mut execution = Self::build(settings(), false);
+        execution.probe = Some(Arc::new(probe));
+        Arc::new(execution)
+    }
+}
 fn settings() -> Settings {
     Settings {
         mode: Mode::CurrentUser,
@@ -324,4 +333,57 @@ fn development_configuration_classification() {
         s.disjoint(&root.join("ws2")).is_ok(),
         "sibling prefix is disjoint"
     );
+}
+
+#[test]
+fn discovery_completion_requires_terminal_success_or_known_absence() {
+    for (stop, cleanup_confirmed, matches_current_user) in [
+        (StopReason::Timeout, true, true),
+        (StopReason::Cancelled, true, true),
+        (StopReason::Shutdown, true, true),
+        (StopReason::OutputLimit, true, true),
+        (StopReason::Exited, false, true),
+        (StopReason::Exited, true, false),
+    ] {
+        let execution = Execution::probe_fixture(move |_, _| {
+            Ok(ResultData {
+                execution_mode: MODE,
+                claim: CLAIM,
+                dedicated: false,
+                stop_reason: stop,
+                exit_code: None,
+                cleanup_confirmed,
+                matches_current_user,
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_dropped_bytes: 0,
+                stderr_dropped_bytes: 0,
+            })
+        });
+        let (value, result, meta) = execution.work(None, &Cancellation::default()).unwrap();
+        assert_eq!(result, Outcome::Failed, "{stop:?}");
+        assert_eq!(value["outcome"], "failed");
+        assert!(value["tools"][0]["found"].is_null());
+        assert_eq!(meta.stop_reason, Some(stop));
+    }
+    let execution = Execution::probe_fixture(|_, _| Err(Reason::Unavailable));
+    let (value, result, _) = execution.work(None, &Cancellation::default()).unwrap();
+    assert_eq!(result, Outcome::Succeeded);
+    assert!(
+        value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["found"] == false)
+    );
+    // Cancellation on the final missing-tool result must not release success.
+    let execution = Execution::probe_fixture(|r, cancel| {
+        if r.tool == *TOOLS.last().unwrap() {
+            cancel.cancel();
+        }
+        Err(Reason::Unavailable)
+    });
+    let (value, result, _) = execution.work(None, &Cancellation::default()).unwrap();
+    assert_eq!(result, Outcome::Failed);
+    assert!(value.is_null());
 }

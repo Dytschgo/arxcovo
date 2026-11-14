@@ -85,7 +85,9 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
-        let observation = if self.activity.dedicated.is_some() && label == "discover_tools" {
+        let observation = if label == "discover_tools"
+            && (self.activity.dedicated.is_some() || self.execution.is_some())
+        {
             Some(
                 self.activity
                     .discovery_observation()
@@ -213,6 +215,9 @@ impl ServerHandler for Inventory {
                 _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
             }
             .map_err(|r| ErrorData::internal_error(r.as_str(), None))?;
+            if let Some(observation) = observation {
+                self.activity.cache_discovery(observation, &result);
+            }
             return Ok(
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())]).into(),
             );

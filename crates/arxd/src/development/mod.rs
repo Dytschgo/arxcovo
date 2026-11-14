@@ -155,6 +155,8 @@ pub struct ResultData {
     pub stderr_dropped_bytes: u64,
 }
 pub struct Execution {
+    #[cfg(test)]
+    probe: Option<Arc<Probe>>,
     #[cfg(all(test, windows))]
     policy_fixture: bool,
     /// Test-only fault: perturbs the in-memory daemon TokenUser copy so the
@@ -179,6 +181,8 @@ impl Drop for Busy<'_> {
     }
 }
 type Work = (serde_json::Value, Outcome, Metadata);
+#[cfg(test)]
+type Probe = dyn Fn(&Request, &Cancellation) -> Result<ResultData, Reason> + Send + Sync;
 impl Execution {
     pub fn new(settings: Settings) -> anyhow::Result<Arc<Self>> {
         settings.validate()?;
@@ -194,6 +198,8 @@ impl Execution {
     #[cfg(any(windows, test))]
     fn build(settings: Settings, _fixture: bool) -> Self {
         Self {
+            #[cfg(test)]
+            probe: None,
             #[cfg(all(test, windows))]
             policy_fixture: _fixture,
             #[cfg(all(test, windows))]
@@ -314,6 +320,8 @@ impl Execution {
             ));
         }
         let mut tools = Vec::new();
+        let mut complete = true;
+        let mut discovery_metadata = metadata(None, None, None);
         for name in TOOLS {
             if cancellation.is_cancelled() {
                 return cancelled();
@@ -326,10 +334,22 @@ impl Execution {
                 output_bytes: 4096,
             };
             let entry = match self.run(&probe, cancellation) {
-                Ok(r) if r.stop_reason == StopReason::Exited => {
+                Ok(r)
+                    if r.stop_reason == StopReason::Exited
+                        && r.cleanup_confirmed
+                        && r.matches_current_user =>
+                {
+                    if r.exit_code != Some(0) {
+                        complete = false;
+                        discovery_metadata = metadata(None, Some(&r), None);
+                    }
                     serde_json::json!({"name":name,"found":true,"version":r.stdout.chars().take(256).collect::<String>()})
                 }
-                Ok(_) => serde_json::json!({"name":name,"found":true,"version":null}),
+                Ok(r) => {
+                    complete = false;
+                    discovery_metadata = metadata(None, Some(&r), None);
+                    serde_json::json!({"name":name,"found":null,"version":null})
+                }
                 Err(Reason::Unavailable) => {
                     serde_json::json!({"name":name,"found":false,"version":null})
                 }
@@ -337,10 +357,21 @@ impl Execution {
             };
             tools.push(entry);
         }
+        // Cancellation during the final probe must not release a completed table.
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        let outcome = if complete {
+            Outcome::Succeeded
+        } else {
+            Outcome::Failed
+        };
         Ok((
-            serde_json::json!({"execution_mode":MODE,"claim":CLAIM,"tools":tools}),
-            Outcome::Succeeded,
-            metadata(None, None, None),
+            // This signal is produced from terminal probe facts. dispatch only
+            // releases it after the matching audit completion commits.
+            serde_json::json!({"execution_mode":MODE,"claim":CLAIM,"tools":tools,"outcome":outcome.as_str()}),
+            outcome,
+            discovery_metadata,
         ))
     }
     #[cfg_attr(not(windows), allow(unused_variables))]
@@ -349,6 +380,10 @@ impl Execution {
         r: &Request,
         cancellation: &Cancellation,
     ) -> std::result::Result<ResultData, Reason> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            return probe(r, cancellation);
+        }
         #[cfg(windows)]
         {
             windows::run(self, r, cancellation)
