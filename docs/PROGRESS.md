@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- SP1/SP2 dormant Windows replay seams pass independent Grok 4.7 high review `25e4309`: source `a65e784`, six pure tests and seven compiled assertion-killed mutations credited at source. Coordinator publishes a clean branch with redacted evidence only; the original owner-path evidence commit is excluded. No native replay/run or historical retry; native coverage and main71 cause remain unverified. Normal exact-head review and five checks remain required; M2 incomplete.
+
 - Windows diagnostic capture source `cf915a4` (retained `b9aa125`) passes independent Grok 4.7 high review `2fac595` (retained `c85e75b`) with no capture-source blocker. Final-source pure tests 4/4, fmt and package all-target Clippy passed. Coordinator authorizes capture-only publication and existing required CI, with no new native tests, replay, manual rerun or discovery change. Future replay blockers SP1/SP2 remain explicit; native capture/incident cause are unverified, no fix claimed. Missing ms accepted under success-path fence; fresh exact-head review and five checks remain merge gates.
 
 - Windows diagnostic source `cf915a4` (retained `b9aa125`), evidence `e696717` (retained `3d39d87`), is prepared for independent Grok review. Final fmt/Clippy/non-test compile are builder evidence; four pure tests ran only on a precursor, not the final pin. Coordinator accepts missing elapsed field ms=- to preserve no new native calls on success and unchanged timeout clocks; no timing value is fabricated. Final pure-test rerun and source/security review remain required. No native replay/run/CI dispatch authorized; main incident unresolved.
