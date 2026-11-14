@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- F0b clean publication is based on merged PR71 `a9ec0ac`, without Windows diagnostic docs. Source `b59410f` (retained `2333e1b`) and test-only correction `d649f6c` (retained `36b1d6d`) pass Opus high source review/recheck `0c3aa33` / `04c49c0` (retained `b71cd2c` / `ca9a96e`), no blockers. Local 66 selected tests, 23 legacy kills, 36 F0b kills and four equivalents are exact-pin evidence; no CLI/native credit. Sizes 757/2447 bytes. Coordinator publishes for exact-head review and normal CI; main Windows ExecutionFailed remains unresolved with no rerun. F2 undispatched, real-record replay/real-Runner PA6 OPEN, M2 incomplete and hardware paths **unverified on real hardware**.
+
 - Required-CI F0 discovery correction `a6f7605` (retained `4bc26ac`) passes Opus high review `0d14a00` (retained `b6d40c2`), no blockers. Exact command passed 47 tests in bash and pwsh; workflow Node checks 3/3. Coordinator publishes only the single-pattern CI change plus supporting review/progress; F0b design is kept on a separate local branch and queued for Sol high review. Hosted checks remain required; no experiment authority.
 
 - Last merged PR70 `affaec91b83d3a3c06a67dc796578a98972c0c2b`, 2026-11-14 02:03:13Z. Squash tree equals independently reviewed `f0baed4`; all five required checks passed and first PR CI attempt `43543080320` succeeded in 538s. Fresh main CI pending. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.

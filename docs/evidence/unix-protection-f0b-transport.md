@@ -245,10 +245,30 @@ committed LF SHA-256 both equal:
 
 Test file SHA-256: `8088fe6096d5d4eb3113fa817f9376226a07d69d096f09b3a54be8bf39d67b85`.
 
-The reviewed migration explicitly permits the narrow test_driver.py v2
-counterfactual changes. This separate F0b evidence file is the coordinator's
+The coordinator explicitly accepts the narrow test_driver.py shared-state
+reset as supporting v2 test isolation; this is a scope disposition, not a
+claim that the proposal named that file. This separate F0b evidence file is the coordinator's
 chosen evidence path; it supersedes the proposal's older append-only naming.
 F0b publication will be cut from merged main without Windows diagnostic
 proposal/history. Other review advisories remain disclosed. No CLI, native,
 privileged operation, dispatch or rerun was performed. M2 incomplete;
 real-record replay and real-Runner PA6 OPEN; hardware unverified.
+
+## Clean publication checkpoint
+
+Coordinator source: merged main `a9ec0ac`; no Windows diagnostic proposal or
+review is included in this F0b branch. Source and corrected tests are byte-equal
+to source-review and recheck pins. Review `04c49c0` retained `ca9a96e` closes
+both blockers. Updated mutation attribution:
+
+- writer_drops_excl: explicit EXCL request and empty-dead-creator content assertions.
+- internal_site_unchecked: carried wrong-mode/installed replay rejection.
+- reader_accepts_final_phase: carried final-phase replay rejection.
+- replay_carried_guard_omitted: all three otherwise-valid carried replay cases.
+- v1_relation_omitted: isolated failed-body relation cases, assertion failures only.
+- progress_marker_reraises: forced create_channel exception is swallowed.
+- outer_overflow_truncates: corrected 2447-byte maximum and output bound checks.
+
+No native execution, historical retry, dispatch or diagnosis is claimed. The
+main71 Windows failure remains unresolved; a passing later run would not
+establish its cause or a fix.
