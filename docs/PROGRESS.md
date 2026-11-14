@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- Gate2 source `3eedb77` (retained `beb590c`), evidence `afcf804` (retained `a04aaf6`), received Grok review `b2dec92`: dormant Rust contract holds, but controller run-readiness NOT cleared. Fix ST-INDEX row numbering, SE-DEADLINE owned clocks/nonblocking telemetry, SE-COMPLETE ledger completion and SE-INHERIT exact bound command/environment. Immutable launch pins, disposable standard-account environment, nested Job proof and measured budget remain gates. Sol high correction is next with compile/pure checks only; no controller/helper/native run.
+
 - Grok final oracle confirmation `ab115ba` closes SP-ORACLE; native replay design now has zero blockers. Coordinator accepts Gate 2 local source/compile/pure-test preparation only. Sol high implementation is next; native functions must remain undiscoverable/unexecuted and no PR may trigger new native tests. Fresh independent source review, controller/environment selection, exact native-run scope and measured CI budget remain OPEN. No historical retry, owner step or native execution authorized.
 
 - Grok recheck `b2676a4` (retained `0872975`) passed Standards/security but found wait/exit_code oracle totals and missing table columns. Coordinator corrected those rows to pass=None, totals=0/0, and expanded the table into 28 explicit labels with pass/totals columns. Eighteen pre-drain rows remain all missing. Proposal remains unaccepted pending narrow recheck; no code/run authority.
