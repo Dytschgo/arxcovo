@@ -84,6 +84,7 @@ internal static class ReplayController {
             last = elapsedMs;
             return false;
         }
+        internal long Deadline { get { return running ? rowStart+10000 : 0; } }
         internal bool Complete { get { return !failed && !running && completed==35 && children==20 && resumes==16; } }
         bool Reject() { failed=true; return false; }
     }
@@ -125,58 +126,167 @@ internal static class ReplayController {
             return !failed && !channel.Failed && channel.Empty && budget.Complete && exited && exitCode==0 && active==0;
         }
     }
+    // Shared by the owner and failure-only waiter. No native operation occurs
+    // under this gate. Synthetic observations use this same machine in checks.
+    internal sealed class Supervisor {
+        readonly object gate=new object();
+        readonly MonitorState monitor=new MonitorState();
+        internal readonly RowChannel Channel=new RowChannel();
+        long last, deadline=10000;
+        int operations;
+        bool failed, done, killIssued, created, assigned, resumed;
+        internal long Deadline { get { lock(gate) return deadline; } }
+        internal bool Failed { get { lock(gate) return failed; } }
+        internal bool ContinueOperation { get { lock(gate) return !failed && !done && operations==1; } }
+        bool Tick(long now) {
+            if(now<last || now>=ConfirmationDeadline(deadline)-2000) failed=true;
+            last=now; return !failed && !done;
+        }
+        internal bool Poll(long now) {
+            lock(gate) {
+                if(!Tick(now) || !monitor.Poll(Channel,now)) { failed=true; return false; }
+                // Keep the last row's absolute cap through exit/teardown. Never
+                // refresh it on END, empty polls, launch or cleanup.
+                if(monitor.budget.completed<35) {
+                    long row=monitor.budget.Deadline;
+                    if(row!=0) deadline=Math.Min(row,360000);
+                }
+                return true;
+            }
+        }
+        // This method has no route to done/success or ledger consumption.
+        internal bool FailureTick(long now) {
+            lock(gate) {
+                if(done) return false;
+                Tick(now);
+                if(Channel.Failed) failed=true;
+                return failed;
+            }
+        }
+        internal void Fail() { lock(gate) { failed=true; Channel.Invalidate(); } }
+        internal bool BeginOperation(long now) {
+            lock(gate) { if(!Tick(now) || operations!=0) { failed=true; return false; } operations++; created=assigned=resumed=false; return true; }
+        }
+        // Observations are made by the owner after each native call returns.
+        // The waiter never calls these methods and cannot authorize a resume.
+        internal bool Created() {
+            lock(gate) { created=true; return !failed && operations==1; }
+        }
+        internal bool Assigned(bool ok) {
+            lock(gate) { assigned=ok; if(!ok || !created) failed=true; return !failed && operations==1; }
+        }
+        internal bool AuthorizeResume() {
+            lock(gate) {
+                if(failed || !created || !assigned || resumed || operations!=1) return false;
+                resumed=true; return true;
+            }
+        }
+        internal bool EndOperation(long now,bool ok) {
+            lock(gate) { operations--; if(!ok || operations!=0) failed=true; return Tick(now); }
+        }
+        internal void KillIssued() { lock(gate) killIssued=true; }
+        internal bool Cleanup(bool killed,uint active,bool exited,long now) {
+            lock(gate) return failed && killIssued && operations==0 && CleanupConfirmed(killed,active,exited,now,ConfirmationDeadline(deadline));
+        }
+        internal bool Finish(long now,bool exited,uint code,uint active) {
+            lock(gate) {
+                // Fresh poll and commit are serialized with failure-only ticks.
+                if(!Poll(now) || operations!=0 || !monitor.Success(Channel,exited,code,active)) return false;
+                done=true; return true;
+            }
+        }
+    }
+    internal static long ConfirmationDeadline(long rowDeadline) { return Math.Min(rowDeadline,360000); }
     // Pure cleanup decision used only after the native termination attempt.
     internal static bool CleanupConfirmed(bool terminateSucceeded,uint active,bool processExited,long now,long until) {
         return terminateSucceeded && active==0 && processExited && now<until;
     }
-    // Created before either launch; sole owner of Job, channel and clock.
+    // One clock and owner across both filters. The waiter can ONLY fail/kill.
     internal sealed class OwnedSession : IDisposable {
         readonly Stopwatch clock=Stopwatch.StartNew();
-        readonly MonitorState state=new MonitorState();
-        internal readonly RowChannel channel=new RowChannel();
+        readonly Supervisor supervisor=new Supervisor();
         readonly FrameDecoder decoder;
         readonly NativeJob job;
-        static readonly List<NativeJob> unknownOwners=new List<NativeJob>();
-        bool failed, disposed, finished;
-        internal OwnedSession() { decoder=new FrameDecoder(channel); job=new NativeJob(); }
-        internal bool Poll() { return !failed && state.Poll(channel,clock.ElapsedMilliseconds); }
-        internal bool Success(bool exited,uint code,uint active) {
-            return Poll() && state.Success(channel,exited,code,active);
+        static readonly List<OwnedSession> unknownOwners=new List<OwnedSession>();
+        readonly Thread waiter;
+        int stop;
+        bool disposed, finished;
+        int retained;
+        void RetainOwner() {
+            lock(unknownOwners) { if(retained==0) { unknownOwners.Add(this); Volatile.Write(ref retained,1); } }
+        }
+        internal OwnedSession() {
+            decoder=new FrameDecoder(supervisor.Channel); job=new NativeJob(supervisor);
+            waiter=new Thread(FailureWait) { IsBackground=true }; waiter.Start();
+        }
+        void FailureWait() {
+            while(Volatile.Read(ref stop)==0) {
+                if(supervisor.FailureTick(clock.ElapsedMilliseconds)) {
+                    // Latch before entering any potentially blocked kernel call.
+                    supervisor.Fail(); supervisor.KillIssued(); RetainOwner(); job.Cancel(); return;
+                }
+                Thread.Sleep(1);
+            }
         }
         internal bool Run(Admission admission) {
-            if(finished || failed || disposed) return false;
+            if(finished || supervisor.Failed || disposed || Volatile.Read(ref retained)!=0) return false;
             try {
                 for(int filter=0;filter<2;filter++) {
-                    admission.Revalidate();
-                    string[] args={filter==0?LaunchSpec.Kernel:LaunchSpec.Matrix,"--exact","--test-threads=1"};
-                    job.Launch(admission.Libtest,admission.Root,args,admission.Environment(args));
+                    if(!supervisor.BeginOperation(clock.ElapsedMilliseconds)) return Abort();
+                    bool launched=false;
+                    try {
+                        admission.Revalidate();
+                        string[] args={filter==0?LaunchSpec.Kernel:LaunchSpec.Matrix,"--exact","--test-threads=1"};
+                        job.Launch(admission.Libtest,admission.Root,args,admission.Environment(args));
+                        launched=true;
+                    } finally { supervisor.EndOperation(clock.ElapsedMilliseconds,launched); }
+                    if(supervisor.Failed) return Abort();
                     for(;;) {
                         bool eof; uint code;
-                        if(!job.Pump(decoder,out eof) || !Poll() || clock.ElapsedMilliseconds>=358000) return Abort();
+                        if(!job.Pump(decoder,out eof) || !supervisor.Poll(clock.ElapsedMilliseconds)) return Abort();
                         bool exited=job.Exited(out code);
                         if(exited && eof) {
                             if(code!=0 || job.Active()!=0 || !decoder.ClosedSegment(filter==0?2:70)) return Abort();
-                            while(!channel.Empty) if(!Poll()) return Abort();
-                            if(filter==1 && !Success(true,code,job.Active())) return Abort();
+                            while(!supervisor.Channel.Empty) if(!supervisor.Poll(clock.ElapsedMilliseconds)) return Abort();
                             break;
                         }
-                        Thread.Sleep(1); // only owner waits, no threadpool callback
+                        Thread.Sleep(1);
                     }
                     job.Next();
                 }
-                finished=true; return true;
+                // Include native handle teardown before the final fresh clock poll.
+                if(!supervisor.BeginOperation(clock.ElapsedMilliseconds)) return Abort();
+                RetainOwner();
+                bool closed=false;
+                try { job.Dispose(); closed=true; }
+                finally { supervisor.EndOperation(clock.ElapsedMilliseconds,closed); }
+                if(!supervisor.Finish(clock.ElapsedMilliseconds,true,0,0)) return Abort();
+                finished=true; disposed=true; Volatile.Write(ref stop,1);
+                lock(unknownOwners) { unknownOwners.Remove(this); Volatile.Write(ref retained,0); }
+                return true;
             } catch { return Abort(); }
         }
         bool Abort() {
-            failed=true; channel.Invalidate();
-            if(!job.KillAndConfirm(clock)) {
-                lock(unknownOwners) unknownOwners.Add(job); // keep kill-on-close owner, prohibit reuse
-            } else { job.Dispose(); disposed=true; }
+            supervisor.Fail(); supervisor.KillIssued(); RetainOwner();
+            // Absolute cap, including teardown; no fresh now+2s allowance.
+            if(job.Disposed) { Volatile.Write(ref stop,1); return false; }
+            bool clean=job.KillAndConfirm(clock,ConfirmationDeadline(supervisor.Deadline));
+            Volatile.Write(ref stop,1);
+            // A waiter blocked inside a kernel call owns references indefinitely.
+            // Never dispose handles concurrently with that call or reuse a row.
+            if(!clean || !supervisor.Cleanup(true,0,true,clock.ElapsedMilliseconds) || !waiter.Join(0)) {
+                RetainOwner();
+            } else {
+                job.Dispose(); disposed=true;
+                lock(unknownOwners) { unknownOwners.Remove(this); Volatile.Write(ref retained,0); }
+            }
             return false;
         }
         public void Dispose() {
-            if(disposed) return;
+            if(disposed || Volatile.Read(ref retained)!=0) return;
             if(!finished) { Abort(); return; }
+            Volatile.Write(ref stop,1);
+            if(!waiter.Join(0)) { RetainOwner(); return; }
             job.Dispose(); disposed=true;
         }
     }
@@ -347,6 +457,7 @@ public static class PureControllerChecks {
         AdmissionPureChecks.Run();
         BindingPureChecks.Run();
         TransportPureChecks.Run();
+        SupervisorPureChecks.Run();
         Check(ReplayController.CleanupConfirmed(true,0,true,1,2),"cleanup zero");
         Check(!ReplayController.CleanupConfirmed(false,0,true,1,2),"cleanup kill first");
         Check(!ReplayController.CleanupConfirmed(true,1,true,1,2),"cleanup active");
@@ -739,5 +850,74 @@ internal static class TransportPureChecks {
         channel=new ReplayController.RowChannel(); decoder=new ReplayController.FrameDecoder(channel);
         var large=new Reader {Bytes=new byte[8192]};
         Check(!ReplayController.PumpTelemetry(large,buffer,decoder,out eof) && large.Offset==4096 && large.Reads==1,"one bounded read");
+    }
+}
+
+// Deterministic scheduler: times and operation completions are observations, not
+// callbacks, wall clocks, native calls, tasks or real threads. Uses the owner's
+// actual Supervisor machine, including its actual MonitorState/ledger.
+internal static class SupervisorPureChecks {
+    static void Check(bool ok,string name) { if(!ok) throw new Exception("supervisor: "+name); }
+    static void Row(ReplayController.Supervisor s,int i,long time) {
+        s.Channel.Publish(new ReplayController.Event(i,true));
+        Check(s.Poll(time),"row begin");
+        s.Channel.Publish(new ReplayController.Event(i,false,i>=1 && i<=32?1:0,i>=15?1:0,i>=19?1:0));
+        Check(s.Poll(time+1),"row end");
+    }
+    internal static void Run() {
+        Check(ReplayController.ConfirmationDeadline(9999)==9999
+            && ReplayController.ConfirmationDeadline(365000)==360000,"global teardown clamp");
+        foreach(string stuck in new[]{"launch stuck","assignment stuck"}) {
+            var s=new ReplayController.Supervisor();
+            Check(s.BeginOperation(0) && s.ContinueOperation,"operation start");
+            Check(!s.FailureTick(7999) && s.FailureTick(8000),stuck);
+            Check(!s.ContinueOperation,"no resume on failure");
+            Check(!s.Cleanup(true,0,true,8001),"kill before unknown cleanup");
+            s.KillIssued();
+            Check(!s.Cleanup(true,0,true,8001),"outstanding prevents cleanup");
+            Check(!s.Created() && !s.Assigned(true) && !s.AuthorizeResume(),"late completion cannot resume");
+            Check(!s.EndOperation(8002,true) && !s.ContinueOperation,"late completion");
+            Check(s.Cleanup(true,0,true,9999) && !s.Cleanup(true,0,true,10000),"teardown cap");
+            Check(!s.BeginOperation(8003) && !s.Finish(8004,true,0,0),"no reuse");
+        }
+        var assign=new ReplayController.Supervisor();
+        Check(assign.BeginOperation(0) && assign.Created(),"created suspended");
+        Check(!assign.AuthorizeResume(),"unassigned cannot resume");
+        Check(assign.FailureTick(8000) && !assign.Assigned(true) && !assign.AuthorizeResume(),"late assignment cannot resume");
+        var refused=new ReplayController.Supervisor();
+        Check(refused.BeginOperation(0) && refused.Created(),"assignment setup");
+        Check(!refused.Assigned(false) && !refused.AuthorizeResume() && !refused.EndOperation(1,true),"containment irrevocable");
+        var normal=new ReplayController.Supervisor();
+        Check(normal.BeginOperation(0) && normal.Created() && normal.Assigned(true) && normal.AuthorizeResume(),"owned resume authorization");
+        Check(!normal.AuthorizeResume(),"resume only once");
+        Check(normal.EndOperation(1,true),"owner operation complete");
+        var last=new ReplayController.Supervisor();
+        for(int i=0;i<35;i++) Row(last,i,i*7000);
+        Check(last.Deadline==248000,"last row absolute deadline");
+        Check(!last.FailureTick(245999) && last.FailureTick(246000),"last row termination reserve");
+        last.KillIssued();
+        Check(last.Cleanup(true,0,true,247999) && !last.Cleanup(true,0,true,248000),"last row teardown cap");
+        Check(!last.Finish(248000,true,0,0),"last row cannot succeed late");
+        var full=new ReplayController.Supervisor();
+        for(int i=0;i<35;i++) Row(full,i,i*2);
+        Check(!full.Finish(70,false,0,0) && !full.Finish(70,true,1,0) && !full.Finish(70,true,0,1),"exit active ledger");
+        Check(full.Finish(70,true,0,0) && !full.FailureTick(360000),"owner success only");
+        var race=new ReplayController.Supervisor();
+        for(int i=0;i<35;i++) Row(race,i,i*2);
+        Check(race.BeginOperation(70),"pending operation");
+        Check(!race.Finish(71,true,0,0),"final outstanding race");
+        race.EndOperation(72,true); race.Channel.Invalidate();
+        Check(race.FailureTick(73) && !race.Finish(74,true,0,0),"telemetry final race");
+        var fresh=new ReplayController.Supervisor();
+        for(int i=0;i<35;i++) Row(fresh,i,i*2);
+        Check(!fresh.Finish(10068,true,0,0),"fresh final poll");
+        var incomplete=new ReplayController.Supervisor();
+        Row(incomplete,0,0);
+        Check(!incomplete.Finish(2,true,0,0),"full ledger required");
+        incomplete.Fail();
+        Check(!incomplete.Cleanup(true,0,true,3),"kill precedes empty cleanup");
+        incomplete.KillIssued();
+        Check(!incomplete.Cleanup(false,0,true,3) && !incomplete.Cleanup(true,1,true,3)
+            && !incomplete.Cleanup(true,0,false,3),"cleanup observations");
     }
 }

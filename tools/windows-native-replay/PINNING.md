@@ -214,3 +214,65 @@ runtime. No entry/row clock was added and no supervisor race/deadline fix is
 claimed. Environment selection, nested Job compatibility and budget are UNRUN.
 M2 incomplete; main71 cause unknown; no historical retry; Phase 1 no focused
 native red loop; PA6 OPEN; **unverified on real hardware**.
+
+
+## Supervisor deadline slice (source only, 2026-11-14)
+
+Supersedes the old now+2s cleanup loop above. One OwnedSession owns the monotonic
+Stopwatch, Supervisor, ledger/decoder/channel, Job and failure-only waiter for
+both filters. The waiter consumes neither frames nor ledger and cannot finish
+successfully. No delegate, caller callback or caller clock can authorize success.
+Pure checks drive the very same Supervisor with synthetic elapsed times and
+native-operation return observations; they never instantiate OwnedSession,
+NativeJob, HeldFiles or a real thread/clock/process.
+
+The initial no-frame cap is 10000ms. Each accepted BEGIN installs its absolute
+rowStart+10000 cap, clipped to the session's absolute 360000 cap. END and empty
+polls never refresh that cap, including after row 34. Failure begins at cap-2000:
+2000ms is explicitly reserved INSIDE the cap for termination and confirmation.
+This is a conservative work cutoff, not a measured guarantee that native calls
+finish in 2000ms. KillAndConfirm receives that same absolute cap, and its polling
+loop cannot add a fresh two seconds. Exact deadline equality cannot confirm
+cleanup or success. The global cap also bounds the retained last row's teardown.
+
+Launch/admission is counted outstanding before synchronous work starts. A
+blocked CreateProcess or assignment does not hold the Supervisor gate. The
+waiter can latch failure and invoke Job termination independently. Created and
+Assigned observations from a late return cannot authorize resume after failure.
+The suspended owned process handle is published before assignment; late-created
+unassigned suspended children are explicitly terminated by owned HANDLE, after
+the Job termination attempt. A completed Job termination is not treated as a
+persistent fence against future assignment. NativeJob rechecks cancellation
+at each late completion, then kills again rather than resuming. Resume admission
+is a one-shot owner transition, never a waiter transition. An already-authorized
+in-flight ResumeThread is subject to Job/process termination; pure scheduling
+does NOT prove an atomic relation between that transition and kernel execution.
+
+Failure is irrevocable. Roots are retained before potentially blocked kill
+calls; this is ownership bookkeeping, not a cleanup result. Native cancellation and final handle disposal share a lifetime gate; failure
+latching never waits on that gate. Exited filter handles are retired until
+final teardown; no second filter launches after failure. Successful final
+admission requires fresh Poll, the full ledger, empty valid channel, exit 0,
+active 0, and zero outstanding launch operation, under the same state gate as
+failure latching. Both filters must first have observed exit 0 and active 0. Native handle
+teardown is counted outstanding and finishes before the final clock sample;
+no native query follows that sample. The waiter
+cannot change a completed owner state into a successful result.
+
+Technical limit: arbitrary synchronous kernel calls (including termination,
+query, resume, close, CreateProcess and assignment) and OS thread scheduling
+have no proven finite upper bound. The waiter requests termination; it cannot
+kill a blocked thread, certify kernel cleanup, or return a blocked owner call.
+A stuck call remains failed/cleanup UNKNOWN, retaining its kill-on-close owner
+and handles; there is no success, row reuse or claim of complete cleanup within
+the cap. Only confirmation polling is capped; native operation wall time is NOT
+bounded by this source. This is a source state-machine slice, not a proof of
+Windows runtime semantics or native readiness. Fresh independent Grok review
+is still required; none is performed by this implementation sub-agent.
+
+Unchanged: final admission refusal, RequireTelemetryBinding throw before
+CreateProcessW, GATE2_ONLY, registration false. No handle-delivery/argv/env grammar,
+duration producer measurement, environment selection or registration is solved.
+Native behavior UNRUN; environment/nested Job/budgets unmeasured and unselected;
+M2 incomplete; main71 cause unknown; no historical retry; Phase 1 has no native
+red loop; real-runner PA6 OPEN; **unverified on real hardware**.

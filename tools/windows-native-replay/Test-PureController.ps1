@@ -1,7 +1,7 @@
 # Compiles native imports as source only. Run() never constructs HeldFiles or
 # OwnedSession and calls no native import, process API or wall-clock reader.
 $ErrorActionPreference = 'Stop'
-$fixedNames = @('Controller.cs','HeldFiles.cs','NativeJob.cs','Admission.cs','Test-PureController.ps1')
+$fixedNames = @('Controller.cs','HeldFiles.cs','NativeJob.cs','Admission.cs','Test-PureController.ps1','Check-Source.py','PINNING.md')
 $fixedHashes = @{}
 foreach($name in $fixedNames) {
     $bytes = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name))
@@ -23,6 +23,17 @@ Add-Type -TypeDefinition $source -ReferencedAssemblies $references -ErrorAction 
 [PureControllerChecks]::Run()
 'managed pure baseline: pass'
 $mutants = @(
+    @('supervisor-global-cap', 'return Math.Min(rowDeadline,360000);', 'return rowDeadline;'),
+    @('supervisor-resume-failure', 'if(failed || !created || !assigned || resumed || operations!=1)', 'if(!created || !assigned || resumed || operations!=1)'),
+    @('supervisor-resume-assignment', '!created || !assigned || resumed', '!created || resumed'),
+    @('supervisor-assignment-latch', 'if(!ok || !created) failed=true;', 'if(!created) failed=true;'),
+    @('supervisor-resume-once', '!assigned || resumed || operations!=1', '!assigned || (resumed && !resumed) || operations!=1'),
+    @('supervisor-reserve', 'now>=ConfirmationDeadline(deadline)-2000', 'now>ConfirmationDeadline(deadline)-2000'),
+    @('supervisor-late', 'return !failed && !done && operations==1;', 'return operations==1;'),
+    @('supervisor-operation', 'operations==0 && CleanupConfirmed', 'true && CleanupConfirmed'),
+    @('supervisor-kill', 'failed && killIssued && operations==0', 'failed && (killIssued || !killIssued) && operations==0'),
+    @('supervisor-final-operation', 'operations!=0 || !monitor.Success', 'false || !monitor.Success'),
+    @('supervisor-final-poll', 'if(!Poll(now) || operations!=0', 'if(false || operations!=0'),
     @('transport-empty', 'if(available==0) return true;', 'if(available==0) return decoder.TransportFailure();'),
     @('transport-cap', 'Math.Min(available,4096u)', 'available'),
     @('transport-read', '!pipe.Read(buffer,count,out read) || read==0 || read>(uint)count', '!pipe.Read(buffer,count,out read) || read>(uint)count'),
@@ -97,7 +108,7 @@ foreach($m in $mutants) {
     if(-not $source.Contains($m[1])) { throw 'mutant target missing' }
     $mutated=$source.Replace($m[1],$m[2])
     if($m[0] -eq 'names-leaf') { $mutated=$mutated.Replace('e.Name!=leaf','false') }
-    $variant=$mutated.Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i").Replace('BindingPureChecks',"BindingPureChecks$i").Replace('TransportPureChecks',"TransportPureChecks$i")
+    $variant=$mutated.Replace('ReplayController',"ReplayController$i").Replace('PureControllerChecks',"PureControllerChecks$i").Replace('HeldFiles',"HeldFiles$i").Replace('NativeJob',"NativeJob$i").Replace('Admission',"Admission$i").Replace('BindingPureChecks',"BindingPureChecks$i").Replace('TransportPureChecks',"TransportPureChecks$i").Replace('SupervisorPureChecks',"SupervisorPureChecks$i")
     $bytes=[Text.Encoding]::UTF8.GetBytes($variant)
     "mutant LF SHA256 $($m[0]): $([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant())"
     # Compilation errors terminate here: they never count as assertion kills.
@@ -107,11 +118,11 @@ foreach($m in $mutants) {
     try { $type.GetMethod('Run').Invoke($null,@()) }
     catch {
         $failure=$_.Exception.GetBaseException()
-        if($failure.GetType() -ne [System.Exception] -or (-not $failure.Message.StartsWith('admission: ') -and -not $failure.Message.StartsWith('transport: ') -and $failure.Message -notin @('end','begin alone incomplete','missing all rows','empty nonblocking deadline','no first event','filter reject','path reject','held pin mismatch','link2 reject','argument escape','quoted end','unterminated','partial EOF','output overflow','poll clock regression','manifest extra','manifest external mismatch','manifest commit mismatch','stream end','stream begin','stream complete','cleanup kill first','cleanup active','cleanup deadline','post hash links','wire complete','duplicate frame','manifest self hash'))) { throw }
+        if($failure.GetType() -ne [System.Exception] -or (-not $failure.Message.StartsWith('admission: ') -and -not $failure.Message.StartsWith('transport: ') -and -not $failure.Message.StartsWith('supervisor: ') -and $failure.Message -notin @('end','begin alone incomplete','missing all rows','empty nonblocking deadline','no first event','filter reject','path reject','held pin mismatch','link2 reject','argument escape','quoted end','unterminated','partial EOF','output overflow','poll clock regression','manifest extra','manifest external mismatch','manifest commit mismatch','stream end','stream begin','stream complete','cleanup kill first','cleanup active','cleanup deadline','post hash links','wire complete','duplicate frame','manifest self hash'))) { throw }
         $killed=$true
     }
     if(-not $killed) { throw "survived: $($m[0])" }
-    "assertion-killed: $($m[0])"
+    "assertion-killed: $($m[0]): $($failure.Message)"
 }
 if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $before) { throw 'source bytes changed' }
 if((Get-FileHash -LiteralPath $heldPath -Algorithm SHA256).Hash -ne $heldBefore) { throw 'held file source bytes changed' }
