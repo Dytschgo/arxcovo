@@ -1,4 +1,7 @@
 //! Owner-local executor. No CLI selector, identity override, account creation or repair.
+#[cfg(any(unix, test))]
+#[path = "owner_launchd_capture.rs"]
+mod launchd_capture;
 #[cfg(unix)]
 use super::owner_plan::OsManager;
 use super::{layout::Error, owner_plan::Plan};
@@ -548,11 +551,7 @@ mod imp {
             if self.layout.platform() == Platform::Linux {
                 q.linux_status(a)
             } else {
-                match (a, q) {
-                    (Artifact::Absent, Query::Absent) => Ok(Status::NotInstalled),
-                    (Artifact::Identical, Query::Absent) => Ok(Status::Stopped),
-                    _ => Err(Error::Manager),
-                }
+                q.macos_status(a)
             }
         }
         pub(super) fn provision(&self) -> Result<(), Error> {
@@ -778,9 +777,12 @@ mod imp {
             {
                 return Query::Unknown;
             }
+            if platform == Platform::Macos {
+                return super::launchd_capture::native_query();
+            }
             match bounded(program, args, Some(cap), Duration::from_secs(10)) {
                 Ok(bytes) if platform == Platform::Linux => owner_query::systemd(true, &bytes),
-                Ok(bytes) => owner_query::launchd(true, &bytes),
+                Ok(_) => Query::Unknown,
                 Err(_) => Query::Unknown,
             }
         }
@@ -1867,5 +1869,180 @@ mod tests {
         .unwrap();
         assert_eq!(execute(&plan), Err(Error::NativeAdapterMissing));
         assert_eq!(provision_state(), Err(Error::NativeAdapterMissing));
+    }
+}
+
+#[cfg(test)]
+mod launchd_lifecycle_pure_tests {
+    use super::super::{
+        owner_plan::{Action, OsManager, OwnerContext, owner_plan},
+        owner_query::{Artifact, Query, State},
+    };
+    use super::*;
+    use std::collections::VecDeque;
+    struct Model {
+        queries: VecDeque<Query>,
+        artifact: Artifact,
+        mutations: usize,
+        vectors: Vec<&'static str>,
+    }
+    impl OsManager for Model {
+        fn apply(&mut self, op: &Operation) -> Result<(), Error> {
+            match op {
+                Operation::Expect(e) => self.queries.pop_front().expect("query-underflow").expect(
+                    *e,
+                    self.artifact,
+                    Platform::Macos,
+                ),
+                Operation::Command { args, when, .. } => {
+                    if *when != Gate::Always
+                        && !self
+                            .queries
+                            .pop_front()
+                            .expect("gate-underflow")
+                            .gate(*when, self.artifact)?
+                    {
+                        return Ok(());
+                    }
+                    self.mutations += 1;
+                    self.vectors.push(args[0]);
+                    Ok(())
+                }
+                Operation::EnsureDirectory { .. }
+                | Operation::ProvisionState
+                | Operation::Constant { .. }
+                | Operation::RemoveConstant { .. } => {
+                    self.mutations += 1;
+                    if matches!(op, Operation::RemoveConstant { .. }) {
+                        self.artifact = Artifact::Absent;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+    fn run(action: Action, queries: Vec<Query>) -> (Result<(), Error>, Model) {
+        let l = Layout::for_test(Platform::Macos);
+        let c = OwnerContext {
+            admin: true,
+            running_binary: l.binary(),
+        };
+        let mut model = Model {
+            queries: queries.into(),
+            artifact: Artifact::Identical,
+            mutations: 0,
+            vectors: vec![],
+        };
+        let result = owner_plan(&l, &c, action).unwrap().execute(&mut model);
+        (result, model)
+    }
+    #[test]
+    fn pure_uncertain_and_loaded_install_never_mutates() {
+        for q in [
+            Query::Unknown,
+            Query::Foreign,
+            Query::Ours(State::Running),
+            Query::Ours(State::Reloading),
+            Query::Ours(State::Starting),
+            Query::Ours(State::Stopping),
+            Query::Ours(State::Stopped),
+            Query::Ours(State::Failed),
+            Query::Ours(State::Loaded),
+        ] {
+            let (result, m) = run(Action::Install, vec![q; 4]);
+            assert!(
+                result.is_err() && m.mutations == 0,
+                "install-refuses-before-any-mutation"
+            );
+        }
+        for action in [Action::Start, Action::Stop, Action::Uninstall] {
+            for q in [Query::Unknown, Query::Foreign] {
+                let (result, m) = run(action, vec![q]);
+                assert!(
+                    result.is_err() && m.mutations == 0,
+                    "uncertain-lifecycle-no-mutation"
+                );
+            }
+        }
+    }
+    #[test]
+    fn pure_post_bootout_requires_fresh_absence_and_keeps_plist() {
+        for after in [
+            Query::Unknown,
+            Query::Foreign,
+            Query::Ours(State::Running),
+            Query::Ours(State::Reloading),
+            Query::Ours(State::Starting),
+            Query::Ours(State::Stopping),
+            Query::Ours(State::Stopped),
+            Query::Ours(State::Failed),
+            Query::Ours(State::Loaded),
+            Query::Absent,
+        ] {
+            for action in [Action::Stop, Action::Uninstall] {
+                let (result, m) = run(
+                    action,
+                    vec![
+                        Query::Ours(State::Loaded),
+                        Query::Ours(State::Loaded),
+                        after,
+                    ],
+                );
+                assert!(
+                    m.vectors == ["disable", "bootout"],
+                    "disable-before-bootout"
+                );
+                assert!(m.queries.is_empty(), "fresh-post-bootout-query-consumed");
+                assert!(
+                    result.is_ok() == (after == Query::Absent),
+                    "only-absence-proves-unloaded"
+                );
+                assert!(
+                    m.artifact
+                        == if after == Query::Absent && action == Action::Uninstall {
+                            Artifact::Absent
+                        } else {
+                            Artifact::Identical
+                        },
+                    "failed-postcondition-keeps-plist"
+                );
+            }
+        }
+    }
+    #[test]
+    fn pure_bootstrap_and_bootout_gates() {
+        for q in [
+            Query::Absent,
+            Query::Ours(State::Running),
+            Query::Ours(State::Loaded),
+            Query::Ours(State::Stopped),
+            Query::Ours(State::Failed),
+        ] {
+            let (result, m) = run(Action::Start, vec![q, q]);
+            assert!(result.is_ok(), "script-start-success");
+            assert!(
+                m.vectors
+                    == if q == Query::Absent {
+                        vec!["enable", "bootstrap"]
+                    } else {
+                        vec!["enable"]
+                    },
+                "bootstrap-only-on-absence"
+            );
+            for action in [Action::Stop, Action::Uninstall] {
+                let (result, m) = run(action, vec![q, q, Query::Absent]);
+                assert!(result.is_ok(), "script-stop-success");
+                assert!(
+                    m.vectors
+                        == if q == Query::Absent {
+                            vec!["disable"]
+                        } else {
+                            vec!["disable", "bootout"]
+                        },
+                    "skip-bootout-only-on-absence"
+                );
+            }
+        }
     }
 }
