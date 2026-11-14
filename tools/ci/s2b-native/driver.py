@@ -141,7 +141,8 @@ def load_mutations(root):
     rows = [json.loads(line) for line in data.splitlines()]
     if [r.get("mutation") for r in rows] != ["drop_skips_store", "group_forgotten"]:
         raise GuardError("manifest_schema")
-    for row, target in zip(rows, (TARGETS[0], TARGETS[-1])):
+    for row, target in zip(rows, ("crates/arxd/src/exec/cgroup.rs",
+                                  "crates/arxd/src/service/unix_bridge/tests/s2b.rs")):
         if set(row) != {"mutation", "target", "old", "new"} or row["target"] != target or not all(isinstance(v, str) for v in row.values()):
             raise GuardError("manifest_schema")
     return rows

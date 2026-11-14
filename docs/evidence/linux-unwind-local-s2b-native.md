@@ -115,7 +115,12 @@ Updated current hashes (supersede matching earlier rows):
 
 The first coordinator portable check failed `manifest_schema`: prepending the
 bridge pin changed the original mutation-target index. Appending the dependency
-pin preserves the reviewed target order and fixes that regression. This failure
-earned no evidence credit. Final portable suite: 11 passed.
+pin preserves the original first six pins, but the second portable check still
+failed: the loader also used TARGETS[-1]. This failure
+earned no evidence credit. Neither failed run receives passing credit.
 
 Updated driver SHA-256: `c6556fec6f2301105727baba86f0d404f6a7fc6ccb8acb89a5ebb557c699a595`.
+
+The loader now names the two reviewed mutation paths explicitly, independent
+of dependency-pin ordering. The third local check passed all 11 portable tests.
+Final driver SHA-256: `2009ce4a8bd2b7ab1a4593224eff930f6a05a91959cb22bdcc2f86788820d6d2`.
