@@ -370,7 +370,7 @@ class F0Mechanism(unittest.TestCase):
     """Synthetic mechanism credit only. No filesystem observation or reproduction."""
     def setUp(self):
         for name, value in (('feedback_phase', 'initial'), ('feedback_mutation', 'staged'),
-                            ('feedback_cleanup', 'unconfirmed'), ('feedback_first', None)):
+                            ('feedback_cleanup', 'unconfirmed'), ('feedback_first', None), ('feedback_internal', None)):
             self.enterContext(patch.object(driver, name, value))
         self.enterContext(patch.object(driver.sys, 'platform', 'linux'))
 

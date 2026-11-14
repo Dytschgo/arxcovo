@@ -16,7 +16,7 @@ from test_driver import valid_env
 class F0Blockers(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(driver.sys, 'platform', 'linux'))
-        for key, val in [('phase', 'initial'), ('first', None), ('mutation', 'none'), ('cleanup', 'not_reached')]:
+        for key, val in [('phase', 'initial'), ('first', None), ('mutation', 'none'), ('cleanup', 'not_reached'), ('internal', None)]:
             self.enterContext(patch.object(driver, 'feedback_' + key, val))
 
     def scenario(self, body=None, cleanup=None, pre=None, service=False, success=False, artifact_refusal=False):
@@ -30,6 +30,9 @@ class F0Blockers(unittest.TestCase):
         def protect(path, site):
             if site == pre or (artifact_refusal and site == 'run_artifact'):
                 raise driver.Refusal(site, driver.feedback_phase, [['link', False, 18]])
+        def snapshot(*_):
+            driver.feedback_internal = dict.fromkeys(driver.PRECEDENCE, 'absent')
+            driver.feedback_internal.update(carried=None, refusal=None)
         def clean(_):
             self.assertEqual(driver.feedback_phase, 'final', 'cleanup phase must be final')
             self.assertEqual(driver.feedback_cleanup, 'unconfirmed', 'cleanup confirmation must follow removal')
@@ -39,7 +42,7 @@ class F0Blockers(unittest.TestCase):
              patch.object(driver, 'Path', return_value=stage) as paths, \
              patch.object(driver.os, 'getuid', return_value=0, create=True), \
              patch.object(driver.os, 'geteuid', return_value=0, create=True), \
-             patch.object(driver, 'cg_preflight'), patch.object(driver, 'protected', side_effect=protect), \
+             patch.object(driver, 'snapshot_internal', side_effect=snapshot), patch.object(driver, 'cg_preflight'), patch.object(driver, 'protected', side_effect=protect), \
              patch.object(driver, 'copy_tree'), patch.object(driver, 'fixture_cleanup', side_effect=clean), \
              patch.object(driver.shutil, 'rmtree') as remove, \
              patch.object(driver.subprocess, 'check_output', side_effect=[b'not-found', valid_env()['GITHUB_SHA'].encode()]), \
@@ -57,7 +60,7 @@ class F0Blockers(unittest.TestCase):
             record = json.loads(line)
             self.assertEqual(remove.call_count, int(not cleanup and not pre))
             self.assertEqual(record['schema'], 'unix-protection-f0')
-            self.assertEqual(record['version'], 1)
+            self.assertEqual(record['version'], 2)
             e = valid_env()
             self.assertEqual(record['provenance'], dict(source_sha=e['ARX_REVIEWED_SHA'], workflow_sha=e['ARX_WORKFLOW_SHA'], run=e['GITHUB_RUN_ID'], attempt=e['GITHUB_RUN_ATTEMPT']))
             return record
@@ -68,13 +71,13 @@ class F0Blockers(unittest.TestCase):
                 r = self.scenario(cleanup=cleanup, service=service)
                 self.assertEqual(r['first'], {'code': body_code})
                 self.assertEqual(r['final'], {'code': 'E_QUARANTINE_CGROUP' if cleanup else body_code})
-                self.assertEqual(r['mutation'], 'service' if service else 'staged')
+                self.assertEqual(r['mutation_lower_bound'], 'service' if service else 'staged')
                 self.assertEqual(r['cleanup'], 'unconfirmed' if cleanup else 'confirmed')
                 if cleanup:
                     self.assertNotEqual(r['first'], r['final'])
         r = self.scenario(pre='run_parent')
         self.assertEqual(r['first'], r['final'])
-        self.assertEqual((r['mutation'], r['cleanup']), ('none', 'not_reached'))
+        self.assertEqual((r['mutation_lower_bound'], r['cleanup']), ('none', 'not_reached'))
         self.assertEqual(r['final']['site'], 'run_parent')
 
     def test_success_and_both_refusals(self):
@@ -86,7 +89,7 @@ class F0Blockers(unittest.TestCase):
         r = self.scenario(artifact_refusal=True, cleanup=final)
         self.assertEqual(r['first'], driver.Refusal('run_artifact', 'initial', [['link', False, 18]]).record)
         self.assertEqual(r['final'], final.record)
-        self.assertEqual((r['mutation'], r['cleanup']), ('staged', 'unconfirmed'))
+        self.assertEqual((r['mutation_lower_bound'], r['cleanup']), ('staged', 'unconfirmed'))
 
     def test_cleanup_only_and_refusal(self):
         # Success body requires the passed marker, while cgroup absence stays false.
@@ -102,14 +105,15 @@ class F0Blockers(unittest.TestCase):
         self.assertEqual(r['final'], error.record)
 
     def valid(self):
-        return dict(schema='unix-protection-f0', version=1,
+        return dict(schema='unix-protection-f0', version=2,
                     provenance=dict(source_sha='a'*40, workflow_sha='a'*40, run='1', attempt='1'),
-                    first=None, final=None, mutation='service', cleanup='confirmed')
+                    first=None, final=None, mutation_lower_bound='service', cleanup='confirmed',
+                    internal=dict(service='absent', **{'fixture-check':'absent'}, harness='absent', carried=None, refusal=None))
 
     def test_counterfactuals(self):
         line = driver.encode_record(self.valid())
         self.assertEqual(driver.replay(line), {})
-        negatives = [line.replace('"version":1', '"version":1,"version":1'),
+        negatives = [line.replace('"version":2', '"version":2,"version":2'),
                      ' ' * 4096 + line, line.replace('"schema"', '"schéma"')]
         # The ASCII counterfactual must fail at transport (E_RECORD_BOUND),
         # not later schema validation (E_RECORD).
@@ -117,16 +121,16 @@ class F0Blockers(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'E_RECORD$' if i == 0 else 'E_RECORD_BOUND$'): driver.replay(bad)
         r = self.valid(); r['provenance']['workflow_sha'] = 'b'*40
         with self.assertRaises(RuntimeError): driver.encode_record(r)
-        for change in [dict(first={'code':'E_BUILD'}), dict(cleanup='not_reached'), dict(mutation='none')]:
+        for change in [dict(first={'code':'E_BUILD'}), dict(cleanup='not_reached'), dict(mutation_lower_bound='none')]:
             r = self.valid(); r.update(change)
             with self.assertRaises(RuntimeError): driver.encode_record(r)
 
     def test_isolated_replay_cross_fields(self):
         cases = []
-        r = self.valid(); r['mutation'] = 'staged'; cases.append(r)
+        r = self.valid(); r['cleanup'] = 'unconfirmed'; cases.append(r)
         r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}); cases.append(r)
-        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation='none', cleanup='unconfirmed'); cases.append(r)
-        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation='staged', cleanup='not_reached'); cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation_lower_bound='none', cleanup='unconfirmed', internal=None); cases.append(r)
+        r = self.valid(); r.update(first={'code': 'E_BUILD'}, final={'code': 'E_OS'}, mutation_lower_bound='staged', cleanup='not_reached', internal=None); cases.append(r)
         refusal = driver.Refusal('run_cleanup', 'final', [['link', True, 0]]).record
         r = self.valid(); r.update(first=dict(refusal), final=dict(refusal), cleanup='unconfirmed'); cases.append(r)
         initial = driver.Refusal('run_parent', 'initial', [['link', True, 0]]).record
@@ -197,16 +201,16 @@ MUTANTS = {
     'mutation_staged_dropped': ("feedback_mutation = 'staged'", "feedback_mutation = 'none'"),
     'mutation_service_dropped': ("feedback_mutation = 'service'", "feedback_mutation = 'staged'"),
     'protected_ignores_phase': ("raise Refusal(site, feedback_phase, triples)", "raise Refusal(site, 'initial', triples)"),
-    'replay_dup_keys_allowed': ("require(key not in out, 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'replay_dup_keys_allowed': ("require(key not in out, 'E_RECORD')\n            out[key] = value", "require(True, 'E_RECORD')\n            out[key] = value"),
     'replay_input_bound_dropped': ("len(line) <= MAX_LINE", "True"),
     'replay_ascii_dropped': ("line.isascii()", "True"),
     'sha_equality_dropped': ("p['source_sha'] == p['workflow_sha']", "True"),
     'protected_bound_dropped': ("len(items) <= MAX_TRIPLES", "True"),
     'conjunct_owner_first': ("(('link', kind == 'link'),\n                                   ('owner', not owner_zero)", "(('owner', not owner_zero),\n                                   ('link', kind == 'link')"),
     'entry_first_is_final': ("feedback_first, final), end='')", "final, final), end='')"),
-    'refusal_exact_type_relaxed': ("type(error) is Refusal", "isinstance(error, Refusal)"),
+    'refusal_exact_type_relaxed': ("if type(error) is Refusal:\n", "if isinstance(error, Refusal):\n"),
     'site_token_unchecked': ("require(site in SITES, 'E_SITE')", "require(True, 'E_SITE')"),
-    'xf_success': ("require(first is None and cleanup == 'confirmed' and mutation == 'service', 'E_RECORD')", "require(True, 'E_RECORD')"),
+    'xf_success': ("require(first is None and cleanup == 'confirmed' and mutation in ('service', 'cgroup', 'account') and\n                all(internal[m] == 'absent' for m in PRECEDENCE), 'E_RECORD')", "require(True, 'E_RECORD')"),
     'xf_confirmed': ("require(first == final, 'E_RECORD')", "require(True, 'E_RECORD')"),
     'xf_none': ("require(cleanup == 'not_reached', 'E_RECORD')", "require(True, 'E_RECORD')"),
     'xf_not_reached': ("require(first == final and final is not None, 'E_RECORD')", "require(True, 'E_RECORD')"),
