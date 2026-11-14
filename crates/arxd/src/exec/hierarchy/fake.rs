@@ -1,5 +1,7 @@
 //! Test-only kernel model. Handles identify objects, not host paths.
 use super::{parse, setup::*};
+#[path = "a5.rs"]
+pub(crate) mod a5;
 use crate::development::Cancellation;
 use std::{
     cell::{Cell, RefCell},

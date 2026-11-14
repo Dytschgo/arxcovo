@@ -1,6 +1,110 @@
 use super::*;
 use crate::exec::hierarchy::setup::SetupFailure;
 use std::sync::atomic::AtomicBool;
+
+#[tokio::test]
+async fn a5_pending_through_janitor_and_s9() {
+    for mode in 0..3 {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let during_calls = calls.clone();
+        let state = Arc::new(std::sync::Mutex::new(None::<Readiness>));
+        let during = state.clone();
+        let observations = Arc::new(AtomicUsize::new(0));
+        let observed = observations.clone();
+        let stop = Cancellation::default();
+        let cancel = stop.clone();
+        let d = StartupDomain::new(
+            &Layout::for_test(Platform::Linux),
+            &config(),
+            exec::hierarchy::locate(b"0::/arxd.service/supervisor"),
+            || Ok(()),
+            move |_| {
+                Ok(Box::new(Port {
+                    calls: count,
+                    residue: Arc::new(AtomicBool::new(false)),
+                    step: Box::new(|_, _, _| Ok(result())),
+                }))
+            },
+            move |location, token| {
+                let outcome = exec::hierarchy::fake::a5::startup(
+                    location,
+                    token,
+                    mode == 1,
+                    Arc::new(move |point| {
+                        assert_eq!(
+                            during.lock().unwrap().as_ref().unwrap().check(),
+                            Err(Unavailable::MechanismUnavailable),
+                            "Pending through setup"
+                        );
+                        assert_eq!(
+                            during_calls.load(Ordering::Acquire),
+                            0,
+                            "zero early runner calls"
+                        );
+                        observed.fetch_or(
+                            match point {
+                                "kill" => 1,
+                                "events" => 2,
+                                "remove" => 4,
+                                "s9" => 8,
+                                _ => 0,
+                            },
+                            Ordering::AcqRel,
+                        );
+                        if mode == 2 && point == "events" {
+                            cancel.cancel();
+                        }
+                    }),
+                );
+                if mode == 0 {
+                    assert_eq!(
+                        outcome,
+                        exec::hierarchy::setup::SetupOutcome::Ready(
+                            exec::hierarchy::setup::SetupEvidence {
+                                leaves_removed: 2,
+                                runs_created: false,
+                                unit_written: true,
+                                runs_written: true,
+                            }
+                        )
+                    );
+                }
+                outcome
+            },
+        );
+        *state.lock().unwrap() = Some(d.readiness.clone());
+        let e = d.domain.handle();
+        let dir = private_temp();
+        let a = activity(&dir);
+        refused(call(&e, &a, false).await, Unavailable::MechanismUnavailable);
+        assert_eq!(
+            d.domain.handle().preflight_for_test(),
+            Err(Unavailable::MechanismUnavailable)
+        );
+        let accepted = d.setup.lock().unwrap().take().unwrap()(stop);
+        assert_eq!(
+            observations.load(Ordering::Acquire),
+            if mode == 0 { 15 } else { 3 }
+        );
+        assert_eq!(accepted, mode == 0);
+        if mode == 0 {
+            assert!(call(&e, &a, false).await.is_ok());
+        } else {
+            refused(
+                call(&e, &a, false).await,
+                if mode == 1 {
+                    Unavailable::Quarantined
+                } else {
+                    Unavailable::Stopping
+                },
+            );
+        }
+        // Only the successful, completed setup admits a fake runner call.
+        assert_eq!(calls.load(Ordering::Acquire), usize::from(mode == 0));
+        e.drain().await.unwrap();
+    }
+}
 pub(super) struct Port {
     pub(super) step: Box<Step>,
     pub(super) residue: Arc<AtomicBool>,

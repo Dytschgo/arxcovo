@@ -99,6 +99,32 @@ fn text(fd: OwnedFd, max: usize) -> FsResult<Vec<u8>> {
     Ok(bytes)
 }
 impl LinuxFs {
+    /// Dormant A5 only: no adoption, path input, raw-fd export or setup call.
+    #[cfg(test)]
+    pub(crate) fn seed_a5(&self, location: &super::parse::Location) -> FsResult<(Dir, Dir)> {
+        use super::fake::a5;
+        let unit = a5::preflight(self, location)?;
+        if self.mkdir_runs(&unit)? != Created::Created {
+            return Err(FsError::Refused);
+        }
+        let runs = self.open_child(&unit, b"runs")?;
+        self.trust(runs.0.as_raw_fd(), libc::S_IFDIR, Some(CGROUP_MAGIC))?;
+        if self.stat(&runs)?.mode & 0o777 != 0o700 {
+            return Err(FsError::Refused);
+        }
+        a5::empty(self, &runs)?;
+        if !super::parse::leaf_name(b"arx-0-0") {
+            return Err(FsError::Invalid);
+        }
+        // mkdirat is exclusive: EEXIST is failure, never reuse a leaf.
+        if unsafe { libc::mkdirat(runs.0.as_raw_fd(), c"arx-0-0".as_ptr(), 0o700) } != 0 {
+            return Err(last());
+        }
+        let leaf = self.open_child(&runs, b"arx-0-0")?;
+        self.trust(leaf.0.as_raw_fd(), libc::S_IFDIR, Some(CGROUP_MAGIC))?;
+        a5::empty(self, &leaf)?;
+        Ok((runs, leaf))
+    }
     pub(crate) fn system() -> Self {
         Self {
             uid: 0,
