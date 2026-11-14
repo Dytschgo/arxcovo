@@ -1,0 +1,14 @@
+[package]
+name = "windows-native-replay-child"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "windows-native-replay-child"
+path = "src/main.rs"
+test = false
+bench = false
