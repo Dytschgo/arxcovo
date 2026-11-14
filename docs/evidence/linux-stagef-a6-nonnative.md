@@ -80,3 +80,18 @@ all other pins, manifests, guards, restoration logic and workflows are unchanged
 `python -I -B tools/ci/s2b-native/test_driver.py` passed 11 portable tests.
 No native driver ran; this adds no native credit. This maintenance is outside
 the builder's original three-file delta and is included in independent review.
+
+## Hosted source-inventory correction
+
+PR100 run `43648564165` failed Ubuntu and macOS at
+`exec::stage_b_tests::w8_e7_crate_wide_inactive_source_inventory`; both reported
+`inactive crate source fence`. Coordinator Sol medium reproduced the same exact
+test failure locally on Windows before editing. The new a6.rs file lacked the
+explicit reviewed-test registration. Added exactly its path and the required
+`tests.rs` -> `mod a6;` declaration check, retaining the existing cfg(test) ancestor
+check, bounds, link/reparse checks and forbidden production tokens. No blanket
+test-directory exemption or scanner removal. The exact fence test then passed.
+All four `service::unix_bridge::tests::a6::` filters passed, as did
+`cargo fmt --all -- --check` and locked offline package lib/tests Clippy with
+warnings denied. No native tests ran. Earlier publication review was cancelled;
+fresh exact-head review and hosted checks remain required.

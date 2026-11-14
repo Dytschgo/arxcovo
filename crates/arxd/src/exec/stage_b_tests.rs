@@ -849,6 +849,7 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
         "exec/disposable.rs",
         "exec/hierarchy/fake.rs",
         "service/unix_bridge/tests.rs",
+        "service/unix_bridge/tests/a6.rs",
         "service/unix_bridge/tests/e6.rs",
         "service/unix_bridge/tests/e7.rs",
     ];
@@ -862,6 +863,7 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
         ),
         ("exec/hierarchy.rs", "#[cfg(test)] pub(crate) mod fake;"),
         ("service/unix_bridge.rs", "#[cfg(test)] mod tests;"),
+        ("service/unix_bridge/tests.rs", "mod a6;"),
         ("service/unix_bridge/tests.rs", "mod e6;"),
         ("service/unix_bridge/tests.rs", "mod e7;"),
     ] {
