@@ -62,7 +62,7 @@ class FakeOS:
             if flags & self.O_CREAT:
                 if name in self.files and flags & self.O_EXCL:
                     raise FileExistsError()
-                self.files[name] = b''
+                self.files.setdefault(name, b'')
             else:
                 assert flags & self.O_NONBLOCK, 'FIFO opens must be nonblocking'
                 assert flags & self.O_NOFOLLOW, 'reader must refuse links'
@@ -157,6 +157,12 @@ class Transport(unittest.TestCase):
             if name in driver.CHANNELS.values():
                 self.assertTrue(flags & self.fs.O_EXCL)
                 self.assertEqual(mode, 0o600)
+
+    def test_writer_empty_existing_channel_is_not_reused(self):
+        name = driver.CHANNELS['service']
+        self.fs.files[name] = b''
+        self.write(refusal())
+        self.assertEqual(self.fs.files[name], b'', 'dead creator empty file is not reusable')
 
     def test_writer_guards(self):
         class Sub(driver.Refusal): pass
@@ -257,8 +263,11 @@ class Transport(unittest.TestCase):
             driver.validate_internal_summary(r)
 
     def test_marker_failure_swallowed(self):
-        self.fs.bad_component='opt'
-        driver.mark_cgroup('123-1')
+        with patch.object(driver, 'create_channel', side_effect=OSError('synthetic')):
+            try:
+                driver.mark_cgroup('123-1')
+            except Exception:
+                self.fail('progress marker error must be swallowed')
         self.assertEqual(self.fs.files,{})
 
     def test_service_marker_does_not_change_effect_order(self):
@@ -300,6 +309,8 @@ class Records(unittest.TestCase):
     def test_cross_fields(self):
         for change in [dict(internal=None),dict(version=1),dict(mutation_lower_bound='staged')]:
             r=self.valid();r.update(change)
+            if change == dict(internal=None):
+                r.update(first={'code':'E_BUILD'}, final={'code':'E_BUILD'})
             with self.assertRaises(RuntimeError): driver.encode_record(r)
         for status in ('unknown','malformed','captured'):
             r=self.valid()
@@ -313,6 +324,21 @@ class Records(unittest.TestCase):
         for change in [dict(service='unknown'),dict(carried='harness'),dict(refusal=refusal().record),dict(service='other')]:
             bad=copy.deepcopy(r);bad['internal'].update(change)
             with self.assertRaises(RuntimeError):driver.encode_record(bad)
+
+    def test_replay_carried_refusal_is_mode_checked(self):
+        for bad in (refusal('harness').record, refusal(site='installed').record,
+                    refusal(phase='final').record):
+            r = self.valid()
+            r.update(first={'code': 'E_BUILD'}, final={'code': 'E_BUILD'})
+            r['internal'].update(service='captured', carried='service', refusal=bad)
+            with self.subTest(refusal=bad['site'], phase=bad['phase']), self.assertRaisesRegex(RuntimeError, '^E_RECORD$'):
+                driver.replay(json.dumps(r, separators=(',', ':')) + '\n')
+
+    def test_v1_relation_isolated_without_type_errors(self):
+        r = self.valid()
+        r.update(first={'code': 'E_BUILD'}, final={'code': 'E_BUILD'}, mutation_lower_bound='staged')
+        with self.assertRaisesRegex(RuntimeError, '^E_RECORD$'):
+            driver.replay(json.dumps(r, separators=(',', ':')) + '\n')
 
     def test_measured_maxima(self):
         outer=[];inner=[]
@@ -329,8 +355,10 @@ class Records(unittest.TestCase):
             r['internal'].update(dict.fromkeys(driver.PRECEDENCE,'malformed'))
             r['internal'].update({mode:'captured','carried':mode,'refusal':carried})
             outer.append(len(driver.encode_record(r).encode('ascii')))
+            r['final'] = r['first']
+            outer.append(len(driver.encode_record(r).encode('ascii')))
         self.assertEqual(max(inner),757)
-        self.assertEqual(max(outer),2445)
+        self.assertEqual(max(outer),2447)
         self.assertLessEqual(max(inner),1024)
         self.assertLessEqual(max(outer),4096)
         print('MEASURED internal='+str(max(inner))+' outer='+str(max(outer)))
@@ -503,6 +531,9 @@ MUTANTS = {
  'progress_from_status':("                value[mode] = status", "                value[mode] = status\n                if status == 'captured': feedback_mutation = 'account'"),
  'v1_accepted':("record['version'] == 2", "record['version'] in (1,2)"),
  'outer_overflow_truncates':("require(len(line.encode('ascii')) <= MAX_LINE, 'E_RECORD_BOUND')", "line = line[:MAX_LINE]"),
+ 'replay_carried_guard_omitted':("    if carried is not None:\n        internal_refusal(carried, value['refusal'])", '    if carried is not None:\n        pass'),
+ 'v1_relation_omitted':("require((internal is None) == (mutation in ('none', 'staged')), 'E_RECORD')", "require(True, 'E_RECORD')"),
+ 'progress_marker_reraises':("        create_channel(run_id, 'progress-cgroup', None)\n    except Exception:\n        pass", "        create_channel(run_id, 'progress-cgroup', None)\n    except Exception:\n        raise"),
 }
 EQUIVALENT = {
  'writer_site_unchecked':'shared validate_internal still enforces the same site and phase before create',

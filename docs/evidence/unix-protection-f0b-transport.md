@@ -214,3 +214,41 @@ undispatched; **M2 is incomplete; real-Runner PA6 and real-record replay are
 OPEN. All native, installed and dedicated paths are unverified on real
 hardware.**
 
+
+## Coordinator test/evidence correction after review 0c3aa33
+
+OpenAI / gpt-6.1-sol / medium, 2026-11-14. Driver unchanged.
+FakeOS now preserves existing bytes on O_CREAT without O_TRUNC, matching the
+kernel contract. A separate pre-existing empty channel test pins refusal of
+a dead first creator; writer_drops_excl fails that assertion, not invented
+truncation. Earlier kill attribution to fake truncation is withdrawn.
+
+Carried-refusal replay inputs individually cover wrong mode, installed and
+final phase while otherwise satisfying the outer record. A staged-bound
+record with internal summary isolates V1 without a success-path TypeError.
+The old internal=None test is also a failed-body record, avoiding that crash.
+Marker tests now force create_channel to raise and assert it is swallowed.
+Three new compiled mutants remove those guards and fail named assertions.
+
+Final safe suite: 66 selected tests passed in 0.391s, CLI excluded. Legacy
+mutation runner: 23 assertion kills. F0b: 40 candidates, 36 assertion kills,
+4 equivalents without credit, zero errors. The first mutation run stopped
+at an old success/internal=None counterfactual's TypeError; no kill was
+credited until that counterfactual was isolated and the full runner passed.
+
+Maximum measured sizes corrected: internal 757 bytes; outer 2447 bytes,
+including the first==final, both-initial-phase worst case. Earlier 2445 is
+superseded. These remain below 1024 and 4096. Earlier working-copy hashes
+must not be read as committed LF hashes. Current driver raw bytes and
+committed LF SHA-256 both equal:
+`b147b117e7287e663ffdc202688877f79c43c150cb271fe927dcb9d445d3551a`.
+
+Test file SHA-256: `8088fe6096d5d4eb3113fa817f9376226a07d69d096f09b3a54be8bf39d67b85`.
+
+The reviewed migration explicitly permits the narrow test_driver.py v2
+counterfactual changes. This separate F0b evidence file is the coordinator's
+chosen evidence path; it supersedes the proposal's older append-only naming.
+F0b publication will be cut from merged main without Windows diagnostic
+proposal/history. Other review advisories remain disclosed. No CLI, native,
+privileged operation, dispatch or rerun was performed. M2 incomplete;
+real-record replay and real-Runner PA6 OPEN; hardware unverified.
