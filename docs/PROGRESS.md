@@ -2,6 +2,14 @@
 
 ## Current state - 2026-11-14
 
+- Last merged PR69 `9f97a2d08170a2c756b73fad9079334f66570bc0`, 2026-11-14 01:24:40Z. Squash tree equals independently reviewed `f55db98`; all five required checks passed. First PR CI attempt `43539239212` passed in 585s. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass. Fresh main CI is not yet measured.
+- S2b local decomposition is integrated. Hosted nonroot native run `43539239495`, attempt 1: UID/euid 1001, U-a before/after baselines passed without skips, both drop-store and test-Group-forgotten mutations killed with exit 100, restored fingerprint verified. Opus exact-head confirmation comment `6869194636` passes. This earns local Group/bridge decomposition credit only; real-Runner PA6 remains OPEN and A13 unaccepted.
+- F0 local bounded refusal/replay preparation by Sol medium source `2c93991` (retained `a872fa2`), evidence `5775b40` (retained `378e6b8`) is under Opus high security review. Safe Python mechanism tests: 22 passed at source. Cross-process exception transport remains explicitly incomplete; real-record replay stays OPEN. No diagnosis, historical retry, dispatch or activation is authorized.
+- Main-after-PR68 run `43535275394` passed attempt 1 in 577s. M2 incomplete, production remains MechanismUnavailable, native/installed/dedicated paths **unverified on real hardware**. Privacy flake, E_PROTECTION and ExecutionFailed remain unknown.
+
+## Historical checkpoint before S2b merge
+
+
 - S2b native harness passes Opus high review `7d20762` (retained `b7a6dba`) and narrow pin/path recheck `3ee9618`. Coordinator Sol medium corrected dependency pins and explicit mutation targets; two failed portable checks are retained, final 11/11 passes. Source remains reviewed `efe8e55`, production unchanged. Publication is for first hosted nonroot U-a and two native mutation checks only; merge waits native evidence, exact-head review and all five required checks. Accepted harness limits are recorded in evidence; real-Runner PA6 stays OPEN, no experiment/activation.
 
 - S2b passes Opus high source/security review `d94b176` (retained `e71fc59`), no blockers on either axis. Reviewer independently ran three portable tests, six assertion-killed portable mutants and Linux-target typecheck (not native execution). Linux U-a nonroot pass-versus-skip and two native Group mutation failures remain merge gates. Coordinator is preparing a bounded non-required native verification job for fresh review before publication. Real-Runner PA6 remains OPEN; no activation or experiment.
