@@ -49,13 +49,13 @@ class FakeOS:
     def open(self, name, flags, mode=0o777, dir_fd=None):
         self.opens.append((name, flags, mode, dir_fd))
         self.events.append('open:' + str(name))
-        if name in ('/', 'opt', 'arx-ci-123-1'):
+        if name in ('/', 'var', 'lib', 'arx-ci-123-1'):
             if name == self.bad_component:
                 raise OSError('synthetic component')
             assert flags & self.O_DIRECTORY and flags & self.O_NOFOLLOW and flags & self.O_CLOEXEC
             assert (dir_fd is None) == (name == '/')
             if dir_fd is not None:
-                assert self.fds[dir_fd][0] == ('/' if name == 'opt' else 'opt')
+                assert self.fds[dir_fd][0] == {'var': '/', 'lib': 'var', 'arx-ci-123-1': 'lib'}[name]
         else:
             assert dir_fd in self.fds and self.fds[dir_fd][0] == 'arx-ci-123-1'
             assert name in (*driver.CHANNELS.values(), 'progress-cgroup')
@@ -79,7 +79,7 @@ class FakeOS:
 
     def fstat(self, fd):
         name = self.fds[fd][0]
-        directory = name in ('/', 'opt', 'arx-ci-123-1')
+        directory = name in ('/', 'var', 'lib', 'arx-ci-123-1')
         info = dict(st_mode=(stat.S_IFDIR | (0o700 if name.startswith('arx-') else 0o755)) if directory else stat.S_IFREG | 0o600,
                     st_uid=0, st_nlink=1, st_size=len(self.files.get(name, b'')))
         info.update((self.component_info if directory else self.file_info).get(name, {}))
@@ -179,7 +179,7 @@ class Transport(unittest.TestCase):
         self.assertEqual(self.fs.files, {})
 
     def test_stage_walk_guards(self):
-        for name in ('/', 'opt', 'arx-ci-123-1'):
+        for name in ('/', 'var', 'lib', 'arx-ci-123-1'):
             for info in (dict(st_uid=1), dict(st_mode=stat.S_IFLNK | 0o700),
                          dict(st_mode=stat.S_IFDIR | 0o722)):
                 self.fs.component_info = {name: info}
@@ -189,7 +189,7 @@ class Transport(unittest.TestCase):
         self.assertIsNone(driver.open_stage('123-1'))
         self.fs.component_info = {}
         self.assertIsNone(driver.open_stage('../1'))
-        for name in ('/', 'opt', 'arx-ci-123-1'):
+        for name in ('/', 'var', 'lib', 'arx-ci-123-1'):
             self.fs.bad_component = name
             self.assertIsNone(driver.open_stage('123-1'))
 
@@ -271,7 +271,7 @@ class Transport(unittest.TestCase):
         self.assertEqual(self.fs.files,{})
 
     def test_service_marker_does_not_change_effect_order(self):
-        stage = Path('/opt/arx-ci-123-1')
+        stage = Path('/var/lib/arx-ci-123-1')
         with patch.object(driver, 'protected') as protect, \
              patch.object(driver, 'private_read', return_value='/artifact'), \
              patch.object(driver, 'harness') as execute:
@@ -399,7 +399,7 @@ class EntryRun(unittest.TestCase):
             return CgroupPath(value) if str(value).startswith('/sys/fs/cgroup') else stage
         if anomaly=='malformed':fs.files['feedback-service']=b'HOSTILE_incomplete'
         if anomaly=='captured':fs.files['feedback-service']=payload()
-        if anomaly=='unknown':fs.bad_component='opt'
+        if anomaly=='unknown':fs.bad_component='var'
         with ExitStack() as stack:
             for name,value in [('phase','initial'),('mutation','none'),('cleanup','not_reached'),('first',None),('internal',None)]:
                 stack.enter_context(patch.object(driver,'feedback_'+name,value))
@@ -478,7 +478,7 @@ class EntryRun(unittest.TestCase):
                     stack.enter_context(patch.object(driver.sys,'platform','linux'))
                     stack.enter_context(patch.object(driver.sys,'argv',['driver.py',mode,'123-1']))
                     stack.enter_context(patch.object(driver,'Path',PurePosixPath))
-                    stack.enter_context(patch.object(driver,'__file__','/opt/arx-ci-123-1/source/tools/unix-exec-validation/driver.py'))
+                    stack.enter_context(patch.object(driver,'__file__','/var/lib/arx-ci-123-1/source/tools/unix-exec-validation/driver.py'))
                     stack.enter_context(patch.object(driver.os,'getuid',return_value=0,create=True))
                     stack.enter_context(patch.object(driver.os,'geteuid',return_value=0,create=True))
                     stack.enter_context(patch.object(driver,'internal_trusted',False))
@@ -510,7 +510,7 @@ MUTANTS = {
  'writer_site_unchecked':("        internal_refusal(mode, error.record)", "        pass # omitted early validation"),
  'writer_drops_excl':("os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC", "os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC"),
  'writer_drops_nofollow':("os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC", "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC"),
- 'writer_walk_skips_ancestor':("('/', 'opt', stage.name)", "('/', stage.name)"),
+ 'writer_walk_skips_ancestor':("('/', 'var', 'lib', stage.name)", "('/', stage.name)"),
  'ancestor_nofollow_dropped':("os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC", "os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC"),
  'writer_ignores_stage_mode':("require(info.st_mode & 0o077 == 0, 'E_RECORD')", "require(True, 'E_RECORD')"),
  'writer_truncates':("require(len(data) <= MAX_INTERNAL, 'E_RECORD')", "data = data[:MAX_INTERNAL]"),

@@ -14,7 +14,9 @@ Environment checks are accidental-use guards, not host attestation.
 
 The public CLI accepts only `guard` or `run`, with no parameters. Run identity is
 two bounded positive decimal GitHub run numbers. The driver reserves an exclusive
-`/opt/arx-ci-<run>-<attempt>` directory and same-named transient systemd unit.
+`/var/lib/arx-ci-<run>-<attempt>` directory and the fixed `arxd.service` unit.
+The parent and every ancestor must pass the unchanged protection checks before
+staging; `/var/lib` permissions on a future native runner remain unverified.
 Source, registry cache and Rust 1.95.0 toolchain are copied to root-private paths;
 links and special files refuse copying. Copying pins directory descriptors,
 uses O_NOFOLLOW for every open, verifies opened inode/type identity, and writes
