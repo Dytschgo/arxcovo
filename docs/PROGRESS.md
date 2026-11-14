@@ -2,6 +2,8 @@
 
 ## Current state - 2026-11-14
 
+- S2a passes independent Anthropic / claude-opus-5-5 / high source/security review `f324e4c` (retained `1571d08`), both axes with no blockers. Reviewer independently ran fmt, workspace all-target Clippy, 36 bridge tests, 33 inventory tests and all four compiled mutants with the new matrix ordered first. Production remains inactive; this changes the inactive catch path only. Coordinator publishes for exact-head review and normal hosted gates. Main-after-S1 remains pending; no new full-suite claim, no native acceptance or activation.
+
 - Last merged PR67 `03c60033b6800f347f25af2aae3c786b848a7376`, 2026-11-14 00:16:37Z. Squash tree equals independently reviewed `fca6eab`; all five required checks passed, first PR CI attempt `43532132037` succeeded in 470s. Main-after-PR67 run `43533088974` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.
 - S2a panic-latch correction by Sol medium: source `76aaae5` retained `a09569a`, evidence `4918a24` retained `3c3852e`, re-pinned onto merged S1 without source changes. Builder fmt/workspace all-target Clippy, 36 bridge tests, 33 inventory tests, final 389 passed / 3 skipped and four compiled assertion kills are credited at source only. Fresh Opus high source review is next; no publication yet. Production selection remains inactive; M2 incomplete, real-Runner PA6 OPEN and hardware paths **unverified on real hardware**.
 
