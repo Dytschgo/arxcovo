@@ -1,11 +1,41 @@
 # Installing and verifying the arxd service (owner guide)
 
-Current S3 checkpoint (2026-11-12): owner service install, configure, start,
-stop, status and uninstall, and unelevated `client-config new`, are wired in
-source under ADR 0018. Independent Opus review and all five hosted gates are
-still required before publication. Native, installed and dedicated paths are
-**unverified on real hardware**; M2 is incomplete. Agents never execute these
-owner steps. The historical status below records earlier slices.
+Source baseline: actual main **`aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`**
+(2026-11-14 audit), not the local branch named main or unpublished diagnostics.
+This is executable acceptance preparation, **not an acceptance pass**. M2 is
+incomplete; real-Runner PA6 is OPEN. Installed and dedicated paths remain
+**unverified on real hardware**. No owner steps are requested now.
+
+**Stop before installation or acceptance at this baseline on every OS.**
+`Execution::configured` selects the inert `Native` executor: successful config
+preflight still returns `MechanismUnavailable`, `run` never launches, and
+`capability` always reports `available: false` with null hardening. Linux's
+standard bridge is test-constructible only. Windows S4U/shim/Job and macOS
+UID-sweep production execution remain absent. macOS additionally has a launchd
+parser stub returning `Query::Unknown`; owner lifecycle refuses `service-manager`.
+Accounts, tools or owner provisioning cannot repair these engineering gaps.
+
+Claim sources at that main pin (repository links locate the files; read their
+Git objects at the pin, not candidate worktree source):
+
+- [executor](../crates/arxd/src/service/executor.rs): `Native`,
+  `Execution::configured`, `unix_bridge_for_test`, `capability`, `schema`, `assess`.
+- [owner query](../crates/arxd/src/service/owner_query.rs): `launchd`;
+  [owner CLI](../crates/arxd/src/service/owner_cli.rs): `parse`, `dispatch`;
+  [SCM](../crates/arxd/src/service/owner_scm.rs): `register`, `start`, `stop`.
+- [layout](../crates/arxd/src/service/layout.rs) and
+  [native Unix](../crates/arxd/src/service/native_unix.rs): macOS endpoint,
+  ancestor policy and endpoint creation;
+  [MCP](../crates/arxd/src/mcp.rs), [stdio entry](../crates/arxd/src/main.rs)
+  and [store](../crates/arxd/src/store.rs): requests, inventory and metadata.
+- Contracts: [ADR 0009](adr/0009-service-lifecycle-and-dedicated-execution.md),
+  [0015](adr/0015-macos-stock-ancestors-and-runtime-placement.md),
+  [0016](adr/0016-windows-install-provisioning-and-owner-entry-points.md),
+  [0019](adr/0019-unix-native-execution-bridge.md) and
+  [0020](adr/0020-linux-execution-hierarchy-and-janitor.md).
+
+The recipes below describe future owner operations after implementation is ready.
+They do not authorize agents to perform owner steps or change existing authority.
 
 Configure fully revalidates the existing config before replacement. A missing
 old workspace refuses with `service-workspace` (exit 3), even if the new
@@ -29,20 +59,15 @@ records the result in docs/PROGRESS.md. Agents never perform these steps. Leave
 the old Lab Manager installation, its state and the `agent-windows-test` VM
 untouched.
 
-Historical status (2026-11-11):
-
-- Main (`d7f3ebd`, #19) has inventory, host identity, the local IPC/stdio
-  bridge and activity v2. The lifecycle plumbing in the PR20 candidate
-  passed 75 runnable Windows tests after integration with main 8fafbe7 but is not installed anywhere.
-- Owner commands and native application wiring do not exist yet. The
-  configuration foundation (PR21) is separate and unmerged.
-- Windows S4U is **not established**. Both disposable experiments failed (runs
-  42995659949 and 43003724132), and no third is planned. The Windows recipe
-  below is the intended contract, not a proven path.
-- You have separately authorized a foreground, current-user Windows
-  development mode (ADR 0010). It is not part of this guide, it is not a
-  fallback for the service, and it does not meet the milestone 2 acceptance
-  below.
+Historical evidence only: S3/candidate wiring notes and ADR proposal statuses
+are not current production availability. The earlier Windows development
+acceptance used the owner's unelevated identity, explicitly excluded installed
+service/dedicated acceptance, and does not satisfy M2. See
+[development evidence](windows-development-execution.md). It supplies no service
+fallback. Neither the optional unpublished Windows replay harness nor its
+extensions is an M2 prerequisite. Windows main71 `ExecutionFailed` is known
+intermittent, cause unknown; no retry or fix is claimed. Existing no-retry,
+review and required-check gates remain in force.
 
 Some steps need administrator or root rights. They are marked **(admin)**.
 Everything else runs as your normal, unelevated login. Never paste a password or
@@ -53,7 +78,8 @@ token into chat, an issue, a command line or a log.
 - A service `arxd`. It runs as SYSTEM on Windows and as root on Linux and macOS,
   and it holds the private config and the activity database.
 - A separate **standard** account (`Arxcovo` on Windows, `arxcovo` on
-  Linux/macOS). Every agent command runs as that account. If that account is
+  Linux/macOS). The required production contract runs every agent command as that account;
+  this execution path is currently unavailable on every OS. If that account is
   missing or misconfigured, commands are refused. They never run as you or as
   the service.
 - A private client file in your profile. Claude Code uses it to reach the
@@ -163,15 +189,10 @@ token into chat, an issue, a command line or a log.
    `sudo …/arxd service configure … --client-account <your-login>` with the
    matching `--env PATH=…`, `CARGO_HOME`, `RUSTUP_HOME` and
    `HOME=/var/lib/arxcovo-build`. Finally run `sudo …/arxd service start`.
-   Install writes the fixed unit and the standard-rights drop-in. Choosing
-   `--rights admin` later removes that drop-in. It also requires you to add the
-   account to `sudo` or `wheel` and to provision a NOPASSWD sudoers rule
-   yourself. In admin mode, root commands started with `sudo` stay in the run's
-   cgroup and are killed with it. A root command can still deliberately move
-   itself to another cgroup or start a separate systemd unit, and such a
-   process can outlive the run. Builds can also read the service's private
-   state, and `list_hosts` reports that. Do not enable lingering
-   (`loginctl enable-linger`) for `arxcovo` in either mode.
+   Install writes the fixed unit and standard-rights drop-in. The owner parser
+   accepts `--rights standard|admin`; Linux admin plans remove the drop-in,
+   but no production executor exists for either mode. This guide's acceptance
+   uses standard rights only. Do not enable lingering for the build account.
 
 ## macOS
 
@@ -193,13 +214,14 @@ token into chat, an issue, a command line or a log.
    `rights_mismatch`.
    Admin mode stays unavailable until a separately reviewed design can contain
    and clean up root processes started through `sudo`.
-4. macOS limits: only one command runs at a time. Before and after each
+4. Planned macOS containment contract (not a working executor): only one
+   command runs at a time. Before and after each
    command, every process whose real or effective user is `arxcovo` must be
    gone; after a command they are killed. A process left behind, or one that
    launchd, `cron` or `at` starts for that account later, blocks further
    commands until the service restarts. Do not use that account interactively
    or give it login items while the service is running.
-5. **Endpoint (ADR 0015, not yet implemented).** The service creates
+5. **Endpoint (ADR 0015, implemented foundation).** The service creates
    `/Library/Application Support/Arxcovo/run` itself. Do not change stock
    folders such as `/private/var/run`. An earlier `/private/var/run/arxcovo` is
    ignored. You may remove it by hand: `sudo rm` a leftover socket, then
@@ -207,7 +229,9 @@ token into chat, an issue, a command line or a log.
    configs name the old path and are refused. After a crash or power loss,
    remove the stale `run/arxd.sock` by hand; it now survives a reboot.
 
-## Start, stop and reboot (Linux and macOS, ADR 0014)
+## Start, stop and reboot (source contract; installed behavior unverified)
+
+The following lifecycle plans describe Linux/macOS; Windows SCM details follow.
 
 - `service install` registers the service but does not start it. It also does
   not start at boot until you run `service start` once.
@@ -231,52 +255,124 @@ token into chat, an issue, a command line or a log.
   that old binary to run `service uninstall`. Then use the new binary to run
   `service install`, then `service configure` again if you use admin rights on
   Linux, then `service start`. Your config and activity history are kept.
-- On macOS, install currently always refuses with `service-manager`, until the
-  launchd behaviour it relies on has been captured from a real system.
+- On macOS, install currently always refuses with `service-manager`, because
+  `owner_query::launchd` still returns `Query::Unknown`. Historical observations
+  have not become an accepted production parser.
 - You do not create `/run/arxcovo` or `/private/var/run/arxcovo` yourself.
   systemd creates the Linux directory at each start, and the service creates
-  the macOS one. If either path already exists with the wrong owner or mode,
+  macOS `.../Arxcovo/run`. If either directory has the wrong owner or mode,
   start is refused. Nothing repairs it for you.
-- macOS service startup is **not yet expected to work on a stock install**.
-  ADR 0015 settles the pass-through policy and new runtime location, but
-  implementation and the required hosted positive controls are still pending.
-- Windows currently registers the service as automatic (delayed). It can
-  therefore start at boot even after install alone, or after a stop. This will
-  be aligned with the rules above in a later change.
+- ADR 0015's macOS ancestor policy, runtime placement and new-directory
+  ownership handling exist in source. Historical hosted observations do not
+  establish an installed service or implement the launchd parser. Its stub
+  still blocks owner lifecycle; provisioning is not the missing parser.
+- Windows implements the same boot intent: register/install leaves demand
+  start; start selects automatic delayed start; stop waits for stopped before
+  selecting demand start. A partial start can leave automatic intent, and a
+  failed stop can leave the previous intent. Installed boot behavior remains
+  **unverified on real hardware**.
 
-## Verify
+## Manual M2 acceptance (future, OS-aware)
 
-1. `arxd service status` prints `running`. On Windows, `sc.exe qc arxd` shows
-   `LocalSystem` and the quoted fixed path followed by `service run`.
-2. Check the file protections. As yourself, opening the config or state
-   directory must fail with access denied. Then run any command through Claude
-   Code, as in step 3: listing the config directory must also fail with access
-   denied when the build account tries it.
-3. Register the bridge for Claude Code (user scope), using your own paths:
+1. Pin independently reviewed source and binary, target OS and time. Check
+   readiness **before install**: at the baseline above, stop on every OS for
+   missing dedicated execution; macOS also stops for missing launchd parsing.
+   Linux still needs ADR 0019/0020 Stage F evidence and Stage G production
+   wiring, including open real-Runner PA6 and panic/release-profile gates.
+   Preserve existing Stage F scope and no-retry restrictions. Windows and
+   macOS need their own reviewed execution implementations. Do not extend
+   diagnostics or enable development mode to get past a refusal.
+2. Once ready, the owner uses the platform recipe above for the protected fixed
+   binary/layout, dedicated **standard build account**, accessible tools and
+   workspace, private client config and registered principal. The service is
+   LocalSystem on Windows or root on Unix; it is not the build identity.
+   Owner CLI grammar is identical on each OS (substitute private local values):
 
-   ```sh
-   claude mcp add --scope user arxcovo -- "C:\Program Files\Arxcovo\arxd.exe" mcp-stdio --client-config "C:\Users\<you>\.arxcovo\client.json"
+   ```text
+   arxd service install
+   arxd client-config new --principal claude-code --out CLIENT_FILE
+   arxd service configure --build-account BUILD_ACCOUNT --client-account CLIENT_ACCOUNT --rights standard --workspace WORKSPACE --env PATH=TOOL_PATH --agent claude-code=HASH
+   arxd service start
+   arxd service status
    ```
 
-   In Claude Code, ask it to call `list_hosts`. The result must show
-   `execution.available: true` and a `cargo` entry in `tools`. Then ask it to
-   call `run_command` with `{"tool":"cargo","args":["--version"]}`.
-4. The milestone 2 acceptance passes when all of the following hold:
-   - the run result shows `observed_identity.kind = windows_sid`, the
-     `Arxcovo` SID, Medium integrity, `rights: standard` and exit code 0;
-   - `list_activity` returns the same `activity_id`, with outcome `succeeded`
-     and `identity_matches_pin: true`;
-   - the row is still there after `arxd service stop` and `arxd service start`.
+   Run `client-config new` unelevated as the Claude Code client account; all
+   service verbs require the owner context. Use the fixed absolute binary
+   path from the OS recipe, never a PATH-selected binary. `configure` also
+   accepts repeated `--env KEY=VALUE` and `--agent PRINCIPAL=HASH` pairs; supply
+   the account's needed HOME/CARGO_HOME/RUSTUP_HOME/SystemRoot as appropriate.
+   Output is `claude-code=HASH`; the hash registers the private file's token,
+   not the token itself. Require status `running`. Do not publish raw output
+   or loosen file protections to make the client connect.
+3. Register the stdio bridge in unelevated Claude Code, substituting the fixed
+   OS binary and private client file (quote paths with spaces):
 
-   Record the SID, the version line and the time in docs/PROGRESS.md. Never
-   record your own login name or the client token.
-5. Negative checks, which are worth doing once:
-   - Stop the service, rename the build account, and start the service again.
-     `list_hosts` must report `account_missing`, and `run_command` must be
-     refused, never run as another identity. If the configured name instead
-     resolves to a different SID or UID, the reason is `account_identity_changed`.
-   - Add the account to Administrators while `rights` is `standard`. The result
-     must be `rights_mismatch`.
+   ```text
+   claude mcp add --scope user arxcovo -- "ABSOLUTE_ARXD_BINARY" mcp-stdio --client-config "PRIVATE_CLIENT_FILE"
+   ```
+
+   The arxd entry accepts exactly `mcp-stdio --client-config FILE`. The Claude
+   registration line is the guide's client invocation; the source pins verify
+   arxd's bridge arguments and MCP schemas, not an installed Claude CLI version.
+   Invoke these MCP tool envelopes in order; they are not shell commands:
+
+   ```json
+   {"name":"list_hosts","arguments":{}}
+   ```
+
+   Require `hosts[0]` OS, arch, logical CPUs, RAM and disk inventory, and
+   `execution.available: true`. Stop on unavailable and retain only its fixed
+   reason. Require genuine account-scoped cargo discovery, not a stale/empty
+   cache. `discover_tools` accepts `{}` if discovery needs refreshing; then
+   reread `list_hosts` and require a found cargo entry with observation time.
+
+   ```json
+   {"name":"run_command","arguments":{"tool":"cargo","args":["--version"]}}
+   ```
+
+   ```json
+   {"name":"list_activity","arguments":{"limit":20}}
+   ```
+
+   Current schemas reject unknown fields. `list_hosts` and `discover_tools`
+   take empty objects. Dedicated `run_command` requires exactly one of `tool`
+   (fixed tool enum including cargo) or `executable`; optional `args` has at
+   most 128 strings of at most 8192 characters, `cwd` at most 4096 characters,
+   `timeout_s` 1–3600 (default 60), `output_bytes` 2–8192 (default 4096).
+   Absolute executable length is at most 4096; runtime validation also applies.
+   `list_activity` accepts `limit` 1–50 (default 20), positive `before_id` and
+   boolean `include_reads` (default false). Use the last row's ID as `before_id`
+   to page backwards when needed; activity visibility is caller-scoped.
+4. Require cargo exit 0, `outcome: succeeded`, `rights: standard`,
+   `cleanup_confirmed: true` and `metadata.identity_mode: dedicated_account`.
+   Verify `metadata.identity_matches_pin: true` against real backend evidence:
+
+   | OS | Required observation and boundary |
+   | --- | --- |
+   | Windows | `observed_identity.kind: windows_sid`, pinned build SID, Medium integrity (8192), non-elevated; `observation_point: post_switch`; `tree_boundary: windows_job` |
+   | Linux | `observed_identity.kind: unix_uid`, pinned UID/GID; `observation_point: pre_exec`; `tree_boundary: linux_cgroup` |
+   | macOS | `observed_identity.kind: unix_uid`, pinned UID/GID; `observation_point: pre_exec`; `tree_boundary: mac_uid_sweep`, once implemented |
+
+   Compare sensitive identity values locally. Synthetic reports and development
+   identity observations cannot satisfy these assertions. Require confirmed
+   tree cleanup, not just the cargo process's exit.
+5. Match the returned `activity_id` to the caller's succeeded `run_command`
+   activity row and its dedicated identity-match/rights/cleanup metadata.
+   Have the owner use the fixed binary's `service stop`, `service start` and
+   `service status`; reconnect Claude Code freshly and read the same row with
+   `list_activity`. Require the same activity ID and persisted terminal facts.
+   Record start/stop/restart results per OS; one OS cannot cover another's
+   service lifecycle. Boot-intent behavior also needs real per-OS evidence.
+6. Retain only source/binary pin, OS, time, sanitized cargo version,
+   identity-match/rights/boundary/cleanup booleans or fixed labels, activity ID
+   correlation and restart-persistence result. Never record raw SID/UID/GID,
+   owner login, private paths, credentials, environment or raw command output.
+   A failure stays a failure. No acceptance was executed for this guide update;
+   all installed/dedicated paths are **unverified on real hardware**.
+
+Fresh Grok/Muse independent review is required before normal publication of
+this correction. Existing cross-provider review, required checks and coordinator
+merge authority remain unchanged. This recipe adds no product approval flow.
 
 ## Uninstall
 
