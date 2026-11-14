@@ -2,6 +2,19 @@
 
 ## Current state - 2026-11-14
 
+- S2b native harness passes Opus high review `7d20762` (retained `b7a6dba`) and narrow pin/path recheck `3ee9618`. Coordinator Sol medium corrected dependency pins and explicit mutation targets; two failed portable checks are retained, final 11/11 passes. Source remains reviewed `efe8e55`, production unchanged. Publication is for first hosted nonroot U-a and two native mutation checks only; merge waits native evidence, exact-head review and all five required checks. Accepted harness limits are recorded in evidence; real-Runner PA6 stays OPEN, no experiment/activation.
+
+- S2b passes Opus high source/security review `d94b176` (retained `e71fc59`), no blockers on either axis. Reviewer independently ran three portable tests, six assertion-killed portable mutants and Linux-target typecheck (not native execution). Linux U-a nonroot pass-versus-skip and two native Group mutation failures remain merge gates. Coordinator is preparing a bounded non-required native verification job for fresh review before publication. Real-Runner PA6 remains OPEN; no activation or experiment.
+
+- S2b local source `efe8e55` and evidence `a7d445c` by Sol medium are ready for Opus high review. Builder fmt/workspace all-target Clippy, focus/inventory checks and final 392 passed / 3 skipped are credited at source. Three portable mutants compiled and failed intended assertions with exact restoration. Linux U-a execution plus drop-store and Group-forgotten mutants remain unrun and required; no native credit or publication yet. Production inactive, real-Runner PA6 OPEN, M2 incomplete.
+
+- Last merged PR68 `47ff894f27f9a9275b320ad2da519e70e6117349`, 2026-11-14 00:36:00Z. Squash tree equals independently reviewed `13e03ce`; all five required checks passed. Its first PR CI attempt `43533996953` succeeded in 572s. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass. Main-after-PR68 run `43535275394` passed attempt 1 in 577s (2026-11-14 00:36:03-00:45:40Z), verified from first-attempt API metadata.
+- S2a inactive panic-path containment latch is merged. S2b local real-Group Drop/bridge decomposition and distinct pre-admitted readiness/residue gate tests are next on this merged base, following the accepted proposal. Real-Runner PA6 remains OPEN; no root/cgroupfs proof, A13 acceptance, experiment or activation is authorized.
+- Main-after-PR67 run `43533088974` passed attempt 1 in 674s (2026-11-14 00:16:39-00:27:53Z), verified through first-attempt API metadata. M2 remains incomplete; production remains MechanismUnavailable. Native, installed and dedicated paths are **unverified on real hardware**. Historical privacy flake, E_PROTECTION and ExecutionFailed remain unknown without fix or retry.
+
+## Historical checkpoint before S2a merge
+
+
 - S2a passes independent Anthropic / claude-opus-5-5 / high source/security review `f324e4c` (retained `1571d08`), both axes with no blockers. Reviewer independently ran fmt, workspace all-target Clippy, 36 bridge tests, 33 inventory tests and all four compiled mutants with the new matrix ordered first. Production remains inactive; this changes the inactive catch path only. Coordinator publishes for exact-head review and normal hosted gates. Main-after-S1 remains pending; no new full-suite claim, no native acceptance or activation.
 
 - Last merged PR67 `03c60033b6800f347f25af2aae3c786b848a7376`, 2026-11-14 00:16:37Z. Squash tree equals independently reviewed `fca6eab`; all five required checks passed, first PR CI attempt `43532132037` succeeded in 470s. Main-after-PR67 run `43533088974` is pending and tracked explicitly. Coordinator OpenAI / gpt-6.1-sol / medium; no bypass.

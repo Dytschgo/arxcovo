@@ -165,6 +165,23 @@ impl Drop for Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+    impl Group {
+        #[cfg(all(test, target_os = "linux"))]
+        pub(crate) fn owned_test_group(base: &tempfile::TempDir, residue: Arc<AtomicBool>) -> Self {
+            let leaf = base.path().join("leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.kill"), b"").unwrap();
+            std::fs::write(leaf.join("cgroup.events"), b"populated 0\n").unwrap();
+            Self {
+                parent: File::open(base.path()).unwrap().into(),
+                dir: File::open(&leaf).unwrap().into(),
+                name: CString::new("leaf").unwrap(),
+                procs: File::open(leaf.join("cgroup.events")).unwrap(),
+                removed: std::cell::Cell::new(false),
+                residue,
+            }
+        }
+    }
 
     #[test]
     fn release_leaf_tracks_failed_unlink_without_reset_or_errno_change() {
