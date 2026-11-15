@@ -162,3 +162,181 @@ fn from_stored(
         },
     })
 }
+
+// Exclusive startup-only read: no adapter or engine exists yet.
+fn preflight(log: &mut VoteLogStore, sm: &StateStore) -> Result<(), StoreError> {
+    let state = log.log_state()?;
+    let valid = if let Some(a) = sm.applied() {
+        if a.index > i64::MAX as u64 {
+            return Err(StoreError::Corrupt);
+        }
+        let end = a.index.checked_add(1).ok_or(StoreError::Corrupt)?;
+        match state.purged {
+            Some(p) if p.index > a.index => false,
+            Some(p) if p.index == a.index => p == a,
+            _ if state.last.is_none_or(|l| l.index < a.index) => state.last < Some(a),
+            _ => {
+                let rows = log.entries(a.index, end, 1)?;
+                rows.len() == 1 && rows[0].0 == a
+            }
+        }
+    } else {
+        state.purged.is_none()
+    };
+    valid.then_some(()).ok_or(StoreError::Corrupt)
+}
+#[derive(Debug)]
+pub(super) enum StartError {
+    Open(StoreError),
+    Preflight(StoreError),
+    Fatal,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open(_) => "consensus store open failed",
+            Self::Preflight(_) => "consensus preflight failed",
+            Self::Fatal => "consensus startup failed",
+        })
+    }
+}
+impl std::error::Error for StartError {}
+mod adapter;
+
+use super::{
+    log_store::VoteLogStore,
+    state_store::{Init, StateStore},
+};
+use adapter::{LogAdapter, SmAdapter, blocking};
+use openraft::{
+    Config, Raft, SnapshotPolicy,
+    network::{NetSnapshot, RaftNetworkFactory},
+};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+use tokio::{
+    sync::Semaphore,
+    task::JoinSet,
+    time::{Instant, timeout_at},
+};
+type Engine = Raft<Arx, SmAdapter>;
+#[derive(Clone, Copy)]
+pub(super) struct Params {
+    pub snapshot_logs: u64,
+    pub keep: u64,
+    pub purge_batch: u64,
+    pub lag: u64,
+    pub election_min: u64,
+    pub election_max: u64,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProposeError {
+    Busy,
+    Stopped,
+    NotLeader(Option<u64>),
+    Unknown,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ReadError {
+    NotLeader,
+    NoQuorum,
+    Unavailable,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Orphaned;
+#[derive(Default)]
+struct Owners {
+    closed: bool,
+    set: JoinSet<()>,
+}
+pub(super) struct ConsensusNode {
+    raft: Option<Engine>,
+    sm: Option<SmAdapter>,
+    log_weak: Weak<Mutex<VoteLogStore>>,
+    sm_weak: Weak<Mutex<StateStore>>,
+    pub permits: Arc<Semaphore>,
+    owners: Mutex<Owners>,
+}
+impl ConsensusNode {
+    pub async fn start<N>(
+        node: u64,
+        dir: &Path,
+        init: Init,
+        params: Params,
+        network: N,
+    ) -> Result<Self, StartError>
+    where
+        N: RaftNetworkFactory<Arx>,
+        N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
+    {
+        let dir = dir.to_owned();
+        let (ls, sm) = tokio::task::spawn_blocking(move || {
+            let mut ls = VoteLogStore::open(&dir, init.cluster).map_err(StartError::Open)?;
+            let sm = StateStore::open(&dir, init).map_err(StartError::Open)?;
+            preflight(&mut ls, &sm).map_err(StartError::Preflight)?;
+            Ok((ls, sm))
+        })
+        .await
+        .map_err(|_| StartError::Open(StoreError::Poisoned))??;
+        let ls = LogAdapter(Arc::new(Mutex::new(ls)));
+        let sm = SmAdapter(Arc::new(Mutex::new(sm)));
+        let log_weak = Arc::downgrade(&ls.0);
+        let sm_weak = Arc::downgrade(&sm.0);
+        let config = Arc::new(params.config().map_err(StartError::Open)?);
+        let raft = Engine::new(node, config, network, ls, sm.clone())
+            .await
+            .map_err(|_| StartError::Fatal)?;
+        Ok(Self {
+            raft: Some(raft),
+            sm: Some(sm),
+            log_weak,
+            sm_weak,
+            permits: Arc::new(Semaphore::new(64)),
+            owners: Mutex::default(),
+        })
+    }
+    pub async fn shutdown(&mut self) -> Result<(), Orphaned> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.owners.lock().map_err(|_| Orphaned)?.closed = true;
+        let mut failed = match &self.raft {
+            Some(raft) => !matches!(timeout_at(deadline, raft.try_shutdown()).await, Ok(Ok(()))),
+            None => false,
+        };
+        let mut set = {
+            let mut o = self.owners.lock().map_err(|_| Orphaned)?;
+            std::mem::take(&mut o.set)
+        };
+        if timeout_at(deadline, async {
+            while let Some(r) = set.join_next().await {
+                failed |= r.is_err();
+            }
+        })
+        .await
+        .is_err()
+        {
+            set.abort_all();
+            while set.join_next().await.is_some() {}
+            failed = true;
+        }
+        self.raft.take();
+        self.sm.take();
+        if timeout_at(deadline, async {
+            while self.log_weak.upgrade().is_some() || self.sm_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            failed = true;
+        }
+        if failed { Err(Orphaned) } else { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+use tests::mem_net;

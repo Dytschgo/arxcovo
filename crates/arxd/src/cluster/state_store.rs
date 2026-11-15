@@ -251,6 +251,12 @@ pub(super) fn open_db(
     Ok((lock, db))
 }
 impl StateStore {
+    pub(super) fn peek(
+        blob: &[u8],
+    ) -> Result<(Option<LogPos>, Option<(LogPos, MembershipBlob)>), StoreError> {
+        let image = decode(blob)?;
+        Ok((image.applied, image.membership))
+    }
     pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
         let (lock, mut db) = open_db(dir, "cluster-state", 64)?;
         let tx = db.transaction()?;
