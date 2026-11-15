@@ -982,6 +982,89 @@ workflow/run/oracle/cleanup evidence, exclude the host, and obtain independent
 source/run/oracle assessment before claiming either case or M2 credit. No extra
 owner confirmation or product approval flow is introduced.
 
+### D7j. Proposed single read-only admission-chain observation (2026-11-15)
+
+**Preparation only; inactive.** D7a–i stay consumed, all their hosts excluded.
+The binding coordinator correction in
+[the next-execution disposition](../reviews/m2-a7-next-execution-disposition.md)
+chooses this leg solely to identify a fresh host's blocking predicate/role before
+another combined attempt. Mutable public recipes do not make D9b impossible;
+original-host policy reconstruction is not a prerequisite. One observation
+cannot establish historical or systematic cause or whole-host qualification.
+
+Baseline main is `18b8fef58403e5ffadfd3f580d6a2a961c6d754c`, tree
+`215d75d3eeb09dd513846c73143f757454e6ce7a`, equal to reviewed
+`291a08a6f4ca302eb35bd5fabe0238d0c735ab92` (PR130 all five green supplied
+by coordinator, not queried here). Parent is `fc4ceda`. The sole candidate is
+the first eligible normal main squash containing this D7j and fixed source,
+after fresh different-provider source/security review, independent exact-head
+review, all five required checks (three platform verify, ci-time-budget,
+agent-review), coordinator merge, exact source inventory and full reviewed-head/
+main-squash tree equality. This source preparation grants no runtime authority.
+
+Strict full-tree baseline-to-candidate predicate: no deletions, renames, type or
+mode changes; only these regular 100644 files may differ:
+
+- `.github/workflows/a7-admission-readonly.yml` (new)
+- `tools/ci/a7-admission-readonly.py` (new)
+- `tools/ci/test-a7-admission-readonly.py` (new)
+- `docs/adr/0019-unix-native-execution-bridge.md`
+- `docs/evidence/linux-a7-admission-readonly-preparation.md` (new)
+- `docs/reviews/m2-a7-next-execution-disposition.md` (inherited correction)
+- `docs/reviews/m2-a7-admission-readonly-muse-review.md` (new fresh review)
+- `docs/PROGRESS.md` (coordinator only, inherited checkpoint)
+
+Every other blob/mode must equal baseline. The evidence inventory pins the three
+new runtime/test files and unchanged driver. No shared driver, selection, Rust,
+helper, package, Cargo, normal CI or production behavior changes. Before once-only
+pin/dispatch, read back main and require exact candidate SHA/tree and all source
+inventory equality. Any advance, unrelated delta or substitution needs a new
+reviewed disposition. Future identities must be recorded, never predicted.
+
+Coordinator only, after those gates: independently confirm all three live pins
+absent; set `A7_ADMISSION_REVIEWED_SHA` once to that exact main squash and read
+back equality. Keep `UNIX_EXECUTION_REVIEWED_SHA` and `SUDO_PACKAGE_REVIEWED_SHA`
+absent. Dispatch `a7-admission-readonly.yml` once on one fresh GitHub-hosted
+Ubuntu24.04 X64 host. Both workflow and wrapper bind repo Dytschgo/arxcovo,
+actor/trigger Dytschgo, manual event, main, source==workflow==reviewed pin,
+attempt1; wrapper additionally checks CI/host/image, bounded run ID, real/effective
+root, no arguments, exact workspace/script/workflow path before driver import
+or root-down reads. No input/selector/alternate path/hash exists.
+
+Manual-only contents:read job, pinned checkout, no persisted credentials and
+3min bound. Safe mocked tests precede the existing fixed transport
+`sudo -n /usr/bin/env -i` into `/usr/bin/python3 -I -B` and this wrapper only.
+Transport is the sole sudo execution; no target sudo version/list/true probe.
+Read-only scope: exact `/`, `/usr`, `/usr/local`, `/usr/local/bin`, `/usr/bin`
+directory predicates, fixed `/bin` readlink/alias identity, optional
+`/usr/local/bin/sudo` exact known payload. Bounded hashed reviewed driver bytes
+are compiled; only `a7_alias_c2 -> sudo_nnp_open/a4_directory` is invoked.
+The finite adapter observes owner-is-root, type-accepted and no group/other
+write before opening each component, stops on first unsafe metadata, and holds
+all ancestor FDs with nofollow/CLOEXEC/NONBLOCK, fstat/reopen/stability checks
+excluding atime only. The accepted alias resolves through its held fixed target,
+never a fresh symlink traversal. Unknown image/hash/metadata or drift refuses.
+No installed-three-payload requalification, policy/NSS/account/proc/systemctl/
+cgroup/mount/Runner/LinuxFs/helper/native execution or host mutation is allowed.
+Root-protected OS dependencies and concurrent privileged writers/mounts remain
+the same D8/A1 trust boundary; this is no adversarial host attestation.
+
+Output is closed diagnosis code/role/three booleans plus validated run/source
+binding. No raw IDs/modes/paths/inodes, unknown hashes, exception text or logs.
+Untrusted source/gate failures emit constant refusal. `qualified` and
+`native_credit` always false; exit0 means only PATH_CHAIN_OBSERVED, never admission.
+
+Capture returned accepted URL directly, monitor that exact run/attempt until
+terminal, retain pin even across ancillary lookup failures, and reconcile uncertain
+identity against that URL without redispatch. Finally clear the pin after terminal
+(or confirmed rejection with no accepted run), independently verify HTTP404 and
+all three pins absent. Any accepted dispatch consumes D7j including skip/failure;
+rejection grants no retry either. No retries/reruns; exclude host afterward.
+Retain bounded sanitized evidence and obtain independent source/run assessment.
+Any later D9b combined run needs its own reviewed disposition on a NEW host and
+all actual NNP/oracle/runtime checks. A7/A11/M2/full F/G/real-Runner PA6 remain
+**unverified on real hardware**. No additional owner approval flow is added.
+
 ## Contract clarifications (2026-11-12)
 
 These settle Sol advisories B-A1 and B-A2 (credited to the
