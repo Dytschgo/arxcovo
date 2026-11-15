@@ -137,3 +137,7 @@ F/G/real-Runner PA6 remain **unverified on real hardware**.
 ## Coordinator review correction F1
 
 Independent Muse `6d8dab4` passed all axes with fail-closed atime finding F1. Added an injected module-read regression: atime-only change must pass; each dev/ino/mode/uid/gid/nlink/size/mtime_ns/ctime_ns change must refuse with all descriptors closed. Exact regression reproduced the pre-fix false refusal (ValueError), then passed after comparing only those nine stable fields. All11 wrapper tests and10 comparator tests pass. The first invocation used a wrong test class name and earned no credit. No host read, privilege or dispatch occurred. Source pin table above is refreshed for this coordinator correction; comparator pin and workflow are unchanged.
+
+## Coordinator candidate and dispatch binding
+
+Reviewed head `895af0c3f0e1a28527088893e6f3c3958633555a` and main squash `47b440a5faeaa24434e155b81d5d03a5c977e4e9` share tree `b490c0479564ad895201e2a7872cb9fd11dad721`. Squash parent is baseline4f1a6db; exact seven allowed paths and new100644 modes match. All other execution bytes, comparator blob/11180-byte hash included, remain baseline. Accepted run43693642693 attempt1/job132749349754 binds this candidate. Main/actor/ref and absent new+old pin variables checked before once-set/readback/once dispatch. Monitor uses the returned URL directly. Terminal result and finally404 remain pending; this local note does not advance main or grant another run.
