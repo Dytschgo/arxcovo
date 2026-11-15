@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "run": "43741300777",
+  "attempt": 1,
+  "job": "132894851824",
+  "source_sha": "2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c",
+  "workflow_sha": "2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c",
+  "event": "workflow_dispatch",
+  "branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "failure",
+  "started_at": "2026-11-15T17:28:37Z",
+  "completed_at": "2026-11-15T17:29:44Z",
+  "duration_seconds": 67,
+  "steps_success": 8,
+  "steps_failure": 1,
+  "feedback": {
+    "schema": "unix-protection-f0",
+    "version": 2,
+    "provenance": {
+      "source_sha": "2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c",
+      "workflow_sha": "2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c",
+      "run": "43741300777",
+      "attempt": "1"
+    },
+    "first": {
+      "code": "E_SERVICE_OR_TEST"
+    },
+    "final": {
+      "code": "E_COMMAND_FAILED"
+    },
+    "mutation_lower_bound": "cgroup",
+    "cleanup": "unconfirmed",
+    "internal": {
+      "service": "absent",
+      "fixture-check": "absent",
+      "harness": "absent",
+      "carried": null,
+      "refusal": null
+    }
+  },
+  "all_three_pins_absent_http404": true,
+  "native_credit": false,
+  "retry_authorized": false
+}
