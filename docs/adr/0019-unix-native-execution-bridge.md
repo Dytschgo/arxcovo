@@ -717,8 +717,7 @@ real-Runner PA6 and M2 stay open. Installed/dedicated paths remain
 
 ### D7g. One replacement native A4 omitted-S7-kill run (2026-11-15)
 
-**Proposed; inactive until independent different-provider exact-head review,
-all five green required checks and coordinator merge. No run authority yet.**
+**Consumed by accepted dispatch `43674201597` on `1958f9975d1620151ca9a182c5047dd8aeb43e65`. The 92-second job succeeded with confirmed cleanup; the reviewed-SHA variable was finally deleted and independently verified absent HTTP404. Independent Muse assessment `21c7615` accepts only D9a A4 disposable present-residue plus native omitted-kill scope. No retry or further D7g authority.**
 Baseline is actual main `994760c98c2816f37b1acdcaa9d9827693765b17` (PR #114),
 tree `908abcf01c0969cb73d3486e92476f3c90c132f5`, identical to reviewed
 `d60665c81f4e83c10382fea170244ee04db98bf1`. PR114's five green gates and Muse
