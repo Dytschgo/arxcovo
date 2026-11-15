@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #121, `d6986171d16077f05bf088f1054128ab94c1b887` at 06:27:34Z, independent Muse exact-head PASS plus retained independent Sol architecture review and all five gates green. Squash tree `d4e4499d5a456ca26027e8e4e6fa9e6f31707fca` equals reviewed `251c9c3`; D9b controlled-policy fixture contract effective, no native grant.
-- Current work: publish controlled-policy source with independent Muse `bce660f` review and coordinator S1 resolution from primary systemd v254 parser/printer: unsuffixed config defaults recursive and prints :rbind, matching strict Rust check, no source widening. Actual systemctl/mount view and Linux integration remain unverified locally; S2/S3 fail-closed notes retained. Profile/qualification/TEST gates closed, no native authority or A7/A11/M2/full F/G/PA6 credit.
+- Last merged: PR #122, `8f7092ed02a2da819756ca6194328e88757b752d` at 06:58:03Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `acfed59`; hosted controlled-policy Linux integration compiled, no native view/acceptance credit.
+- Current work: publish finite official Ubuntu package comparator after independent Muse `82f9e91` PASS on all axes, zero blockers; ten mocks/155 portable tests rerun green. Only reviewed sudo/plugin/libsudo_util payloads and fixed ELF/link facts, refusing CLI. Public provenance/build-path and independent package review retained. Inconclusive sudo-V module stays unpublished/excluded. Actual file reads need a new narrow grant; A7/A11/M2/full F/G/PA6 open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
