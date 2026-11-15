@@ -13,6 +13,7 @@ use std::{fs::File, path::Path};
 pub const MAX_APPEND: usize = 64;
 pub const MAX_LIVE: usize = 512;
 const MAX_ROW: usize = 4163;
+const _: () = assert!(90 + 40 * super::enrollment::MAX_FOUND_WIRE <= MAX_ROW);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StoredVote {
     pub term: u64,
@@ -75,7 +76,7 @@ fn decode_row(b: &[u8]) -> Result<(LogPos, Entry), StoreError> {
     let p = valid_pos(get_pos(&mut r)?)?;
     let e = match r.bytes(1)?[0] {
         0 => Entry::Blank,
-        t @ (1 | 2) => Entry::Enrollment(codec::decode_command(t, &mut r)?),
+        t @ (1 | 2 | 4 | 5) => Entry::Enrollment(codec::decode_command(t, &mut r)?),
         3 => {
             let n = r.u16()? as usize;
             Entry::Membership(MembershipBlob::new(r.bytes(n)?.to_vec())?)

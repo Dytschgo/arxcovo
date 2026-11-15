@@ -13,6 +13,11 @@ struct Cluster {
 }
 impl Cluster {
     async fn new(params: Params) -> Self {
+        let c = Self::unfounded(params).await;
+        c.write(founders()).await;
+        c
+    }
+    async fn unfounded(params: Params) -> Self {
         let mut c = Self {
             dirs: (0..3).map(|_| private_temp()).collect(),
             nodes: vec![None, None, None],
@@ -512,6 +517,239 @@ async fn u6_cancelled_callers_keep_engine_permits_until_resolution() {
             }
             c.finish().await;
         }
+    })
+    .await
+    .unwrap();
+}
+
+fn founders() -> Command {
+    use crate::cluster::enrollment::{FoundMembers, NodeId};
+    Command::Found {
+        cluster: [1; 16],
+        members: FoundMembers::new((1..=3).map(|n| {
+            (
+                NodeId::new(n).unwrap(),
+                KeyDigest::of_spki(&[250, n as u8]).unwrap(),
+            )
+        }))
+        .unwrap(),
+        proposed_at_ms: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t4_registry_revocation_snapshot_and_prune() {
+    use crate::cluster::enrollment::{FoundMembers, NodeId, PeerRefusal, TOMBSTONE_MS};
+    timeout(Duration::from_secs(45), async {
+        let started = Instant::now();
+        let mut c = Cluster::unfounded(Params {
+            snapshot_logs: 8,
+            keep: 0,
+            purge_batch: 1,
+            lag: 16,
+            ..Params::default()
+        })
+        .await;
+        let pair = |n| {
+            (
+                NodeId::new(n).unwrap(),
+                KeyDigest::of_spki(&[250, n as u8]).unwrap(),
+            )
+        };
+        let found = |pairs| Command::Found {
+            cluster: [1; 16],
+            members: FoundMembers::new(pairs).unwrap(),
+            proposed_at_ms: 0,
+        };
+        let invalid = vec![
+            vec![],
+            (1..=17).map(pair).collect(),
+            (1..=64).map(pair).collect(),
+            vec![pair(2), pair(1)],
+            vec![pair(1), (NodeId::new(2).unwrap(), pair(1).1)],
+            vec![pair(4)],
+        ];
+        for pairs in &invalid {
+            let l = c.leader().await;
+            let sm = c.node(l).sm.as_ref().unwrap().clone();
+            let before = blocking(move || Ok(sm.0.lock().unwrap().state().clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                c.write(found(pairs.clone())).await.1,
+                Some(Outcome::Rejected(Reject::BadFounders))
+            );
+            let sm = c.node(c.leader().await).sm.as_ref().unwrap().clone();
+            assert_eq!(
+                blocking(move || Ok(sm.0.lock().unwrap().state().clone()))
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+        assert_eq!(
+            c.write(founders()).await.1,
+            Some(Outcome::Founded { replay: false })
+        );
+        for pairs in [
+            vec![],
+            (1..=17).map(pair).collect(),
+            (1..=64).map(pair).collect(),
+        ] {
+            assert_eq!(
+                c.write(found(pairs)).await.1,
+                Some(Outcome::Rejected(Reject::BadFounders))
+            );
+        }
+        assert_eq!(
+            c.write(found(vec![pair(1)])).await.1,
+            Some(Outcome::Founded { replay: true })
+        );
+        assert_eq!(
+            c.write(found(vec![(
+                pair(1).0,
+                KeyDigest::of_spki(b"conflict").unwrap()
+            )]))
+            .await
+            .1,
+            Some(Outcome::Rejected(Reject::AlreadyFounded))
+        );
+        let code = code(1);
+        c.write(mint(&code, 1, 1000)).await;
+        let redeem = redeem(&code, 2, 1, 1001);
+        grant(c.write(redeem.clone()).await.1, 4, false);
+        c.converge().await;
+        let k = KeyDigest::of_spki(&[1]).unwrap();
+        let n = NodeId::new(4).unwrap();
+        for i in 0..3 {
+            assert_eq!(c.node(i).local_authorize([1; 16], n, k).await, Ok(()));
+        }
+        let l = c.leader().await;
+        let f = (l + 1) % 3;
+        let stopped = c
+            .node(f)
+            .raft
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .unwrap();
+        c.stop(f).await;
+        assert_eq!(
+            c.write(Command::Remove {
+                cluster: [1; 16],
+                node: n,
+                proposed_at_ms: 1002
+            })
+            .await
+            .1,
+            Some(Outcome::Removed { replay: false })
+        );
+        assert_eq!(
+            c.write(redeem).await.1,
+            Some(Outcome::Rejected(Reject::Revoked))
+        );
+        for r in 180..220 {
+            assert_eq!(
+                c.write(unknown(r)).await.1,
+                Some(Outcome::Rejected(Reject::UnknownCode))
+            );
+        }
+        let l = c.leader().await;
+        let purged = c
+            .node(l)
+            .raft
+            .as_ref()
+            .unwrap()
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.purged.is_some_and(|p| p.index > stopped.index),
+                "T4 purged beyond follower",
+            )
+            .await
+            .unwrap()
+            .purged
+            .unwrap();
+        assert_eq!(
+            c.router.snapshots_to.lock().unwrap().get(&(f as u64 + 1)),
+            None
+        );
+        c.start(f).await;
+        c.converge().await;
+        let snapshots = *c
+            .router
+            .snapshots_to
+            .lock()
+            .unwrap()
+            .get(&(f as u64 + 1))
+            .unwrap();
+        assert!(snapshots >= 1);
+        assert_eq!(
+            c.node(f).local_authorize([1; 16], n, k).await,
+            Err(PeerRefusal::NotMember)
+        );
+        for j in 1..=3 {
+            assert_eq!(
+                c.node(f)
+                    .local_authorize([1; 16], pair(j).0, pair(j).1)
+                    .await,
+                Ok(())
+            );
+        }
+        let prune = 1000 + CODE_TTL_MS + TOMBSTONE_MS;
+        let mut expired = unknown(220);
+        if let Command::Redeem { proposed_at_ms, .. } = &mut expired {
+            *proposed_at_ms = prune;
+        }
+        assert_eq!(
+            c.write(expired).await.1,
+            Some(Outcome::Rejected(Reject::UnknownCode))
+        );
+        c.converge().await;
+        for i in 0..3 {
+            assert_eq!(
+                c.node(i).local_authorize([1; 16], n, k).await,
+                Err(PeerRefusal::NotMember)
+            );
+            for j in 1..=3 {
+                assert_eq!(
+                    c.node(i)
+                        .local_authorize([1; 16], pair(j).0, pair(j).1)
+                        .await,
+                    Ok(())
+                );
+            }
+            let sm = c.node(i).sm.as_ref().unwrap().clone();
+            blocking(move || {
+                let s = sm.0.lock().unwrap();
+                let membership = decode(&s.membership().unwrap().1)?;
+                assert!(registry_covers(&membership, s.state()));
+                let mut state_bytes = Vec::new();
+                crate::cluster::enrollment::codec::encode(s.state(), &mut state_bytes);
+                assert_eq!(&state_bytes[32..34], &[0, 0]); // All records pruned.
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        // Every store reopens; convergence compares complete snapshot bytes.
+        for i in 0..3 {
+            c.stop(i).await;
+        }
+        for i in 0..3 {
+            c.start(i).await;
+        }
+        c.converge().await;
+        eprintln!(
+            "T4 follower={} stopped={} purged={} snapshots={} elapsed={:?}",
+            f + 1,
+            stopped.index,
+            purged.index,
+            snapshots,
+            started.elapsed()
+        );
+        c.finish().await;
     })
     .await
     .unwrap();

@@ -15,7 +15,16 @@ fn code(n: u8) -> JoinCode {
     .unwrap()
 }
 fn state() -> EnrollmentState {
-    EnrollmentState::new(CLUSTER, node(10))
+    let mut s = EnrollmentState::new(CLUSTER, node(10));
+    s.apply(&found(vec![(node(1), key(250))]));
+    s
+}
+fn found(pairs: Vec<(NodeId, KeyDigest)>) -> Command {
+    Command::Found {
+        cluster: CLUSTER,
+        members: FoundMembers::new(pairs).unwrap(),
+        proposed_at_ms: 0,
+    }
 }
 fn mint(c: &JoinCode, request: u8, time: u64) -> Command {
     Command::Mint {
@@ -323,7 +332,14 @@ fn retained_cap_only_pruning_frees_records_and_replay_precedes_full() {
     let mut s = state();
     for n in 1..=64 {
         s.apply(&mint(&code(n), n, u64::from(n)));
-        grant(s.apply(&redeem(&code(n), n, 1, u64::from(n))));
+        grant(s.apply(&redeem(&code(n), n, n, u64::from(n))));
+        if n > 1 {
+            s.apply(&Command::Remove {
+                cluster: CLUSTER,
+                node: node(9 + u64::from(n)),
+                proposed_at_ms: u64::from(n),
+            });
+        }
     }
     let before = s.clone();
     reject(&mut s, mint(&code(65), 65, 65), Reject::StateFull);
@@ -354,6 +370,7 @@ fn retained_cap_only_pruning_frees_records_and_replay_precedes_full() {
 #[test]
 fn node_exhaustion_never_issues_max_and_leaves_pending_intact() {
     let mut s = EnrollmentState::new(CLUSTER, node(u64::MAX - 1));
+    s.apply(&found(vec![(node(1), key(250))]));
     let a = code(1);
     let b = code(2);
     s.apply(&mint(&a, 1, 0));
@@ -398,6 +415,14 @@ fn delayed_sole_proposal_grants_by_proposal_time_then_issuance_guard_refuses() {
 #[test]
 fn replies_are_generic_and_replicas_deterministic() {
     let rejects = [
+        Reject::NotFounded,
+        Reject::BadFounders,
+        Reject::AlreadyFounded,
+        Reject::KeyInUse,
+        Reject::MembersFull,
+        Reject::Revoked,
+        Reject::UnknownNode,
+        Reject::LastMember,
         Reject::WrongCluster,
         Reject::TimeOutOfRange,
         Reject::ClockBehind,
@@ -499,7 +524,12 @@ fn pending_precedes_total_cap_and_rejects_still_prune() {
     for n in 1..=64 {
         s.apply(&mint(&code(n), n, 0));
         if n <= 56 {
-            grant(s.apply(&redeem(&code(n), n, 1, 0)));
+            let g = grant(s.apply(&redeem(&code(n), n, n, 0)));
+            s.apply(&Command::Remove {
+                cluster: CLUSTER,
+                node: g.node(),
+                proposed_at_ms: 0,
+            });
         }
     }
     assert_eq!(s.records.len(), 64);
@@ -526,4 +556,219 @@ fn wrong_proof_on_expired_pending_is_bad_proof() {
         CODE_TTL_MS,
     );
     assert_eq!(s.apply(&cmd), Outcome::Rejected(Reject::BadProof));
+}
+
+#[test]
+fn registry_validation_replay_gates_and_authorization() {
+    for (r, text) in [
+        (PeerRefusal::WrongCluster, "wrong cluster"),
+        (PeerRefusal::NotMember, "not member"),
+        (PeerRefusal::KeyMismatch, "key mismatch"),
+    ] {
+        assert_eq!(r.to_string(), text);
+    }
+    let mut s = EnrollmentState::new(CLUSTER, node(10));
+    for cmd in [
+        mint(&code(1), 1, 0),
+        redeem(&code(1), 1, 1, 0),
+        Command::Remove {
+            cluster: CLUSTER,
+            node: node(1),
+            proposed_at_ms: 0,
+        },
+    ] {
+        reject(&mut s, cmd, Reject::NotFounded);
+    }
+    let invalid = vec![
+        vec![],
+        vec![(node(10), key(1))],
+        vec![(node(2), key(2)), (node(1), key(1))],
+        vec![(node(1), key(1)), (node(1), key(2))],
+        vec![(node(1), key(1)), (node(2), key(1))],
+        (1..=17).map(|n| (node(n), key(n as u8))).collect(),
+    ];
+    for founded in [false, true] {
+        if founded {
+            assert_eq!(
+                s.apply(&found(vec![(node(1), key(250))])),
+                Outcome::Founded { replay: false }
+            );
+        }
+        for pairs in &invalid {
+            let before = s.clone();
+            reject(&mut s, found(pairs.clone()), Reject::BadFounders);
+            assert_eq!(s, before);
+        }
+    }
+    assert_eq!(
+        s.apply(&found(vec![(node(1), key(250))])),
+        Outcome::Founded { replay: true }
+    );
+    reject(
+        &mut s,
+        found(vec![(node(1), key(249))]),
+        Reject::AlreadyFounded,
+    );
+    assert_eq!(
+        s.authorize_peer([0; 16], node(1), key(250)),
+        Err(PeerRefusal::WrongCluster)
+    );
+    assert_eq!(
+        s.authorize_peer(CLUSTER, node(10), key(250)),
+        Err(PeerRefusal::NotMember)
+    );
+    assert_eq!(
+        s.authorize_peer(CLUSTER, node(1), key(1)),
+        Err(PeerRefusal::KeyMismatch)
+    );
+    let remove = |n| Command::Remove {
+        cluster: CLUSTER,
+        node: node(n),
+        proposed_at_ms: 0,
+    };
+    reject(&mut s, remove(10), Reject::UnknownNode);
+    reject(&mut s, remove(1), Reject::LastMember);
+    for (n, k) in [(1, 1), (2, 2)] {
+        s.apply(&mint(&code(n), n, 0));
+        reject(&mut s, redeem(&code(n), n, 250, 0), Reject::KeyInUse);
+        if n == 2 {
+            reject(&mut s, redeem(&code(n), n, 1, 0), Reject::KeyInUse);
+        }
+        grant(s.apply(&redeem(&code(n), n, k, 0)));
+    }
+    assert_eq!(
+        s.apply(&found(vec![(node(10), key(1))])),
+        Outcome::Founded { replay: true }
+    );
+    assert_eq!(s.apply(&remove(10)), Outcome::Removed { replay: false });
+    assert_eq!(s.apply(&remove(10)), Outcome::Removed { replay: true });
+    assert_eq!(
+        s.authorize_peer(CLUSTER, node(10), key(1)),
+        Err(PeerRefusal::NotMember)
+    );
+    reject(&mut s, redeem(&code(1), 1, 1, 0), Reject::Revoked);
+    let prune = CODE_TTL_MS + TOMBSTONE_MS;
+    reject(&mut s, redeem(&code(2), 2, 2, prune), Reject::UnknownCode);
+    assert!(s.records.is_empty());
+    assert_eq!(s.authorize_peer(CLUSTER, node(11), key(2)), Ok(()));
+}
+#[test]
+fn registry_capacity_rejection_keeps_code_and_counter() {
+    let mut s = EnrollmentState::new(CLUSTER, node(17));
+    assert_eq!(
+        s.apply(&found((1..=16).map(|n| (node(n), key(n as u8))).collect())),
+        Outcome::Founded { replay: false }
+    );
+    s.apply(&mint(&code(80), 80, 0));
+    let before = s.clone();
+    reject(&mut s, redeem(&code(80), 80, 80, 0), Reject::MembersFull);
+    assert_eq!(s, before);
+    s.apply(&Command::Remove {
+        cluster: CLUSTER,
+        node: node(16),
+        proposed_at_ms: 0,
+    });
+    assert_eq!(
+        grant(s.apply(&redeem(&code(80), 80, 80, 0))).node(),
+        node(17)
+    );
+}
+#[test]
+fn founding_iterator_is_bounded_before_command_construction() {
+    use std::cell::Cell;
+    for n in [0, 1, 16, 17, 64] {
+        assert_eq!(
+            FoundMembers::new((0..n).map(|_| (node(1), key(1))))
+                .unwrap()
+                .as_slice()
+                .len(),
+            n
+        );
+    }
+    let pulls = Cell::new(0);
+    assert_eq!(
+        FoundMembers::new((0..1_000_000).map(|_| {
+            pulls.set(pulls.get() + 1);
+            (node(1), key(1))
+        })),
+        Err(FoundTooLarge)
+    );
+    assert_eq!(pulls.get(), 65);
+}
+
+#[test]
+fn registry_commands_preserve_common_time_and_prune_prefix() {
+    let mut s = state();
+    s.apply(&mint(&code(1), 1, 0));
+    for remove in [false, true] {
+        for (cluster, time, reason) in [
+            ([0; 16], u64::MAX, Reject::WrongCluster),
+            (CLUSTER, MAX_TIME_MS + 1, Reject::TimeOutOfRange),
+        ] {
+            let cmd = if remove {
+                Command::Remove {
+                    cluster,
+                    node: node(1),
+                    proposed_at_ms: time,
+                }
+            } else {
+                Command::Found {
+                    cluster,
+                    members: FoundMembers::new([]).unwrap(),
+                    proposed_at_ms: time,
+                }
+            };
+            let before = s.clone();
+            reject(&mut s, cmd, reason);
+            assert_eq!(s, before);
+        }
+    }
+    let prune = CODE_TTL_MS + TOMBSTONE_MS;
+    let members = s.members.clone();
+    let next = s.next_node_id;
+    reject(
+        &mut s,
+        Command::Found {
+            cluster: CLUSTER,
+            members: FoundMembers::new([]).unwrap(),
+            proposed_at_ms: prune,
+        },
+        Reject::BadFounders,
+    );
+    assert!(s.records.is_empty());
+    assert_eq!(s.members, members);
+    assert_eq!(s.next_node_id, next);
+    let before = s.clone();
+    reject(
+        &mut s,
+        Command::Remove {
+            cluster: CLUSTER,
+            node: node(1),
+            proposed_at_ms: prune - SKEW_MS - 1,
+        },
+        Reject::ClockBehind,
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
+fn founder_count_cap_is_independent_of_allocation_and_other_structure() {
+    for count in [17, 64] {
+        for already_founded in [false, true] {
+            let mut s = EnrollmentState::new(CLUSTER, node(65));
+            if already_founded {
+                assert_eq!(
+                    s.apply(&found(vec![(node(1), key(250))])),
+                    Outcome::Founded { replay: false }
+                );
+            }
+            let before = s.clone();
+            let pairs = (1..=count).map(|n| (node(n), key(n as u8))).collect();
+            assert_eq!(
+                s.apply(&found(pairs)),
+                Outcome::Rejected(Reject::BadFounders)
+            );
+            assert_eq!(s, before);
+        }
+    }
 }

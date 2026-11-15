@@ -102,7 +102,7 @@ pub(super) fn get_pos(r: &mut Reader<'_>) -> Result<LogPos, StoreError> {
 }
 fn encode(i: &Image) -> Vec<u8> {
     let mut b = b"ARXSM1\0\0".to_vec();
-    b.extend(1u16.to_be_bytes());
+    b.extend(2u16.to_be_bytes());
     b.push(u8::from(i.applied.is_some()));
     if let Some(p) = i.applied {
         put_pos(&mut b, p);
@@ -127,8 +127,13 @@ fn decode(b: &[u8]) -> Result<Image, StoreError> {
         return Err(StoreError::Corrupt);
     }
     let mut r = Reader(payload);
-    if r.bytes(8)? != b"ARXSM1\0\0" || r.u16()? != 1 {
+    if r.bytes(8)? != b"ARXSM1\0\0" {
         return Err(StoreError::Corrupt);
+    }
+    match r.u16()? {
+        2 => {}
+        1 => return Err(StoreError::Unsupported),
+        _ => return Err(StoreError::Corrupt),
     }
     let applied = if r.flag()? {
         Some(get_pos(&mut r)?)
