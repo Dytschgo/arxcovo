@@ -109,3 +109,7 @@ review, required CI and coordinator integration are outstanding. A separate
 reviewed one-run disposition is required for native execution. A4, M2, remaining
 F/G and real-Runner PA6 remain open. Installed/dedicated and all hardware paths
 are **unverified on real hardware**. No A4 acceptance is claimed.
+
+## Coordinator publication pin maintenance
+
+The E3 `linux.rs` source pin advances from `75b174ac10c7c3dd3be5984f507ba891ae4dccd953c49dfb12327007c0b907bd` to `59acc5ff560910f66564655008d6447cff3646864f6fd43338a507f972de2f1e`, recomputed from committed LF blob `7c4196333f4938499188c7f99e5476c955b8e9d0`. Only the hash constant changes; manifests, mutation anchors and guards stay unchanged. The source delta is the independently reviewed cfg(test)-only cleanup/identity helper. Portable revalidation is recorded in PROGRESS. No native execution is granted.
