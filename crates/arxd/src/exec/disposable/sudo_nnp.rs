@@ -1,18 +1,169 @@
-//! SOURCE ONLY. No delivery pins or qualifying host/policy attestation exists.
+//! Fixed disposable candidate; native authority requires the separate D7i gates.
 use super::*;
 
-// This is deliberately not an environment/config selector. A later separately
-// reviewed delivery slice must replace this refusal with verified owned inputs.
+// Fixed test-only delivery; no environment/config selection of policy facts.
 struct Prepared {
     accounts: [OwnerConfig; 2], // rule, then no-rule; driver-owned and pinned
     arxd: PathBuf,
     reentry: PathBuf,
 }
 fn prepared_delivery() -> Option<Prepared> {
-    // No host/image policy bytes have been independently attested. This literal
-    // must remain closed until a separate qualification and execution grant.
-    let expected_profile: Option<&str> = None;
-    read_fixed_delivery(expected_profile?).map(|(prepared, _held)| prepared)
+    let (prepared, _held) = read_fixed_delivery(A7_PROFILE)?;
+    let _runtime = runtime_package()?;
+    let run =
+        std::env::var("GITHUB_RUN_ID").ok()? + "-" + &std::env::var("GITHUB_RUN_ATTEMPT").ok()?;
+    let _view = controlled_view(&run, &prepared.accounts)?;
+    Some(prepared)
+}
+
+// SHA256 of canonical reviewed package/default/policy facts (evidence JSON).
+// This identifier never asserts whole-host qualification or replaces live checks.
+const A7_PROFILE: &str = "51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210";
+const PACKAGE: [(&str, u64, &str); 3] = [
+    (
+        "/usr/bin/sudo",
+        282032,
+        "6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff",
+    ),
+    (
+        "/usr/libexec/sudo/sudoers.so",
+        588080,
+        "151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c",
+    ),
+    (
+        "/usr/libexec/sudo/libsudo_util.so.0.0.0",
+        133944,
+        "aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d",
+    ),
+];
+fn package_file(path: &Path, size: u64, digest: &str) -> Option<std::fs::File> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let file = delivery_open(path, false)?;
+    let before = file.metadata().ok()?;
+    if !before.is_file()
+        || before.uid() != 0
+        || before.nlink() != 1
+        || before.mode() & 0o022 != 0
+        || before.len() != size
+    {
+        return None;
+    }
+    let bytes = controlled_read(&file, size)?;
+    if bytes.len() as u64 != size || format!("{:x}", Sha256::digest(&bytes)) != digest {
+        return None;
+    }
+    let again = delivery_open(path, false)?;
+    let snapshot = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.mode(),
+            m.uid(),
+            m.gid(),
+            m.nlink(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    if snapshot(&before) != snapshot(&file.metadata().ok()?)
+        || snapshot(&before) != snapshot(&again.metadata().ok()?)
+    {
+        return None;
+    }
+    Some(file)
+}
+fn runtime_link(parent: &std::fs::File, name: &std::ffi::CStr, targets: &[&[u8]]) -> Option<()> {
+    use std::os::fd::AsRawFd;
+    let read = || {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let st = unsafe { st.assume_init() };
+        (st.st_mode & libc::S_IFMT == libc::S_IFLNK && st.st_uid == 0 && st.st_nlink == 1)
+            .then_some((st.st_dev, st.st_ino, st.st_size, st.st_mtime, st.st_ctime))
+    };
+    let before = read()?;
+    let mut bytes = [0u8; 32];
+    let n = unsafe {
+        libc::readlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if n < 0
+        || n as usize >= bytes.len()
+        || !targets.contains(&&bytes[..n as usize])
+        || before.2 != n as i64
+        || read()? != before
+    {
+        return None;
+    }
+    Some(())
+}
+fn runtime_package() -> Option<Vec<std::fs::File>> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    if std::env::consts::ARCH != "x86_64"
+        || unsafe { libc::getuid() } != 0
+        || unsafe { libc::geteuid() } != 0
+    {
+        return None;
+    }
+    let mut held = Vec::new();
+    for (path, size, digest) in PACKAGE {
+        held.push(package_file(Path::new(path), size, digest)?);
+    }
+    let util = delivery_open(Path::new("/usr/libexec/sudo"), true)?;
+    for name in [c"libsudo_util.so", c"libsudo_util.so.0"] {
+        runtime_link(&util, name, &[b"libsudo_util.so.0.0.0"])?;
+    }
+    let root = delivery_open(Path::new("/"), true)?;
+    runtime_link(&root, c"bin", &[b"usr/bin", b"/usr/bin"])?;
+    let usrbin = delivery_open(Path::new("/usr/bin"), true)?;
+    let mut alias = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(root.as_raw_fd(), c"bin".as_ptr(), alias.as_mut_ptr(), 0) } != 0 {
+        return None;
+    }
+    let alias = unsafe { alias.assume_init() };
+    let target = usrbin.metadata().ok()?;
+    if alias.st_dev != target.dev() || alias.st_ino != target.ino() {
+        return None;
+    }
+    let local = delivery_open(Path::new("/usr/local/bin"), true)?;
+    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            local.as_raw_fd(),
+            c"sudo".as_ptr(),
+            info.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        held.push(package_file(
+            Path::new("/usr/local/bin/sudo"),
+            PACKAGE[0].1,
+            PACKAGE[0].2,
+        )?);
+    } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+        return None;
+    }
+    held.extend([util, root, usrbin, local]);
+    Some(held)
 }
 
 #[derive(serde::Deserialize)]
@@ -305,6 +456,9 @@ fn read_fixed_delivery(profile: &str) -> Option<(Prepared, Vec<std::fs::File>)> 
             return None;
         }
     }
+    if env("GITHUB_RUN_ATTEMPT")?.as_str() != "1" {
+        return None;
+    }
     let run = format!("{}-{}", env("GITHUB_RUN_ID")?, env("GITHUB_RUN_ATTEMPT")?);
     let stage = delivery_stage(&std::env::current_exe().ok()?, &run)?;
     if delivery_open(&stage, true)?.metadata().ok()?.mode() & 0o7777 != 0o700 {
@@ -459,7 +613,7 @@ fn read_fixed_delivery(profile: &str) -> Option<(Prepared, Vec<std::fs::File>)> 
     ))
 }
 
-// D9b candidate only; installed plugin digest/default-path/floor proof is absent.
+// D9b fixed candidate; package equality plus this live view binds reviewed defaults.
 const CONTROLLED_PLUGIN: &str = "/usr/libexec/sudo/sudoers.so";
 fn controlled_literals(run: &str) -> Option<Vec<(&'static str, Vec<u8>)>> {
     let names = delivery_names(run)?;
@@ -797,11 +951,11 @@ fn a7_controlled_policy_discriminators() {
 }
 
 fn recheck_delivery(config: &OwnerConfig, executable: &Path) -> Option<Vec<std::fs::File>> {
-    let expected_profile: Option<&str> = None;
-    let (prepared, held) = read_fixed_delivery(expected_profile?)?;
+    let (prepared, held) = read_fixed_delivery(A7_PROFILE)?;
     let run =
         std::env::var("GITHUB_RUN_ID").ok()? + "-" + &std::env::var("GITHUB_RUN_ATTEMPT").ok()?;
     let mut held = held;
+    held.extend(runtime_package()?);
     held.extend(controlled_view(&run, &prepared.accounts)?);
     let pinned = prepared
         .accounts
@@ -1087,7 +1241,7 @@ fn valid_run(run: &RunResult, config: &OwnerConfig, residue: bool) -> bool {
 }
 
 #[test]
-#[ignore = "A7/A11 source only; unattested host/policy and no native grant; unselected"]
+#[ignore = "A7/A11 fixed candidate; D7i review/gates/merge required before native execution"]
 fn disposable_linux_a7_a11() {
     let startup = std::time::Instant::now();
     // Refuse BEFORE any host observation, LinuxFs, account or process operation.

@@ -888,6 +888,98 @@ hardware**. Existing user authorization covers this fresh disposable-host leg;
 no extra owner confirmation or product approval flow is introduced. This local
 preparation performs none of the future coordinator operations above.
 
+### D7i. Proposed single combined A7/A11 fresh-host run (2026-11-15)
+
+**Preparation only; inactive until the following review/merge gates. No dispatch
+or runtime grant is exercised by this source preparation.** D7a-h remain consumed;
+all their hosts, including D7h host43693642693, are excluded. No stale A1/A2 grant
+is renewed. This proposal permits no retries, reruns, diagnostic redispatch or
+host reuse. A7/A11/M2/full F/G/real-Runner PA6 remain **unverified on real hardware**.
+
+Baseline is exactly main `7d8ab1c160a4af488f4a85abb8dc08a45e4d6103`, tree
+`ea260f731c6d0149de68df7f0e2fb9428a9bfb7f`. Local Git verification confirms exact
+reviewed `ebafeed` tree equality; PR127 all five green and Muse exact-head PASS
+comment6893948634 are supplied coordinator evidence. Runtime source candidate
+`7385785c50ec28118db6d84138f7dc9e21242ec7` is pinned in the
+[preparation evidence](../evidence/linux-a7-a11-execution-preparation.md), including
+every source blob/mode and the canonical profile facts. No future main SHA is
+invented. That evidence identifies static reviewed package/default/policy facts,
+not whole-host qualification before runtime checks.
+
+The sole dispatch candidate is the **first eligible normal main squash containing
+this D7i and its fixed runtime source**, after fresh independent Muse source/security
+review before publication, different-provider exact-head review, all five green
+required checks (three platform verify, ci-time-budget, agent-review), and coordinator
+merge. The changed Linux controller must compile in hosted Linux CI. Required
+source corrections need fresh review and updated exact blob inventory before this
+proposal can become effective; they cannot be substituted after review.
+
+Strict baseline-to-candidate diff predicate: compare recursive full trees including
+modes, with no deletions, renames, type changes or executable-bit changes. ONLY these
+regular100644 paths may differ:
+
+- crates/arxd/src/exec/disposable/sudo_nnp.rs
+- tools/unix-exec-validation/driver.py
+- tools/unix-exec-validation/test_driver.py
+- tools/unix-exec-validation/mutation_check.py
+- docs/adr/0019-unix-native-execution-bridge.md
+- docs/evidence/linux-a7-a11-execution-preparation.md (new)
+- docs/reviews/m2-a7-a11-execution-candidate-muse-review.md (new retained fresh review)
+- docs/PROGRESS.md (existing parent/coordinator checkpoint only; builder does not edit)
+
+The four source blobs must equal the reviewed inventory; every other non-doc
+blob/mode must equal both the inventory and baseline. Comparator, native workflow,
+package/Standard drop-in, helper, Cargo/lockfile/toolchain, normal CI/policy and
+production code must stay byte-identical. No unrelated delta is admitted. Record
+reviewed head/tree, main squash/tree, exact delta and complete source inventory;
+reviewed head and squash must have exact full-tree equality. Read back live main
+immediately before pin/dispatch: it must still be that exact candidate. Any main
+advance, mismatched tree/workflow/source/pin or unrelated delta stops this grant
+and requires a new reviewed disposition, never normalization or adoption.
+
+After those gates, coordinator only may set UNIX_EXECUTION_REVIEWED_SHA once to
+that exact main squash, read back equality, then dispatch unix-execution-experiment.yml
+once on one new GitHub-hosted Ubuntu24.04 amd64 host. Source SHA == workflow SHA ==
+reviewed pin == checkout HEAD must all agree with the reviewed candidate. Existing
+fixed repository/actor/triggering actor/event/main/host/root gates stay mandatory;
+A7 attempt must be1. Use only the fixed combined TEST; no workflow input, alternate
+selector, caller profile, package revision or fixture paths. Keep the distinct
+SUDO_PACKAGE_REVIEWED_SHA absent; D7h is not a prerequisite to rerun on another host.
+
+Native scope, on that SAME NEW host: existing fixed privilege transport, finite
+runtime package _read_linux comparison of installed sudo/plugin/util against the
+reviewed Noble1.9.15p5-3ubuntu5.24.04.4 amd64 payload/default facts under D8/A1;
+protected C2 absent-or-trusted and /bin alias identity; root/kernel/systemd/cgroup2/
+controller/delegation floor; owned fixture/artifact/account provisioning; exactly
+four controlled read-only policy mappings and in-unit literal/entry/mount/NSS checks;
+then actual production tool-probe and fixed E4 NNP reentry for BOTH accounts, with
+all existing identity/status/descriptor/output/cleanup oracles and owned final cleanup.
+Read equality from the consumed D7h host cannot substitute for these checks.
+Unknown bytes, architecture, path, link/plugin/mapping/floor/account identity,
+profile mismatch or failed oracle refuses. The canonical profile is a fixed label
+for reviewed facts, never self-attestation by a delivery digest. No original-host
+policy capture/reconstruction, sudo -V/list oracle, full OS audit, production
+activation or owner administrative work. Existing A4 helper workflow compilation
+remains compile-only; it gains no native execution authority.
+
+Keep the merged budgets, two workers, both cancellation domains and join-both,
+markers, reservations, stop/cgroup/live-UID confirmation, owned-only cleanup and
+quarantine on uncertainty. No timeout relaxation or detached cleanup. A late syscall
+or cleanup may exceed measured envelopes; it refuses, never earns bounded-completion
+credit. No native account/policy effects are permitted outside the disposable fixture.
+
+Capture the accepted run URL **directly from dispatch output**, bind run ID/attempt1,
+and monitor THAT exact URL through terminal outcome. Retain the pin throughout,
+including failed ancillary lookups. Uncertain identity requires bounded reconciliation
+against that direct URL, no early pin deletion or second dispatch. Finally delete
+the variable after the exact run is terminal (or confirmed dispatch rejection with
+no accepted run), then independently verify HTTP404 absence. Verify both native and
+read-only variables absent. Any accepted dispatch consumes D7i regardless of skip,
+failure or success; rejection also grants no retry. Retain bounded sanitized source/
+workflow/run/oracle/cleanup evidence, exclude the host, and obtain independent
+source/run/oracle assessment before claiming either case or M2 credit. No extra
+owner confirmation or product approval flow is introduced.
+
 ## Contract clarifications (2026-11-12)
 
 These settle Sol advisories B-A1 and B-A2 (credited to the
