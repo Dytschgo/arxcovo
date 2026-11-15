@@ -984,6 +984,8 @@ owner confirmation or product approval flow is introduced.
 
 ### D7j. Proposed single read-only admission-chain observation (2026-11-15)
 
+**Consumed by accepted run43720496074 attempt1/job132831225756 on main7a26fcdd9729ee858c9fc5e1610ff4b75d408592. Six-second read-only leg intentionally refused E_PATH: usr_local_bin root/type accepted, group_other_write_absent=false; stopped before unsafe open. All three pins independently absent404 after finally-clear. No retry, qualification or native acceptance. Remaining text records historical grant only.**
+
 **Preparation only; inactive.** D7a–i stay consumed, all their hosts excluded.
 The binding coordinator correction in
 [the next-execution disposition](../reviews/m2-a7-next-execution-disposition.md)

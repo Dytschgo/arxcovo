@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "run": "43720496074",
+  "attempt": 1,
+  "job": "132831225756",
+  "source_sha": "7a26fcdd9729ee858c9fc5e1610ff4b75d408592",
+  "workflow_sha": "7a26fcdd9729ee858c9fc5e1610ff4b75d408592",
+  "event": "workflow_dispatch",
+  "branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "failure",
+  "started_at": "2026-11-15T13:43:43Z",
+  "completed_at": "2026-11-15T13:43:49Z",
+  "duration_seconds": 6,
+  "steps_success": 5,
+  "steps_failure": 1,
+  "report": {
+    "binding": {
+      "attempt": "1",
+      "run": "43720496074",
+      "source_sha": "7a26fcdd9729ee858c9fc5e1610ff4b75d408592",
+      "workflow_sha": "7a26fcdd9729ee858c9fc5e1610ff4b75d408592"
+    },
+    "diagnosis": {
+      "code": "E_PATH",
+      "native_credit": false,
+      "predicates": [
+        {
+          "group_other_write_absent": true,
+          "owner_is_root": true,
+          "role": "root",
+          "type_accepted": true
+        },
+        {
+          "group_other_write_absent": true,
+          "owner_is_root": true,
+          "role": "usr",
+          "type_accepted": true
+        },
+        {
+          "group_other_write_absent": true,
+          "owner_is_root": true,
+          "role": "usr_local",
+          "type_accepted": true
+        },
+        {
+          "group_other_write_absent": false,
+          "owner_is_root": true,
+          "role": "usr_local_bin",
+          "type_accepted": true
+        }
+      ],
+      "qualified": false,
+      "schema": 1,
+      "status": "read_only_diagnosis"
+    },
+    "schema": 1
+  },
+  "all_three_pins_absent_http404": true,
+  "retry_authorized": false,
+  "native_credit": false
+}

@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #131, `7a26fcdd9729ee858c9fc5e1610ff4b75d408592` at 13:42:55Z, independent Muse exact-head PASS6895123755 and all five gates green (agent-review status58962440969). Squash/reviewed489a5d4 tree `c2d56d5e1a30262af0c9ef574d6dd507cd31ca5f` identical; exact D7j scope/modes/four source pins verified.
-- Current work: accepted D7j read-only run43720496074 attempt1/job132831225756 on exact7a26fcd is in progress. Direct URL monitor retains dedicated A7 admission pin through terminal then finally clears/404; both old pins absent before dispatch. D7j consumed regardless of outcome, host excluded after, no retry or A7/A11 acceptance. Monitor completion wakes coordinator for closed predicate record and independent assessment.
+- Current work: independently assess D7j closed result and settle minimal fixture-local remedy. Fresh run43720496074 exact7a26fcd returned E_PATH because usr_local_bin group/other-write predicate failed (root/type pass), reader stopped before unsafe open. All three pins absent404; D7j consumed, no retry/native acceptance or historical cause claim. Protected-path fences remain; no host permission mutation. Active assessment/architecture completion wake awaited.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: D7j run43720496074/job132831225756 failed6s with useful closed readonlydiagnosis: root/usr/usr_local allpredicates true, usr_local_bin root/type true and group_other_write_absent false, no child traversal. One schema extracted within2MiB, no rawpayload. Finally-cleared dedicated pin and independent allthree404 confirmed. D7j consumed/hostexcluded, no historicalcause or A7/A11 credit; independent assessment and fixture-local remedy decision follow.
 
 - 2026-11-15: Coordinator verified five gates/independent PASS, unwatched and merged PR1317a26fcd; reviewedtree/sourceinventory and exact8path100644 predicate match. Allthreepins absent, dedicated admission pin set once and exactlive main/readback checked; direct URL accepted43720496074 attempt1/job132831225756 workflow_dispatch/main/Dytschgo. Background monitor69861 awaits exactterminal thenfinallyclear404. D7j consumed; no record/result/qualification or NNP acceptance yet.
 
