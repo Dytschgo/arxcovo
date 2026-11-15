@@ -444,3 +444,7 @@ the predicate above and by reviewed-head/squash tree equality.
 100644 blob 041854f74501ecbb719e93f24f73e471596ab572	ui/vite.config.ts
 100644 blob b916fd8d80a9ae1434207a621d8cfc15291c271a	ui/vitest.config.ts
 ```
+
+## Actual final D7k dispatch binding
+
+PR134 merged `07d88692e2f1480c6e18ff5df846cfb871a18033` at2026-11-15T15:07:24Z after independent Sol exact-head PASS6896501718/status58965170994 andallfivegreens. Reviewed `a85a093f3a930e849812c016879b1729428ab006` andsquash tree `ec024a1fdbd5801f13912951bcf59d951d82e1f8` identical. Baselineparent52ce2a5, exactfourdoc100644predicate/full222inventory19629bytes/SHA25604a7f684.../all16keypins independently verified atcandidate. Allthreevariablesabsent404, nativepinsetonce/readback/live-main exact. Accepted FINAL Opus-owned run43728169361 attempt1/job132854558246 exact07d8869 workflow_dispatch/main/actortriggerDytschgo via directreturnedURL. Monitor retains pin through terminal thenfinallyclears/allthree404; run inprogress. FinalD7kbudgetconsumed regardlessofoutcome, anymissdedicated-hostNO-GO; no retry/diagnostic/newgrantreset or nativeacceptanceclaimed.
