@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #146, `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` at22:19:44Z; independent Opus exact-head PASS6902189029/status58980320152 and all five gates green. Reviewed3476da6/squash full trees equal. Hosted three-OS actual snapshot catch-up and post-catch-up append credit is in-process only, not fullM3 acceptance.
-- Current work: bounded independent Sol high diagnoses of the intermittent consensus append and Linux shim s9c tests. Consensus hotfix has priority and will be independently reviewed before publication. Member-registry Opus R1 test corrections are retained locally while these diagnoses run; no registry acceptance or M2 native retry is implied.
+- Current work: bounded Sol high consensus append diagnosis; the Linux shim s9c reproduction is blocked on an available ordinary Linux environment. Consensus hotfix has priority and will be independently reviewed before publication. Member-registry Opus R1 test corrections are retained locally while these diagnoses run; no registry acceptance or M2 native retry is implied.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -36,6 +36,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Sol high Linux s9c diagnosis9c677b1 records no usable local Linux environment: WSL not installed, container clients absent, read-only Multipass inventory bounded at8s without establishing availability. Zero test executions and zero fix attempts; no cause, timeout change or quarantine. [Bounded repeat handoff](evidence/linux-s9c-intermittent-diagnosis.md) keeps this flake unresolved. Consensus diagnosis remains active and prioritized.
 
 - 2026-11-16: Two isolated Sol high bounded diagnoses are active: consensus append callback/poison test (priority hotfix) and Linux s9c bound-object test (local Linux availability must first be established). No cause is asserted yet. Latest exact-main CI43768671593 is independently confirmed green. Both fixes require independent Opus review and fresh hosted gates; no native M2 grant or retry follows.
 
