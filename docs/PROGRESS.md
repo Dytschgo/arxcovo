@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #119, `d18a721d601aa625698826399df0b0820d3f0290` at 05:51:15Z, independent Muse exact-head PASS and all five gates green. Squash tree `fecfc45295dc45edce0b412e6e831f2ef530b9fe` equals reviewed `991bc75`; hosted Linux delivery integration compiled. No native A7/A11 credit.
-- Current work: publish injected qualification source after independent Muse PASS (all axes zero findings, ten mocks/17 mutants rerun green). Coordinator retains exact UTF8LF review artifact; reviewer left it uncommitted. Empty allowlist/qualified=false/refusing CLI remain. Public policy provenance research separately active; OS adapter/floor evidence/new read-only grant absent, no host reads or native A7/A11/M2/full F/G/PA6 credit.
+- Last merged: PR #120, `7ad58d9b41ed652f75fc2471cdd1f90214631b04` at 06:13:22Z, independent Muse exact-head PASS and all five gates green. Squash tree `4d9d9d2702b847d1b464d8ce3dbca03dabf5f20f` equals reviewed `ef28fba`; injected qualification model only, no host adapter/read or authority.
+- Current work: Muse architecture decision compares controlled fixture-local policy construction with current complete-host-byte private-review route. Public policy reconstruction incomplete; list-query shortcut independently rejected. Current exact-byte contract remains binding; source collector CLI refuses and qualified=false. No further native grant; A7/A11/M2/full F/G/PA6 remain open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
