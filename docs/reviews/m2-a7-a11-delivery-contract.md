@@ -88,3 +88,42 @@ grant pins both cases, source/artifacts/workflow/profile, one dispatch and varia
 set/absence lifecycle. D7a-g remain consumed; no retries or host reuse. Coordinator
 automates authorized fresh-host actions through independent review and green required
 gates including ci-time-budget; no new human approval. No ADR rewrite absent spec change.
+
+## Binding review corrections (source preparation)
+
+The following four exact pins supersede abbreviated wording above and bind the source slice:
+
+1. JSON-to-gate binding. Schema list alone does not bind the JSON. Require:
+   JSON `run` equals `gate`/`identity` (`GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`);
+   `source_sha` equals `GITHUB_SHA == ARX_REVIEWED_SHA == ARX_WORKFLOW_SHA`;
+   `host_profile_sha256` equals the independently reviewed attested profile
+   digest for this exact host/image. Any mismatch refuses before effects.
+2. Reentry-to-harness identity. "Libtest copy is both E4 caller and the same
+   build as controller" is ambiguous across the two cargo invocations.
+   Require: the staged libtest artifact comes from the single
+   `cargo test --locked --lib --no-run --message-format=json` invocation that
+   also produced the harness binary, and its bytes equal the harness artifact
+   bytes (hash equality checked before copy and rechecked after copy);
+   the staged arxd artifact comes from the single
+   `cargo build --locked --bin arxd --message-format=json` invocation as the
+   one non-test artifact. State the copy direction (held-fd read, `O_EXCL`
+   create, destination byte reverify) for both.
+3. Exact `OwnerConfig`/`RunSpec` field names. "Private roots=[stage]" and
+   "cwd/rights config" do not name code fields. Require:
+   `account=name`, `uid`/`gid`=captured `>=1000` distinct across cases,
+   `workspace=/var/lib/<name>/workspace` derived (never from JSON),
+   `protected_directories=[stage]`, `environment={PATH:/usr/bin:/bin}`,
+   `admin=false`, `cgroup_parent=/sys/fs/cgroup/system.slice/arxd.service/runs`,
+   `memory_bytes=64MiB`, `pids=32`, `RunSpec.cwd=workspace`,
+   `timeout=20s`, `output_bytes=4096`; recheck owned base/workspace
+   dev/ino + owner + `0700` immediately before each Runner call.
+4. Executable admission TOCTOU scope. "Hold descriptors; recheck named identity"
+   is insufficient unless the recheck is an `O_NOFOLLOW|O_CLOEXEC` open plus
+   `fstat` dev/ino/mode/uid/nlink match against the pinned JSON immediately
+   before each Runner call, and `protected()` covers every ancestor including
+   `/usr`, `/usr/libexec`, and the exclusive
+   `/usr/libexec/arxcovo-a7-a11-<run>-<attempt>` dir itself (root-owned `0755`,
+   no pre-existing adoption). State the load-bearing assumption: only
+   root-writable ancestry makes path-based exec after recheck safe; build
+   accounts hold no write bit on any ancestor.
+
