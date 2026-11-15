@@ -35,8 +35,8 @@ def a4_selected():
     return TEST == 'exec::disposable::a4::disposable_linux_a4'
 
 
-A4_IMAGE_SHA = 'fc814889c294db4216093e8f360201401be2c1b2dc6c4b01fd84617701f3a92e'
-A4_IMAGE_SIZE = 3696
+A4_IMAGE_SHA = 'cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369'
+A4_IMAGE_SIZE = 3680
 
 
 def a4_image(data):
@@ -48,7 +48,7 @@ def a4_image(data):
 def a4_input(name, bound):
     # Fixed checkout-relative assets only, each opened root-down without links.
     # Checkout is the existing reviewed-source boundary; not owner attestation.
-    require(name in ('helper.rs', 'recipe.json', 'image-pin.json',
+    require(name in ('helper.rs', 'recipe.json', 'linux-image-pin.json',
                      'out/candidate-pin.json', 'out/a4-helper'), 'E_PATH')
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     fd = os.open('/', flags | os.O_DIRECTORY)
@@ -77,15 +77,15 @@ def a4_input(name, bound):
 def a4_delivery():
     require(a4_selected(), 'E_TEST_ARGS')
     # Source/recipe authorization is independent of image authorization. The
-    # Windows pin stays unchanged; Linux candidates get no self-authorization.
+    # Both independent host pins stay fixed; candidates get no self-authorization.
     inputs = {}
     for name, digest in (
         ('helper.rs', '770ab397264ab78deb5d54854bd00d4cfabb1b3660b0e975ee751472fbeada5a'),
         ('recipe.json', '90a3d497971ce504470c6bbead42e4a1b37f77ec0cd56b11cbb6312be739b47d'),
-        ('image-pin.json', '7ae3e8c501e53681e327d2b229ed45b5870ba0e9df7a3c304aad1025631df971')):
+        ('linux-image-pin.json', '6427856805b5fa362de01cace73930c6f1f9fa78ee08f32a8da61a252b0a13d8')):
         inputs[name] = a4_input(name, 16384)
         require(hashlib.sha256(inputs[name]).hexdigest() == digest, 'E_ARTIFACT')
-    reviewed = json.loads(inputs['image-pin.json'])
+    reviewed = json.loads(inputs['linux-image-pin.json'])
     candidate = json.loads(a4_input('out/candidate-pin.json', 16384), object_pairs_hook=unique_pairs)
     require(type(candidate) is dict and set(candidate) == set(reviewed), 'E_ARTIFACT')
     # Compiler hashes are observations of the unprivileged Linux build, not a

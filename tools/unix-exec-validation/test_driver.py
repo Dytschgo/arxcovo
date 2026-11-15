@@ -970,7 +970,7 @@ class A4Delivery(unittest.TestCase):
                 opened.assert_not_called()
 
     def test_size_and_hash_both_required_before_open(self):
-        for data in (b'', b'x' * 3696, b'x' * 3697):
+        for data in (b'', b'x' * 3680, b'x' * 3681):
             with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
                 driver.a4_image(data)
             with patch.object(driver, 'TEST', self.selected), \
@@ -992,11 +992,11 @@ class A4Delivery(unittest.TestCase):
 
     def test_linux_provenance_and_fixed_pin_before_image(self):
         root = ROOT / 'tools/unix-exec-validation/a4-helper'
-        inputs = {name: (root / name).read_bytes() for name in ('helper.rs', 'recipe.json', 'image-pin.json')}
-        pin = json.loads(inputs['image-pin.json'])
+        inputs = {name: (root / name).read_bytes() for name in ('helper.rs', 'recipe.json', 'linux-image-pin.json')}
+        pin = json.loads(inputs['linux-image-pin.json'])
         candidate = dict(pin, compiler_identity=pin['compiler_identity'].replace(
             'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'))
-        for key, bad in [('compiler_identity', pin['compiler_identity']), ('compiler_sha256', ''),
+        for key, bad in [('compiler_identity', pin['compiler_identity'].replace('x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc')), ('compiler_sha256', ''),
                          ('flags', []), ('image_sha256', '0' * 64), ('source_sha256', '0' * 64)]:
             altered = dict(candidate, **{key: bad})
             def read(name, bound):
@@ -1015,7 +1015,7 @@ class A4Delivery(unittest.TestCase):
             image.assert_called_once_with(b'synthetic reviewed image')
 
     @staticmethod
-    def info(mode=stat.S_IFDIR | 0o755, uid=0, inode=1, size=3696, links=1):
+    def info(mode=stat.S_IFDIR | 0o755, uid=0, inode=1, size=3680, links=1):
         return SimpleNamespace(st_mode=mode, st_uid=uid, st_dev=1, st_ino=inode,
                                st_size=size, st_nlink=links)
 
@@ -1028,7 +1028,7 @@ class A4Delivery(unittest.TestCase):
         stack.enter_context(patch.object(driver, 'TEST', self.selected))
         mocks = {'image': stack.enter_context(patch.object(driver, 'a4_image', side_effect=lambda data: data))}
         defaults = dict(open=[10, 11, 12, 13, 14], fstat=self.info(),
-                        stat=self.info(), write=3696, read=b'x' * 3696,
+                        stat=self.info(), write=3680, read=b'x' * 3680,
                         listdir=['a4-helper'])
         for name in ('open', 'close', 'fstat', 'stat', 'mkdir', 'write', 'fchmod',
                      'lseek', 'read', 'listdir', 'unlink', 'rmdir'):
@@ -1042,13 +1042,13 @@ class A4Delivery(unittest.TestCase):
         file = self.info(stat.S_IFREG | 0o755)
         mocks = self.staging(fstat=[self.info()] * 4 + [file, file, self.info(), self.info()])
         owned = {}
-        driver.install_a4_helper(b'x' * 3696, owned)
+        driver.install_a4_helper(b'x' * 3680, owned)
         self.assertEqual(set(owned), {'parent', 'created', 'directory', 'fd', 'image'})
         opened = mocks['open'].call_args_list
         self.assertEqual([c.args[0] for c in opened], ['/', 'usr', 'libexec', 'arxcovo', 'a4-helper'])
         self.assertTrue(all(c.args[1] & driver.os.O_NOFOLLOW for c in opened))
         self.assertTrue(opened[-1].args[1] & os.O_EXCL)
-        mocks['read'].assert_called_once_with(14, 3697)
+        mocks['read'].assert_called_once_with(14, 3681)
         self.assertEqual(mocks['image'].call_count, 2)
         mocks['fchmod'].assert_called_once_with(14, 0o755)
         mocks['stat'].side_effect = [owned['directory'], owned['image']]
@@ -1060,7 +1060,7 @@ class A4Delivery(unittest.TestCase):
         mocks = self.staging(mkdir=FileExistsError())
         owned = {}
         with self.assertRaises(FileExistsError):
-            driver.install_a4_helper(b'x' * 3696, owned)
+            driver.install_a4_helper(b'x' * 3680, owned)
         driver.remove_a4_helper(owned)
         self.assertNotIn('directory', owned)
         mocks['unlink'].assert_not_called()
@@ -1071,7 +1071,7 @@ class A4Delivery(unittest.TestCase):
                      self.info(stat.S_IFLNK | 0o755), self.info(stat.S_IFREG | 0o755)):
             mocks = self.staging(fstat=info)
             with self.assertRaisesRegex(RuntimeError, 'E_PATH'):
-                driver.install_a4_helper(b'x' * 3696, {})
+                driver.install_a4_helper(b'x' * 3680, {})
             mocks['mkdir'].assert_not_called()
 
     def test_replaced_or_extra_asset_quarantines(self):
@@ -1088,7 +1088,7 @@ class A4Delivery(unittest.TestCase):
     def test_short_write_cannot_launch(self):
         mocks = self.staging(write=3695)
         with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
-            driver.install_a4_helper(b'x' * 3696, {})
+            driver.install_a4_helper(b'x' * 3680, {})
         mocks['fchmod'].assert_not_called()
         mocks['close'].assert_any_call(14)
 
@@ -1102,15 +1102,15 @@ class A4Delivery(unittest.TestCase):
 
     def test_fixed_input_no_follow_bounded_regular_single_link(self):
         for info in (self.info(stat.S_IFLNK), self.info(stat.S_IFIFO),
-                     self.info(stat.S_IFREG, size=3697), self.info(stat.S_IFREG, links=2)):
+                     self.info(stat.S_IFREG, size=3681), self.info(stat.S_IFREG, links=2)):
             mocks = self.staging(open=[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], fstat=info)
             with patch.object(driver.Path, 'cwd', return_value=PurePosixPath('/checkout')):
                 with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
-                    driver.a4_input('out/a4-helper', 3696)
+                    driver.a4_input('out/a4-helper', 3680)
             self.assertTrue(all(c.args[1] & driver.os.O_NOFOLLOW for c in mocks['open'].call_args_list))
             mocks['read'].assert_not_called()
         with self.assertRaisesRegex(RuntimeError, 'E_PATH'):
-            driver.a4_input('../foreign', 3696)
+            driver.a4_input('../foreign', 3680)
 
     def test_cleanup_after_stop_before_runtime_removal(self):
         events = []

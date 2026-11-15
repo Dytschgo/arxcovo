@@ -1,0 +1,353 @@
+{
+  "schema": "a4-helper-compile-comparison-1",
+  "run": 43658953897,
+  "job": 132643750056,
+  "head": "75d2ef8dc0582ad6cde8b4e439ecd91cd150ea94",
+  "image_executed": false,
+  "windows_cross_layout": {
+    "elf_header": [
+      2,
+      62,
+      1,
+      2102124,
+      64,
+      3120,
+      0,
+      64,
+      56,
+      5,
+      64,
+      9,
+      7
+    ],
+    "entry": 2102124,
+    "loads_without_section_table_offset": [
+      {
+        "offset": 0,
+        "sha256": "f784e75f73cc8661a0008502709a1e1da56a7afb1fc3472498383dab0c9074c2",
+        "size": 876
+      },
+      {
+        "offset": 876,
+        "sha256": "cc1a943206e25a739c49f02cf06a81ec7690e112578939891e2b281695cd812d",
+        "size": 1332
+      }
+    ],
+    "program_headers": [
+      [
+        6,
+        4,
+        64,
+        2097216,
+        2097216,
+        280,
+        280,
+        8
+      ],
+      [
+        1,
+        4,
+        0,
+        2097152,
+        2097152,
+        876,
+        876,
+        4096
+      ],
+      [
+        1,
+        5,
+        876,
+        2102124,
+        2102124,
+        1332,
+        1332,
+        4096
+      ],
+      [
+        1685382480,
+        4,
+        348,
+        2097500,
+        2097500,
+        76,
+        76,
+        4
+      ],
+      [
+        1685382481,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "sections": [
+      {
+        "address": 0,
+        "alignment": 0,
+        "flags": 0,
+        "name": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 0,
+        "type": 0
+      },
+      {
+        "address": 2097496,
+        "alignment": 1,
+        "flags": 2,
+        "name": ".rodata",
+        "sha256": "8c2574892063f995fdf756bce07f46c1a5193e54cd52837ed91e32008ccf41ac",
+        "size": 1,
+        "type": 1
+      },
+      {
+        "address": 2097500,
+        "alignment": 4,
+        "flags": 2,
+        "name": ".eh_frame_hdr",
+        "sha256": "b71fade02dd86a833e5661afae96dc577fb8d4d517a0281a1935e5c663526450",
+        "size": 76,
+        "type": 1
+      },
+      {
+        "address": 2097576,
+        "alignment": 8,
+        "flags": 2,
+        "name": ".eh_frame",
+        "sha256": "3a3a30bfab6d9560ea26c23ced479fa3d40be9635a1747abafa283f25902e317",
+        "size": 452,
+        "type": 1
+      },
+      {
+        "address": 2102124,
+        "alignment": 4,
+        "flags": 6,
+        "name": ".text",
+        "sha256": "cc1a943206e25a739c49f02cf06a81ec7690e112578939891e2b281695cd812d",
+        "size": 1332,
+        "type": 1
+      },
+      {
+        "address": 0,
+        "alignment": 1,
+        "flags": 48,
+        "name": ".comment",
+        "sha256": "8d13bfd02d611b9d163246846d6bf5b4ca6b93ca0b43783a13c37fb2542f41f1",
+        "size": 153,
+        "type": 1
+      },
+      {
+        "address": 0,
+        "alignment": 8,
+        "flags": 0,
+        "name": ".symtab",
+        "sha256": "a1cd0c88f0a50b50ff542cf11d7f446600f650d154c203bc019db24c1b467734",
+        "size": 264,
+        "type": 2
+      },
+      {
+        "address": 0,
+        "alignment": 1,
+        "flags": 0,
+        "name": ".shstrtab",
+        "sha256": "e8ee5011864661202c0f3e223192391b0b95be27f780deb9e0fc85ae22b54e96",
+        "size": 74,
+        "type": 3
+      },
+      {
+        "address": 0,
+        "alignment": 1,
+        "flags": 0,
+        "name": ".strtab",
+        "sha256": "76e392ddbdf7ded69b8a8c363f05070a30299b582bddecd860ee6e0503f4152b",
+        "size": 407,
+        "type": 3
+      }
+    ]
+  },
+  "linux_comparison": {
+    "compiler_sha256": "bff349e72704ff70bc08a234a3847338e797065bbedde5e556808bc87b7bf7c6",
+    "image_sha256": "cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369",
+    "image_size": 3680,
+    "kind": "a4-compile-comparison",
+    "layout": {
+      "elf_header": [
+        2,
+        62,
+        1,
+        2102124,
+        64,
+        3104,
+        0,
+        64,
+        56,
+        5,
+        64,
+        9,
+        7
+      ],
+      "entry": 2102124,
+      "loads_without_section_table_offset": [
+        {
+          "offset": 0,
+          "sha256": "f784e75f73cc8661a0008502709a1e1da56a7afb1fc3472498383dab0c9074c2",
+          "size": 876
+        },
+        {
+          "offset": 876,
+          "sha256": "cc1a943206e25a739c49f02cf06a81ec7690e112578939891e2b281695cd812d",
+          "size": 1332
+        }
+      ],
+      "program_headers": [
+        [
+          6,
+          4,
+          64,
+          2097216,
+          2097216,
+          280,
+          280,
+          8
+        ],
+        [
+          1,
+          4,
+          0,
+          2097152,
+          2097152,
+          876,
+          876,
+          4096
+        ],
+        [
+          1,
+          5,
+          876,
+          2102124,
+          2102124,
+          1332,
+          1332,
+          4096
+        ],
+        [
+          1685382480,
+          4,
+          348,
+          2097500,
+          2097500,
+          76,
+          76,
+          4
+        ],
+        [
+          1685382481,
+          6,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "sections": [
+        {
+          "address": 0,
+          "alignment": 0,
+          "flags": 0,
+          "name": "",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0,
+          "type": 0
+        },
+        {
+          "address": 2097496,
+          "alignment": 1,
+          "flags": 2,
+          "name": ".rodata",
+          "sha256": "8c2574892063f995fdf756bce07f46c1a5193e54cd52837ed91e32008ccf41ac",
+          "size": 1,
+          "type": 1
+        },
+        {
+          "address": 2097500,
+          "alignment": 4,
+          "flags": 2,
+          "name": ".eh_frame_hdr",
+          "sha256": "b71fade02dd86a833e5661afae96dc577fb8d4d517a0281a1935e5c663526450",
+          "size": 76,
+          "type": 1
+        },
+        {
+          "address": 2097576,
+          "alignment": 8,
+          "flags": 2,
+          "name": ".eh_frame",
+          "sha256": "3a3a30bfab6d9560ea26c23ced479fa3d40be9635a1747abafa283f25902e317",
+          "size": 452,
+          "type": 1
+        },
+        {
+          "address": 2102124,
+          "alignment": 4,
+          "flags": 6,
+          "name": ".text",
+          "sha256": "cc1a943206e25a739c49f02cf06a81ec7690e112578939891e2b281695cd812d",
+          "size": 1332,
+          "type": 1
+        },
+        {
+          "address": 0,
+          "alignment": 1,
+          "flags": 48,
+          "name": ".comment",
+          "sha256": "e8780c076734fe8cf032ac94e3ccdefe4dbd4ac1a6e255e9b41635fd73f5c570",
+          "size": 139,
+          "type": 1
+        },
+        {
+          "address": 0,
+          "alignment": 8,
+          "flags": 0,
+          "name": ".symtab",
+          "sha256": "a1cd0c88f0a50b50ff542cf11d7f446600f650d154c203bc019db24c1b467734",
+          "size": 264,
+          "type": 2
+        },
+        {
+          "address": 0,
+          "alignment": 1,
+          "flags": 0,
+          "name": ".shstrtab",
+          "sha256": "e8ee5011864661202c0f3e223192391b0b95be27f780deb9e0fc85ae22b54e96",
+          "size": 74,
+          "type": 3
+        },
+        {
+          "address": 0,
+          "alignment": 1,
+          "flags": 0,
+          "name": ".strtab",
+          "sha256": "76e392ddbdf7ded69b8a8c363f05070a30299b582bddecd860ee6e0503f4152b",
+          "size": 407,
+          "type": 3
+        }
+      ]
+    },
+    "linker_sha256": "60f305b55da767671e895b231e0c78e87f4ccbf790d7181842039c53bb60281c",
+    "matches": {
+      "flags": true,
+      "image_sha256": false,
+      "image_size": false,
+      "source_sha256": true,
+      "symbols": true
+    },
+    "symbol_count": 10,
+    "symbol_names_match": true
+  }
+}

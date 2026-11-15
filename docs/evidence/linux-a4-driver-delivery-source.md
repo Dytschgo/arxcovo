@@ -137,3 +137,35 @@ second mapped1332bytes has the .text hash above. Expected complete layout is
 retained in ignored out/windows-layout.json. Ten mocked tests pass. Actual
 Linux section/load comparison remains pending; no metadata-only conclusion
 or image fix is claimed before that evidence. No helper image is executed.
+
+## Concrete host-metadata diagnosis and proposed Linux pin
+
+Head75d2ef8 run43658953897 job132643750056 provides the complete bounded
+comparison retained in a4-helper-linux-build-comparison.json. Entry, program
+headers and both mapped-byte digests agree, except only e_shoff is masked in
+the header-containing segment. Every allocated section, .symtab, .strtab and
+.shstrtab agrees. The sole section content difference is non-ALLOC .comment:
+Windows153bytes versus Linux139; section-table offset3120 versus3104 accounts
+for final size3696 versus3680. Other ELF header fields match.
+The ELF manual defines e_shoff as the section-table file offset and program
+headers as the execution segment descriptions:
+https://man7.org/linux/man-pages/man5/elf.5.html .
+
+This evidence supports a separate reviewed Linux image, not a relaxed runtime
+comparison. Preserve image-pin.json unchanged for Windows cross-build verify.
+Propose linux-image-pin.json from the actual hosted report: full image SHA256
+cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369,
+size3680, same source/flags/symbols, actual Linux compiler/linker digests.
+Build, driver admission and ignored Rust fixture use that fixed Linux pin;
+arbitrary candidate differences still fail the full-file hash/size gate.
+The new pin blob SHA256 is
+6427856805b5fa362de01cace73930c6f1f9fa78ee08f32a8da61a252b0a13d8.
+No normalizer participates in admission. Source helper and recipe flags are
+unchanged. Independent other-provider review of this exact evidence/pin update
+is required before merge or delivery. No native grant exists.
+
+Coordinator checks: six A4 pure models, ten helper-tool mocked tests,89 driver
+tests with36 assertion kills, F0 23 kills and F0b36kills/4equivalents passed;
+fmt, Windows package all-target offline Clippy -D warnings and diff check pass.
+No helper image executed. The previous red builds were diagnosis observations,
+not failed fixes to admit a candidate; this is the first proposed image fix.

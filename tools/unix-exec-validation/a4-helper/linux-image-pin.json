@@ -1,0 +1,96 @@
+{
+  "source_sha256": "770ab397264ab78deb5d54854bd00d4cfabb1b3660b0e975ee751472fbeada5a",
+  "compiler_identity": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+  "compiler_sha256": "bff349e72704ff70bc08a234a3847338e797065bbedde5e556808bc87b7bf7c6",
+  "linker_sha256": "60f305b55da767671e895b231e0c78e87f4ccbf790d7181842039c53bb60281c",
+  "flags": [
+    "--edition=2024",
+    "--target=x86_64-unknown-linux-gnu",
+    "-D",
+    "warnings",
+    "-C",
+    "panic=abort",
+    "-C",
+    "opt-level=z",
+    "-C",
+    "lto=fat",
+    "-C",
+    "codegen-units=1",
+    "-C",
+    "debuginfo=0",
+    "-C",
+    "overflow-checks=yes",
+    "-C",
+    "relocation-model=static",
+    "-C",
+    "linker-flavor=ld.lld",
+    "-C",
+    "link-arg=--build-id=none",
+    "-C",
+    "link-arg=-static"
+  ],
+  "image_sha256": "cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369",
+  "image_size": 3680,
+  "symbols": [
+    {
+      "name": "_ZN54_$LT$helper..native..Native$u20$as$u20$helper..Ops$GT$3now17hb2ca3f2d574ea81eE",
+      "type": 2,
+      "value": 2102138,
+      "size": 109
+    },
+    {
+      "name": "_ZN54_$LT$helper..native..Native$u20$as$u20$helper..Ops$GT$4poll17h46a4d9a5fde46a5aE",
+      "type": 2,
+      "value": 2102247,
+      "size": 50
+    },
+    {
+      "name": "_ZN6helper3run17hf0851dd1e5192355E",
+      "type": 2,
+      "value": 2102297,
+      "size": 426
+    },
+    {
+      "name": "_ZN6helper4wait17h3f1448223ef3cac3E",
+      "type": 2,
+      "value": 2102723,
+      "size": 133
+    },
+    {
+      "name": "_ZN6helper6native4exit17h8c71b3984c4b1976E",
+      "type": 2,
+      "value": 2102856,
+      "size": 18
+    },
+    {
+      "name": "_ZN6helper7decimal17ha41b0a6b767c520cE",
+      "type": 2,
+      "value": 2102874,
+      "size": 117
+    },
+    {
+      "name": "_ZN6helper9remaining17h7f5b03ccb4402ae3E",
+      "type": 2,
+      "value": 2102991,
+      "size": 150
+    },
+    {
+      "name": "_start",
+      "type": 16,
+      "value": 2102124,
+      "size": 0
+    },
+    {
+      "name": "entry",
+      "type": 18,
+      "value": 2103141,
+      "size": 315
+    },
+    {
+      "name": "helper.c6ca105ed2cd78ff-cgu.0",
+      "type": 4,
+      "value": 0,
+      "size": 0
+    }
+  ]
+}

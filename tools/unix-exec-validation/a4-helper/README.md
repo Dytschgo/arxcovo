@@ -73,35 +73,38 @@ segments, undefined/forbidden symbols and an entry other than recorded _start.
 Symbol names alone are not a proof of behavior; the single source plus fixed
 compiler/linker and artifact identity supply the reviewable closure.
 
-`image-pin.json` records a real **Windows-to-Linux cross-compile**, not a Linux
-hosted build or execution. Compiler host is explicitly Windows. No binary is
-committed or distributed. A Linux-host compiler has a different identity and
-must receive a separately reviewed recipe/pin, not overwrite this one or
-pretend its output is identical. The bounded exception below observes a Linux
-candidate without creating a new admission pin.
+`image-pin.json` preserves the reviewed **Windows-to-Linux cross-compile**
+(3,696 bytes). `linux-image-pin.json` records the actual hosted Linux build
+(3,680 bytes), with its observed compiler/linker identity and hashes. No binary
+is committed. Both use the same pinned source, flags and full symbol inventory.
+The [compile comparison](../../../docs/evidence/a4-helper-linux-build-comparison.json)
+records identical entry, program headers and mapped bytes after excluding only
+`e_shoff`, the non-runtime section-table offset. Only non-loaded `.comment`
+content and the resulting section-table location differ. This Linux pin awaits
+independent review with the source change; no arbitrary candidate may repin itself.
 
 ## Dormant Linux delivery preparation
 
 On an already-equipped Linux host, as a non-root account, `python
 tools/unix-exec-validation/a4-helper/build.py linux-candidate` uses the same
 source/flags and Rust release identity, with the Linux compiler host substituted.
-It records actual compiler/linker hashes in ignored `out/candidate-pin.json`;
-it compares source, flags, image hash, size and symbols to the unchanged reviewed
-pin and fails on any difference. A failed candidate record grants no admission.
-Neither build mode compiles as root. No toolchains are installed.
+It records compiler/linker observations in ignored `out/candidate-pin.json` and
+compares source, flags, exact image hash, size and symbols to the separately
+fixed `linux-image-pin.json`. Any difference refuses. Neither pin is overwritten.
+The section/load comparison report is diagnostic only; it cannot authorize an
+image or replace the full-file SHA-256 check. No toolchains are installed.
 
-The closed A4 driver branch requires that Linux provenance record and independently
-validates fixed source/recipe/pin bytes and the exact image before reservation or
-privileged mutation. Observed compiler hashes do not authorize a different image.
-Delivery holds the verified bytes in memory, exclusively creates root-owned
-`/usr/libexec/arxcovo`, and writes only `a4-helper` through no-follow descriptors.
-Existing parent entries refuse with no adoption; missing/untrusted ancestors also
-refuse. The staged held descriptor must match the same 3,696-byte image pin used
+The closed A4 driver branch independently validates fixed source/recipe/Linux-pin
+bytes and the exact Linux image before reservation or privileged mutation.
+Observed compiler hashes do not authorize a different image. Delivery holds
+verified bytes in memory, exclusively creates root-owned `/usr/libexec/arxcovo`,
+and writes only `a4-helper` through no-follow descriptors. Existing parent
+entries refuse with no adoption; missing/untrusted ancestors also refuse.
+The staged held descriptor must match the same 3,680-byte Linux image pin used
 by the ignored fixture. Owned cleanup follows unit stop and cgroup disappearance;
 replacement, extra entries or missing identity quarantine rather than delete.
 No launcher, image path parameter, environment override or root helper compile
-is added. Actual Linux-host build/equality evidence remains pending; do not replace
-the reviewed pin if it differs. Independent source/security review is pending.
+is added. Actual TEST stays A5; this tooling grants no native A4 execution.
 
 ## Pure checks
 

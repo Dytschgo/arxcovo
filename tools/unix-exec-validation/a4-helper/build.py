@@ -189,7 +189,7 @@ def main():
         regular(candidate)
         candidate.write_text(json.dumps(observed, indent=2) + "\n", encoding="utf-8")
         if candidate_mode:
-            pin = json.loads(read(ROOT / "image-pin.json"))
+            pin = json.loads(read(ROOT / "linux-image-pin.json"))
             keys = ("source_sha256", "flags", "image_sha256", "image_size", "symbols")
             matches = {key: observed[key] == pin[key] for key in keys}
             if not all(matches.values()):
@@ -204,7 +204,7 @@ def main():
                                   "symbol_names_match": [s["name"] for s in observed["symbols"]]
                                   == [s["name"] for s in pin["symbols"]]}, sort_keys=True))
                 raise ValueError("Linux candidate differs from independently reviewed image")
-        print("compile-only candidate written; reviewed image-pin.json unchanged")
+        print("compile-only candidate written; reviewed pins unchanged")
 
 
 def refusal_label(error):

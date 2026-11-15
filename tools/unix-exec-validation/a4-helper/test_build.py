@@ -54,7 +54,7 @@ class InventoryTests(unittest.TestCase):
     def test_linux_candidate_compares_independent_pin_never_updates_it(self):
         recipe = build.read(build.ROOT / 'recipe.json')
         source = build.read(build.ROOT / 'helper.rs')
-        pin = json.loads(build.read(build.ROOT / 'image-pin.json'))
+        pin = json.loads(build.read(build.ROOT / 'linux-image-pin.json'))
         identity = pin['compiler_identity'].replace('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu')
         data = bytes(elf())
         # Synthetic authorized identity stands in for the independently held pin.
@@ -62,7 +62,7 @@ class InventoryTests(unittest.TestCase):
         for differs in (False, True):
             def read(path):
                 return {'recipe.json': recipe, 'helper.rs': source,
-                        'image-pin.json': json.dumps(pin).encode(),
+                        'linux-image-pin.json': json.dumps(pin).encode(),
                         'a4-helper': data + (b'!' if differs else b'')}[path.name]
             with patch.object(sys, 'argv', ['build.py', 'linux-candidate']), \
                  patch.object(sys, 'platform', 'linux'), \
