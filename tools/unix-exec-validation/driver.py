@@ -1,5 +1,6 @@
 """Manual disposable CI only. Import and guard/planning functions have no effects."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -24,8 +25,145 @@ def standard_profile():
     require(TEST in ('exec::disposable::disposable_linux_a1_a2',
                      'exec::disposable::disposable_linux_a3_standard',
                      'exec::disposable::disposable_linux_a3_none',
+                     'exec::disposable::a4::disposable_linux_a4',
                      'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')
     return TEST != 'exec::disposable::disposable_linux_a3_none'
+
+
+def a4_selected():
+    standard_profile()
+    return TEST == 'exec::disposable::a4::disposable_linux_a4'
+
+
+A4_IMAGE_SHA = 'fc814889c294db4216093e8f360201401be2c1b2dc6c4b01fd84617701f3a92e'
+A4_IMAGE_SIZE = 3696
+
+
+def a4_image(data):
+    require(len(data) == A4_IMAGE_SIZE and
+            hashlib.sha256(data).hexdigest() == A4_IMAGE_SHA, 'E_ARTIFACT')
+    return data
+
+
+def a4_input(name, bound):
+    # Fixed checkout-relative assets only, each opened root-down without links.
+    # Checkout is the existing reviewed-source boundary; not owner attestation.
+    require(name in ('helper.rs', 'recipe.json', 'image-pin.json',
+                     'out/candidate-pin.json', 'out/a4-helper'), 'E_PATH')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    fd = os.open('/', flags | os.O_DIRECTORY)
+    try:
+        parts = (*Path.cwd().parts[1:], 'tools', 'unix-exec-validation', 'a4-helper',
+                 *name.split('/'))
+        for part in parts[:-1]:
+            child = os.open(part, flags | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        image = os.open(parts[-1], flags, dir_fd=fd)
+        try:
+            info = os.fstat(image)
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                    info.st_size <= bound, 'E_ARTIFACT')
+            with os.fdopen(os.dup(image), 'rb') as stream:
+                data = stream.read(bound + 1)
+            require(len(data) <= bound, 'E_ARTIFACT')
+            return data
+        finally:
+            os.close(image)
+    finally:
+        os.close(fd)
+
+
+def a4_delivery():
+    require(a4_selected(), 'E_TEST_ARGS')
+    # Source/recipe authorization is independent of image authorization. The
+    # Windows pin stays unchanged; Linux candidates get no self-authorization.
+    inputs = {}
+    for name, digest in (
+        ('helper.rs', '770ab397264ab78deb5d54854bd00d4cfabb1b3660b0e975ee751472fbeada5a'),
+        ('recipe.json', '90a3d497971ce504470c6bbead42e4a1b37f77ec0cd56b11cbb6312be739b47d'),
+        ('image-pin.json', '7ae3e8c501e53681e327d2b229ed45b5870ba0e9df7a3c304aad1025631df971')):
+        inputs[name] = a4_input(name, 16384)
+        require(hashlib.sha256(inputs[name]).hexdigest() == digest, 'E_ARTIFACT')
+    reviewed = json.loads(inputs['image-pin.json'])
+    candidate = json.loads(a4_input('out/candidate-pin.json', 16384), object_pairs_hook=unique_pairs)
+    require(type(candidate) is dict and set(candidate) == set(reviewed), 'E_ARTIFACT')
+    # Compiler hashes are observations of the unprivileged Linux build, not a
+    # replacement trust pin. Only the independent source/recipe/image may admit.
+    for key in ('compiler_sha256', 'linker_sha256'):
+        require(type(candidate[key]) is str and re.fullmatch('[0-9a-f]{64}', candidate[key]), 'E_ARTIFACT')
+        reviewed[key] = candidate[key]
+    reviewed['compiler_identity'] = reviewed['compiler_identity'].replace(
+        'host: x86_64-pc-windows-msvc', 'host: x86_64-unknown-linux-gnu')
+    require(candidate == reviewed, 'E_ARTIFACT')
+    return a4_image(a4_input('out/a4-helper', A4_IMAGE_SIZE))
+
+
+def a4_directory(fd):
+    info = os.fstat(fd)
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+            not info.st_mode & 0o022, 'E_PATH')
+    return info
+
+
+def install_a4_helper(data, owned):
+    require(a4_selected(), 'E_TEST_ARGS')
+    a4_image(data)  # before even opening the privileged parent
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    parent = os.open('/', flags | os.O_DIRECTORY)
+    owned['parent'] = parent
+    for part in ('usr', 'libexec'):
+        a4_directory(parent)
+        child = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent)
+        os.close(parent)
+        parent = child
+        owned['parent'] = parent
+    a4_directory(parent)
+    # Existing directories, links and any differing parent refuse: no adoption.
+    os.mkdir('arxcovo', mode=0o755, dir_fd=parent)
+    owned['created'] = True
+    owned['directory'] = os.stat('arxcovo', dir_fd=parent, follow_symlinks=False)
+    directory = os.open('arxcovo', flags | os.O_DIRECTORY, dir_fd=parent)
+    owned['fd'] = directory
+    info = a4_directory(directory)
+    require((info.st_dev, info.st_ino) ==
+            (owned['directory'].st_dev, owned['directory'].st_ino), 'E_FIXTURE_INODE')
+    fd = os.open('a4-helper', os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                 os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+    try:
+        owned['image'] = os.fstat(fd)
+        require(os.write(fd, data) == len(data), 'E_ARTIFACT')
+        os.fchmod(fd, 0o755)
+        owned['image'] = os.fstat(fd)
+        info = owned['image']
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                stat.S_IMODE(info.st_mode) == 0o755 and info.st_nlink == 1 and
+                info.st_size == A4_IMAGE_SIZE, 'E_ARTIFACT')
+        os.lseek(fd, 0, os.SEEK_SET)
+        a4_image(os.read(fd, A4_IMAGE_SIZE + 1))
+    finally:
+        os.close(fd)
+
+
+def remove_a4_helper(owned):
+    if 'directory' not in owned:
+        require(not owned.get('created'), 'E_QUARANTINE_CGROUP')
+        return  # collision owns no asset
+    require('fd' in owned, 'E_QUARANTINE_CGROUP')
+    parent, directory = owned['parent'], owned['fd']
+    a4_directory(parent)
+    a4_directory(directory)
+    def same(name, fd, expected):
+        now = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        require((now.st_dev, now.st_ino, now.st_mode, now.st_uid) ==
+                (expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid),
+                'E_FIXTURE_INODE')
+    same('arxcovo', parent, owned['directory'])
+    require(set(os.listdir(directory)) == ({'a4-helper'} if 'image' in owned else set()), 'E_PATH')
+    if 'image' in owned:
+        same('a4-helper', directory, owned['image'])
+        os.unlink('a4-helper', dir_fd=directory)
+    os.rmdir('arxcovo', dir_fd=parent)
 
 
 def identity(env):
@@ -848,6 +986,7 @@ def run_body(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     standard_profile()
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
+    helper_data = a4_delivery() if a4_selected() else None
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')
     cg_preflight()  # read-only; no retry or global controller writes
     stage, unit = plan(run_id)
@@ -855,6 +994,7 @@ def run_body(env):
     # Exclusive fixed-name reservation. A collision owns nothing and cleans nothing.
     fd, lock, lock_info = reserve_unit()
     owned = []
+    helper_owned = {}
     unit_created = False
     stage_created = False
     stage_info = None
@@ -865,6 +1005,8 @@ def run_body(env):
         stage.mkdir(mode=0o700)
         stage_created = True
         stage_info = stage.lstat()
+        if helper_data is not None:
+            install_a4_helper(helper_data, helper_owned)
         source = Path.cwd()
         require(subprocess.check_output(['/usr/bin/git', '-c', 'safe.directory=' + str(source), 'rev-parse', 'HEAD'], env=SAFE_ENV,
                                         timeout=5, stderr=subprocess.DEVNULL).decode().strip() == env['GITHUB_SHA'], 'E_CHECKOUT')
@@ -910,7 +1052,11 @@ def run_body(env):
         try:
             require(not installation_pending, 'E_QUARANTINE_CGROUP')
             if stage_created or owned:
-                cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned)
+                if helper_data is not None:
+                    cleanup_a1a2(run_id, unit, stage, stage_created, stage_info,
+                                 unit_created, owned, helper_owned)
+                else:
+                    cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned)
             else:
                 feedback_cleanup = 'not_reached'
         finally:
@@ -919,9 +1065,12 @@ def run_body(env):
                 same_object(lock, lock_info)
                 lock.unlink()
             os.close(fd)
+            for key in ('fd', 'parent'):
+                if key in helper_owned:
+                    os.close(helper_owned[key])
 
 
-def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned):
+def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, helper_owned=None):
     global feedback_cleanup
     if unit_created:
         require(unit == 'arxd.service', 'E_UNIT_COLLISION')
@@ -937,6 +1086,8 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
             snapshot_internal(run_id, unit, stopped)
         cg = Path('/sys/fs/cgroup/system.slice') / unit
         require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')
+    if helper_owned is not None:
+        remove_a4_helper(helper_owned)
     remove_runtime(owned)
     if stage_created:
         same_object(stage, stage_info)

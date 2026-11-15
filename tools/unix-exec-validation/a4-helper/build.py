@@ -109,13 +109,23 @@ def inventory(data):
 
 
 def main():
-    if sys.argv[1:] not in (["build"], ["verify"]):
-        raise ValueError("use build or verify")
+    if sys.argv[1:] not in (["build"], ["verify"], ["linux-candidate"]):
+        raise ValueError("use build, verify or linux-candidate")
+    # Neither the original build nor candidate compilation may run as root.
+    if os.name != "nt" and (os.getuid() == 0 or os.geteuid() == 0):
+        raise ValueError("unprivileged build required")
+    candidate_mode = sys.argv[1] == "linux-candidate"
     recipe = json.loads(read(ROOT / "recipe.json"))
     if recipe["flags"] != FLAGS or sha(read(ROOT / "helper.rs")) != recipe["source_sha256"]:
         raise ValueError("unreviewed source or flags")
     identity = command(["rustc", "+1.95.0", "--version", "--verbose"])
-    if identity != recipe["compiler_identity"]:
+    expected = recipe["compiler_identity"]
+    if candidate_mode:
+        if sys.platform != "linux":
+            raise ValueError("Linux hosted compiler required")
+        expected = expected.replace("host: x86_64-pc-windows-msvc",
+                                    "host: x86_64-unknown-linux-gnu")
+    if identity != expected:
         raise ValueError("compiler identity mismatch")
     sysroot = Path(command(["rustc", "+1.95.0", "--print", "sysroot"]))
     host = next(line[6:] for line in identity.splitlines() if line.startswith("host: "))
@@ -127,7 +137,7 @@ def main():
     out.mkdir(exist_ok=True)
     image = out / "a4-helper"
     regular(image)
-    if sys.argv[1] == "build":
+    if sys.argv[1] in ("build", "linux-candidate"):
         command(["rustc", "+1.95.0", *FLAGS, "-C", "linker=" + str(linker),
                  "helper.rs", "-o", "out/a4-helper"])
     data = read(image)
@@ -143,6 +153,11 @@ def main():
         candidate = out / "candidate-pin.json"
         regular(candidate)
         candidate.write_text(json.dumps(observed, indent=2) + "\n", encoding="utf-8")
+        if candidate_mode:
+            pin = json.loads(read(ROOT / "image-pin.json"))
+            if any(observed[key] != pin[key] for key in
+                   ("source_sha256", "flags", "image_sha256", "image_size", "symbols")):
+                raise ValueError("Linux candidate differs from independently reviewed image")
         print("compile-only candidate written; reviewed image-pin.json unchanged")
 
 

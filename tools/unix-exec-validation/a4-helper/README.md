@@ -1,7 +1,8 @@
 # Fixed A4 waiting helper — source/build preparation only
 
-This directory is outside Cargo and is not a tool-discovery asset. Nothing in
-the driver, selectors, workflows, package or production code references it.
+This directory is outside Cargo and is not a tool-discovery asset. The dormant
+closed A4 driver branch references only its fixed inputs and output. Default
+TEST remains A5; workflows, package and production code do not reference it.
 Binding: ADR0020 D9a binding 1, effective with PR102 merge
 `fa416937d49964ffa2491fc99d66bc0890ea6ee6`. No fixture spawn is implemented here.
 
@@ -76,8 +77,31 @@ compiler/linker and artifact identity supply the reviewable closure.
 hosted build or execution. Compiler host is explicitly Windows. No binary is
 committed or distributed. A Linux-host compiler has a different identity and
 must receive a separately reviewed recipe/pin, not overwrite this one or
-pretend its output is identical. Artifact delivery and descriptor-bound
-SHA-256/size verification before spawn remain later fixture work.
+pretend its output is identical. The bounded exception below observes a Linux
+candidate without creating a new admission pin.
+
+## Dormant Linux delivery preparation
+
+On an already-equipped Linux host, as a non-root account, `python
+tools/unix-exec-validation/a4-helper/build.py linux-candidate` uses the same
+source/flags and Rust release identity, with the Linux compiler host substituted.
+It records actual compiler/linker hashes in ignored `out/candidate-pin.json`;
+it compares source, flags, image hash, size and symbols to the unchanged reviewed
+pin and fails on any difference. A failed candidate record grants no admission.
+Neither build mode compiles as root. No toolchains are installed.
+
+The closed A4 driver branch requires that Linux provenance record and independently
+validates fixed source/recipe/pin bytes and the exact image before reservation or
+privileged mutation. Observed compiler hashes do not authorize a different image.
+Delivery holds the verified bytes in memory, exclusively creates root-owned
+`/usr/libexec/arxcovo`, and writes only `a4-helper` through no-follow descriptors.
+Existing parent entries refuse with no adoption; missing/untrusted ancestors also
+refuse. The staged held descriptor must match the same 3,696-byte image pin used
+by the ignored fixture. Owned cleanup follows unit stop and cgroup disappearance;
+replacement, extra entries or missing identity quarantine rather than delete.
+No launcher, image path parameter, environment override or root helper compile
+is added. Actual Linux-host build/equality evidence remains pending; do not replace
+the reviewed pin if it differs. Independent source/security review is pending.
 
 ## Pure checks
 
