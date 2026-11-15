@@ -110,3 +110,16 @@ Source blob identities (Git SHA1; all mode 100644):
 The only `exec/mod.rs` change is the four-line test-only path declaration;
 the only inactive-inventory change is the new source path and exact declaration.
 PROGRESS, ADRs, Cargo and production behavior are unchanged by this slice.
+
+## Coordinator correction after exact-head review
+
+Initial publication head911c4fd failed required macOS nextest at residue_tests::cleanup_source_pins_release_sites_and_legacy_errno_order. Its real source split stops at the first exact cfg(test) attribute; the early A12 module declaration truncated production text. Coordinator reproduced that exact Windows test red (0 vs1 residue-clone occurrence), then moved only the unchanged four-line declaration beside the trailing test modules. Existing guard assertions and A12 source remain unchanged. Rustfmt orders a12 before disposable in that final group. Only the frozen exec/mod.rs SHA256 in S2b advances; all other pins/manifest/guards unchanged.
+
+Actually ran after correction: residue_tests2 passed, stage_b_tests14 passed, portable a12 tests3 passed, S2b in-memory applicability1 passed. The first format check requested ordering adjustment; applied rustfmt, recomputed final pin and reran the exact residue guard and applicability test (bothpass), final fmt and diff checks pass. No native Linux fixture or host/account/proc/sys path executed; mock/pure/source checks only, build/temp outputs D:/Code/arxcovo-a12-source. Full hosted gates and fresh independent exact-head delta review required.
+
+Final correction source inventory (supersedes the two historical builder table entries above only):
+
+| Path | Blob | SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/exec/mod.rs` | `b150f543a894d57b25c56bab19c95b4f9bd2beeb` | `1f23fe1a7d03c2a8a455426cafcfbd289ab6bf334bff290620dbd024e44896ad` |
+| `tools/ci/s2b-native/driver.py` | `379b56c342b92e94faaaf27282d319b66a94c386` | `d8582b949e579f8ccd2405ca5edc4c2f07e0ff2a260f7cc791dc224ad7057883` |

@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #135, `cdb05409a2f3b65a5476e72ff62b15c0d89d8c40` at 15:25:29Z, independent Opus exact-head PASS6896741619/status58965831977 and all five required gates green. Reviewed734c3e6/squash tree `a6849207eae3a63d5918505e68a5ee134bfec1e5` identical; hosted A7/A11 final NO-GO checkpointed, dedicated-host acceptance unverified.
-- Current work: publish dormant A12 producer source after independent Opus175acbd PASS with no publication blockers. DeliveryNone, ignored fixture unselected/unrun, no native acceptance; Linux-only non-ignored a12_delivery_closed asserts the gate only. Fresh hosted Linux compile/exact-head five gates required; optional S2b automatic revalidation is not A12 evidence. A7/A11 hosted final NO-GO stays closed. Next source delivery/rechecks remain separately reviewed.
+- Current work: corrected PR136 A12 module placement after Opus exact-head review caught required residue source guard failure. Exact regression reproduced red, unchanged test-only declaration moved to trailing test modules, S2b execmod pin refreshed. Residue2/stageB14/A12portable3/pin1 pass; final exactguard/pin/fmt/diff pass. Fresh independent Opus corrected-head review and all hosted gates pending. DeliveryNone/unrun, no nativegrant; A7 hosted finalNO-GO unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus publicationreview correctly FAILS original PR136head911c4fd: early cfg(test)A12mod truncates residue sourceguard. Coordinator reproduces exactred locally, moves declaration besideexistingtestmodules withoutweakeningguard andrefreshes onlyS2bexecmodSHA. Residue2/stageB14/A12portable3/pin1 green; rustfmtorderingfollowup then exactguard/pin/fmt/diffgreen. Correctedheadgets freshindependentreview/CI; no native or acceptance claim.
 
 - 2026-11-15: Independent Opus175acbd review passes A12Standards/Spec/Security for dormantpublication, no blockers. Reviewer reruns S2b in-memorypin andactualowned-call mock test, standaloneLinuxwarning-patternprobe; fullLinuxfixturecompile pendingCI. Confirms realpost-forkleafproof+OkCancelled/execevidence, joins before actualresidue/ENOENT/emptytasks checks, nofixturesignalling/removal substitute. Optionaladvisories keptnonblocking; futuredeliverymustrecheckaccount/workspace/runs percall. Publishing through exactheadreview/gates, no nativegrant.
 
