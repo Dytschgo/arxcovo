@@ -370,8 +370,12 @@ fn stop_reason(
     }
 }
 
+#[cfg(test)]
+#[path = "disposable/a12.rs"]
+mod a12;
 #[cfg(all(test, target_os = "linux"))]
 mod disposable;
+
 #[cfg(test)]
 mod stage_b_tests;
 
