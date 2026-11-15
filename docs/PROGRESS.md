@@ -7,7 +7,26 @@
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
+## Ordering and M2 closure plan
+
+Owner steering on2026-11-15 14:06 permits parallel work on features with few dependencies. Later delegated steering explicitly permits independent M3 after bounded remaining M2 audits. [ADR0023](adr/0023-parallel-m3-with-open-m2-hardware-gaps.md) records this exception to KICKOFF's normal milestone order. **M3 runs in parallel; M2 remains unchecked and incomplete.** PR142/143 and current PR144 are independent source/storage work, not M2 acceptance.
+
+| Remaining M2 item | Evidence and blocker | Work status / closure prerequisite |
+| --- | --- | --- |
+| A6 quarantine and A8 Ready/discovery join | Accepted injected-port/SDK/persisted-state coverage; no native failure/startup credit | Source coverage remains actively maintained by ordinary CI. Any claimed native extension needs dedicated-host evidence. |
+| A4 crash provenance; crash/A9/U9 populated-stop and production Drain | D9a present-residue accepted; PR141 only proves removal after natural exit with empty directories | Native gap **unverified on real hardware**; dedicated qualifying host needed, no new hosted diagnostic authorized. |
+| A7 sudo/NNP and A11 descriptor/alias | D7k final hosted NO-GO; no case proof | Deferred pending dedicated Linux host; **unverified on real hardware**. No more hosted bind/fix/grant/retry. |
+| A10 capability sufficiency for actual Runner | PR140 covers setup/janitor/fixture migration, not Runner self-migration/lifecycle | Source regression checks actively maintained; unmatched native operations need dedicated-host proof, **unverified on real hardware**. |
+| A12 normal/cancel residue producer | D7l sole run43741300777 failed; cleanup unconfirmed; consumer SDK joins are nonnative | Attempt consumed, host excluded, no further hosted execution authorized. Deferred dedicated-host producer evidence; **unverified on real hardware**. |
+| Full Stage F | Partial bounded credits A1-A5 and source joins do not cover every item above | Acceptance ledger/source regressions actively maintained; full credit blocked on missing native items, **unverified on real hardware**. |
+| Full Stage G | Pure/source refusal checks do not replace the real execution path | Source checks remain workable in CI; native execution/panic/security acceptance blocked on qualifying host and F, **unverified on real hardware**. |
+| Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
+
+Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
+
 ## Task history
+
+- 2026-11-15: Babysitter ordering/closure correction applied. Existing historical M3 steering is made prominent with ADR0023 and per-item M2 blocker/active-work table. No M2 acceptance waiver or new run permission; source regressions stay active, hardware closure explicitly deferred to a qualifying owner-provided host. Fresh Opus review includes this clarification and PR144 test-only macOS correction.
 
 - 2026-11-15: PR144 macOS verify fails page-size fixtureIo/Unsupported at tests448. Coordinator makes its private-file precondition explicit with exclusive0600Unix creation and private/page1024 readbacks; production unchanged. FocusedWindows and rebuilt36cluster/fmt/offlineClippy pass; exactmacOSrednotlocallyreproduced, fresh hosted gates plus Opus delta review required. No nativeM2retry or admin action.
 
