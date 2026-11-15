@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #133, `52ce2a5d2443de018b06965dfca43fdc626b5f36` at 14:53:14Z, independent Sol exact-head PASS6896280064/status58964602017 and all five required gates green. Squash/reviewedcaba0fe tree `923842bae41f48ec2be53b2f3a1372b0ede61e88` identical; Opus D9c source has hosted Linux compilation credit, no native run.
-- Current work: Opus owns the separate docs-only D7k disposition for exactly ONE final hosted A7/A11 attempt on unchanged merged D9c source. Source/exact-head gates passed; disposition still needs independent Sol review, exact-head five gates and coordinator merge before pin/dispatch. All prior grants consumed; any final preflight/view/budget/unknown/cleanup miss defers dedicated-host acceptance and advances other M2/M3. Active Opus completion wake awaited.
+- Current work: publish Opus final docs-only D7k disposition556faa4 retained67f5b60 after independent Sol Standards/Spec/Security PASS. Full222-file inventory/digest and16 keypins verified, no executable delta. Exactly ONE final Opus-owned hosted attempt only after exact-head five gates/coordinator merge/treepin; any miss means dedicated-host deferral, no new diagnostic/grant reset. No run/pin authority yet.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus5.5/high556faa4 retained67f5b60 prepares final D7k unchanged-source disposition. Independent Sol coordinator inspects actual grant/predictions/missrules and recomputes222-source inventory/19629bytes/digest,16 keyblob/size/SHA256pins, retaineddiff/baseline tree/docspathmodes/UTF8LF; PASS allaxes. Publishing four-doc candidate through hosted/exacthead gates; no run or diagnostic authority before merge.
 
 - 2026-11-15: Coordinator verified PR133 exact head/five greens, unwatched and merged52ce2a5; full squash/reviewedtree923842b identical. Independent Sol review of Opus source and hosted Linux gate complete; source alone grants no execution. Opus receives docs-only final D7k one-dispatch disposition with predictions, strict unchanged-executable predicate and unconditional no-retry/dedicated-host fallback after any miss. No Sol bind iteration resumed.
 
