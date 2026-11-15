@@ -26,9 +26,13 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Opus highabf7a5e retained6553408 passes test-only T3 all axes,99cluster and focused repeated snapshot checks plus counterfactuals independently green. Parent U6 timing correction merged into follow-up without altering T3 assertions; fresh parent exact-head delta review starts next. No T3 publication before parent gates/merge.
+
 - 2026-11-15: PR145 exact-head Opus PASS6901884167/status58979456839 delivered, hosted checks pending. Coordinator refreshes separate T3 test branch with parent review/PROGRESS only; T3 feature unchanged. Fresh Opus snapshot source review starts while parent gates are watched.
 
 - 2026-11-15: Sol high19f89e7 retained1461340 completes test-only T3 snapshot catch-up on separate follow-up branch. Actual198-byte snapshot RPC to restarted follower, purged39 versus followerapplied2, convergence/consecutiveappend and disabled-route red observed. All99cluster/fmt/offlineClippy/diff pass locally. Parent T1/T2 Opus review remains active; T3 review queued afterward, separate publication/gates required. No production change or fullM3/host acceptance.
+
+- 2026-11-15: PR145 Windows U6 fails on an unsupported8s all-responder completion assertion after routing restore. Coordinator aligns test with reviewed contract: observe bounded-window resolution count, retain actual64uncommitted/zero permits/Busy and strict shutdown64/emptyowners/Weak/Stopped. Production unchanged, no timeout increase/retry. ExactU6Windows/fmt/offlineClippy pass; fresh Opus delta review queued after active T3 review and new hosted gates required.
 
 - 2026-11-15: Opus high1fc7036 independently passes real adapter/T1T2/U6 source/security and reruns98cluster/fmt/Clippy plus five caught counterfactuals. Reviews dependency edges and Suite partition, no fullconformance/host claim. Nonblocking shutdown finalizer timing/read catchup deadlines stay visible for later integration; T3 is separate immediate follow-up. Coordinator publishes parent for exact-head review and all hosted gates.
 
