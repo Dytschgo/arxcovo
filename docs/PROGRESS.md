@@ -3,11 +3,18 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #132, `b3798371f93f733fe407f0d6ec1a6a657434d199` at 14:03:03Z, independent Muse exact-head PASS6895340233 and all five required gates green. Squash/reviewed78be6ec tree `6a4213fc542a2f7367e5b61267a6cd8c74aa4ab1` identical; D7j result and D9c exact-five controlled-view amendment merged.
-- Current work: THREE-ATTEMPT correction handoff for the entire A7/A11 acceptance item, not per D7 grant. Sol D9c builderb0599dee cancellation requested; no further Sol correction/bind. GitHub-hosted achievability is NOT ESTABLISHED: D7h proves FILE equality only; D7i refused E_PATH; D7j proved writable usr_local_bin on that fresh host; D9c namespace remedy remains unrun. Opus5.5/high owns the bounded GO-or-dedicated-host decision before any further bind. If NO-GO, keep A7/A11 **unverified on real hardware**, pending dedicated host, advance remaining M2 and then independent M3 per latest steering. No grant/dispatch authority.
+- Current work: Opus5.5/high decided A7/A11 GitHub-hosted achievability: **GO for exactly ONE Opus-owned hosted attempt**, recorded in [the decision](reviews/m2-a7-a11-opus-hosted-achievability.md). This is a source-feasibility finding, not proven host acceptance. Opus owns the fresh D9c source slice; Sol `b0599dee` is not adopted, and Sol does not resume. The predictions and NO-GO limits are pre-recorded. Any pre-mutation, view-proof, envelope or unknown miss ends hosted A7/A11, which then stays **unverified on real hardware** pending a dedicated host, and work moves to the remaining M2 items and then independent M3. The coordinator reviews this decision and then assigns the bounded implementation. No run, pin or grant authority is implied.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Anthropic claude-opus-5-5/high (static source/docs only; no run, pin, bind, host or native action) decided A7/A11 hosted achievability: GO, one attempt. Evidence:
+  - Hosted A1-A5/A4 credit proves the floor, Runner, accounts and Standard drop-in.
+  - D7h matched the installed C1 package.
+  - The `runtime_package` and `a7_alias_c2` host C2-parent check matches D7j's writable `usr_local_bin` (the D7i cause is unproven).
+  - In the D9c 0755 view, the shim maps C2 to ENOENT/absent, skips the C3 alias and runs execveat on C1 under NNP, so both cases give `exit_nonzero`.
+  The native budget is ONE attempt. Any miss means NO-GO pending a dedicated host, and work moves to remaining M2 and then M3. Outcome: decision only, awaiting coordinator review.
 
 - 2026-11-15: Babysitter three-attempt escalation accepted for A7/A11 as a whole, including D7h FILE-only, D7i failure, attribution and D7j diagnosis/fifth-view correction. Coordinator requested task_cancel for Solb0599dee, preserved partial work without acceptance/adoption, and stopped Sol iterations. Opus5.5 is exposed by current provider catalog; correction handoff requires explicit achievability decision recorded before another bind. Fresh grants cannot reset the acceptance-item attempt count. Latest steering permits remaining M2 then independent M3 with hardware A7/A11 explicitly deferred if not feasible; M2 is not falsely marked complete.
 
