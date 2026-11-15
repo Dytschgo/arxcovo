@@ -2439,3 +2439,208 @@ class RuntimeAdmission(unittest.TestCase):
              patch.object(driver,'a7_admission') as admission:
             with self.assertRaisesRegex(RuntimeError,'E_ID'):driver.run_body(env)
             admission.assert_not_called()
+
+
+class A12Delivery(unittest.TestCase):
+    def test_closed_gates_before_effects(self):
+        self.assertFalse(driver.A12_DELIVERY_ENABLED)
+        self.assertFalse(driver.A12_EXECUTION_ENABLED)
+        with patch.object(driver.sys,'platform','linux'), patch.object(driver, 'TEST', driver.A12_TEST), patch.object(driver, 'cg_preflight', side_effect=AssertionError('host probe')), patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('uid probe')):
+            self.assertTrue(driver.standard_profile())
+            self.assertEqual(driver.test_argv('/binary')[1],driver.A12_TEST)
+            self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.run_body,valid_env())
+            self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.main)
+            self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.prepare_a12,valid_env(),{})
+        self.assertEqual(driver.TEST,'exec::disposable::sudo_nnp::disposable_linux_a7_a11')
+
+    def test_owned_names_refuse_paths(self):
+        self.assertEqual(driver.a12_name('123-1'),'arxa12123x1')
+        for value in ('123/1','../123-1','0123-1','123-0','123-1x','1-1234567'):
+            self.assertRaises(RuntimeError,driver.a12_name,value)
+
+    def test_exact_markers_and_summary(self):
+        base = ('ARX_A12_NORMAL_OK\nARX_A12_CANCEL_OK\nARX_A12_COMPLETE_OK\n'
+            'test '+driver.A12_TEST+' ... ok\n'
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 412 filtered out; finished in 1.00s\n')
+        with patch.object(driver,'TEST',driver.A12_TEST), patch.object(driver,'private_read') as read, patch.object(driver.Path,'stat',return_value=SimpleNamespace(st_size=1024)), patch.object(driver.Path,'exists',return_value=True):
+            read.return_value=base
+            driver.verify_test_result(Path('/fake'),0)
+            for marker in ('ARX_A12_NORMAL_OK','ARX_A12_CANCEL_OK','ARX_A12_COMPLETE_OK'):
+                for text in (base.replace(marker+'\n',''),base+marker+'\n'):
+                    read.return_value=text
+                    self.assertRaises(RuntimeError,driver.verify_test_result,Path('/fake'),0)
+            for text in (base.replace('1 passed','0 passed'),base+base,base.replace('0 ignored','1 ignored'),base.replace('1.00s','NaNs')):
+                read.return_value=text
+                self.assertRaises(RuntimeError,driver.verify_test_result,Path('/fake'),0)
+
+    def test_collision_owns_nothing(self):
+        import types
+        pwd=types.SimpleNamespace(getpwnam=lambda _:SimpleNamespace())
+        grp=types.SimpleNamespace(getgrnam=lambda _:SimpleNamespace())
+        owned={}
+        with patch.dict(sys.modules,{'pwd':pwd,'grp':grp}), patch.object(driver,'A12_DELIVERY_ENABLED',True), patch.object(driver,'TEST',driver.A12_TEST), patch.object(driver.sys,'platform','linux'), patch.object(driver,'build_a12',side_effect=AssertionError('build')), patch.object(driver,'call',side_effect=AssertionError('mutation')):
+            self.assertRaisesRegex(RuntimeError,'E_ACCOUNT_COLLISION',driver.prepare_a12,valid_env(),owned)
+        self.assertEqual(owned,{})
+        driver.cleanup_a12(owned) # no host reads even without unit gate
+
+    def test_partial_capture_quarantines_before_reads(self):
+        for owned in ({'pending':True},{'pending':False}):
+            for gone in (False,True):
+                if gone and not owned['pending']:continue
+                with patch.object(driver,'a12_account',side_effect=AssertionError('read')):
+                    self.assertRaisesRegex(RuntimeError,'E_QUARANTINE_CGROUP',driver.cleanup_a12,owned,gone)
+
+    def test_uid_release_before_all_deletion(self):
+        item=dict(pending=False,name='arxa12123x1',uid=2001,gid=2001,workspace=Path('/fake/a12/workspace'),root=object(),workspace_info=object())
+        for live in (True,False):
+            events=[]
+            proc=Path('/fake/42')
+            with patch.object(driver.os,'O_NOFOLLOW',0x20000,create=True),patch.object(driver.os,'O_CLOEXEC',0x80000,create=True),patch.object(driver.os,'open',return_value=77),patch.object(driver.os,'read',return_value=b'Uid: 0 0 0 0\n'),patch.object(driver.os,'close'),patch.object(driver,'a12_account',side_effect=lambda _:events.append('account-check')), patch.object(driver.Path,'iterdir',return_value=[proc]), patch.object(driver.Path,'stat',return_value=SimpleNamespace(st_uid=2001 if live else 0)), patch.object(driver,'same_object',side_effect=lambda *a:events.append('inode-check')), patch.object(driver,'call',side_effect=lambda a:events.append(a[0])), patch.object(driver.shutil,'rmtree') as remove:
+                remove.avoids_symlink_attacks=True
+                if live:
+                    self.assertRaisesRegex(RuntimeError,'E_UID_LIVE',driver.cleanup_a12,item,True)
+                    self.assertEqual(events,['account-check'])
+                    remove.assert_not_called()
+                else:
+                    driver.cleanup_a12(item,True)
+                    self.assertEqual(events,['account-check','inode-check','inode-check','/usr/sbin/userdel','/usr/sbin/groupdel'])
+                    remove.assert_called_once()
+
+    def test_owned_pin_reads_and_mutations(self):
+        data=b'ELF!'
+        info=SimpleNamespace(st_mode=0o100700,st_uid=0,st_gid=0,st_dev=1,st_ino=2,st_nlink=1,st_size=4,st_mtime_ns=1,st_ctime_ns=1)
+        for fault in ('none','nlink','size','changed'):
+            before=SimpleNamespace(**vars(info))
+            if fault=='nlink':before.st_nlink=2
+            if fault=='size':before.st_size=3
+            after=SimpleNamespace(**vars(before))
+            if fault=='changed':after.st_ino+=1
+            stream=io.BytesIO(data)
+            with patch.object(driver,'a12_open',return_value=77), patch.object(driver.os,'fstat',side_effect=[before,after]), patch.object(driver.os,'read',side_effect=lambda *a:stream.read(a[1])),patch.object(driver.os,'close') as close:
+                if fault=='none':
+                    pin=driver.a12_pin(Path('/fake'),True)
+                    self.assertEqual(pin['sha256'],driver.hashlib.sha256(data).hexdigest())
+                    self.assertEqual(pin['ino'],2)
+                else:self.assertRaises(RuntimeError,driver.a12_pin,Path('/fake'),True)
+                close.assert_called_once_with(77)
+
+    def test_a12_cleanup_precedes_shared_deletion(self):
+        events=[]
+        with patch.object(driver.os.path,'lexists',return_value=False), patch.object(driver,'cleanup_a12',side_effect=lambda *a,**k:events.append('a12')), patch.object(driver,'remove_runtime',side_effect=lambda _:events.append('runtime')):
+            driver.cleanup_a1a2('123-1','arxd.service',None,False,None,False,[],a12_owned={})
+        self.assertEqual(events,['a12','runtime'])
+
+
+    def test_one_bounded_build_and_clock(self):
+        good=json.dumps(dict(reason='compiler-artifact',profile=dict(test=True),executable='/var/lib/arx-ci-123-1/source/target/debug/deps/arxd-abc')).encode()+b'\n'
+        for fault in ('none','overflow','two','path','clock-back','late','failure'):
+            data=good
+            if fault=='overflow':data=b'x'*(4*1024*1024+1)
+            if fault=='two':data=good+good
+            if fault=='path':data=good.replace(b'/var/lib/arx-ci-123-1/source/target/debug/deps',b'/tmp')
+            out=io.BytesIO(); waits=[]; commands=[]
+            child=SimpleNamespace(stdout=io.BytesIO(data),returncode=1 if fault=='failure' else 0,wait=lambda timeout:waits.append(timeout),poll=lambda:0,kill=lambda:self.fail('unneeded kill'))
+            def spawn(args,**kw):
+                commands.append(args)
+                return nullcontext(child)
+            with patch.object(driver.Path,'open',return_value=nullcontext(out)),patch.object(driver.Path,'read_bytes',side_effect=lambda:out.getvalue()),patch.object(driver.subprocess,'Popen',side_effect=spawn),patch.object(driver.time,'monotonic',side_effect=[100,99 if fault=='clock-back' else 461 if fault=='late' else 101]):
+                if fault=='none':self.assertEqual(driver.build_a12(Path('/var/lib/arx-ci-123-1')).name,'arxd-abc')
+                else:self.assertRaises(RuntimeError,driver.build_a12,Path('/var/lib/arx-ci-123-1'))
+            self.assertEqual(waits,[360])
+            self.assertEqual(len(commands),1)
+            self.assertIn('--lib',commands[0])
+            self.assertLessEqual(len(out.getvalue()),4*1024*1024)
+
+    def test_source_callgraph_fences(self):
+        source=Path(driver.__file__).read_text()
+        tree=ast.parse(source)
+        selected={n.name:ast.get_source_segment(source,n) for n in tree.body if isinstance(n,ast.FunctionDef)}
+        for name in ('prepare_a12','build_a12','cleanup_a12','a12_open','a12_pin','a12_account'):
+            for forbidden in ('sudo_nnp','a7_admission','a4_delivery','package','policy','/sudo'):
+                self.assertNotIn(forbidden,selected[name])
+        self.assertLess(selected['cleanup_a12'].index('a12_uid_released('),selected['cleanup_a12'].index("'/usr/sbin/userdel'"))
+        self.assertLess(selected['cleanup_a1a2'].index('cleanup_a12('),selected['cleanup_a1a2'].index('remove_runtime('))
+        self.assertLess(selected['run_body'].index('A12_EXECUTION_ENABLED'),selected['run_body'].index('os.getuid()'))
+
+
+    def test_preparation_handoff_and_partial_capture(self):
+        import types
+        for fail in ('none','group','capture'):
+            state={'group':False,'user':False}; writes={}; owned={}; events=[]
+            def lookup(role):
+                def get(name):
+                    if not state[role]:raise KeyError(name)
+                    return SimpleNamespace(pw_uid=2001,gr_gid=2002)
+                return get
+            def call(args):
+                events.append(args[0])
+                if 'groupadd' in args[0]:
+                    state['group']=True
+                    if fail=='group':raise RuntimeError('E_OS')
+                if 'useradd' in args[0]:state['user']=True
+            info=SimpleNamespace(st_dev=1,st_ino=2,st_mode=0o40700,st_uid=0)
+            def lstat(path):
+                if fail=='capture':raise RuntimeError('E_OS')
+                return info
+            def pin(path,binary=False,owner=None):
+                uid=0 if binary else 2001
+                return dict(dev=1,ino=2,mode=0o100700 if binary else 0o40700,uid=uid,gid=0 if binary else 2002,nlink=1,size=4 if binary else 0,sha256='b'*64 if binary else '')
+            with patch.dict(sys.modules,{'pwd':types.SimpleNamespace(getpwnam=lookup('user')),'grp':types.SimpleNamespace(getgrnam=lookup('group'))}), patch.object(driver,'TEST',driver.A12_TEST),patch.object(driver,'A12_DELIVERY_ENABLED',True),patch.object(driver.sys,'platform','linux'),patch.object(driver.os.path,'lexists',return_value=False),patch.object(driver,'build_a12',return_value=Path('/var/lib/arx-ci-123-1/source/target/debug/deps/arxd-abc')),patch.object(driver.Path,'chmod'),patch.object(driver.Path,'mkdir'),patch.object(driver.Path,'lstat',autospec=True,side_effect=lstat),patch.object(driver.os,'chown',create=True),patch.object(driver,'call',side_effect=call),patch.object(driver,'a12_account'),patch.object(driver,'a12_pin',side_effect=pin),patch.object(driver,'exclusive_file',side_effect=lambda p,b:writes.update({p.name:b})):
+                if fail=='none':
+                    driver.prepare_a12(valid_env(),owned)
+                    record=json.loads(writes['a12-delivery.json'])
+                    self.assertEqual(record['run'],'123-1')
+                    self.assertEqual(record['source_sha'],valid_env()['GITHUB_SHA'])
+                    self.assertEqual(record['workflow_sha'],valid_env()['ARX_WORKFLOW_SHA'])
+                    self.assertEqual((record['uid'],record['gid']),(2001,2002))
+                    self.assertEqual(owned['workspace'],Path('/var/lib/arxa12123x1/workspace'))
+                    self.assertFalse(owned['pending'])
+                    self.assertEqual(len(events),2)
+                else:
+                    self.assertRaisesRegex(RuntimeError,'E_OS',driver.prepare_a12,valid_env(),owned)
+                    self.assertTrue(owned['pending'])
+                    self.assertEqual(writes,{})
+                    self.assertRaisesRegex(RuntimeError,'E_QUARANTINE_CGROUP',driver.cleanup_a12,owned,True)
+
+
+    def test_a12_ack_clock_and_attribution(self):
+        monitor=A1A2().monitor
+        with patch.object(driver,'TEST',driver.A12_TEST):
+            self.assertEqual(monitor(['active','inactive'],ticks=[0,1,2,3,4,5]),['attribution','identity-ack','summary'])
+            for ticks in ([0,1,16],[0,1,2,8]):
+                self.assertRaisesRegex(RuntimeError,'E_TEST_TIMEOUT',monitor,['active'],ticks=ticks)
+            self.assertRaises(RuntimeError,monitor,['active'],actual='43')
+            self.assertRaises(RuntimeError,monitor,['active'],tasks=b'42\n43\n')
+
+    def test_bounded_local_identity_aliases_and_groups(self):
+        item=dict(uid=2001,gid=2002,name='arxa12123x1')
+        passwd=b'arxa12123x1:x:2001:2002::/var/lib/arxa12123x1/workspace:/usr/sbin/nologin\n'
+        group=b'arxa12123x1:x:2002:\n'
+        for fault in ('none','uid-alias','primary-alias','group-alias','supplement','writable'):
+            pw=passwd;gr=group
+            if fault=='uid-alias':pw+=b'other:x:2001:3000::/:/bin/sh\n'
+            if fault=='primary-alias':pw+=b'other:x:3000:2002::/:/bin/sh\n'
+            if fault=='group-alias':gr+=b'other:x:2002:\n'
+            if fault=='supplement':gr+=b'other:x:3000:arxa12123x1\n'
+            payloads=[pw,gr];current={}
+            def opened(path):
+                self.assertIn(path.as_posix(),('/etc/passwd','/etc/group'))
+                data=payloads.pop(0);current['stream']=io.BytesIO(data)
+                current['info']=SimpleNamespace(st_mode=0o100666 if fault=='writable' else 0o100644,st_uid=0,st_gid=0,st_dev=1,st_ino=2,st_nlink=1,st_size=len(data),st_mtime_ns=1,st_ctime_ns=1)
+                return 77
+            with patch.object(driver,'a12_open',side_effect=opened),patch.object(driver.os,'fstat',side_effect=lambda _:current['info']),patch.object(driver.os,'read',side_effect=lambda fd,n:current['stream'].read(n)),patch.object(driver.os,'close'):
+                if fault=='none':driver.a12_local_identity(item)
+                else:self.assertRaises(RuntimeError,driver.a12_local_identity,item)
+
+
+    def test_live_uid_all_four_fields(self):
+        proc=SimpleNamespace(name='42',stat=lambda:SimpleNamespace(st_uid=0))
+        class Proc:
+            name='42'
+            def stat(self):return proc.stat()
+            def __truediv__(self,name):return Path('/fake/status')
+        for data in (b'Uid: 0 0 0 0\n',b'Uid: 2001 0 0 0\n',b'Uid: 0 2001 0 0\n',b'Uid: 0 0 2001 0\n',b'Uid: 0 0 0 2001\n',b'',b'Uid: 0 0 0\n',b'x'*4097):
+            with patch.object(driver.os,'O_NOFOLLOW',0x20000,create=True),patch.object(driver.os,'O_CLOEXEC',0x80000,create=True),patch.object(driver.Path,'iterdir',return_value=[Proc()]),patch.object(driver.os,'open',return_value=77),patch.object(driver.os,'read',return_value=data),patch.object(driver.os,'close') as close:
+                if data==b'Uid: 0 0 0 0\n':driver.a12_uid_released(2001)
+                else:self.assertRaises(RuntimeError,driver.a12_uid_released,2001)
+                close.assert_called_once_with(77)

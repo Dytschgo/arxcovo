@@ -730,3 +730,35 @@ def execution_admission_mutants():
             result=unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([case(name)]))
         assert result.failures and not result.errors,before+str(result.errors)
         print('KILLED admission '+before)
+
+
+
+def a12_assertion_mutants():
+    """Only A12 injected ports; never execute any native adapter."""
+    source=Path(driver.__file__).read_text()
+    cases=[
+        ('A12_DELIVERY_ENABLED = False','A12_DELIVERY_ENABLED = True','test_closed_gates_before_effects'),
+        ('A12_EXECUTION_ENABLED = False','A12_EXECUTION_ENABLED = True','test_closed_gates_before_effects'),
+        ("len(name) <= 32 and len(run.split('-')[1]) <= 6", "True", 'test_owned_names_refuse_paths'),
+        ("require(unit_gone and not owned.get('pending'), 'E_QUARANTINE_CGROUP')", "require(unit_gone, 'E_QUARANTINE_CGROUP')",'test_partial_capture_quarantines_before_reads'),
+        ("require(proc.stat().st_uid != uid, 'E_UID_LIVE')",'pass','test_uid_release_before_all_deletion'),
+        ("require(0 <= time.monotonic() - start <= 360, 'E_BUILD')",'pass','test_one_bounded_build_and_clock'),
+        ("require(len(artifacts) == 1, 'E_ARTIFACT')", "require(len(artifacts) >= 1, 'E_ARTIFACT')",'test_one_bounded_build_and_clock'),
+    ]
+    for before,after,name in cases:
+        # Multiple historical artifact assertions are deliberately left intact.
+        if before.startswith('require(len(artifacts)'):
+            start=source.index('def build_a12(');end=source.index('def a12_account(',start)
+            changed=source[:start]+source[start:end].replace(before,after)+source[end:]
+        elif before.startswith('require(proc.stat()'):
+            start=source.index('def a12_uid_released(');end=source.index('def cleanup_a12(',start)
+            changed=source[:start]+source[start:end].replace(before,after)+source[end:]
+        else:
+            assert source.count(before)==1,before
+            changed=source.replace(before,after)
+        module=types.ModuleType('a12_mutant');module.__file__=driver.__file__
+        exec(compile(changed,'<mock-only-a12-mutant>','exec'),module.__dict__)
+        with patch.object(test_driver,'driver',module):
+            result=unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([test_driver.A12Delivery(name)]))
+        assert result.failures and not result.errors,(name,result.errors)
+        print('KILLED A12 '+name)
