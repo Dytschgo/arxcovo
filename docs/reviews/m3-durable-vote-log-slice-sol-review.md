@@ -1,0 +1,11 @@
+# Durable vote/log slice: independent Sol review
+
+Target Opuscf5e1da retained48b8185. Standards/Spec/Security PASS for implementing this bounded storage probe after coordinator clarifications. Existing dependencies only; no OpenRaft adapter or quorum claim yet. No tests/build ran in this review.
+
+Reviewed the API/order/canonical-body contracts against the retained OpenRaft0.10 source, especially testing/log/suite.rs purge_logs_upto_20, delete_logs_after_11 and append_to_log. The original test sentence accidentally chained independent Suite cases: purge20 followed by append11 violates the contract. Corrected to separate tail10/purge0/append11 from purge20/next21. A same-leader committed vote cannot regress; a greater term may start uncommitted, consistent with derived vote order.
+
+The2048-page capacity argument assumes4096-byte pages; the log store now requires exactly4096 rather than accepting a smaller page size while claiming512 maximal rows fit. The shared open helper accepts only the two fixed stems, preserving StateStore behavior. Tests must prove the full512 maximal-entry batch population fits and refusal is atomic; no silent purging.
+
+Snapshot-before-purge and durable-apply-before-return are mandatory future-adapter obligations. The standalone log store does not know SM applied position and cannot independently enforce cross-file I4. Integration tests and later OpenRaft startup/adapter tests must verify those invariants; source reading is not execution. Sparse first append is log-Suite compatibility, not permission for sparse StateStore apply. No persisted committed position is adopted only for the durable-state-machine model described; linearizable reads still require the consensus protocol.
+
+Private fixed files, poison-on-SQLite-error, bounded canonical verifier-only rows/meta, process-kill acknowledgement tests and explicit unknown commit outcomes are appropriate. Future callback exactly-once handling must cover cancellation and spawn-blocking failure; it is not implemented by this slice. Power-loss/quorum/three-node/signing/mTLS and M2 hardware acceptance remain open. Ready for Sol implementation of exactly the listed files, followed by fresh Opus source review and all hosted gates.

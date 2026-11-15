@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus highcf5e1da retained48b8185 settles SQLite durable vote/log contract. Independent Sol review checks actual Suite cases, corrects accidental purge20/append11 chaining, clarifies same-leader vote regression, exact4096-byte log pages and fixed helper stems. Contract accepted for bounded implementation; cross-file ordering and callback/consensus remain future-adapter obligations. No test/native action or quorum acceptance.
+
 - 2026-11-15: Coordinator verifies PR143 exact head/all five green gates, unwatches and mergescd28bb9; reviewed/squash full trees equal. Hosted three-OS crash/journal/privacy probes now credited for state-machine backend only. Opus next architecture task settles vote/log store sync and recovery contract before implementation; no new native M2 action or full M3 credit.
 
 - 2026-11-15: Opus high5366bf1 rechecks R1 membership decoder coverage with8192-limit and decoder-only bypass counterfactuals; new test detects both while old test misses decoder bypass. Independently reran23cluster/four-kill/fmt/Clippy, all pass. Coordinator publishes durable-state probe for exact-head review and hosted OS gates. No power-loss/quorum/three-node acceptance or M2 closure.

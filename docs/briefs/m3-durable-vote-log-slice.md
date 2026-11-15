@@ -59,7 +59,7 @@ sync, truncate/purge crash/reopen boundaries; a sync API a later OpenRaft 0.10 a
 `cluster.rs` gains `pub mod log_store;`. In `state_store.rs`: `LogPos` derives `PartialOrd, Ord` (field
 order equals `LogId` order); `put_pos`/`get_pos` become `pub(super)`; extract the dir/sidecar/lock/pragma code
 into `pub(super) fn open_db(dir, stem, max_pages) -> Result<(File, Connection), StoreError>`
-(`StateStore` keeps `cluster-state`, 64, byte-identical behavior); add `StoreError::{Full, Conflict, VoteRegressed}`
+(stem accepts only `cluster-state` or `cluster-log`; state keeps64pages/unchanged behavior); add `StoreError::{Full, Conflict, VoteRegressed}`
 with static `Display`; `#[cfg(test)] pub(super) mod tests;` and `pub(super)` on `code`, `mint`, `redeem`,
 `absent`, `privacy_markers`, `pause` and `KillOnDrop`. `enrollment/codec.rs` gains `encode_command`/`decode_command`.
 New: `log_store.rs`, `log_store/tests.rs`, `docs/evidence/m3-durable-vote-log-store.md`. Commits: refactor (existing
@@ -71,7 +71,7 @@ New: `log_store.rs`, `log_store/tests.rs`, `docs/evidence/m3-durable-vote-log-st
   last: Option<LogPos>}`; entries `(LogPos, state_store::Entry)`. API: `VoteLogStore::open(dir, cluster)`, `vote()`, `log_state()`, `live()`, `save_vote(StoredVote)`,
   `append(&[(LogPos, Entry)])`, `entries(start, end_excl, limit)`, `truncate_after(Option<LogPos>)`, `purge(LogPos)`.
 - **Open:** `open_db(dir, "cluster-log", 2048)` validates `cluster-log.{lock,sqlite3}` and its `-journal/-wal/-shm`
-  sidecars, holds the lock, and reads back TRUNCATE, `synchronous=2`, `fullfsync=1` and `page_size<=4096`.
+  sidecars, holds the lock, and reads back TRUNCATE, `synchronous=2`, `fullfsync=1` and log `page_size=4096`.
   `user_version` 0 creates `meta(singleton CHECK=1, blob CHECK(length<=256))`, `log(idx INTEGER PRIMARY KEY
   CHECK(idx>=0), body BLOB NOT NULL CHECK(length(body)<=4163))` and the initial meta, in one transaction. Version 1 decodes meta and scans every row; any other version is `Unsupported`. A foreign cluster is `WrongCluster`.
 - **Scan:** rows exactly `first..=last` from the meta tail, count ≤ `MAX_LIVE`, each body decodes with
@@ -125,9 +125,9 @@ sparse applies, so the adapter slice chooses how to run the official Suite. Thes
 2. Append: sparse first index 1; then gap, overlap, duplicate, non-consecutive batch, or lower `LogPos` → `OutOfOrder`; 65 →
    `TooLarge`; `i64::MAX+1` → `TooLarge`. 512 max-size membership rows fit within 2048 pages, and the 513th is `Full`. All are unchanged on disk after reopen.
 3. Reads: ranges `3..3`, `5..7`, `0..`, below purged, past the end, reversed, and `limit` 1/64 match the Suite expectations.
-4. Truncate/purge: the Suite cases (`(1,11)` no-op, `None`, `purge (0,0)`, `(1,20)` past the end then append `(2,11)` →
-   index 11). Mismatched ids give `Conflict`; going below purged gives `OutOfOrder`. A conflicting tail can be truncated and replaced.
-5. Votes: start at `None`; lower term, same-term lower node, or committed→uncommitted → `VoteRegressed`; equal is a no-op;
+4. Truncate/purge: independent Suite cases: `(1,11)` truncate no-op; `None`; tail10/purge`(0,0)` then append`(2,11)`;
+   separately purge`(1,20)` past tail10, then require next index21 (index11 rejects). Mismatched ids give `Conflict`; going below purged gives `OutOfOrder`. A conflicting tail can be truncated and replaced.
+5. Votes: start at `None`; lower term, same-term lower node, or same-leader committed→uncommitted → `VoteRegressed`; equal is a no-op;
    a vote survives reopen; index 0 appends with no vote.
 6. Open fails closed: a flipped meta or row byte, a deleted middle/first/last row, an extra row, `user_version` 2, a foreign
    cluster, a held lock, or a directory or symlink sidecar.
