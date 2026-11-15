@@ -67,16 +67,35 @@ pub(crate) fn preflight<F: CgroupFs>(fs: &F, location: &parse::Location) -> FsRe
 }
 
 pub(crate) fn finish<F: CgroupFs>(fs: &F, clock: &dyn Clock, token: &Cancellation) -> bool {
+    finish_observed(fs, clock, token).1
+}
+
+pub(crate) fn finish_observed<F: CgroupFs>(
+    fs: &F,
+    clock: &dyn Clock,
+    token: &Cancellation,
+) -> (Option<SetupOutcome>, bool) {
     let Ok(proc) = fs.proc_cgroup() else {
-        return false;
+        return (None, false);
     };
     if proc.magic != PROC_MAGIC {
-        return false;
+        return (None, false);
     }
     let Some(location) = parse::locate(&proc.bytes) else {
-        return false;
+        return (None, false);
     };
-    let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token) else {
+    let outcome = setup(fs, &location, clock, token);
+    let accepted = post_setup(fs, &location, token, outcome);
+    (Some(outcome), accepted)
+}
+
+fn post_setup<F: CgroupFs>(
+    fs: &F,
+    location: &parse::Location,
+    token: &Cancellation,
+    outcome: SetupOutcome,
+) -> bool {
+    let SetupOutcome::Ready(evidence) = outcome else {
         return false;
     };
     if evidence.runs_created

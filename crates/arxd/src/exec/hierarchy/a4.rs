@@ -116,6 +116,214 @@ pub(crate) fn limits<F: CgroupFs>(
     Ok(())
 }
 
+// Fixed test-only port: directory provenance belongs to this wrapper, never an fd.
+enum Handle<'a, D> {
+    Owned(D),
+    Held(&'a D),
+}
+pub(crate) struct Tagged<'a, D> {
+    handle: Handle<'a, D>,
+    path: Vec<Vec<u8>>,
+}
+impl<D> Tagged<'_, D> {
+    fn inner(&self) -> &D {
+        match &self.handle {
+            Handle::Owned(d) => d,
+            Handle::Held(d) => d,
+        }
+    }
+}
+pub(crate) struct OmitS7<'a, F: CgroupFs> {
+    fs: &'a F,
+    unit: Vec<Vec<u8>>,
+    attempts: std::cell::Cell<usize>,
+    omitted: std::cell::Cell<usize>,
+    forwarded: std::cell::Cell<usize>,
+    removals: std::cell::Cell<usize>,
+    invalid: std::cell::Cell<bool>,
+}
+impl<'a, F: CgroupFs> OmitS7<'a, F> {
+    pub(crate) fn new(fs: &'a F) -> FsResult<Self> {
+        let proc = fs.proc_cgroup()?;
+        if proc.magic != PROC_MAGIC {
+            return Err(FsError::Refused);
+        }
+        let location = parse::locate(&proc.bytes).ok_or(FsError::Refused)?;
+        Ok(Self {
+            fs,
+            unit: location
+                .unit_components()
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
+            attempts: 0.into(),
+            omitted: 0.into(),
+            forwarded: 0.into(),
+            removals: 0.into(),
+            invalid: false.into(),
+        })
+    }
+    fn forward_write(&self, d: &Tagged<'_, F::Dir>, file: &str, bytes: &[u8]) -> FsResult<()> {
+        if file == "cgroup.kill" {
+            self.forwarded.set(self.forwarded.get() + 1);
+        }
+        self.fs.write(d.inner(), file, bytes)
+    }
+    fn runs_path(&self) -> Vec<Vec<u8>> {
+        let mut p = self.unit.clone();
+        p.push(b"runs".to_vec());
+        p
+    }
+    pub(crate) fn held(
+        &self,
+        runs: &'a F::Dir,
+        leaf: &'a F::Dir,
+    ) -> (Tagged<'a, F::Dir>, Tagged<'a, F::Dir>) {
+        let r = self.runs_path();
+        let mut l = r.clone();
+        l.push(b"arx-0-0".to_vec());
+        (
+            Tagged {
+                handle: Handle::Held(runs),
+                path: r,
+            },
+            Tagged {
+                handle: Handle::Held(leaf),
+                path: l,
+            },
+        )
+    }
+}
+impl<'a, F: CgroupFs> CgroupFs for OmitS7<'a, F> {
+    type Dir = Tagged<'a, F::Dir>;
+    fn proc_cgroup(&self) -> FsResult<ProcFile> {
+        self.fs.proc_cgroup()
+    }
+    fn proc_status(&self) -> FsResult<ProcFile> {
+        self.fs.proc_status()
+    }
+    fn identity(&self) -> FsResult<(u32, u32)> {
+        self.fs.identity()
+    }
+    fn pid(&self) -> FsResult<u32> {
+        self.fs.pid()
+    }
+    fn open_root(&self) -> FsResult<Self::Dir> {
+        Ok(Tagged {
+            handle: Handle::Owned(self.fs.open_root()?),
+            path: vec![],
+        })
+    }
+    fn open_child(&self, dir: &Self::Dir, name: &[u8]) -> FsResult<Self::Dir> {
+        let inner = self.fs.open_child(dir.inner(), name)?;
+        let mut path = dir.path.clone();
+        path.push(name.to_vec());
+        Ok(Tagged {
+            handle: Handle::Owned(inner),
+            path,
+        })
+    }
+    fn stat(&self, d: &Self::Dir) -> FsResult<Stat> {
+        self.fs.stat(d.inner())
+    }
+    fn read(&self, d: &Self::Dir, f: &str, m: usize) -> FsResult<Vec<u8>> {
+        self.fs.read(d.inner(), f, m)
+    }
+    fn write(&self, d: &Self::Dir, f: &str, b: &[u8]) -> FsResult<()> {
+        if f == "cgroup.kill" {
+            self.attempts.set(self.attempts.get() + 1);
+            if d.path != self.runs_path() || b != b"1" || self.attempts.get() != 1 {
+                self.invalid.set(true);
+                return Err(FsError::Refused);
+            }
+            self.omitted.set(self.omitted.get() + 1);
+            return Ok(());
+        }
+        self.forward_write(d, f, b)
+    }
+    fn xattr_delegate(&self, d: &Self::Dir) -> FsResult<Option<Vec<u8>>> {
+        self.fs.xattr_delegate(d.inner())
+    }
+    fn mkdir_runs(&self, d: &Self::Dir) -> FsResult<Created> {
+        self.fs.mkdir_runs(d.inner())
+    }
+    fn list(&self, d: &Self::Dir, m: usize) -> FsResult<Vec<RawEntry>> {
+        self.fs.list(d.inner(), m)
+    }
+    fn rmdir(&self, d: &Self::Dir, n: &[u8]) -> FsResult<()> {
+        self.removals.set(self.removals.get() + 1);
+        self.fs.rmdir(d.inner(), n)
+    }
+    fn open_ro(&self, d: &Self::Dir, f: &str) -> FsResult<()> {
+        self.fs.open_ro(d.inner(), f)
+    }
+}
+
+// Only the shared acceptance assertion is caught; payloads are never inspected.
+pub(crate) fn assertion_rejected(accepted: bool) -> bool {
+    std::panic::catch_unwind(|| acceptance(accepted)).is_err()
+}
+fn retained_structure<F: CgroupFs>(fs: &F, runs: &F::Dir, leaf: &F::Dir) -> bool {
+    for (dir, expected) in [(runs, Some(b"arx-0-0".as_slice())), (leaf, None)] {
+        if !fs.stat(dir).is_ok_and(|s| {
+            s.uid == 0
+                && s.mode & 0o022 == 0
+                && s.mode & 0o170000 == 0o040000
+                && s.magic == CGROUP_MAGIC
+        }) {
+            return false;
+        }
+        let Ok(entries) = fs.list(dir, 512) else {
+            return false;
+        };
+        if entries.len() > 512 {
+            return false;
+        }
+        let mut children = 0;
+        for e in entries {
+            match parse::classify_entry(&e.name, e.d_type, e.fstatat_mode) {
+                parse::Entry::Dot | parse::Entry::Control => (),
+                parse::Entry::Child if expected == Some(e.name.as_slice()) => children += 1,
+                _ => return false,
+            }
+        }
+        if children != usize::from(expected.is_some()) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn rejection<F: CgroupFs>(
+    fs: &OmitS7<'_, F>,
+    runs: &Tagged<'_, F::Dir>,
+    leaf: &Tagged<'_, F::Dir>,
+    observation: &Observation,
+    panicked: bool,
+    child: &mut impl ChildOps,
+) -> bool {
+    panicked
+        && !observation.accepted
+        && observation.preconditions
+        && observation.outcome == Some(SetupOutcome::Unavailable(SetupFailure::KillTimeout))
+        && fs.attempts.get() == 1
+        && fs.omitted.get() == 1
+        && fs.forwarded.get() == 0
+        && !fs.invalid.get()
+        && fs.removals.get() == 0
+        && retained_structure(fs, runs, leaf)
+        && fs.open_child(runs, b"arx-0-0").is_ok()
+        && [runs, leaf].iter().all(|d| {
+            fs.read(d, "cgroup.events", 4096)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .and_then(|s| parse::events(&s))
+                == Some(true)
+        })
+        && child.live()
+        && child.remaining().is_some_and(|d| !d.is_zero())
+}
+
 pub(crate) trait ChildOps {
     // Must establish live owned child, exactly one task and actual membership.
     fn live(&mut self) -> bool;
@@ -132,6 +340,26 @@ pub(crate) fn finish<F: CgroupFs>(
     clock: &dyn Clock,
     child: &mut impl ChildOps,
 ) -> bool {
+    finish_observed(fs, runs, leaf, clock, child).accepted
+}
+
+pub(crate) struct Observation {
+    pub preconditions: bool,
+    pub outcome: Option<SetupOutcome>,
+    pub accepted: bool,
+}
+
+pub(crate) fn acceptance(accepted: bool) {
+    assert!(accepted);
+}
+
+pub(crate) fn finish_observed<F: CgroupFs>(
+    fs: &F,
+    runs: &F::Dir,
+    leaf: &F::Dir,
+    clock: &dyn Clock,
+    child: &mut impl ChildOps,
+) -> Observation {
     let observe = || -> FsResult<()> {
         let proc = fs.proc_cgroup()?;
         if proc.magic != PROC_MAGIC {
@@ -197,12 +425,26 @@ pub(crate) fn finish<F: CgroupFs>(
         || child
             .remaining()
             .is_none_or(|d| d <= Duration::from_secs(6))
+        || observe().is_err()
+        || !child.live()
+        || child
+            .remaining()
+            .is_none_or(|d| d <= Duration::from_secs(6))
     {
-        return false;
+        return Observation {
+            preconditions: false,
+            outcome: None,
+            accepted: false,
+        };
     }
     // A5's production setup/evidence/fresh S9/literal-absence assertions apply
     // unchanged. This is the only setup call. No fixture kill on this path.
-    a5::finish(fs, clock, &Cancellation::default()) && child.killed()
+    let (outcome, accepted) = a5::finish_observed(fs, clock, &Cancellation::default());
+    Observation {
+        preconditions: true,
+        outcome,
+        accepted: accepted && child.killed(),
+    }
 }
 
 #[test]
@@ -393,6 +635,120 @@ fn fixture_limits_are_ordered_and_refuse_failed_or_wrong_controls() {
             writes
                 .iter()
                 .all(|o| o.name != b"cgroup.kill" && o.name != b"cgroup.procs")
+        );
+    }
+}
+
+#[test]
+fn omitted_s7_observes_real_setup_timeout_without_reap_or_removal() {
+    for case in 0..16 {
+        let (fs, r, l, mut child) = fixture();
+        let runs = Dir(r);
+        let leaf = Dir(l);
+        let omitted = OmitS7::new(&fs).unwrap();
+        let (runs, leaf) = omitted.held(&runs, &leaf);
+        let clock = Manual::default();
+        let mut observation = finish_observed(&omitted, &runs, &leaf, &clock, &mut child);
+        assert!(observation.preconditions);
+        assert_eq!(
+            observation.outcome,
+            Some(SetupOutcome::Unavailable(SetupFailure::KillTimeout))
+        );
+        assert!(!observation.accepted);
+        assert_eq!(clock.now(), Duration::from_secs(5));
+        assert_eq!(child.reaps, 0);
+        assert_eq!(omitted.attempts.get(), 1);
+        assert_eq!(omitted.omitted.get(), 1);
+        fs.no_removal();
+        assert_eq!(
+            fs.0.borrow()
+                .log
+                .iter()
+                .filter(|o| o.kind == "mkdir")
+                .count(),
+            1
+        );
+        assert!(
+            !fs.0
+                .borrow()
+                .log
+                .iter()
+                .any(|o| o.kind == "write" && o.name == b"cgroup.kill")
+        );
+        let panicked = assertion_rejected(observation.accepted);
+        match case {
+            1 => observation.preconditions = false,
+            2 => observation.outcome = Some(SetupOutcome::Unavailable(SetupFailure::KillInterface)),
+            3 => {
+                observation.outcome = Some(SetupOutcome::Ready(SetupEvidence {
+                    leaves_removed: 1,
+                    runs_created: false,
+                    unit_written: true,
+                    runs_written: true,
+                }))
+            }
+            4 => observation.accepted = true,
+            5 => omitted.attempts.set(0),
+            6 => {
+                let _ = omitted.write(&runs, "cgroup.kill", b"1");
+            }
+            7 => fs.0.borrow_mut().clear(l),
+            8 => child.live = false,
+            9 => child.remaining = None,
+            10 => omitted.removals.set(1),
+            12 => {
+                fs.0.borrow_mut().child(r, b"unknown");
+            }
+            13 => {
+                fs.0.borrow_mut().child(l, b"arx-1-0");
+            }
+            14 => child.remaining = Some(Duration::ZERO),
+            15 => omitted.forwarded.set(1),
+            _ => (),
+        }
+        assert_eq!(
+            rejection(
+                &omitted,
+                &runs,
+                &leaf,
+                &observation,
+                panicked && case != 11,
+                &mut child
+            ),
+            case == 0,
+            "case {case}"
+        );
+        assert_eq!(child.reaps, 0);
+    }
+    assert!(!assertion_rejected(true));
+}
+
+#[test]
+fn omitted_s7_rejects_wrong_targets_bytes_and_duplicate_attempts() {
+    for case in 0..3 {
+        let (fs, r, l, _) = fixture();
+        let runs = Dir(r);
+        let leaf = Dir(l);
+        let omitted = OmitS7::new(&fs).unwrap();
+        let (runs, leaf) = omitted.held(&runs, &leaf);
+        if case == 2 {
+            omitted.write(&runs, "cgroup.kill", b"1").unwrap();
+        }
+        assert!(
+            match case {
+                0 => omitted.write(&leaf, "cgroup.kill", b"1"),
+                1 => omitted.write(&runs, "cgroup.kill", b"0"),
+                _ => omitted.write(&runs, "cgroup.kill", b"1"),
+            }
+            .is_err()
+        );
+        assert!(omitted.invalid.get());
+        assert!(
+            !fs.0
+                .borrow()
+                .log
+                .iter()
+                .any(|o| o.kind == "write" && o.name == b"cgroup.kill")
         );
     }
 }

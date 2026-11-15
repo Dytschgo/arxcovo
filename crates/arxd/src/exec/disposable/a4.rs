@@ -93,6 +93,14 @@ struct Child<'a> {
     leaf: &'a Dir,
 }
 impl Child<'_> {
+    fn cleanup_failed_acceptance(&mut self) -> bool {
+        if self.reaped || unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
+            return false;
+        }
+        use a4::ChildOps;
+        self.killed() && self.reaped
+    }
+
     fn remaining_ns(&mut self) -> Option<u64> {
         let n = now()?;
         let remaining = a4::remaining(self.deadline, self.last, n)?;
@@ -262,6 +270,45 @@ impl Drop for Child<'_> {
 #[test]
 #[ignore = "A4 fixed staged helper + Standard unit; fresh disposable Linux only; unselected"]
 fn disposable_linux_a4() {
+    fixture(Case::Positive);
+}
+
+#[test]
+#[ignore = "A4 fixed omitted S7; fresh disposable Linux only; NOT granted"]
+fn disposable_linux_a4_omitted_kill() {
+    fixture(Case::Omitted);
+}
+
+enum Case {
+    Positive,
+    Omitted,
+}
+
+fn rejection_marker() -> bool {
+    let bytes = b"ARX_A4_OMITTED_S7_REJECTED\n";
+    let mut offset = 0;
+    for _ in 0..64 {
+        let rc = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes[offset..].as_ptr().cast(),
+                bytes.len() - offset,
+            )
+        };
+        if rc > 0 {
+            offset += rc as usize;
+            if offset == bytes.len() {
+                return true;
+            }
+        } else if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+    }
+    false
+}
+
+// Both literal entries use this one fixed spawn/seed/placement body.
+fn fixture(case: Case) {
     for (key, value) in [
         ("CI", "true"),
         ("GITHUB_ACTIONS", "true"),
@@ -392,13 +439,37 @@ fn disposable_linux_a4() {
             std::thread::sleep(d);
         }
     }
-    assert!(a4::finish(
-        &fs,
-        &runs,
-        &leaf,
-        &Monotonic(Instant::now()),
-        child
-    ));
+    match case {
+        Case::Positive => a4::acceptance(a4::finish(
+            &fs,
+            &runs,
+            &leaf,
+            &Monotonic(Instant::now()),
+            child,
+        )),
+        Case::Omitted => {
+            let omitted = a4::OmitS7::new(&fs).unwrap();
+            let (r, l) = omitted.held(&runs, &leaf);
+            let observation =
+                a4::finish_observed(&omitted, &r, &l, &Monotonic(Instant::now()), child);
+            let panicked = a4::assertion_rejected(observation.accepted);
+            assert!(!child.reaped);
+            assert!(a4::rejection(
+                &omitted,
+                &r,
+                &l,
+                &observation,
+                panicked,
+                child
+            ));
+            assert!(!child.reaped);
+            fs.retained_a4(&runs, &leaf).unwrap();
+            assert!(rejection_marker());
+            // All attribution precedes the separately owned failure-only signal.
+            assert!(child.cleanup_failed_acceptance());
+            fs.cleanup_a4(&runs, &leaf).unwrap();
+        }
+    }
     a5::empty(&fs, &runs).unwrap();
     let socket = std::env::var_os("NOTIFY_SOCKET").unwrap();
     crate::service::unix::Notify::send_to(&socket, b"READY=1").unwrap();

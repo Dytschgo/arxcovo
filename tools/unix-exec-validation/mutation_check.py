@@ -62,6 +62,13 @@ CASES += [
     ('omit helper short write fence', "require(os.write(fd, data) == len(data), 'E_ARTIFACT')", "os.write(fd, data)", 'A4Delivery.test_short_write_cannot_launch'),
     ('adopt replaced helper directory', "same('arxcovo', parent, owned['directory'])", 'pass', 'A4Delivery.test_replaced_or_extra_asset_quarantines'),
 ]
+CASES += [
+    ('skip negative finally cleanup', '        remove_a4_helper(helper_owned)', '        pass', 'A4Delivery.test_negative_cleanup_failure_refuses'),
+    ('omit negative literal', "                     'exec::disposable::a4::disposable_linux_a4_omitted_kill',\n", '', 'A4Delivery.test_negative_literal_marker_and_lifecycle'),
+    ('allow missing negative marker', "text.count('ARX_A4_OMITTED_S7_REJECTED\\n') == 1", "text.count('ARX_A4_OMITTED_S7_REJECTED\\n') <= 1", 'A4Delivery.test_negative_literal_marker_and_lifecycle'),
+    ('allow duplicate negative marker', "text.count('ARX_A4_OMITTED_S7_REJECTED\\n') == 1", "text.count('ARX_A4_OMITTED_S7_REJECTED\\n') >= 1", 'A4Delivery.test_negative_literal_marker_and_lifecycle'),
+]
+
 
 def safe_suite():
     # Guard CLI, RuntimeGuards and CopyGuards deliberately excluded. CgroupScan
@@ -109,28 +116,45 @@ def rust_mutants():
     root = Path(__file__).resolve().parents[2]
     base = root / 'crates/arxd/src'
     paths = [base / p for p in ('exec/hierarchy/parse.rs', 'exec/hierarchy/setup.rs',
-                                'exec/hierarchy/fake.rs', 'development/types.rs')]
+                                'exec/hierarchy/fake.rs', 'development/types.rs',
+                                'exec/hierarchy/a4.rs', 'exec/hierarchy/a5.rs')]
     fingerprints = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
-    parse, setup, fake, types_source = [p.read_text() for p in paths]
+    parse, setup, fake, types_source, a4, a5 = [p.read_text() for p in paths]
     parse = parse[:parse.index('pub(crate) fn bin_alias')]
     parse = parse.replace('use crate::service::{config::Rights, preflight::ExecutionUnavailable};\n', '').replace('use serde::Deserialize;\n', '')
     cancellation = types_source[types_source.index('#[derive(Clone, Default)]'):types_source.index('\n}', types_source.index('impl Cancellation'))+2]
     prefix = fake[:fake.index('#[test]')]
-    # This existing stdin harness selects only A1/A2; omit the separately
-    # housed A5 model module instead of resolving its relative path from stdin.
-    a5_module = '#[path = "a5.rs"]\npub(crate) mod a5;\n'
-    assert prefix.count(a5_module) == 1, 'A5 module anchor'
-    prefix = prefix.replace(a5_module, '')
+    # Inline only the pure test modules. Image-pin hashing is covered by the
+    # Cargo pure tests; no native adapter or ignored fixture enters this binary.
+    a4 = 'use super::*;\n' + a4[a4.index('pub(crate) fn remaining'):]
+    pin_start = a4.index('#[test]\nfn source_and_image_pins')
+    a4 = a4[:pin_start] + a4[a4.index('struct MockChild', pin_start):]
+    for name, body in [('a4', a4), ('a5', a5)]:
+        declaration = f'#[path = "{name}.rs"]\npub(crate) mod {name};\n'
+        assert prefix.count(declaration) == 1, name + ' module anchor'
+        prefix = prefix.replace(declaration, 'pub(crate) mod ' + name + ' {\n' + body.replace('//!', '//') + '\n}\n')
     focused = fake[fake.index('#[test]\nfn a1a2_production_setup_before_acceptance'):]
     source = ('#![allow(dead_code)]\nmod development { use std::sync::{Arc,atomic::{AtomicBool,Ordering}};\n' + cancellation +
               '\n}\nmod hierarchy { pub(crate) use parse::locate;\nmod parse {\n' + parse +
               '\n}\nmod setup {\n' + setup + '\n}\nmod fake {\n' + prefix + focused + '\n}}')
     mutants = [
-      ('omit setup', 'setup(fs, &location, clock, token)', 'SetupOutcome::Ready(SetupEvidence { leaves_removed: 0, runs_created: true, unit_written: true, runs_written: true })', 'a1a2_production_setup_before_acceptance'),
+      ('omit setup', 'let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token)', 'let SetupOutcome::Ready(evidence) = SetupOutcome::Ready(SetupEvidence { leaves_removed: 0, runs_created: true, unit_written: true, runs_written: true })', 'a1a2_production_setup_before_acceptance'),
       ('runs before setup', 'let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token)', 'let _ = fs.mkdir_runs(&fs.open_child(&fs.open_root().unwrap(), b"arxd.service").unwrap()); let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token)', 'a1a2_production_setup_before_acceptance'),
       ('continue Unavailable', 'let SetupOutcome::Ready(evidence) = setup(fs, &location, clock, token) else {\n        return false;\n    };', 'let evidence = match setup(fs, &location, clock, token) { SetupOutcome::Ready(e) => e, SetupOutcome::Unavailable(_) => return true };', 'a1a2_refusals_never_release_acceptance'),
       ('skip A2 postcondition', 'info.uid != 0 || info.mode & 0o777 != 0o700 || info.magic != CGROUP_MAGIC', 'info.uid != 0 || info.magic != CGROUP_MAGIC', 'a1a2_cancel_timeout_and_postcondition_refuse'),
     ]
+    negative = 'a4::omitted_s7_observes_real_setup_timeout_without_reap_or_removal'
+    mutants += [
+        ('forward omitted S7', 'self.omitted.set(self.omitted.get() + 1);', 'self.omitted.set(self.omitted.get() + 1); self.forward_write(d, f, b)?;', negative),
+        ('omit shared acceptance assertion', 'assert!(accepted);', 'let _ = accepted;', negative),
+        ('swallow KillTimeout', 'check(clock.now().saturating_sub(start) < DEADLINE, KillTimeout)?;', 'if clock.now().saturating_sub(start) >= DEADLINE { break; }', negative),
+        ('reap before rejection', 'accepted: accepted && child.killed()', 'accepted: child.killed() && accepted', negative),
+    ]
+    selected = ('a1a2_production_setup_before_acceptance', 'a1a2_refusals_never_release_acceptance',
+                'a1a2_cancel_timeout_and_postcondition_refuse', negative,
+                'a4::populated_leaf_requires_s7_and_one_removal',
+                'a4::omitted_s7_rejects_wrong_targets_bytes_and_duplicate_attempts',
+                'a5::empty_orphan_removed_before_acceptance')
     artifacts = root / 'target'
     artifacts.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='a1a2-pure-', dir=artifacts) as tmp:
@@ -138,13 +162,14 @@ def rust_mutants():
         def compile_run(code):
             built = subprocess.run(['rustc','--edition=2024','--test','-','-o',str(exe)], input=code, text=True, capture_output=True, timeout=60)
             assert built.returncode == 0, built.stderr
-            return [subprocess.run([str(exe),'hierarchy::fake::'+test,'--exact','--test-threads=1'], capture_output=True, text=True, timeout=20) for test in ('a1a2_production_setup_before_acceptance', 'a1a2_refusals_never_release_acceptance', 'a1a2_cancel_timeout_and_postcondition_refuse')]
+            return [subprocess.run([str(exe),'hierarchy::fake::'+test,'--exact','--test-threads=1'], capture_output=True, text=True, timeout=20) for test in selected]
         baseline = compile_run(source)
         assert all(r.returncode == 0 and '1 passed; 0 failed' in r.stdout for r in baseline), [(r.stdout,r.stderr) for r in baseline]
-        print('Rust pure baseline: 3 passed')
+        print('Rust pure baseline: 7 passed')
         for label, before, after, test in mutants:
-            assert source.count(before) == 1, 'Rust anchor: ' + label
-            results = compile_run(source.replace(before,after))
+            scope = focused if test.startswith('a1a2_') else source
+            assert scope.count(before) == 1, 'Rust anchor: ' + label
+            results = compile_run(source.replace(scope, scope.replace(before, after)))
             result = next(r for r in results if ('hierarchy::fake::'+test+' ...') in r.stdout)
             assert result.returncode == 101 and 'panicked at' in result.stdout and 'assertion' in result.stdout and ('hierarchy::fake::'+test+' ... FAILED') in result.stdout, 'no assertion credit: '+label+' '+result.stdout+result.stderr
             print('KILLED '+label+' assertion='+test)
