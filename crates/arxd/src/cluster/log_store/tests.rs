@@ -26,15 +26,16 @@ fn batch(start: u64, end: u64) -> Vec<(LogPos, Entry)> {
 }
 fn payloads() -> Vec<(LogPos, Entry)> {
     vec![
+        (pos(0), crate::cluster::state_store::tests::found()),
         (
-            pos(0),
+            pos(1),
             Entry::Membership(MembershipBlob::new(b"synthetic-members-m3".to_vec()).unwrap()),
         ),
-        (pos(1), mint(5, 0)),
-        (pos(2), redeem(5, 1)),
-        (pos(3), mint(6, 2)),
-        (pos(4), redeem(5, 3)),
-        (pos(5), redeem(6, 4)),
+        (pos(2), mint(5, 0)),
+        (pos(3), redeem(5, 1)),
+        (pos(4), mint(6, 2)),
+        (pos(5), redeem(5, 3)),
+        (pos(6), redeem(6, 4)),
     ]
 }
 fn resign(b: &mut Vec<u8>) {
@@ -57,7 +58,7 @@ fn bad_meta(b: &[u8], edit: impl FnOnce(&mut Vec<u8>)) {
 #[test]
 fn canonical_codecs_and_full_payload_semantic_rejections() {
     let mut entries = payloads();
-    entries.push((pos(6), Entry::Blank));
+    entries.push((pos(7), Entry::Blank));
     for n in [1, 4096] {
         entries.push((
             pos(7),
@@ -78,7 +79,7 @@ fn canonical_codecs_and_full_payload_semantic_rejections() {
             let n = x.len() - 32;
             x.insert(n, 0);
         });
-        for tag in [4, 255] {
+        for tag in [6, 255] {
             bad_row(&b, |x| x[32] = tag);
         }
         bad_row(&b, |x| {
@@ -537,14 +538,14 @@ fn two_store_ordering_replay_and_snapshot_install_ahead_of_tail() {
     let entries = payloads();
     log.append(&entries).unwrap();
     let mut reference = EnrollmentState::new(init.cluster, init.first_free);
-    for (p, e) in &entries[..4] {
+    for (p, e) in &entries[..5] {
         let out = sm.apply(*p, e).unwrap();
         if let Entry::Enrollment(c) = e {
             assert_eq!(out, Some(reference.apply(c)));
         }
     }
-    assert!(pos(3).index <= sm.applied().unwrap().index);
-    log.purge(pos(3)).unwrap();
+    assert!(pos(4).index <= sm.applied().unwrap().index);
+    log.purge(pos(4)).unwrap();
     let snap = sm.snapshot();
     drop(log);
     drop(sm);
@@ -563,7 +564,7 @@ fn two_store_ordering_replay_and_snapshot_install_ahead_of_tail() {
     for (p, e) in &entries {
         source.apply(*p, e).unwrap();
     }
-    for i in 6..=10 {
+    for i in 7..=10 {
         source.apply(pos(i), &Entry::Blank).unwrap();
     }
     sm.install(&source.snapshot()).unwrap();
@@ -611,7 +612,7 @@ fn crash_child() {
     let dir = std::path::PathBuf::from(std::env::var_os("ARX_LOG_CRASH_DIR").unwrap());
     let mode = std::env::var("ARX_LOG_CRASH_MODE").unwrap();
     let mut s = open(&dir);
-    s.append(&payloads()[..4]).unwrap();
+    s.append(&payloads()[..5]).unwrap();
     s.save_vote(StoredVote {
         term: 2,
         node: 3,
@@ -620,9 +621,9 @@ fn crash_child() {
     .unwrap();
     s.hook = Some((dir.clone(), mode.ends_with("after")));
     if mode.starts_with("append") {
-        s.append(&payloads()[4..]).unwrap();
+        s.append(&payloads()[5..]).unwrap();
     } else if mode.starts_with("truncate") {
-        s.truncate_after(Some(pos(1))).unwrap();
+        s.truncate_after(Some(pos(2))).unwrap();
     } else {
         s.save_vote(StoredVote {
             term: 3,
@@ -644,7 +645,7 @@ fn four_process_kills_recover_exact_pre_post_and_replay() {
         let d = private_temp();
         let reference = private_temp();
         let mut r = open(reference.path());
-        r.append(&payloads()[..4]).unwrap();
+        r.append(&payloads()[..5]).unwrap();
         r.save_vote(StoredVote {
             term: 2,
             node: 3,
@@ -654,9 +655,9 @@ fn four_process_kills_recover_exact_pre_post_and_replay() {
         let pre = r.meta.clone();
         let pre_rows = r.entries(0, 10, 64).unwrap();
         if mode.starts_with("append") {
-            r.append(&payloads()[4..]).unwrap();
+            r.append(&payloads()[5..]).unwrap();
         } else if mode.starts_with("truncate") {
-            r.truncate_after(Some(pos(1))).unwrap();
+            r.truncate_after(Some(pos(2))).unwrap();
         } else {
             r.save_vote(StoredVote {
                 term: 3,
@@ -716,9 +717,9 @@ fn four_process_kills_recover_exact_pre_post_and_replay() {
             assert_eq!(s.meta, pre);
             assert_eq!(s.entries(0, 10, 64).unwrap(), pre_rows);
             if mode.starts_with("append") {
-                s.append(&payloads()[4..]).unwrap();
+                s.append(&payloads()[5..]).unwrap();
             } else {
-                s.truncate_after(Some(pos(1))).unwrap();
+                s.truncate_after(Some(pos(2))).unwrap();
             }
         } else {
             assert_eq!(s.meta, post);
@@ -727,9 +728,9 @@ fn four_process_kills_recover_exact_pre_post_and_replay() {
         assert_eq!(s.meta, post);
         assert_eq!(s.entries(0, 10, 64).unwrap(), post_rows);
         if mode.starts_with("append") {
-            assert_eq!(s.append(&payloads()[4..]), Err(StoreError::OutOfOrder));
+            assert_eq!(s.append(&payloads()[5..]), Err(StoreError::OutOfOrder));
         } else if mode.starts_with("truncate") {
-            s.append(&payloads()[2..]).unwrap();
+            s.append(&payloads()[3..]).unwrap();
             assert_eq!(s.entries(0, 10, 64).unwrap(), payloads());
         } else {
             assert_eq!(
@@ -854,4 +855,76 @@ fn reads_recheck_purged_position_and_exact_tail_id_then_poison() {
         assert_eq!(s.entries(0, 100, 64), Err(StoreError::Poisoned));
         assert_eq!(s.append(&[]), Err(StoreError::Poisoned));
     }
+}
+
+#[test]
+fn registry_rows_match_independent_raw_format_and_bounds() {
+    use crate::cluster::enrollment::{Command, FoundMembers, KeyDigest};
+    assert_eq!(std::mem::size_of::<ClusterId>(), 16);
+    for count in [0, 1, 16, 17, 64] {
+        let pairs: Vec<_> = (1..=count)
+            .map(|n| {
+                (
+                    NodeId::new(n).unwrap(),
+                    KeyDigest::of_spki(&n.to_be_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let c = Entry::Enrollment(Command::Found {
+            cluster: [0xab; 16],
+            proposed_at_ms: 123,
+            members: FoundMembers::new(pairs.clone()).unwrap(),
+        });
+        let row = encode_row(pos(42), &c);
+        let mut raw = b"ARXLE1\0\0".to_vec();
+        for n in [2u64, 3, 42] {
+            raw.extend(n.to_be_bytes());
+        }
+        raw.push(4);
+        raw.extend([0xab; 16]);
+        raw.extend(123u64.to_be_bytes());
+        raw.push(count as u8);
+        for (n, k) in pairs {
+            raw.extend(n.get().to_be_bytes());
+            raw.extend(k.as_bytes());
+        }
+        let digest = Sha256::digest(&raw);
+        raw.extend(digest);
+        assert_eq!(row, raw);
+        assert_eq!(row.len(), 90 + 40 * count as usize);
+        assert_eq!(decode_row(&row), Ok((pos(42), c)));
+        for n in 0..row.len() {
+            assert_eq!(decode_row(&row[..n]), Err(StoreError::Corrupt));
+        }
+        bad_row(&row, |b| b[57] = 65);
+        bad_row(&row, |b| {
+            let end = b.len() - 32;
+            b.insert(end, 0);
+        });
+        if count == 64 {
+            bad_row(&row, |b| {
+                b.drain(58..98);
+            });
+        }
+    }
+    let c = Entry::Enrollment(Command::Remove {
+        cluster: [0xab; 16],
+        node: NodeId::new(9).unwrap(),
+        proposed_at_ms: 123,
+    });
+    let row = encode_row(pos(42), &c);
+    let mut raw = b"ARXLE1\0\0".to_vec();
+    for n in [2u64, 3, 42] {
+        raw.extend(n.to_be_bytes());
+    }
+    raw.push(5);
+    raw.extend([0xab; 16]);
+    raw.extend(9u64.to_be_bytes());
+    raw.extend(123u64.to_be_bytes());
+    let digest = Sha256::digest(&raw);
+    raw.extend(digest);
+    assert_eq!(row, raw);
+    assert_eq!(row.len(), 97);
+    assert_eq!(decode_row(&row), Ok((pos(42), c)));
+    bad_row(&row, |b| b[32] = 6);
 }

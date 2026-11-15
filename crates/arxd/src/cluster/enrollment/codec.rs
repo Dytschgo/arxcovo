@@ -51,6 +51,12 @@ pub(crate) fn encode(s: &EnrollmentState, b: &mut Vec<u8>) {
             b.extend(c.node.get().to_be_bytes());
         }
     }
+    b.push(u8::from(s.founded));
+    b.push(s.members.len() as u8);
+    for (n, k) in &s.members {
+        b.extend(n.get().to_be_bytes());
+        b.extend(k.0);
+    }
 }
 pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> {
     let cluster = r.array()?;
@@ -114,7 +120,37 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> 
     if pending > MAX_PENDING {
         return Err(StoreError::Corrupt);
     }
+    let founded = r.flag()?;
+    let count = r.bytes(1)?[0] as usize;
+    if count > MAX_MEMBERS {
+        return Err(StoreError::Corrupt);
+    }
+    let mut members = BTreeMap::new();
+    let mut last = None;
+    for _ in 0..count {
+        let node = NodeId::new(r.u64()?).ok_or(StoreError::Corrupt)?;
+        let key = KeyDigest(r.array()?);
+        if node >= next_node_id
+            || last.is_some_and(|n| n >= node)
+            || members.values().any(|k| *k == key)
+        {
+            return Err(StoreError::Corrupt);
+        }
+        last = Some(node);
+        members.insert(node, key);
+    }
+    if (founded && members.is_empty())
+        || (!founded && (!members.is_empty() || !records.is_empty()))
+        || records
+            .values()
+            .filter_map(|r| r.consumed.as_ref())
+            .any(|c| members.get(&c.node).is_some_and(|k| *k != c.key))
+    {
+        return Err(StoreError::Corrupt);
+    }
     Ok(EnrollmentState {
+        founded,
+        members,
         cluster,
         next_node_id,
         committed_ms,
@@ -125,6 +161,30 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> 
 /// Persist only reduced verifiers. Times are validated by core apply, never this codec.
 pub(crate) fn encode_command(c: &Command, b: &mut Vec<u8>) {
     match c {
+        Command::Found {
+            cluster,
+            members,
+            proposed_at_ms,
+        } => {
+            b.push(4);
+            b.extend(cluster);
+            b.extend(proposed_at_ms.to_be_bytes());
+            b.push(members.as_slice().len() as u8);
+            for (n, k) in members.as_slice() {
+                b.extend(n.get().to_be_bytes());
+                b.extend(k.0);
+            }
+        }
+        Command::Remove {
+            cluster,
+            node,
+            proposed_at_ms,
+        } => {
+            b.push(5);
+            b.extend(cluster);
+            b.extend(node.get().to_be_bytes());
+            b.extend(proposed_at_ms.to_be_bytes());
+        }
         Command::Mint {
             cluster,
             actor,
@@ -161,6 +221,31 @@ pub(crate) fn encode_command(c: &Command, b: &mut Vec<u8>) {
 }
 pub(crate) fn decode_command(tag: u8, r: &mut Reader<'_>) -> Result<Command, StoreError> {
     Ok(match tag {
+        4 => {
+            let cluster = r.array()?;
+            let proposed_at_ms = r.u64()?;
+            let count = r.bytes(1)?[0] as usize;
+            if count > MAX_FOUND_WIRE {
+                return Err(StoreError::Corrupt);
+            }
+            let mut pairs = Vec::with_capacity(count);
+            for _ in 0..count {
+                pairs.push((
+                    NodeId::new(r.u64()?).ok_or(StoreError::Corrupt)?,
+                    KeyDigest(r.array()?),
+                ));
+            }
+            Command::Found {
+                cluster,
+                proposed_at_ms,
+                members: FoundMembers::new(pairs).map_err(|_| StoreError::Corrupt)?,
+            }
+        }
+        5 => Command::Remove {
+            cluster: r.array()?,
+            node: NodeId::new(r.u64()?).ok_or(StoreError::Corrupt)?,
+            proposed_at_ms: r.u64()?,
+        },
         1 => Command::Mint {
             cluster: r.array()?,
             actor: r.array()?,

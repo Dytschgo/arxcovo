@@ -1,5 +1,7 @@
 //! Pure proposal-time enrollment. This module performs no I/O and proves no consensus commit.
 mod code;
+mod registry;
+pub use registry::{FoundMembers, FoundTooLarge, MAX_FOUND_WIRE, MAX_MEMBERS, PeerRefusal};
 pub(super) mod codec;
 pub use code::{CodeError, CodeVerifier, JoinCode, JoinSecret, RedeemProof};
 use sha2::{Digest, Sha256};
@@ -38,6 +40,16 @@ impl KeyDigest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    Found {
+        cluster: ClusterId,
+        members: FoundMembers,
+        proposed_at_ms: u64,
+    },
+    Remove {
+        cluster: ClusterId,
+        node: NodeId,
+        proposed_at_ms: u64,
+    },
     /// Propose only from a fresh in-memory JoinCode::generate value. Retry that
     /// value only before first_proposal + CODE_TTL_MS - 4*SKEW_MS, then discard.
     /// Never re-propose a Mint decoded from storage/wire or accept a peer verifier.
@@ -82,6 +94,14 @@ impl Command {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
+    NotFounded,
+    BadFounders,
+    AlreadyFounded,
+    KeyInUse,
+    MembersFull,
+    Revoked,
+    UnknownNode,
+    LastMember,
     WrongCluster,
     TimeOutOfRange,
     ClockBehind,
@@ -99,6 +119,14 @@ pub enum Reject {
 impl std::fmt::Display for Reject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::NotFounded => "not founded",
+            Self::BadFounders => "bad founders",
+            Self::AlreadyFounded => "already founded",
+            Self::KeyInUse => "key in use",
+            Self::MembersFull => "members full",
+            Self::Revoked => "revoked",
+            Self::UnknownNode => "unknown node",
+            Self::LastMember => "last member",
             Self::WrongCluster => "wrong cluster",
             Self::TimeOutOfRange => "time out of range",
             Self::ClockBehind => "clock behind",
@@ -181,6 +209,8 @@ impl EnrollmentGrant {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    Founded { replay: bool },
+    Removed { replay: bool },
     Minted { expires_ms: u64, replay: bool },
     Enrolled(EnrollmentGrant),
     Rejected(Reject),
@@ -216,6 +246,8 @@ struct CodeRecord {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnrollmentState {
+    founded: bool,
+    members: BTreeMap<NodeId, KeyDigest>,
     cluster: ClusterId,
     next_node_id: NodeId,
     committed_ms: u64,
@@ -225,6 +257,8 @@ impl EnrollmentState {
     pub fn new(cluster: ClusterId, first_free: NodeId) -> Self {
         Self {
             cluster,
+            founded: false,
+            members: BTreeMap::new(),
             next_node_id: first_free,
             committed_ms: 0,
             records: BTreeMap::new(),
@@ -238,6 +272,16 @@ impl EnrollmentState {
                 ..
             }
             | Command::Redeem {
+                cluster,
+                proposed_at_ms,
+                ..
+            }
+            | Command::Found {
+                cluster,
+                proposed_at_ms,
+                ..
+            }
+            | Command::Remove {
                 cluster,
                 proposed_at_ms,
                 ..
@@ -276,7 +320,12 @@ impl EnrollmentState {
                 .checked_add(TOMBSTONE_MS)
                 .is_some_and(|t| t > eff)
         });
+        if !self.founded && !matches!(command, Command::Found { .. }) {
+            return Outcome::Rejected(Reject::NotFounded);
+        }
         match command {
+            Command::Found { members, .. } => self.found(members),
+            Command::Remove { node, .. } => self.remove(*node),
             Command::Mint {
                 actor,
                 request,
@@ -348,10 +397,19 @@ impl EnrollmentState {
                     if consumed.key != *key {
                         return Outcome::Rejected(Reject::KeyConflict);
                     }
+                    if self.members.get(&consumed.node) != Some(key) {
+                        return Outcome::Rejected(Reject::Revoked);
+                    }
                     (consumed.node, true)
                 } else {
                     if usable_time >= record.expires_ms {
                         return Outcome::Rejected(Reject::Expired);
+                    }
+                    if self.members.values().any(|k| k == key) {
+                        return Outcome::Rejected(Reject::KeyInUse);
+                    }
+                    if self.members.len() >= MAX_MEMBERS {
+                        return Outcome::Rejected(Reject::MembersFull);
                     }
                     let Some(next) = self.next_node_id.get().checked_add(1).and_then(NodeId::new)
                     else {
@@ -363,6 +421,7 @@ impl EnrollmentState {
                         key: *key,
                         node,
                     });
+                    self.members.insert(node, *key);
                     self.next_node_id = next;
                     (node, false)
                 };
@@ -385,6 +444,8 @@ mod tests;
 impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Found { .. } => "enrollment found",
+            Self::Remove { .. } => "enrollment remove",
             Self::Mint { .. } => "enrollment mint",
             Self::Redeem { .. } => "enrollment redeem",
         })

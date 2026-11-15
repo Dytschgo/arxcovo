@@ -404,3 +404,37 @@ impl ConsensusNode {
 mod mem_net;
 #[cfg(test)]
 mod three_node;
+
+#[cfg(test)]
+fn registry_covers(m: &Members, state: &super::enrollment::EnrollmentState) -> bool {
+    m.nodes().all(|(n, _)| {
+        super::enrollment::NodeId::new(*n).is_some_and(|n| {
+            // A key mismatch still proves that the node is allocated in the registry.
+            matches!(
+                state.authorize_peer(
+                    super::enrollment::codec::cluster(state),
+                    n,
+                    super::enrollment::KeyDigest::of_spki(b"probe").unwrap(),
+                ),
+                Ok(()) | Err(super::enrollment::PeerRefusal::KeyMismatch)
+            )
+        })
+    })
+}
+impl ConsensusNode {
+    #[cfg(test)]
+    async fn local_authorize(
+        &self,
+        cluster: super::enrollment::ClusterId,
+        node: super::enrollment::NodeId,
+        key: super::enrollment::KeyDigest,
+    ) -> Result<(), super::enrollment::PeerRefusal> {
+        let sm = self.sm.as_ref().unwrap().clone();
+        blocking(move || {
+            let store = sm.0.lock().unwrap();
+            Ok(store.state().authorize_peer(cluster, node, key))
+        })
+        .await
+        .unwrap()
+    }
+}
