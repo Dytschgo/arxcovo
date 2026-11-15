@@ -176,6 +176,146 @@ def rust_mutants():
     assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths] == fingerprints
     print('Rust source fingerprints unchanged')
 
+def sudo_nnp_source_checks():
+    """Only pure extracted Rust and SudoNnp mocks; no native module is linked.
+
+    Call-graph audit: extracted items contain scalar comparisons/assignments and
+    assertions only. rustc compiles stdin; generated test binaries have no host
+    adapters. Python SudoNnp patches every filesystem/account/process effect.
+    """
+    root = Path(__file__).resolve().parents[2]
+    files = [root / 'crates/arxd/src/exec/disposable/sudo_nnp.rs',
+             root / 'crates/arxd/src/unix_shim_rights_linux.rs',
+             root / 'crates/arxd/src/unix_shim_rights_linux_tests.rs']
+    original = [p.read_bytes() for p in files]
+    controller, linux, tests = [b.decode('utf-8') for b in original]
+    facts = controller[controller.index('#[derive(Clone, Copy)]'):controller.index('fn output(')]
+    fact_test = controller[controller.index('#[test]\nfn a7_a11_discriminators'):controller.index('#[test]\nfn a7_a11_delivery_stays_closed')]
+    observation = linux[linux.index('#[cfg(test)]\n#[derive(Clone, Copy, Default)]'):linux.index('#[cfg(test)]\nstd::thread_local!')]
+    scalar_test = tests[tests.index('#[test]\nfn s14_sudo_nnp_scalar_discriminators'):]
+    sources = [(facts + fact_test, 'a7_a11_discriminators',
+                ['f.' + field for field in ('identity', 'exited', 'bounded', 'records', 'rights', 'c1',
+                 'alias_skipped', 'c3_unopened', 'path', 'cloexec', 'regular', 'exec_eof',
+                 'nonzero', 'both_policy_cases', 'cleanup')]),
+               (observation + scalar_test, 's14_sudo_nnp_scalar_discriminators',
+                ['o.' + field for field in ('c1', 'alias_skipped', 'path', 'cloexec', 'regular',
+                  'same_inode', 'exec_eof', 'nonzero')] +
+                ['!o.c3_opened', 'o.uid == uid', 'o.gid == gid', 'uid != 0', 'gid != 0'])]
+    with tempfile.TemporaryDirectory(prefix='a7-a11-pure-') as tmp:
+        exe = Path(tmp) / 'pure.exe'
+        for source, test, terms in sources:
+            def check(code):
+                result = subprocess.run(['rustc', '--edition=2024', '--test', '-', '-o', str(exe)],
+                                        input='#![allow(dead_code)]\n' + code, text=True, capture_output=True, timeout=60)
+                assert result.returncode == 0, result.stderr
+                return subprocess.run([str(exe), test, '--exact'], text=True, capture_output=True, timeout=20)
+            baseline = check(source)
+            assert baseline.returncode == 0 and '1 passed; 0 failed' in baseline.stdout, baseline.stdout
+            print('PASS pure ' + test)
+            for term in terms:
+                # Operate only within acceptance function, never its test setup.
+                end = source.index('#[test]')
+                predicate, assertions = source[:end], source[end:]
+                assert predicate.count(term) == 1, term
+                result = check(predicate.replace(term, 'true') + assertions)
+                assert result.returncode == 101 and 'assertion' in result.stdout, term + result.stdout + result.stderr
+                print('KILLED scalar ' + term)
+    # Compile the actual bounded record parsers against the already-built locked
+    # offline serde_json dependency. No probe, Runner, or native adapter included.
+    tools_source = (root / 'crates/arxd/src/development/mod.rs').read_text()
+    tools = tools_source[tools_source.index('pub const TOOLS:'):tools_source.index('const ENVIRONMENT:')]
+    parsers = controller[controller.index('fn probe_records('):controller.index('fn valid_run(')]
+    parser_test = controller[controller.index('#[test]\nfn a7_a11_record_discriminators'):controller.index('#[test]\nfn a7_a11_run_discriminators')]
+    rlibs = sorted((root / 'target/debug/deps').glob('libserde_json-*.rlib'))
+    assert rlibs, 'build locked offline Cargo test dependencies first'
+    print('offline parser dependency: ' + rlibs[0].name)
+    parser_source = 'mod development { ' + tools + '}\n' + parsers + parser_test
+    with tempfile.TemporaryDirectory(prefix='a7-a11-records-') as tmp:
+        exe = Path(tmp) / 'records.exe'
+        def check_records(code):
+            built = subprocess.run(['rustc', '--edition=2024', '--test', '-', '-L',
+                                    'dependency=' + str(root / 'target/debug/deps'), '--extern',
+                                    'serde_json=' + str(rlibs[0]), '-o', str(exe)], input=code,
+                                   text=True, capture_output=True, timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe), 'a7_a11_record_discriminators', '--exact'],
+                                  text=True, capture_output=True, timeout=20)
+        result = check_records(parser_source)
+        assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout, result.stdout
+        print('PASS actual bounded record parsers')
+        before = 'lines.last() == Some(&r#"{"rights":{"no_new_privs":true,"sudo":"exit_nonzero"}}"#)'
+        assert parser_source.count(before) == 1
+        result = check_records(parser_source.replace(before, 'true'))
+        assert result.returncode == 101 and 'assertion' in result.stdout, result.stdout
+        print('KILLED accept unknown/zero/absent rights')
+        for term in ("!text.ends_with('\\n')", 'lines.len() != crate::development::TOOLS.len() + 1'):
+            assert parsers.count(term) == 1, term
+            result = check_records(parser_source.replace(parsers, parsers.replace(term, 'false')))
+            assert result.returncode == 101 and 'assertion' in result.stdout, term + result.stdout
+            print('KILLED record ' + term)
+
+
+    exec_source = (root / 'crates/arxd/src/exec/mod.rs').read_text()
+    types_source = exec_source[exec_source.index('#[derive(Clone)]\npub struct OwnerConfig'):exec_source.index('#[derive(Debug, PartialEq, Eq)]\npub enum ExecError')]
+    output_source = controller[controller.index('fn output('):controller.index('fn probe_records(')]
+    valid_source = controller[controller.index('fn valid_run('):controller.index('#[test]\n#[ignore')]
+    run_test = controller[controller.index('#[test]\nfn a7_a11_run_discriminators'):]
+    with tempfile.TemporaryDirectory(prefix='a7-a11-results-') as tmp:
+        exe = Path(tmp) / 'results.exe'
+        result_source = ('use std::{collections::BTreeMap,path::PathBuf,time::Duration};\n' +
+                         types_source + output_source + valid_source + run_test)
+        def check_result(code):
+            built = subprocess.run(['rustc','--edition=2024','--test','-','-o',str(exe)],
+                                   input=code,text=True,capture_output=True,timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe),'a7_a11_run_discriminators','--exact'],
+                                  text=True,capture_output=True,timeout=20)
+        result = check_result(result_source)
+        assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout, result.stdout
+        print('PASS actual RunResult identity/status/capture/cleanup predicates')
+        for term in ('run.outcome == Outcome::Exited', 'run.exit_code == Some(0)',
+                     'run.tree_boundary == TreeBoundary::LinuxCgroupV2',
+                     'run.tree_cleanup_confirmed', '!residue'):
+            assert valid_source.count(term) == 1, term
+            code = result_source.replace(valid_source, valid_source.replace(term, 'true'))
+            result = check_result(code)
+            assert result.returncode == 101 and 'assertion' in result.stdout, term + result.stdout
+            print('KILLED result ' + term)
+        identity = valid_source[valid_source.index('run.identity'):valid_source.index('&& run.outcome')]
+        result = check_result(result_source.replace(valid_source, valid_source.replace(identity, 'true\n        ')))
+        assert result.returncode == 101 and 'assertion' in result.stdout, result.stdout
+        print('KILLED actual wrong identity')
+        for term in ('run.stdout.dropped_bytes != 0', 'run.stderr.dropped_bytes != 0',
+                     '!run.stderr.head.is_empty()', '!run.stderr.tail.is_empty()',
+                     'run.stdout.head.len() + run.stdout.tail.len() > 4096'):
+            assert output_source.count(term) == 1, term
+            result = check_result(result_source.replace(output_source, output_source.replace(term, 'false')))
+            assert result.returncode == 101 and 'assertion' in result.stdout, term + result.stdout
+            print('KILLED capture ' + term)
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.SudoNnp)
+    result = unittest.TextTestRunner().run(suite)
+    assert result.wasSuccessful()
+    source = Path(driver.__file__).read_text()
+    cases = [
+        ("raise RuntimeError('E_FIXTURE_COLLISION')", 'pass', 'test_collision_no_adoption'),
+        ("require(unit_gone is True, 'E_QUARANTINE_CGROUP')", 'pass', 'test_cleanup_requires_stop_and_matching_identity'),
+        ("if index == 0:", "if False:", "test_two_cases_and_owned_cleanup"),
+    ]
+    for before, after, name in cases:
+        assert source.count(before) == 1
+        module = types.ModuleType('sudo_nnp_mutant')
+        exec(compile(source.replace(before, after), '<in-memory-mutant>', 'exec'), module.__dict__)
+        with patch.object(test_driver, 'driver', module):
+            suite = unittest.TestSuite([test_driver.SudoNnp(name)])
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+        # Errors do not count as a killed assertion.
+        assert result.failures and not result.errors, name + str(result.errors)
+        print('KILLED mock ' + name)
+    assert [p.read_bytes() for p in files] == original
+    print('A7/A11 pure and mock source bytes unchanged')
+
+
 if __name__ == '__main__':
     main()
     rust_mutants()

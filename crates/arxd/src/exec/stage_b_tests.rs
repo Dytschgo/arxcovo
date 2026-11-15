@@ -848,6 +848,7 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
         "exec/residue_tests.rs",
         "exec/disposable.rs",
         "exec/disposable/a4.rs",
+        "exec/disposable/sudo_nnp.rs",
         "exec/hierarchy/fake.rs",
         "service/unix_bridge/tests.rs",
         "service/unix_bridge/tests/a6.rs",
@@ -864,6 +865,7 @@ fn w8_e7_crate_wide_inactive_source_inventory() {
         ),
         ("exec/hierarchy.rs", "#[cfg(test)] pub(crate) mod fake;"),
         ("exec/disposable.rs", "mod a4;"),
+        ("exec/disposable.rs", "mod sudo_nnp;"),
         (
             "exec/hierarchy/fake.rs",
             "#[path = \"a4.rs\"] pub(crate) mod a4;",

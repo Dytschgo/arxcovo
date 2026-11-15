@@ -168,6 +168,158 @@ def remove_a4_helper(owned):
     os.rmdir('arxcovo', dir_fd=parent)
 
 
+# Dormant Slice 1 only: neither run_body nor any CLI selector calls these.
+# Syntax success is never policy proof. No qualifying image is attested yet.
+def sudo_nnp_host_attested():
+    return False
+
+
+def sudo_nnp_eligible(host_attested, policy_attested):
+    return host_attested is True and policy_attested is True
+
+
+def sudo_nnp_names(run):
+    require(re.fullmatch('[1-9][0-9]{0,19}-[1-9][0-9]{0,5}', run), 'E_IDENTITY')
+    names = tuple('arxsn' + run.replace('-', 'x') + suffix for suffix in ('r', 'n'))
+    require(all(len(name) <= 32 for name in names), 'E_IDENTITY')
+    return names
+
+
+def prepare_sudo_nnp(run, owned):
+    """Root controller only, before service start. Caller retains owned on failure.
+
+    No adoption: pre-existing accounts/groups, roots or policy names refuse before
+    the first mutation. Unknown identity after a partial command quarantines.
+    """
+    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    import pwd
+    import grp
+    require(os.getuid() == os.geteuid() == 0 and not owned, 'E_FIXTURE_UID')
+    names = sudo_nnp_names(run)
+    for parent in (Path('/var/lib'), Path('/etc/sudoers.d')):
+        protected(parent, 'run_parent')
+    for name in names:
+        for lookup in (pwd.getpwnam, grp.getgrnam):
+            try:
+                lookup(name)
+            except KeyError:
+                continue
+            raise RuntimeError('E_FIXTURE_COLLISION')
+        for path in (Path('/var/lib') / name, Path('/etc/sudoers.d') / name):
+            require(not os.path.lexists(path), 'E_FIXTURE_COLLISION')
+    for index, name in enumerate(names):
+        base = Path('/var/lib') / name
+        item = dict(name=name, base=base, created=False, identity=None, policy=None)
+        owned.append(item)
+        base.mkdir(mode=0o700)
+        item['base_created'] = True
+        item['base_info'] = base.lstat()
+        # Mark before command: failure may have partially created account/group.
+        item['created'] = True
+        call(['/usr/sbin/useradd', '--no-create-home', '--user-group',
+              '--shell', '/usr/sbin/nologin', name])
+        account, group = pwd.getpwnam(name), grp.getgrnam(name)
+        require(account.pw_uid >= 1000 and account.pw_gid == group.gr_gid >= 1000 and
+                account.pw_shell == '/usr/sbin/nologin' and not group.gr_mem and
+                os.getgrouplist(name, account.pw_gid) == [account.pw_gid], 'E_FIXTURE_UID')
+        item['identity'] = (account.pw_uid, account.pw_gid)
+        cg_scan(uid=account.pw_uid, gid=account.pw_gid)
+        workspace = base / 'workspace'
+        workspace.mkdir(mode=0o700)
+        os.chown(workspace, account.pw_uid, account.pw_gid, follow_symlinks=False)
+        item['workspace_info'] = workspace.lstat()
+        # Private build-owned root; retain captured inode for owned-only cleanup.
+        os.chown(base, account.pw_uid, account.pw_gid, follow_symlinks=False)
+        item['base_info'] = base.lstat()
+        if index == 0:
+            policy = Path('/etc/sudoers.d') / name
+            data = (name + ' ALL=(root) NOPASSWD: /usr/bin/true\n').encode('ascii')
+            fd = os.open(policy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o440)
+            # Capture immediately, including short-write/fchmod/syntax failure.
+            item['policy_pending'] = True
+            try:
+                item['policy'] = (policy, os.fstat(fd))
+                item['policy_pending'] = False
+                require(os.write(fd, data) == len(data), 'E_POLICY_WRITE')
+                os.fchmod(fd, 0o440)
+                item['policy'] = (policy, os.fstat(fd))
+            finally:
+                os.close(fd)
+            # Fixed bounded syntax refusal only, never an effective-policy check.
+            subprocess.run(['/usr/sbin/visudo', '-c', '-f', str(policy)], env=SAFE_ENV,
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    require(owned[0]['identity'][0] != owned[1]['identity'][0] and
+            owned[0]['identity'][1] != owned[1]['identity'][1], 'E_FIXTURE_UID')
+
+
+def cleanup_sudo_nnp(owned, unit_gone=False):
+    """Only after existing driver stop/cgroup confirmation. Uncertainty retains.
+
+    All identity and live-task checks precede destructive cleanup. No wildcard
+    paths, policy discovery, account adoption, or foreign-state deletion.
+    """
+    import pwd
+    import grp
+    require(unit_gone is True, 'E_QUARANTINE_CGROUP')
+    for item in owned:
+        require(not item.get('policy_pending') and
+                (not item.get('base_created') or item.get('base_info') is not None),
+                'E_QUARANTINE_PATH_UNCAPTURED')
+        require(item.get('identity') is not None or not item['created'], 'E_QUARANTINE_UID_UNCAPTURED')
+        if item.get('base_info') is not None:
+            same_object(item['base'], item['base_info'])
+        if item['created']:
+            account, group = pwd.getpwnam(item['name']), grp.getgrnam(item['name'])
+            require((account.pw_uid, account.pw_gid) == item['identity'] and
+                    group.gr_gid == account.pw_gid and not group.gr_mem and
+                    account.pw_shell == '/usr/sbin/nologin' and
+                    os.getgrouplist(item['name'], account.pw_gid) == [account.pw_gid], 'E_FIXTURE_UID')
+            for count, proc in enumerate(Path('/proc').iterdir()):
+                require(count < 20000, 'E_PROC_BOUND')
+                if proc.name.isdigit():
+                    try:
+                        require(proc.stat().st_uid != account.pw_uid, 'E_UID_LIVE')
+                    except FileNotFoundError:
+                        pass
+        if item['policy']:
+            policy, info = item['policy']
+            same_object(policy, info)
+            require(stat.S_ISREG(policy.lstat().st_mode) and policy.lstat().st_uid == 0
+                    and policy.lstat().st_nlink == 1, 'E_POLICY_IDENTITY')
+    require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
+    for item in reversed(owned):
+        if item['policy']:
+            policy, info = item['policy']
+            same_object(policy, info)
+            policy.unlink()
+            require(not os.path.lexists(policy), 'E_POLICY_RESIDUE')
+        if item['created']:
+            call(['/usr/sbin/userdel', item['name']])
+            try:
+                pwd.getpwnam(item['name'])
+            except KeyError:
+                pass
+            else:
+                raise RuntimeError('E_FIXTURE_RESIDUE')
+            try:
+                group = grp.getgrnam(item['name'])
+            except KeyError:
+                group = None
+            if group is not None:
+                require(group.gr_gid == item['identity'][1] and not group.gr_mem, 'E_GROUP_ORPHAN')
+                call(['/usr/sbin/groupdel', item['name']])
+            try:
+                grp.getgrnam(item['name'])
+            except KeyError:
+                pass
+            else:
+                raise RuntimeError('E_GROUP_ORPHAN')
+        if item.get('base_info') is not None:
+            same_object(item['base'], item['base_info'])
+            shutil.rmtree(item['base'])
+            require(not os.path.lexists(item['base']), 'E_FIXTURE_RESIDUE')
+
+
 def identity(env):
     for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
         require(re.fullmatch(r'[1-9][0-9]{0,19}', env.get(key, '')), 'E_ID')

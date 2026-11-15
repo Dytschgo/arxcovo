@@ -1186,5 +1186,173 @@ class A4Delivery(unittest.TestCase):
         self.assertEqual(events, ['stop', 'helper', 'runtime'])
 
 
+class SudoNnp(unittest.TestCase):
+    """Every host effect is mocked; importing fake pwd/grp also works on Windows."""
+    def setup_owned(self, collision=False, fail_call=None):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        users, groups = {}, {}
+        if collision:
+            users[driver.sudo_nnp_names('123-1')[0]] = object()
+        def lookup(table, name):
+            if name not in table:
+                raise KeyError(name)
+            return table[name]
+        pwd = SimpleNamespace(getpwnam=lambda n: lookup(users, n))
+        grp = SimpleNamespace(getgrnam=lambda n: lookup(groups, n))
+        stack.enter_context(patch.dict(sys.modules, pwd=pwd, grp=grp))
+        events = []
+        def call(args):
+            events.append(args[0])
+            if fail_call == len(events):
+                raise RuntimeError('E_INJECTED')
+            name = args[-1]
+            if args[0].endswith('useradd'):
+                uid = 2000 + len(users)
+                users[name] = SimpleNamespace(pw_uid=uid, pw_gid=uid, pw_shell='/usr/sbin/nologin')
+                groups[name] = SimpleNamespace(gr_gid=uid, gr_mem=[])
+            elif args[0].endswith('userdel'):
+                del users[name]
+            elif args[0].endswith('groupdel'):
+                del groups[name]
+        info = SimpleNamespace(st_dev=1, st_ino=1, st_mode=stat.S_IFREG | 0o440, st_uid=0, st_nlink=1)
+        mocks = {}
+        for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+            stack.enter_context(patch.object(driver.os, flag, 0, create=True))
+        for owner, name, kw in [
+            (driver, 'sudo_nnp_eligible', dict(return_value=True)),
+            (driver, 'protected', {}), (driver, 'cg_scan', {}),
+            (driver, 'call', dict(side_effect=call)), (driver, 'same_object', {}),
+            (driver.os, 'getuid', dict(return_value=0)), (driver.os, 'geteuid', dict(return_value=0)),
+            (driver.os.path, 'lexists', dict(return_value=False)),
+            (driver.os, 'getgrouplist', dict(side_effect=lambda n,g: [g])),
+            (driver.os, 'chown', {}), (driver.os, 'open', dict(return_value=17)),
+            (driver.os, 'fstat', dict(return_value=info)),
+            (driver.os, 'write', dict(side_effect=lambda fd,data: len(data))),
+            (driver.os, 'fchmod', {}), (driver.os, 'close', {}),
+            (driver.Path, 'mkdir', {}), (driver.Path, 'lstat', dict(return_value=info)),
+            (driver.Path, 'iterdir', dict(return_value=[])), (driver.Path, 'unlink', {}),
+            (driver.shutil, 'rmtree', {}), (driver.subprocess, 'run', {}),
+        ]:
+            mocks[name] = stack.enter_context(patch.object(owner, name, create=True, **kw))
+        mocks['rmtree'].avoids_symlink_attacks = True
+        return users, groups, events, mocks
+
+    def test_names_and_closed_selector(self):
+        names = driver.sudo_nnp_names('123-1')
+        self.assertEqual(names, ('arxsn123x1r', 'arxsn123x1n'))
+        for value in ('../foreign', '0-1', '123-0', '123/1', '1-1r', '9'*20 + '-' + '9'*6):
+            with self.assertRaisesRegex(RuntimeError, 'E_IDENTITY'):
+                driver.sudo_nnp_names(value)
+        selected = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
+        with patch.object(driver, 'TEST', selected), patch.object(driver.os, 'open') as opened:
+            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                driver.test_argv('/binary')
+            opened.assert_not_called()
+        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
+
+    def test_unattested_before_effects(self):
+        with patch.object(driver, 'call') as call, patch.object(driver.Path, 'mkdir') as mkdir:
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
+                driver.prepare_sudo_nnp('123-1', [])
+            call.assert_not_called()
+            mkdir.assert_not_called()
+        self.assertFalse(driver.sudo_nnp_host_attested())
+        for host, policy in [(False, True), (True, False), (None, True), (True, None)]:
+            self.assertFalse(driver.sudo_nnp_eligible(host, policy))
+        self.assertTrue(driver.sudo_nnp_eligible(True, True))
+
+    def test_collision_no_adoption(self):
+        _, _, events, mocks = self.setup_owned(collision=True)
+        owned = []
+        with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_COLLISION'):
+            driver.prepare_sudo_nnp('123-1', owned)
+        self.assertEqual(events, [])
+        self.assertEqual(owned, [])
+        mocks['mkdir'].assert_not_called()
+
+    def test_two_cases_and_owned_cleanup(self):
+        users, groups, events, mocks = self.setup_owned()
+        owned = []
+        driver.prepare_sudo_nnp('123-1', owned)
+        self.assertEqual(len(owned), 2)
+        self.assertNotEqual(owned[0]['identity'], owned[1]['identity'])
+        self.assertIsNotNone(owned[0]['policy'])
+        self.assertIsNone(owned[1]['policy'])
+        mocks['write'].assert_called_once_with(17, b'arxsn123x1r ALL=(root) NOPASSWD: /usr/bin/true\n')
+        mocks['fchmod'].assert_called_once_with(17, 0o440)
+        self.assertEqual(mocks['run'].call_args.args[0][:3], ['/usr/sbin/visudo', '-c', '-f'])
+        driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        self.assertEqual(users, {})
+        self.assertEqual(groups, {})
+        self.assertEqual(mocks['unlink'].call_count, 1)
+        self.assertEqual(mocks['rmtree'].call_count, 2)
+
+    def test_partial_failure_quarantines_uncaptured_identity(self):
+        _, _, events, mocks = self.setup_owned(fail_call=2)
+        owned = []
+        with self.assertRaisesRegex(RuntimeError, 'E_INJECTED'):
+            driver.prepare_sudo_nnp('123-1', owned)
+        with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_UID_UNCAPTURED'):
+            driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        self.assertEqual(len(events), 2)
+        mocks['unlink'].assert_not_called()
+        mocks['rmtree'].assert_not_called()
+
+    def test_syntax_failure_finally_cleans_only_owned(self):
+        users, groups, _, mocks = self.setup_owned()
+        mocks['run'].side_effect = RuntimeError('E_SYNTAX')
+        owned = []
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'E_SYNTAX'):
+                driver.prepare_sudo_nnp('123-1', owned)
+        finally:
+            driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        self.assertFalse(users or groups)
+        self.assertEqual(mocks['unlink'].call_count, 1)
+        self.assertEqual(mocks['rmtree'].call_count, 1)
+
+    def test_uncaptured_policy_closes_and_quarantines(self):
+        _, _, events, mocks = self.setup_owned()
+        mocks['fstat'].side_effect = RuntimeError('E_CAPTURE')
+        owned = []
+        with self.assertRaisesRegex(RuntimeError, 'E_CAPTURE'):
+            driver.prepare_sudo_nnp('123-1', owned)
+        mocks['close'].assert_called_once_with(17)
+        with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_PATH_UNCAPTURED'):
+            driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        self.assertEqual(len(events), 1)
+        mocks['unlink'].assert_not_called()
+        mocks['rmtree'].assert_not_called()
+
+    def test_path_collision_and_short_write(self):
+        _, _, events, mocks = self.setup_owned()
+        mocks['lexists'].return_value = True
+        with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_COLLISION'):
+            driver.prepare_sudo_nnp('123-1', [])
+        self.assertEqual(events, [])
+        mocks['lexists'].return_value = False
+        mocks['write'].side_effect = lambda fd,data: len(data)-1
+        owned = []
+        with self.assertRaisesRegex(RuntimeError, 'E_POLICY_WRITE'):
+            driver.prepare_sudo_nnp('123-1', owned)
+        driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        mocks['run'].assert_not_called()
+        mocks['unlink'].assert_called_once()
+
+    def test_cleanup_requires_stop_and_matching_identity(self):
+        _, _, events, mocks = self.setup_owned()
+        owned = []
+        driver.prepare_sudo_nnp('123-1', owned)
+        with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_CGROUP'):
+            driver.cleanup_sudo_nnp(owned)
+        mocks['same_object'].side_effect = RuntimeError('E_FIXTURE_INODE')
+        with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_INODE'):
+            driver.cleanup_sudo_nnp(owned, unit_gone=True)
+        self.assertEqual(len(events), 2)
+        mocks['unlink'].assert_not_called()
+        mocks['rmtree'].assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

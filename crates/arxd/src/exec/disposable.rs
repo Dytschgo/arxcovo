@@ -2,6 +2,7 @@
 //! Never run on an owner PC, self-hosted runner, or persistent machine.
 use super::*;
 mod a4;
+mod sudo_nnp;
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt, chown},

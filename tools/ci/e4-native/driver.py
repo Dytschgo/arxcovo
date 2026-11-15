@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': '102ec5720cd1ecfd1236ebea4237025e155bcef974de27ad876b550525e059fd', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
+PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '3fc3e949dc0725d22d466c12f1ef3fa13d395fea586a84546c8cb4e4be8ceef4', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': '672bc7e57bd6251b5e4db4a51e78de5f930b962ab9b3034774b128b4cacb7048', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
 TARGETS = tuple(PINS)
 MANIFEST = "tools/ci/e4-native/mutations.jsonl"
 MANIFEST_SHA = '15980053ce88457578407686d309af95a6dd18cb175fd777d82ac0e70b850671'

@@ -95,6 +95,54 @@ pub(super) fn probe() -> &'static str {
         || {},
     )
 }
+// Fixed thread-local scalars only; never accessed in the fork child.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct Observation {
+    c1: bool,
+    alias_skipped: bool,
+    c3_opened: bool,
+    path: bool,
+    cloexec: bool,
+    regular: bool,
+    dev: u64,
+    ino: u64,
+    same_inode: bool,
+    uid: u32,
+    gid: u32,
+    exec_eof: bool,
+    nonzero: bool,
+}
+#[cfg(test)]
+fn observation_accepts(o: Observation, uid: u32, gid: u32) -> bool {
+    o.c1 && o.alias_skipped
+        && !o.c3_opened
+        && o.path
+        && o.cloexec
+        && o.regular
+        && o.same_inode
+        && o.uid == uid
+        && uid != 0
+        && o.gid == gid
+        && gid != 0
+        && o.exec_eof
+        && o.nonzero
+}
+#[cfg(test)]
+std::thread_local! {
+    static OBSERVATION: std::cell::Cell<Observation> = const { std::cell::Cell::new(Observation {
+        c1: false, alias_skipped: false, c3_opened: false, path: false,
+        cloexec: false, regular: false, dev: 0, ino: 0, same_inode: false, uid: 0, gid: 0, exec_eof: false, nonzero: false,
+    }) };
+}
+#[cfg(test)]
+fn observe(update: impl FnOnce(&mut Observation)) {
+    OBSERVATION.with(|slot| {
+        let mut value = slot.get();
+        update(&mut value);
+        slot.set(value);
+    });
+}
 fn fd(raw: i32) -> Result<OwnedFd, &'static str> {
     // Keep every prepared descriptor outside stdio even if the caller closed it.
     if (0..3).contains(&raw) {
@@ -215,14 +263,24 @@ fn classify_and_execute(
     settings: &Settings,
     #[cfg(test)] hook: impl FnOnce(),
 ) -> &'static str {
+    #[cfg(test)]
+    OBSERVATION.with(|slot| slot.set(Observation::default()));
     let mut chosen = None;
     let mut untrusted = false;
     let mut unknown = false;
     for (index, parts) in CANDIDATES.iter().enumerate() {
         let result = if index == 2 {
             match alias(&root, settings.owner()) {
-                Ok(true) => continue,
-                Ok(false) => candidate(&root, parts, settings.owner()),
+                Ok(true) => {
+                    #[cfg(test)]
+                    observe(|o| o.alias_skipped = true);
+                    continue;
+                }
+                Ok(false) => {
+                    #[cfg(test)]
+                    observe(|o| o.c3_opened = true);
+                    candidate(&root, parts, settings.owner())
+                }
                 Err(reason) => Err(reason),
             }
         } else {
@@ -231,6 +289,14 @@ fn classify_and_execute(
         match result {
             Ok(value) => {
                 if chosen.is_none() {
+                    #[cfg(test)]
+                    observe(|o| {
+                        o.c1 = index == 0;
+                        if let Ok(s) = stat(&value) {
+                            o.dev = s.st_dev;
+                            o.ino = s.st_ino;
+                        }
+                    });
                     chosen = Some(value);
                 }
             }
@@ -293,6 +359,17 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
     let (Ok(read), Ok(write)) = (read_result, write_result) else {
         return "unknown";
     };
+    #[cfg(test)]
+    observe(|o| {
+        let flags = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFL) };
+        o.path = flags >= 0 && flags & libc::O_PATH != 0;
+        let flags = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFD) };
+        o.cloexec = flags >= 0 && flags & libc::FD_CLOEXEC != 0;
+        o.regular = stat(&executable).is_ok_and(|s| trusted(&s, libc::S_IFREG, settings.owner()));
+        o.same_inode = stat(&executable).is_ok_and(|s| s.st_dev == o.dev && s.st_ino == o.ino);
+        o.uid = unsafe { libc::getuid() };
+        o.gid = unsafe { libc::getgid() };
+    });
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return "unknown";
@@ -335,6 +412,11 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
             if count != 0 || !libc::WIFEXITED(status) {
                 return "unknown";
             }
+            #[cfg(test)]
+            observe(|o| {
+                o.exec_eof = true;
+                o.nonzero = libc::WEXITSTATUS(status) != 0;
+            });
             return if libc::WEXITSTATUS(status) == 0 {
                 "exit_zero"
             } else {
