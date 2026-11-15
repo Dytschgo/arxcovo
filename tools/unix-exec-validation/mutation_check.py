@@ -176,6 +176,70 @@ def rust_mutants():
     assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths] == fingerprints
     print('Rust source fingerprints unchanged')
 
+def sudo_nnp_delivery_checks():
+    """Pure schema/layout extraction only; never link the fixed reader/adapters."""
+    root = Path(__file__).resolve().parents[2]
+    path = root / 'crates/arxd/src/exec/disposable/sudo_nnp.rs'
+    original = path.read_bytes()
+    controller = original.decode('utf-8')
+    schema = controller[controller.index('#[derive(serde::Deserialize)]'):controller.index('// Every component')]
+    tests = controller[controller.index('#[test]\nfn a7_a11_delivery_schema_rejections'):controller.index('#[derive(Clone, Copy)]')]
+    source = 'use std::path::{Path,PathBuf};\n' + schema + tests
+    deps = root / 'target/debug/deps'
+    with tempfile.TemporaryDirectory(prefix='a7-a11-delivery-pure-') as tmp:
+        exe = Path(tmp) / 'schema.exe'
+        def check(code):
+            args = ['rustc', '--edition=2024', '--test', '-', '-L', 'dependency=' + str(deps)]
+            for name in ('serde', 'serde_json'):
+                rlibs = sorted(deps.glob('lib' + name + '-*.rlib'))
+                assert rlibs, 'build locked offline dependencies first'
+                args += ['--extern', name + '=' + str(rlibs[0])]
+            built = subprocess.run(args + ['-o', str(exe)], input='#![allow(dead_code)]\n' + code,
+                                   text=True, capture_output=True, timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe), 'a7_a11_delivery_schema_rejections', '--exact'],
+                                  text=True, capture_output=True, timeout=20)
+        baseline = check(source)
+        assert baseline.returncode == 0 and '1 passed; 0 failed' in baseline.stdout, baseline.stdout
+        print('PASS actual strict delivery schema/layout')
+        for term in ('d.run != run', 'd.source_sha != source', 'd.host_profile_sha256 != profile',
+                     'source != workflow', 'source != reviewed', 'd.accounts[0].uid == d.accounts[1].uid',
+                     'd.accounts[0].gid == d.accounts[1].gid', 'a.uid < 1000', 'a.size > 128 * 1024 * 1024',
+                     'm.size == a.size', 'm.dev == a.dev', 'm.ino == a.ino',
+                     'm.mode == 0o100755', 'm.uid == 0', 'm.nlink == 1',
+                     'uid == a.uid', 'gid == a.gid', 'shell == b"/usr/sbin/nologin"'):
+            assert schema.count(term) == 1, term
+            rejection = term.startswith(('d.', 'source ', 'a.'))
+            result = check(source.replace(schema, schema.replace(term, 'false' if rejection else 'true')))
+            assert result.returncode == 101 and 'assertion' in result.stdout, term + result.stdout
+            print('KILLED delivery ' + term)
+        result = check(source.replace(schema, schema.replace('#[serde(deny_unknown_fields)]', '')))
+        assert result.returncode == 101 and 'assertion' in result.stdout, result.stdout
+        print('KILLED unknown delivery fields')
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.SudoNnpDelivery)
+    assert unittest.TextTestRunner().run(suite).wasSuccessful()
+    driver_bytes = Path(driver.__file__).read_bytes()
+    driver_source = driver_bytes.decode('utf-8')
+    for before, after, test in [
+        ('4 * 1024 * 1024 - start', '4 * 1024 * 1024', 'test_shared_build_budget_and_capture'),
+        ('remaining = deadline - time.monotonic()', 'remaining = 360', 'test_shared_build_budget_and_capture'),
+        ("os.write(dst, data) == len(data)", 'True', 'test_copy_same_harness_bytes_and_partial_failure'),
+        ("(copied['size'], copied['sha256']) == (pin['size'], pin['sha256'])", 'True', 'test_copy_same_harness_bytes_and_partial_failure'),
+        ('sudo_nnp_digest(src) == pin', 'True', 'test_copy_same_harness_bytes_and_partial_failure'),
+    ]:
+        assert driver_source.count(before) == 1, before
+        module = types.ModuleType('delivery_mutant')
+        exec(compile(driver_source.replace(before, after), '<delivery-mutant>', 'exec'), module.__dict__)
+        with patch.object(test_driver, 'driver', module):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(
+                unittest.TestSuite([test_driver.SudoNnpDelivery(test)]))
+        assert result.failures and not result.errors, before + str(result.errors)
+        print('KILLED delivery mock ' + before)
+    assert Path(driver.__file__).read_bytes() == driver_bytes
+    assert path.read_bytes() == original
+    print('Delivery source bytes unchanged')
+
+
 def sudo_nnp_source_checks():
     """Only pure extracted Rust and SudoNnp mocks; no native module is linked.
 
@@ -303,9 +367,10 @@ def sudo_nnp_source_checks():
         ("if index == 0:", "if False:", "test_two_cases_and_owned_cleanup"),
     ]
     for before, after, name in cases:
-        assert source.count(before) == 1
+        fixture = source[:source.index('def sudo_nnp_artifact')]
+        assert fixture.count(before) == 1
         module = types.ModuleType('sudo_nnp_mutant')
-        exec(compile(source.replace(before, after), '<in-memory-mutant>', 'exec'), module.__dict__)
+        exec(compile(source.replace(fixture, fixture.replace(before, after)), '<in-memory-mutant>', 'exec'), module.__dict__)
         with patch.object(test_driver, 'driver', module):
             suite = unittest.TestSuite([test_driver.SudoNnp(name)])
             result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)

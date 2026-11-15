@@ -11,7 +11,7 @@ import tempfile
 import json
 import stat
 from types import SimpleNamespace
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from unittest.mock import patch
 
 import driver
@@ -1352,6 +1352,157 @@ class SudoNnp(unittest.TestCase):
         self.assertEqual(len(events), 2)
         mocks['unlink'].assert_not_called()
         mocks['rmtree'].assert_not_called()
+
+
+class SudoNnpDelivery(unittest.TestCase):
+    """No host adapters: records are pure; all descriptor/process ports mocked."""
+    def record(self, libtest=True, executable=None):
+        stage = Path('/var/lib/arx-ci-123-1')
+        return json.dumps(dict(reason='compiler-artifact',
+            target=dict(name='arxd', kind=['lib'] if libtest else ['bin']),
+            profile=dict(test=libtest), executable=str(executable or
+                (stage / ('source/target/debug/deps/arxd-abc' if libtest else 'source/target/debug/arxd'))))).encode() + b'\n'
+
+    def test_single_build_output_identity(self):
+        stage, _ = driver.plan('123-1')
+        for libtest in (True, False):
+            good = self.record(libtest)
+            self.assertEqual(driver.sudo_nnp_artifact(good, stage, libtest).name,
+                             'arxd-abc' if libtest else 'arxd')
+            for bad in (b'', good + good, self.record(not libtest),
+                        self.record(libtest, Path('/tmp/arxd')), good.replace(b'"arxd"', b'"foreign"')):
+                with self.assertRaises(RuntimeError):
+                    driver.sudo_nnp_artifact(bad, stage, libtest)
+        with self.assertRaisesRegex(RuntimeError, 'E_BUILD_LOG'):
+            driver.sudo_nnp_artifact(b' ' * (4 * 1024 * 1024 + 1), stage, True)
+
+    def test_shared_build_budget_and_capture(self):
+        for overflow in (False, True):
+            out = io.BytesIO()
+            outputs = [b'x' * (3 * 1024 * 1024)] * 2 if overflow else [self.record(True), self.record(False)]
+            waits, commands = [], []
+            def spawn(args, **kw):
+                commands.append(args)
+                child = SimpleNamespace(stdout=io.BytesIO(outputs[len(commands)-1]), returncode=0,
+                    wait=lambda timeout: waits.append(timeout), kill=lambda: self.fail('unexpected kill'))
+                return nullcontext(child)
+            def opened(path, mode):
+                return nullcontext(out if mode == 'xb' else io.BytesIO(out.getvalue()))
+            with patch.object(driver.sys, 'platform', 'linux'), patch.object(driver, 'sudo_nnp_open', return_value=17), \
+                 patch.object(driver.os, 'close'), \
+                 patch.object(driver.Path, 'open', autospec=True, side_effect=opened), \
+                 patch.object(driver.subprocess, 'Popen', side_effect=spawn), \
+                 patch.object(driver.time, 'monotonic', side_effect=[0, 10, 15, 20, 25]):
+                if overflow:
+                    # The first valid-size capture can contain arbitrary Cargo
+                    # messages; isolate the shared cap from JSON interpretation.
+                    with patch.object(driver, 'sudo_nnp_artifact', return_value=Path('/fixed')):
+                        with self.assertRaisesRegex(RuntimeError, 'E_BUILD_LOG'):
+                            driver.build_sudo_nnp(valid_env())
+                else:
+                    artifacts = driver.build_sudo_nnp(valid_env())
+                    self.assertEqual(artifacts[0].name, 'arxd-abc')
+                    self.assertEqual(artifacts[1].name, 'arxd')
+                self.assertEqual(waits, [350, 340])
+                self.assertEqual([a[1] for a in commands], ['test', 'build'])
+                self.assertLessEqual(len(out.getvalue()), 4 * 1024 * 1024)
+
+    def test_closed_before_build_or_handoff_effects(self):
+        with patch.object(driver.sys, 'platform', 'linux'), \
+             patch.object(driver, 'build_sudo_nnp') as build, \
+             patch.object(driver.os, 'open') as opened, \
+             patch.object(driver, 'exclusive_file') as written:
+            for action in (lambda: driver.stage_sudo_nnp(valid_env(), {}),
+                           lambda: driver.handoff_sudo_nnp(valid_env(), [], [])):
+                with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
+                    action()
+            build.assert_not_called()
+            opened.assert_not_called()
+            written.assert_not_called()
+        bad = valid_env()
+        bad['ARX_WORKFLOW_SHA'] = 'b' * 40
+        with patch.object(driver.sys, 'platform', 'linux'), patch.object(driver.os, 'open') as opened:
+            with self.assertRaisesRegex(RuntimeError, 'E_SHA'):
+                driver.stage_sudo_nnp(bad, {})
+            opened.assert_not_called()
+
+    def test_digest_rejects_changed_bytes_and_links(self):
+        data = b'\x7fELFpayload'
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0,
+            st_nlink=1, st_size=len(data), st_dev=1, st_ino=9)
+        with patch.object(driver.os, 'fstat', return_value=info), \
+             patch.object(driver.os, 'lseek'), \
+             patch.object(driver.os, 'read', side_effect=[data, b'']):
+            pin = driver.sudo_nnp_digest(17)
+        self.assertEqual(pin['size'], len(data))
+        self.assertEqual(pin['sha256'], driver.hashlib.sha256(data).hexdigest())
+        for content in ([b'not ELF!!!!', b''], [data[:-1], b''], [data + b'x', b'']):
+            with patch.object(driver.os, 'fstat', return_value=info), \
+                 patch.object(driver.os, 'lseek'), patch.object(driver.os, 'read', side_effect=content):
+                with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                    driver.sudo_nnp_digest(17)
+        info.st_nlink = 2
+        with patch.object(driver.os, 'fstat', return_value=info), patch.object(driver.os, 'read') as read:
+            with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                driver.sudo_nnp_digest(17)
+            read.assert_not_called()
+
+    def test_cleanup_uncertain_or_swapped_never_deletes(self):
+        pin = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_nlink=2)
+        owned = dict(created=True, directory=pin, parent=1, fd=2, name='arxcovo-a7-a11-123-1', images=[])
+        with patch.object(driver.os, 'unlink') as unlink, patch.object(driver.os, 'rmdir') as rmdir:
+            with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_CGROUP'):
+                driver.cleanup_sudo_nnp_delivery(owned)
+            with patch.object(driver, 'a4_directory'), patch.object(driver.os, 'stat',
+                    return_value=SimpleNamespace(**{**vars(pin), 'st_ino': 3})):
+                with self.assertRaisesRegex(RuntimeError, 'E_FIXTURE_INODE'):
+                    driver.cleanup_sudo_nnp_delivery(owned, True)
+            with patch.object(driver, 'a4_directory'), patch.object(driver.os, 'stat', return_value=pin), \
+                 patch.object(driver.os, 'listdir', return_value=['uncaptured']):
+                with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_PATH_UNCAPTURED'):
+                    driver.cleanup_sudo_nnp_delivery(owned, True)
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+
+    def test_copy_same_harness_bytes_and_partial_failure(self):
+        stage, _ = driver.plan('123-1')
+        harness = stage / 'source/target/debug/deps/arxd-abc'
+        pin = dict(size=4, sha256='a' * 64, dev=1, ino=2)
+        copied = {**pin, 'ino': 3}
+        for fault in ('none', 'short', 'hash', 'source'):
+            with self.subTest(fault=fault), ExitStack() as stack:
+                def mock(obj, name, **kw):
+                    return stack.enter_context(patch.object(obj, name, create=True, **kw))
+                mock(driver.sys, 'platform', new='linux')
+                mock(driver, 'sudo_nnp_eligible', return_value=True)
+                build = mock(driver, 'build_sudo_nnp', return_value=(harness, stage / 'source/target/debug/arxd'))
+                write_manifest = mock(driver, 'exclusive_file')
+                opens = mock(driver, 'sudo_nnp_open', side_effect=[1, 2, 3, 4])
+                mock(driver.os, 'mkdir')
+                mock(driver.os, 'stat', return_value=SimpleNamespace(st_dev=1, st_ino=1))
+                mock(driver.os, 'fstat', return_value=SimpleNamespace(st_dev=1, st_ino=1))
+                mock(driver.os, 'open', return_value=5)
+                for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+                    mock(driver.os, flag, new=0)
+                mock(driver.os, 'fchmod')
+                mock(driver.os, 'lseek')
+                mock(driver.os, 'close')
+                mock(driver.os, 'read', return_value=b'\x7fELF')
+                mock(driver.os, 'write', return_value=3 if fault == 'short' else 4)
+                mock(driver, 'sudo_nnp_digest', side_effect=[pin,
+                    {**copied, 'sha256': 'b'*64} if fault == 'hash' else copied,
+                    {**pin, 'ino': 99} if fault == 'source' else pin,
+                    pin, copied, pin])
+                owned = {}
+                if fault == 'none':
+                    self.assertEqual(driver.stage_sudo_nnp(valid_env(), owned), [copied, copied])
+                    self.assertEqual(opens.call_args_list[-1].args, (harness,))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                        driver.stage_sudo_nnp(valid_env(), owned)
+                    self.assertEqual(len(owned['images']), 1)  # captured for quarantine/cleanup
+                build.assert_called_once()
+                write_manifest.assert_called_once_with(stage / 'artifact', str(harness).encode('ascii'))
 
 
 if __name__ == '__main__':
