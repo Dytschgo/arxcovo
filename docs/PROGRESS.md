@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #118, `17a2cb47306f73730c2ce990f4661094c4d01f3b` at 05:11:02Z, independent Muse exact-head PASS and all five gates green. Squash tree `3f56e0ad91c2c7b3fdfcd798c7d67a50bf62f7ac` equals reviewed `cae125a`. Hosted Ubuntu/macOS verify and optional E4 revalidation succeeded; this is compilation/source regression evidence, not A7/A11 native acceptance.
-- Current work: publish dormant fixed A7/A11 delivery after independent Muse `507030c` PASS (Standards/Spec/Security zero findings, all four contract pins verified, six delivery mocks rerun green). Profile=None/host-policy=False/closed TEST gates remain before effects, no run_body edge. Hosted Linux integration compile and exact-head review pending; native host qualification/execution grants absent. A7/A11/M2/full F/G/PA6 unverified on real hardware.
+- Last merged: PR #119, `d18a721d601aa625698826399df0b0820d3f0290` at 05:51:15Z, independent Muse exact-head PASS and all five gates green. Squash tree `fecfc45295dc45edce0b412e6e831f2ef530b9fe` equals reviewed `991bc75`; hosted Linux delivery integration compiled. No native A7/A11 credit.
+- Current work: prepare bounded source-only read-only host/policy qualification collection under the accepted delivery contract. Fixed paths and read caps; sanitized digest/closed-result output, no provisioning/sudo execution or raw policy release. Actual root reads require a separate reviewed grant. Profile/qualification/TEST gates remain closed; M2/full F/G/PA6 remain open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
