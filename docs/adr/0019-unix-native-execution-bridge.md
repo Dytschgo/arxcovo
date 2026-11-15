@@ -791,7 +791,7 @@ A4/M2/full F/G/real-Runner PA6 remain open; installed/dedicated paths remain
 
 ### D7h. One fresh hosted read-only sudo package comparison (2026-11-15)
 
-**Consumed by accepted run `43693642693` on `47b440a5faeaa24434e155b81d5d03a5c977e4e9`. Eight-second job succeeded with candidate_match=true and qualified=false; dedicated pin finally deleted and independently absent404. FILE-leg assessment pending; no retry or further D7h authority.** Baseline is PR #123 main squash
+**Consumed by accepted run `43693642693` on `47b440a5faeaa24434e155b81d5d03a5c977e4e9`. Eight-second job succeeded with candidate_match=true and qualified=false; dedicated pin finally deleted and independently absent404. Independent Muse assessment a81c028 accepts the FILE leg only; no qualification/A7/A11 credit, retry or further D7h authority.** Baseline is PR #123 main squash
 `4f1a6db3f652291ffb94550fea85aa395f78109a`, tree
 `6fb6ffd467d81a5f1d2cd0a39da6ae92aab5bc3b`. Coordinator supplies equality to
 reviewed `40e24e7`, all five gates and Muse PASS; this preparation does not

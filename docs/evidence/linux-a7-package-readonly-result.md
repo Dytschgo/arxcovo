@@ -38,3 +38,7 @@ read-only mappings/literals/NSS, artifact/account admission and both real NNP
 cases still need fresh-host revalidation and a separately reviewed native
 disposition. This host cannot be reused. No A7/A11/M2/full F/G/PA6 acceptance
 is claimed; installed/dedicated paths are **unverified on real hardware**.
+
+## Independent disposition
+
+Muse assessment `a81c028` passed Standards/Spec/Security and grants FILE-leg credit only: the three installed payloads match the official package/default-path candidate under the stated distro-build and D8/A1 trust. It grants no C2/alias/floor, effective unit policy view, account/artifact or NNP-case acceptance. [Assessment](../reviews/m2-d7h-package-match-muse-assessment.md). No host reuse or further D7h authority.
