@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "run": "43715436515",
+  "attempt": 1,
+  "job": "132815838689",
+  "event": "workflow_dispatch",
+  "branch": "main",
+  "source_sha": "0011d23a0681c0acb717064166c399e194937869",
+  "workflow_sha": "0011d23a0681c0acb717064166c399e194937869",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "failure",
+  "started_at": "2026-11-15T12:45:18Z",
+  "completed_at": "2026-11-15T12:45:36Z",
+  "duration_seconds": 18,
+  "steps_success": 8,
+  "steps_failure": 1,
+  "feedback": {
+    "schema": "unix-protection-f0",
+    "version": 2,
+    "provenance": {
+      "source_sha": "0011d23a0681c0acb717064166c399e194937869",
+      "workflow_sha": "0011d23a0681c0acb717064166c399e194937869",
+      "run": "43715436515",
+      "attempt": "1"
+    },
+    "first": {
+      "code": "E_PATH"
+    },
+    "final": {
+      "code": "E_PATH"
+    },
+    "mutation_lower_bound": "none",
+    "cleanup": "not_reached",
+    "internal": null
+  },
+  "native_pin_absent_http404": true,
+  "readonly_pin_absent_http404": true,
+  "native_credit": false,
+  "retry_authorized": false
+}

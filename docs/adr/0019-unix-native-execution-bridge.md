@@ -890,6 +890,8 @@ preparation performs none of the future coordinator operations above.
 
 ### D7i. Proposed single combined A7/A11 fresh-host run (2026-11-15)
 
+**Consumed by accepted run43715436515 attempt1/job132815838689 on main0011d23a0681c0acb717064166c399e194937869. The18s job failed with first/final E_PATH, mutation lower bound none, cleanup not_reached and internal null. No native acceptance. Both pins independently absent404 after finally-clear. No retry or further D7i authority; remaining text records historical grant only.**
+
 **Preparation only; inactive until the following review/merge gates. No dispatch
 or runtime grant is exercised by this source preparation.** D7a-h remain consumed;
 all their hosts, including D7h host43693642693, are excluded. No stale A1/A2 grant
