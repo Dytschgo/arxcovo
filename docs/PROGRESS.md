@@ -2,12 +2,22 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #140, `00dd9345c53dcd5c98e8fd0ccd39f5672823937f` at18:00:26Z; independent Opus exact-head PASS6898705734/status58971067972 and all five required gates green. Reviewed e845a95/squash trees equal; A10 evidence join only, A10 remains open.
-- Current work: publish independently reviewed A9/U9 bounded stop/drain evidence join through exact-head review and hosted gates. A9/U9 remain open for populated stop/crash/production Drain. Independent M3 enrollment contract correction is active before implementation. A10/native gaps remain open; A12 consumed/no retry with cleanup unconfirmed, A7 hosted FINAL NO-GO closed; M2 incomplete.
+- Last merged: PR #141, `8e802070fb6b6f7de663adf6fdf8420d3a8eea6a` at18:12:33Z; independent Opus exact-head PASS6898850222/status58971457086 and all five required gates green. Reviewed f90027e/squash full trees equal. Bounded A9/U9 evidence only; populated stop/crash/production Drain remain open.
+- Current work: publish independently reviewed first M3 pure enrollment core through exact-head review and hosted gates. Opus source review ac14a63 PASS all axes; reviewer reran13 tests/fmt/Clippy and independently verified hash vectors. No signing, transport, consensus, real expiry or host activation. M2 remains incomplete: A9/U9/A10/A12/full F/G/PA6 native gaps open, A7 hosted FINAL NO-GO and A12 consumed/no retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus highac14a63 independently reviews Sol M3 pure enrollment implementation, Standards/Spec/Security PASS with no blockers. Reran13 focused nextest/fmt/Clippy, independent hash vectors and scratch counterfactuals; future-adapter replay/key policies and low test-gap advisories remain explicit and do not grant acceptance. Coordinator publishes one-concern pure-core PR; no runtime endpoint/signing/Raft storage integration.
+
+- 2026-11-15: Sol high730a18a retained493106a implements exactly five Rust paths plus evidence for the reviewed M3 pure enrollment core. Builder ran13 focused nextest tests, fmt and locked offline workspace Clippy, all passed. Coordinator inspected actual diff and starts fresh Opus source/security review before publication. No network/CA/Raft/host integration or physical expiry claim; M2 remains incomplete.
+
+- 2026-11-15: Coordinator verifies PR141 exact head/five green gates, unwatches and merges8e80207; squash/reviewed full trees equal. M3 branch merge conflict confined to PROGRESS, retaining review/steering history. Sol enrollment pure-core builder remains active on unchanged implementation brief; no native M2 authority or closure.
+
+- 2026-11-15: Opus high1fbad65 retainedc6fe014 corrects M3 pure enrollment brief; independent Sol recheck closes delayed-commit expiry T1 and finite retention T2. Physical expiry and consensus authority explicitly remain future-adapter claims. Sol implementation is eligible only for the named I/O-free core/tests; no transport, signing, host or native activation. M2 remains open, M3 independent steering applies.
+
+- 2026-11-15: Coordinator independently reviews Opus M3 brief17cd7d8 retained860cd50. Proposed-time expiry has an unaddressed sole-command delayed-commit counterexample; requests narrow fresh issuance-boundary and total-record-cap correction before source implementation. Records superseding user steering for independent M3 without M2 closure. No test/native action or transport/signing activation.
 
 - 2026-11-15: Opus high571cb74 independently reviews the bounded A9/U9 join, all axes PASS with no blockers. Six accepted records and exact historical stop/absence ordering verified; only natural-exit empty-directory removal credited. Crash/populated stop/production Drain remain open. Publish separately after PR140 parent merges. M3 architecture under ADR0005 active before any enrollment source implementation. No native authority.
 
@@ -1188,7 +1198,7 @@
 - docs/dev-host-setup.md and early feasibility ADRs are preserved in open PR #10. Policy regression PR #9 is also open. These have not been accepted or merged.
 - All VM/hypervisor paths, S4U/cross-account execution and installed services remain **unverified on real hardware**. Hosted software tests do not establish owner-PC installation or VM acceptance.
 - Never touch the old Lab Manager installation/state or Hyper-V VM `agent-windows-test`. No agent performed owner-PC account, rights, service or task administration.
-- Post-v1 scope stays in docs/ROADMAP.md. No milestone 3 implementation starts before milestone 2 acceptance.
+- Post-v1 scope stays in docs/ROADMAP.md. Superseding user-delegated steering permits independent milestone 3 source work after the bounded remaining M2 audits while hardware-dependent M2 gaps remain explicitly open. M2 is not marked accepted; M3 architecture/security decisions and ordinary independent reviews/green gates remain required.
 
 ## Oversight
 
