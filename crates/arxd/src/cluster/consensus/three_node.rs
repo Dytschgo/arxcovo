@@ -71,6 +71,8 @@ impl Cluster {
             .ok()
             .expect("caller still owns node");
         n.shutdown().await.unwrap();
+        assert!(n.log_weak.upgrade().is_none());
+        assert!(n.sm_weak.upgrade().is_none());
         assert_eq!(n.permits.available_permits(), 64);
         assert!(n.owners.lock().unwrap().set.is_empty());
         assert_eq!(n.propose(unknown(250)).await, Err(ProposeError::Stopped));
@@ -131,6 +133,7 @@ impl Cluster {
             let expected = b.clone();
             blocking(move || {
                 let s = sm.0.lock().unwrap();
+                assert_eq!(s.applied(), p);
                 assert_eq!(s.snapshot(), expected);
                 Ok(())
             })
@@ -170,13 +173,66 @@ impl Cluster {
                         .to_vec();
                     for marker in [secret, proof, c.expose_for_owner_transfer().into_bytes()] {
                         for m in [&marker, &hex::encode(&marker).into_bytes()] {
-                            assert!(!bytes.windows(m.len()).any(|w| w == m));
+                            let contains = |bytes: &[u8]| bytes.windows(m.len()).any(|w| w == m);
+                            let control = [b"prefix".as_slice(), m, b"suffix"].concat();
+                            assert!(contains(&control), "privacy scanner positive control");
+                            assert!(!contains(&bytes), "persisted secret marker");
                         }
                     }
                 }
             }
         }
     }
+}
+
+// Real RPC catch-up: no direct snapshot installation or fabricated acknowledgments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t3_snapshot_catchup_then_consecutive_append() {
+    timeout(Duration::from_secs(45), async {
+        let started = Instant::now();
+        let params = Params {
+            snapshot_logs: 8,
+            keep: 0,
+            purge_batch: 1,
+            lag: 16,
+            ..Params::default()
+        };
+        params.config().unwrap();
+        let mut c = Cluster::new(params).await;
+        c.write(unknown(180)).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let f = (l + 1) % 3;
+        let follower_applied = c.node(f).raft.as_ref().unwrap()
+            .metrics().borrow_watched().last_applied.unwrap();
+        c.stop(f).await;
+        for request in 181..221 {
+            assert_eq!(c.write(unknown(request)).await.1,
+                Some(Outcome::Rejected(Reject::UnknownCode)));
+        }
+        let l = c.leader().await;
+        let purged = c.node(l).raft.as_ref().unwrap()
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.purged.is_some_and(|p| p.index > follower_applied.index),
+                "leader purged beyond stopped follower")
+            .await.unwrap().purged.unwrap();
+        assert_eq!(c.router.snapshots_to.lock().unwrap().get(&(f as u64 + 1)), None);
+        c.start(f).await; // Same persistent directory, mandatory ConsensusNode preflight.
+        c.converge().await;
+        let snapshots = *c.router.snapshots_to.lock().unwrap().get(&(f as u64 + 1))
+            .expect("catch-up requires full_snapshot RPC to the restarted follower");
+        assert!(snapshots >= 1);
+        assert!(c.router.snapshot_max.load(Ordering::Relaxed) > 0);
+        let (before, _) = c.node(c.leader().await).linearizable_state().await.unwrap();
+        let (after, outcome) = c.write(unknown(221)).await;
+        assert_eq!(after.index, before.unwrap().index + 1);
+        assert_eq!(outcome, Some(Outcome::Rejected(Reject::UnknownCode)));
+        c.converge().await;
+        eprintln!("T3 follower={}, stopped_applied={}, leader_purged={}, snapshots_to_follower={}, final_applied={}",
+            f + 1, follower_applied.index, purged.index, snapshots, after.index);
+        c.finish().await;
+        eprintln!("T3 elapsed={:?}", started.elapsed());
+    }).await.unwrap();
 }
 impl Drop for Cluster {
     fn drop(&mut self) {
