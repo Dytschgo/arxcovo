@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #146, `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` at22:19:44Z; independent Opus exact-head PASS6902189029/status58980320152 and all five gates green. Reviewed3476da6/squash full trees equal. Hosted three-OS actual snapshot catch-up and post-catch-up append credit is in-process only, not fullM3 acceptance.
-- Current work: Opus settles next bounded M3 enrollment/authentication slice joining committed identity/key binding to actual certificate issuance/verification without enabling a production endpoint. Consensus and snapshot tests are merged; CA-key role/storage, CSR proof, revocation and membership policy still need explicit decisions. M2 active source regression/ledger maintenance and hardware blockers remain under Ordering; A7/A12 no-retry unchanged.
+- Current work: fresh independent Opus review of implemented committed member-key registry and actual-engine revocation/snapshot T4. Builder107 cluster tests/eight kill probes/T1T2T3U6/fmt/workspaceClippy pass locally. State format2 refuses nonproduction v1 unchanged; no new dependency, CA, TLS or production authorization. Local revocation has unbounded staleness until apply; fullM3 and M2 remain open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -25,6 +25,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-15: Sol higha8118e9/38d7d96 retained71b32d9/400f901 implements member registry/Found/Remove/revoked replay and statecodec2, boundedwire64semantic16.107cluster tests pass8.77s with actualT4 snapshotrevocation, pruning and all-node reopen; eight crash probes/oldtests retained, fmt/workspaceofflineClippy/diff pass. Coordinator inspects evidence/manifests and requests fresh Opus source/security review before publication. No CA/TLS/transport/host acceptance.
 
 - 2026-11-15: Opus high2278908 retained2640629 closes registry staleness and bounded Found representation; independent Sol recheck passes with actual16-byteClusterId size arithmetic, pre-founding Remove gate and nonempty-founded codec invariant. Registry implementation starts with no dependency/TLS/CA change. M2 hardware blockers remain explicit and unchecked.
 
