@@ -17,9 +17,11 @@ run `43644661407`; A5 acceptance is limited to that reviewed run. D7e is consume
 Positive baseline feedback does not satisfy the native omitted-kill requirement
 or grant A4/M2 acceptance. D7f is consumed by accepted dispatch `43672720190`;
 its job skipped with zero steps, earning no native credit. No D7f retry is
-authorized. D7g below proposes one replacement fixed native omitted-kill run,
-inactive until its independent review, five
-gates and coordinator merge. All other native execution and historical retries
+authorized. D7g is consumed by `43674201597`; independent Muse assessment
+`21c7615` accepts only its D9a A4 disposable present-residue and omitted-kill
+scope. D7h below proposes one fresh-host read-only package comparison, inactive
+until fresh independent Muse architecture/security/source review, exact-head
+review, five gates and coordinator merge. All other native execution and historical retries
 remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
@@ -237,8 +239,8 @@ slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
 run and its environment must not be retried or reused. D7a and D7b are
-consumed, as are D7c, D7d, D7e and D7f; only D7g proposes one fixed A4 native
-omitted-kill run, subject to its exact candidate and gates.
+consumed, as are D7c, D7d, D7e, D7f and D7g; only D7h proposes one fixed
+read-only package comparison, subject to its exact candidate and gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
 
@@ -786,6 +788,105 @@ owner-PC/account/admin/payment, static-VM or backup action is included.
 Independent native assessment remains mandatory before any D9a A4 credit.
 A4/M2/full F/G/real-Runner PA6 remain open; installed/dedicated paths remain
 **unverified on real hardware**. This preparation executes nothing.
+
+### D7h. One fresh hosted read-only sudo package comparison (2026-11-15)
+
+**Proposed; no read or dispatch performed.** Baseline is PR #123 main squash
+`4f1a6db3f652291ffb94550fea85aa395f78109a`, tree
+`6fb6ffd467d81a5f1d2cd0a39da6ae92aab5bc3b`. Coordinator supplies equality to
+reviewed `40e24e7`, all five gates and Muse PASS; this preparation does not
+re-run those hosted checks. D7a–D7g remain consumed. D7h renews none of them.
+
+The sole candidate is the **first eligible normal main squash containing D7h**
+after that baseline. Fresh Muse architecture/security/source review is required
+before publication; different-provider independent exact-head review, all five
+green required checks (three platform verify, ci-time-budget, agent-review),
+coordinator merge and reviewed-head/main-squash exact tree equality must precede
+pinning. Compare the full candidate tree, including modes, with the baseline.
+The exact allowed delta paths are ONLY:
+
+- `.github/workflows/sudo-package-readonly.yml` (new regular 100644 file)
+- `tools/ci/sudo-package-readonly.py` (new regular 100644 file)
+- `tools/ci/test-sudo-package-readonly.py` (new regular 100644 file)
+- `docs/adr/0019-unix-native-execution-bridge.md`
+- `docs/evidence/linux-a7-package-readonly-preparation.md`
+- `docs/reviews/m2-d7h-package-readonly-muse-review.md` (retained fresh review)
+- `docs/PROGRESS.md` (coordinator only)
+
+No other executable blob or mode change is allowed. Driver, fixture, comparator,
+Cargo/lockfile/toolchain, package, helper and normal CI/policy remain identical.
+Record actual reviewed head/tree and squash/tree in the evidence; do not invent
+future identities. Read back current main immediately before pinning/dispatch;
+it must remain exactly that candidate. Any unrelated delta, main advancement,
+tree mismatch or substitution needs a new independently reviewed disposition.
+
+Coordinator only, once effective: set **SUDO_PACKAGE_REVIEWED_SHA** once to that
+candidate and read back equality, then dispatch **sudo-package-readonly.yml**
+once on one fresh GitHub-hosted Ubuntu 24.04 amd64 host. This distinct variable
+confers no authority on the old native workflow; do not set
+UNIX_EXECUTION_REVIEWED_SHA. Both workflow and wrapper enforce repository
+Dytschgo/arxcovo, actor and triggering actor Dytschgo, workflow_dispatch,
+refs/heads/main and source SHA == workflow SHA == reviewed variable. The wrapper
+also enforces attempt 1, bounded run ID, GitHub-hosted Linux/X64/ubuntu24,
+root real/effective UID, no arguments, fixed workspace/script path and exact
+workflow ref before importing the comparator or reading package bytes.
+
+The manual-only job has contents:read, checkout credentials disabled, the
+existing pinned checkout action and a three-minute deadline. It has no inputs,
+artifact, secrets or permission expansion. Ten safe mocked wrapper tests run
+before privilege. D7h explicitly grants **the existing coordinator-host
+privilege wrapper** `sudo -n /usr/bin/env -i` invoking only isolated system
+Python and the fixed repository wrapper, with the fixed forwarded gate fields
+and PATH in the reviewed workflow. This necessarily executes the host sudo
+transport; it grants no execution of the subject as a version/list/true oracle
+and no sudo -V, sudo -l, policy/account/proc/sys/systemd query or helper/native
+fixture. No account, installation, administrative mutation or policy change.
+
+The wrapper loads only bounded fixed `__file__`-relative comparator source
+(11180 bytes; SHA256
+`12a122db7d30be04dd7523db046d49f4083882c318b375ccf0986ec0eb338e75`),
+via nofollow held directories and regular single-link file, hashes before
+compile, and invokes **only its existing `_read_linux()` once**. No argv/path/
+expected-hash override, CLI activation or general import search exists. The
+comparator CLI remains refusing. Scope is exactly three fixed payloads, two
+fixed links and ancestor metadata described in the
+[package source evidence](../evidence/linux-a7-sudo-package-comparison-source.md),
+including existing fixed readlink/ELF/digest/budget/reopen fences. No extra
+host collection is authorized. The baseline comparator blob is
+`520d341633c67dc52ec483e9b3fcc92131a3da1f`.
+
+Checkout at the admitted SHA and exact workflow ref bind the wrapper source;
+the wrapper checks its own fixed path and hashes comparator bytes independently.
+As in ADR0020 D8/A1, privileged concurrent writers/mounts and root-protected OS
+dependencies are trusted; these fences are observations, not adversarial host
+attestation. No whole-host audit is implied. Read-only refers to this comparison
+leg: ordinary checkout and sudo transport may have platform-managed effects.
+
+Before printing once, validate the entire closed comparison schema: fixed
+revision/architecture, status and boolean flags, known digests only on a match,
+null digests on refusal, qualified always false. Emit only that reconstructed
+JSON plus validated source_sha/workflow_sha/run/attempt binding. Exceptions,
+invalid schemas and gate failures emit one constant refusal with no partial
+payload or private exception text. Exit 0 means candidate_match only; every
+refusal exits 2. No raw file, unknown digest, path metadata or logs escape.
+
+Capture the accepted run URL **directly from dispatch output**, bind the exact
+run ID and attempt, and retain the pin until **that exact run is terminal**,
+even if ancillary lookup returns none or fails. Finally delete the variable
+and independently verify HTTP 404 absence after terminal outcome (or confirmed
+dispatch rejection without an accepted run). Uncertain identity requires bounded
+reconciliation against that direct URL, never early pin deletion or redispatch.
+Any accepted dispatch consumes D7h regardless of outcome, including skipped jobs;
+no retry, rerun, second dispatch or host reuse. Rejection grants no retry either.
+Retain only bounded sanitized result/binding and exclude the host afterward.
+
+This is ONLY the read-only FILE comparison leg of ADR0020 D9b. candidate_match
+is not qualification, fixture admission, A7/A11 native acceptance or M2 credit.
+C2, floor, four-mask in-unit view/literals/NSS and actual NNP allow/deny oracles
+remain open. A7/A11/M2/full F/G/real-Runner PA6 remain **unverified on real
+hardware**. Existing user authorization covers this fresh disposable-host leg;
+no extra owner confirmation or product approval flow is introduced. This local
+preparation performs none of the future coordinator operations above.
 
 ## Contract clarifications (2026-11-12)
 
