@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #122, `8f7092ed02a2da819756ca6194328e88757b752d` at 06:58:03Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `acfed59`; hosted controlled-policy Linux integration compiled, no native view/acceptance credit.
-- Current work: publish finite official Ubuntu package comparator after independent Muse `82f9e91` PASS on all axes, zero blockers; ten mocks/155 portable tests rerun green. Only reviewed sudo/plugin/libsudo_util payloads and fixed ELF/link facts, refusing CLI. Public provenance/build-path and independent package review retained. Inconclusive sudo-V module stays unpublished/excluded. Actual file reads need a new narrow grant; A7/A11/M2/full F/G/PA6 open.
+- Last merged: PR #123, `4f1a6db3f652291ffb94550fea85aa395f78109a` at 07:48:41Z, independent Muse exact-head PASS and all five gates green. Squash tree `6fb6ffd467d81a5f1d2cd0a39da6ae92aab5bc3b` equals reviewed `40e24e7`; fixed package comparator remains dormant/refusing CLI, no installed-host read.
+- Current work: publish D7h read-only workflow/grant after Muse `6d8dab4` PASS and coordinator F1 correction: exclude atime from module-file stability, retain nine identity/content/ownership fields. Regression red-to-green; 11 wrapper/10 comparator mocks pass. Distinct SHA pin, exact manual admission and three fixed file reads only; no actual reads or grant used before fresh-head review/five gates/merge/exact squash binding.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
