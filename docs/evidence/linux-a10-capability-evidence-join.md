@@ -43,10 +43,12 @@ fields alone are insufficient. Every listed attempt is attempt 1.
 | A5 [43644661407](https://github.com/Dytschgo/arxcovo/actions/runs/43644661407), [record](../reviews/m2-a5-hosted-record.md), [review](../reviews/m2-a5-hosted-muse-review.md) | `cf3a2510fc45e0cb438ae14cc41115e492bc0f41` | Standard loaded; exclusive empty-orphan seed, one production setup, one removal, reused `runs`, confirmed cleanup. |
 
 Profile attribution is per run, not borrowed from the separate A3 host:
-the historical `tools/unix-exec-validation/driver.py` `standard_profile()` /
-`runtime_files()` selects the unchanged Standard bytes except for A3 None;
-`verify_runtime()` requires exact FragmentPath, DropInPaths, directory contents
-and byte equality. The accepted reviews above retain this source/result join.
+at A1/A2 `1e9d881`, the historical driver's `install_runtime()` exclusively
+writes the staged unchanged unit and Standard bytes plus the fixture override,
+with no post-load DropInPaths/byte verification. From A3 `beb7117` on,
+`standard_profile()` / `runtime_files()` select the Standard bytes except for
+A3 None; `verify_runtime()` requires exact FragmentPath, DropInPaths, directory
+contents and byte equality. The accepted reviews above retain this source/result join.
 A1/A2, A4 and A5 additionally pass production setup's R4 gate; A4/A5 seed
 preflight repeats it before mutation. A3 None supplies no positive A10 proof.
 
