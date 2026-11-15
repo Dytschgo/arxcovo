@@ -750,3 +750,25 @@ fn registry_commands_preserve_common_time_and_prune_prefix() {
     );
     assert_eq!(s, before);
 }
+
+#[test]
+fn founder_count_cap_is_independent_of_allocation_and_other_structure() {
+    for count in [17, 64] {
+        for already_founded in [false, true] {
+            let mut s = EnrollmentState::new(CLUSTER, node(65));
+            if already_founded {
+                assert_eq!(
+                    s.apply(&found(vec![(node(1), key(250))])),
+                    Outcome::Founded { replay: false }
+                );
+            }
+            let before = s.clone();
+            let pairs = (1..=count).map(|n| (node(n), key(n as u8))).collect();
+            assert_eq!(
+                s.apply(&found(pairs)),
+                Outcome::Rejected(Reject::BadFounders)
+            );
+            assert_eq!(s, before);
+        }
+    }
+}

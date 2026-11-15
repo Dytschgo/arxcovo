@@ -709,6 +709,15 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
         x[flag + 42..flag + 82].copy_from_slice(&a);
     });
     corrupt(&b, |x| set64(x, flag + 2, 74));
+    // Keep order and consumed-record consistency so only duplicate member keys reject.
+    corrupt(&b, |x| {
+        let duplicate = x[flag + 10..flag + 42].to_vec();
+        x[flag + 50..flag + 82].copy_from_slice(&duplicate);
+        let consumed_key = next + 18 + 49 * 145 + 105;
+        x[consumed_key..consumed_key + 32].copy_from_slice(&duplicate);
+    });
+    // The last member has no matching consumed record at74; ordering remains valid.
+    corrupt(&b, |x| set64(x, flag + 2 + 15 * 40, 74));
     corrupt(&b, |x| x[flag + 10] ^= 1); // Current consumed member has different key.
     corrupt(&b, |x| set64(x, next, 58));
     corrupt(&b, |x| {
