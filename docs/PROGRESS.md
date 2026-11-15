@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #146, `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` at22:19:44Z; independent Opus exact-head PASS6902189029/status58980320152 and all five gates green. Reviewed3476da6/squash full trees equal. Hosted three-OS actual snapshot catch-up and post-catch-up append credit is in-process only, not fullM3 acceptance.
-- Current work: fresh independent Opus review of implemented committed member-key registry and actual-engine revocation/snapshot T4. Builder107 cluster tests/eight kill probes/T1T2T3U6/fmt/workspaceClippy pass locally. State format2 refuses nonproduction v1 unchanged; no new dependency, CA, TLS or production authorization. Local revocation has unbounded staleness until apply; fullM3 and M2 remain open.
+- Current work: bounded independent Sol high diagnoses of the intermittent consensus append and Linux shim s9c tests. Consensus hotfix has priority and will be independently reviewed before publication. Member-registry Opus R1 test corrections are retained locally while these diagnoses run; no registry acceptance or M2 native retry is implied.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -14,7 +14,7 @@ Two red main runs were missed in prior checkpoint updates; they are now explicit
 - Main38750cf (after PR144), CI [43757400254](https://github.com/Dytschgo/arxcovo/actions/runs/43757400254): Ubuntu `unix_shim::rights::linux::tests::s9c_bound_object_survives_file_and_directory_swap` failed at unix_shim_rights_linux_tests.rs237, actual `unknown` versus expected `exit_zero`.
 - Main765df2b (after PR145), CI [43767515928](https://github.com/Dytschgo/arxcovo/actions/runs/43767515928): Ubuntu `cluster::consensus::tests::append_spawned_cancellation_panic_and_poison_complete_once` failed at consensus/tests.rs550, unwrap of `StoreError::Io`.
 
-PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. The next main run after PR146 was reported green; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
+PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. Coordinator live verification on2026-11-16 confirms latest main CI [43768671593](https://github.com/Dytschgo/arxcovo/actions/runs/43768671593) completed successfully on exact main0ab5038d89e86e5f726fbed7e5ef6d76e64fa306; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
 
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main.
 
@@ -36,6 +36,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Two isolated Sol high bounded diagnoses are active: consensus append callback/poison test (priority hotfix) and Linux s9c bound-object test (local Linux availability must first be established). No cause is asserted yet. Latest exact-main CI43768671593 is independently confirmed green. Both fixes require independent Opus review and fresh hosted gates; no native M2 grant or retry follows.
 
 - 2026-11-16: Babysitter main-health correction accepted. Coordinator verifies both red-main logs and records exact tests/symptoms/runs, treats both as intermittent, prioritizes bounded consensus-flake diagnosis, and adds exact-live-main green-CI merge prerequisite independent of duration-only ci-time-budget. Registry R1 test fixes remain in progress; no owner-admin or M2 native retry follows.
 
