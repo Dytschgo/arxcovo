@@ -121,3 +121,62 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> 
         records,
     })
 }
+
+/// Persist only reduced verifiers. Times are validated by core apply, never this codec.
+pub(crate) fn encode_command(c: &Command, b: &mut Vec<u8>) {
+    match c {
+        Command::Mint {
+            cluster,
+            actor,
+            request,
+            code,
+            verifier,
+            proposed_at_ms,
+        } => {
+            b.push(1);
+            b.extend(cluster);
+            b.extend(actor);
+            b.extend(request);
+            b.extend(code);
+            b.extend(verifier.bytes());
+            b.extend(proposed_at_ms.to_be_bytes());
+        }
+        Command::Redeem {
+            cluster,
+            request,
+            code,
+            presented,
+            key,
+            proposed_at_ms,
+        } => {
+            b.push(2);
+            b.extend(cluster);
+            b.extend(request);
+            b.extend(code);
+            b.extend(presented.bytes());
+            b.extend(key.0);
+            b.extend(proposed_at_ms.to_be_bytes());
+        }
+    }
+}
+pub(crate) fn decode_command(tag: u8, r: &mut Reader<'_>) -> Result<Command, StoreError> {
+    Ok(match tag {
+        1 => Command::Mint {
+            cluster: r.array()?,
+            actor: r.array()?,
+            request: r.array()?,
+            code: r.array()?,
+            verifier: CodeVerifier::from_bytes(r.array()?),
+            proposed_at_ms: r.u64()?,
+        },
+        2 => Command::Redeem {
+            cluster: r.array()?,
+            request: r.array()?,
+            code: r.array()?,
+            presented: CodeVerifier::from_bytes(r.array()?),
+            key: KeyDigest(r.array()?),
+            proposed_at_ms: r.u64()?,
+        },
+        _ => return Err(StoreError::Corrupt),
+    })
+}
