@@ -391,3 +391,67 @@ fn s9_final_object_owner_check() {
     );
     no_markers(root.path());
 }
+
+// Literal build-account reentry, selected only by the dormant combined controller.
+#[test]
+#[ignore = "installed sudo through actual Runner only; no native grant; unselected"]
+fn e4_sudo_nnp_reentry() {
+    assert_ne!(unsafe { libc::getuid() }, 0);
+    assert_eq!(nnp(), Some(true));
+    assert_eq!(run(&Settings::default(), || {}), "exit_nonzero");
+    let o = OBSERVATION.with(|slot| slot.get());
+    assert!(observation_accepts(o, unsafe { libc::getuid() }, unsafe {
+        libc::getgid()
+    }));
+    println!("ARX_A7_A11_REENTRY_OK");
+}
+
+#[test]
+fn s14_sudo_nnp_scalar_discriminators() {
+    let good = Observation {
+        c1: true,
+        alias_skipped: true,
+        c3_opened: false,
+        path: true,
+        cloexec: true,
+        regular: true,
+        same_inode: true,
+        uid: 2000,
+        gid: 2001,
+        exec_eof: true,
+        nonzero: true,
+        ..Observation::default()
+    };
+    assert!(observation_accepts(good, 2000, 2001));
+    assert!(!observation_accepts(good, 2002, 2001));
+    assert!(!observation_accepts(good, 2000, 2002));
+    assert!(!observation_accepts(
+        Observation { uid: 0, ..good },
+        0,
+        2001
+    ));
+    assert!(!observation_accepts(
+        Observation { gid: 0, ..good },
+        2000,
+        0
+    ));
+    for index in 0..10 {
+        let mut bad = good;
+        match index {
+            0 => bad.c1 = false,
+            1 => bad.alias_skipped = false,
+            2 => bad.c3_opened = true,
+            3 => bad.path = false,
+            4 => bad.cloexec = false,
+            5 => bad.regular = false,
+            6 => bad.same_inode = false,
+            7 => bad.exec_eof = false,
+            8 => bad.nonzero = false,
+            _ => bad.uid = 2002,
+        }
+        assert!(
+            !observation_accepts(bad, 2000, 2001),
+            "assertion scalar discriminator {index}"
+        );
+    }
+}
