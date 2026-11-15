@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #118, `17a2cb47306f73730c2ce990f4661094c4d01f3b` at 05:11:02Z, independent Muse exact-head PASS and all five gates green. Squash tree `3f56e0ad91c2c7b3fdfcd798c7d67a50bf62f7ac` equals reviewed `cae125a`. Hosted Ubuntu/macOS verify and optional E4 revalidation succeeded; this is compilation/source regression evidence, not A7/A11 native acceptance.
-- Current work: settle minimal A7/A11 delivery contract for actual staged arxd/libtest and owned account inputs, with qualifying host/local policy still unattested. Existing None/False/closed selector gates remain; no new native grant. Reuse fixed current Runner and descriptor-bound probe without policy-parser or host-audit framework. M2/full F/G/PA6 remain open.
+- Current work: independent Muse review of Sol fixed A7/A11 delivery contract `b4e45ec`: private fixed schema, root-owned staged arxd/libtest and owned accounts, shared build/runtime bounds and cleanup. Qualification/selection remain closed. Exact local policy bytes and qualifying host need separate bounded root-read-only evidence; no general policy parser or extra human approval. No native grant or A7/A11/M2/full F/G/PA6 credit.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
