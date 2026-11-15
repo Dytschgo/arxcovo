@@ -159,7 +159,9 @@ class Tests(unittest.TestCase):
         self.assertTrue(callable(comparator._read_linux))  # Never invoked.
         self.assertEqual(comparator.compare(None), result(False))
         info = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_nlink=1,
-                                     st_size=len(source))
+                                     st_size=len(source), st_dev=1, st_ino=2,
+                                     st_uid=1001, st_gid=1001,
+                                     st_mtime_ns=10, st_ctime_ns=20, st_atime_ns=30)
         for data, metadata, expected in ((source, info, True),
                                         (b"X" + source[1:], info, False),
                                         (source[:-1], info, False),
@@ -207,6 +209,31 @@ class Tests(unittest.TestCase):
                         with self.assertRaises(Exception):
                             W._module_bytes()
                     self.assertEqual(closed.call_count, opened.call_count)
+
+    def test_11_module_read_atime_only_and_identity_drift(self):
+        source = (ROOT / "tools/unix-exec-validation/sudo_package_profile.py").read_bytes()
+        values = dict(st_mode=stat.S_IFREG | 0o644, st_nlink=1, st_size=len(source),
+                      st_dev=1, st_ino=2, st_uid=1001, st_gid=1001,
+                      st_mtime_ns=10, st_ctime_ns=20, st_atime_ns=30)
+        for field in ("st_atime_ns", "st_dev", "st_ino", "st_uid", "st_gid",
+                      "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns"):
+            before = types.SimpleNamespace(**values)
+            after = types.SimpleNamespace(**{**values, field: values[field] + 1})
+            stream = io.BytesIO(source)
+            with self.subTest(field=field), ExitStack() as ports:
+                for name, flag in (("O_NOFOLLOW", 131072), ("O_DIRECTORY", 65536),
+                                   ("O_CLOEXEC", 524288), ("O_NONBLOCK", 2048)):
+                    ports.enter_context(patch.object(W.os, name, flag, create=True))
+                opened = ports.enter_context(patch.object(W.os, "open", side_effect=range(10, 30)))
+                ports.enter_context(patch.object(W.os, "fstat", side_effect=[before, after]))
+                ports.enter_context(patch.object(W.os, "read", side_effect=lambda fd, n: stream.read(n)))
+                closed = ports.enter_context(patch.object(W.os, "close"))
+                if field == "st_atime_ns":
+                    self.assertEqual(W._module_bytes(), source)
+                else:
+                    with self.assertRaises(ValueError):
+                        W._module_bytes()
+                self.assertEqual(closed.call_count, opened.call_count)
 
     def test_10_workflow_and_callgraph_fences(self):
         source = (ROOT / "tools/ci/sudo-package-readonly.py").read_text(encoding="utf-8")

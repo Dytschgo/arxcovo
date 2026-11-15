@@ -107,8 +107,8 @@ New executable-source SHA256 pins (LF bytes; this note does not hash itself):
 | File | SHA256 |
 | --- | --- |
 | `.github/workflows/sudo-package-readonly.yml` | `fe7e423573e43299c794f58c3dff0a9b9cbc69512654a1c973a32c90e84f94a1` |
-| `tools/ci/sudo-package-readonly.py` | `d4e2c648f5380109aa6bd524436c72f27e08e3d2e7fb4ca3dea9c684e2014ef9` |
-| `tools/ci/test-sudo-package-readonly.py` | `db6136f3908048eb7668026e6f862b9ced33bbe2c8314212e79fd3787310512b` |
+| `tools/ci/sudo-package-readonly.py` | `a40f58ae124b1d4136197cada6bb0cec08278ae04668d0ebca633b14a66f3f0c` |
+| `tools/ci/test-sudo-package-readonly.py` | `ac114477eea3bc2863376c6c93954f0a9394527ca99b16002798edf4c3330ceb` |
 
 ## Coordinator work still pending
 
@@ -133,3 +133,7 @@ network request, push, PR, subagent or old Lab Manager access. candidate_match
 will establish only the read-only FILE leg; C2/floor/in-unit four-mask view,
 fixture literals/NSS and actual NNP allow/deny cases remain open. A7/A11/M2/full
 F/G/real-Runner PA6 remain **unverified on real hardware**.
+
+## Coordinator review correction F1
+
+Independent Muse `6d8dab4` passed all axes with fail-closed atime finding F1. Added an injected module-read regression: atime-only change must pass; each dev/ino/mode/uid/gid/nlink/size/mtime_ns/ctime_ns change must refuse with all descriptors closed. Exact regression reproduced the pre-fix false refusal (ValueError), then passed after comparing only those nine stable fields. All11 wrapper tests and10 comparator tests pass. The first invocation used a wrong test class name and earned no credit. No host read, privilege or dispatch occurred. Source pin table above is refreshed for this coordinator correction; comparator pin and workflow are unchanged.

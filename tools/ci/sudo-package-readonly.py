@@ -81,7 +81,11 @@ def _module_bytes():
             data.extend(block)
             _need(len(data) <= _MODULE_SIZE)
         _need(not block and len(data) == _MODULE_SIZE)
-        _need(os.fstat(fd) == before)
+        after = os.fstat(fd)
+        # Reading may update atime; identity, content and ownership may not drift.
+        _need(all(getattr(after, key) == getattr(before, key) for key in (
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+            "st_size", "st_mtime_ns", "st_ctime_ns")))
         _need(hashlib.sha256(data).hexdigest() == _MODULE_SHA256)
         return bytes(data)
     finally:
