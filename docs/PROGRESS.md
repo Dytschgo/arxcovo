@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus high1fbad65 retainedc6fe014 corrects M3 pure enrollment brief; independent Sol recheck closes delayed-commit expiry T1 and finite retention T2. Physical expiry and consensus authority explicitly remain future-adapter claims. Sol implementation is eligible only for the named I/O-free core/tests; no transport, signing, host or native activation. M2 remains open, M3 independent steering applies.
+
 - 2026-11-15: Coordinator independently reviews Opus M3 brief17cd7d8 retained860cd50. Proposed-time expiry has an unaddressed sole-command delayed-commit counterexample; requests narrow fresh issuance-boundary and total-record-cap correction before source implementation. Records superseding user steering for independent M3 without M2 closure. No test/native action or transport/signing activation.
 
 - 2026-11-15: Opus high571cb74 independently reviews the bounded A9/U9 join, all axes PASS with no blockers. Six accepted records and exact historical stop/absence ordering verified; only natural-exit empty-directory removal credited. Crash/populated stop/production Drain remain open. Publish separately after PR140 parent merges. M3 architecture under ADR0005 active before any enrollment source implementation. No native authority.
