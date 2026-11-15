@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #116, `83075b57bb4b7f0bc5902e9acac80ec070a25903` at 04:11:18Z, independent Muse exact-head PASS and all five gates green. Squash tree `f4903eb99b8507c7b9258425f33154d55afcba1c` equals reviewed `9047d80`; bounded D9a A4 present-residue plus native omitted-kill checkpoint merged.
-- Current work: PR117 test-only SDK cancellation/confirmed-cleanup to durable exact activity lookup is in independent exact-head review and hosted CI; prior head190e41e passed independent Muse review, and the branch is refreshed against merged PR116 with unchanged test/evidence/review blobs; fresh-head review and gates pending. No production or native residue change. A12 native/crash-A9-U9/M2/full F/G/PA6 remain open; no further native run authority.
+- Last merged: PR #117, `7113a420140de8a45a17c82a25305f8794c3adb8` at 04:22:45Z, independent Muse refreshed-head PASS and all five gates green. Squash tree `f323a747839bf619eb2f140261cfb4b56b6a654a` equals reviewed `a6d9440`; SDK cancelled/confirmed-cleanup durable activity join merged (test-only).
+- Current work: prepare the smallest combined A7/A11 sudo/NNP descriptor execution acceptance slice within M2, reusing existing implementation and hosted fences. No native authority remains; source/design preparation only. A12 native/crash-A9-U9/M2/full F/G/PA6 remain open; installed/dedicated paths unverified on real hardware.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
