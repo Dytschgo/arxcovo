@@ -1,15 +1,15 @@
 # Brief: M3 OpenRaft 0.10.0 adapter and in-process three-node proof
 
-Status: **proposed** (Opus 5.5 high, 2026-11-15) on `7431327` (main `38750cf`, PR #144). C1/C2 of the Sol review (`4bee9db`) are fixed in decisions 6/10/12, shutdown
-and U4/U6; the coordinator rechecks them before Sol builds. Nothing built or run; no M3 acceptance, transport, mTLS, CA, signing, power-loss or real-host claim. M2 is
-open: A7 FINAL NO-GO and the consumed, cleanup-unconfirmed A12 attempt get no retry. ADR 0005 is unchanged; this brief implements its invariants, adopting none of
-its open policy choices.
+Status: **proposed** (Opus 5.5 high, 2026-11-15); main `38750cf` (PR #144). Startup corrected on `e6667d7` after Sol's actual equal-index handback (`507905b`, evidence
+top). Retained `5cd8c6b` (ex-`7d60a76`) holds only pins, types, mapping and codec; no adapter or service is in Git. C1/C2 (decisions 6/10/12, shutdown, U4/U6) and the
+corrected responder/lock contract are unchanged. After Sol rechecks decision 9 and R1–R4, the builder resumes commit 2 without another broad plan. Nothing else is built
+or run; no M3 acceptance, transport, mTLS, CA, signing, power-loss or real-host claim. M2 is open: A7 FINAL NO-GO; the consumed, cleanup-unconfirmed A12 attempt gets no
+retry. ADR 0005 gains one startup invariant and adopts none of its open policy choices.
 
 ## Goal
 
-Run the real OpenRaft engine over the merged `VoteLogStore` and `StateStore` stores. Prove an election, commit/apply,
-2-of-3 continuation, restart convergence, ReadIndex reads, no-quorum refusal and enrollment outcomes from committed
-entries. Use three persistent in-process nodes and a test-only in-memory network: no sockets, listeners or certificates.
+Run the real OpenRaft engine over the merged `VoteLogStore` and `StateStore` stores. Prove an election, commit/apply, 2-of-3 continuation, restart convergence,
+ReadIndex reads, no-quorum refusal and committed enrollment outcomes on three persistent in-process nodes over a test-only in-memory network (no sockets or certificates).
 
 ## Verified source facts (crate `openraft-0.10.0`, sha256 `2628033834a6…7ad0`; deps fetched from static.crates.io)
 
@@ -31,10 +31,10 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 - `RaftStateMachine` (`raft_state_machine.rs`): `type SnapshotData`/`SnapshotBuilder`; `applied_state`; `apply(Stream<Item =
   io::Result<(Entry, Option<ApplyResponder>)>>)` (`ApplyResponder::send(R)` must run after each apply, or `client_write`
   never returns); a required `get_snapshot_builder`; `install_snapshot(&meta, SD)`; `get_current_snapshot`.
-- Startup (`storage/helper.rs`): `committed = max(read_committed, applied)`. It installs `get_current_snapshot` only if
-  newer than applied. It errors if `applied < purged` ("state machine is behind the purged logs") or if the log is inverted.
-  If applied is ahead of the log at a greater index, it calls `purge(applied)`; an equal or lower index is an error. It
-  rebuilds the snapshot if it is below purged. `Raft::build` maps the error to `Fatal::StorageError` and does not validate `Config`.
+- Startup (`storage/helper.rs`, inside `Raft::build` with `with_id`): `committed = max(read_committed, applied)`; it installs `get_current_snapshot` only if newer than
+  applied and errors if `applied < purged` or `last_log < purged`. It compares indexes **only** when `last_log_id < last_applied` in `LogId` order (term, leader node,
+  index): an equal or lower index errors, a greater one calls `purge(applied)`. A log at or above applied in that order passes unchecked at any index (Sol's probe: SM
+  T1-N1.5, tail T2-N1.5 `Ok`; tail T0-N1.5 errors). It rebuilds a snapshot below purged. `Raft::build` maps errors to `Fatal::StorageError` (`?`), never validates `Config`.
 - Install (`engine/handler/following_handler`) is ignored unless snapshot > `local_committed`. Then it truncates
   conflicts, installs the SM, then purges. `Command::PurgeLog` waits for `Condition::Snapshot{upto}`.
 - `Raft::new(id, Arc<Config>, N, LS, SM)` needs `N::Network: NetSnapshot<SnapshotData = SM::SnapshotData>`. `RaftNetworkV2`
@@ -88,9 +88,17 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
    `purged ≤ durable applied` holds across stores (I4). `install_snapshot` rejects data over 16384 B. A new pure
    `StateStore::peek(blob)` must match meta exactly (applied and canonical membership) before `install`; otherwise
    `Corrupt` with nothing changed. `try_create_snapshot_builder` keeps its default.
-9. **Startup** is OpenRaft's helper unchanged. It repairs SM-ahead (purge past the tail is supported) and fails closed when the
-   SM is behind purged or on an equal-index conflict. No `save_committed`: apply is durable, so restart never reverts.
-   Reads go through the leader's ReadIndex only.
+9. **Startup is an Arxcovo preflight, then OpenRaft's helper unchanged.** The helper does not enforce equal-index ID consistency (facts). So `ConsensusNode::start`
+   runs `fn preflight(log: &mut VoteLogStore, sm: &StateStore) -> Result<(), StoreError>` in one `blocking` closure on the stores it just opened and still owns, before
+   any `Arc`/`Mutex`, adapter, `Raft::new`, task or writer exists. Ownership makes it atomic, so no lock order is needed; wrap the stores only after `Ok`. Reads only:
+   `sm.applied()` = A, `log.log_state()` = (P, L), then at most one store-validated `log.entries(a, a + 1, 1)`. With `a = A.index`, first match decides: (1) A `None`:
+   accept iff P `None`. (2) `P.index > a`: refuse (behind purged). (3) `P.index == a`: accept iff P == A. (4) L `None` or `L.index < a` (SM-ahead hole): accept iff `L < Some(A)` in
+   `LogPos` order, so the helper's `purge(A)` repair runs and the store accepts it. (5) Else accept iff exactly one row has index a and its `LogPos` == A. A higher or lower term, a
+   different leader or a missing row is refused even when the tail is further ahead. A refusal is `StoreError::Corrupt` (read errors pass through) wrapped as
+   `StartError::Preflight`; the stores drop, nothing is written and the helper never runs. Rows below a are not comparable (the SM keeps only A; log matching at A covers
+   them); rows above a are tail the engine may truncate. `Raft::new` then runs the unchanged helper, which may purge (hole) and rebuild the snapshot. No runtime
+   cross-store check (it would race the engine); I4 after start stays protocol-held (decision 8). No `save_committed`: apply is durable, so restart never reverts.
+   Reads go through the leader's ReadIndex only. If a legitimate restart (T1–T3) trips the preflight, hand back with evidence; never relax it.
 10. **Config and backpressure** (`Params`, validated, `check()` asserted in tests). Production: heartbeat 100 ms, election 500..1000 ms, `max_payload_entries=64`,
     `max_append_entries=Some(64)`, `api_batch_capacity=Some(64)`, `api_channel_size=Some(1024)`, `snapshot_policy=LogsSinceLast(64)`,
     `max_in_snapshot_log_to_keep=32`, `purge_batch_size=32`, `replication_lag_threshold=128`, and `enable_pre_vote=Some(false)` (no pre-vote RPC; ADR 0005). Decision
@@ -114,23 +122,22 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 ## Files (only these, plus Cargo.toml/Cargo.lock as in decision 1)
 
 - `cluster.rs`: `pub mod consensus;`. `enrollment.rs`: `Display for Command`. `state_store.rs`: `StoreError::Membership`, `pub(super) fn peek`.
-- `cluster/consensus.rs` (≤ 380 lines): type config, `Applied`, `Params`/config, mapping, membership codec, and `ConsensusNode::{start, propose, linearizable_state,
-  shutdown}`. `shutdown` in order: (1) set `closed` under the owners lock; (2) `try_shutdown` *before* waiting on any owner (a no-quorum write never completes;
+- `cluster/consensus.rs` (≤ 420 lines): type config, `Applied`, `Params`/config, mapping, membership codec, `preflight`, `StartError::{Open(StoreError),
+  Preflight(StoreError), Fatal}` (static text) and `ConsensusNode::{start, propose, linearizable_state, shutdown}`. `shutdown` in order: (1) set `closed` under the owners lock; (2) `try_shutdown` *before* waiting on any owner (a no-quorum write never completes;
   waiting first deadlocks), whose core exit resolves every owner; (3) take the set and `join_next` until empty within one shared 5 s deadline, else `abort_all`, join
   the rest and return `Orphaned`; (4) drop the `Raft` and poll until both stores' `Weak`s are gone in the same deadline, else `Orphaned`. An SM-worker
   `ApplyResponder` (outside `try_shutdown`'s joins) surfaces as `Orphaned`, never a silent leak. After: 64 permits, empty set.
 - `cluster/consensus/adapter.rs` (≤ 320 lines): `LogAdapter` (also the reader), `SmAdapter`, `SnapBuilder`, `Completion`, and the `blocking` helper.
 - `#[cfg(test)]` `cluster/consensus/{mem_net.rs, tests.rs, three_node.rs}`, plus `docs/evidence/m3-openraft-three-node.md`.
-- Commits: (1) deps, types, mapping, codec and unit tests; (2) adapters, Suite and startup; (3) service, mem_net and T1/T2; (4) T3 and evidence.
+- Commits: (1) deps, types, mapping, codec and unit tests (retained `5cd8c6b`); (2) adapters, Suite, preflight and R1–R4; (3) service, mem_net and T1/T2; (4) T3 and evidence.
   If the diff exceeds ~1800 lines, (4) becomes an immediate follow-up PR. T1/T2 are the first usable three-node proof.
 
 ## In-memory network (test double, not a transport claim)
 
-`MemRouter{nodes: Mutex<BTreeMap<u64, Raft>>, isolated: Mutex<BTreeSet<u64>>, counters}`. `MemNetwork{source, target}`
-calls the target's `append_entries`/`vote`/`install_full_snapshot`. If either side is absent or isolated, or the remote returns
-`Fatal`, it returns `Unreachable`. It checks the claimed sender (`rpc.vote.leader_id.node_id`) equals `source`; on a mismatch it
-returns Unreachable and increments a counter, and the test requires 0. It records max entries per append (must be ≤ 64) and
-snapshot bytes (must be ≤ 16384). Nodes are removed from the map before shutdown, which breaks the Raft↔router reference cycle.
+`MemRouter{nodes: Mutex<BTreeMap<u64, Raft>>, isolated: Mutex<BTreeSet<u64>>, counters}`. `MemNetwork{source, target}` calls the target's
+`append_entries`/`vote`/`install_full_snapshot`. If either side is absent or isolated, or the remote returns `Fatal`, it returns `Unreachable`. It checks the claimed
+sender (`rpc.vote.leader_id.node_id`) equals `source`; a mismatch returns Unreachable and increments a counter the test requires to be 0. It records max entries per
+append (≤ 64) and snapshot bytes (≤ 16384). Nodes are removed from the map before shutdown, which breaks the Raft↔router reference cycle.
 
 ## Tests (`cluster::consensus::*`; `private_temp`; each three-node test runs ≤ 45 s inside `timeout` with owned shutdown)
 
@@ -146,8 +153,15 @@ snapshot bytes (must be ≤ 16384). Nodes are removed from the map before shutdo
   from caller tasks, require metrics to show 64 entries appended past committed (else fail, never vacuous), then abort and join every caller. The next `propose` is
   `Busy` with 0 permits. Shut the isolated leader down: `shutdown` returns within 5 s without `Orphaned`, 64 permits, empty set; a later `propose` is `Stopped`. A
   second fixture repeats the burst, then restores quorum: permits never exceed 64 (resolutions recorded, not asserted) and `shutdown` still restores 64 and empties the set.
-- S1/S2 Suite as in decision 11. R1–R4 startup through the real `StorageHelper::get_initial_state`: SM 0..=5 over log 0..=3 → purged = last = 5,
-  next append 6 (4 rejected); SM 0..=1 under log purge(3) → error, and `Raft::new` → `Fatal::StorageError`; equal-index term conflict → error; normal.
+- S1/S2 Suite as in decision 11. R1–R4 startup: saved vote T3-N1, cluster [1;16], states built only through store APIs; "SM X.n" applies blanks 0..=n at X.
+  **R3 own refusal** (`preflight` directly, then `ConsensusNode::start` → `StartError::Preflight(Corrupt)` with no `Raft` built; reopen: vote, log state, applied,
+  blob and every retained row unchanged). Over SM T1-N1.5: row 5 = tail T2-N1, T0-N1 or T1-N2; P = L = T2-N1.5; row 5 T2-N1 or T0-N1 under tail T2-N1.7; row 5
+  missing (log 7..=9, no purge); hole tail T2-N1.3 or T1-N2.3. SM T1-N2.5 over row 5 = tail T1-N1. **R2:** SM T1-N1.1 under purge(3), and nothing applied with P set:
+  refused the same way. **R1/R4 accepted** (start `Ok`, then `shutdown`): exact T1-N1.5; row 5 equal under tail T2-N1.7; P = A with a tail ahead; log rows with
+  nothing applied; empty; SM T1-N1.5 over log 0..=3 at T1-N1 → after shutdown, reopen: purged = last = 5, append 4 rejected, append 6 accepted. **Raw library characterization**, labelled as such:
+  `StorageHelper::new(..).with_id(1).get_initial_state()` returns `Ok` for equal-index higher term or leader, P = L = T2-N1.5, both interior rows and both hole
+  orderings (pinned 0.10.0 limitation, not enforcement), and `Err` for lower term or leader at equal index and behind-purged. Only behind-purged is also proven
+  through raw `Raft::new` (adapters, no preflight) → `Fatal::StorageError`. No `Raft::new` Fatal is claimed for any equal-index case.
 - Fixture: ids 1..3, node 1 `initialize({1,2,3} → BasicNode::new("mem:N"))`, `first_free = 4`, deterministic code RNG, explicit
   logical times. Writes go to the discovered leader, re-routing on `NotLeader` within the deadline. Every ack is recorded.
 - T1 follower: Mint A, Redeem A(K1, R1) → `Enrolled{4}`; an identical retry gives replay 4. Isolate and shut down a follower. Then 2/3 writes:
@@ -178,8 +192,9 @@ key authentication, signing, MCP ingress, KICKOFF M3 acceptance. All are **unver
 
 ## Sol handoff
 
-Sol high implements in commit order. Do not edit `log_store.rs`, or the codecs and semantics of the merged stores. If a compatible Suite case
-fails, show which documented OpenRaft contract the store breaks before changing anything. Otherwise move the case to S2 with a reason and
-flag it for Opus review. Never weaken the SM order to pass a case. Three failed fixes trigger a handoff with evidence. No subagents beyond
-the routing rules, no native or M2 actions, no admin steps. A different-provider review and green gates are required before merge.
-The C1/C2 constructions (decisions 6 and 12, the shutdown order, U4/U6) are mandatory; if the actual API rejects one, stop and hand back compiler output.
+Sol high implements in commit order. Do not edit `log_store.rs`, or the codecs and semantics of the merged stores. If a compatible Suite case fails, show which
+documented OpenRaft contract the store breaks before changing anything. Otherwise move the case to S2 with a reason and flag it for Opus review. Never weaken the SM
+order to pass a case. Three failed fixes trigger a handoff with evidence. No subagents beyond the routing rules, no native or M2 actions, no admin steps. A
+different-provider review and green gates are required before merge. The C1/C2 constructions (decisions 6 and 12, the shutdown order, U4/U6) are mandatory; if the
+actual API rejects one, stop and hand back compiler output. The decision 9 preflight is mandatory, startup-only and lives only in `start`: no OpenRaft patch,
+upgrade or new dependency, no store semantic change, no runtime cross-store check. T1/T2 remain required; their restarts are the preflight's normal-path evidence.
