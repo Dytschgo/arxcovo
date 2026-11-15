@@ -15,8 +15,10 @@ for Standard `43635131545` and None `43636804545`. D7d is consumed by A5
 run `43644661407`; A5 acceptance is limited to that reviewed run. D7e is consumed by accepted A4 baseline dispatch
 `43666413693` on `a328060000b8cb7bb389d39f8785f96f6bcb0c25`.
 Positive baseline feedback does not satisfy the native omitted-kill requirement
-or grant A4/M2 acceptance. No further D7e run is authorized. All other native execution and
-historical retries remain unauthorized. The historical E_PROTECTION diagnosis remains
+or grant A4/M2 acceptance. No further D7e run is authorized. D7f below proposes
+one fixed native omitted-kill run, inactive until its independent review, five
+gates and coordinator merge. All other native execution and historical retries
+remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
 
@@ -233,8 +235,8 @@ slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
 run and its environment must not be retried or reused. D7a and D7b are
-consumed, as are D7c and D7d; only D7e proposes one A4 baseline feedback
-run, subject to its prerequisite baseline and gates.
+consumed, as are D7c, D7d and D7e; only D7f proposes one fixed A4 native
+omitted-kill run, subject to its exact candidate and gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
 
@@ -549,7 +551,8 @@ unchanged. No native operation or execution permission follows from these checks
 **Consumed by accepted dispatch `43666413693`, attempt1, exact main
 `a328060000b8cb7bb389d39f8785f96f6bcb0c25`.** Job success and confirmed
 cleanup are recorded in [baseline feedback](../evidence/linux-a4-hosted-baseline-feedback.md);
-independent baseline assessment remains pending. The reviewed-SHA variable
+the [independent baseline assessment](../reviews/m2-a4-hosted-baseline-muse-assessment.md)
+passed for positive feedback only (PR #111). The reviewed-SHA variable
 is absent. No retry or further execution is authorized. The preparation
 conditions below are retained as the record of this consumed grant.
 
@@ -618,11 +621,96 @@ helper, fixture and exact packaged Standard unit. Observe the existing exact
 test-ok, one-pass/zero-failure summary, real systemd success/zero exit and
 confirmed cleanup; retain the existing bounded sanitized feedback. This is
 **baseline native feedback only**. ADR0020 D9a's native omitted-kill negative
-case is still **unrun and NOT granted**. Pure/model assertion mutants cannot
+case was **unrun and NOT granted under D7e** and remains unrun; only D7f
+below proposes its separate conditional disposition. Pure/model assertion mutants cannot
 satisfy it. **A4 acceptance stays open** until that requirement is independently
 satisfied; no new mutation framework or waiver is introduced. A7–A12, full
 Stage F, Stage G, real-Runner PA6 and M2 remain open. Installed/dedicated paths
 are **unverified on real hardware**.
+
+### D7f. One fixed native A4 omitted-S7-kill run (2026-11-15)
+
+**Proposed, inactive. Independent Muse exact-head review, all five required
+checks and coordinator merge are still needed; no native authority exists yet.**
+PR #113 merged the fixed source as `d0b4c5530b1c4c084a35fe40499afa96a2678b0b`,
+tree `9cfd66dbdf7ce1afc43c1f5acecf4eb62fd09455`, equal to reviewed head
+`15c4d73a3eaf02779672870e5054e34edea6f5c5`. Its all-five-gates/Muse PASS
+is supplied coordinator evidence, not re-run here. D7e and all earlier grants
+stay consumed. Positive run `43666413693` on `a328060000b8cb7bb389d39f8785f96f6bcb0c25`
+remains feedback only; the native negative is **unrun**.
+
+The sole candidate is the **first eligible normal main squash containing D7f**
+after that baseline, after independent different-provider exact-head review,
+all five green required checks (three platform `verify`, `ci-time-budget`,
+`agent-review`) and coordinator merge. Before any grant is used, compare the
+entire candidate against that baseline. The exact allowed non-document paths
+are only:
+
+- `tools/unix-exec-validation/driver.py`: the single fixed TEST assignment from
+  positive to `exec::disposable::a4::disposable_linux_a4_omitted_kill`.
+- `tools/unix-exec-validation/test_driver.py`: focused default-selection
+  assertions/name and exact-summary mock marker correction, preserving every
+  assertion and explicit historical positive/mode pins.
+- `tools/unix-exec-validation/mutation_check.py`: the focused inverse selection
+  mutant anchor, restoring positive A4 as the counterfactual.
+
+Those three blobs must equal the independently reviewed preparation blobs
+recorded in [preparation evidence](../evidence/linux-a4-negative-run-preparation.md).
+Every other non-document execution blob must equal the baseline, including all
+Rust/fixture/LinuxFs/production, helper source/recipe/build/image pins, workflows,
+package/unit/Standard profile, Cargo/lockfile and toolchain. No new selector,
+substitution or unrelated source/main change qualifies. Allowed document delta
+is only this ADR, that evidence note, the retained D7f independent review
+`docs/reviews/m2-d7f-a4-negative-muse-review.md`, and coordinator PROGRESS.
+Verify exact reviewed-head/candidate tree equality after merge; record and pin
+its actual full main squash SHA and tree (not a branch head, baseline or invented
+future SHA), changed blobs and the complete diff. Read back main immediately
+before dispatch. Main advancing, any blob mismatch, intervening unrelated main
+content or a different candidate requires a new independently reviewed
+disposition **before** grant; substitution cannot consume this grant.
+
+Only after those conditions may the coordinator set `UNIX_EXECUTION_REVIEWED_SHA`
+**once**, read back the exact candidate value, and dispatch the unchanged
+`unix-execution-experiment.yml` **once**, on one fresh GitHub-hosted Ubuntu 24.04
+host. Verify repository `Dytschgo/arxcovo`, actor and triggering actor `Dytschgo`,
+`refs/heads/main`, source and workflow SHAs, and
+`GITHUB_SHA == ARX_REVIEWED_SHA == ARX_WORKFLOW_SHA ==` the variable/candidate.
+Retain manual-only/read-only credentials, protected staging, fixed-unit collision
+refusal, packaged Standard hardening, descriptor-bound fixed helper delivery,
+MainPID/supervisor attribution, exact ignored/exact/one-thread argv, all existing
+bounds and owned-only finally cleanup. Clear the variable in a finally operation
+on completion, failure or rejected dispatch, independently verifying HTTP 404
+absence. The owner's delegated disposable-host authorization covers these
+coordinator operations without further human approval; this preparation performs
+none. No owner-PC, owner account/admin/payment, static-VM or backup action is
+included.
+
+An **accepted dispatch consumes D7f regardless of outcome**. No retries, reruns,
+second dispatch, environment reuse or renewed older grant. A rejected dispatch
+also grants no retry. Failure, unknown result or uncertain cleanup stops work;
+retain bounded sanitized feedback and exclude the host. Exclude every previous
+experiment host, including D7a through D7e and historical `43091339273`.
+
+Only the fixed negative literal is selected. Native credit requires one real
+production setup under the existing OmitS7, rejection by the shared inner positive
+`assert!(accepted)` caught only at that assertion, exact
+`Unavailable(KillTimeout)`, exactly 1 reached / 1 omitted / 0 forwarded S7 writes,
+zero removals, real retained populated literal leaf and live unreaped sole helper
+with original lifetime remaining **before failure cleanup**. Require the fixed
+raw-fd `ARX_A4_OMITTED_S7_REJECTED` LF marker exactly once, then checked owned-child
+SIGKILL/reap and owned-leaf emptiness/removal/absence before READY/identity-ack.
+Require the outer exact test-ok, one-pass/zero-failure summary, real systemd
+success/zero exit and independent driver finally stop/cgroup/helper/runtime
+cleanup confirmation. A green job alone, false bool, other panic/refusal, early
+death/expiry, fake clock/events, second setup or cleanup kill earns no S7 credit.
+The unchanged native deadline, five-second wait, limits and bounds all apply.
+
+Retain the existing bounded sanitized result/provenance and independent native
+assessment, including rejection attribution and cleanup, before any A4 credit.
+Pure/mock tests and assertion mutants provide no native evidence. Even a native
+negative pass earns only the separately assessed D9a A4 scope; full F/G,
+real-Runner PA6 and M2 stay open. Installed/dedicated paths remain
+**unverified on real hardware**.
 
 ## Contract clarifications (2026-11-12)
 
