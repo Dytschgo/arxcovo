@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Coordinator independently reviews Opus M3 brief17cd7d8 retained860cd50. Proposed-time expiry has an unaddressed sole-command delayed-commit counterexample; requests narrow fresh issuance-boundary and total-record-cap correction before source implementation. Records superseding user steering for independent M3 without M2 closure. No test/native action or transport/signing activation.
+
 - 2026-11-15: Opus high571cb74 independently reviews the bounded A9/U9 join, all axes PASS with no blockers. Six accepted records and exact historical stop/absence ordering verified; only natural-exit empty-directory removal credited. Crash/populated stop/production Drain remain open. Publish separately after PR140 parent merges. M3 architecture under ADR0005 active before any enrollment source implementation. No native authority.
 
 - 2026-11-15: Sol high e5779a3 retained1f8a8b6 prepares bounded89-line A9/U9 join: systemd unit-directory absence after natural fixture exit, with empty runs where created; no signal-stop/populated/crash/production Drain credit. Coordinator inspected source/claim distinctions. A10 PR140 exact-head review active; A9 review queued next. Independent M3 enrollment slice design begins under ADR0005 without closing M2 or reopening native grants.
@@ -1188,7 +1190,7 @@
 - docs/dev-host-setup.md and early feasibility ADRs are preserved in open PR #10. Policy regression PR #9 is also open. These have not been accepted or merged.
 - All VM/hypervisor paths, S4U/cross-account execution and installed services remain **unverified on real hardware**. Hosted software tests do not establish owner-PC installation or VM acceptance.
 - Never touch the old Lab Manager installation/state or Hyper-V VM `agent-windows-test`. No agent performed owner-PC account, rights, service or task administration.
-- Post-v1 scope stays in docs/ROADMAP.md. No milestone 3 implementation starts before milestone 2 acceptance.
+- Post-v1 scope stays in docs/ROADMAP.md. Superseding user-delegated steering permits independent milestone 3 source work after the bounded remaining M2 audits while hardware-dependent M2 gaps remain explicitly open. M2 is not marked accepted; M3 architecture/security decisions and ordinary independent reviews/green gates remain required.
 
 ## Oversight
 
