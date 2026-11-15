@@ -1,10 +1,14 @@
 """Pure manifest/ELF rejection tests. No waiting image or native adapter runs."""
 
 import copy
+import contextlib
+import io
 import json
 import struct
 import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import build
@@ -28,6 +32,72 @@ def elf():
 
 
 class InventoryTests(unittest.TestCase):
+    def test_refusal_labels_distinguish_gates_without_exception_text(self):
+        self.assertEqual(build.refusal_label(ValueError("compiler identity mismatch")), "compiler-identity")
+        self.assertEqual(build.refusal_label(ValueError("Linux candidate differs from independently reviewed image")), "image-pin")
+        for error in (ValueError("PRIVATE-MARKER/path"), OSError("PRIVATE-MARKER/path"),
+                      build.subprocess.CalledProcessError(1, ["PRIVATE-MARKER/path"], output=b"PRIVATE-MARKER")):
+            label = build.refusal_label(error)
+            self.assertIn(label, ("format", "io", "compiler-command"))
+            self.assertNotIn("PRIVATE-MARKER", label)
+
+    def test_root_refuses_before_any_compiler_or_source_read(self):
+        for uid, euid in ((0, 1000), (1000, 0), (0, 0)):
+            with patch.object(sys, 'argv', ['build.py', 'build']), \
+                 patch.object(build, 'os', SimpleNamespace(name='posix', getuid=lambda: uid, geteuid=lambda: euid)), \
+                 patch.object(build, 'command') as command, patch.object(build, 'read') as read:
+                with self.assertRaisesRegex(ValueError, 'unprivileged'):
+                    build.main()
+                command.assert_not_called()
+                read.assert_not_called()
+
+    def test_linux_candidate_compares_independent_pin_never_updates_it(self):
+        recipe = build.read(build.ROOT / 'recipe.json')
+        source = build.read(build.ROOT / 'helper.rs')
+        pin = json.loads(build.read(build.ROOT / 'linux-image-pin.json'))
+        identity = pin['compiler_identity'].replace('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu')
+        data = bytes(elf())
+        # Synthetic authorized identity stands in for the independently held pin.
+        pin['image_sha256'], pin['image_size'] = build.sha(data), len(data)
+        for differs in (False, True):
+            def read(path):
+                return {'recipe.json': recipe, 'helper.rs': source,
+                        'linux-image-pin.json': json.dumps(pin).encode(),
+                        'a4-helper': data + (b'!' if differs else b'')}[path.name]
+            with patch.object(sys, 'argv', ['build.py', 'linux-candidate']), \
+                 patch.object(sys, 'platform', 'linux'), \
+                 patch.object(build, 'os', SimpleNamespace(name='posix', getuid=lambda: 1000, geteuid=lambda: 1000)), \
+                 patch.object(build, 'read', side_effect=read), \
+                 patch.object(build, 'command', side_effect=[identity, '/fixed/sysroot', '']) as command, \
+                 patch.object(build, 'regular'), patch.object(Path, 'mkdir'), \
+                 patch.object(Path, 'write_text') as write, \
+                 patch.object(build, 'tool_sha', return_value='a' * 64), \
+                 patch.object(build, 'inventory', return_value=pin['symbols']):
+                if differs:
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), self.assertRaisesRegex(ValueError, 'independently reviewed image'):
+                        build.main()
+                    report = json.loads(output.getvalue())
+                    self.assertEqual(set(report), {"kind", "matches", "image_sha256", "image_size", "symbol_count", "symbol_names_match", "compiler_sha256", "linker_sha256", "layout"})
+                    self.assertEqual(report["kind"], "a4-compile-comparison")
+                    self.assertEqual(report["image_size"], len(data) + 1)
+                    self.assertFalse(report["matches"]["image_sha256"])
+                    self.assertFalse(report["matches"]["image_size"])
+                    self.assertTrue(report["matches"]["source_sha256"])
+                    self.assertTrue(report["symbol_names_match"])
+                    self.assertEqual(report["layout"]["entry"], 4096)
+                    self.assertEqual(len(report["layout"]["sections"]), 4)
+                    self.assertNotIn("synthetic static image", output.getvalue())
+                else:
+                    build.main()
+                self.assertEqual(command.call_count, 3)
+                self.assertIn('helper.rs', command.call_args.args[0])
+                write.assert_called_once()
+                record = json.loads(write.call_args.args[0])
+                self.assertEqual(record['compiler_identity'], identity)
+                self.assertEqual(record['compiler_sha256'], 'a' * 64)
+                self.assertEqual(record['source_sha256'], pin['source_sha256'])
+
     def test_fixed_static_entry(self):
         self.assertEqual(build.inventory(elf()), [
             {"name": "_start", "type": 18, "value": 4096, "size": 1}])

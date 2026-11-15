@@ -2,8 +2,8 @@
 use super::*;
 
 pub(crate) const IMAGE_HASH: &str =
-    "fc814889c294db4216093e8f360201401be2c1b2dc6c4b01fd84617701f3a92e";
-pub(crate) const IMAGE_SIZE: usize = 3696;
+    "cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369";
+pub(crate) const IMAGE_SIZE: usize = 3680;
 pub(crate) const SOURCE_HASH: &str =
     "770ab397264ab78deb5d54854bd00d4cfabb1b3660b0e975ee751472fbeada5a";
 
@@ -206,12 +206,12 @@ pub(crate) fn finish<F: CgroupFs>(
 }
 
 #[test]
-fn source_and_image_pins_are_reviewed_cross_image() {
+fn source_and_image_pins_are_reviewed_linux_image() {
     use sha2::{Digest, Sha256};
     let source = include_bytes!("../../../../../tools/unix-exec-validation/a4-helper/helper.rs");
     assert_eq!(hex::encode(Sha256::digest(source)), SOURCE_HASH);
     let pin: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../tools/unix-exec-validation/a4-helper/image-pin.json"
+        "../../../../../tools/unix-exec-validation/a4-helper/linux-image-pin.json"
     ))
     .unwrap();
     assert_eq!(pin["image_sha256"], IMAGE_HASH);
@@ -221,7 +221,7 @@ fn source_and_image_pins_are_reviewed_cross_image() {
         pin["compiler_identity"]
             .as_str()
             .unwrap()
-            .contains("host: x86_64-pc-windows-msvc")
+            .contains("host: x86_64-unknown-linux-gnu")
     );
     assert!(!image(&[]));
     assert!(!image(&vec![0; IMAGE_SIZE]));

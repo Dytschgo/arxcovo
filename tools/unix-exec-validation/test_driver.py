@@ -738,9 +738,11 @@ class A1A2(unittest.TestCase):
         unit = (package / 'arxd.service').read_bytes()
         profile = (package / '50-arxcovo-standard-rights.conf').read_bytes()
         root = Path('/run/systemd/system')
-        for name, present in [('a1_a2', True), ('a3_standard', True), ('a3_none', False), ('a5', True)]:
+        for name, present in [('a1_a2', True), ('a3_standard', True), ('a3_none', False), ('a5', True), ('a4', True)]:
             with self.subTest(name=name), ExitStack() as stack:
                 selected = 'exec::disposable::disposable_linux_' + name
+                if name == 'a4':
+                    selected = 'exec::disposable::a4::disposable_linux_a4'
                 stack.enter_context(patch.object(driver, 'TEST', selected))
                 stack.enter_context(patch.object(Path, 'read_bytes', lambda p: profile if p.name.startswith('50-') else unit))
                 stack.enter_context(patch.object(driver, 'protected'))
@@ -928,6 +930,199 @@ class A1A2(unittest.TestCase):
                 driver.verify_test_result(stage, 0)
             except RuntimeError as error:
                 self.fail('exact selected summary refused: ' + str(error))
+
+
+class A4Delivery(unittest.TestCase):
+    selected = 'exec::disposable::a4::disposable_linux_a4'
+
+    def test_closed_mapping_and_default(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a5')
+        with patch.object(driver, 'TEST', self.selected):
+            try:
+                self.assertTrue(driver.standard_profile())
+            except RuntimeError:
+                self.fail('closed A4 mapping refused')
+            self.assertEqual(driver.test_argv('/binary'),
+                ['/binary', self.selected, '--ignored', '--exact', '--test-threads=1', '--color=never'])
+            self.assertTrue(driver.a4_selected())
+        with patch.object(driver.os, 'open') as opened:
+            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                driver.a4_delivery()
+            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                driver.install_a4_helper(b'', {})
+            opened.assert_not_called()
+
+    def test_source_and_recipe_independent_of_image(self):
+        root = ROOT / 'tools/unix-exec-validation/a4-helper'
+        for bad in ('helper.rs', 'recipe.json'):
+            reads = []
+            def read(name, bound):
+                reads.append(name)
+                if name not in ('helper.rs', 'recipe.json'):
+                    self.fail('unreviewed source reached image provenance')
+                return b'changed' if name == bad else (root / name).read_bytes()
+            with patch.object(driver, 'TEST', self.selected), \
+                 patch.object(driver, 'a4_input', side_effect=read), \
+                 patch.object(driver.os, 'open') as opened:
+                with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                    driver.a4_delivery()
+                self.assertNotIn('out/a4-helper', reads)
+                opened.assert_not_called()
+
+    def test_size_and_hash_both_required_before_open(self):
+        for data in (b'', b'x' * 3680, b'x' * 3681):
+            with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                driver.a4_image(data)
+            with patch.object(driver, 'TEST', self.selected), \
+                 patch.object(driver.os, 'open') as opened:
+                with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                    driver.install_a4_helper(data, {})
+                opened.assert_not_called()
+
+    def test_bad_a4_input_refuses_before_privileged_probe(self):
+        with patch.object(driver, 'TEST', self.selected), \
+             patch.object(driver.sys, 'platform', 'linux'), \
+             patch.object(driver, 'a4_delivery', side_effect=RuntimeError('E_ARTIFACT')), \
+             patch.object(driver.os, 'getuid', create=True) as uid, \
+             patch.object(driver, 'reserve_unit') as reserve:
+            with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                driver.run_body(valid_env())
+            uid.assert_not_called()
+            reserve.assert_not_called()
+
+    def test_linux_provenance_and_fixed_pin_before_image(self):
+        root = ROOT / 'tools/unix-exec-validation/a4-helper'
+        inputs = {name: (root / name).read_bytes() for name in ('helper.rs', 'recipe.json', 'linux-image-pin.json')}
+        pin = json.loads(inputs['linux-image-pin.json'])
+        candidate = dict(pin, compiler_identity=pin['compiler_identity'].replace(
+            'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'))
+        for key, bad in [('compiler_identity', pin['compiler_identity'].replace('x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc')), ('compiler_sha256', ''),
+                         ('flags', []), ('image_sha256', '0' * 64), ('source_sha256', '0' * 64)]:
+            altered = dict(candidate, **{key: bad})
+            def read(name, bound):
+                if name == 'out/a4-helper':
+                    self.fail('invalid provenance reached delivery')
+                return json.dumps(altered).encode() if name == 'out/candidate-pin.json' else inputs[name]
+            with patch.object(driver, 'TEST', self.selected), patch.object(driver, 'a4_input', side_effect=read):
+                with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                    driver.a4_delivery()
+        inputs['out/candidate-pin.json'] = json.dumps(candidate).encode()
+        inputs['out/a4-helper'] = b'synthetic reviewed image'
+        with patch.object(driver, 'TEST', self.selected), \
+             patch.object(driver, 'a4_input', side_effect=lambda name, bound: inputs[name]), \
+             patch.object(driver, 'a4_image', return_value=b'held bytes') as image:
+            self.assertEqual(driver.a4_delivery(), b'held bytes')
+            image.assert_called_once_with(b'synthetic reviewed image')
+
+    @staticmethod
+    def info(mode=stat.S_IFDIR | 0o755, uid=0, inode=1, size=3680, links=1):
+        return SimpleNamespace(st_mode=mode, st_uid=uid, st_dev=1, st_ino=inode,
+                               st_size=size, st_nlink=links)
+
+    def staging(self, **options):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(driver, 'os', SimpleNamespace(**vars(os))))
+        for flag in ('O_NOFOLLOW', 'O_CLOEXEC', 'O_DIRECTORY', 'O_NONBLOCK'):
+            stack.enter_context(patch.object(driver.os, flag, getattr(os, flag, 0x80000), create=True))
+        stack.enter_context(patch.object(driver, 'TEST', self.selected))
+        mocks = {'image': stack.enter_context(patch.object(driver, 'a4_image', side_effect=lambda data: data))}
+        defaults = dict(open=[10, 11, 12, 13, 14], fstat=self.info(),
+                        stat=self.info(), write=3680, read=b'x' * 3680,
+                        listdir=['a4-helper'])
+        for name in ('open', 'close', 'fstat', 'stat', 'mkdir', 'write', 'fchmod',
+                     'lseek', 'read', 'listdir', 'unlink', 'rmdir'):
+            value = options.get(name, defaults.get(name))
+            sequential = isinstance(value, BaseException) or (isinstance(value, list) and name != 'listdir')
+            kw = {'side_effect': value} if sequential else {'return_value': value}
+            mocks[name] = stack.enter_context(patch.object(driver.os, name, create=True, **kw))
+        return mocks
+
+    def test_stage_descriptor_bytes_and_owned_cleanup(self):
+        file = self.info(stat.S_IFREG | 0o755)
+        mocks = self.staging(fstat=[self.info()] * 4 + [file, file, self.info(), self.info()])
+        owned = {}
+        driver.install_a4_helper(b'x' * 3680, owned)
+        self.assertEqual(set(owned), {'parent', 'created', 'directory', 'fd', 'image'})
+        opened = mocks['open'].call_args_list
+        self.assertEqual([c.args[0] for c in opened], ['/', 'usr', 'libexec', 'arxcovo', 'a4-helper'])
+        self.assertTrue(all(c.args[1] & driver.os.O_NOFOLLOW for c in opened))
+        self.assertTrue(opened[-1].args[1] & os.O_EXCL)
+        mocks['read'].assert_called_once_with(14, 3681)
+        self.assertEqual(mocks['image'].call_count, 2)
+        mocks['fchmod'].assert_called_once_with(14, 0o755)
+        mocks['stat'].side_effect = [owned['directory'], owned['image']]
+        driver.remove_a4_helper(owned)
+        mocks['unlink'].assert_called_once_with('a4-helper', dir_fd=13)
+        mocks['rmdir'].assert_called_once_with('arxcovo', dir_fd=12)
+
+    def test_collision_never_adopted_or_deleted(self):
+        mocks = self.staging(mkdir=FileExistsError())
+        owned = {}
+        with self.assertRaises(FileExistsError):
+            driver.install_a4_helper(b'x' * 3680, owned)
+        driver.remove_a4_helper(owned)
+        self.assertNotIn('directory', owned)
+        mocks['unlink'].assert_not_called()
+        mocks['rmdir'].assert_not_called()
+
+    def test_untrusted_ancestor_never_mutates(self):
+        for info in (self.info(uid=1000), self.info(stat.S_IFDIR | 0o777),
+                     self.info(stat.S_IFLNK | 0o755), self.info(stat.S_IFREG | 0o755)):
+            mocks = self.staging(fstat=info)
+            with self.assertRaisesRegex(RuntimeError, 'E_PATH'):
+                driver.install_a4_helper(b'x' * 3680, {})
+            mocks['mkdir'].assert_not_called()
+
+    def test_replaced_or_extra_asset_quarantines(self):
+        for replacement, contents in [(self.info(inode=2), ['a4-helper']),
+                                      (self.info(), ['a4-helper', 'foreign'])]:
+            mocks = self.staging(stat=replacement, listdir=contents)
+            mocks['stat'].side_effect = lambda name, **kw: replacement if name == 'arxcovo' else self.info()
+            owned = dict(parent=12, fd=13, directory=self.info(), image=self.info())
+            with self.assertRaises(RuntimeError):
+                driver.remove_a4_helper(owned)
+            mocks['unlink'].assert_not_called()
+            mocks['rmdir'].assert_not_called()
+
+    def test_short_write_cannot_launch(self):
+        mocks = self.staging(write=3695)
+        with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+            driver.install_a4_helper(b'x' * 3680, {})
+        mocks['fchmod'].assert_not_called()
+        mocks['close'].assert_any_call(14)
+
+    def test_uncaptured_created_directory_quarantines(self):
+        mocks = self.staging()
+        for owned in ({'created': True}, {'created': True, 'directory': self.info()}):
+            with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_CGROUP'):
+                driver.remove_a4_helper(owned)
+        mocks['unlink'].assert_not_called()
+        mocks['rmdir'].assert_not_called()
+
+    def test_fixed_input_no_follow_bounded_regular_single_link(self):
+        for info in (self.info(stat.S_IFLNK), self.info(stat.S_IFIFO),
+                     self.info(stat.S_IFREG, size=3681), self.info(stat.S_IFREG, links=2)):
+            mocks = self.staging(open=[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], fstat=info)
+            with patch.object(driver.Path, 'cwd', return_value=PurePosixPath('/checkout')):
+                with self.assertRaisesRegex(RuntimeError, 'E_ARTIFACT'):
+                    driver.a4_input('out/a4-helper', 3680)
+            self.assertTrue(all(c.args[1] & driver.os.O_NOFOLLOW for c in mocks['open'].call_args_list))
+            mocks['read'].assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, 'E_PATH'):
+            driver.a4_input('../foreign', 3680)
+
+    def test_cleanup_after_stop_before_runtime_removal(self):
+        events = []
+        stage = Path('/var/lib/arx-ci-123-1')
+        with patch.object(driver, 'verify_runtime'), \
+             patch.object(driver.subprocess, 'run', side_effect=lambda *a, **kw: events.append('stop') or SimpleNamespace(returncode=0)), \
+             patch.object(driver, 'snapshot_internal'), \
+             patch.object(driver.os.path, 'lexists', return_value=False), \
+             patch.object(driver, 'remove_a4_helper', side_effect=lambda x: events.append('helper')), \
+             patch.object(driver, 'remove_runtime', side_effect=lambda x: events.append('runtime')):
+            driver.cleanup_a1a2('123-1', 'arxd.service', stage, False, None, True, [], {})
+        self.assertEqual(events, ['stop', 'helper', 'runtime'])
 
 
 if __name__ == '__main__':
