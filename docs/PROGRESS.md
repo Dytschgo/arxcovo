@@ -2,12 +2,14 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #141, `8e802070fb6b6f7de663adf6fdf8420d3a8eea6a` at18:12:33Z; independent Opus exact-head PASS6898850222/status58971457086 and all five required gates green. Reviewed f90027e/squash full trees equal. Bounded A9/U9 evidence only; populated stop/crash/production Drain remain open.
-- Current work: publish independently reviewed first M3 pure enrollment core through exact-head review and hosted gates. Opus source review ac14a63 PASS all axes; reviewer reran13 tests/fmt/Clippy and independently verified hash vectors. No signing, transport, consensus, real expiry or host activation. M2 remains incomplete: A9/U9/A10/A12/full F/G/PA6 native gaps open, A7 hosted FINAL NO-GO and A12 consumed/no retry unchanged.
+- Last merged: PR #142, `4f323c36e2d134b56c1f6efb3035b6cc18143c84` at18:32:43Z; independent Opus exact-head PASS6899129519/status58972231000 and all five required gates green. Reviewed9deec76/squash trees equal; first M3 pure enrollment core only, not cluster acceptance.
+- Current work: Opus settles the next bounded M3 implementation boundary under ADR0005 after the merged pure enrollment core. Priority is durable replicated-state/storage integration prerequisites and explicit commit/signing trust, not a production enrollment endpoint. M2 remains incomplete with hardware gaps open; A7 hosted FINAL NO-GO and consumed A12 no-retry/cleanup uncertainty unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Coordinator verifies PR142 exact head/all five gates, unwatches and merges4f323c3; reviewed/squash full trees equal. Next Opus architecture task selects one bounded implementable M3 durable-state/commit boundary under ADR0005. No new owner/native/production authority; M3 acceptance and M2 hardware gaps remain open.
 
 - 2026-11-15: Opus highac14a63 independently reviews Sol M3 pure enrollment implementation, Standards/Spec/Security PASS with no blockers. Reran13 focused nextest/fmt/Clippy, independent hash vectors and scratch counterfactuals; future-adapter replay/key policies and low test-gap advisories remain explicit and do not grant acceptance. Coordinator publishes one-concern pure-core PR; no runtime endpoint/signing/Raft storage integration.
 
