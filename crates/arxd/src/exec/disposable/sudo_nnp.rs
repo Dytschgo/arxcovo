@@ -9,7 +9,625 @@ struct Prepared {
     reentry: PathBuf,
 }
 fn prepared_delivery() -> Option<Prepared> {
-    None
+    // No host/image policy bytes have been independently attested. This literal
+    // must remain closed until a separate qualification and execution grant.
+    let expected_profile: Option<&str> = None;
+    read_fixed_delivery(expected_profile?).map(|(prepared, _held)| prepared)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Delivery {
+    run: String,
+    source_sha: String,
+    host_profile_sha256: String,
+    accounts: [DeliveryAccount; 2],
+    artifacts: [DeliveryArtifact; 2],
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryAccount {
+    uid: u32,
+    gid: u32,
+    base_dev: u64,
+    base_ino: u64,
+    workspace_dev: u64,
+    workspace_ino: u64,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryArtifact {
+    size: u64,
+    sha256: String,
+    dev: u64,
+    ino: u64,
+}
+#[derive(Clone, Copy, Debug)]
+struct DeliveryIdentity {
+    size: u64,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    nlink: u64,
+}
+fn artifact_identity(a: &DeliveryArtifact, m: DeliveryIdentity) -> bool {
+    m.size == a.size
+        && m.dev == a.dev
+        && m.ino == a.ino
+        && m.mode == 0o100755
+        && m.uid == 0
+        && m.nlink == 1
+}
+fn account_record(a: &DeliveryAccount, uid: u32, gid: u32, shell: &[u8]) -> bool {
+    uid == a.uid && gid == a.gid && shell == b"/usr/sbin/nologin"
+}
+fn hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn delivery_names(run: &str) -> Option<[String; 2]> {
+    let (id, attempt) = run.split_once('-')?;
+    let decimal = |s: &str, max| {
+        !s.is_empty()
+            && s.len() <= max
+            && !s.starts_with('0')
+            && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !decimal(id, 20) || !decimal(attempt, 6) {
+        return None;
+    }
+    let names = [
+        format!("arxsn{id}x{attempt}r"),
+        format!("arxsn{id}x{attempt}n"),
+    ];
+    names.iter().all(|s| s.len() <= 32).then_some(names)
+}
+fn delivery_schema(
+    bytes: &[u8],
+    run: &str,
+    source: &str,
+    workflow: &str,
+    reviewed: &str,
+    profile: &str,
+) -> Option<Delivery> {
+    if bytes.len() > 4096
+        || !hex(source, 40)
+        || source != workflow
+        || source != reviewed
+        || !hex(profile, 64)
+    {
+        return None;
+    }
+    // Struct deserialization rejects duplicates as well as missing/unknown fields;
+    // from_slice requires EOF after the single record (apart from whitespace).
+    let d: Delivery = serde_json::from_slice(bytes).ok()?;
+    delivery_names(run)?;
+    if d.run != run
+        || d.source_sha != source
+        || d.host_profile_sha256 != profile
+        || d.accounts.iter().any(|a| a.uid < 1000 || a.gid < 1000)
+        || d.accounts[0].uid == d.accounts[1].uid
+        || d.accounts[0].gid == d.accounts[1].gid
+        || d.artifacts
+            .iter()
+            .any(|a| a.size < 4 || a.size > 128 * 1024 * 1024 || !hex(&a.sha256, 64))
+    {
+        return None;
+    }
+    Some(d)
+}
+fn delivery_stage(exe: &Path, run: &str) -> Option<PathBuf> {
+    delivery_names(run)?;
+    let stage = PathBuf::from(format!("/var/lib/arx-ci-{run}"));
+    let name = exe.file_name()?.to_str()?.strip_prefix("arxd-")?;
+    (!name.is_empty()
+        && hex(name, name.len())
+        && exe.parent()? == stage.join("source/target/debug/deps"))
+    .then_some(stage)
+}
+
+// Every component is opened root-down, relative to the held parent; never
+// canonicalize away a link. Only root-writable ancestry makes path-based exec
+// after the immediate recheck safe: build accounts have no ancestor write bit.
+fn delivery_open(path: &Path, directory: bool) -> Option<std::fs::File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    };
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let root = unsafe { libc::open(c"/".as_ptr(), flags | libc::O_DIRECTORY) };
+    if root < 0 {
+        return None;
+    }
+    let mut held = unsafe { std::fs::File::from_raw_fd(root) };
+    let parts: Vec<_> = path.components().collect();
+    if parts.first() != Some(&std::path::Component::RootDir) {
+        return None;
+    }
+    for (index, part) in parts.iter().enumerate().skip(1) {
+        let parent = held.metadata().ok()?;
+        if !parent.is_dir() || parent.uid() != 0 || parent.mode() & 0o022 != 0 {
+            return None;
+        }
+        let std::path::Component::Normal(name) = part else {
+            return None;
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let dir = directory || index + 1 < parts.len();
+        let fd = unsafe {
+            libc::openat(
+                held.as_raw_fd(),
+                name.as_ptr(),
+                flags | if dir { libc::O_DIRECTORY } else { 0 },
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        held = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let info = held.metadata().ok()?;
+    if directory && (!info.is_dir() || info.uid() != 0 || info.mode() & 0o022 != 0) {
+        return None;
+    }
+    Some(held)
+}
+fn file_identity(file: &std::fs::File) -> Option<DeliveryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?;
+    Some(DeliveryIdentity {
+        size: m.len(),
+        dev: m.dev(),
+        ino: m.ino(),
+        mode: m.mode(),
+        uid: m.uid(),
+        nlink: m.nlink(),
+    })
+}
+fn delivery_account(name: &str, a: &DeliveryAccount) -> Option<()> {
+    use std::mem::MaybeUninit;
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buffer = vec![0u8; 65536];
+    let mut pw = MaybeUninit::<libc::passwd>::uninit();
+    let mut found = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            pw.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    let pw = unsafe { pw.assume_init() };
+    // NSS strings must lie within the fixed lookup buffer; never unbounded CStr.
+    let offset = (pw.pw_shell as usize).checked_sub(buffer.as_ptr() as usize)?;
+    let shell = buffer.get(offset..)?;
+    let end = shell.iter().position(|b| *b == 0)?;
+    if !account_record(a, pw.pw_uid, pw.pw_gid, &shell[..end]) {
+        return None;
+    }
+    let mut groups = [0; 64];
+    let mut count = 64;
+    let rc = unsafe { libc::getgrouplist(name.as_ptr(), a.gid, groups.as_mut_ptr(), &mut count) };
+    if rc < 0 || count != 1 || groups[0] != a.gid {
+        return None;
+    }
+    let mut gr = MaybeUninit::<libc::group>::uninit();
+    let mut found = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            gr.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    let gr = unsafe { gr.assume_init() };
+    if gr.gr_gid != a.gid {
+        return None;
+    }
+    let offset = (gr.gr_mem as usize).checked_sub(buffer.as_ptr() as usize)?;
+    buffer.get(offset..offset.checked_add(std::mem::size_of::<*mut libc::c_char>())?)?;
+    if !unsafe { gr.gr_mem.read_unaligned() }.is_null() {
+        return None;
+    }
+    Some(())
+}
+fn delivery_workspace(
+    path: &Path,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+) -> Option<std::fs::File> {
+    // The account owns the last two components, so open them below the protected
+    // /var/lib descriptor, then compare both pinned identities without traversal.
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::MetadataExt,
+    };
+    let parent = delivery_open(Path::new("/var/lib"), true)?;
+    let relative = path.strip_prefix("/var/lib").ok()?;
+    let mut held = parent;
+    for part in relative.components() {
+        let std::path::Component::Normal(name) = part else {
+            return None;
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let fd = unsafe {
+            libc::openat(
+                held.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        held = unsafe { std::fs::File::from_raw_fd(fd) };
+        let m = held.metadata().ok()?;
+        if m.uid() != uid || m.gid() != gid || m.mode() & 0o7777 != 0o700 {
+            return None;
+        }
+    }
+    let m = held.metadata().ok()?;
+    (m.dev() == dev && m.ino() == ino).then_some(held)
+}
+fn read_fixed_delivery(profile: &str) -> Option<(Prepared, Vec<std::fs::File>)> {
+    use sha2::{Digest, Sha256};
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let env = |name| std::env::var(name).ok();
+    for (key, value) in [
+        ("CI", "true"),
+        ("GITHUB_ACTIONS", "true"),
+        ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ("RUNNER_OS", "Linux"),
+        ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+        ("GITHUB_REPOSITORY", "Dytschgo/arxcovo"),
+        ("GITHUB_ACTOR", "Dytschgo"),
+        ("GITHUB_TRIGGERING_ACTOR", "Dytschgo"),
+        ("GITHUB_REF", "refs/heads/main"),
+    ] {
+        if env(key)?.as_str() != value {
+            return None;
+        }
+    }
+    let run = format!("{}-{}", env("GITHUB_RUN_ID")?, env("GITHUB_RUN_ATTEMPT")?);
+    let stage = delivery_stage(&std::env::current_exe().ok()?, &run)?;
+    if delivery_open(&stage, true)?.metadata().ok()?.mode() & 0o7777 != 0o700 {
+        return None;
+    }
+    let source = env("GITHUB_SHA")?;
+    let mut file = delivery_open(&stage.join("a7-a11-delivery.json"), false)?;
+    let m = file.metadata().ok()?;
+    if !m.is_file()
+        || m.uid() != 0
+        || m.nlink() != 1
+        || m.mode() & 0o7777 != 0o600
+        || m.len() > 4096
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(4097).read_to_end(&mut bytes).ok()?;
+    let d = delivery_schema(
+        &bytes,
+        &run,
+        &source,
+        &env("ARX_WORKFLOW_SHA")?,
+        &env("ARX_REVIEWED_SHA")?,
+        profile,
+    )?;
+    let names = delivery_names(&run)?;
+    let mut held = vec![file];
+    let mut accounts = Vec::new();
+    for (a, name) in d.accounts.iter().zip(names) {
+        delivery_account(&name, a)?;
+        let base = PathBuf::from(format!("/var/lib/{name}"));
+        let workspace = base.join("workspace");
+        held.push(delivery_workspace(
+            &base, a.base_dev, a.base_ino, a.uid, a.gid,
+        )?);
+        held.push(delivery_workspace(
+            &workspace,
+            a.workspace_dev,
+            a.workspace_ino,
+            a.uid,
+            a.gid,
+        )?);
+        accounts.push(OwnerConfig {
+            account: name,
+            uid: a.uid,
+            gid: a.gid,
+            workspace,
+            protected_directories: vec![stage.clone()],
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            admin: false,
+            cgroup_parent: Some("/sys/fs/cgroup/system.slice/arxd.service/runs".into()),
+            memory_bytes: 64 * 1024 * 1024,
+            pids: 32,
+        });
+    }
+    let directory = PathBuf::from(format!("/usr/libexec/arxcovo-a7-a11-{run}"));
+    let dir = delivery_open(&directory, true)?;
+    if dir.metadata().ok()?.mode() & 0o7777 != 0o755 {
+        return None;
+    }
+    held.push(dir);
+    for (a, name) in d.artifacts.iter().zip(["arxd", "reentry"]) {
+        let mut file = delivery_open(&directory.join(name), false)?;
+        if !artifact_identity(a, file_identity(&file)?) {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        let mut count = 0u64;
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buffer).ok()?;
+            if n == 0 {
+                break;
+            }
+            if count == 0 && !buffer[..n].starts_with(b"\x7fELF") {
+                return None;
+            }
+            count += n as u64;
+            if count > a.size {
+                return None;
+            }
+            hash.update(&buffer[..n]);
+        }
+        if count != a.size || format!("{:x}", hash.finalize()) != a.sha256 {
+            return None;
+        }
+        held.push(file);
+    }
+    // The controller is the original libtest from the SINGLE test build. Bind
+    // reentry to those same harness bytes independently of the bin build.
+    let mut harness = delivery_open(&std::env::current_exe().ok()?, false)?;
+    let m = harness.metadata().ok()?;
+    if !m.is_file()
+        || m.uid() != 0
+        || m.nlink() != 1
+        || m.mode() & 0o022 != 0
+        || m.len() != d.artifacts[1].size
+    {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = harness.read(&mut buffer).ok()?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        if count > d.artifacts[1].size {
+            return None;
+        }
+        hash.update(&buffer[..n]);
+    }
+    if count != d.artifacts[1].size || format!("{:x}", hash.finalize()) != d.artifacts[1].sha256 {
+        return None;
+    }
+    held.push(harness);
+    // Hashing is bounded but takes time. Reopen both names with NOFOLLOW and
+    // CLOEXEC and fstat every pinned scalar immediately before admission returns.
+    for (a, name) in d.artifacts.iter().zip(["arxd", "reentry"]) {
+        let file = delivery_open(&directory.join(name), false)?;
+        if !artifact_identity(a, file_identity(&file)?) {
+            return None;
+        }
+        held.push(file);
+    }
+    for (a, config) in d.accounts.iter().zip(&accounts) {
+        held.push(delivery_workspace(
+            config.workspace.parent()?,
+            a.base_dev,
+            a.base_ino,
+            a.uid,
+            a.gid,
+        )?);
+        held.push(delivery_workspace(
+            &config.workspace,
+            a.workspace_dev,
+            a.workspace_ino,
+            a.uid,
+            a.gid,
+        )?);
+    }
+    Some((
+        Prepared {
+            accounts: accounts.try_into().ok()?,
+            arxd: directory.join("arxd"),
+            reentry: directory.join("reentry"),
+        },
+        held,
+    ))
+}
+
+fn recheck_delivery(config: &OwnerConfig, executable: &Path) -> Option<Vec<std::fs::File>> {
+    let expected_profile: Option<&str> = None;
+    let (prepared, held) = read_fixed_delivery(expected_profile?)?;
+    let pinned = prepared
+        .accounts
+        .iter()
+        .find(|a| a.account == config.account)?;
+    (pinned.uid == config.uid
+        && pinned.gid == config.gid
+        && pinned.workspace == config.workspace
+        && pinned.protected_directories == config.protected_directories
+        && pinned.environment == config.environment
+        && pinned.admin == config.admin
+        && pinned.cgroup_parent == config.cgroup_parent
+        && pinned.memory_bytes == config.memory_bytes
+        && pinned.pids == config.pids
+        && (executable == prepared.arxd || executable == prepared.reentry))
+        .then_some(held)
+}
+
+#[test]
+fn a7_a11_delivery_schema_rejections() {
+    let account_pin = DeliveryAccount {
+        uid: 2000,
+        gid: 2001,
+        base_dev: 1,
+        base_ino: 2,
+        workspace_dev: 1,
+        workspace_ino: 3,
+    };
+    assert!(account_record(
+        &account_pin,
+        2000,
+        2001,
+        b"/usr/sbin/nologin"
+    ));
+    assert!(!account_record(
+        &account_pin,
+        2002,
+        2001,
+        b"/usr/sbin/nologin"
+    ));
+    assert!(!account_record(
+        &account_pin,
+        2000,
+        2002,
+        b"/usr/sbin/nologin"
+    ));
+    assert!(!account_record(&account_pin, 2000, 2001, b"/bin/sh"));
+    let pin = DeliveryArtifact {
+        size: 4,
+        sha256: "c".repeat(64),
+        dev: 1,
+        ino: 2,
+    };
+    let identity = DeliveryIdentity {
+        size: 4,
+        dev: 1,
+        ino: 2,
+        mode: 0o100755,
+        uid: 0,
+        nlink: 1,
+    };
+    assert!(artifact_identity(&pin, identity));
+    for bad in [
+        DeliveryIdentity {
+            size: 5,
+            ..identity
+        },
+        DeliveryIdentity { dev: 2, ..identity },
+        DeliveryIdentity { ino: 3, ..identity },
+        DeliveryIdentity {
+            mode: 0o120755,
+            ..identity
+        },
+        DeliveryIdentity {
+            mode: 0o100775,
+            ..identity
+        },
+        DeliveryIdentity {
+            uid: 1000,
+            ..identity
+        },
+        DeliveryIdentity {
+            nlink: 2,
+            ..identity
+        },
+    ] {
+        assert!(!artifact_identity(&pin, bad));
+    }
+    let source = "a".repeat(40);
+    let profile = "b".repeat(64);
+    let account = |uid| serde_json::json!({"uid":uid,"gid":uid,"base_dev":1,"base_ino":2,"workspace_dev":1,"workspace_ino":3});
+    let artifact = serde_json::json!({"size":4,"sha256":"c".repeat(64),"dev":1,"ino":4});
+    let good = serde_json::json!({"run":"123-1","source_sha":source,"host_profile_sha256":profile,"accounts":[account(2000),account(2001)],"artifacts":[artifact,artifact]});
+    let check = |bytes: &[u8]| {
+        delivery_schema(bytes, "123-1", &source, &source, &source, &profile).is_some()
+    };
+    let bytes = serde_json::to_vec(&good).unwrap();
+    assert!(check(&bytes));
+    assert!(!check(&[bytes.as_slice(), b"{}"].concat()));
+    assert!(!check(&vec![b' '; 4097]));
+    for field in [
+        "run",
+        "source_sha",
+        "host_profile_sha256",
+        "accounts",
+        "artifacts",
+    ] {
+        let mut bad = good.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert!(
+            !check(&serde_json::to_vec(&bad).unwrap()),
+            "missing {field}"
+        );
+    }
+    for (pointer, value) in [
+        ("/run", serde_json::json!("124-1")),
+        ("/source_sha", serde_json::json!("d".repeat(40))),
+        ("/host_profile_sha256", serde_json::json!("d".repeat(64))),
+        ("/accounts/1/uid", serde_json::json!(2000)),
+        ("/accounts/1/gid", serde_json::json!(2000)),
+        ("/accounts/0/uid", serde_json::json!(999)),
+        ("/accounts/0/gid", serde_json::json!(true)),
+        ("/accounts/0/uid", serde_json::json!(4294967296u64)),
+        ("/artifacts/0/size", serde_json::json!(134217729)),
+        ("/artifacts/0/sha256", serde_json::json!("invalid")),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !check(&serde_json::to_vec(&bad).unwrap()),
+            "assertion {pointer}"
+        );
+    }
+    for pointer in ["", "/accounts/0", "/artifacts/0"] {
+        let mut bad = good.clone();
+        bad.pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("path".into(), serde_json::json!("/tmp"));
+        assert!(!check(&serde_json::to_vec(&bad).unwrap()));
+    }
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    for (key, value) in [("run", "\"123-1\""), ("uid", "2000"), ("size", "4")] {
+        let duplicate = text.replacen(
+            &format!("\"{key}\":"),
+            &format!("\"{key}\":{value},\"{key}\":"),
+            1,
+        );
+        assert!(!check(duplicate.as_bytes()), "duplicate {key}");
+    }
+    assert!(
+        delivery_schema(&bytes, "123-1", &source, &"d".repeat(40), &source, &profile).is_none()
+    );
+    assert!(
+        delivery_schema(&bytes, "123-1", &source, &source, &"d".repeat(40), &profile).is_none()
+    );
+    let exe = Path::new("/var/lib/arx-ci-123-1/source/target/debug/deps/arxd-abc");
+    assert!(delivery_stage(exe, "123-1").is_some());
+    for path in [
+        "/tmp/arxd-abc",
+        "/var/lib/arx-ci-123-1/source/target/debug/deps/arxd-xyz",
+        "/var/lib/arx-ci-123-1/source/target/debug/deps/../arxd-abc",
+    ] {
+        assert!(delivery_stage(Path::new(path), "123-1").is_none());
+    }
+    assert!(delivery_stage(exe, "124-1").is_none());
 }
 
 #[derive(Clone, Copy)]
@@ -169,10 +787,11 @@ fn disposable_linux_a7_a11() {
         let mut spec = RunSpec {
             executable: prepared.arxd.clone(),
             arguments: vec!["tool-probe".into()],
-            cwd: PathBuf::new(),
+            cwd: config.workspace.clone(),
             timeout: Duration::from_secs(20),
             output_bytes: 4096,
         };
+        let _probe_admission = recheck_delivery(&config, &spec.executable).unwrap();
         let probe = runner
             .run_phased(&spec, &Cancellation::default(), &Cancellation::default())
             .unwrap();
@@ -187,6 +806,7 @@ fn disposable_linux_a7_a11() {
             "--test-threads=1".into(),
             "--color=never".into(),
         ];
+        let _reentry_admission = recheck_delivery(&config, &spec.executable).unwrap();
         let reentry = runner
             .run_phased(&spec, &Cancellation::default(), &Cancellation::default())
             .unwrap();

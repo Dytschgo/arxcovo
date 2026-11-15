@@ -320,6 +320,230 @@ def cleanup_sudo_nnp(owned, unit_gone=False):
             require(not os.path.lexists(item['base']), 'E_FIXTURE_RESIDUE')
 
 
+def sudo_nnp_artifact(output, stage, libtest):
+    require(len(output) <= 4 * 1024 * 1024, 'E_BUILD_LOG')
+    artifacts = []
+    for line in output.splitlines():
+        j = json.loads(line, object_pairs_hook=unique_pairs)
+        if j.get('reason') != 'compiler-artifact' or not j.get('executable'):
+            continue
+        require(j.get('target', {}).get('name') == 'arxd' and
+                j.get('profile', {}).get('test') is libtest and
+                j.get('target', {}).get('kind') == (['lib'] if libtest else ['bin']), 'E_ARTIFACT')
+        artifacts.append(Path(j['executable']))
+    require(len(artifacts) == 1, 'E_ARTIFACT')
+    artifact = artifacts[0]
+    target = stage / 'source/target/debug'
+    require((libtest and artifact.parent == target / 'deps' and
+             re.fullmatch('arxd-[0-9a-f]+', artifact.name)) or
+            (not libtest and artifact == target / 'arxd'), 'E_ARTIFACT_PATH')
+    return artifact
+
+
+def build_sudo_nnp(env):
+    """Dormant: one libtest (also harness), one production build; shared budget.
+
+    The existing root-private offline copy/prebuild must already be complete.
+    No account preparation, selector or run_body edge is added here.
+    """
+    run = gate(env, sys.platform)
+    sudo_nnp_names(run)
+    stage, _ = plan(run)
+    stage_fd = sudo_nnp_open(stage, True)
+    os.close(stage_fd)
+    deadline = time.monotonic() + 360
+    exceeded = threading.Event()
+    artifacts = []
+    with (stage / 'a7-a11-build-output').open('xb') as out:
+        for libtest in (True, False):
+            start = out.tell()
+            args = [str(stage / 'rust/bin/cargo'), 'test' if libtest else 'build',
+                    '-p', 'arxd', '--locked']
+            args += ['--lib', '--no-run'] if libtest else ['--bin', 'arxd']
+            args += ['--message-format=json']
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, 'E_BUILD')
+            with subprocess.Popen(args, cwd=stage / 'source', env=cargo_env(stage),
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+                def capture():
+                    try:
+                        drain_output(child.stdout, out, exceeded, 4 * 1024 * 1024 - start)
+                    except Exception:
+                        exceeded.set()
+                drain = threading.Thread(target=capture, daemon=True)
+                drain.start()
+                try:
+                    child.wait(timeout=remaining)
+                except BaseException:
+                    child.kill()
+                    child.wait(timeout=5)
+                    raise
+                finally:
+                    drain.join(timeout=5)
+                require(not drain.is_alive() and not exceeded.is_set(), 'E_BUILD_LOG')
+                require(child.returncode == 0, 'E_BUILD')
+                require(time.monotonic() <= deadline, 'E_BUILD')
+            out.flush()
+            with (stage / 'a7-a11-build-output').open('rb') as capture:
+                capture.seek(start)
+                data = capture.read(4 * 1024 * 1024 + 1)
+            artifacts.append(sudo_nnp_artifact(data, stage, libtest))
+    # Return harness first, production binary second. Never rebuild the harness.
+    return tuple(artifacts)
+
+
+def sudo_nnp_open(path, directory=False):
+    """Fixed derived callers only. Check ALL ancestors including /usr/libexec."""
+    require(path.is_absolute() and '..' not in path.parts, 'E_PATH')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    fd = os.open('/', flags | os.O_DIRECTORY)
+    try:
+        for index, part in enumerate(path.parts[1:]):
+            a4_directory(fd)
+            child = os.open(part, flags | (os.O_DIRECTORY if directory or
+                            index < len(path.parts) - 2 else 0), dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if directory:
+            a4_directory(fd)
+        result, fd = fd, None
+        return result
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def sudo_nnp_digest(fd):
+    info = os.fstat(fd)
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+            info.st_nlink == 1 and 4 <= info.st_size <= 128 * 1024 * 1024,
+            'E_ARTIFACT')
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest, count = hashlib.sha256(), 0
+    while True:
+        data = os.read(fd, 65536)
+        if not data:
+            break
+        require(count != 0 or data.startswith(b'\x7fELF'), 'E_ARTIFACT')
+        count += len(data)
+        require(count <= info.st_size, 'E_ARTIFACT')
+        digest.update(data)
+    require(count == info.st_size, 'E_ARTIFACT')
+    return dict(size=count, sha256=digest.hexdigest(), dev=info.st_dev, ino=info.st_ino)
+
+
+def stage_sudo_nnp(env, owned):
+    """Held-fd read -> O_EXCL copy -> destination rehash, never copy sudo.
+
+    Fixed cargo outputs only. Libtest bytes ARE the harness bytes from the single
+    test invocation, not an executable inferred from the subsequent bin build.
+    Partial captures stay in owned for stop-gated cleanup; no adoption.
+    """
+    run = gate(env, sys.platform)
+    sudo_nnp_names(run)
+    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(not owned, 'E_FIXTURE_COLLISION')
+    stage, _ = plan(run)
+    # Build capture defines exactly one output from each invocation.
+    # The caller records the single libtest path as the existing harness artifact.
+    harness, production = build_sudo_nnp(env)
+    exclusive_file(stage / 'artifact', str(harness).encode('ascii'))
+    require(harness.parent == stage / 'source/target/debug/deps' and
+            re.fullmatch('arxd-[0-9a-f]+', harness.name), 'E_ARTIFACT_PATH')
+    require(production == stage / 'source/target/debug/arxd', 'E_ARTIFACT_PATH')
+    sources = (production, harness)
+    parent = sudo_nnp_open(Path('/usr/libexec'), True)
+    owned['parent'] = parent
+    name = 'arxcovo-a7-a11-' + run
+    owned['name'] = name
+    os.mkdir(name, mode=0o755, dir_fd=parent)
+    owned['created'] = True
+    owned['directory'] = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    directory = sudo_nnp_open(Path('/usr/libexec') / name, True)
+    owned['fd'] = directory
+    info = os.fstat(directory)
+    require((info.st_dev, info.st_ino) ==
+            (owned['directory'].st_dev, owned['directory'].st_ino), 'E_FIXTURE_INODE')
+    os.fchmod(directory, 0o755)
+    owned['directory'] = os.fstat(directory)
+    owned['images'] = []
+    artifacts = []
+    for source, target in zip(sources, ('arxd', 'reentry')):
+        src = sudo_nnp_open(source)
+        try:
+            pin = sudo_nnp_digest(src)
+            dst = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                          os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+            owned['images'].append((target, os.fstat(dst)))
+            try:
+                os.lseek(src, 0, os.SEEK_SET)
+                remaining = pin['size']
+                while remaining:
+                    data = os.read(src, min(65536, remaining))
+                    require(data and os.write(dst, data) == len(data), 'E_ARTIFACT')
+                    remaining -= len(data)
+                os.fchmod(dst, 0o755)
+                owned['images'][-1] = (target, os.fstat(dst))
+                copied = sudo_nnp_digest(dst)
+                require((copied['size'], copied['sha256']) == (pin['size'], pin['sha256']) and
+                        sudo_nnp_digest(src) == pin, 'E_ARTIFACT')
+                artifacts.append(copied)
+            finally:
+                os.close(dst)
+        finally:
+            os.close(src)
+    return artifacts
+
+
+def handoff_sudo_nnp(env, accounts, artifacts):
+    run = gate(env, sys.platform)
+    names = sudo_nnp_names(run)
+    expected_profile = None  # independently attested exact host/image; absent
+    require(expected_profile is not None and
+            sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(len(accounts) == len(artifacts) == 2, 'E_ARTIFACT')
+    captured = []
+    for item, name in zip(accounts, names):
+        base = Path('/var/lib') / name
+        require(item['name'] == name and item['base'] == base and item['created'], 'E_FIXTURE_UID')
+        same_object(base, item['base_info'])
+        same_object(base / 'workspace', item['workspace_info'])
+        uid, gid = item['identity']
+        require(uid >= 1000 and gid >= 1000, 'E_FIXTURE_UID')
+        captured.append(dict(uid=uid, gid=gid, base_dev=item['base_info'].st_dev,
+            base_ino=item['base_info'].st_ino, workspace_dev=item['workspace_info'].st_dev,
+            workspace_ino=item['workspace_info'].st_ino))
+    require(captured[0]['uid'] != captured[1]['uid'] and captured[0]['gid'] != captured[1]['gid'], 'E_FIXTURE_UID')
+    data = canonical(dict(run=run, source_sha=env['GITHUB_SHA'],
+        host_profile_sha256=expected_profile, accounts=captured, artifacts=artifacts))
+    require(len(data) <= 4096, 'E_ARTIFACT')
+    stage, _ = plan(run)
+    exclusive_file(stage / 'a7-a11-delivery.json', data)
+
+
+def cleanup_sudo_nnp_delivery(owned, unit_gone=False):
+    require(unit_gone is True, 'E_QUARANTINE_CGROUP')
+    if not owned.get('created'):
+        return  # collision owns nothing
+    require('directory' in owned and 'fd' in owned, 'E_QUARANTINE_PATH_UNCAPTURED')
+    parent, directory = owned['parent'], owned['fd']
+    a4_directory(parent)
+    a4_directory(directory)
+    def same(name, fd, expected):
+        now = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        require((now.st_dev, now.st_ino, now.st_mode, now.st_uid, now.st_nlink) ==
+                (expected.st_dev, expected.st_ino, expected.st_mode, expected.st_uid, expected.st_nlink), 'E_FIXTURE_INODE')
+    same(owned['name'], parent, owned['directory'])
+    images = owned.get('images', [])
+    require(set(os.listdir(directory)) == {name for name, _ in images}, 'E_QUARANTINE_PATH_UNCAPTURED')
+    for name, info in images:
+        same(name, directory, info)
+    for name, info in images:
+        same(name, directory, info)
+        os.unlink(name, dir_fd=directory)
+    os.rmdir(owned['name'], dir_fd=parent)
+
+
 def identity(env):
     for key in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
         require(re.fullmatch(r'[1-9][0-9]{0,19}', env.get(key, '')), 'E_ID')
