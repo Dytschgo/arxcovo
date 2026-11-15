@@ -1,3 +1,144 @@
+# M3 OpenRaft retained implementation evidence
+
+Status: **local T1/T2 proof passed; fresh independent Opus review pending**.
+Sol high, 2026-11-15. Resume parent `d52a009d17d2aca6203fd450873b9cd9d9728326`;
+main `38750cf1e179e14da6fa871972027b6d66028ec9` (PR #144).
+This section supersedes the historical blocked status below, preserving its facts.
+
+## Retained scope
+
+- Commit 1 remains `5cd8c6bd2f5a5a41fba98ce05f9479f82f5daed6`: pins/types/mappings/codec.
+- Commit 2 `7b4bf62e25d902cb713a926bcfa8cc275cf06e0c`: adapters, eager callback,
+  bounded snapshot peek, exclusive startup preflight, official Suite and startup tests.
+- Commit 3 `e39535ff27af4d827cf51811a30c9d8c1b4f7fc6`: tracked proposal owners,
+  ReadIndex, shutdown, test-only in-memory RPC, T1/T2/U6; routine Clippy corrections.
+- Commit 4 is this evidence and the explicit immediate T3 follow-up below.
+
+The source delta from the resume parent is 1752 added lines in six allowed paths.
+`consensus.rs` is 406 lines; `adapter.rs` is 309. Params validation/default impls
+live beside the adapters to keep both files within their prescribed bounds.
+No log_store, enrollment core codec/order, dependency pins/lock, PROGRESS, ADR,
+workflow, gate or other production path changed. No external agent, publication,
+admin/native/VM/Lab Manager, listener, transport, CA or signing action ran.
+
+## Current retained checks actually run
+
+All build commands used CARGO_TARGET_DIR `D:/Temp/arxcovo-openraft-target` and
+TEMP/TMP `D:/Temp/arxcovo-openraft-target/tmp`. These are Windows local results.
+No previous partial-draft run receives current test credit.
+
+- Commit-2 focused `cargo test -p arxd --locked --lib cluster::consensus::tests
+  -- --nocapture`: 59 passed, 1.83 s runtime (before service restoration).
+- Final `cargo nextest run -p arxd --locked cluster::`: **98 passed**, 456 skipped,
+  8.788 s execution, 11.36 s build. This includes the unchanged old 36 cluster
+  tests and both four-process-kill probes (eight owned process kills total).
+- Final T1 1.236 s, T2 7.943 s, U6 1.662 s; each has a 45 s outer deadline.
+- `cargo fmt --check`: passed. `cargo clippy -p arxd --all-targets --locked --
+  -D warnings`: passed, 3.81 s including lock waits. `git diff --check`: passed.
+- A separate current three-node run with `--nocapture` passed all three tests,
+  7.60 s, recording RPC counters: sender mismatches 0 for every fixture;
+  observed append maxima 3/7/64/5 (all <=64); snapshot maxima 0, full snapshots 0.
+  U6 reported all 64 owners resolved after restored quorum.
+
+Current local logs are in that target directory: `current-commit2.txt`,
+`current-cluster-final.txt`, `current-clippy.txt`, `current-three-node-counters.txt`,
+`current-openraft-features.txt`, `current-chrono-features.txt`.
+Hosted three-OS checks and total CI wall time have not run for this head.
+No full-workspace owner-security AccessDenied run was repeated.
+
+## What these tests establish
+
+Preflight runs inside the one blocking store-open closure, with exclusive owned
+stores before any Arc, adapter or Raft exists. It reads A/P/L, checks the SQLite
+index cap and checked successor, and reads at most one validated retained row.
+Twelve refusal fixtures cover both term directions, leader mismatch, purged-ID
+mismatch, interior mismatches, missing applied row, unordered lower-index tails,
+behind-purged state and absent applied state with a purge. Direct preflight and
+own start refuse with Corrupt/StartError::Preflight; reopened vote, log state,
+every retained row and exact SM snapshot bytes remain equal. Extra snapshot
+fixtures reject indices i64::MAX+1 and u64::MAX without lookup overflow.
+Seven accepted fixtures cover empty/log-only stores, exact applied slot, retained
+slot under a newer tail, P=A, and ordered SM-ahead holes including an empty log.
+The hole test verifies purged=last=5, append 4 refused and append 6 accepted.
+A bounded yield/reopen loop handles transient Windows file-lock release after
+Weak expiration; no failed preflight is retried or relaxed.
+
+Raw-helper characterization bypasses own preflight and grants no enforcement
+credit. On these exact fixtures, higher-term/leader equal-index, both interior
+mismatches and the two unordered hole tails return Ok. Lower-term/leader equal
+index, P=L=T2-N1.5 over SM T1-N1.5, the missing-prefix log 7..9, and behind-purged
+fixtures return Err. In particular, the first two additional Err results differ
+from the brief's exploratory raw-helper expectation; tests retain observed facts,
+not an invented Ok. Raw Raft::new behind-purged returns Fatal::StorageError.
+No equal-index raw Raft Fatal is claimed. Own refusal passes independently.
+
+All 47 official cases were actually rerun unchanged: S1's 27 return Ok; S2's
+19 plus transfer_snapshot return Err containing "out of order", each under
+its own spawned task with panics/unexpected Ok rejected. Exact named partition
+is the unchanged historical S1/S2 list below and the retained tests. No case
+was reclassified, no SM ordering was weakened, and this is not full conformance.
+
+C1's actual plain append first owns Completion before iteration. Actual unpolled
+valid/65/unencodable futures produce one callback Err and unchanged reopened
+logs. Awaited success is durable on reopen; store error, iterator panic, injected
+blocking append panic and subsequent poisoned access fail closed. A manually
+polled then dropped append completes durably after its caller future disappears.
+The IOFlushed::signal oneshot receives its sole value; Completion consumes the
+callback on finish and Drop only handles an unconsumed callback.
+
+C2 uses JoinSet owners and ProgressResponder::complete_only, retaining each permit
+through the final engine response independently of the caller. U6 establishes
+committed membership before isolation, observes 64 actual log entries beyond
+local_committed, aborts/joins callers, and requires zero permits and next Busy.
+Both isolated-leader shutdown and restored quorum restore 64 permits, no owners,
+Weak release and later Stopped. Shutdown closes admission, stops the core before
+joining owners and drops its own strong adapters under the shared five-second
+deadline. No shutdown reports Orphaned in these successful fixtures.
+
+T1 exercises committed Mint/Redeem, deterministic replay, follower offline with
+2/3 continuation, reuse, concurrent competing keys (one node 5, one Consumed),
+wrong proof and logical expiry. T2 exercises leader offline/election, continued
+writes, ReadIndex covering acknowledged positions, follower refusal, durable
+old-leader SM reopen, no-quorum write/read refusal, identical unknown retry and
+node IDs 5 then 6 proving at-most-once allocation. Restarts pass the mandatory
+preflight and converge to byte-identical state. Every fixture shuts down owned
+nodes and scans all directory files for raw/hex deterministic secrets, bearer
+proofs and owner-transfer codes. The code-ID and secret RNG patterns are distinct
+so a public field cannot masquerade as the secret marker.
+
+## Remaining delivery boundary
+
+**T3 is an immediate follow-up, not completed or credited.** Source already adds
+1752 lines before this evidence; a retained full_snapshot catch-up fixture would
+exceed the roughly 1800-line slice budget. Next: small snapshot params (8/0/1/16),
+stop a follower, commit 40 unknown redeems until leader purge passes it, restart,
+require an actual full_snapshot RPC to that follower, byte-identical convergence,
+then consecutive applies and bounded owned shutdown. Current zero-snapshot
+counters explicitly provide no T3 credit.
+
+Fresh Opus source/security review is required before publication; required hosted
+gates remain required. This proves only real OpenRaft over persistent local stores
+with in-memory RPC and graceful restarts. Logical time only; no physical-expiry,
+authentication, separate-process/host, TCP/mTLS/CA, crash-during-consensus,
+power-loss, membership-change or full M3 acceptance claim. All hardware paths are
+**unverified on real hardware**. M2 remains open, A7 FINAL NO-GO and A12's consumed,
+cleanup-unconfirmed no-retry boundary are unchanged.
+
+## Dependency verification repeated for retained pins
+
+Parsed Cargo.lock comparison to main: 208 existing packages, 243 current, 35 new,
+zero removed. Only arxd and chrono existing blocks differ; metadata (including
+versions/checksums/sources) is unchanged. Dependency additions are exactly
+arxd futures-util/openraft and chrono js-sys/wasm-bindgen; none removed.
+Cargo.toml/arxd Cargo.toml/Cargo.lock are byte-unchanged from resume parent.
+Actual locked feature trees show OpenRaft only tokio-rt; chrono default/wasmbind
+unification through display-more/OpenRaft macros remains as previously recorded.
+No serde/clap/bt/single-threaded/type-alias OpenRaft feature; no serde-free claim.
+
+---
+
+# Historical handbacks (preserved; statuses below are historical)
+
 # M3 OpenRaft resume: new bounded recovery handback
 
 Status: **BLOCKED on new actual recovery-contract conflict**, Sol high, 2026-11-15.
