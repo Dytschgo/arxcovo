@@ -49,10 +49,32 @@ pub enum Command {
         cluster: ClusterId,
         request: RequestId,
         code: CodeId,
-        proof: RedeemProof,
+        presented: CodeVerifier,
         key: KeyDigest,
         proposed_at_ms: u64,
     },
+}
+impl Command {
+    /// Reduce the bearer proof before proposing or forwarding. Future ingress must accept
+    /// proofs only, never client verifiers. Committed members have trusted cluster authority;
+    /// apply's verifier comparison is consistency checking, not member authentication.
+    pub fn redeem(
+        cluster: ClusterId,
+        request: RequestId,
+        code: CodeId,
+        proof: &RedeemProof,
+        key: KeyDigest,
+        proposed_at_ms: u64,
+    ) -> Self {
+        Self::Redeem {
+            cluster,
+            request,
+            code,
+            presented: CodeVerifier::of_proof(proof),
+            key,
+            proposed_at_ms,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -305,15 +327,14 @@ impl EnrollmentState {
             Command::Redeem {
                 request,
                 code,
-                proof,
+                presented,
                 key,
                 ..
             } => {
                 let Some(record) = self.records.get_mut(code) else {
                     return Outcome::Rejected(Reject::UnknownCode);
                 };
-                let actual = CodeVerifier::of_proof(proof);
-                if !bool::from(record.verifier.bytes().ct_eq(actual.bytes())) {
+                if !bool::from(record.verifier.bytes().ct_eq(presented.bytes())) {
                     return Outcome::Rejected(Reject::BadProof);
                 }
                 let (node, replay) = if let Some(consumed) = &record.consumed {
