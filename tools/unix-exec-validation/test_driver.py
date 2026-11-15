@@ -1676,3 +1676,92 @@ class ControlledPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'E_IDENTITY'):
                     driver.stage_controlled_sudo_nnp(run, {})
             opened.assert_not_called()
+
+
+class A7Integration(unittest.TestCase):
+    selected = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
+
+    def test_closed_before_host_and_package_adapter(self):
+        with patch.object(driver, 'TEST', self.selected), \
+             patch.object(driver, 'cg_preflight', side_effect=AssertionError('host')), \
+             patch.object(driver, 'reserve_unit', side_effect=AssertionError('reserve')):
+            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+                driver.run_body(valid_env())
+            # Even counterfactually opening only selection cannot qualify this host.
+            with patch.object(driver, 'standard_profile', return_value=True), patch.object(driver.sys, 'platform', 'linux'):
+                with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
+                    driver.run_body(valid_env())
+        self.assertFalse(driver.sudo_nnp_host_attested())
+
+    def test_both_case_markers_and_exact_summary(self):
+        stage = unittest.mock.MagicMock()
+        (stage / 'test-output').stat.return_value.st_size = 100
+        text = ('running 1 test\ntest ' + self.selected + ' ... '
+                'ARX_A7_A11_CASE0_OK\nARX_A7_A11_CASE1_OK\nARX_A7_A11_COMPLETE_OK\nok\n'
+                'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 500 filtered out; finished in 0.01s\n')
+        def check(value, status=0):
+            with patch.object(driver, 'TEST', self.selected), patch.object(driver, 'private_read', return_value=value):
+                driver.verify_test_result(stage, status)
+        check(text)
+        for marker in ('ARX_A7_A11_CASE0_OK', 'ARX_A7_A11_CASE1_OK', 'ARX_A7_A11_COMPLETE_OK'):
+            for bad in (text.replace(marker + '\n', ''), text + marker + '\n'):
+                with self.assertRaisesRegex(RuntimeError, 'E_TEST'): check(bad)
+        for bad in (text.replace('0 ignored', '1 ignored'), text.replace('1 passed', '0 passed'),
+                    text + 'test result: ok. 1 passed; 0 failed;\n'):
+            with self.assertRaisesRegex(RuntimeError, 'E_TEST'): check(bad)
+        with self.assertRaisesRegex(RuntimeError, 'E_TEST'): check(text, 1)
+
+    def test_active_identity_before_ack_and_terminal_deadline(self):
+        with patch.object(driver, 'TEST', self.selected):
+            monitor = A1A2().monitor
+            self.assertEqual(monitor(['active', 'inactive']), ['attribution', 'identity-ack', 'summary'])
+            for states, kwargs in [(['inactive'], {}), (['active','inactive'], dict(actual='43')),
+                    (['active','inactive'], dict(tasks=b'42\n43\n')),
+                    (['active','inactive'], dict(result='exit-code')),
+                    (['active','inactive'], dict(status='1')),
+                    (['active','inactive'], dict(ticks=[0,1,16,17,18,19])),
+                    (['active','inactive'], dict(ticks=[0,1,2,8,9,10])),
+                    (['active','inactive'], dict(ticks=[0,1,2,3,4,121]))]:
+                with self.assertRaises(RuntimeError): monitor(states, **kwargs)
+
+    def test_source_sequence_and_owned_cleanup_edges(self):
+        controller = (ROOT / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+        fixture = controller.split('fn disposable_linux_a7_a11() {',1)[1].split('// Raw fixed records',1)[0]
+        self.assertLess(fixture.index('prepare_a1a2('), fixture.index('b"READY=1"'))
+        self.assertLess(fixture.index('b"READY=1"'), fixture.index('a7_identity_ack();'))
+        self.assertLess(fixture.index('a7_identity_ack();'), fixture.index('a7_cases('))
+        case = controller.split('fn a7_case(',1)[1].split('// Fixed two-case scope',1)[0]
+        self.assertLess(case.index('recheck_delivery('), case.index('runner.run_phased('))
+        for term in ('55', '10', '4096', '60', '15', 'probe_records(', 'reentry_records(', 'valid_run('):
+            self.assertIn(term, case)
+        source = Path(driver.__file__).read_text()
+        run = source.split('def run_body(env):',1)[1].split('def cleanup_a1a2',1)[0]
+        for term in ('a7_admission()', 'stage_sudo_nnp(', 'prepare_controlled_sudo_nnp(', 'handoff_sudo_nnp('):
+            self.assertIn(term, run)
+        cleanup = source.split('def cleanup_a1a2',1)[1].split('def main',1)[0]
+        self.assertLess(cleanup.index('not os.path.lexists(cg)'), cleanup.index('cleanup_sudo_nnp(accounts'))
+        self.assertLess(cleanup.index('cleanup_controlled_sudo_nnp('), cleanup.index('shutil.rmtree(stage)'))
+
+
+    def test_cleanup_requires_stop_and_preserves_partial_policy(self):
+        for residue, pending in ((True, False), (False, True), (False, False)):
+            events = []
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(driver, 'verify_runtime'))
+                stack.enter_context(patch.object(driver, 'snapshot_internal'))
+                stack.enter_context(patch.object(driver.subprocess, 'run', return_value=SimpleNamespace(returncode=0)))
+                stack.enter_context(patch.object(driver.os.path, 'lexists', return_value=residue))
+                for name in ('cleanup_sudo_nnp', 'cleanup_sudo_nnp_delivery', 'remove_runtime'):
+                    stack.enter_context(patch.object(driver, name, side_effect=lambda *a, n=name, **kw: events.append(n)))
+                def policy(*a, **kw):
+                    events.append('policy')
+                    if pending: raise RuntimeError('E_POLICY_IDENTITY')
+                stack.enter_context(patch.object(driver, 'cleanup_controlled_sudo_nnp', side_effect=policy))
+                args = ('123-1','arxd.service',None,False,None,True,[])
+                if residue or pending:
+                    with self.assertRaises(RuntimeError):
+                        driver.cleanup_a1a2(*args,a7_owned=([],{},dict(pending=pending,entries=[])))
+                    self.assertEqual(events, [] if residue else ['policy'])
+                else:
+                    driver.cleanup_a1a2(*args,a7_owned=([],{},dict(entries=[1])))
+                    self.assertEqual(events, ['policy','cleanup_sudo_nnp','cleanup_sudo_nnp_delivery','remove_runtime'])

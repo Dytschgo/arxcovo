@@ -1089,6 +1089,7 @@ fn valid_run(run: &RunResult, config: &OwnerConfig, residue: bool) -> bool {
 #[test]
 #[ignore = "A7/A11 source only; unattested host/policy and no native grant; unselected"]
 fn disposable_linux_a7_a11() {
+    let startup = std::time::Instant::now();
     // Refuse BEFORE any host observation, LinuxFs, account or process operation.
     let prepared = prepared_delivery().expect("A7/A11 host/policy/delivery unattested");
     use hierarchy::{linux::LinuxFs, setup::Clock};
@@ -1118,67 +1119,264 @@ fn disposable_linux_a7_a11() {
         &Monotonic(std::time::Instant::now()),
         &Cancellation::default()
     ));
-    let both_policy_cases = prepared.accounts.len() == 2;
-    let mut cases = 0;
-    for config in prepared.accounts {
+    let runners = prepared.accounts.each_ref().map(|config| {
         assert!(config.uid >= 1000 && config.gid >= 1000 && !config.admin);
         assert_eq!(config.memory_bytes, 64 * 1024 * 1024);
         assert_eq!(config.pids, 32);
-        let _initial_admission = recheck_delivery(&config, &prepared.arxd).unwrap();
-        let runner = Runner::new(config.clone()).unwrap();
-        let mut spec = RunSpec {
-            executable: prepared.arxd.clone(),
-            arguments: vec!["tool-probe".into()],
-            cwd: config.workspace.clone(),
-            timeout: Duration::from_secs(20),
-            output_bytes: 4096,
-        };
-        let _probe_admission = recheck_delivery(&config, &spec.executable).unwrap();
-        let probe = runner
-            .run_phased(&spec, &Cancellation::default(), &Cancellation::default())
-            .unwrap();
-        assert!(valid_run(&probe, &config, runner.cleanup_residue()));
-        assert!(probe_records(&output(&probe).unwrap()));
-        spec.executable = prepared.reentry.clone();
-        spec.arguments = vec![
-            "--exact".into(),
-            "unix_shim::rights::linux::tests::e4_sudo_nnp_reentry".into(),
-            "--ignored".into(),
-            "--nocapture".into(),
-            "--test-threads=1".into(),
-            "--color=never".into(),
-        ];
-        let _reentry_admission = recheck_delivery(&config, &spec.executable).unwrap();
-        let reentry = runner
-            .run_phased(&spec, &Cancellation::default(), &Cancellation::default())
-            .unwrap();
-        assert!(valid_run(&reentry, &config, runner.cleanup_residue()));
-        let bytes = output(&reentry).unwrap();
-        let observed = reentry_records(&bytes);
-        assert!(observed);
-        assert!(accepts(Facts {
-            identity: valid_run(&reentry, &config, runner.cleanup_residue()),
-            exited: reentry.exit_code == Some(0),
-            bounded: output(&reentry).is_some(),
-            records: probe_records(&output(&probe).unwrap()),
-            rights: observed,
-            c1: observed,
-            alias_skipped: observed,
-            c3_unopened: observed,
-            path: observed,
-            cloexec: observed,
-            regular: observed,
-            exec_eof: observed,
-            nonzero: observed,
-            both_policy_cases,
-            cleanup: reentry.tree_cleanup_confirmed && !runner.cleanup_residue()
-        }));
-        cases += 1;
-    }
-    assert_eq!(cases, 2);
+        let _held = recheck_delivery(config, &prepared.arxd).unwrap();
+        Runner::new(config.clone()).unwrap()
+    });
+    assert!(startup.elapsed() <= Duration::from_secs(15));
     crate::service::unix::Notify::send_to(&std::env::var_os("NOTIFY_SOCKET").unwrap(), b"READY=1")
         .unwrap();
-    hold_identity_ack();
+    a7_identity_ack();
+    let callers = [Cancellation::default(), Cancellation::default()];
+    let shutdowns = runners.each_ref().map(Runner::shutdown_handle);
+    assert!(a7_cases(
+        |index| a7_case(
+            &prepared,
+            index,
+            &runners[index],
+            &callers[index],
+            &shutdowns[index]
+        ),
+        || {
+            for token in callers.iter().chain(shutdowns.iter()) {
+                token.cancel();
+            }
+        },
+        || a7_marker(b"ARX_A7_A11_COMPLETE_OK\n")
+    ));
+}
+
+// Raw fixed records bypass libtest capture; no identities or host data escape.
+fn a7_marker(bytes: &[u8]) -> bool {
+    use std::io::Write;
+    std::io::stdout().lock().write_all(bytes).is_ok()
+}
+
+// Fixture-local ACK envelope; do not widen the shared fixture hold or detach IO.
+fn a7_identity_ack() {
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        time::Instant,
+    };
+    let start = Instant::now();
+    loop {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("identity-ack");
+        if let Ok(file) = file {
+            let m = file.metadata().unwrap();
+            assert!(m.is_file() && m.uid() == 0 && m.mode() & 0o7777 == 0o600 && m.nlink() == 1);
+            let mut bytes = Vec::new();
+            file.take(2).read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"1");
+            assert!(start.elapsed() <= Duration::from_secs(5));
+            return;
+        } else {
+            assert_eq!(file.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn a7_case(
+    prepared: &Prepared,
+    index: usize,
+    runner: &Runner,
+    caller: &Cancellation,
+    shutdown: &Cancellation,
+) -> bool {
+    use std::time::Instant;
+    let start = Instant::now();
+    let config = &prepared.accounts[index];
+    let mut calls = [Duration::ZERO; 2];
+    for step in 0..2 {
+        let spec = RunSpec {
+            executable: if step == 0 {
+                prepared.arxd.clone()
+            } else {
+                prepared.reentry.clone()
+            },
+            arguments: if step == 0 {
+                vec!["tool-probe".into()]
+            } else {
+                vec![
+                    "--exact".into(),
+                    "unix_shim::rights::linux::tests::e4_sudo_nnp_reentry".into(),
+                    "--ignored".into(),
+                    "--nocapture".into(),
+                    "--test-threads=1".into(),
+                    "--color=never".into(),
+                ]
+            },
+            cwd: config.workspace.clone(),
+            timeout: Duration::from_secs(if step == 0 { 55 } else { 10 }),
+            output_bytes: 4096,
+        };
+        // Reopen NOFOLLOW+CLOEXEC and retain all account/view/artifact pins.
+        let Some(_held) = recheck_delivery(config, &spec.executable) else {
+            return false;
+        };
+        if start.elapsed().saturating_sub(calls.iter().sum()) > Duration::from_secs(15) {
+            return false;
+        }
+        let call = Instant::now();
+        let result = runner.run_phased(&spec, caller, shutdown);
+        // Entire synchronous call, including error returns and native guard drops.
+        calls[step] = call.elapsed();
+        if calls[step] > Duration::from_secs(if step == 0 { 60 } else { 15 }) {
+            return false;
+        }
+        let Ok(result) = result else {
+            return false;
+        };
+        if !valid_run(&result, config, runner.cleanup_residue()) {
+            return false;
+        }
+        let Some(bytes) = output(&result) else {
+            return false;
+        };
+        if !(if step == 0 {
+            probe_records(&bytes)
+        } else {
+            reentry_records(&bytes)
+        }) {
+            return false;
+        }
+    }
+    let marked = a7_marker(if index == 0 {
+        b"ARX_A7_A11_CASE0_OK\n"
+    } else {
+        b"ARX_A7_A11_CASE1_OK\n"
+    });
+    let total = start.elapsed();
+    marked && a7_envelopes(calls, total.saturating_sub(calls.iter().sum()), total)
+}
+
+// Fixed two-case scope, shared by pure counterfactuals and the ignored controller.
+// Catch inside each worker so failure cancellation precedes any implicit join.
+fn a7_cases(
+    work: impl Fn(usize) -> bool + Sync,
+    cancel: impl Fn() + Sync,
+    complete: impl FnOnce() -> bool,
+) -> bool {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        time::Instant,
+    };
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cases_start = Instant::now();
+        let handles = [0, 1].map(|index| {
+            let tx = tx.clone();
+            let work = &work;
+            let cancel = &cancel;
+            scope.spawn(move || {
+                let good = catch_unwind(AssertUnwindSafe(|| work(index))).unwrap_or(false);
+                if !good {
+                    cancel();
+                }
+                let _ = tx.send(good);
+                good
+            })
+        });
+        drop(tx);
+        let mut good = true;
+        // Receive either completion, never join a healthy worker while hiding failure.
+        for _ in 0..2 {
+            let remaining = Duration::from_secs(90).saturating_sub(cases_start.elapsed());
+            if rx.recv_timeout(remaining) != Ok(true) {
+                good = false;
+                cancel();
+                break;
+            }
+        }
+        let join = Instant::now();
+        // Do not short-circuit: BOTH joins run even if either reports a panic.
+        let joined = handles.map(|handle| handle.join().unwrap_or(false));
+        let accepted = a7_completion(good, joined, join.elapsed());
+        accepted && complete() && join.elapsed() <= Duration::from_secs(10)
+    })
+}
+fn a7_completion(good: bool, joined: [bool; 2], elapsed: Duration) -> bool {
+    good && joined == [true, true] && elapsed <= Duration::from_secs(10)
+}
+fn a7_envelopes(calls: [Duration; 2], checks: Duration, total: Duration) -> bool {
+    calls[0] <= Duration::from_secs(60)
+        && calls[1] <= Duration::from_secs(15)
+        && checks <= Duration::from_secs(15)
+        && total <= Duration::from_secs(90)
+}
+
+#[test]
+fn a7_a11_scheduling_counterfactuals() {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let d = Duration::from_secs;
+    assert!(a7_completion(true, [true, true], d(10)));
+    for (good, joined, elapsed) in [
+        (false, [true, true], d(0)),
+        (true, [false, true], d(0)),
+        (true, [true, false], d(0)),
+        (true, [true, true], d(11)),
+    ] {
+        assert!(!a7_completion(good, joined, elapsed));
+    }
+    assert!(a7_envelopes([d(60), d(15)], d(15), d(90)));
+    for (calls, checks, total) in [
+        ([d(61), d(0)], d(0), d(61)),
+        ([d(0), d(16)], d(0), d(16)),
+        ([d(1), d(1)], d(16), d(18)),
+        ([d(60), d(15)], d(15), d(91)),
+    ] {
+        assert!(!a7_envelopes(calls, checks, total));
+    }
+    for failed in 0..2 {
+        for panic in [false, true] {
+            let cancelled = AtomicBool::new(false);
+            let finished = AtomicUsize::new(0);
+            let barrier = Barrier::new(2);
+            assert!(!a7_cases(
+                |index| {
+                    barrier.wait();
+                    if index == failed {
+                        finished.fetch_add(1, Ordering::SeqCst);
+                        assert!(!panic, "injected worker panic");
+                        return false;
+                    }
+                    let wait = std::time::Instant::now();
+                    while !cancelled.load(Ordering::SeqCst)
+                        && wait.elapsed() < Duration::from_secs(1)
+                    {
+                        std::thread::yield_now();
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+                || cancelled.store(true, Ordering::SeqCst),
+                || panic!("completion after failed worker")
+            ));
+            assert!(cancelled.load(Ordering::SeqCst));
+            assert_eq!(finished.load(Ordering::SeqCst), 2);
+        }
+    }
+    let completed = AtomicUsize::new(0);
+    assert!(a7_cases(
+        |_| {
+            completed.fetch_add(1, Ordering::SeqCst);
+            true
+        },
+        || {},
+        || true
+    ));
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
 }
 
 // Pure discriminators, also compiled in isolation by the source-only check.

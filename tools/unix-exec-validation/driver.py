@@ -168,8 +168,23 @@ def remove_a4_helper(owned):
     os.rmdir('arxcovo', dir_fd=parent)
 
 
-# Dormant Slice 1 only: neither run_body nor any CLI selector calls these.
+# Fixed integration branch remains dormant behind selection and qualification.
 # Syntax success is never policy proof. No qualifying image is attested yet.
+def a7_selected():
+    # Derived solely from the fixed source selection; standard_profile still rejects it.
+    return TEST == 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
+
+
+def a7_admission():
+    # No installed adapter invocation or profile inference is authorized.
+    expected_profile = None
+    installed_payloads = None
+    require(expected_profile is not None and
+            sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    from sudo_package_profile import compare
+    require(compare(installed_payloads)['candidate_match'] is True, 'E_ARTIFACT')
+
+
 def sudo_nnp_host_attested():
     return False
 
@@ -1299,12 +1314,16 @@ def capture_size(stage):
 
 def monitor_a1a2(stage, artifact):
     deadline = time.monotonic() + 120
+    monitor_start = deadline - 120
     acknowledged = False
     while True:
         require(time.monotonic() < deadline, 'E_TEST_TIMEOUT')
         require(capture_size(stage) <= 1024 * 1024, 'E_TEST_LOG')
         state = unit_properties()
         if state['ActiveState'] == 'active' and not acknowledged:
+            ack_start = time.monotonic()
+            if a7_selected():
+                require(ack_start - monitor_start <= 15, 'E_TEST_TIMEOUT')
             verify_runtime(stage, stage.name.removeprefix('arx-ci-'), state)
             pid = private_read(stage / 'harness-pid')
             require(re.fullmatch('[1-9][0-9]{0,9}', pid), 'E_PID')
@@ -1324,12 +1343,15 @@ def monitor_a1a2(stage, artifact):
             finally:
                 os.close(fd)
             require(tasks == (pid + '\n').encode('ascii'), 'E_UNIT_CGROUP')
+            if a7_selected():
+                require(time.monotonic() - ack_start <= 5, 'E_TEST_TIMEOUT')
             exclusive_file(stage / 'identity-ack', b'1')
             acknowledged = True
         if state['ActiveState'] in ('inactive', 'failed'):
             require(acknowledged and state['Result'] == 'success' and
                     state['ExecMainStatus'] == '0', 'E_SERVICE_OR_TEST')
             verify_test_result(stage, 0)
+            require(deadline > time.monotonic(), 'E_TEST_TIMEOUT')
             return
         time.sleep(0.01)
 
@@ -1337,6 +1359,11 @@ def monitor_a1a2(stage, artifact):
 def verify_test_result(stage, returncode):
     require((stage / 'test-output').stat().st_size <= 1024 * 1024, 'E_TEST_LOG')
     text = private_read(stage / 'test-output', 1024 * 1024)
+    if a7_selected():
+        for marker in ('ARX_A7_A11_CASE0_OK', 'ARX_A7_A11_CASE1_OK', 'ARX_A7_A11_COMPLETE_OK'):
+            require(text.count(marker + '\n') == 1, 'E_TEST')
+            text = text.replace(marker + '\n', '')
+        require(len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]+s$', text, re.M)) == 1, 'E_TEST')
     if TEST == 'exec::disposable::a4::disposable_linux_a4_omitted_kill':
         require(text.count('ARX_A4_OMITTED_S7_REJECTED\n') == 1, 'E_TEST')
         # Raw fd output may interrupt libtest's in-progress test-ok line.
@@ -1448,7 +1475,8 @@ def runtime_files(stage, run):
         files.append((root / 'arxd.service.d/50-arxcovo-standard-rights.conf',
                       (package / '50-arxcovo-standard-rights.conf').read_bytes()))
     files.append((root / 'arxd.service.d/90-disposable-a1a2.conf',
-                  fixture_override(stage, run).encode('ascii')))
+                  (fixture_override(stage, run) +
+                   (controlled_override(run) if a7_selected() else '')).encode('ascii')))
     return files
 
 
@@ -1514,6 +1542,9 @@ def run_body(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     standard_profile()
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
+    selected_a7 = a7_selected()
+    if selected_a7:
+        a7_admission()  # before root/host probes, reservation or staging
     helper_data = a4_delivery() if a4_selected() else None
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')
     cg_preflight()  # read-only; no retry or global controller writes
@@ -1523,6 +1554,7 @@ def run_body(env):
     fd, lock, lock_info = reserve_unit()
     owned = []
     helper_owned = {}
+    a7_accounts, a7_artifacts, a7_policy = [], {}, {}
     unit_created = False
     stage_created = False
     stage_info = None
@@ -1545,22 +1577,28 @@ def run_body(env):
         copy_tree(Path('/home/runner/.cargo/registry'), stage / 'cargo/registry')
         driver = stage / 'source/tools/unix-exec-validation/driver.py'
         build_env = cargo_env(stage)
-        # Build before the 120s harness bound, with no fixture account yet.
-        with (stage / 'build-output').open('xb') as out:
-            result = subprocess.run(command(stage) + ['--no-run', '--message-format=json'],
-                                    cwd=stage / 'source', env=build_env, timeout=360,
-                                    stdout=out, stderr=subprocess.DEVNULL)
-        require(result.returncode == 0, 'E_BUILD')
-        require((stage / 'build-output').stat().st_size <= 4 * 1024 * 1024, 'E_BUILD_LOG')
-        artifacts = [j['executable'] for line in (stage / 'build-output').read_text().splitlines()
-                     if (j := json.loads(line)).get('reason') == 'compiler-artifact'
-                     and j.get('executable') and j.get('profile', {}).get('test')]
-        require(len(artifacts) == 1, 'E_ARTIFACT')
-        artifact = Path(artifacts[0])
-        require(artifact.parent == stage / 'source/target/debug/deps' and
-                re.fullmatch(r'arxd-[0-9a-f]+', artifact.name), 'E_ARTIFACT_PATH')
-        protected(artifact, 'run_artifact')
-        exclusive_file(stage / 'artifact', str(artifact).encode('ascii'))
+        if selected_a7:
+            pins = stage_sudo_nnp(env, a7_artifacts)
+            artifact = Path(private_read(stage / 'artifact'))
+            prepare_controlled_sudo_nnp(run_id, a7_accounts, a7_policy)
+            handoff_sudo_nnp(env, a7_accounts, pins)
+        else:
+            # Build before the 120s harness bound, with no fixture account yet.
+            with (stage / 'build-output').open('xb') as out:
+                result = subprocess.run(command(stage) + ['--no-run', '--message-format=json'],
+                                        cwd=stage / 'source', env=build_env, timeout=360,
+                                        stdout=out, stderr=subprocess.DEVNULL)
+            require(result.returncode == 0, 'E_BUILD')
+            require((stage / 'build-output').stat().st_size <= 4 * 1024 * 1024, 'E_BUILD_LOG')
+            artifacts = [j['executable'] for line in (stage / 'build-output').read_text().splitlines()
+                         if (j := json.loads(line)).get('reason') == 'compiler-artifact'
+                         and j.get('executable') and j.get('profile', {}).get('test')]
+            require(len(artifacts) == 1, 'E_ARTIFACT')
+            artifact = Path(artifacts[0])
+            require(artifact.parent == stage / 'source/target/debug/deps' and
+                    re.fullmatch(r'arxd-[0-9a-f]+', artifact.name), 'E_ARTIFACT_PATH')
+            protected(artifact, 'run_artifact')
+            exclusive_file(stage / 'artifact', str(artifact).encode('ascii'))
         installation_pending = True
         install_runtime(stage, run_id, owned)
         installation_pending = False
@@ -1580,7 +1618,10 @@ def run_body(env):
         try:
             require(not installation_pending, 'E_QUARANTINE_CGROUP')
             if stage_created or owned:
-                if helper_data is not None:
+                if selected_a7:
+                    cleanup_a1a2(run_id, unit, stage, stage_created, stage_info,
+                                 unit_created, owned, a7_owned=(a7_accounts, a7_artifacts, a7_policy))
+                elif helper_data is not None:
                     cleanup_a1a2(run_id, unit, stage, stage_created, stage_info,
                                  unit_created, owned, helper_owned)
                 else:
@@ -1593,12 +1634,13 @@ def run_body(env):
                 same_object(lock, lock_info)
                 lock.unlink()
             os.close(fd)
-            for key in ('fd', 'parent'):
-                if key in helper_owned:
-                    os.close(helper_owned[key])
+            for assets in (helper_owned, a7_artifacts):
+                for key in ('fd', 'parent'):
+                    if key in assets:
+                        os.close(assets[key])
 
 
-def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, helper_owned=None):
+def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, helper_owned=None, a7_owned=None):
     global feedback_cleanup
     if unit_created:
         require(unit == 'arxd.service', 'E_UNIT_COLLISION')
@@ -1614,6 +1656,12 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
             snapshot_internal(run_id, unit, stopped)
         cg = Path('/sys/fs/cgroup/system.slice') / unit
         require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')
+    if a7_owned is not None:
+        accounts, artifacts, policy = a7_owned
+        if policy:
+            cleanup_controlled_sudo_nnp(run_id, policy, unit_gone=True)
+        cleanup_sudo_nnp(accounts, unit_gone=True)
+        cleanup_sudo_nnp_delivery(artifacts, unit_gone=True)
     if helper_owned is not None:
         remove_a4_helper(helper_owned)
     remove_runtime(owned)
