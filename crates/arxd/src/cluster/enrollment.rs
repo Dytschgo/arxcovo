@@ -1,5 +1,6 @@
 //! Pure proposal-time enrollment. This module performs no I/O and proves no consensus commit.
 mod code;
+pub(super) mod codec;
 pub use code::{CodeError, CodeVerifier, JoinCode, JoinSecret, RedeemProof};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, num::NonZeroU64};
@@ -37,6 +38,9 @@ impl KeyDigest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Propose only from a fresh in-memory JoinCode::generate value. Retry that
+    /// value only before first_proposal + CODE_TTL_MS - 4*SKEW_MS, then discard.
+    /// Never re-propose a Mint decoded from storage/wire or accept a peer verifier.
     Mint {
         cluster: ClusterId,
         actor: ActorId,
