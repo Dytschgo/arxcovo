@@ -2,12 +2,14 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #139, `0df242e02ac6bdaac201196d6b687440ce505ca8` at17:48:11Z; independent Opus exact-head PASS6898553625/status58970661048 and all five required gates green. Reviewed4847db0/squash full trees equal. A12 failure checkpoint only, cleanup unconfirmed; no native credit or retry.
-- Current work: A10 evidence join attribution correction is under independent Opus recheck, and bounded A9/U9 stop/drain evidence join is being prepared. Publish each reviewed note through normal gates, then independent M3 source work. A10/native gaps remain open; A12 D7l consumed with unconfirmed cleanup/no retry, A7 hosted FINAL NO-GO closed, M2 incomplete.
+- Last merged: PR #141, `8e802070fb6b6f7de663adf6fdf8420d3a8eea6a` at18:12:33Z; independent Opus exact-head PASS6898850222/status58971457086 and all five required gates green. Reviewed f90027e/squash full trees equal. Bounded A9/U9 evidence only; populated stop/crash/production Drain remain open.
+- Current work: Sol implements the independently reviewed first pure M3 enrollment core (Opus corrected contract1fbad65, Sol recheck9867540). Deterministic bounded mint/redeem/retry and injected-time issuance guard only; no signing, transport, Raft, endpoints or native activation. M2 remains incomplete with A9/U9/A10/A12/full F/G/PA6 hardware gaps open; A7 hosted FINAL NO-GO and consumed A12 no-retry remain closed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Coordinator verifies PR141 exact head/five green gates, unwatches and merges8e80207; squash/reviewed full trees equal. M3 branch merge conflict confined to PROGRESS, retaining review/steering history. Sol enrollment pure-core builder remains active on unchanged implementation brief; no native M2 authority or closure.
 
 - 2026-11-15: Opus high1fbad65 retainedc6fe014 corrects M3 pure enrollment brief; independent Sol recheck closes delayed-commit expiry T1 and finite retention T2. Physical expiry and consensus authority explicitly remain future-adapter claims. Sol implementation is eligible only for the named I/O-free core/tests; no transport, signing, host or native activation. M2 remains open, M3 independent steering applies.
 
