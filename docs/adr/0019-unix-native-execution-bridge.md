@@ -1175,6 +1175,14 @@ host.
 
 ### D7l. Proposed one bounded A12 producer attempt (2026-11-15)
 
+**CONSUMED:** run43741300777 attempt1 on main2a1d5ad failed with
+E_SERVICE_OR_TEST/E_COMMAND_FAILED, cgroup lower bound and unconfirmed cleanup.
+All three pins independently absent HTTP404 afterward. Host excluded; no retry,
+rerun, diagnostic leg or further grant. No A12 credit. See the
+[result disposition](../evidence/linux-a12-hosted-result.md). The proposal below
+is retained as the historical eligibility contract.
+
+
 **SOURCE/DISPOSITION CANDIDATE ONLY. No effective grant yet.** OpenAI
 GPT-6.1 Sol / high, implementation sub-agent, no subagents. D7a-k are consumed;
 all their environments and historical `43091339273` are excluded. Hosted
