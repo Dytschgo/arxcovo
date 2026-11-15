@@ -126,3 +126,7 @@ The following four exact pins supersede abbreviated wording above and bind the s
    no pre-existing adoption). State the load-bearing assumption: only
    root-writable ancestry makes path-based exec after recheck safe; build
    accounts hold no write bit on any ancestor.
+
+## Controlled-policy amendment
+
+ADR0020 D9b supersedes the complete original-host policy-byte qualification/private-capture route for the controlled fixture only, after its review/gates/merge. The four literal read-only mount mappings and in-unit view checks establish the policy cases by construction; installed binary/plugin/default-path/floor checks and all delivery pins remain. No host-original-policy claim or list-mode oracle. Existing false/None selection gates remain until separately reviewed source and native disposition.

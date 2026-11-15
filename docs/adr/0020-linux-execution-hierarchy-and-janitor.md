@@ -666,6 +666,52 @@ pinned-identity match, never directly from bridge output.
   reset, and no owner command is added. The owner restarts the service with
   existing owner tooling.
 
+### D9b. Controlled A7 policy fixture (2026-11-15)
+
+This test-contract amendment takes effect only after independent different-provider
+exact-head review, all required checks and coordinator merge. It grants no native
+execution, activation, host-policy or milestone acceptance. It implements A7's
+with/without NOPASSWD fence test using known source-literal policy rather than
+reconstructing the fresh host's original policy. The installed real sudo and
+plugin remain; product/Runner/packaged unit/Standard drop-in behavior is unchanged.
+[Decision](../reviews/m2-a7-controlled-policy-fixture-decision.md) and
+[independent Sol review](../reviews/m2-a7-controlled-policy-fixture-sol-review.md)
+record the equivalence and case1 transcription correction.
+
+Only the disposable override may add these four read-only bind mappings:
+`<stage>/fx/sudoers:/etc/sudoers`, `<stage>/fx/sudo.conf:/etc/sudo.conf`,
+`<stage>/fx/nsswitch.conf:/etc/nsswitch.conf`, and
+`<stage>/fx/sudoers.d:/etc/sudoers.d`. No other mapping, missing-source optional
+prefix, production use or host-policy edit is permitted. Exact unit mapping set,
+read-only mount view and source-literal bytes/entry set must be checked inside
+the unit before Runner admission; systemd configuration text alone is insufficient.
+
+The fixture sudoers has no direct grants and one include directory. Its entire
+include set is exactly one exclusive root-owned0440 rule:
+`<case0> ALL=(root) NOPASSWD: /usr/bin/true`. Case1 and its sole primary group
+have no grant, ALL selector, UID/user alias or external source. sudo.conf selects
+only the fixed trusted local sudoers plugin; NSS sudoers/passwd/group use files,
+with no sss/ldap/netgroup routing. All bytes are reviewed source literals with
+only validated generated account substitution. No runtime policy parser or
+list-mode oracle is added; query-oracle NO-GO remains binding.
+
+Before effects, require protected installed C1 ELF and plugin identity/digest,
+C2 absent-or-trusted, compiled-default path equality covering all four masks,
+merged-/usr alias and existing systemd/kernel/cgroup/delegation floor. Revalidate
+the fixture view, account lookup, identities and artifact pins before each
+Runner case; unknown defaults, extra entries/mappings, plugin or inode drift,
+failed NSS lookup and any mismatch refuse. Maintain NNP, packaged capability
+bounds, limits/deadlines/output caps, descriptor C1/alias/O_PATH/CLOEXEC/execveat
+and all existing collision/owned cleanup/quarantine fences. No copied sudo.
+
+The old complete-host-byte allowlist/private-capture route is superseded for
+this controlled fixture only. It remains necessary for any claim about the
+host's original policy; this amendment claims none. Existing injected collector
+stays source-only/false and is not a prerequisite for this fixture path. Separate
+reviewed source, exact-head gates, coordinator merge and a new narrowly bounded
+fresh-host grant remain before selection or native execution. A7/A11 acceptance
+still requires independent source/run/oracle evidence; M2/full F/G/PA6 stay open.
+
 ### D9a. Bounded A4/A6 acceptance scope (2026-11-14)
 
 This amendment changes acceptance coverage only. It becomes effective after

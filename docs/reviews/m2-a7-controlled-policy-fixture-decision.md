@@ -77,7 +77,7 @@ single `#includedir /etc/sudoers.d`), `sudoers.d/10-a7-case0` (exclusive
 (`sudoers: files`, `passwd`/`group` on files, no `sss`/`ldap`). Closed set:
 exactly one include file; unknown names/routes/plugins refuse.
 3. Case1 closure is by construction plus static literal review: no grant for
-case0-name-or-group, no `ALL`, no UID/user-alias match, no external source.
+case1-name-or-group, no `ALL`, no UID/user-alias match, no external source.
 No runtime policy inference; list-mode oracles stay banned per `25bbbdc`.
 4. Binary/plugin/floor pins per execution host: C1 ELF digest, resolved
 plugin digest, compiled-default path equality, systemd>=254, kernel>=5.14,
