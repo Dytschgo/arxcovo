@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: PR145 Windows U6 fails on an unsupported8s all-responder completion assertion after routing restore. Coordinator aligns test with reviewed contract: observe bounded-window resolution count, retain actual64uncommitted/zero permits/Busy and strict shutdown64/emptyowners/Weak/Stopped. Production unchanged, no timeout increase/retry. ExactU6Windows/fmt/offlineClippy pass; fresh Opus delta review queued after active T3 review and new hosted gates required.
+
 - 2026-11-15: Opus high1fc7036 independently passes real adapter/T1T2/U6 source/security and reruns98cluster/fmt/Clippy plus five caught counterfactuals. Reviews dependency edges and Suite partition, no fullconformance/host claim. Nonblocking shutdown finalizer timing/read catchup deadlines stay visible for later integration; T3 is separate immediate follow-up. Coordinator publishes parent for exact-head review and all hosted gates.
 
 - 2026-11-15: Sol high7b4bf62/e39535f/095504c retained93651ed/0a74643/40564a3 completes adapters, exclusive preflight, tracked service, actual Suite partition and T1/T2/U6.98cluster tests pass8.788s including old36/eightkillprobes; fmt/lockedClippy/diff pass.64 actual uncommitted entries prove cancellation bound; graceful leader/follower restarts converge. Raw-helper differences recorded honestly. Fresh Opus review active; T3 snapshot catch-up remains immediate uncredited follow-up.

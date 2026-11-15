@@ -1,3 +1,11 @@
+## PR145 Windows U6 observation-window correction
+
+Head80f87e3 Windows verify run43765400142/job132969243566 failed U6 at three_node.rs450: the restored-routing leg required all64 old engine responders to resolve within8s and unwrapped Elapsed. The reviewed decision12/U6 explicitly requires restored-quorum resolutions to be recorded, not asserted; OpenRaft provides no bound on a deposed leader's pending responders. The production permit/ownership implementation is unchanged.
+
+Coordinator changes only that observation window: record whether all resolved and the observed count (still <=64), then always perform the same bounded owned shutdown. The nonvacuous64-uncommitted condition, aborted/joined callers, zero permits/nextBusy, post-shutdown64permits/empty owners/Weak release/Stopped and RPC/privacy checks remain strict. No timeout was raised, no retry was added and no commit/cancellation safety assertion was removed. This corrects an overstrong test expectation, not evidence of a production permit defect or a proven historical scheduling cause.
+
+LocalWindows exact U6 nextest passed (run5ac46a3e-1097-46b5-af0f-b9f31d822e2d,0.881s); fmt and locked offline arxd all-target Clippy with warnings denied passed. D: target/TEMP/TMP only. The exact hosted scheduling failure was not reproduced locally. Fresh independent delta review and new-head hosted gates remain required; prior-head green does not count.
+
 # M3 OpenRaft retained implementation evidence
 
 Status: **local T1/T2 proof passed; fresh independent Opus review pending**.
