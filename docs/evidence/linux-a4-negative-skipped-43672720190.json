@@ -1,0 +1,16 @@
+{
+  "run_id": 43672720190,
+  "attempt": 1,
+  "event": "workflow_dispatch",
+  "head_sha": "994760c98c2816f37b1acdcaa9d9827693765b17",
+  "head_branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "skipped",
+  "job_id": 132686133651,
+  "job_conclusion": "skipped",
+  "step_count": 0,
+  "variable_absent_http404": true,
+  "native_credit": false,
+  "monitor_failure": "Immediate run-list lookup did not return accepted dispatch; finally cleared pin before job admission. Dispatch URL had already identified run. No retry."
+}

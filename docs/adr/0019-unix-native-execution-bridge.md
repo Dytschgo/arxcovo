@@ -630,8 +630,7 @@ are **unverified on real hardware**.
 
 ### D7f. One fixed native A4 omitted-S7-kill run (2026-11-15)
 
-**Proposed, inactive. Independent Muse exact-head review, all five required
-checks and coordinator merge are still needed; no native authority exists yet.**
+**Consumed by accepted dispatch `43672720190` on main `994760c98c2816f37b1acdcaa9d9827693765b17`. The job skipped with zero steps after monitor pin cleanup raced admission; no native credit. Variable absence independently verified HTTP 404. No retry or further D7f authority.**
 PR #113 merged the fixed source as `d0b4c5530b1c4c084a35fe40499afa96a2678b0b`,
 tree `9cfd66dbdf7ce1afc43c1f5acecf4eb62fd09455`, equal to reviewed head
 `15c4d73a3eaf02779672870e5054e34edea6f5c5`. Its all-five-gates/Muse PASS
