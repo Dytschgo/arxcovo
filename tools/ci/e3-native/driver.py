@@ -13,7 +13,7 @@ import threading
 import time
 
 TARGET = "crates/arxd/src/exec/hierarchy/linux.rs"
-SOURCE_SHA = "af82315a49d97d090086d2ef1cc0fe7069be8894ad597f70b3238f7c0b6e9479"
+SOURCE_SHA = "75b174ac10c7c3dd3be5984f507ba891ae4dccd953c49dfb12327007c0b907bd"
 MANIFEST_SHA = "c824820588a406800124352931597e3a220a32b945333e85d3a186612bca3d93"
 PREFIX = "exec::hierarchy::linux::tests::"
 NAMES = (
