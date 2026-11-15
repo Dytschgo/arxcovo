@@ -11,7 +11,7 @@ import sys
 import time
 import threading
 
-TEST = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
+TEST = 'exec::a12::native::disposable_linux_a12'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 
@@ -34,8 +34,8 @@ def standard_profile():
 
 
 # Neither delivery preparation nor execution is authorized by selecting a name.
-A12_DELIVERY_ENABLED = False
-A12_EXECUTION_ENABLED = False
+A12_DELIVERY_ENABLED = True
+A12_EXECUTION_ENABLED = True
 A12_TEST = 'exec::a12::native::disposable_linux_a12'
 
 

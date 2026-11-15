@@ -21,12 +21,13 @@ authorized. D7g is consumed by `43674201597`; independent Muse assessment
 `21c7615` accepts only its D9a A4 disposable present-residue and omitted-kill
 scope. D7h (`43693642693`, FILE leg only), D7i (`43715436515`, pre-mutation
 E_PATH) and D7j (`43720496074`, read-only E_PATH diagnosis) are consumed with no
-A7/A11 credit. D7k below is the docs-only disposition for exactly ONE final
-Opus-owned hosted A7/A11 attempt on the unchanged merged D9c source (PR #133,
-`52ce2a5`); it is inactive until independent Sol review, exact-head review,
-five gates, coordinator merge and source-inventory equality, and any miss
-defers A7/A11 to a dedicated host. All other native execution and historical retries
-remain unauthorized. The historical E_PROTECTION diagnosis remains
+A7/A11 credit. D7k is consumed by final run `43728169361` with no case
+proof and confirmed cleanup; hosted A7/A11 is FINAL NO-GO. No source fix,
+debug, bind, old host reuse, original policy/package/NNP probe or new grant
+can reset that item. D7l below proposes exactly one different-item A12
+producer attempt, inactive pending independent Opus source/content and
+exact-head review, all five green checks, coordinator merge and exact source
+and tree equality. It grants nothing during preparation. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
 
@@ -1171,6 +1172,98 @@ marked complete. Source feasibility is not acceptance. Even a matching run needs
 a mandatory independent post-run source/run/oracle assessment, and credit covers
 only the exact case proof shown. Retain bounded sanitized evidence and exclude the
 host.
+
+### D7l. Proposed one bounded A12 producer attempt (2026-11-15)
+
+**SOURCE/DISPOSITION CANDIDATE ONLY. No effective grant yet.** OpenAI
+GPT-6.1 Sol / high, implementation sub-agent, no subagents. D7a-k are consumed;
+all their environments and historical `43091339273` are excluded. Hosted
+A7/A11 remains FINAL NO-GO; A12 is a different item and resets no counter.
+The [preparation record](../evidence/linux-a12-one-run-preparation.md) fixes
+full baseline/review identities, allowed paths/modes, complete non-doc inventory,
+canonical LF hashes, tests and pre-registered limits. It is part of this contract.
+
+**Candidate and eligibility.** The sole candidate is the FIRST eligible normal
+main squash containing D7l and the fixed A12 source selection. No future SHA is
+predicted. Before any grant takes effect: fresh independent Opus source/content
+review, independent exact-head review, all five required checks green (Windows,
+Linux and macOS verify, ci-time-budget, agent-review), coordinator merge, actual
+first eligible main squash readback, reviewed-head/main-squash full-tree equality,
+strict baseline path/mode predicate and complete source-inventory equality with
+the preparation record. The record binds actual workflow/source bytes; require
+candidate `github.sha == github.workflow_sha == reviewed pin` and checkout HEAD
+identity. Any unrelated delta, main advance, mode/blob/tree mismatch or substitution
+stops eligibility; do not adopt, normalize or guess a replacement candidate.
+
+Only four source selections change: Rust DELIVERY_ENABLED=true, driver
+A12_DELIVERY_ENABLED=true, A12_EXECUTION_ENABLED=true and literal
+`TEST='exec::a12::native::disposable_linux_a12'`. Focused pure/mock tests and
+mutation anchors adapt to that enabled candidate; only the consumed D7j wrapper
+MODULE hash/size follow changed driver bytes. Production, workflow, Cargo,
+package, helper, rights and A7 logic stay byte-identical. The native test remains
+ignored: ordinary tests use pure/injected readers and source checks, never the
+now-enabled `prepared_delivery` reader. An explicit fixed ignored selection is
+required. Source flags alone grant no run.
+
+**Operation, coordinator only after eligibility.** Independently verify all three
+repository variables absent before starting: `UNIX_EXECUTION_REVIEWED_SHA`,
+`SUDO_PACKAGE_REVIEWED_SHA`, `A7_ADMISSION_REVIEWED_SHA`. Set ONLY the native
+`UNIX_EXECUTION_REVIEWED_SHA` once to the exact full main candidate SHA and read
+back exact equality. D7h/D7j variables remain absent throughout. Dispatch the
+unchanged `unix-execution-experiment.yml` ONCE, on main, no inputs, one fresh
+GitHub-hosted ubuntu-24.04 host, attempt 1, fixed A12 only. Existing workflow
+repo/actor/triggering-actor/event/ref/SHA gates and driver checks all apply.
+Capture the returned URL DIRECTLY from dispatch output and monitor THAT URL
+through terminal, binding run ID/attempt 1. Keep the pin until terminal even if
+ancillary lookups fail; no early clear or redispatch. Finally delete the native
+pin and independently verify all three variables absent with three HTTP404s.
+
+Any accepted dispatch consumes D7l, including skip, failure, cancellation,
+infrastructure failure or unknown. A confirmed rejection consumes it too. No
+retry, rerun, new grant, diagnostic leg, fence relaxation or environment reuse
+is authorized by this task. Exclude the host after this attempt. On ANY miss,
+stop with a closed sanitized record and bounded source assessment; no automatic
+retry. Escalate any security finding. No permission for the old A7 source or
+runtime follows, even if that historical code remains present in the harness.
+
+**Native scope and oracles, unchanged.** One exclusively owned fresh standard
+nologin account/group/root/workspace and root-private stage; strict bounded
+source/workflow-bound record, hash/size/inode/ownership/artifact pins and trusted
+fixed `/usr/bin/true` then `/usr/bin/sleep 15`. No sudo, NNP, package/policy views,
+A7 fixture or original qualification. Absolute OwnerConfig.workspace, empty
+RunSpec.cwd under ADR0007; held/reopened account/workspace/artifact/target/runs
+checks immediately before EACH actual Runner call. Root-only ancestry/no-follow,
+collision refusal, pending-capture quarantine and unit-owned cleanup persist.
+
+True must actually complete successfully through real Runner with the observed
+standard UID/GID and daemon-root attribution, LinuxCgroupV2, zero exit and tree
+cleanup confirmed. Cancellation requires a real sole populated owned leaf,
+matching held/reopened inode and nonzero PID BEFORE cancelling the sleep call;
+then actual Cancelled result, explicit owned join, real cleanup_residue=false,
+empty runs/tasks and held-leaf literal ENOENT. No synthetic flag, pre-spawn
+cancellation, error, missing join, fixture deletion or marker substitutes.
+Require NORMAL, CANCEL, COMPLETE markers each exactly once, identity ACK with
+exact runtime/MainPID/executable/cgroup/sole-PID attribution, exact single-test
+summary, successful owned systemd exit and independent final cleanup confirmed.
+Stop/confirm unit cgroup absent and live UID released BEFORE account, root,
+workspace, runtime and stage deletion. Uncertainty quarantines owned artifacts.
+
+Bounds remain preparation15s/ACK5s/Runner15s/proof5s/call25s/fixture90s,
+packaged startup30s/monitor120s/runtime140s, output1024, memory64MiB/pids32,
+harness128MiB with A12-only DEBUG=0, one bounded build. No increased limit.
+Synchronous OS/NSS calls and scoped joins may stall; elapsed checks reject late
+results, not guarantee hard interruption. No orphan workers are permitted.
+
+**Pre-registered predictions and credit.** Source feasibility predicts true
+Exited/exit0 and sleep Cancelled only after real post-spawn proof, correct identity,
+confirmed cleanup, residue=false, empty runs, literal held-leaf ENOENT, three
+markers once, exact summary, ACK and independent final cleanup. Feasibility is
+not acceptance. Fresh independent post-run source/run/oracle assessment is
+mandatory before any A12 credit, limited to that exact attempt. No A7/A11,
+real-Runner PA6, full F/G or M2 completion credit is implied. All native paths
+remain **unverified on real hardware**. Dedicated-host A7 work and owner admin
+steps are outside this proposal. This implementation task runs no native code,
+dispatch or variable action and publishes nothing.
 
 ## Contract clarifications (2026-11-12)
 
