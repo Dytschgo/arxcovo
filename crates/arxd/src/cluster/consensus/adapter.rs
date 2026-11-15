@@ -71,6 +71,29 @@ impl RaftLogReader<Arx> for LogAdapter {
 }
 #[cfg(test)]
 pub(super) static PANIC_APPEND: Mutex<Option<usize>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) struct AppendCompletionPause {
+    pub store: usize,
+    pub entered: tokio::sync::oneshot::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+pub(super) static APPEND_COMPLETION_PAUSE: Mutex<Option<AppendCompletionPause>> = Mutex::new(None);
+#[cfg(test)]
+fn pause_append_completion(store: usize) {
+    let pause = {
+        let mut hook = APPEND_COMPLETION_PAUSE.lock().unwrap();
+        if hook.as_ref().is_some_and(|p| p.store == store) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
+}
 struct Completion(Option<IOFlushed<Arx>>);
 impl Completion {
     fn new(c: IOFlushed<Arx>) -> Self {
@@ -162,7 +185,15 @@ impl RaftLogStorage<Arx> for LogAdapter {
                                 }
                                 s.append(&b)
                             });
+                        #[cfg(test)]
+                        let store_id = Arc::as_ptr(&store) as usize;
+                        // A cancelled caller can reopen as soon as it receives the
+                        // callback. Release this worker's ownership (including the
+                        // file lock if it is last) before publishing completion.
+                        drop(store);
                         guard.finish(&r.as_ref().map(|_| ()).map_err(|e| err(*e)));
+                        #[cfg(test)]
+                        pause_append_completion(store_id);
                         r
                     })
                     .await
