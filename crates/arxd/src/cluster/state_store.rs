@@ -55,6 +55,7 @@ pub enum StoreError {
     Full,
     Conflict,
     VoteRegressed,
+    Membership,
 }
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +72,7 @@ impl std::fmt::Display for StoreError {
             Self::Full => "log full",
             Self::Conflict => "log conflict",
             Self::VoteRegressed => "vote regressed",
+            Self::Membership => "membership out of bounds",
         })
     }
 }
