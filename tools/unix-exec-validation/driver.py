@@ -11,7 +11,7 @@ import sys
 import time
 import threading
 
-TEST = 'exec::disposable::a4::disposable_linux_a4_omitted_kill'
+TEST = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 
@@ -27,7 +27,8 @@ def standard_profile():
                      'exec::disposable::disposable_linux_a3_none',
                      'exec::disposable::a4::disposable_linux_a4',
                      'exec::disposable::a4::disposable_linux_a4_omitted_kill',
-                     'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')
+                     'exec::disposable::disposable_linux_a5',
+                     'exec::disposable::sudo_nnp::disposable_linux_a7_a11'), 'E_TEST_ARGS')
     return TEST != 'exec::disposable::disposable_linux_a3_none'
 
 
@@ -168,24 +169,104 @@ def remove_a4_helper(owned):
     os.rmdir('arxcovo', dir_fd=parent)
 
 
-# Fixed integration branch remains dormant behind selection and qualification.
-# Syntax success is never policy proof. No qualifying image is attested yet.
+# Fixed combined candidate. The profile labels reviewed facts, never host proof.
+A7_PROFILE = '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210'
+
+
 def a7_selected():
-    # Derived solely from the fixed source selection; standard_profile still rejects it.
     return TEST == 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
 
 
+def a7_package_read():
+    # Isolated Python has no sibling import path. Load only the reviewed fixed
+    # comparator bytes root-down without links. The fixed source hash supplies
+    # trust for checkout bytes; installed payload ancestry is checked by _read_linux.
+    path = Path(__file__).absolute().parent / 'sudo_package_profile.py'
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    fd = os.open('/', flags | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, flags | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        child = os.open(path.name, flags, dir_fd=fd)
+        os.close(fd)
+        fd = child
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and info.st_size == 11180, 'E_ARTIFACT')
+        data = os.read(fd, 11181)
+        require(len(data) == 11180 and os.read(fd, 1) == b'' and
+                hashlib.sha256(data).hexdigest() ==
+                '12a122db7d30be04dd7523db046d49f4083882c318b375ccf0986ec0eb338e75', 'E_ARTIFACT')
+        scope = {'__name__': 'a7_fixed_package'}
+        exec(compile(data, '<fixed-package>', 'exec'), scope)
+        return scope['_read_linux']()
+    finally:
+        os.close(fd)
+
+
+def a7_alias_c2():
+    # Missing final C2 is allowed; missing/unsafe ancestors and dangling links refuse.
+    held = []
+    try:
+        parent = sudo_nnp_open(Path('/usr/local/bin'), True)
+        held.append(parent)
+        root = sudo_nnp_open(Path('/'), True)
+        held.append(root)
+        usrbin = sudo_nnp_open(Path('/usr/bin'), True)
+        held.append(usrbin)
+        try:
+            info = os.stat('sudo', dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                    info.st_nlink == 1 and not info.st_mode & 0o022, 'E_C2')
+        before = os.stat('bin', dir_fd=root, follow_symlinks=False)
+        require(stat.S_ISLNK(before.st_mode) and before.st_uid == 0 and
+                before.st_nlink == 1 and before.st_size in (7, 8), 'E_ALIAS')
+        import ctypes
+        call = ctypes.CDLL(None).readlinkat
+        call.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t)
+        call.restype = ctypes.c_ssize_t
+        buffer = ctypes.create_string_buffer(9)
+        length = call(root, b'bin', buffer, 9)
+        require(0 <= length < 9 and buffer.raw[:length] in (b'usr/bin', b'/usr/bin'), 'E_ALIAS')
+        after = os.stat('bin', dir_fd=root, follow_symlinks=False)
+        require(before == after and os.stat('bin', dir_fd=root) == os.fstat(usrbin), 'E_ALIAS')
+        if info is not None:
+            fd = sudo_nnp_open(Path('/usr/local/bin/sudo'))
+            try:
+                pin = sudo_nnp_digest(fd)
+                require(pin['size'] == 282032 and pin['sha256'] ==
+                        '6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff'
+                        and os.stat('sudo', dir_fd=parent, follow_symlinks=False) == info,
+                        'E_C2')
+            finally:
+                os.close(fd)
+    finally:
+        for fd in reversed(held):
+            os.close(fd)
+
+
 def a7_admission():
-    # No installed adapter invocation or profile inference is authorized.
-    expected_profile = None
-    installed_payloads = None
-    require(expected_profile is not None and
-            sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
-    from sudo_package_profile import compare
-    require(compare(installed_payloads)['candidate_match'] is True, 'E_ARTIFACT')
+    require(a7_selected() and sys.platform == 'linux' and
+            os.getuid() == os.geteuid() == 0 and os.uname().machine == 'x86_64', 'E_POLICY_UNATTESTED')
+    result = a7_package_read()
+    require(result == dict(schema=1, status='candidate_match', candidate_match=True,
+            qualified=False, revision='1.9.15p5-3ubuntu5.24.04.4', architecture='amd64',
+            digests=dict(sudo='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff',
+                         sudoers='151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c',
+                         util='aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d')),
+            'E_ARTIFACT')
+    a7_alias_c2()
+    cg_preflight()
+    return A7_PROFILE
 
 
 def sudo_nnp_host_attested():
+    # Legacy original-host-policy path stays closed.
     return False
 
 
@@ -206,7 +287,7 @@ def sudo_nnp_accounts(run, owned):
     No adoption: pre-existing accounts/groups, roots or policy names refuse before
     the first mutation. Unknown identity after a partial command quarantines.
     """
-    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(a7_admission() == A7_PROFILE, 'E_POLICY_UNATTESTED')
     import pwd
     import grp
     require(os.getuid() == os.geteuid() == 0 and not owned, 'E_FIXTURE_UID')
@@ -348,7 +429,7 @@ def cleanup_sudo_nnp(owned, unit_gone=False):
             require(not os.path.lexists(item['base']), 'E_FIXTURE_RESIDUE')
 
 
-# Candidate only: installed plugin digest/default paths/floor remain UNATTESTED.
+# Candidate only: finite package/default checks precede effects; live view remains required.
 SUDO_NNP_PLUGIN = '/usr/libexec/sudo/sudoers.so'
 
 
@@ -380,7 +461,7 @@ def controlled_override(run):
 
 def prepare_controlled_sudo_nnp(run, accounts, fixture):
     # No original-policy collector, legacy writer or runtime selector edge.
-    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(a7_admission() == A7_PROFILE, 'E_POLICY_UNATTESTED')
     stage_controlled_sudo_nnp(run, fixture)
     for _ in sudo_nnp_accounts(run, accounts):
         pass
@@ -406,7 +487,7 @@ def controlled_pin(fd, directory=False):
 
 
 def stage_controlled_sudo_nnp(run, owned):
-    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(a7_admission() == A7_PROFILE, 'E_POLICY_UNATTESTED')
     sudo_nnp_names(run)
     require(not owned and os.getuid() == os.geteuid() == 0, 'E_FIXTURE_UID')
     stage, _ = plan(run)
@@ -602,7 +683,7 @@ def stage_sudo_nnp(env, owned):
     """
     run = gate(env, sys.platform)
     sudo_nnp_names(run)
-    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(a7_admission() == A7_PROFILE, 'E_POLICY_UNATTESTED')
     require(not owned, 'E_FIXTURE_COLLISION')
     stage, _ = plan(run)
     # Build capture defines exactly one output from each invocation.
@@ -659,9 +740,8 @@ def stage_sudo_nnp(env, owned):
 def handoff_sudo_nnp(env, accounts, artifacts):
     run = gate(env, sys.platform)
     names = sudo_nnp_names(run)
-    expected_profile = None  # independently attested exact host/image; absent
-    require(expected_profile is not None and
-            sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    expected_profile = a7_admission()
+    require(expected_profile == A7_PROFILE, 'E_POLICY_UNATTESTED')
     require(len(accounts) == len(artifacts) == 2, 'E_ARTIFACT')
     captured = []
     for item, name in zip(accounts, names):
@@ -1544,6 +1624,7 @@ def run_body(env):
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
     selected_a7 = a7_selected()
     if selected_a7:
+        require(env['GITHUB_RUN_ATTEMPT'] == '1', 'E_ID')
         a7_admission()  # before root/host probes, reservation or staging
     helper_data = a4_delivery() if a4_selected() else None
     require(os.getuid() == os.geteuid() == 0, 'E_ROOT')

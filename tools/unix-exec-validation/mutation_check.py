@@ -1,6 +1,7 @@
 """Finite in-memory assertion mutants. Only the audited pure/mock subset runs."""
 import hashlib
 import io
+import os
 from pathlib import Path
 import types
 import subprocess
@@ -13,8 +14,8 @@ import test_f0_blockers
 import test_f0b_transport
 
 CASES = [
- ('restore positive A4 selection', "TEST = 'exec::disposable::a4::disposable_linux_a4_omitted_kill'", "TEST = 'exec::disposable::a4::disposable_linux_a4'", 'test_source_selection_is_a4_omitted_kill'),
- ('omit closed A5', "'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')", "'exec::disposable::disposable_linux_a4'), 'E_TEST_ARGS')", 'test_closed_mapping'),
+ ('restore positive A4 selection', "TEST = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'", "TEST = 'exec::disposable::a4::disposable_linux_a4'", 'test_source_selection_is_combined_a7'),
+ ('omit closed A5', "'exec::disposable::disposable_linux_a5',", "'exec::disposable::disposable_linux_a4',", 'test_closed_mapping'),
  ('A5 without Standard', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST not in ('exec::disposable::disposable_linux_a3_none', 'exec::disposable::disposable_linux_a5')", 'test_closed_mapping'),
  ('A5 argv selects A3', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return [binary, 'exec::disposable::disposable_linux_a3_none' if TEST == 'exec::disposable::disposable_linux_a5' else TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_closed_mapping'),
  ('admit arbitrary disposable names', "require(TEST in (", "require(TEST.startswith('exec::disposable::disposable_linux_') or TEST in (", 'test_closed_selection_before_effects'),
@@ -185,7 +186,7 @@ def sudo_nnp_delivery_checks():
     schema = controller[controller.index('#[derive(serde::Deserialize)]'):controller.index('// Every component')]
     tests = controller[controller.index('#[test]\nfn a7_a11_delivery_schema_rejections'):controller.index('#[derive(Clone, Copy)]')]
     source = 'use std::path::{Path,PathBuf};\n' + schema + tests
-    deps = root / 'target/debug/deps'
+    deps = Path(os.environ.get('ARX_PURE_DEPS', str(root / 'target/debug/deps')))
     with tempfile.TemporaryDirectory(prefix='a7-a11-delivery-pure-') as tmp:
         exe = Path(tmp) / 'schema.exe'
         def check(code):
@@ -290,7 +291,7 @@ def sudo_nnp_source_checks():
     tools = tools_source[tools_source.index('pub const TOOLS:'):tools_source.index('const ENVIRONMENT:')]
     parsers = controller[controller.index('fn probe_records('):controller.index('fn valid_run(')]
     parser_test = controller[controller.index('#[test]\nfn a7_a11_record_discriminators'):controller.index('#[test]\nfn a7_a11_run_discriminators')]
-    rlibs = sorted((root / 'target/debug/deps').glob('libserde_json-*.rlib'))
+    rlibs = sorted((Path(os.environ.get('ARX_PURE_DEPS', str(root / 'target/debug/deps')))).glob('libserde_json-*.rlib'))
     assert rlibs, 'build locked offline Cargo test dependencies first'
     print('offline parser dependency: ' + rlibs[0].name)
     parser_source = 'mod development { ' + tools + '}\n' + parsers + parser_test
@@ -298,7 +299,7 @@ def sudo_nnp_source_checks():
         exe = Path(tmp) / 'records.exe'
         def check_records(code):
             built = subprocess.run(['rustc', '--edition=2024', '--test', '-', '-L',
-                                    'dependency=' + str(root / 'target/debug/deps'), '--extern',
+                                    'dependency=' + str(Path(os.environ.get('ARX_PURE_DEPS', str(root / 'target/debug/deps')))), '--extern',
                                     'serde_json=' + str(rlibs[0]), '-o', str(exe)], input=code,
                                    text=True, capture_output=True, timeout=60)
             assert built.returncode == 0, built.stderr
@@ -553,3 +554,93 @@ if __name__ == '__main__':
     controlled_policy_mutants()
     a7_integration_checks()
     a7_case_mock_checks()
+
+
+def execution_preparation_checks():
+    """Actual package_file/runtime_link; all file and syscall ports are fake."""
+    import os
+    source = (Path(__file__).resolve().parents[2] / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+    code = source[source.index('fn package_file('):source.index('fn runtime_package(')]
+    code = code.replace('std::fs::File','FakeFile').replace('std::fs::Metadata','FakeMeta')
+    code = code.replace('    use std::os::unix::fs::MetadataExt;\n','').replace('    use std::os::fd::AsRawFd;\n','')
+    mock = r'''
+#![allow(dead_code,non_camel_case_types)]
+use std::{path::Path,cell::RefCell,collections::VecDeque};
+#[derive(Clone)] struct FakeMeta { kind: bool, uid: u32, mode: u32, nlink: u64, len: u64, ino: u64 }
+impl FakeMeta {
+ fn is_file(&self)->bool {self.kind} fn uid(&self)->u32 {self.uid}
+ fn mode(&self)->u32 {self.mode} fn nlink(&self)->u64 {self.nlink}
+ fn len(&self)->u64 {self.len} fn ino(&self)->u64 {self.ino}
+ fn dev(&self)->u64 {1} fn gid(&self)->u32 {0}
+ fn mtime(&self)->i64 {1} fn mtime_nsec(&self)->i64 {0}
+ fn ctime(&self)->i64 {1} fn ctime_nsec(&self)->i64 {0}
+}
+#[derive(Clone)] struct FakeFile { meta: FakeMeta, bytes: Vec<u8> }
+impl FakeFile { fn metadata(&self)->Result<FakeMeta,()> {Ok(self.meta.clone())} fn as_raw_fd(&self)->i32 {17} }
+thread_local! { static FILES: RefCell<VecDeque<FakeFile>> = const {RefCell::new(VecDeque::new())};
+ static LINK: RefCell<(u32,u32,u64,Vec<u8>,bool)> = RefCell::new((0o120777,0,1,b"usr/bin".to_vec(),false)); }
+fn delivery_open(_: &Path,_:bool)->Option<FakeFile> { FILES.with(|q|q.borrow_mut().pop_front()) }
+fn controlled_read(f:&FakeFile,_:u64)->Option<Vec<u8>> {Some(f.bytes.clone())}
+mod libc {
+ pub const AT_SYMLINK_NOFOLLOW:i32=256; pub const S_IFMT:u32=0o170000; pub const S_IFLNK:u32=0o120000;
+ pub struct stat {pub st_mode:u32,pub st_uid:u32,pub st_nlink:u64,pub st_dev:u64,pub st_ino:u64,pub st_size:i64,pub st_mtime:i64,pub st_ctime:i64}
+ pub unsafe fn fstatat(_:i32,_:*const i8,p:*mut stat,_:i32)->i32 {
+  super::LINK.with(|v| {let v=v.borrow(); unsafe {p.write(stat {st_mode:v.0,st_uid:v.1,st_nlink:v.2,st_dev:1,st_ino:2,st_size:v.3.len() as i64,st_mtime:1,st_ctime:1})};0})
+ }
+ pub unsafe fn readlinkat(_:i32,_:*const i8,p:*mut std::ffi::c_void,n:usize)->isize {
+  super::LINK.with(|v| {let v=v.borrow(); if v.4 {return n as isize;} unsafe {std::ptr::copy_nonoverlapping(v.3.as_ptr(),p.cast(),v.3.len().min(n))}; v.3.len() as isize})
+ }
+}
+fn file()->FakeFile {FakeFile {meta:FakeMeta {kind:true,uid:0,mode:0o100755,nlink:1,len:5,ino:1},bytes:b"known".to_vec()}}
+#[test] fn runtime_package_counterfactuals() {
+ const HASH:&str="7117fff2d0fd294462b3c802b7cb8753579f23f3946b99cf55f38e873f013f10";
+ let check=|f:FakeFile,g:FakeFile| {FILES.with(|q|*q.borrow_mut()=VecDeque::from([f,g]));package_file(Path::new("/fixed"),5,HASH).is_some()};
+ assert!(check(file(),file()));
+ for i in 0..8 {let mut f=file();match i {0=>f.bytes[0]=b'X',1=>{f.bytes.pop();},2=>f.meta.uid=1,3=>f.meta.mode|=2,4=>f.meta.nlink=2,5=>f.meta.kind=false,6=>f.meta.len=4,_=>f.bytes.extend_from_slice(b"x")};assert!(!check(f.clone(),f),"case {i}");}
+ let mut swapped=file();swapped.meta.ino=2;assert!(!check(file(),swapped));
+ assert!(runtime_link(&file(),c"bin",&[b"usr/bin",b"/usr/bin"]).is_some());
+ for i in 0..5 {LINK.with(|v| {let mut v=v.borrow_mut();*v=(0o120777,0,1,b"usr/bin".to_vec(),false);match i {0=>v.0=0o100777,1=>v.1=1,2=>v.2=2,3=>v.3=b"dangling".to_vec(),_=>v.4=true}});assert!(runtime_link(&file(),c"bin",&[b"usr/bin",b"/usr/bin"]).is_none(),"link {i}");}
+}
+'''
+    # Reuse read-only locked development deps; build and temp outputs use D:.
+    deps = Path(os.environ.get('ARX_PURE_DEPS', str(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/deps')))
+    libs = sorted(deps.glob('libsha2-*.rlib'))
+    assert libs, 'existing locked sha2 development rlib required'
+    with tempfile.TemporaryDirectory(prefix='a7-runtime-') as tmp:
+        exe = Path(tmp) / 'runtime.exe'
+        def check(text):
+            result = subprocess.run(['rustc','--edition=2024','--test','-','-L','dependency='+str(deps),
+                '--extern','sha2='+str(libs[0]),'-o',str(exe)],input=mock+text,text=True,capture_output=True,timeout=60)
+            assert result.returncode == 0, result.stderr
+            return subprocess.run([str(exe),'runtime_package_counterfactuals','--exact'],capture_output=True,text=True,timeout=20)
+        result=check(code)
+        assert result.returncode == 0, result.stdout+result.stderr
+        print('PASS actual package_file/runtime_link mocked ports')
+        for before,after in [('before.uid() != 0','false'),('before.nlink() != 1','false'),
+                ('before.mode() & 0o022 != 0','false'),('before.len() != size','false'),
+                ('format!("{:x}", Sha256::digest(&bytes)) != digest','false'),
+                ('snapshot(&before) != snapshot(&again.metadata().ok()?)','false'),
+                ('!targets.contains(&&bytes[..n as usize])','false'),('st.st_uid == 0','true'),
+                ('st.st_nlink == 1','true')]:
+            assert code.count(before)==1,before
+            result=check(code.replace(before,after))
+            assert result.returncode==101 and "panicked at" in result.stdout,before+result.stdout+result.stderr
+            print('KILLED runtime '+before)
+
+
+def execution_admission_mutants():
+    source=Path(driver.__file__).read_text()
+    for before,after,case,name in [
+        ('require(result == dict(', 'require(True or result == dict(',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ("os.uname().machine == 'x86_64'",'True',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ('    a7_alias_c2()\n    cg_preflight()', '    cg_preflight()',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ('    cg_preflight()\n    return A7_PROFILE', '    return A7_PROFILE',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ("require(expected_profile == A7_PROFILE, 'E_POLICY_UNATTESTED')",'pass',test_driver.RuntimeAdmission,'test_profile_mismatch_before_handoff'),
+        ('        a7_admission()  # before root/host probes, reservation or staging','        pass',test_driver.A7Integration,'test_closed_before_host_and_package_adapter')]:
+        assert source.count(before)==1,before
+        module=types.ModuleType('runtime_admission_mutant')
+        exec(compile(source.replace(before,after),'<mocked-runtime-mutant>','exec'),module.__dict__)
+        with patch.object(test_driver,'driver',module):
+            result=unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([case(name)]))
+        assert result.failures and not result.errors,before+str(result.errors)
+        print('KILLED admission '+before)

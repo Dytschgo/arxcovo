@@ -806,8 +806,8 @@ class A1A2(unittest.TestCase):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
 
-    def test_source_selection_is_a4_omitted_kill(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
+    def test_source_selection_is_combined_a7(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::sudo_nnp::disposable_linux_a7_a11')
 
     def test_closed_mapping(self):
         # Independent expectations: never obtain the cases/profile from the driver.
@@ -919,6 +919,7 @@ class A1A2(unittest.TestCase):
             with patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=uid, st_nlink=links)), self.assertRaisesRegex(RuntimeError, 'E_TEST_LOG'):
                 driver.capture_size(Path('/stage'))
 
+    @patch.object(driver, "TEST", "exec::disposable::a4::disposable_linux_a4_omitted_kill")
     def test_exact_summary(self):
         marker = ('ARX_A4_OMITTED_S7_REJECTED\n'
                   if driver.TEST == 'exec::disposable::a4::disposable_linux_a4_omitted_kill' else '')
@@ -943,6 +944,7 @@ class A1A2(unittest.TestCase):
 class A4Delivery(unittest.TestCase):
     selected = 'exec::disposable::a4::disposable_linux_a4'
 
+    @patch.object(driver, "TEST", "exec::disposable::a4::disposable_linux_a4_omitted_kill")
     def test_closed_mapping_and_default(self):
         self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
         with patch.object(driver, 'TEST', self.selected):
@@ -1201,6 +1203,7 @@ class SudoNnp(unittest.TestCase):
         pwd = SimpleNamespace(getpwnam=lambda n: lookup(users, n))
         grp = SimpleNamespace(getgrnam=lambda n: lookup(groups, n))
         stack.enter_context(patch.dict(sys.modules, pwd=pwd, grp=grp))
+        stack.enter_context(patch.object(driver, 'a7_admission', return_value=driver.A7_PROFILE))
         events = []
         def call(args):
             events.append(args[0])
@@ -1246,11 +1249,9 @@ class SudoNnp(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'E_IDENTITY'):
                 driver.sudo_nnp_names(value)
         selected = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
-        with patch.object(driver, 'TEST', selected), patch.object(driver.os, 'open') as opened:
-            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
-                driver.test_argv('/binary')
-            opened.assert_not_called()
-        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
+        with patch.object(driver, 'TEST', selected):
+            self.assertTrue(driver.standard_profile())
+            self.assertEqual(driver.test_argv('/binary')[1], selected)
 
     def test_unattested_before_effects(self):
         with patch.object(driver, 'call') as call, patch.object(driver.Path, 'mkdir') as mkdir:
@@ -1408,7 +1409,8 @@ class SudoNnpDelivery(unittest.TestCase):
                 self.assertEqual([a[1] for a in commands], ['test', 'build'])
                 self.assertLessEqual(len(out.getvalue()), 4 * 1024 * 1024)
 
-    def test_closed_before_build_or_handoff_effects(self):
+    @patch.object(driver, "a7_admission", side_effect=RuntimeError("E_POLICY_UNATTESTED"))
+    def test_closed_before_build_or_handoff_effects(self, _admission):
         with patch.object(driver.sys, 'platform', 'linux'), \
              patch.object(driver, 'build_sudo_nnp') as build, \
              patch.object(driver.os, 'open') as opened, \
@@ -1476,6 +1478,7 @@ class SudoNnpDelivery(unittest.TestCase):
                     return stack.enter_context(patch.object(obj, name, create=True, **kw))
                 mock(driver.sys, 'platform', new='linux')
                 mock(driver, 'sudo_nnp_eligible', return_value=True)
+                mock(driver, 'a7_admission', return_value=driver.A7_PROFILE)
                 build = mock(driver, 'build_sudo_nnp', return_value=(harness, stage / 'source/target/debug/arxd'))
                 write_manifest = mock(driver, 'exclusive_file')
                 opens = mock(driver, 'sudo_nnp_open', side_effect=[1, 2, 3, 4])
@@ -1513,7 +1516,8 @@ if __name__ == '__main__':
 class ControlledPolicy(unittest.TestCase):
     setup_owned = SudoNnp.setup_owned
 
-    def test_closed_before_effects_and_no_legacy_edge(self):
+    @patch.object(driver, "a7_admission", side_effect=RuntimeError("E_POLICY_UNATTESTED"))
+    def test_closed_before_effects_and_no_legacy_edge(self, _admission):
         with patch.object(driver, 'stage_controlled_sudo_nnp') as stage, \
              patch.object(driver, 'sudo_nnp_accounts') as accounts:
             with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
@@ -1624,6 +1628,7 @@ class ControlledPolicy(unittest.TestCase):
     def test_stage_is_exclusive_private_and_quarantines_short_write(self):
         with ExitStack() as stack:
             stack.enter_context(patch.object(driver, 'sudo_nnp_eligible', return_value=True))
+            stack.enter_context(patch.object(driver, 'a7_admission', return_value=driver.A7_PROFILE))
             stack.enter_context(patch.object(driver.os, 'getuid', return_value=0, create=True))
             stack.enter_context(patch.object(driver.os, 'geteuid', return_value=0, create=True))
             for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
@@ -1670,7 +1675,7 @@ class ControlledPolicy(unittest.TestCase):
             legacy.assert_not_called()
 
     def test_invalid_identity_before_staging_effects(self):
-        with patch.object(driver, 'sudo_nnp_eligible', return_value=True), \
+        with patch.object(driver, 'a7_admission', return_value=driver.A7_PROFILE), \
              patch.object(driver, 'sudo_nnp_open') as opened:
             for run in ('1-1234567', '../foreign', '0-1'):
                 with self.assertRaisesRegex(RuntimeError, 'E_IDENTITY'):
@@ -1683,15 +1688,15 @@ class A7Integration(unittest.TestCase):
 
     def test_closed_before_host_and_package_adapter(self):
         with patch.object(driver, 'TEST', self.selected), \
-             patch.object(driver, 'cg_preflight', side_effect=AssertionError('host')), \
-             patch.object(driver, 'reserve_unit', side_effect=AssertionError('reserve')):
-            with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
+             patch.object(driver, 'a7_admission', side_effect=RuntimeError('E_POLICY_UNATTESTED')), \
+             patch.object(driver, 'reserve_unit') as reserve, \
+             patch.object(driver, 'cg_preflight', side_effect=RuntimeError('E_HOST')), \
+             patch.object(driver.os, 'getuid', create=True, return_value=0), \
+             patch.object(driver.os, 'geteuid', create=True, return_value=0), \
+             patch.object(driver.sys, 'platform', 'linux'):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
                 driver.run_body(valid_env())
-            # Even counterfactually opening only selection cannot qualify this host.
-            with patch.object(driver, 'standard_profile', return_value=True), patch.object(driver.sys, 'platform', 'linux'):
-                with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
-                    driver.run_body(valid_env())
-        self.assertFalse(driver.sudo_nnp_host_attested())
+            reserve.assert_not_called()
 
     def test_both_case_markers_and_exact_summary(self):
         stage = unittest.mock.MagicMock()
@@ -1765,3 +1770,138 @@ class A7Integration(unittest.TestCase):
                 else:
                     driver.cleanup_a1a2(*args,a7_owned=([],{},dict(entries=[1])))
                     self.assertEqual(events, ['policy','cleanup_sudo_nnp','cleanup_sudo_nnp_delivery','remove_runtime'])
+
+
+class RuntimeAdmission(unittest.TestCase):
+    """Fixed-read boundaries replaced; no native adapter is ever constructed."""
+    def ports(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        patches = [(driver.sys, 'platform', {'new': 'linux'}),
+                   (driver.os, 'getuid', {'return_value': 0}),
+                   (driver.os, 'geteuid', {'return_value': 0}),
+                   (driver.os, 'uname', {'return_value': SimpleNamespace(machine='x86_64')}),
+                   (driver, 'a7_package_read', {'return_value': dict(schema=1,status='candidate_match',
+                     candidate_match=True, qualified=False, revision='1.9.15p5-3ubuntu5.24.04.4',
+                     architecture='amd64',digests=dict(
+                     sudo='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff',
+                     sudoers='151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c',
+                     util='aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d'))}),
+                   (driver,'a7_alias_c2',{}), (driver,'cg_preflight',{})]
+        return {name: stack.enter_context(patch.object(owner,name,create=True,**kw)) for owner,name,kw in patches}
+
+    def test_runtime_refusals_before_effects(self):
+        ports = self.ports()
+        self.assertEqual(driver.a7_admission(), '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210')
+        good = ports['a7_package_read'].return_value
+        for field,value in [('qualified',True),('candidate_match',False),('architecture','arm64'),
+                ('revision','unknown'),('digests',{}),('status','refused')]:
+            ports['a7_package_read'].return_value = dict(good, **{field:value})
+            ports['a7_alias_c2'].reset_mock()
+            with self.assertRaises(RuntimeError): driver.a7_admission()
+            ports['a7_alias_c2'].assert_not_called()
+        ports['a7_package_read'].return_value = good
+        for port in ('a7_alias_c2','cg_preflight'):
+            ports[port].side_effect = RuntimeError('refuse')
+            with self.assertRaises(RuntimeError): driver.a7_admission()
+            ports[port].side_effect = None
+        for selected in ('unknown','exec::disposable::disposable_linux_arbitrary'):
+            with patch.object(driver,'TEST',selected), self.assertRaises(RuntimeError): driver.standard_profile()
+        ports['uname'].return_value.machine = 'aarch64'
+        ports['a7_package_read'].reset_mock()
+        with self.assertRaises(RuntimeError): driver.a7_admission()
+        ports['a7_package_read'].assert_not_called()
+
+    def test_profile_mismatch_before_handoff(self):
+        with patch.object(driver.sys,'platform','linux'), \
+             patch.object(driver,'a7_admission',return_value='b'*64), \
+             patch.object(driver,'exclusive_file') as write:
+            with self.assertRaisesRegex(RuntimeError,'E_POLICY_UNATTESTED'):
+                driver.handoff_sudo_nnp(valid_env(),[],[])
+            write.assert_not_called()
+
+    def test_controller_runtime_and_view_precede_runner(self):
+        source = (ROOT / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+        for section in (source.split('fn prepared_delivery()',1)[1].split('#[derive',1)[0],
+                        source.split('fn recheck_delivery(',1)[1].split('#[test]',1)[0]):
+            self.assertIn('runtime_package()?',section)
+            self.assertIn('controlled_view(',section)
+            self.assertIn('read_fixed_delivery(A7_PROFILE)?',section)
+        self.assertIn('51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210',source)
+
+
+    def test_alias_c2_with_only_fake_ports(self):
+        import ctypes
+        class Call:
+            target = b'usr/bin'
+            def __call__(self,fd,name,buffer,limit):
+                self_test.assertEqual((fd,name,limit),(17,b'bin',9))
+                buffer.raw = self.target.ljust(9,b'X')[:9]
+                return len(self.target)
+        self_test=self
+        call=Call()
+        fake=SimpleNamespace(CDLL=lambda _:SimpleNamespace(readlinkat=call),
+             c_int=ctypes.c_int,c_char_p=ctypes.c_char_p,c_void_p=ctypes.c_void_p,
+             c_size_t=ctypes.c_size_t,c_ssize_t=ctypes.c_ssize_t,
+             create_string_buffer=ctypes.create_string_buffer)
+        link=SimpleNamespace(st_mode=stat.S_IFLNK|0o777,st_uid=0,st_nlink=1,st_size=7)
+        directory=object()
+        c2=SimpleNamespace(st_mode=stat.S_IFREG|0o4755,st_uid=0,st_nlink=1)
+        def run(present=False,pin=None):
+            def info(name,**kw):
+                if name=='sudo':
+                    if not present: raise FileNotFoundError()
+                    return c2
+                return link if kw.get('follow_symlinks') is False else directory
+            with patch.dict(sys.modules,ctypes=fake), \
+                 patch.object(driver,'sudo_nnp_open',return_value=17), \
+                 patch.object(driver.os,'stat',side_effect=info), \
+                 patch.object(driver.os,'fstat',return_value=directory), \
+                 patch.object(driver.os,'close'), \
+                 patch.object(driver,'sudo_nnp_digest',return_value=pin):
+                driver.a7_alias_c2()
+        run()
+        good=dict(size=282032,sha256='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff')
+        run(True,good)
+        for pin in (dict(good,size=1),dict(good,sha256='b'*64)):
+            with self.assertRaises(RuntimeError):run(True,pin)
+        for mode in (stat.S_IFLNK|0o777,stat.S_IFREG|0o777):
+            c2.st_mode=mode
+            with self.assertRaises(RuntimeError):run(True,good)
+        for target in (b'dangling',b'usr/binXX',b'/tmp'):
+            call.target=target
+            with self.assertRaises(RuntimeError):run()
+
+
+    def test_fixed_loader_hash_before_adapter(self):
+        data=(ROOT / 'tools/unix-exec-validation/sudo_package_profile.py').read_bytes()
+        reader=unittest.mock.Mock(return_value='fixed result')
+        def load(code,scope):
+            scope['_read_linux']=reader
+        for payload,nlink,regular in ((data,1,True),(data[:-1],1,True),
+                (b'X'+data[1:],1,True),(data,2,True),(data,1,False)):
+            reader.reset_mock()
+            with ExitStack() as stack:
+                for flag,value in [('O_NOFOLLOW',8),('O_CLOEXEC',16),('O_NONBLOCK',32),('O_DIRECTORY',64)]:
+                    stack.enter_context(patch.object(driver.os,flag,new=value,create=True))
+                stack.enter_context(patch.object(driver.os,'open',return_value=17))
+                stack.enter_context(patch.object(driver.os,'close'))
+                stack.enter_context(patch.object(driver.os,'fstat',return_value=SimpleNamespace(
+                    st_mode=(stat.S_IFREG if regular else stat.S_IFDIR)|0o644,st_nlink=nlink,st_size=11180)))
+                stack.enter_context(patch.object(driver.os,'read',side_effect=[payload,b'']))
+                stack.enter_context(patch('builtins.exec',side_effect=load))
+                if payload==data and nlink==1 and regular:
+                    self.assertEqual(driver.a7_package_read(),'fixed result')
+                    reader.assert_called_once_with()
+                else:
+                    with self.assertRaises(RuntimeError):driver.a7_package_read()
+                    reader.assert_not_called()
+
+
+    def test_retry_attempt_refuses_before_adapter(self):
+        env=valid_env()
+        env['GITHUB_RUN_ATTEMPT']='2'
+        with patch.object(driver.sys,'platform','linux'), \
+             patch.object(driver,'a7_admission') as admission:
+            with self.assertRaisesRegex(RuntimeError,'E_ID'):driver.run_body(env)
+            admission.assert_not_called()
