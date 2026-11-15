@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Sol highfed7d66 retained26360a5 correctly hands back actual E0308(defaultProgressResponder vs specifiedOneshot) and additivechrono lock edges; no implementation retained or quorum proof. Coordinator verifies exact primary ProgressResponder::complete_only source and corrects the constructor plus narrow lock-edge allowlist, preserving pins/C1/C2. Implementation resumes; partial40-test draft results not counted as current consensus evidence.
+
 - 2026-11-15: Opus high1a12ad8 retainedbc90124 corrects C1 eager callback ownership and C2 tracked engine-held proposal permits. Independent Sol delta review closes both for implementation; actual unpolled callback and64-uncommitted cancellation tests mandatory. Sol real-engine/in-process3node implementation starts next; no transport/signing/fullM3 or M2 credit.
 
 - 2026-11-15: Opus high2664129 retained284b80e prepares real OpenRaft adapter/three-node contract. Independent Sol review finds cancellation gaps C1(unpolled append callback guard) and C2(caller cancellation releases permit before engine completion). D: dependency-free Rust probe confirms deferred/eager guard distinction. Narrow Opus correction requested before implementation; no actual consensus acceptance or M2 closure.

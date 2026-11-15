@@ -52,7 +52,7 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 
 1. **Pins.** In `crates/arxd/Cargo.toml`: `openraft = { version = "=0.10.0", default-features = false, features = ["tokio-rt"] }`,
    `futures-util = "=0.3.34"`, and tokio gains `"sync"`. No `serde`, `clap`, `bt`, `single-threaded` or `type-alias`. Cargo.lock may only
-   **add** packages; existing entries stay byte-identical. Record `cargo tree -e features -i openraft` in the evidence file.
+   add packages and necessary direct edges in `arxd`; existing package versions/checksums/sources stay identical. The only other existing-block additions allowed are `chrono`'s `js-sys`/`wasm-bindgen` edges from default-feature unification. Record package-block comparison and feature trees; no manual incomplete lock.
 2. **Types.** `declare_raft_types!(pub Arx: D = enrollment::Command, R = Applied)`, with all other defaults. `Applied(pub
    Option<Outcome>)`. `Command` gains a static `Display` ("enrollment mint"/"enrollment redeem"). No tracing subscriber
    is added; if one is added later, Debug/Display exposure must be reviewed again.
@@ -104,7 +104,7 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
     Unknown}` and never retries. `Busy`/`Stopped`/`NotLeader` mean not appended. `Unknown` is never a final failure: callers retry the identical command; enrollment
     dedup resolves it. **Owners (C2):** with no `.await` before the spawn, `propose` does `try_acquire_owned` on a 64-permit `Arc<Semaphore>` (none: `Busy`), locks
     `owners: std::sync::Mutex<{closed, set: JoinSet<()>}>` (never across `.await`), returns `Stopped` if `closed`, else reaps via `try_join_next` and does
-    `set.spawn(owner(raft.clone(), cmd, permit, reply_tx))`. The owner calls `client_write_ff(cmd, Some(responder))`, holds the permit until the receiver resolves or
+    `set.spawn(owner(raft.clone(), cmd, permit, reply_tx))`. The owner gets `(responder, receiver)` from default `ProgressResponder::<Arx, _>::complete_only()`, calls `client_write_ff(cmd, Some(responder))`, holds the permit until the receiver resolves or
     `Fatal`, then drops it and does `let _ = reply_tx.send(..)`. The caller awaits only `reply_rx`, so its cancellation or timeout never frees a permit the engine
     still needs; a `propose` dropped before the spawn enqueued nothing. `propose` has no timeout; a caller timeout means `Unknown`. `Ok` gives `(LogPos(log_id),
     data.0)`, `ForwardToLeader` `NotLeader`, and `LogEntryDiscarded`/`Fatal`/`RecvError`/owner panic `Unknown`. Owners exist only in `set` (no `tokio::spawn`/detach);
