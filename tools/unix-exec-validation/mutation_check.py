@@ -48,9 +48,20 @@ CASES = [
 def run_case(module, name):
     owner = test_f0_blockers if name.startswith('F0Blockers.') else test_driver
     with patch.object(owner, 'driver', module):
-        suite = unittest.defaultTestLoader.loadTestsFromName(name if owner is test_f0_blockers else 'A1A2.' + name, owner)
+        suite = unittest.defaultTestLoader.loadTestsFromName(name if owner is test_f0_blockers or name.startswith('A4Delivery.') else 'A1A2.' + name, owner)
         result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
     return result
+
+
+CASES += [
+    ('omit closed A4', "                     'exec::disposable::a4::disposable_linux_a4',\n", '', 'A4Delivery.test_closed_mapping_and_default'),
+    ('A4 without Standard', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST not in ('exec::disposable::disposable_linux_a3_none', 'exec::disposable::a4::disposable_linux_a4')", 'A4Delivery.test_closed_mapping_and_default'),
+    ('omit A4 source recipe hash', "require(hashlib.sha256(inputs[name]).hexdigest() == digest, 'E_ARTIFACT')", "require(True, 'E_ARTIFACT')", 'A4Delivery.test_source_and_recipe_independent_of_image'),
+    ('omit image size and hash', "require(len(data) == A4_IMAGE_SIZE and\n            hashlib.sha256(data).hexdigest() == A4_IMAGE_SHA, 'E_ARTIFACT')", "require(True, 'E_ARTIFACT')", 'A4Delivery.test_size_and_hash_both_required_before_open'),
+    ('omit staged held hash', '        a4_image(os.read(fd, A4_IMAGE_SIZE + 1))', '        pass', 'A4Delivery.test_stage_descriptor_bytes_and_owned_cleanup'),
+    ('omit helper short write fence', "require(os.write(fd, data) == len(data), 'E_ARTIFACT')", "os.write(fd, data)", 'A4Delivery.test_short_write_cannot_launch'),
+    ('adopt replaced helper directory', "same('arxcovo', parent, owned['directory'])", 'pass', 'A4Delivery.test_replaced_or_extra_asset_quarantines'),
+]
 
 def safe_suite():
     # Guard CLI, RuntimeGuards and CopyGuards deliberately excluded. CgroupScan
@@ -60,6 +71,7 @@ def safe_suite():
     suite = unittest.TestSuite(test_driver.Guards(n) for n in names)
     for case in (test_driver.A1A2, test_driver.CgroupScan, test_f0_blockers.F0Blockers):
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.A4Delivery))
     suite.addTests(test_f0b_transport.suite())
     return suite
 
@@ -80,7 +92,7 @@ def main():
         result = run_case(module, name)
         assert not result.errors, 'errors earn no credit: ' + label + str(result.errors)
         assert result.failures and all(t.id().endswith(name) or name in t.id() for t,_ in result.failures), 'SURVIVED: ' + label
-        print('KILLED ' + label + ' assertion=' + (name if name.startswith('F0Blockers.') else 'A1A2.'+name))
+        print('KILLED ' + label + ' assertion=' + (name if name.startswith(('F0Blockers.', 'A4Delivery.')) else 'A1A2.'+name))
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, 'source changed'
     print('source unchanged sha256=' + digest)
 

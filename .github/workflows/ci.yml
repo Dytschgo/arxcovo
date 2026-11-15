@@ -35,6 +35,11 @@ jobs:
           tool: cargo-nextest@0.9.151
       - name: Pure Unix experiment guards (no provisioning)
         run: python -I -m unittest discover -s tools/unix-exec-validation -p 'test_*.py'
+      - name: Compile fixed A4 helper without execution
+        if: runner.os == 'Linux'
+        run: |
+          python3 -I -B -m unittest discover -s tools/unix-exec-validation/a4-helper -p 'test_build.py'
+          python3 -I -B tools/unix-exec-validation/a4-helper/build.py linux-candidate
       - name: Bounded read-only Unix manager observations
         if: runner.os == 'Linux'
         run: |

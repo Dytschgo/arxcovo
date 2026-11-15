@@ -1,7 +1,8 @@
 # Fixed A4 waiting helper — source/build preparation only
 
-This directory is outside Cargo and is not a tool-discovery asset. Nothing in
-the driver, selectors, workflows, package or production code references it.
+This directory is outside Cargo and is not a tool-discovery asset. The dormant
+closed A4 driver branch references only its fixed inputs and output. Default
+TEST remains A5; workflows, package and production code do not reference it.
 Binding: ADR0020 D9a binding 1, effective with PR102 merge
 `fa416937d49964ffa2491fc99d66bc0890ea6ee6`. No fixture spawn is implemented here.
 
@@ -72,12 +73,38 @@ segments, undefined/forbidden symbols and an entry other than recorded _start.
 Symbol names alone are not a proof of behavior; the single source plus fixed
 compiler/linker and artifact identity supply the reviewable closure.
 
-`image-pin.json` records a real **Windows-to-Linux cross-compile**, not a Linux
-hosted build or execution. Compiler host is explicitly Windows. No binary is
-committed or distributed. A Linux-host compiler has a different identity and
-must receive a separately reviewed recipe/pin, not overwrite this one or
-pretend its output is identical. Artifact delivery and descriptor-bound
-SHA-256/size verification before spawn remain later fixture work.
+`image-pin.json` preserves the reviewed **Windows-to-Linux cross-compile**
+(3,696 bytes). `linux-image-pin.json` records the actual hosted Linux build
+(3,680 bytes), with its observed compiler/linker identity and hashes. No binary
+is committed. Both use the same pinned source, flags and full symbol inventory.
+The [compile comparison](../../../docs/evidence/a4-helper-linux-build-comparison.json)
+records identical entry, program headers and mapped bytes after excluding only
+`e_shoff`, the non-runtime section-table offset. Only non-loaded `.comment`
+content and the resulting section-table location differ. This Linux pin awaits
+independent review with the source change; no arbitrary candidate may repin itself.
+
+## Dormant Linux delivery preparation
+
+On an already-equipped Linux host, as a non-root account, `python
+tools/unix-exec-validation/a4-helper/build.py linux-candidate` uses the same
+source/flags and Rust release identity, with the Linux compiler host substituted.
+It records compiler/linker observations in ignored `out/candidate-pin.json` and
+compares source, flags, exact image hash, size and symbols to the separately
+fixed `linux-image-pin.json`. Any difference refuses. Neither pin is overwritten.
+The section/load comparison report is diagnostic only; it cannot authorize an
+image or replace the full-file SHA-256 check. No toolchains are installed.
+
+The closed A4 driver branch independently validates fixed source/recipe/Linux-pin
+bytes and the exact Linux image before reservation or privileged mutation.
+Observed compiler hashes do not authorize a different image. Delivery holds
+verified bytes in memory, exclusively creates root-owned `/usr/libexec/arxcovo`,
+and writes only `a4-helper` through no-follow descriptors. Existing parent
+entries refuse with no adoption; missing/untrusted ancestors also refuse.
+The staged held descriptor must match the same 3,680-byte Linux image pin used
+by the ignored fixture. Owned cleanup follows unit stop and cgroup disappearance;
+replacement, extra entries or missing identity quarantine rather than delete.
+No launcher, image path parameter, environment override or root helper compile
+is added. Actual TEST stays A5; this tooling grants no native A4 execution.
 
 ## Pure checks
 
