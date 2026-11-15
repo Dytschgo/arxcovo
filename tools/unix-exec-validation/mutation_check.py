@@ -433,7 +433,123 @@ def controlled_policy_mutants():
             print('KILLED controlled Rust ' + before)
 
 
+def a7_integration_checks():
+    """Actual fixed scheduling code only: no Runner, files, LinuxFs or helper."""
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.A7Integration)
+    assert unittest.TextTestRunner().run(suite).wasSuccessful()
+    source = Path(driver.__file__).read_text()
+    for before, after, name in [
+            ("text.count(marker + '\\n') == 1", 'True', 'test_both_case_markers_and_exact_summary'),
+            ("require(deadline > time.monotonic(), 'E_TEST_TIMEOUT')", 'pass', 'test_active_identity_before_ack_and_terminal_deadline'),
+            ("ack_start - monitor_start <= 15", 'True', 'test_active_identity_before_ack_and_terminal_deadline'),
+            ("time.monotonic() - ack_start <= 5", 'True', 'test_active_identity_before_ack_and_terminal_deadline'),
+            ("        if policy:\n            cleanup_controlled_sudo_nnp", "        if policy.get('entries'):\n            cleanup_controlled_sudo_nnp", 'test_cleanup_requires_stop_and_preserves_partial_policy')]:
+        assert source.count(before) == 1, before
+        module = types.ModuleType('a7_driver_mutant')
+        exec(compile(source.replace(before, after), '<a7-mutant>', 'exec'), module.__dict__)
+        with patch.object(test_driver, 'driver', module):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(
+                unittest.TestSuite([test_driver.A7Integration(name)]))
+        assert result.failures and not result.errors, name + str(result.errors)
+        print('KILLED A7 driver ' + before)
+    root = Path(__file__).resolve().parents[2]
+    controller = (root / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+    code = 'use std::time::Duration;\n' + controller[controller.index('fn a7_cases('):controller.index('// Pure discriminators')]
+    with tempfile.TemporaryDirectory(prefix='a7-integration-') as tmp:
+        exe = Path(tmp) / 'schedule.exe'
+        def check(text):
+            result = subprocess.run(['rustc','--edition=2024','--test','-','-o',str(exe)],
+                input=text, text=True, capture_output=True, timeout=60)
+            assert result.returncode == 0, result.stderr
+            return subprocess.run([str(exe),'a7_a11_scheduling_counterfactuals','--exact'],
+                text=True, capture_output=True, timeout=20)
+        assert check(code).returncode == 0
+        print('PASS actual a7_a11_scheduling_counterfactuals exact pure Rust')
+        for before, after in [('calls[0] <= Duration::from_secs(60)', 'true'),
+                ('calls[1] <= Duration::from_secs(15)', 'true'),
+                ('checks <= Duration::from_secs(15)', 'true'),
+                ('total <= Duration::from_secs(90)', 'true'),
+                ('good && joined == [true, true]', 'true && joined == [true, true]'),
+                ('elapsed <= Duration::from_secs(10)', 'true'),
+                ('joined == [true, true]', 'true')]:
+            assert code.count(before) == 1
+            result = check(code.replace(before, after))
+            assert result.returncode == 101 and 'assertion' in result.stdout, before + result.stdout
+            print('KILLED integration ' + before)
+
+
+def a7_case_mock_checks():
+    # Actual case function; every host boundary below is replaced with a mock.
+    root = Path(__file__).resolve().parents[2]
+    controller = (root / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+    case = controller[controller.index('fn a7_case('):controller.index('// Fixed two-case scope')]
+    envelope = controller[controller.index('fn a7_envelopes('):controller.index('#[test]\nfn a7_a11_scheduling')]
+    mock = r'''
+use std::{path::{Path,PathBuf},time::Duration,cell::RefCell};
+thread_local! { static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; }
+fn event(s: &str) { EVENTS.with(|e| e.borrow_mut().push(s.into())); }
+struct Config { workspace: PathBuf }
+struct Prepared { accounts: [Config;2], arxd: PathBuf, reentry: PathBuf }
+struct Cancellation;
+struct RunSpec { executable: PathBuf, arguments: Vec<String>, cwd: PathBuf, timeout: Duration, output_bytes: usize }
+struct RunResult { step: usize }
+struct Runner { fail: usize, residue: bool }
+impl Runner {
+    fn run_phased(&self,spec: &RunSpec,_: &Cancellation,_: &Cancellation) -> Result<RunResult,()> {
+        let step = if spec.executable == Path::new("arxd") { 0 } else { 1 };
+        assert_eq!(spec.timeout, Duration::from_secs(if step == 0 {55} else {10}));
+        assert_eq!(spec.output_bytes,4096);
+        assert_eq!(spec.cwd, Path::new("workspace"));
+        if step == 0 { assert_eq!(spec.arguments, ["tool-probe"]); }
+        else { assert_eq!(spec.arguments, ["--exact","unix_shim::rights::linux::tests::e4_sudo_nnp_reentry","--ignored","--nocapture","--test-threads=1","--color=never"]); }
+        event(if step == 0 {"probe"} else {"reentry"});
+        if self.fail == step { Err(()) } else { Ok(RunResult {step}) }
+    }
+    fn cleanup_residue(&self) -> bool { self.residue }
+}
+fn recheck_delivery(_: &Config, exe: &Path) -> Option<()> { event(if exe == Path::new("arxd") {"admit-probe"} else {"admit-reentry"}); Some(()) }
+fn valid_run(_: &RunResult,_: &Config,residue: bool) -> bool { !residue }
+fn output(r: &RunResult) -> Option<Vec<u8>> { Some(vec![r.step as u8]) }
+fn probe_records(b: &[u8]) -> bool { b == [0] }
+fn reentry_records(b: &[u8]) -> bool { b == [1] }
+fn a7_marker(b: &[u8]) -> bool { event(std::str::from_utf8(b).unwrap()); true }
+#[test]
+fn actual_case_sequence() {
+    let prepared = Prepared { accounts: [Config {workspace: "workspace".into()},Config {workspace: "workspace".into()}], arxd: "arxd".into(), reentry: "reentry".into() };
+    for index in 0..2 {
+        for fail in 0..3 {
+            EVENTS.with(|e| e.borrow_mut().clear());
+            assert_eq!(a7_case(&prepared,index,&Runner {fail,residue:false},&Cancellation,&Cancellation),fail == 2);
+            let expected = if fail == 0 { vec!["admit-probe".to_string(),"probe".into()] }
+                else { let mut v = vec!["admit-probe".to_string(),"probe".into(),"admit-reentry".into(),"reentry".into()];
+                    if fail == 2 { v.push(format!("ARX_A7_A11_CASE{index}_OK\n")); } v };
+            EVENTS.with(|e| assert_eq!(*e.borrow(), expected));
+        }
+        assert!(!a7_case(&prepared,index,&Runner {fail:2,residue:true},&Cancellation,&Cancellation));
+    }
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='a7-case-mocks-') as tmp:
+        exe = Path(tmp) / 'case.exe'
+        def check(text):
+            built = subprocess.run(['rustc','--edition=2024','--test','-','-o',str(exe)],
+                input=text,text=True,capture_output=True,timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe),'actual_case_sequence','--exact'],text=True,capture_output=True,timeout=20)
+        result = check(mock + case + envelope)
+        assert result.returncode == 0, result.stdout + result.stderr
+        print('PASS actual a7_case with mocked boundaries: both indices, call failures, residue, sequence')
+        for before, after in [('55', '20'), ('4096', '8192'), ('probe_records(&bytes)', 'false'),
+                ('reentry_records(&bytes)', 'false'), ('valid_run(&result, config, runner.cleanup_residue())', 'true')]:
+            assert case.count(before) == 1
+            result = check(mock + case.replace(before, after) + envelope)
+            assert result.returncode == 101 and 'assertion' in result.stdout, before + result.stdout
+            print('KILLED actual case ' + before)
+
+
 if __name__ == '__main__':
     main()
     rust_mutants()
     controlled_policy_mutants()
+    a7_integration_checks()
+    a7_case_mock_checks()
