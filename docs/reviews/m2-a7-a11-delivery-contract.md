@@ -194,3 +194,23 @@ both cases/source/artifacts/workflow/profile/bounds on a fresh host. D7a-h remai
 consumed; the stale A1/A2 owner reply is closed. Source ceiling and pure rejection/
 scheduling/cancellation tests are as fixed in the proposal. A7/A11, M2, full F/G
 and real-Runner PA6 remain **unverified on real hardware**.
+
+## Binding C2-view amendment (ADR0020 D9c)
+
+After this amendment review/gates/merge, the controlled fixture uses exactly FIVE
+read-only mappings: four D9b policy mappings plus `<stage>/fx/c2-empty:/usr/local/bin`.
+Exclusive root-owned empty source0755, captured identity, no022, exact empty set;
+no adoption, optional source or extra mapping. Earlier 0700 remedy wording is
+superseded: the actual low-UID probe opens candidate directories O_RDONLY and
+must observe sudo ENOENT, not EACCES/unknown. No product rights logic changes.
+Verify effective mapping property, mountinfo/statvfs read-only, source/view dev+ino,
+ownership/mode/empty/C2-absence inside unit before Runner and per call. Extend
+existing fixed mapping/held-FD/owned-cleanup/quarantine shape only to this source.
+Outside-unit admission keeps package/C1/plugin/util, protected /usr/bin/alias and
+floor checks; host C2 ancestry is not claimed safe or absent. Only this controlled
+fixture proves its closed C2 view in-unit instead. Ordinary strict host checks
+stay. PATH=/usr/bin:/bin, artifacts/accounts/schema, NNP and all real oracles,
+case budgets and both-worker cancel/join stay. Future source updates canonical
+profile facts for this exact view. No implementation before amendment merge,
+no native run before separate source review/gates/merge and a new exact grant.
+D7a-j consumed; hardware paths remain **unverified on real hardware**.
