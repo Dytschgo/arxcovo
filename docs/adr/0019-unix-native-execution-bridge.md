@@ -19,9 +19,13 @@ or grant A4/M2 acceptance. D7f is consumed by accepted dispatch `43672720190`;
 its job skipped with zero steps, earning no native credit. No D7f retry is
 authorized. D7g is consumed by `43674201597`; independent Muse assessment
 `21c7615` accepts only its D9a A4 disposable present-residue and omitted-kill
-scope. D7h below proposes one fresh-host read-only package comparison, inactive
-until fresh independent Muse architecture/security/source review, exact-head
-review, five gates and coordinator merge. All other native execution and historical retries
+scope. D7h (`43693642693`, FILE leg only), D7i (`43715436515`, pre-mutation
+E_PATH) and D7j (`43720496074`, read-only E_PATH diagnosis) are consumed with no
+A7/A11 credit. D7k below is the docs-only disposition for exactly ONE final
+Opus-owned hosted A7/A11 attempt on the unchanged merged D9c source (PR #133,
+`52ce2a5`); it is inactive until independent Sol review, exact-head review,
+five gates, coordinator merge and source-inventory equality, and any miss
+defers A7/A11 to a dedicated host. All other native execution and historical retries
 remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
@@ -1066,6 +1070,105 @@ Retain bounded sanitized evidence and obtain independent source/run assessment.
 Any later D9b combined run needs its own reviewed disposition on a NEW host and
 all actual NNP/oracle/runtime checks. A7/A11/M2/full F/G/real-Runner PA6 remain
 **unverified on real hardware**. No additional owner approval flow is added.
+
+### D7k. Final single Opus-owned hosted A7/A11 attempt (2026-11-15)
+
+**Docs-only disposition; inactive.** Anthropic claude-opus-5-5, high. This is the
+ONE further hosted attempt allowed by the
+[Opus achievability decision](../reviews/m2-a7-a11-opus-hosted-achievability.md)
+under the A7/A11 attempt ceiling in the
+[correction handoff](../reviews/m2-a7-a11-cross-provider-correction-handoff.md).
+D7a–j stay consumed and all their hosts excluded; no earlier grant is renewed.
+The D7 staging sentence naming only D7h is historical. Exact pins, inventory and
+predictions are in the
+[preparation evidence](../evidence/linux-a7-final-opus-execution-preparation.md).
+
+**No source change.** Runtime source is the merged Opus D9c slice (ADR0020 D9c):
+source `f41af38f570c3ceeaeff87ec7decfcc6f9b0d9c7`, retained
+`c596f50cf79ec1ac51bae7d0ba615a0a2b0ef37e`, reviewed head
+`caba0fe0635ad00784d9f2006cbf225b032f4ad5`, main squash
+`52ce2a5d2443de018b06965dfca43fdc626b5f36` (PR #133, 2026-11-15T14:53:14Z), both
+tree `923842bae41f48ec2be53b2f3a1372b0ede61e88`. Independent Sol source review
+and exact-head PASS comment6896280064, status58964602017 and all five greens,
+including hosted Linux compilation, are supplied coordinator evidence, not re-run
+here. `TEST` is already fixed to the combined A7/A11 literal. D7k adds no fix,
+bind, selection, workflow, package, Cargo or code change.
+
+**Candidate.** The sole candidate is the **first eligible normal main squash
+containing D7k**, after independent Sol content and exact-head review, all five
+required checks green (three platform verify, ci-time-budget, agent-review),
+coordinator merge, exact reviewed-head/main-squash full-tree equality and a new
+check that the candidate's source inventory equals the recorded one. Strict
+full-tree predicate against baseline `52ce2a5`: no deletions, renames, type or
+mode changes; only these regular 100644 paths may differ:
+
+- `docs/adr/0019-unix-native-execution-bridge.md`
+- `docs/evidence/linux-a7-final-opus-execution-preparation.md` (new)
+- `docs/reviews/m2-d7k-final-opus-disposition-sol-review.md` (new Sol review)
+- `docs/PROGRESS.md` (existing coordinator checkpoint only)
+
+Every other blob and mode, including every runtime, source, test, workflow,
+helper, package, Cargo/toolchain and policy file, must equal the baseline tree;
+the recorded non-doc inventory binds all of them. The canonical profile label
+`99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e` names reviewed
+static facts only. It attests nothing about a host. The actual in-unit five-view
+proof and native oracles are still required. Any main advance, tree or inventory
+mismatch, unrelated delta or substitution stops D7k; it is never normalized or
+adopted.
+
+**Operation (coordinator only, after all gates).** Read back live main; it must be
+the exact candidate. Independently confirm `UNIX_EXECUTION_REVIEWED_SHA`,
+`SUDO_PACKAGE_REVIEWED_SHA` and `A7_ADMISSION_REVIEWED_SHA` all absent. Set
+`UNIX_EXECUTION_REVIEWED_SHA` once to the candidate and read back equality; the
+other two stay absent throughout. Dispatch `unix-execution-experiment.yml` once on
+main, with no inputs, onto one fresh GitHub-hosted `ubuntu-24.04` host. The
+existing workflow gate binds repo, actor, triggering actor, manual event and main,
+and requires `github.sha == github.workflow_sha == pin`. The driver binds reviewed
+SHA, workflow SHA and checkout HEAD equality, and requires attempt 1. The other
+two pins are not observed in-run; their absence before and after is a
+coordinator-verified precondition.
+
+Capture the accepted run URL **directly from dispatch output**. Bind run ID and
+attempt 1, and monitor THAT URL through terminal. Keep the pin until then, even if
+ancillary lookups fail. Do not clear early or re-dispatch. Reconcile uncertain
+identity only against that URL. A dispatch rejection counts only once it is
+confirmed that no run was accepted. Finally delete the pin and independently
+verify HTTP404, with all three pins absent.
+
+**Budget.** Any accepted dispatch consumes D7k whatever the outcome: success,
+failure, infrastructure failure, skipped job, cancellation or unknown. A confirmed
+rejection consumes it too. No retry, rerun, image retry, diagnostic read, new
+grant name, fence or timeout relaxation, or extra owner approval exists. The
+coordinator dispatches operationally; Opus owns the attempt and its disposition.
+
+**Native scope (unchanged merged source).** On that one new host, before effects:
+finite installed package comparison of C1 sudo, plugin and util against the
+reviewed Noble `1.9.15p5-3ubuntu5.24.04.4` amd64 facts, protected `/` and
+`/usr/bin`, the `/bin -> usr/bin` alias identity, and the systemd/kernel/cgroup2/
+controller/delegation floor. Host `/usr/local/bin` is not consulted. Then the D9c
+controlled owned account/artifact fixture with exactly five read-only views,
+in-unit five-set/mountinfo/statvfs/dev+ino/empty/C2-ENOENT proof before Runner and
+before each call, and the actual production tool probe plus fixed E4 NNP reentry
+for BOTH cases. Merged budgets, two workers, cancel-both, join-both, strict
+markers, systemd stop/cgroup/live-UID confirmation and owned-only cleanup apply.
+
+**Pre-registered predictions.** Both cases: `no_new_privs=true`, C1 chosen, C3
+skipped by the alias, C2 exactly ENOENT through the view, and
+`sudo=exit_nonzero`: case0 despite its NOPASSWD rule, case1 with no grant. All
+identity, descriptor, record, residue and cleanup oracles pass. CASE0, CASE1 and
+COMPLETE each appear once, and cleanup is `confirmed`.
+
+**Outcomes.** `exit_zero` with NNP true is a product security finding: stop and
+escalate, with no further hosted attempt. ANY other miss is NO-GO for hosted
+A7/A11. That includes preflight, package or digest drift, view proof, envelope,
+time, budget, cancel/join, cleanup, quarantine, unknown, unattributed, skipped or
+infrastructure failure. A7/A11 then stay **unverified on real hardware** pending
+a dedicated Linux host (owner's, not an agent admin step). Work advances to the
+remaining M2 items that do not depend on A7/A11, then independent M3. M2 is not
+marked complete. Source feasibility is not acceptance. Even a matching run needs
+a mandatory independent post-run source/run/oracle assessment, and credit covers
+only the exact case proof shown. Retain bounded sanitized evidence and exclude the
+host.
 
 ## Contract clarifications (2026-11-12)
 
