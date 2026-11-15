@@ -30,6 +30,15 @@ def elf():
 
 
 class InventoryTests(unittest.TestCase):
+    def test_refusal_labels_distinguish_gates_without_exception_text(self):
+        self.assertEqual(build.refusal_label(ValueError("compiler identity mismatch")), "compiler-identity")
+        self.assertEqual(build.refusal_label(ValueError("Linux candidate differs from independently reviewed image")), "image-pin")
+        for error in (ValueError("PRIVATE-MARKER/path"), OSError("PRIVATE-MARKER/path"),
+                      build.subprocess.CalledProcessError(1, ["PRIVATE-MARKER/path"], output=b"PRIVATE-MARKER")):
+            label = build.refusal_label(error)
+            self.assertIn(label, ("format", "io", "compiler-command"))
+            self.assertNotIn("PRIVATE-MARKER", label)
+
     def test_root_refuses_before_any_compiler_or_source_read(self):
         for uid, euid in ((0, 1000), (1000, 0), (0, 0)):
             with patch.object(sys, 'argv', ['build.py', 'build']), \

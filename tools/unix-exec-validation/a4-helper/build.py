@@ -161,8 +161,29 @@ def main():
         print("compile-only candidate written; reviewed image-pin.json unchanged")
 
 
+def refusal_label(error):
+    # Closed labels only: never print exception text, paths or compiler output.
+    known = {
+        "unprivileged build required": "privilege",
+        "unreviewed source or flags": "source",
+        "compiler identity mismatch": "compiler-identity",
+        "Linux hosted compiler required": "compiler-host",
+        "linked/reparse build path": "linked-path",
+        "oversized input": "input-limit",
+        "build pin mismatch": "build-pin",
+        "Linux candidate differs from independently reviewed image": "image-pin",
+    }
+    if isinstance(error, ValueError):
+        return known.get(str(error), "format")
+    if isinstance(error, subprocess.SubprocessError):
+        return "compiler-command"
+    if isinstance(error, OSError):
+        return "io"
+    return "format"
+
+
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, subprocess.SubprocessError, KeyError, StopIteration, struct.error):
-        sys.exit("fixed helper build/verification refused")
+    except (ValueError, OSError, subprocess.SubprocessError, KeyError, StopIteration, struct.error) as error:
+        sys.exit("fixed helper build/verification refused: " + refusal_label(error))

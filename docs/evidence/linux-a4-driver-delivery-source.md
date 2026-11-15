@@ -94,3 +94,15 @@ selector, permission, timeout or required-check change. The image pin is not
 overwritten; a differing output fails the step. Actual Linux result remains
 pending this PR. This explicit CI delta supersedes the builder-only scope
 statement above; it is included in the fresh independent review.
+
+## First Linux compile-only refusal
+
+PR106 run43657778405 job132640072365 passed109 pure guards and9
+helper-tool tests, then refused at linux-candidate behind a generic fixed
+message. The public rust-toolchain step matches the expected Rust1.95.0 commit
+and LLVM22.1.2 identity; the candidate image is not credited. Coordinator adds
+closed refusal labels only (no exception text/path/compiler output) to localize
+the concrete failing gate on the next ordinary hosted build. No admission,
+recipe/image pin or runtime behavior changes. Ten helper-tool tests pass,
+including planted-private-marker suppression; diff checks pass. Pending hosted
+result must be diagnosed before any repin or native disposition.
