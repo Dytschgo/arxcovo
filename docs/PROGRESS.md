@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus high571cb74 independently reviews the bounded A9/U9 join, all axes PASS with no blockers. Six accepted records and exact historical stop/absence ordering verified; only natural-exit empty-directory removal credited. Crash/populated stop/production Drain remain open. Publish separately after PR140 parent merges. M3 architecture under ADR0005 active before any enrollment source implementation. No native authority.
+
 - 2026-11-15: Sol high e5779a3 retained1f8a8b6 prepares bounded89-line A9/U9 join: systemd unit-directory absence after natural fixture exit, with empty runs where created; no signal-stop/populated/crash/production Drain credit. Coordinator inspected source/claim distinctions. A10 PR140 exact-head review active; A9 review queued next. Independent M3 enrollment slice design begins under ADR0005 without closing M2 or reopening native grants.
 
 - 2026-11-15: Opus high c129599 rechecks exact A1/A2 install versus A3+ verification attribution; S1 closed, all axes PASS. A10 remains open for Runner migration/lifecycle proof. Coordinator publishes evidence-only note with retained review/recheck after PR139 checkpoint merge; A9/U9 join remains active, no native authority.
