@@ -15,8 +15,10 @@ for Standard `43635131545` and None `43636804545`. D7d is consumed by A5
 run `43644661407`; A5 acceptance is limited to that reviewed run. D7e is consumed by accepted A4 baseline dispatch
 `43666413693` on `a328060000b8cb7bb389d39f8785f96f6bcb0c25`.
 Positive baseline feedback does not satisfy the native omitted-kill requirement
-or grant A4/M2 acceptance. No further D7e run is authorized. D7f below proposes
-one fixed native omitted-kill run, inactive until its independent review, five
+or grant A4/M2 acceptance. D7f is consumed by accepted dispatch `43672720190`;
+its job skipped with zero steps, earning no native credit. No D7f retry is
+authorized. D7g below proposes one replacement fixed native omitted-kill run,
+inactive until its independent review, five
 gates and coordinator merge. All other native execution and historical retries
 remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
@@ -235,7 +237,7 @@ slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
 run and its environment must not be retried or reused. D7a and D7b are
-consumed, as are D7c, D7d and D7e; only D7f proposes one fixed A4 native
+consumed, as are D7c, D7d, D7e and D7f; only D7g proposes one fixed A4 native
 omitted-kill run, subject to its exact candidate and gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
@@ -621,7 +623,7 @@ helper, fixture and exact packaged Standard unit. Observe the existing exact
 test-ok, one-pass/zero-failure summary, real systemd success/zero exit and
 confirmed cleanup; retain the existing bounded sanitized feedback. This is
 **baseline native feedback only**. ADR0020 D9a's native omitted-kill negative
-case was **unrun and NOT granted under D7e** and remains unrun; only D7f
+case was **unrun and NOT granted under D7e** and remains unrun; only D7g
 below proposes its separate conditional disposition. Pure/model assertion mutants cannot
 satisfy it. **A4 acceptance stays open** until that requirement is independently
 satisfied; no new mutation framework or waiver is introduced. A7–A12, full
@@ -631,6 +633,8 @@ are **unverified on real hardware**.
 ### D7f. One fixed native A4 omitted-S7-kill run (2026-11-15)
 
 **Consumed by accepted dispatch `43672720190` on main `994760c98c2816f37b1acdcaa9d9827693765b17`. The job skipped with zero steps after monitor pin cleanup raced admission; no native credit. Variable absence independently verified HTTP 404. No retry or further D7f authority.**
+The remaining D7f text records its historical grant only; it cannot authorize
+another dispatch. See the [closed record](../evidence/linux-a4-negative-skipped-43672720190.json).
 PR #113 merged the fixed source as `d0b4c5530b1c4c084a35fe40499afa96a2678b0b`,
 tree `9cfd66dbdf7ce1afc43c1f5acecf4eb62fd09455`, equal to reviewed head
 `15c4d73a3eaf02779672870e5054e34edea6f5c5`. Its all-five-gates/Muse PASS
@@ -710,6 +714,79 @@ Pure/mock tests and assertion mutants provide no native evidence. Even a native
 negative pass earns only the separately assessed D9a A4 scope; full F/G,
 real-Runner PA6 and M2 stay open. Installed/dedicated paths remain
 **unverified on real hardware**.
+
+### D7g. One replacement native A4 omitted-S7-kill run (2026-11-15)
+
+**Proposed; inactive until independent different-provider exact-head review,
+all five green required checks and coordinator merge. No run authority yet.**
+Baseline is actual main `994760c98c2816f37b1acdcaa9d9827693765b17` (PR #114),
+tree `908abcf01c0969cb73d3486e92476f3c90c132f5`, identical to reviewed
+`d60665c81f4e83c10382fea170244ee04db98bf1`. PR114's five green gates and Muse
+PASS are supplied coordinator evidence. D7f's accepted run `43672720190`,
+attempt 1/job `132686133651`, was `workflow_dispatch` on that exact main,
+actor/triggering actor `Dytschgo`, completed **SKIPPED with zero steps**.
+The dispatch command returned its run URL; an immediate ancillary run-list
+lookup returned none, and monitor finally cleanup deleted the pin before job
+admission. Root independently confirmed variable absence by HTTP 404. Nothing
+native ran; D7f and all older grants remain consumed.
+
+The sole candidate is the **first eligible normal main squash containing D7g**
+after that baseline, following independent exact-head review, all five green
+required checks (three platform `verify`, `ci-time-budget`, `agent-review`) and
+coordinator merge. Compare the whole candidate tree against the baseline:
+**zero executable/non-document delta is allowed**, including file modes.
+Every source, fixture, workflow, driver/tool, helper/recipe/image pin,
+package/unit/profile, Cargo/lockfile and toolchain blob must be identical.
+The exact allowed document paths are only:
+
+- `docs/adr/0019-unix-native-execution-bridge.md`
+- `docs/evidence/linux-a4-negative-skipped-43672720190.json`
+- `docs/evidence/linux-a4-negative-replacement-preparation.md`
+- `docs/reviews/m2-d7g-a4-negative-replacement-muse-review.md`
+- `docs/PROGRESS.md` (coordinator only)
+
+Record the actual reviewed head/tree, main squash SHA/tree, full diff and blob
+identity in the [replacement preparation](../evidence/linux-a4-negative-replacement-preparation.md).
+Verify reviewed-head/main-squash tree equality after merge. Read back current
+main immediately before dispatch; it must still be that exact candidate.
+Advancing main, intervening unrelated content, any mismatch or substitution
+requires a new independently reviewed disposition before grant.
+
+Once effective, coordinator only: set `UNIX_EXECUTION_REVIEWED_SHA` **once**,
+read back its exact candidate value, and dispatch unchanged
+`unix-execution-experiment.yml` **once** on one fresh GitHub-hosted Ubuntu 24.04
+host. **Capture the accepted run URL directly from dispatch output**, bind its
+exact run ID, and hold the pin until **that exact run is terminal**, even if an
+ancillary run-list lookup fails or returns none. Never redispatch on lookup
+failure, infer rejection from it, or clear the pin while the accepted run is
+nonterminal. Finally clear after that terminal result (or confirmed dispatch
+rejection with no accepted run), then independently verify HTTP 404 absence.
+Uncertain identity/result requires bounded reconciliation of the accepted URL,
+not early pin deletion or a second dispatch. This coordinator monitor correction
+is outside the repository; no new workflow, tool or runtime infrastructure is
+authorized or needed.
+
+Verify `Dytschgo/arxcovo`, actor/triggering actor `Dytschgo`, `refs/heads/main`,
+and `GITHUB_SHA == ARX_REVIEWED_SHA == ARX_WORKFLOW_SHA ==` candidate/variable.
+Retain all D7f native oracles and bounds above without exception: fixed negative
+literal, one real setup, shared positive assertion rejection with exact
+KillTimeout and 1/1/0 writes, zero removals, populated retained leaf/live unreaped
+helper before cleanup, exactly one raw-fd LF marker, checked owned SIGKILL/reap
+and leaf cleanup before READY/identity-ack, exact outer pass summary, real
+systemd success/zero exit and independent driver finally cleanup. All D7f
+staging, hardening, descriptor, attribution, argv, lifetime/read/output and
+owned-only cleanup fences remain. No green-job-only or pure/mock native credit.
+
+An accepted dispatch consumes D7g regardless of outcome; no retry, rerun,
+second dispatch or host reuse. Rejection grants no retry. Failure, unknown result
+or uncertain cleanup stops further execution; retain bounded sanitized feedback
+and exclude the host. All previous experiment hosts, including D7f's skipped
+run and historical `43091339273`, remain excluded. Existing owner authorization
+covers this bounded disposable-host operation without extra approval; no
+owner-PC/account/admin/payment, static-VM or backup action is included.
+Independent native assessment remains mandatory before any D9a A4 credit.
+A4/M2/full F/G/real-Runner PA6 remain open; installed/dedicated paths remain
+**unverified on real hardware**. This preparation executes nothing.
 
 ## Contract clarifications (2026-11-12)
 
