@@ -9,6 +9,7 @@ mod security;
 pub mod service;
 pub mod store;
 
+pub mod cluster;
 pub mod development;
 #[cfg(any(unix, test))]
 pub mod unix_shim;
