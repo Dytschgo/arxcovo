@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #137, `fb23b58ed5a333044af746bdfe15afb7c0bec64f` at 16:50:34Z, independent Opus exact-head PASS6897800328/status58968647772 and all five required gates green. Reviewedb80f888/squash tree `1b861b4a175c00a63ca7e64ec35b017442d4e7a7` identical; closed A12 delivery Linux compilation credited, no native fixture run.
-- Current work: independent Opus source/content review of bounded A12 candidate0ff89c8/e157069. Fixed Rust/driver flags and TEST selected, focused candidate tests/mutants and consumedwrapperpins adapted, runtime/oracles/budgets unchanged. Proposed D7l inactive before reviews/exact-head five gates/coordinator merge/tree/source pins; no dispatch. Builder7Rust/196portable/13wrapper/nineA12mutants/guards/pins/fmtClippygreen reported. A7 hosted finalNO-GO unchanged; completion wake awaited.
+- Current work: publish the bounded A12 one-run candidate after independent Opus source review and S1 recheck PASS. Historical mutation anchor corrected; 196 portable tests, 91 audited tests and all 40 historical/nine A12 mutants independently corroborated. Exact-head review and five green hosted gates remain required before coordinator merge, then exact squash/tree/223-file inventory verification before any once-only D7l dispatch. A12 is **unverified on real hardware**; A7 hosted final NO-GO remains closed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus 5.5 high recheck 937435b retained a488acf closes S1 with no new blockers; independently reran 196 portable tests, 91 audited tests, 40 historical and nine A12 assertion kills, and reproduced all 223 inventory rows/digest dbc11a5a. Coordinator publishes reviewed candidate for exact-head review and hosted Linux compile. No native execution or acceptance credit.
 
 - 2026-11-15: Sol0ff89c8/e157069 prepares minimal A12 enabled-source selection and proposed one-run D7l, exactfive sourcepaths plusADR/evidence, complete223fileinventory andfixedpins. OrdinarynonignoredLinuxgate test now injectedreaderonly, actualnativepreparedreader remains ignoredfixture-only. Coordinator inspects actualdelta, requests fresh Opus source/contentreview beforepublication; no root/native/pin/dispatch authority. Builderchecks allgreen asreported, currentLinuxcompilepending.
 
