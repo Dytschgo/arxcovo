@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #127, `7d8ab1c160a4af488f4a85abb8dc08a45e4d6103` at 12:06:17Z, independent Muse exact-head PASS6893948634 and all five required gates green. Squash tree `ea260f731c6d0149de68df7f0e2fb9428a9bfb7f` equals reviewed `ebafeed`; bounded dormant A7/A11 integration now compiled by hosted Linux gates.
-- Current work: prepare the narrow A7/A11 runtime-admission and one-run execution candidate atop merged PR127, using reviewed fixed Ubuntu package/defaults and controlled policy rather than host-original policy or a query oracle. Source preparation only; independent source/exact-head reviews, five gates and coordinator merge still precede any separately pinned native run. D7a-h consumed; stale A1/A2 closed. Active Sol builder completion wake awaited.
+- Current work: independent Muse source/security review of fixed A7/A11 runtime admission and proposed D7i combined run candidate. Sol7385785/c1f0cc6 retaineda3fdb3b/573051a; 136 audited mocked tests and relevant assertion mutants passed at builder. Profile is a reviewed static-facts identifier, never host proof; fresh runtime package/C2/alias/floor and in-unit controlled-view checks required. No native authority before fresh review, exact-head gates and merge. Completion wake awaited; D7a-h consumed, stale A1/A2 closed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol high prepared finite runtime admission and fixed combined selection7385785 plus D7i/evidencec1f0cc6, retaineda3fdb3b/573051a. Four test/controller/driver paths plus ADR/evidence; no workflow/package/production change. Coordinator inspected actual source and queues fresh Muse source/security review, including metadata stability/readlink atime sensitivity. 136 audited pure/mock tests and relevant mutation checks pass per builder; fresh Linux compilation and all publication gates remain required, no native execution.
 
 - 2026-11-15: Coordinator verified PR127 exact head and all five green gates, unwatched and squash merged7d8ab1c; reviewed/squash trees identical. Hosted verification supplies Linux compilation credit only, no ignored-fixture/native execution. Next bounded source/disposition builder closes finite runtime admission using existing reviewed package and controlled-view proof, keeps one-shot run authority pending normal review/gates/merge.
 
