@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Sol integration builder stopped as instructed at packaged30s startup versus four pre-READY calls/20s RunSpec versus50s probe contract (06dd8ba); no integration gates changed. Coordinator accepts blocker and proposes fixture-only post-READY, post-identity-ack two scoped case workers with explicit55s/10s per-call budgets inside existing120s monitor/140s runtime, pending arithmetic/cancellation/security review. No production timeout or hardening change is authorized.
+
 - 2026-11-15: Independent Muse `25bbbdc` rejected the effective-policy-query proposal: exit1 conflates denial/errors and root list success does not establish target NOPASSWD. Coordinator retains NO-GO; no query-based weakening or implementation. Next architecture investigation compares a source-pinned fixture-local policy construction with the existing complete-host-byte private-review route, preserving both cases and actual NNP exec assertions. Any fixture-policy amendment still needs independent review/gates; current contract stays binding.
 
 - 2026-11-15: Sol / high public provenance research `00e4b2a` found pinned upstream/runner-image inputs but no complete policy literal candidate; no runtime equality claimed. Coordinator retained the note and drafted an unaccepted fixed effective-policy-query alternative for future architecture review, with status1/error and NOPASSWD ambiguities explicitly unresolved. Current exact-byte/closed qualification contract remains binding; no host reads or authority change. This reassesses concrete acceptance overhead under owner priority steering.
