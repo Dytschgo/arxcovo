@@ -615,7 +615,9 @@ owner's machine:
 - **A7** R5 with an installed `sudo` and a NOPASSWD rule for the build
   account: under the runner's NNP the result is `exit_nonzero`. Without the
   rule, also `exit_nonzero`. Neither is `exit_zero`. This shows the fence,
-  not the policy.
+  not the policy. ADR0020 D9b permits a source-literal fixture-local read-only
+  policy view for the two cases; it makes no claim about the host original
+  policy and retains installed sudo/plugin, NNP, identity and descriptor fences.
 - **A8** Startup discovery runs after Ready and writes one daemon row.
 - **A9** Whether systemd removes delegated children at unit stop (U9).
 - **A10** That cgroupfs writes and migration need no capability beyond the

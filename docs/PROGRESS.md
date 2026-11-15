@@ -2,12 +2,16 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #119, `d18a721d601aa625698826399df0b0820d3f0290` at 05:51:15Z, independent Muse exact-head PASS and all five gates green. Squash tree `fecfc45295dc45edce0b412e6e831f2ef530b9fe` equals reviewed `991bc75`; hosted Linux delivery integration compiled. No native A7/A11 credit.
-- Current work: publish injected qualification source after independent Muse PASS (all axes zero findings, ten mocks/17 mutants rerun green). Coordinator retains exact UTF8LF review artifact; reviewer left it uncommitted. Empty allowlist/qualified=false/refusing CLI remain. Public policy provenance research separately active; OS adapter/floor evidence/new read-only grant absent, no host reads or native A7/A11/M2/full F/G/PA6 credit.
+- Last merged: PR #120, `7ad58d9b41ed652f75fc2471cdd1f90214631b04` at 06:13:22Z, independent Muse exact-head PASS and all five gates green. Squash tree `4d9d9d2702b847d1b464d8ce3dbca03dabf5f20f` equals reviewed `ef28fba`; injected qualification model only, no host adapter/read or authority.
+- Current work: docs-only D9b controlled A7 policy-fixture amendment after conditional Muse architecture GO dec7f9b and independent Sol source/spec/security review. Corrected case1 transcription, required exact four readonly mappings and in-unit view checks; no product/host-policy change. This replaces unknown host-policy reconstruction only for fixture acceptance, preserving installed sudo/plugin/default-path/floor and all native gates. No implementation/execution authority before amendment gates/merge.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Independent Muse `25bbbdc` rejected the effective-policy-query proposal: exit1 conflates denial/errors and root list success does not establish target NOPASSWD. Coordinator retains NO-GO; no query-based weakening or implementation. Next architecture investigation compares a source-pinned fixture-local policy construction with the existing complete-host-byte private-review route, preserving both cases and actual NNP exec assertions. Any fixture-policy amendment still needs independent review/gates; current contract stays binding.
+
+- 2026-11-15: Sol / high public provenance research `00e4b2a` found pinned upstream/runner-image inputs but no complete policy literal candidate; no runtime equality claimed. Coordinator retained the note and drafted an unaccepted fixed effective-policy-query alternative for future architecture review, with status1/error and NOPASSWD ambiguities explicitly unresolved. Current exact-byte/closed qualification contract remains binding; no host reads or authority change. This reassesses concrete acceptance overhead under owner priority steering.
 
 - 2026-11-15: Muse / high `7e8f0ad` independently accepted the cancelled activity consumer join: Standards/Spec/Security zero findings. Focused SDK regression, fmt, offline Clippy and diff checks rerun green; no production/native change or A12 credit. Coordinator clarified builder-checkout versus landed-parent provenance and publishes the bounded test slice through normal exact-head and hosted gates.
 
