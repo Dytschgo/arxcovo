@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Sol high19f89e7 retained1461340 completes test-only T3 snapshot catch-up on separate follow-up branch. Actual198-byte snapshot RPC to restarted follower, purged39 versus followerapplied2, convergence/consecutiveappend and disabled-route red observed. All99cluster/fmt/offlineClippy/diff pass locally. Parent T1/T2 Opus review remains active; T3 review queued afterward, separate publication/gates required. No production change or fullM3/host acceptance.
+
 - 2026-11-15: Sol high7b4bf62/e39535f/095504c retained93651ed/0a74643/40564a3 completes adapters, exclusive preflight, tracked service, actual Suite partition and T1/T2/U6.98cluster tests pass8.788s including old36/eightkillprobes; fmt/lockedClippy/diff pass.64 actual uncommitted entries prove cancellation bound; graceful leader/follower restarts converge. Raw-helper differences recorded honestly. Fresh Opus review active; T3 snapshot catch-up remains immediate uncredited follow-up.
 
 - 2026-11-15: Opus high496f10f retained66a9bf8 defines exclusive pre-start cross-store consistency check and ADR0005 invariant after real helper asymmetry. Independent Sol recheck passes with checked lookup/index cap and precise preflight read-only scope. Resume adapter/service/T1T2 implementation; no quorum credit until actual tests, no M2 native retry.
