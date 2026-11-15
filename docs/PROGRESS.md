@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #143, `cd28bb91fb7a42307e6c48e360c96adbf36128fd` at19:18:55Z; independent Opus exact-head PASS6899732283/status58973875331 and all five required gates green. Reviewedcbd8055/squash full trees equal. M3 state-store crash probe passed hosted Windows/macOS/Ubuntu; local process-kill consistency only, not power loss or quorum.
-- Current work: Opus settles durable M3 vote/log storage acknowledgement, truncation/purge and crash-recovery boundaries for the next small implementation slice, tied to ADR0005 and real OpenRaft APIs. No production adapter, network, signing or quorum acceptance yet. M2 remains incomplete; A7 FINAL hosted NO-GO and consumed A12 cleanup-unconfirmed/no-retry remain unchanged.
+- Current work: independent Opus review of implemented M3 durable vote/log store and shared private SQLite opener. Builder reports unchanged23-test baseline and final33 cluster tests with both four-kill groups, fmt/offline Clippy/diff passing. No OpenRaft dependency/adapter, quorum or three-node claim. Hosted OS gates remain required; M2 gaps and closed A7/A12 no-retry status unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol highcad7f08/07da6a5 retained189bbc9/077e121 implements shared fixed-stem SQLite helper and bounded vote/log store with verifier-only codec. Builder23 baseline and33 final cluster tests/eight total crash probes/fmt/offlineClippy/diff pass. Test-helper visibility corrected to cluster scope, privacy scans account for held Windows locks without dropping assertions. Fresh Opus source/security review requested; no quorum/power-loss/OpenRaft acceptance.
 
 - 2026-11-15: Opus highcf5e1da retained48b8185 settles SQLite durable vote/log contract. Independent Sol review checks actual Suite cases, corrects accidental purge20/append11 chaining, clarifies same-leader vote regression, exact4096-byte log pages and fixed helper stems. Contract accepted for bounded implementation; cross-file ordering and callback/consensus remain future-adapter obligations. No test/native action or quorum acceptance.
 
