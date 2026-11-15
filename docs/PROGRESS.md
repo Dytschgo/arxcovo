@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Sol high730a18a retained493106a implements exactly five Rust paths plus evidence for the reviewed M3 pure enrollment core. Builder ran13 focused nextest tests, fmt and locked offline workspace Clippy, all passed. Coordinator inspected actual diff and starts fresh Opus source/security review before publication. No network/CA/Raft/host integration or physical expiry claim; M2 remains incomplete.
+
 - 2026-11-15: Coordinator verifies PR141 exact head/five green gates, unwatches and merges8e80207; squash/reviewed full trees equal. M3 branch merge conflict confined to PROGRESS, retaining review/steering history. Sol enrollment pure-core builder remains active on unchanged implementation brief; no native M2 authority or closure.
 
 - 2026-11-15: Opus high1fbad65 retainedc6fe014 corrects M3 pure enrollment brief; independent Sol recheck closes delayed-commit expiry T1 and finite retention T2. Physical expiry and consensus authority explicitly remain future-adapter claims. Sol implementation is eligible only for the named I/O-free core/tests; no transport, signing, host or native activation. M2 remains open, M3 independent steering applies.
