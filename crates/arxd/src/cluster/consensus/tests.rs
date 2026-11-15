@@ -738,6 +738,43 @@ async fn append_spawned_cancellation_panic_and_poison_complete_once() {
     );
     assert!(rx.await.unwrap().is_err());
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_append_callback_releases_store_before_worker_returns() {
+    let (dir, mut ls, sm) = stores();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *super::adapter::APPEND_COMPLETION_PAUSE.lock().unwrap() =
+        Some(super::adapter::AppendCompletionPause {
+            store: Arc::as_ptr(&ls.0) as usize,
+            entered: entered_tx,
+            release: release_rx,
+        });
+    let held = ls.0.clone();
+    let lock = held.lock().unwrap();
+    let (tx, rx) = Arx::oneshot();
+    let mut future = Box::pin(ls.append(vec![blank(0)], IOFlushed::signal(tx)));
+    assert!(
+        std::future::Future::poll(
+            future.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(future);
+    drop(lock);
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rx.await.unwrap().is_ok());
+    drop(ls);
+    drop(sm);
+    drop(held);
+    // The worker is parked after the callback. Reopening must already be safe.
+    // Dropping release_tx also unblocks the worker if this assertion panics.
+    assert_eq!(disk(dir.path()).1.last, Some(pos(blank(0).log_id)));
+    drop(release_tx);
+}
 #[test]
 fn parameter_profiles_validate_and_reject_unsafe_sizes() {
     for p in [
