@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #139, `0df242e02ac6bdaac201196d6b687440ce505ca8` at17:48:11Z; independent Opus exact-head PASS6898553625/status58970661048 and all five required gates green. Reviewed4847db0/squash full trees equal. A12 failure checkpoint only, cleanup unconfirmed; no native credit or retry.
-- Current work: A10 evidence join attribution correction is under independent Opus recheck, and bounded A9/U9 stop/drain evidence join is being prepared. Publish each reviewed note through normal gates, then independent M3 source work. A10/native gaps remain open; A12 D7l consumed with unconfirmed cleanup/no retry, A7 hosted FINAL NO-GO closed, M2 incomplete.
+- Last merged: PR #140, `00dd9345c53dcd5c98e8fd0ccd39f5672823937f` at18:00:26Z; independent Opus exact-head PASS6898705734/status58971067972 and all five required gates green. Reviewed e845a95/squash trees equal; A10 evidence join only, A10 remains open.
+- Current work: publish independently reviewed A9/U9 bounded stop/drain evidence join through exact-head review and hosted gates. A9/U9 remain open for populated stop/crash/production Drain. Independent M3 enrollment contract correction is active before implementation. A10/native gaps remain open; A12 consumed/no retry with cleanup unconfirmed, A7 hosted FINAL NO-GO closed; M2 incomplete.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
