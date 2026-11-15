@@ -125,6 +125,46 @@ impl LinuxFs {
         super::fake::a5::empty(self, leaf)?;
         self.write(leaf, "cgroup.procs", pid.to_string().as_bytes())
     }
+    /// Failure-only A4 cleanup, after retained-identity reap. No adoption.
+    #[cfg(test)]
+    pub(crate) fn retained_a4(&self, runs: &Dir, leaf: &Dir) -> FsResult<()> {
+        self.trust(runs.0.as_raw_fd(), libc::S_IFDIR, Some(CGROUP_MAGIC))?;
+        let fresh = self.open_child(runs, b"arx-0-0")?;
+        let inode = |d: &Dir| -> FsResult<(u64, u64)> {
+            self.trust(d.0.as_raw_fd(), libc::S_IFDIR, Some(CGROUP_MAGIC))?;
+            let mut s = MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(d.0.as_raw_fd(), s.as_mut_ptr()) } != 0 {
+                return Err(last());
+            }
+            let s = unsafe { s.assume_init() };
+            Ok((s.st_dev, s.st_ino))
+        };
+        if inode(&fresh)? != inode(leaf)? {
+            return Err(FsError::Refused);
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn cleanup_a4(&self, runs: &Dir, leaf: &Dir) -> FsResult<()> {
+        self.retained_a4(runs, leaf)?;
+        super::fake::a5::empty(self, leaf)?;
+        for (file, expected) in [("cgroup.procs", false), ("cgroup.events", true)] {
+            let b = self.read(runs, file, 4096)?;
+            let s = std::str::from_utf8(&b).map_err(|_| FsError::Invalid)?;
+            if if expected {
+                super::parse::events(s) != Some(false)
+            } else {
+                super::parse::pids(s) != Some(vec![])
+            } {
+                return Err(FsError::Refused);
+            }
+        }
+        self.rmdir(runs, b"arx-0-0")?;
+        if !matches!(self.open_child(runs, b"arx-0-0"), Err(FsError::Missing)) {
+            return Err(FsError::Refused);
+        }
+        super::fake::a5::empty(self, runs)
+    }
     /// Dormant A5 only: no adoption, path input, raw-fd export or setup call.
     #[cfg(test)]
     pub(crate) fn seed_a5(&self, location: &super::parse::Location) -> FsResult<(Dir, Dir)> {

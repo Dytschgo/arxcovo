@@ -26,13 +26,15 @@ def standard_profile():
                      'exec::disposable::disposable_linux_a3_standard',
                      'exec::disposable::disposable_linux_a3_none',
                      'exec::disposable::a4::disposable_linux_a4',
+                     'exec::disposable::a4::disposable_linux_a4_omitted_kill',
                      'exec::disposable::disposable_linux_a5'), 'E_TEST_ARGS')
     return TEST != 'exec::disposable::disposable_linux_a3_none'
 
 
 def a4_selected():
     standard_profile()
-    return TEST == 'exec::disposable::a4::disposable_linux_a4'
+    return TEST in ('exec::disposable::a4::disposable_linux_a4',
+                    'exec::disposable::a4::disposable_linux_a4_omitted_kill')
 
 
 A4_IMAGE_SHA = 'cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369'
@@ -813,6 +815,10 @@ def monitor_a1a2(stage, artifact):
 def verify_test_result(stage, returncode):
     require((stage / 'test-output').stat().st_size <= 1024 * 1024, 'E_TEST_LOG')
     text = private_read(stage / 'test-output', 1024 * 1024)
+    if TEST == 'exec::disposable::a4::disposable_linux_a4_omitted_kill':
+        require(text.count('ARX_A4_OMITTED_S7_REJECTED\n') == 1, 'E_TEST')
+        # Raw fd output may interrupt libtest's in-progress test-ok line.
+        text = text.replace('ARX_A4_OMITTED_S7_REJECTED\n', '')
     passed = (text.splitlines().count(f'test {TEST} ... ok') == 1 and
               re.findall(r'^test result: ok\. ([0-9]+) passed; ([0-9]+) failed;', text, re.M) == [('1', '0')])
     require(returncode == 0 and passed and (stage / 'harness-pid').exists(), 'E_TEST')

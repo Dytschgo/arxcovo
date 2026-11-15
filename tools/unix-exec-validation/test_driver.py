@@ -723,6 +723,8 @@ class A1A2(unittest.TestCase):
                       'exec::disposable::disposable_linux_a5_none',
                       'exec::disposable::disposable_linux_a5_standard',
                       'exec::disposable::disposable_linux_a5x',
+                      'exec::disposable::a4::disposable_linux_a4_omitted_killx',
+                      'exec::disposable::a4::disposable_linux_a4_omitted_kill\n',
                       'exec::disposable::disposable_linux_a5\n', driver.TEST + 'x'):
             with patch.object(driver, 'TEST', value), \
                  patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('probe')), \
@@ -956,6 +958,58 @@ class A4Delivery(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
                 driver.install_a4_helper(b'', {})
             opened.assert_not_called()
+
+    def test_negative_literal_marker_and_lifecycle(self):
+        selected = 'exec::disposable::a4::disposable_linux_a4_omitted_kill'
+        with patch.object(driver, 'TEST', selected):
+            try:
+                self.assertTrue(driver.standard_profile())
+                self.assertTrue(driver.a4_selected())
+            except RuntimeError:
+                self.fail('closed negative mapping refused')
+            self.assertEqual(driver.test_argv('/binary'), ['/binary', selected, '--ignored', '--exact', '--test-threads=1', '--color=never'])
+            stage = unittest.mock.MagicMock()
+            (stage / 'test-output').stat.return_value.st_size = 100
+            marker = 'ARX_A4_OMITTED_S7_REJECTED\n'
+            summary = f'test {selected} ... ok\ntest result: ok. 1 passed; 0 failed;'
+            for count in (0, 1, 2):
+                with patch.object(driver, 'private_read', return_value=marker * count + summary):
+                    if count == 1:
+                        try:
+                            driver.verify_test_result(stage, 0)
+                        except RuntimeError:
+                            self.fail('exact negative result refused')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+                            driver.verify_test_result(stage, 0)
+            with patch.object(driver, 'private_read', return_value=summary.replace('... ok', '... ' + marker + 'ok')):
+                try:
+                    driver.verify_test_result(stage, 0)
+                except RuntimeError:
+                    self.fail('interleaved raw marker refused')
+            for text, code in [(marker + summary, 1), (marker + summary.replace('1 passed;', '0 passed;'), 0),
+                               (marker + summary.replace('0 failed;', '1 failed;'), 0),
+                               (marker + summary.replace('... ok', '... FAILED'), 0)]:
+                with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
+                    driver.verify_test_result(stage, code)
+            # Reuse the same fully mocked identity/service/finally-cleanup fences.
+            checks = A1A2()
+            checks.test_exit_requires_ack_and_real_success()
+            checks.test_mainpid_and_placement_required()
+            checks.test_cleanup_replacement_quarantines()
+            checks.test_cleanup_cannot_stop_another_unit()
+
+    def test_negative_cleanup_failure_refuses(self):
+        with patch.object(driver, 'TEST', 'exec::disposable::a4::disposable_linux_a4_omitted_kill'), \
+             patch.object(driver, 'verify_runtime'), \
+             patch.object(driver.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+             patch.object(driver, 'snapshot_internal'), \
+             patch.object(driver.os.path, 'lexists', return_value=False), \
+             patch.object(driver, 'remove_a4_helper', side_effect=RuntimeError('E_QUARANTINE_CGROUP')), \
+             patch.object(driver, 'remove_runtime') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_CGROUP'):
+                driver.cleanup_a1a2('123-1', 'arxd.service', Path('/var/lib/arx-ci-123-1'), False, None, True, [], {})
+            remove.assert_not_called()
 
     def test_source_and_recipe_independent_of_image(self):
         root = ROOT / 'tools/unix-exec-validation/a4-helper'
