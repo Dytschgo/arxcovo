@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #113, `d0b4c5530b1c4c084a35fe40499afa96a2678b0b` at 03:12:06Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `15c4d73`; hosted Ubuntu/macOS compilation succeeded. Native omitted-kill remains unrun and no run authority exists.
-- Current work: publish D7f fixed native omitted-kill candidate after independent Muse `2318b567` PASS on Standards/Spec/Security. Reviewer reran 91 audited mocks, 40 Python kills, seven pure Rust baselines and eight Rust assertion kills; 201 assertion calls preserved and exact three execution blobs verified. Exact-head review/five gates/coordinator merge and actual squash binding remain before any dispatch. Native negative remains unrun; A4/M2/F/G/PA6 open.
+- Last merged: PR #114, `994760c98c2816f37b1acdcaa9d9827693765b17` at 03:30:17Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `d60665c`, exact three execution blobs and seven paths verified before D7f dispatch.
+- Current work: publish docs-only D7g replacement after independent Muse `d7cd505` PASS (Standards/Spec/Security, no findings). Zero execution/blob/mode delta versus PR114 `994760c`; monitor binds returned run URL through terminal before pin clear. D7f remains consumed with skipped zero-step run; native negative unrun. Exact-head review, five gates, merge and exact squash verification remain before replacement dispatch.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. Native A4 omitted-kill, A4 acceptance, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
