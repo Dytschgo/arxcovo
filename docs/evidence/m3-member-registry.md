@@ -3,7 +3,7 @@
 Sol high, 2026-11-15. Parent `4750ae1` on the enrollment/auth boundary; main reference
 `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` (PR146). Source/test commit `a8118e96d5920fde6fa35e660f6265650fd2ebe2`.
 The settled brief includes retained `2640629` and the coordinator's 16-byte ClusterId correction;
-R1/R2 design review is closed. This implementation still requires fresh independent Opus review.
+R1/R2 design review is closed. Independent Opus source review and R1 recheck now pass; exact-head publication review and hosted gates remain required.
 No PR, push, hosted check, merge, watcher, delegation or admin operation was performed.
 
 ## Implemented boundary
@@ -48,7 +48,7 @@ OpenRaft0.10.0, rusqlite0.37.0 and tokio1.48.0 remain pinned by the unchanged lo
 | Command | Observed result |
 | --- | --- |
 | `cargo test -p arxd --lib cluster::enrollment --locked --offline` | Initial focused existing pure tests:14 passed. New pure tests also pass in the complete cluster runs. |
-| `cargo test -p arxd --lib cluster:: --locked --offline -- --nocapture` | Final107 passed,0 failed,2 ignored child entry points;8.77s test execution. Both parent process-kill tests invoke their ignored owned child entry points. |
+| `cargo test -p arxd --lib cluster:: --locked --offline -- --nocapture` | Historical builder result:107 passed,0 failed,2 ignored child entry points;8.77s test execution. Superseded final R1/main-integration result:109 passed (below). Both parent process-kill tests invoke their ignored owned child entry points. |
 | `cargo test -p arxd --lib cluster::state_store::tests::maximum_v2_image_and_registry_semantics_with_recomputed_checksums --locked --offline` | After the equivalent lint correction:1 passed in1.42s. Complete cluster suite subsequently rerun green. |
 | `cargo fmt --all -- --check` | Pass on final source. |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Pass on final source;4.21s incremental. |
@@ -100,17 +100,25 @@ M2 remains open; A7 FINAL NO-GO and A12 consumed/cleanup-uncertain no-retry are 
 (three processes/hosts and an agent build from A on B) remains unmet. Coordinator owns PROGRESS, fresh
 Opus review and any future PR/gates; this implementation does not waive them.
 
+## R1 isolation and main integration
+
+The original rejection-coverage statement was overstated: three checks were masked by other refusals. Test-only correction `7a37a68` adds31 lines across the two test files. Found count cap now has allocated, sorted, unique-keyed17/64-pair cases before and after founding, each requiring BadFounders and unchanged state. The maximum-image duplicate-member-key case also updates record49's consumed key; the last-member range case preserves ordering while setting that member to next_node_id74.
+
+Independent Opus recheck `b1efd7b` at `5b451df` weakened each guard alone. Each mutant compiled and produced108 passed/1 assertion failure at its new case; the old masked cases still passed. After restoring exact hashes,109 cluster tests passed again (8.51s; fresh pre-mutation run8.86s), including T4/T3 and both crash groups. Fmt, locked/offline workspace Clippy with warnings denied and diff checks passed. The109 count is107 plus the isolated Found test and PR147's consensus regression; the state-store cases extend an existing test. The earlier unobserved root run is not credited.
+
+Main integration preserves every registry production blob from `e617200`; PR147 supplies only the independent consensus append hotfix. This remains in-process evidence, **unverified on real hardware**, and gives no full M3 acceptance.
+
 ## Source/test blob pins
 
-| Path | Git blob at source/test commit |
+| Path | Git blob after R1 (other eight unchanged) |
 | --- | --- |
 | `crates/arxd/src/cluster/consensus.rs` | `d331442ec2d69433d0293bc3e97b48b66ea95ab6` |
 | `crates/arxd/src/cluster/consensus/three_node.rs` | `9999af2fba30e3b5af9f31a65911e84d1287748b` |
 | `crates/arxd/src/cluster/enrollment.rs` | `d26e28b45b277f1b6379bf3882e8de4f636f0c4b` |
 | `crates/arxd/src/cluster/enrollment/codec.rs` | `ecaeb9ffa0e614bb99da015ea4ee485b621e674b` |
 | `crates/arxd/src/cluster/enrollment/registry.rs` | `3764f4d5214fa90fb67d36ec5b02ec1b7b6b8727` |
-| `crates/arxd/src/cluster/enrollment/tests.rs` | `eea3855e6a5e0cf3fce971379a5e67cca636eedc` |
+| `crates/arxd/src/cluster/enrollment/tests.rs` | `762505ee071937758f1caabaf324a57185a941b7` |
 | `crates/arxd/src/cluster/log_store.rs` | `02db51fc2409201f7f84c731707329d71398727c` |
 | `crates/arxd/src/cluster/log_store/tests.rs` | `f0072dd177289361c6c1b85da2a1278d1f924b93` |
 | `crates/arxd/src/cluster/state_store.rs` | `90474881230e40061648efcedd0a51dd66eab54e` |
-| `crates/arxd/src/cluster/state_store/tests.rs` | `72203af92889454dd9f32773c96f9e99b1545713` |
+| `crates/arxd/src/cluster/state_store/tests.rs` | `1bc25e51483fa1144b691b7da72b4e6746bf5591` |
