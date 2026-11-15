@@ -13,8 +13,9 @@ evidence.
 
 **Hosted A7/A11: NO-GO. Final and irrevocable under the pre-registered D7k rule.**
 
-- Run `43728169361` attempt 1 is a miss. It is not the `exit_zero` with
-  `no_new_privs=true` security outcome, so the "ANY other miss" branch applies.
+- Run `43728169361` attempt 1 is a miss. The closed record does not show an `exit_zero` with
+  `no_new_privs=true` security outcome; the NO-GO miss branch applies without
+  inferring an unobserved sudo result.
 - **No acceptance.** No A7, A11, M2, full F/G or real-Runner PA6 credit. A7/A11
   stay **unverified on real hardware**, pending a dedicated Linux host owned by
   the owner (systemd >= 254, kernel >= 5.14, cgroup v2, no writable
@@ -81,9 +82,13 @@ evidence.
   - `cleanup` is `confirmed`, which requires `first == final`. Both are
     `{"code": "E_ARTIFACT"}`, a member of `CODES`.
   - The record has no inconsistent fields.
-- By those invariants, the driver records no service, cgroup or account mutation
-  for this run. So the record contains no case evidence: no CASE0, CASE1 or
-  COMPLETE marker, no NNP value, no candidate choice and no sudo outcome.
+- The record retains no case evidence: no CASE0, CASE1 or COMPLETE marker,
+  no NNP value, no candidate choice and no sudo outcome. `staged` is a LOWER
+  bound, not proof of absent effects. Coordinator Sol source review notes that
+  `prepare_controlled_sudo_nnp` and `handoff_sudo_nnp` run before the driver
+  advances its marker to service, so account effects cannot be ruled out from
+  this record. Confirmed cleanup is the reported postcondition, not a claim
+  that nothing needed cleanup.
 - **Precise credit: none.** Not partial A7, not A11, not C1 identity, not the
   five-view proof. Earlier hosted credits (A1/A2, A3, A5, D9a A4) are neither
   widened nor reduced by this run.
@@ -145,3 +150,11 @@ correctly and is final.** No acceptance and no credit. A7/A11 stay **unverified
 on real hardware** pending a dedicated host. Remaining M2 work comes first, then
 independent M3. M2 is not complete. This assessment grants no run, pin, grant or
 reopening.
+
+## Coordinator Sol correction at publication
+
+2026-11-15: independent source check of run_body corrects the earlier inference
+from staged to no-account-effects. Account provisioning can precede the service
+marker; the retained lower bound cannot establish absence. No case evidence or
+sudo security outcome is inferred. This wording correction does not alter the
+closed JSON, consumed grant, confirmed-cleanup report or final NO-GO decision.
