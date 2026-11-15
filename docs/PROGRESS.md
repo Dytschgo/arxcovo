@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #114, `994760c98c2816f37b1acdcaa9d9827693765b17` at 03:30:17Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `d60665c`, exact three execution blobs and seven paths verified before D7f dispatch.
-- Current work: record D7f consumed by accepted run `43672720190`, attempt1/job132686133651, skipped with zero steps. Monitor mistakenly used an immediate eventually consistent run-list lookup instead of dispatch-returned URL; finally-clear raced job admission. Variable independently absent HTTP404. No native negative execution or credit. Prepare a narrow replacement disposition only after normal review/gates, with monitor bound to returned run URL through terminal completion; no retry under D7f.
+- Current work: independent Muse review of Sol docs-only D7g replacement preparation `3a00f68`, with zero execution/blob/mode change versus PR114 main `994760c`. D7f run43672720190 was skipped before steps and is consumed; pin absent404. Replacement monitor must bind dispatch-returned URL and retain pin through that run terminal. No further native authority before review, gates, merge and exact squash verification.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. Native A4 omitted-kill, A4 acceptance, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
