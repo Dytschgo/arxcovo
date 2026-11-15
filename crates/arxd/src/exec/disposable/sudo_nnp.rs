@@ -459,9 +459,350 @@ fn read_fixed_delivery(profile: &str) -> Option<(Prepared, Vec<std::fs::File>)> 
     ))
 }
 
+// D9b candidate only; installed plugin digest/default-path/floor proof is absent.
+const CONTROLLED_PLUGIN: &str = "/usr/libexec/sudo/sudoers.so";
+fn controlled_literals(run: &str) -> Option<Vec<(&'static str, Vec<u8>)>> {
+    let names = delivery_names(run)?;
+    Some(vec![
+        ("sudoers", b"#includedir /etc/sudoers.d\n".to_vec()),
+        (
+            "sudo.conf",
+            format!("Plugin sudoers_policy {CONTROLLED_PLUGIN}\n").into_bytes(),
+        ),
+        (
+            "nsswitch.conf",
+            b"passwd: files\ngroup: files\nsudoers: files\n".to_vec(),
+        ),
+        (
+            "sudoers.d/10-a7-case0",
+            format!("{} ALL=(root) NOPASSWD: /usr/bin/true\n", names[0]).into_bytes(),
+        ),
+    ])
+}
+fn controlled_mappings(run: &str, mappings: &[&str]) -> bool {
+    if delivery_names(run).is_none() {
+        return false;
+    }
+    let expected: Vec<_> = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+        .iter()
+        .map(|n| format!("/var/lib/arx-ci-{run}/fx/{n}:/etc/{n}:rbind"))
+        .collect();
+    mappings.len() == 4
+        && expected
+            .iter()
+            .all(|e| mappings.iter().filter(|m| **m == e).count() == 1)
+}
+fn controlled_mounts(text: &str) -> bool {
+    if text.len() > 1024 * 1024 {
+        return false;
+    }
+    let expected = [
+        "/etc/sudoers",
+        "/etc/sudo.conf",
+        "/etc/nsswitch.conf",
+        "/etc/sudoers.d",
+    ];
+    let mut seen = [0; 4];
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 10 || !fields.contains(&"-") {
+            return false;
+        }
+        let path = fields[4];
+        if let Some(i) = expected.iter().position(|p| *p == path) {
+            if !fields[5].split(',').any(|o| o == "ro") {
+                return false;
+            }
+            seen[i] += 1;
+        } else if path.starts_with("/etc/") {
+            return false;
+        }
+    }
+    seen == [1; 4]
+}
+fn controlled_bytes(run: &str, entries: &[(&str, &[u8])]) -> bool {
+    let Some(expected) = controlled_literals(run) else {
+        return false;
+    };
+    entries.len() == 4
+        && expected.iter().all(|(n, b)| {
+            entries
+                .iter()
+                .filter(|(name, data)| name == n && *data == b)
+                .count()
+                == 1
+        })
+}
+fn controlled_read(file: &std::fs::File, bound: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(bound + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= bound).then_some(bytes)
+}
+fn controlled_unit_mappings() -> Option<String> {
+    use std::{
+        io::Read,
+        os::fd::AsRawFd,
+        process::{Command, Stdio},
+    };
+    let mut child = Command::new("/usr/bin/systemctl")
+        .args([
+            "show",
+            "arxd.service",
+            "--property=BindReadOnlyPaths",
+            "--value",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let result = (|| {
+        let mut pipe = child.stdout.take()?;
+        let fd = pipe.as_raw_fd();
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.len() > 4096 {
+                        return None;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop {
+            if let Some(status) = child.try_wait().ok()? {
+                return status
+                    .success()
+                    .then(|| String::from_utf8(bytes).ok())
+                    .flatten();
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+fn controlled_view(run: &str, accounts: &[OwnerConfig; 2]) -> Option<Vec<std::fs::File>> {
+    use std::{
+        mem::MaybeUninit,
+        os::{fd::AsRawFd, unix::fs::MetadataExt},
+    };
+    let mappings = controlled_unit_mappings()?;
+    if !controlled_mappings(run, &mappings.split_whitespace().collect::<Vec<_>>()) {
+        return None;
+    }
+    // Fixed kernel path only, bounded; never called by portable pure tests.
+    let mounts = controlled_read(
+        &std::fs::File::open("/proc/self/mountinfo").ok()?,
+        1024 * 1024,
+    )?;
+    if !controlled_mounts(std::str::from_utf8(&mounts).ok()?) {
+        return None;
+    }
+    let mut observed = Vec::new();
+    let stage = PathBuf::from(format!("/var/lib/arx-ci-{run}/fx"));
+    let mut held = Vec::new();
+    for name in [
+        "",
+        "sudoers.d",
+        "sudoers",
+        "sudo.conf",
+        "nsswitch.conf",
+        "sudoers.d/10-a7-case0",
+    ] {
+        let directory = name.is_empty() || name == "sudoers.d";
+        let source = delivery_open(&stage.join(name), directory)?;
+        let view = delivery_open(&Path::new("/etc").join(name), directory)?;
+        let a = source.metadata().ok()?;
+        let b = view.metadata().ok()?;
+        let valid = |m: &std::fs::Metadata| {
+            m.uid() == 0
+                && m.gid() == 0
+                && if directory {
+                    m.is_dir() && m.mode() & 0o7777 == 0o700
+                } else {
+                    m.is_file() && m.mode() == 0o100440 && m.nlink() == 1
+                }
+        };
+        // fx itself maps no /etc directory. Validate its protected staging only.
+        if name.is_empty() {
+            if !valid(&a) {
+                return None;
+            }
+        } else {
+            if !valid(&a) || !valid(&b) || a.dev() != b.dev() || a.ino() != b.ino() {
+                return None;
+            }
+            let mut fs = MaybeUninit::<libc::statvfs>::uninit();
+            if unsafe { libc::fstatvfs(view.as_raw_fd(), fs.as_mut_ptr()) } != 0
+                || unsafe { fs.assume_init() }.f_flag & libc::ST_RDONLY == 0
+            {
+                return None;
+            }
+        }
+        if directory {
+            let expected: Vec<&str> = if name.is_empty() {
+                vec!["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+            } else {
+                vec!["10-a7-case0"]
+            };
+            // Held descriptor path, not an arbitrary caller path; no symlink traversal of entries.
+            for fd in if name.is_empty() {
+                vec![source.as_raw_fd()]
+            } else {
+                vec![source.as_raw_fd(), view.as_raw_fd()]
+            } {
+                let mut entries = Vec::new();
+                for entry in std::fs::read_dir(format!("/proc/self/fd/{fd}"))
+                    .ok()?
+                    .take(6)
+                {
+                    entries.push(entry.ok()?.file_name().into_string().ok()?);
+                }
+                if entries.len() != expected.len()
+                    || !expected.iter().all(|e| entries.iter().any(|n| n == e))
+                {
+                    return None;
+                }
+            }
+        } else {
+            let source_bytes = controlled_read(&source, 4096)?;
+            let view_bytes = controlled_read(&view, 4096)?;
+            if source_bytes != view_bytes {
+                return None;
+            }
+            observed.push((name, view_bytes));
+        }
+        let again = delivery_open(&stage.join(name), directory)?
+            .metadata()
+            .ok()?;
+        if again.dev() != a.dev() || again.ino() != a.ino() {
+            return None;
+        }
+        if !name.is_empty() {
+            let again_view = delivery_open(&Path::new("/etc").join(name), directory)?
+                .metadata()
+                .ok()?;
+            if !valid(&again_view) || again_view.dev() != b.dev() || again_view.ino() != b.ino() {
+                return None;
+            }
+        }
+        if !valid(&again) {
+            return None;
+        }
+        held.extend([source, view]);
+    }
+    if !controlled_bytes(
+        run,
+        &observed
+            .iter()
+            .map(|(n, b)| (*n, b.as_slice()))
+            .collect::<Vec<_>>(),
+    ) {
+        return None;
+    }
+    for a in accounts {
+        let pin = DeliveryAccount {
+            uid: a.uid,
+            gid: a.gid,
+            base_dev: 0,
+            base_ino: 0,
+            workspace_dev: 0,
+            workspace_ino: 0,
+        };
+        delivery_account(&a.account, &pin)?;
+    }
+    Some(held)
+}
+
+#[test]
+fn a7_controlled_policy_discriminators() {
+    let run = "123-1";
+    let literals = controlled_literals(run).unwrap();
+    let entries: Vec<_> = literals.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    assert!(controlled_bytes(run, &entries));
+    for i in 0..4 {
+        let mut bad = entries.clone();
+        bad.remove(i);
+        assert!(!controlled_bytes(run, &bad));
+        let mut bad = entries.clone();
+        bad[i].1 = b"arxsn123x1n ALL=(root) NOPASSWD: /usr/bin/true\n";
+        assert!(!controlled_bytes(run, &bad));
+    }
+    let mut bad = entries.clone();
+    bad.push(("sudoers.d/extra", b"ALL ALL=(ALL) ALL\n"));
+    assert!(!controlled_bytes(run, &bad));
+    let mappings: Vec<_> = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+        .iter()
+        .map(|n| format!("/var/lib/arx-ci-{run}/fx/{n}:/etc/{n}:rbind"))
+        .collect();
+    let refs: Vec<_> = mappings.iter().map(String::as_str).collect();
+    assert!(controlled_mappings(run, &refs));
+    assert!(!controlled_mappings(run, &refs[..3]));
+    let mut bad = refs.clone();
+    bad.push(refs[0]);
+    assert!(!controlled_mappings(run, &bad));
+    let mut extra = refs.clone();
+    extra.push("/foreign:/etc/other:rbind");
+    assert!(!controlled_mappings(run, &extra));
+    let mut strings = mappings.clone();
+    strings[0].insert(0, '-');
+    assert!(!controlled_mappings(
+        run,
+        &strings.iter().map(String::as_str).collect::<Vec<_>>()
+    ));
+    let mounts: String = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+        .iter()
+        .map(|n| format!("1 2 0:1 /fx/{n} /etc/{n} ro,nosuid - ext4 /dev/x rw\n"))
+        .collect();
+    assert!(controlled_mounts(&mounts));
+    assert!(!controlled_mounts(&mounts.replacen(
+        "ro,nosuid",
+        "rw,nosuid",
+        1
+    )));
+    assert!(!controlled_mounts(
+        &mounts.lines().skip(1).collect::<Vec<_>>().join("\n")
+    ));
+    assert!(!controlled_mounts(
+        &(mounts.clone() + "1 2 0:1 /x /etc/other ro - ext4 /dev/x rw\n")
+    ));
+    assert!(!controlled_mounts(
+        &(mounts.clone() + mounts.lines().next().unwrap())
+    ));
+    assert!(!controlled_mappings("124-1", &refs));
+}
+
 fn recheck_delivery(config: &OwnerConfig, executable: &Path) -> Option<Vec<std::fs::File>> {
     let expected_profile: Option<&str> = None;
     let (prepared, held) = read_fixed_delivery(expected_profile?)?;
+    let run =
+        std::env::var("GITHUB_RUN_ID").ok()? + "-" + &std::env::var("GITHUB_RUN_ATTEMPT").ok()?;
+    let mut held = held;
+    held.extend(controlled_view(&run, &prepared.accounts)?);
     let pinned = prepared
         .accounts
         .iter()
@@ -783,6 +1124,7 @@ fn disposable_linux_a7_a11() {
         assert!(config.uid >= 1000 && config.gid >= 1000 && !config.admin);
         assert_eq!(config.memory_bytes, 64 * 1024 * 1024);
         assert_eq!(config.pids, 32);
+        let _initial_admission = recheck_delivery(&config, &prepared.arxd).unwrap();
         let runner = Runner::new(config.clone()).unwrap();
         let mut spec = RunSpec {
             executable: prepared.arxd.clone(),

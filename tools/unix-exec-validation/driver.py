@@ -185,7 +185,7 @@ def sudo_nnp_names(run):
     return names
 
 
-def prepare_sudo_nnp(run, owned):
+def sudo_nnp_accounts(run, owned):
     """Root controller only, before service start. Caller retains owned on failure.
 
     No adoption: pre-existing accounts/groups, roots or policy names refuse before
@@ -196,7 +196,7 @@ def prepare_sudo_nnp(run, owned):
     import grp
     require(os.getuid() == os.geteuid() == 0 and not owned, 'E_FIXTURE_UID')
     names = sudo_nnp_names(run)
-    for parent in (Path('/var/lib'), Path('/etc/sudoers.d')):
+    for parent in (Path('/var/lib'),):
         protected(parent, 'run_parent')
     for name in names:
         for lookup in (pwd.getpwnam, grp.getgrnam):
@@ -205,9 +205,9 @@ def prepare_sudo_nnp(run, owned):
             except KeyError:
                 continue
             raise RuntimeError('E_FIXTURE_COLLISION')
-        for path in (Path('/var/lib') / name, Path('/etc/sudoers.d') / name):
+        for path in (Path('/var/lib') / name,):
             require(not os.path.lexists(path), 'E_FIXTURE_COLLISION')
-    for index, name in enumerate(names):
+    for name in names:
         base = Path('/var/lib') / name
         item = dict(name=name, base=base, created=False, identity=None, policy=None)
         owned.append(item)
@@ -231,6 +231,21 @@ def prepare_sudo_nnp(run, owned):
         # Private build-owned root; retain captured inode for owned-only cleanup.
         os.chown(base, account.pw_uid, account.pw_gid, follow_symlinks=False)
         item['base_info'] = base.lstat()
+        yield item
+    require(owned[0]['identity'][0] != owned[1]['identity'][0] and
+            owned[0]['identity'][1] != owned[1]['identity'][1], 'E_FIXTURE_UID')
+
+
+def prepare_sudo_nnp(run, owned):
+    """Legacy dormant host-policy path; never called by controlled preparation."""
+    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    require(os.getuid() == os.geteuid() == 0 and not owned, 'E_FIXTURE_UID')
+    names = sudo_nnp_names(run)
+    os.close(sudo_nnp_open(Path('/etc/sudoers.d'), True))
+    for name in names:
+        require(not os.path.lexists(Path('/etc/sudoers.d') / name), 'E_FIXTURE_COLLISION')
+    for index, item in enumerate(sudo_nnp_accounts(run, owned)):
+        name = item['name']
         if index == 0:
             policy = Path('/etc/sudoers.d') / name
             data = (name + ' ALL=(root) NOPASSWD: /usr/bin/true\n').encode('ascii')
@@ -248,8 +263,6 @@ def prepare_sudo_nnp(run, owned):
             # Fixed bounded syntax refusal only, never an effective-policy check.
             subprocess.run(['/usr/sbin/visudo', '-c', '-f', str(policy)], env=SAFE_ENV,
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-    require(owned[0]['identity'][0] != owned[1]['identity'][0] and
-            owned[0]['identity'][1] != owned[1]['identity'][1], 'E_FIXTURE_UID')
 
 
 def cleanup_sudo_nnp(owned, unit_gone=False):
@@ -318,6 +331,139 @@ def cleanup_sudo_nnp(owned, unit_gone=False):
             same_object(item['base'], item['base_info'])
             shutil.rmtree(item['base'])
             require(not os.path.lexists(item['base']), 'E_FIXTURE_RESIDUE')
+
+
+# Candidate only: installed plugin digest/default paths/floor remain UNATTESTED.
+SUDO_NNP_PLUGIN = '/usr/libexec/sudo/sudoers.so'
+
+
+def controlled_literals(run):
+    case0, _case1 = sudo_nnp_names(run)
+    return {'sudoers': b'#includedir /etc/sudoers.d\n',
+            'sudo.conf': ('Plugin sudoers_policy ' + SUDO_NNP_PLUGIN + '\n').encode('ascii'),
+            'nsswitch.conf': b'passwd: files\ngroup: files\nsudoers: files\n',
+            'sudoers.d/10-a7-case0': (case0 + ' ALL=(root) NOPASSWD: /usr/bin/true\n').encode('ascii')}
+
+
+def controlled_mappings(run):
+    sudo_nnp_names(run)
+    stage, _ = plan(run)
+    return tuple((stage / 'fx' / name).as_posix() + ':/etc/' + name
+                 for name in ('sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d'))
+
+
+def controlled_mapping_set(run, mappings):
+    expected = controlled_mappings(run)
+    require(len(mappings) == 4 and set(mappings) == set(expected), 'E_POLICY_MAPPING')
+
+
+def controlled_override(run):
+    stage, _ = plan(run)
+    return fixture_override(stage, run) + ''.join(
+        'BindReadOnlyPaths=' + mapping + '\n' for mapping in controlled_mappings(run))
+
+
+def prepare_controlled_sudo_nnp(run, accounts, fixture):
+    # No original-policy collector, legacy writer or runtime selector edge.
+    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    stage_controlled_sudo_nnp(run, fixture)
+    for _ in sudo_nnp_accounts(run, accounts):
+        pass
+
+
+def controlled_pin(fd, directory=False):
+    info = os.fstat(fd)
+    mode = 0o700 if directory else 0o440
+    require(info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == mode and
+            (stat.S_ISDIR(info.st_mode) if directory else
+             stat.S_ISREG(info.st_mode) and info.st_nlink == 1), 'E_POLICY_IDENTITY')
+    digest = None
+    if not directory:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, 4097)
+        require(len(data) <= 4096 and os.read(fd, 1) == b'', 'E_POLICY_BOUND')
+        digest = hashlib.sha256(data).hexdigest()
+    after = os.fstat(fd)
+    require((info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink, info.st_size) ==
+            (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink, after.st_size),
+            'E_POLICY_IDENTITY')
+    return (info.st_dev, info.st_ino, digest)
+
+
+def stage_controlled_sudo_nnp(run, owned):
+    require(sudo_nnp_eligible(sudo_nnp_host_attested(), False), 'E_POLICY_UNATTESTED')
+    sudo_nnp_names(run)
+    require(not owned and os.getuid() == os.geteuid() == 0, 'E_FIXTURE_UID')
+    stage, _ = plan(run)
+    parent = sudo_nnp_open(stage, True)
+    try:
+        require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'E_POLICY_IDENTITY')
+        owned['entries'] = []
+        for name in ('fx', 'fx/sudoers.d'):
+            owned['pending'] = True
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+            fd = sudo_nnp_open(stage / name, True)
+            owned['entries'].append((name, fd, None))
+            owned['entries'][-1] = (name, fd, controlled_pin(fd, True))
+            owned['pending'] = False
+        for name, data in controlled_literals(run).items():
+            owned['pending'] = True
+            fd = os.open('fx/' + name, os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o440, dir_fd=parent)
+            # Retain descriptor immediately: short writes and uncertain capture quarantine.
+            owned['entries'].append(('fx/' + name, fd, None))
+            require(os.write(fd, data) == len(data), 'E_POLICY_WRITE')
+            os.fchmod(fd, 0o440)
+            owned['entries'][-1] = ('fx/' + name, fd, controlled_pin(fd))
+            owned['pending'] = False
+        recheck_controlled_sudo_nnp(run, owned)
+    finally:
+        os.close(parent)
+
+
+def recheck_controlled_sudo_nnp(run, owned):
+    stage, _ = plan(run)
+    literals = controlled_literals(run)
+    require(not owned.get('pending') and len(owned.get('entries', [])) == 6, 'E_POLICY_IDENTITY')
+    require({n for n, _, _ in owned['entries']} ==
+            {'fx', 'fx/sudoers.d'} | {'fx/' + n for n in literals}, 'E_POLICY_ENTRIES')
+    for name, held, pin in owned['entries']:
+        directory = name in ('fx', 'fx/sudoers.d')
+        require(pin is not None and controlled_pin(held, directory) == pin, 'E_POLICY_IDENTITY')
+        fd = sudo_nnp_open(stage / name, directory)
+        try:
+            require(controlled_pin(fd, directory) == pin, 'E_POLICY_IDENTITY')
+            if not directory:
+                require(pin[2] == hashlib.sha256(literals[name[3:]]).hexdigest(), 'E_POLICY_LITERAL')
+            else:
+                expected = {'10-a7-case0'} if name.endswith('sudoers.d') else {
+                    'sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d'}
+                require(set(os.listdir(fd)) == expected, 'E_POLICY_ENTRIES')
+        finally:
+            os.close(fd)
+
+
+def cleanup_controlled_sudo_nnp(run, owned, unit_gone=False):
+    require(unit_gone is True, 'E_QUARANTINE_CGROUP')
+    # Partial/unidentified creation retains everything; never guess ownership.
+    recheck_controlled_sudo_nnp(run, owned)
+    stage, _ = plan(run)
+    parent = sudo_nnp_open(stage, True)
+    try:
+        for name, held, pin in reversed(owned['entries']):
+            fd = sudo_nnp_open(stage / name, name in ('fx', 'fx/sudoers.d'))
+            try:
+                require(controlled_pin(fd, name in ('fx', 'fx/sudoers.d')) == pin, 'E_POLICY_IDENTITY')
+            finally:
+                os.close(fd)
+            if name in ('fx', 'fx/sudoers.d'):
+                os.rmdir(name, dir_fd=parent)
+            else:
+                os.unlink(name, dir_fd=parent)
+            os.close(held)
+        owned.clear()
+    finally:
+        os.close(parent)
 
 
 def sudo_nnp_artifact(output, stage, libtest):
