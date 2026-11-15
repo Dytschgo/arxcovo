@@ -19,6 +19,7 @@ fn ids(page: &Value) -> Vec<i64> {
 }
 
 // Join real command completion, SDK serialization and exact persisted lookup.
+// Includes post-spawn cancellation with confirmed cleanup and no exit code.
 // Only typed fixture reports enter the existing dispatcher; no process runs.
 #[tokio::test]
 async fn completed_command_sdk_exact_lookup_preserves_outcome_and_identity() {
@@ -26,13 +27,18 @@ async fn completed_command_sdk_exact_lookup_preserves_outcome_and_identity() {
         executor::tests::{OnceReport, SID_A, completed, default_fixture, good},
         layout::Platform,
     };
-    use crate::store::Rights;
+    use crate::store::{Rights, StopReason};
     use std::sync::Mutex;
 
-    for (exit_code, outcome) in [(0, "succeeded"), (7, "failed")] {
+    for (stop, exit_code, outcome, stop_reason) in [
+        (StopReason::Exited, Some(0), "succeeded", "exited"),
+        (StopReason::Exited, Some(7), "failed", "exited"),
+        (StopReason::Cancelled, None, "failed", "cancelled"),
+    ] {
         let dir = crate::service::application::tests::private_temp();
         let mut evidence = good(Platform::Windows, Rights::Standard);
-        evidence.exit_code = Some(exit_code);
+        evidence.stop = Some(stop);
+        evidence.exit_code = exit_code;
         let executor = default_fixture(Arc::new(OnceReport(Mutex::new(Some(completed(evidence))))));
         let mut store = Activity::open_service_fixture(dir.path()).unwrap();
         store.dedicated = Some(executor.clone());
@@ -61,25 +67,33 @@ async fn completed_command_sdk_exact_lookup_preserves_outcome_and_identity() {
         let id = result["activity_id"].as_i64().unwrap();
         assert!(id > 0);
         assert_eq!(result["outcome"], outcome);
-        assert_eq!(result["exit_code"], exit_code);
+        assert_eq!(result["exit_code"], json!(exit_code));
+        assert!(result["reason"].is_null());
+        assert_ne!(executor.capability()["reason"], "quarantined");
         assert_eq!(result["metadata"]["identity_mode"], "dedicated_account");
         assert_eq!(result["observed_identity"]["id"], SID_A);
         assert_eq!(result["observed_identity"]["kind"], "windows_sid");
         assert_eq!(result["metadata"]["identity_matches_pin"], true);
-        assert_eq!(result["metadata"]["stop_reason"], "exited");
+        assert_eq!(result["metadata"]["stop_reason"], stop_reason);
         assert_eq!(result["cleanup_confirmed"], true);
         assert_eq!(result["rights"], "standard");
         assert_eq!(result["metadata"]["program"], "cargo");
         assert_eq!(result["metadata"]["argc"], 1);
         // The terminal row is already committed when the command payload arrives.
         let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
-        let persisted: (String, i32, String) = db.query_row(
-            "SELECT outcome,exit_code,principal FROM activity WHERE id=?1 AND finished_at_ms IS NOT NULL",
-            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        let persisted: (String, Option<i32>, String, String, bool) = db.query_row(
+            "SELECT outcome,exit_code,principal,stop_reason,cleanup_confirmed FROM activity WHERE id=?1 AND finished_at_ms IS NOT NULL",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).unwrap();
         assert_eq!(
             persisted,
-            (outcome.into(), exit_code, "fixture-agent".into())
+            (
+                outcome.into(),
+                exit_code,
+                "fixture-agent".into(),
+                stop_reason.into(),
+                true
+            )
         );
         drop(db);
         client.cancel().await.unwrap();
