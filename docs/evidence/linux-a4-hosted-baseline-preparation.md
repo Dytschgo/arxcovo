@@ -118,3 +118,25 @@ Checks: full ordinary Python discovery109tests passed; audited89tests and
 4 documented equivalents passed. All original failed audit counts above stay
 uncredited. Source driver hash remains c44d027c82abce854bef26ebe77554308619f1098d332179e13b48a503f41671.
 PR108 merge/actual baseline pins and fresh independent review remain pending.
+
+## Accepted integration baseline
+
+PR108 merged as 1869175ba31e5c81386f45d293ed50365081fb1f at2026-11-15T01:10:12Z,
+all five gates green and independent Muse publication PASS. Squash tree
+a1feee1deeefe47e9a266f805e3e5128f3cc930d equals reviewed76c49d2.
+Full baseline source/assets/workflow/package/toolchain blobs are retained in
+[a4-d7e-execution-baseline.json](a4-d7e-execution-baseline.json). Earlier
+pending-baseline notes above are preparation history and now resolved.
+Coordinator also normalized the legacy dash bytes in the builder PROGRESS
+status line, preserving the valid UTF-8 content elsewhere.
+The current local edited-file pins below supersede the old preparation table.
+No local head is dispatch authority.
+
+| Current path | Git blob |
+| --- | --- |
+| `tools/unix-exec-validation/driver.py` | `eb085b3e416f9bd8ca08c87c95c84fcd27cafd18` |
+| `.github/workflows/unix-execution-experiment.yml` | `dbcca2276307357301719ed68a09631b8ab7a10a` |
+| `tools/unix-exec-validation/test_driver.py` | `bb0db6f29f1fe72ef17ca9f5258cac99eaff7364` |
+| `tools/unix-exec-validation/mutation_check.py` | `143bd308d3e4ded15ee8f25b6aa95761bab2bef1` |
+| `tools/unix-exec-validation/test_f0_blockers.py` | `4779931b8cdf8444c4b19d34faa291559e717d05` |
+| `tools/unix-exec-validation/test_f0b_transport.py` | `294568ab0cadaec82a7497f9a29858d605ccff04` |

@@ -927,6 +927,63 @@ pub(crate) fn assert_private(v: &Value) {
         Value::Null | Value::Bool(_) => {}
     }
 }
+// The whole-file privacy scan also sees the unrelated random hex host ID.
+// Pin only this fixture value so short decimal UID/GID markers cannot collide.
+fn pin_durable_privacy_host_id(dir: &std::path::Path) {
+    let db = rusqlite::Connection::open(dir.join("activity.sqlite3")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=TRUNCATE;").unwrap();
+    db.execute(
+        "UPDATE local_host_identity SET host_id=?1",
+        ["a".repeat(64)],
+    )
+    .unwrap();
+}
+
+#[test]
+fn adr0017_durable_privacy_host_id_collision() {
+    let dir = private_temp();
+    let activity = Activity::open_service_fixture(dir.path()).unwrap();
+    let path = dir.path().join("activity.sqlite3");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=TRUNCATE;").unwrap();
+    let colliding_id = format!("{}6200263003", "a".repeat(54));
+    db.execute("UPDATE local_host_identity SET host_id=?1", [&colliding_id])
+        .unwrap();
+    // This is a valid store identity, before any executor/report has run.
+    assert_eq!(activity.host_id().unwrap(), colliding_id);
+    let contains =
+        |bytes: &[u8], marker: &str| bytes.windows(marker.len()).any(|b| b == marker.as_bytes());
+    let bytes = std::fs::read(&path).unwrap();
+    for marker in ["62002", "63003"] {
+        assert!(contains(&bytes, marker), "synthetic host ID collision");
+    }
+    pin_durable_privacy_host_id(dir.path());
+    let bytes = std::fs::read(&path).unwrap();
+    for marker in ["62002", "63003"] {
+        assert!(!contains(&bytes, marker), "synthetic host ID pinned");
+    }
+    // Pinning the identity must not conceal persisted synthetic report bytes.
+    // A separate probe table permits even identifiers rejected by store CHECKs.
+    db.execute_batch("CREATE TABLE privacy_probe(payload TEXT);")
+        .unwrap();
+    for marker in [
+        SID_B,
+        OUTPUT_MARKER,
+        "62002",
+        "63003",
+        "S-1-x",
+        &format!("S-1-5-{}1", "0".repeat(178)),
+    ] {
+        db.execute("INSERT INTO privacy_probe VALUES(?1)", [marker])
+            .unwrap();
+        pin_durable_privacy_host_id(dir.path());
+        assert!(
+            contains(&std::fs::read(&path).unwrap(), marker),
+            "synthetic row leak remains visible"
+        );
+    }
+}
+
 #[tokio::test]
 async fn adr0017_dispatch_durable_matrix() {
     // Each case uses a new store and backend, real dispatch, and every metadata
@@ -1482,6 +1539,7 @@ async fn adr0017_dispatch_durable_matrix() {
             .to_string();
         let dir = private_temp();
         let a = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+        pin_durable_privacy_host_id(dir.path());
         let pin = if platform == Platform::Windows {
             windows_pin(rights)
         } else {
@@ -1733,17 +1791,17 @@ async fn adr0017_dispatch_durable_matrix() {
         ] {
             if path.exists() {
                 let bytes = std::fs::read(path).unwrap();
-                for secret in [
-                    SID_B,
-                    OUTPUT_MARKER,
-                    "62002",
-                    "63003",
-                    "S-1-x",
-                    &format!("S-1-5-{}1", "0".repeat(178)),
+                for (marker, secret) in [
+                    ("sid_b", SID_B),
+                    ("output", OUTPUT_MARKER),
+                    ("uid_b", "62002"),
+                    ("gid_b", "63003"),
+                    ("malformed_sid", "S-1-x"),
+                    ("overlong_sid", &format!("S-1-5-{}1", "0".repeat(178))),
                 ] {
                     assert!(
                         !bytes.windows(secret.len()).any(|b| b == secret.as_bytes()),
-                        "{name}"
+                        "{name}: persisted synthetic marker {marker}"
                     );
                 }
             }

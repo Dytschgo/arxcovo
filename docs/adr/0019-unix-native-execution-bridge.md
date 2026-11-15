@@ -548,14 +548,15 @@ unchanged. No native operation or execution permission follows from these checks
 
 **Proposed; source preparation only, no execution permission yet.** PR #106
 merged as `40adbe55672293c894abd2d49be4de630e62577e`. PR #108's reviewed
-deterministic privacy fixture must merge first; its actual full main squash
-SHA and execution-blob inventory are **pending coordinator fill**, not inferred
-from a branch head. Before publishing this candidate, the coordinator must
-record that accepted reviewed source baseline, verify its tree against the
-reviewed PR #108 head, and retain full Git blob pins for execution source,
-fixture, helper source/build/recipe/pins, driver, workflow, package and Standard
-profile. No merge or SHA is asserted here. Local preparation is based on #106;
-it cannot substitute for that future baseline or waive a failing guard test.
+privacy fixture merged as `1869175ba31e5c81386f45d293ed50365081fb1f` at
+2026-11-15T01:10:12Z after all five gates and independent review. The coordinator
+verified its tree `a1feee1deeefe47e9a266f805e3e5128f3cc930d` equals reviewed
+head `76c49d22562357d46c2f5c8ecdec92a3eda94df6`.
+The [execution baseline inventory](../evidence/a4-d7e-execution-baseline.json)
+pins all arxd source, Unix-validation assets, both relevant workflows, Cargo
+metadata, toolchain, unit and Standard profile at that exact accepted baseline.
+This baseline is never the dispatch SHA. The candidate's full main squash SHA
+remains pending independent review, required checks and coordinator merge.
 
 The sole dispatch candidate is the **first normal gated main squash** containing
 this amendment and `TEST = 'exec::disposable::a4::disposable_linux_a4'` after that
