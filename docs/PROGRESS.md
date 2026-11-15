@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #112, `f15e9acc46b4534eb9d760b546f358f83a47a12d` at 02:39:57Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `8903812`; fixed test-only omitted-kill contract is effective, with no native execution grant.
-- Current work: publish independently reviewed fixed native omitted-kill source. Muse `94e9237`, retained `8859401`, found no blockers; two exact omitted-S7 tests/E3 inventory/fmt/diff passed independently. Coordinator refreshed the E3 linux.rs hash from committed LF bytes; portable E3 25 tests passed with one skip. TEST remains positive; hosted Linux compile and exact-head publication review remain pending. No native negative run or authority.
+- Last merged: PR #113, `d0b4c5530b1c4c084a35fe40499afa96a2678b0b` at 03:12:06Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `15c4d73`; hosted Ubuntu/macOS compilation succeeded. Native omitted-kill remains unrun and no run authority exists.
+- Current work: Sol / high preparing the one-run native omitted-kill disposition and fixed selection against merged PR113. The candidate must pass independent review and five gates before merge or dispatch; no A4/M2/F/G/PA6 acceptance is credited.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. Native A4 omitted-kill, A4 acceptance, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
