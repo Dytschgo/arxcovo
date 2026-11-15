@@ -77,3 +77,7 @@ The production change explicitly drops the worker's Arc before publishing ordina
 - No `[DEBUG-...]` markers remain in consensus source. The channel gate is retained as regression infrastructure and compiled only under `cfg(test)`.
 
 This proves the callback/worker ownership race exists and is fixed under a controlled real-path interleaving on Windows. It does not prove no other cause contributed to the Ubuntu CI incident. Ubuntu/macOS reruns, exact-main transplant validation and fresh independent Opus review remain for the coordinator. No external network or real cluster hardware path was exercised; LAN/Tailscale and VM paths remain **unverified on real hardware**. No timeout increases, weakened assertions or retry-based workaround.
+
+## Coordinator exact-main transplant
+
+The hotfix is retained as `ebdecee` on main `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306`, independently of the unmerged member-registry feature. On this main-based branch, `cargo nextest run -p arxd --locked --offline cluster::consensus::` ran 64 tests: 64 passed, 492 skipped, 8.876s. `cargo fmt --all --check` and `git diff --check origin/main` passed. These are local Windows results, not hosted Ubuntu reproduction or acceptance. Independent Opus review and fresh hosted gates remain pending.
