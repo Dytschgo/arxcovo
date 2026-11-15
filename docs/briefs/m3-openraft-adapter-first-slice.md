@@ -1,9 +1,9 @@
 # Brief: M3 OpenRaft 0.10.0 adapter and in-process three-node proof
 
-Status: **proposed** (Opus 5.5 high, 2026-11-15) on `7431327` (main `38750cf`, PR #144). Sol reviews before code.
-Nothing built or run. No M3 acceptance, transport, mTLS, CA, signing, power-loss or real-host claim. M2 stays open:
-A7 FINAL NO-GO and the consumed, cleanup-unconfirmed A12 attempt get no retry. ADR 0005 stays unchanged; this brief
-implements its invariants and adopts none of its open policy choices.
+Status: **proposed** (Opus 5.5 high, 2026-11-15) on `7431327` (main `38750cf`, PR #144). C1/C2 of the Sol review (`4bee9db`) are fixed in decisions 6/10/12, shutdown
+and U4/U6; the coordinator rechecks them before Sol builds. Nothing built or run; no M3 acceptance, transport, mTLS, CA, signing, power-loss or real-host claim. M2 is
+open: A7 FINAL NO-GO and the consumed, cleanup-unconfirmed A12 attempt get no retry. ADR 0005 is unchanged; this brief implements its invariants, adopting none of
+its open policy choices.
 
 ## Goal
 
@@ -24,10 +24,10 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 - `Membership::new(Vec<BTreeSet<NID>>, nodes)` checks voters ⊆ nodes; it has `get_joint_config()` and `nodes()`. Its fields
   are crate-private. `StoredMembership::new(Option<LogId>, M)`. `SnapshotMeta{last_log_id, last_membership}` has no
   snapshot id in 0.10. `Snapshot{meta, snapshot: SD}`.
-- `RaftLogStorage` (`storage/v2/raft_log_storage.rs`) returns `io::Error`. It must serialize all write IO; `save_vote` is
-  durable before return; `append(entries, IOFlushed)` must be readable on return, and the callback means durable (before or
-  after return). `IOFlushed` (`storage/callback.rs`) has no completing `Drop`, so a dropped callback never completes the IO.
-  `IOFlushed::signal(oneshot)` is public. `RaftLogReader` requires `try_get_log_entries(RangeBounds)` and `read_vote`.
+- `RaftLogStorage` (`storage/v2/raft_log_storage.rs`) returns `io::Error`. It must serialize all write IO; `save_vote` is durable before return; `append(entries,
+  IOFlushed)` must be readable on return, and the callback means durable (before or after return). `IOFlushed` has no completing `Drop`, so a dropped callback never
+  completes the IO. `IOFlushed::signal(oneshot)` is public. `RaftLogReader` requires `try_get_log_entries(RangeBounds)` and `read_vote`. `#[add_async_trait]` (macros
+  0.10.0) rewrites each trait `async fn` to `fn … -> impl Future<Output = T> + Send` (RPITIT) unless `single-threaded`, so an impl may be a plain `fn`.
 - `RaftStateMachine` (`raft_state_machine.rs`): `type SnapshotData`/`SnapshotBuilder`; `applied_state`; `apply(Stream<Item =
   io::Result<(Entry, Option<ApplyResponder>)>>)` (`ApplyResponder::send(R)` must run after each apply, or `client_write`
   never returns); a required `get_snapshot_builder`; `install_snapshot(&meta, SD)`; `get_current_snapshot`.
@@ -40,10 +40,11 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 - `Raft::new(id, Arc<Config>, N, LS, SM)` needs `N::Network: NetSnapshot<SnapshotData = SM::SnapshotData>`. `RaftNetworkV2`
   (`network/v2/network.rs`) blanket-implements all `Net*`. It needs `append_entries`, `vote` and `full_snapshot`; the
   default `pre_vote` grants. `Config::enable_pre_vote` `None` resolves to false. `RPCError::Unreachable(Unreachable::new(&e))`.
-- Reads: `ensure_linearizable(LinearizerOption)` waits for leadership and for apply ≥ `read_log_id`. With
-  `LinearizerOption::new(Some(ZERO), true).with_wait_timeout(d)` a missing quorum ends in
-  `LinearizableReadError::{QuorumNotEnough, ForwardToLeader}`. `client_write` has no timeout. `try_shutdown` joins only
-  the core and tick tasks ("independently of ... other background task lifetimes").
+- Reads: `ensure_linearizable(LinearizerOption)` waits for leadership and for apply ≥ `read_log_id`. With `LinearizerOption::new(Some(ZERO),
+  true).with_wait_timeout(d)` a missing quorum ends in `LinearizableReadError::{QuorumNotEnough, ForwardToLeader}`. `client_write` has no timeout. `try_shutdown`
+  joins only the core and tick tasks ("independently of ... other background task lifetimes"). `client_write_ff(D, Some(responder))` returns once the request is in
+  the API channel (`Fatal` if the core is gone); a `OneshotResponder::new_pair()` receiver then gets `Ok` after apply, `ForwardToLeader` (not appended; includes
+  `LeaseExpired`, lease = `election_timeout_max`), `LogEntryDiscarded` (purged, outcome unknown), or closes when the core exits and drops `client_responders`.
 - `testing::log::Suite` runs 46 `run_test` cases plus `transfer_snapshot`. Each case is a `pub async fn(LS, SM)`, so cases
   can be called one by one. 19 cases and `transfer_snapshot` start SM apply at index > 0 or leave a gap.
 
@@ -69,11 +70,13 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
    and never holds a guard across `.await`. A `JoinError` (panic, or cancelled before start) maps to `StoreError::Poisoned`.
    A mutex poisoned by a panic fails closed with `Poisoned` (no `into_inner`) until the process restarts and reopens.
    Errors are `io::Error::other(StoreError)` with static text. OpenRaft then goes fatal and the outcome is unknown (N5).
-6. **Append callback exactly once.** `append` collects `entries.into_iter().take(65)`; more than 64 is `TooLarge`, never
-   truncated. It wraps the callback in `Completion(Option<IOFlushed>)` and moves that into the blocking closure. After
-   `VoteLogStore::append` returns (`Ok` only after COMMIT), it calls `finish(result)`. `Drop` completes with
-   `Err(Poisoned)` if the callback is still unset: panic, cancelled-before-start, or a dropped closure. A conversion error
-   completes `Err` before any spawn. `append` then returns the same result. The callback fires even if OpenRaft drops the append future.
+6. **Append callback exactly once, owned eagerly (C1).** `LogAdapter::append` is a plain `fn append<I>(&mut self, entries: I, callback: IOFlushed<Arx>) -> impl
+   Future<Output = io::Result<()>> + Send` with the trait's `OptionalSend` bounds, never `async fn` (its body runs at first poll). Its first statement is `let guard =
+   Completion::new(callback)`, before iterating, collecting, converting or cloning. Still synchronously it collects `entries.into_iter().take(65)` (more than 64 is
+   `TooLarge`, never truncated) and converts, calling `guard.finish(Err)` on any error, giving `prepared: Result<(Batch, Completion), io::Error>`. It returns `async
+   move { match prepared { Err(e) => Err(e), Ok((b, guard)) => blocking(move || { let r = store.append(b); guard.finish(&r); r }).await } }`.
+   `Completion(Option<IOFlushed>)`: `finish` takes the callback; `Drop` completes `Err(Poisoned)` only if still set. So an unpolled or pre-spawn future drop, an
+   outer-fn panic, a closure dropped before it starts and a closure panic each complete once; after spawning, the closure finishes it. `Ok` only after COMMIT.
 7. **State-machine semantics stay as they are.** `apply` takes items in order. On an item `Err` it returns that error. Each
    entry is one blocking `StateStore::apply` (durable before return). `responder.send(Applied(outcome))` happens only after
    `Ok`; on error the responder drops and the call returns `Err`. The consecutive-from-0 rule and term rule stay; a real
@@ -88,28 +91,34 @@ entries. Use three persistent in-process nodes and a test-only in-memory network
 9. **Startup** is OpenRaft's helper unchanged. It repairs SM-ahead (purge past the tail is supported) and fails closed when the
    SM is behind purged or on an equal-index conflict. No `save_committed`: apply is durable, so restart never reverts.
    Reads go through the leader's ReadIndex only.
-10. **Config and backpressure** (`Params`, validated, `check()` asserted in tests). Production: heartbeat 100 ms, election
-    500..1000 ms, `max_payload_entries=64`, `max_append_entries=Some(64)`, `api_batch_capacity=Some(64)`,
-    `api_channel_size=Some(1024)`, `snapshot_policy=LogsSinceLast(64)`, `max_in_snapshot_log_to_keep=32`, `purge_batch_size=32`,
-    `replication_lag_threshold=128`, and `enable_pre_vote=Some(false)` (no pre-vote RPC; ADR 0005). Proposals hold one permit
-    of a 64-permit `Semaphore` until `client_write` returns; no permit means retryable `Busy`. `check()` requires
-    `snapshot_logs + keep + purge_batch + 64 + 8 ≤ MAX_LIVE (512)` and `lag > snapshot_logs`. This is sizing, not proof:
-    `Full` stays a fail-closed liveness error. The snapshot test params (8/0/1/16) pass the same `check()`.
+10. **Config and backpressure** (`Params`, validated, `check()` asserted in tests). Production: heartbeat 100 ms, election 500..1000 ms, `max_payload_entries=64`,
+    `max_append_entries=Some(64)`, `api_batch_capacity=Some(64)`, `api_channel_size=Some(1024)`, `snapshot_policy=LogsSinceLast(64)`,
+    `max_in_snapshot_log_to_keep=32`, `purge_batch_size=32`, `replication_lag_threshold=128`, and `enable_pre_vote=Some(false)` (no pre-vote RPC; ADR 0005). Decision
+    12's 64 owner permits bound engine-held proposals. `check()` requires `snapshot_logs + keep + purge_batch + 64 + 8 ≤ MAX_LIVE (512)` and `lag > snapshot_logs`.
+    This is sizing, not proof: `Full` stays a fail-closed liveness error. The snapshot test params (8/0/1/16) pass the same `check()`.
 11. **Suite honesty.** Run the 27 compatible official cases by name, unmodified. Run the 19 sparse-SM cases plus `transfer_snapshot`
     and require each to return `Err` displaying "out of order". Run each in `tokio::spawn` so a panic or `Ok` fails and forces
     reclassification. The evidence names both lists. This is never reported as full Suite conformance; Arxcovo startup tests cover the gaps.
     S2 = `last_membership_in_log`, `get_membership_from_{empty_log_and_sm, log_le_sm_last_applied, log_gt_sm_last_applied_1, _2}`, `get_initial_state_{with_state, membership_from_empty_log_and_sm, membership_from_sm_inlog_is_smaller, membership_from_log_insm_is_smaller, last_log_gt_sm, last_log_lt_sm, last_log_lt_sm_past_snapshot, sm_lt_purged, inverted_log_order, conflict_at_same_index, log_ids, re_apply_committed}`, `last_id_in_log`, `last_applied_state`, `transfer_snapshot`. S1 = every other `test_store` case.
-12. **Command service** (`pub(super)`, no ingress). `propose(Command)` gives `(LogPos, Option<Outcome>)` or `ProposeError::{Busy,
-    NotLeader(Option<u64>), Unavailable}`; it never retries. `linearizable_state()` gives `(Option<LogPos>, Vec<u8>)` or
-    `ReadError::{NotLeader, NoQuorum, Unavailable}`. It uses the option from the facts with `wait_timeout` 1500 ms, and checks the
-    returned applied value is ≥ `read_log_id`. Fresh-mint-only ingress (A2) and fresh signing guards stay future boundaries.
+12. **Command service** (`pub(super)`, no ingress). `propose(Command)` gives `(LogPos, Option<Outcome>)` or `ProposeError::{Busy, Stopped, NotLeader(Option<u64>),
+    Unknown}` and never retries. `Busy`/`Stopped`/`NotLeader` mean not appended. `Unknown` is never a final failure: callers retry the identical command; enrollment
+    dedup resolves it. **Owners (C2):** with no `.await` before the spawn, `propose` does `try_acquire_owned` on a 64-permit `Arc<Semaphore>` (none: `Busy`), locks
+    `owners: std::sync::Mutex<{closed, set: JoinSet<()>}>` (never across `.await`), returns `Stopped` if `closed`, else reaps via `try_join_next` and does
+    `set.spawn(owner(raft.clone(), cmd, permit, reply_tx))`. The owner calls `client_write_ff(cmd, Some(responder))`, holds the permit until the receiver resolves or
+    `Fatal`, then drops it and does `let _ = reply_tx.send(..)`. The caller awaits only `reply_rx`, so its cancellation or timeout never frees a permit the engine
+    still needs; a `propose` dropped before the spawn enqueued nothing. `propose` has no timeout; a caller timeout means `Unknown`. `Ok` gives `(LogPos(log_id),
+    data.0)`, `ForwardToLeader` `NotLeader`, and `LogEntryDiscarded`/`Fatal`/`RecvError`/owner panic `Unknown`. Owners exist only in `set` (no `tokio::spawn`/detach);
+    dropping `ConsensusNode` aborts them. `linearizable_state()` gives `(Option<LogPos>, Vec<u8>)` or `ReadError::{NotLeader, NoQuorum, Unavailable}`. It uses the
+    facts' option with `wait_timeout` 1500 ms and checks applied ≥ `read_log_id`. Fresh-mint-only ingress (A2) and fresh signing guards stay future boundaries.
 
 ## Files (only these, plus Cargo.toml/Cargo.lock as in decision 1)
 
 - `cluster.rs`: `pub mod consensus;`. `enrollment.rs`: `Display for Command`. `state_store.rs`: `StoreError::Membership`, `pub(super) fn peek`.
-- `cluster/consensus.rs` (≤ 350 lines): type config, `Applied`, `Params`/config, mapping, membership codec, and `ConsensusNode::{start,
-  propose, linearizable_state, shutdown}`. `shutdown` runs `try_shutdown`, drops the `Raft`, then polls ≤ 5 s until `Weak`s of
-  both stores are gone; otherwise `Orphaned`.
+- `cluster/consensus.rs` (≤ 380 lines): type config, `Applied`, `Params`/config, mapping, membership codec, and `ConsensusNode::{start, propose, linearizable_state,
+  shutdown}`. `shutdown` in order: (1) set `closed` under the owners lock; (2) `try_shutdown` *before* waiting on any owner (a no-quorum write never completes;
+  waiting first deadlocks), whose core exit resolves every owner; (3) take the set and `join_next` until empty within one shared 5 s deadline, else `abort_all`, join
+  the rest and return `Orphaned`; (4) drop the `Raft` and poll until both stores' `Weak`s are gone in the same deadline, else `Orphaned`. An SM-worker
+  `ApplyResponder` (outside `try_shutdown`'s joins) surfaces as `Orphaned`, never a silent leak. After: 64 permits, empty set.
 - `cluster/consensus/adapter.rs` (≤ 320 lines): `LogAdapter` (also the reader), `SmAdapter`, `SnapBuilder`, `Completion`, and the `blocking` helper.
 - `#[cfg(test)]` `cluster/consensus/{mem_net.rs, tests.rs, three_node.rs}`, plus `docs/evidence/m3-openraft-three-node.md`.
 - Commits: (1) deps, types, mapping, codec and unit tests; (2) adapters, Suite and startup; (3) service, mem_net and T1/T2; (4) T3 and evidence.
@@ -129,9 +138,14 @@ snapshot bytes (must be ≤ 16384). Nodes are removed from the map before shutdo
 - U2 codec: the Suite default node; the maximal joint 2×16 voters with 16×200-B addrs round-trips canonically. Rejected: id 0, unsorted or
   duplicate ids, a voter not in nodes, 17 nodes, addr 0/201/bad byte, 3 configs, version 2, a trailing byte, truncation at every length. No panics.
 - U3 `Params::check`/`Config::validate` for both profiles; mutated params are rejected.
-- U4 completion via `IOFlushed::signal`: exactly one value on success (after COMMIT, the row is visible on reopen), on store error,
-  on a 65-entry batch (disk unchanged), after a panic in a blocking op (then every later call returns `Poisoned`), and for a dropped unrun `Completion`.
+- U4 through the actual `RaftLogStorage::append(&mut adapter, …, IOFlushed::signal(tx))`: the returned future dropped **unpolled** for a valid batch, a 65-entry batch
+  and an unencodable membership entry each gives exactly one `Err` and an unchanged disk on reopen. Awaited: one `Ok` after COMMIT (row visible on reopen); a store
+  error gives one `Err`; a blocking-op panic gives one `Err`, then `Poisoned`. Polled once then dropped: one value. `rx` closes after it.
 - U5 SM sparse stream (first index 1) gives `Err` "out of order" with the store unchanged. Install with mismatched meta is `Corrupt`, unchanged.
+- U6 owners (three-node fixture; owner profile election 3000..6000 ms so the lease outlasts the burst; passes `check()`): isolate both followers, issue 64 proposes
+  from caller tasks, require metrics to show 64 entries appended past committed (else fail, never vacuous), then abort and join every caller. The next `propose` is
+  `Busy` with 0 permits. Shut the isolated leader down: `shutdown` returns within 5 s without `Orphaned`, 64 permits, empty set; a later `propose` is `Stopped`. A
+  second fixture repeats the burst, then restores quorum: permits never exceed 64 (resolutions recorded, not asserted) and `shutdown` still restores 64 and empties the set.
 - S1/S2 Suite as in decision 11. R1–R4 startup through the real `StorageHelper::get_initial_state`: SM 0..=5 over log 0..=3 → purged = last = 5,
   next append 6 (4 rejected); SM 0..=1 under log purge(3) → error, and `Raft::new` → `Fatal::StorageError`; equal-index term conflict → error; normal.
 - Fixture: ids 1..3, node 1 `initialize({1,2,3} → BasicNode::new("mem:N"))`, `first_free = 4`, deterministic code RNG, explicit
@@ -141,7 +155,7 @@ snapshot bytes (must be ≤ 16384). Nodes are removed from the map before shutdo
   Redeem C at mint time + `CODE_TTL_MS` → `Expired`; a wrong proof → `BadProof`. Restart the follower: applied equals the leader's, and the blobs are equal on all three.
 - T2 leader: acked writes; isolate and shut down the leader; a new leader appears within 5 s; writes continue. A linearizable read sees every ack;
   a follower read gets `NotLeader`. Reopen the old leader's SM directly: applied ≥ each write it acked. Restart it and it converges. Shut down
-  two nodes: a lone-node propose gets no `Ok` within 2 s, and a read gets `NoQuorum`/`NotLeader` within 3 s. Restart one node: an identical retry
+  two nodes: a lone-node propose (2 s caller timeout: `Unknown`/`NotLeader`) gets no `Ok`; a read gets `NoQuorum`/`NotLeader` within 3 s. Restart one node: an identical retry
   of the unacked command resolves deterministically, with the node counter advanced at most once. All converge. Marker scans run on all directories.
 - T3 snapshot: small params. Isolate and shut down a follower; commit 40 Redeem-unknown entries until the leader has purged beyond the follower;
   restart. Expect ≥ 1 `full_snapshot` to it, applied converged with blobs equal, then consecutive applies afterwards.
@@ -168,3 +182,4 @@ Sol high implements in commit order. Do not edit `log_store.rs`, or the codecs a
 fails, show which documented OpenRaft contract the store breaks before changing anything. Otherwise move the case to S2 with a reason and
 flag it for Opus review. Never weaken the SM order to pass a case. Three failed fixes trigger a handoff with evidence. No subagents beyond
 the routing rules, no native or M2 actions, no admin steps. A different-provider review and green gates are required before merge.
+The C1/C2 constructions (decisions 6 and 12, the shutdown order, U4/U6) are mandatory; if the actual API rejects one, stop and hand back compiler output.
