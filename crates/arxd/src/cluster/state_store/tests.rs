@@ -83,6 +83,26 @@ fn corrupt(b: &[u8], edit: impl FnOnce(&mut Vec<u8>)) {
     assert_eq!(decode(&x), Err(StoreError::Corrupt));
 }
 #[test]
+fn membership_size_boundary_reaches_constructor_and_decoder() {
+    assert_eq!(MembershipBlob::new(Vec::new()), Err(StoreError::Corrupt));
+    assert!(MembershipBlob::new(vec![0x42; 4096]).is_ok());
+    assert_eq!(
+        MembershipBlob::new(vec![0x42; 4097]),
+        Err(StoreError::Corrupt)
+    );
+    let d = private_temp();
+    let mut s = open(d.path());
+    rich(&mut s);
+    let mut image = s.image.clone();
+    image.membership = Some((pos(1), MembershipBlob(vec![0x42; 4096])));
+    assert_eq!(decode(&encode(&image)), Ok(image.clone()));
+    image.membership = Some((pos(1), MembershipBlob(vec![0x42; 4097])));
+    let oversized = encode(&image);
+    assert!(oversized.len() < LIMIT);
+    assert_eq!(decode(&oversized), Err(StoreError::Corrupt));
+}
+
+#[test]
 fn canonical_roundtrip_and_semantic_decoder_rejections() {
     let d = private_temp();
     let mut s = open(d.path());

@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus high67bf037 retained2e7e5e1 passes durable-store source/security but finds decoder membership-limit test vacuous. Coordinator adds full4097-byte canonical image plus0/4096/4097 constructor controls; production unchanged. Reran23 cluster tests/four crash probes/fmt/offline Clippy/diff, all pass. Fresh Opus delta recheck pending; broader workspace access-denied failures remain recorded, no admin action or waiver.
+
 - 2026-11-15: Sol high6aa2b8b/309371e retained92a4f7f/45eb7c0 implements verifier reduction and canonical SQLite store with four process-kill boundaries. Local22 cluster tests and four hot-journal/pre-post recovery probes pass, fmt/Clippy pass. Broader workspace352pass/8owner-security-access-denied failures/115unrun recorded honestly; no baseline attribution or admin action. Coordinator inspects evidence and requests fresh Opus review before publication.
 
 - 2026-11-15: Opus high33410cf retainedc736cf7 settles bounded SQLite durable enrollment state/crash probe using existing dependencies. Independent Sol review passes with explicit codec/install invariants and removal of unsupported calendar-only dependency gate. Next Sol implements verifier boundary plus canonical atomic state store; no quorum/power-loss/signing acceptance and no M2 closure.

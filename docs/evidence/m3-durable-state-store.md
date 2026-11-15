@@ -98,3 +98,9 @@ here and are **unverified on real hardware**. SHA-256 does not authenticate a
 snapshot. No M2 retry or grant follows: A7 FINAL NO-GO and consumed A12 D7l cleanup
 unconfirmed/no-retry remain unchanged. No host admin, VM, old Lab Manager, network
 endpoint, publication, push, PR, merge or watch action was performed by this task.
+
+## Independent review correction: membership length coverage
+
+Opus review67bf037 retained2e7e5e1 found the original4097 length edit failed on truncated payload before reaching membership construction. Coordinator added a test-only complete canonical image containing4097 membership bytes and a valid checksum; it is below the overall16KiB cap and must decode asCorrupt. A4096-byte image round-trips; constructor assertions cover0,4096,4097. Production bytes are unchanged.
+
+Coordinator reran `cargo nextest run -p arxd --locked --offline cluster::`:23 passed,455 skipped,0.806s (run2ef62714-3741-4802-a4a6-e3154317f1ca), including four-kill probe0.655s. `cargo fmt --all --check`, locked/offline arxd all-target Clippy with warnings denied, and diff whitespace passed. D: build/TEMP/TMP only. No full workspace rerun, no baseline or owner-security remediation, no hosted OS claim. Fresh Opus delta recheck remains required.
