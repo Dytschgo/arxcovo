@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus highea8a25c retainedc0ef722 passes vote/log production/security but blocks Standards on eight uncovered fail-closed guards. Coordinator adds107 test-only lines covering purge/truncate regression, checksum-valid reopen inconsistency and per-read poisoning, with unchanged disk/memory/reopen assertions. All36cluster/eight crash probes/fmt/offlineClippy/diff pass. Evidence narrows membership4097 bound attribution; fresh Opus delta recheck pending, no production change.
+
 - 2026-11-15: Sol highcad7f08/07da6a5 retained189bbc9/077e121 implements shared fixed-stem SQLite helper and bounded vote/log store with verifier-only codec. Builder23 baseline and33 final cluster tests/eight total crash probes/fmt/offlineClippy/diff pass. Test-helper visibility corrected to cluster scope, privacy scans account for held Windows locks without dropping assertions. Fresh Opus source/security review requested; no quorum/power-loss/OpenRaft acceptance.
 
 - 2026-11-15: Opus highcf5e1da retained48b8185 settles SQLite durable vote/log contract. Independent Sol review checks actual Suite cases, corrects accidental purge20/append11 chaining, clarifies same-leader vote regression, exact4096-byte log pages and fixed helper stems. Contract accepted for bounded implementation; cross-file ordering and callback/consensus remain future-adapter obligations. No test/native action or quorum acceptance.

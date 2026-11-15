@@ -22,7 +22,7 @@ An early compile overlapped a premature module declaration with the helper check
 
 ## Test evidence and limits
 
-1. Canonical round trips cover Blank, Mint, Redeem, membership lengths 1/4096 and command time u64::MAX. Every truncation, trailing byte, invalid tag/flag/version/header/digest, invalid index, first/tail/purged mismatch, membership zero/4097 rejects. Semantic mutations retain full payloads and recompute SHA where appropriate; core apply deterministically rejects out-of-range command time.
+1. Canonical round trips cover Blank, Mint, Redeem, membership lengths 1/4096 and command time u64::MAX. Every truncation, trailing byte, invalid tag/flag/version/header/digest, invalid index and initial meta/range mismatches reject; complete purged-position and read-tail guards were added after independent R1 review below. Membership zero rejects via construction; a complete4097-byte membership row rejects at the overall MAX_ROW reader bound before membership construction. Semantic mutations retain full payloads and recompute SHA where appropriate; core apply deterministically rejects out-of-range command time.
 2. Append rejects gaps, overlaps, duplicates, nonconsecutive/lower-position batches, 65 entries and indexes above i64::MAX. Reopen checks unchanged state. Capacity fills eight 64-entry maximal batches, checks all payloads on reopen and atomic Full. An i64::MAX tail truncate/read/reopen probe protects SQL bound conversion.
 3. Reads cover empty, reversed, clipped, purged, past-tail and limited ranges. A middle-row deletion poisons reads and all later APIs.
 4. Truncate/purge cases are independent: tail10/purge0/append11 succeeds; purge20 requires next21 and rejects11. Tests exercise exclusive truncation, inclusive purge, sparse starts, mismatched ids, below-purged refusal and replacement of a conflicting tail.
@@ -36,3 +36,9 @@ An early compile overlapped a premature module declaration with the helper check
 ## Remaining gates
 
 Fresh Opus independent code/security review, then coordinator-authorized publication and required hosted Windows/macOS/Ubuntu fmt, Clippy and cluster checks, agent-review and ci-time-budget remain pending. Hosted cluster <60 s and full CI <15 min are acceptance gates, not established by local timing. No OpenRaft dependency/Suite execution, quorum, three-node availability, transport, signing or host power-loss claim. These hardware/consensus paths are **unverified on real hardware**. M2 remains incomplete; A7 FINAL NO-GO and consumed A12 cleanup uncertainty remain unchanged, with no retry.
+
+## Independent R1 correction
+
+Opus ea8a25c retainedc0ef722 found eight guard-removal mutants not detected by the original tests. Coordinator added tests only: lower-position purge with and without a tail, mismatched truncate at the purged index, sparse-start purge order, valid-checksum first row below purged on reopen, lower-position meta tail, and post-open first/tail row substitutions. Invalid operations assert unchanged metadata and raw meta/row bytes both immediately and after reopen. Read corruption asserts Corrupt followed by Poisoned on subsequent reads/writes. No production bytes changed.
+
+Coordinator reran all36 cluster tests (run2472684f-f24e-4ce4-9e03-ee60eff6f5be):36passed,456skipped,1.200s including both four-process kill groups. Formatting check, locked offline arxd all-target Clippy with warnings denied, and whitespace check passed. Build/TEMP/TMP stayed on D:. No broad workspace or hosted OS rerun; existing owner-security fixture failures remain unattributed. Fresh Opus delta recheck remains required before publication.

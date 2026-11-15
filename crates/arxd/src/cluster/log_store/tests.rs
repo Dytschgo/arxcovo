@@ -732,3 +732,110 @@ fn four_process_kills_recover_exact_pre_post_and_replay() {
     }
     assert!(started.elapsed() < Duration::from_secs(60));
 }
+
+fn durable_bytes(s: &VoteLogStore) -> (Vec<u8>, Vec<(i64, Vec<u8>)>) {
+    let meta =
+        s.db.query_row("SELECT blob FROM meta", [], |r| r.get(0))
+            .unwrap();
+    let mut stmt =
+        s.db.prepare("SELECT idx,body FROM log ORDER BY idx")
+            .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    (meta, rows)
+}
+
+#[test]
+fn invalid_purge_and_purged_truncate_preserve_memory_and_disk() {
+    for case in 0..4 {
+        let d = private_temp();
+        let mut s = open(d.path());
+        s.append(&batch(if case == 3 { 5 } else { 1 }, 11)).unwrap();
+        if case == 1 {
+            s.purge(pos(20)).unwrap();
+        }
+        if case == 2 {
+            s.purge(pos(3)).unwrap();
+        }
+        let before_meta = s.meta.clone();
+        let before_disk = durable_bytes(&s);
+        let (result, expected) = match case {
+            0 => (
+                s.purge(LogPos { term: 1, ..pos(20) }),
+                StoreError::OutOfOrder,
+            ),
+            1 => (
+                s.purge(LogPos { term: 1, ..pos(25) }),
+                StoreError::OutOfOrder,
+            ),
+            2 => (
+                s.truncate_after(Some(LogPos {
+                    leader: 4,
+                    ..pos(3)
+                })),
+                StoreError::Conflict,
+            ),
+            3 => (s.purge(LogPos { term: 3, ..pos(4) }), StoreError::Conflict),
+            _ => unreachable!(),
+        };
+        assert_eq!(result, Err(expected), "case {case}");
+        assert_eq!(s.meta, before_meta);
+        assert_eq!(durable_bytes(&s), before_disk);
+        drop(s);
+        let reopened = open(d.path());
+        assert_eq!(reopened.meta, before_meta);
+        assert_eq!(durable_bytes(&reopened), before_disk);
+    }
+}
+
+#[test]
+fn reopen_rejects_first_row_below_purged_and_meta_position_regression() {
+    let d = private_temp();
+    let mut s = open(d.path());
+    s.append(&batch(1, 11)).unwrap();
+    s.purge(pos(3)).unwrap();
+    let mut meta = s.meta.clone();
+    meta.tail.as_mut().unwrap().1.term = 1;
+    assert_eq!(decode_meta(&encode_meta(&meta)), Err(StoreError::Corrupt));
+    let row = encode_row(LogPos { term: 1, ..pos(4) }, &Entry::Blank);
+    assert!(decode_row(&row).is_ok());
+    s.db.execute("UPDATE log SET body=?1 WHERE idx=4", [row])
+        .unwrap();
+    drop(s);
+    assert!(matches!(
+        VoteLogStore::open(d.path(), [1; 16]),
+        Err(StoreError::Corrupt)
+    ));
+}
+
+#[test]
+fn reads_recheck_purged_position_and_exact_tail_id_then_poison() {
+    for purged_case in [true, false] {
+        let d = private_temp();
+        let mut s = open(d.path());
+        s.append(&batch(1, 11)).unwrap();
+        let (index, changed) = if purged_case {
+            s.purge(pos(3)).unwrap();
+            (4, LogPos { term: 1, ..pos(4) })
+        } else {
+            (
+                10,
+                LogPos {
+                    leader: 2,
+                    ..pos(10)
+                },
+            )
+        };
+        let row = encode_row(changed, &Entry::Blank);
+        assert!(decode_row(&row).is_ok());
+        s.db.execute("UPDATE log SET body=?1 WHERE idx=?2", params![row, index])
+            .unwrap();
+        assert_eq!(s.entries(index, index + 1, 1), Err(StoreError::Corrupt));
+        assert_eq!(s.vote(), Err(StoreError::Poisoned));
+        assert_eq!(s.entries(0, 100, 64), Err(StoreError::Poisoned));
+        assert_eq!(s.append(&[]), Err(StoreError::Poisoned));
+    }
+}
