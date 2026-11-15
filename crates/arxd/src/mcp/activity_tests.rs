@@ -18,6 +18,129 @@ fn ids(page: &Value) -> Vec<i64> {
         .collect()
 }
 
+// Join real command completion, SDK serialization and exact persisted lookup.
+// Only typed fixture reports enter the existing dispatcher; no process runs.
+#[tokio::test]
+async fn completed_command_sdk_exact_lookup_preserves_outcome_and_identity() {
+    use crate::service::{
+        executor::tests::{OnceReport, SID_A, completed, default_fixture, good},
+        layout::Platform,
+    };
+    use crate::store::Rights;
+    use std::sync::Mutex;
+
+    for (exit_code, outcome) in [(0, "succeeded"), (7, "failed")] {
+        let dir = crate::service::application::tests::private_temp();
+        let mut evidence = good(Platform::Windows, Rights::Standard);
+        evidence.exit_code = Some(exit_code);
+        let executor = default_fixture(Arc::new(OnceReport(Mutex::new(Some(completed(evidence))))));
+        let mut store = Activity::open_service_fixture(dir.path()).unwrap();
+        store.dedicated = Some(executor.clone());
+        let activity = Arc::new(store);
+        let inventory = Inventory {
+            activity: activity.clone(),
+            execution: None,
+            principal: Some(Principal("fixture-agent".into())),
+        };
+        let (s, c) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+        let client = ().serve(c).await.unwrap();
+        let result = content(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("run_command").with_arguments(
+                        json!({"tool":"cargo","args":["--version"]})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        let id = result["activity_id"].as_i64().unwrap();
+        assert!(id > 0);
+        assert_eq!(result["outcome"], outcome);
+        assert_eq!(result["exit_code"], exit_code);
+        assert_eq!(result["metadata"]["identity_mode"], "dedicated_account");
+        assert_eq!(result["observed_identity"]["id"], SID_A);
+        assert_eq!(result["observed_identity"]["kind"], "windows_sid");
+        assert_eq!(result["metadata"]["identity_matches_pin"], true);
+        assert_eq!(result["metadata"]["stop_reason"], "exited");
+        assert_eq!(result["cleanup_confirmed"], true);
+        assert_eq!(result["rights"], "standard");
+        assert_eq!(result["metadata"]["program"], "cargo");
+        assert_eq!(result["metadata"]["argc"], 1);
+        // The terminal row is already committed when the command payload arrives.
+        let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+        let persisted: (String, i32, String) = db.query_row(
+            "SELECT outcome,exit_code,principal FROM activity WHERE id=?1 AND finished_at_ms IS NOT NULL",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            persisted,
+            (outcome.into(), exit_code, "fixture-agent".into())
+        );
+        drop(db);
+        client.cancel().await.unwrap();
+        server.await.unwrap().unwrap();
+        executor.drain().await.unwrap();
+        drop(activity);
+
+        // Reopen SQLite and use independent SDK sessions for both principals.
+        // No executor is attached on recovery: this is persisted history only.
+        let activity = Arc::new(Activity::open_service_fixture(dir.path()).unwrap());
+        for principal in ["fixture-agent", "other-agent"] {
+            let inventory = Inventory {
+                activity: activity.clone(),
+                execution: None,
+                principal: Some(Principal(principal.into())),
+            };
+            let (s, c) = tokio::io::duplex(65536);
+            let server =
+                tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+            let client = ().serve(c).await.unwrap();
+            let page = content(
+                client
+                    .call_tool(call(json!({"activity_id":id})))
+                    .await
+                    .unwrap(),
+            );
+            if principal == "other-agent" {
+                assert_eq!(page, json!({"activities":[],"next_before_id":null}));
+            } else {
+                assert_eq!(ids(&page), [id]);
+                assert!(page["next_before_id"].is_null());
+                let row = &page["activities"][0];
+                assert_eq!(row["tool"], "run_command");
+                assert_eq!(row["outcome"], result["outcome"]);
+                assert_eq!(row["exit_code"], result["exit_code"]);
+                assert!(
+                    row["finished_at_ms"].as_i64().unwrap()
+                        >= row["started_at_ms"].as_i64().unwrap()
+                );
+                for (key, value) in result["metadata"].as_object().unwrap() {
+                    assert_eq!(&row[key], value, "{outcome}: metadata {key}");
+                }
+                for (identity_key, row_key) in [
+                    ("kind", "observed_kind"),
+                    ("id", "observed_id"),
+                    ("gid", "observed_gid"),
+                    ("integrity_rid", "integrity_rid"),
+                    ("elevation", "elevation"),
+                    ("observation_point", "observation_point"),
+                ] {
+                    assert_eq!(row[row_key], result["observed_identity"][identity_key]);
+                }
+                assert_eq!(row["execution_mode"], "dedicated_account");
+                assert!(row["claim"].is_null());
+            }
+            client.cancel().await.unwrap();
+            server.await.unwrap().unwrap();
+        }
+    }
+}
+
 // Actual SDK requests over an in-memory duplex; only the existing fake dispatcher
 // and a fresh private temporary store are used. No native executor is invoked.
 #[tokio::test]
