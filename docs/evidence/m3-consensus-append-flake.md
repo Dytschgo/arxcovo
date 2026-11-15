@@ -81,3 +81,5 @@ This proves the callback/worker ownership race exists and is fixed under a contr
 ## Coordinator exact-main transplant
 
 The hotfix is retained as `ebdecee` on main `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306`, independently of the unmerged member-registry feature. On this main-based branch, `cargo nextest run -p arxd --locked --offline cluster::consensus::` ran 64 tests: 64 passed, 492 skipped, 8.876s. `cargo fmt --all --check` and `git diff --check origin/main` passed. These are local Windows results, not hosted Ubuntu reproduction or acceptance. Independent Opus review and fresh hosted gates remain pending.
+
+On the same main-based branch, `cargo clippy -p arxd --all-targets --locked --offline -- -D warnings` passed in34.60s using the coordinator-owned D: target. No hosted result is inferred.

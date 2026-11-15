@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Exact-main transplant of the append hotfix passes64 consensus tests in8.876s, fmt and locked/offline all-target arxd Clippy with warnings denied in34.60s. These local Windows checks are separate from the builder feature-parent65-test result. Independent Opus review remains active; hosted gates and exact-head publication review remain required.
+
 - 2026-11-16: Coordinator records both red main runs and exact-main green-CI merge prerequisite after babysitter correction. Sol high d51d3c0 retained ebdecee fixes worker store release before append completion. Natural local repeats200/200 pass before and after; controlled interleaving20/20 fails before and20/20 passes after. Independent Opus review and fresh exact-main checks are pending; no hosted natural-cause claim. Linux s9c remains blocked on ordinary Linux capacity, zero tests/fix attempts.
 
 - 2026-11-15: Coordinator verifies PR145 corrected head/all five gates, unwatches and merges765df2b; reviewed/squash trees equal. T3 branch incorporates squash retaining reviewed test-only additions and parent U6 correction; source add/add conflicts arise from squash ancestry, resolved to composed reviewed bytes. Publishing separate snapshot catch-up after parent merge, no fullM3/M2 closure.
