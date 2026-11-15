@@ -2,12 +2,18 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #138, `2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c` at 17:28:03Z, independent Opus exact-head PASS6898267544/status58969899019 and all five gates green. Reviewed3cf4a33/squash tree68db17fb identical; complete223-file inventory digestdbc11a5a verified.
-- Current work: publish the independently assessed consumed D7l A12 failure checkpoint, then join existing accepted evidence for the remaining A10 capability-limits claim (docs only, no native run). Opus assessment9d3e9d4 PASS all axes: no A12 credit, cleanup unconfirmed, host excluded, no retry/diagnostic/grant. A7 hosted FINAL NO-GO stays closed; M2 incomplete; independent M3 follows remaining source work.
+- Last merged: PR #139, `0df242e02ac6bdaac201196d6b687440ce505ca8` at17:48:11Z; independent Opus exact-head PASS6898553625/status58970661048 and all five required gates green. Reviewed4847db0/squash full trees equal. A12 failure checkpoint only, cleanup unconfirmed; no native credit or retry.
+- Current work: A10 evidence join attribution correction is under independent Opus recheck, and bounded A9/U9 stop/drain evidence join is being prepared. Publish each reviewed note through normal gates, then independent M3 source work. A10/native gaps remain open; A12 D7l consumed with unconfirmed cleanup/no retry, A7 hosted FINAL NO-GO closed, M2 incomplete.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus high c129599 rechecks exact A1/A2 install versus A3+ verification attribution; S1 closed, all axes PASS. A10 remains open for Runner migration/lifecycle proof. Coordinator publishes evidence-only note with retained review/recheck after PR139 checkpoint merge; A9/U9 join remains active, no native authority.
+
+- 2026-11-15: Opus high ee48c84 retained f162c0e reviews A10 join: Standards/Security PASS, Spec conditional on historical attribution S1. Coordinator replaces the overbroad runtime-verification sentence with exact A1/A2 exclusive install plus R4 and later A3+ loaded-file verification. A10 remains open. Bounded A9/U9 join follows, no native proposal; then independent M3.
+
+- 2026-11-15: Sol high3ce8faf retained0d3d6cf completes docs-only A10 capability evidence join. A10 stays open: accepted setup/janitor and fixture migration do not prove Runner child self-migration or lifecycle. Local link/UTF8LF/scope/diff checks passed, no tests/build/native actions. Coordinator inspected operation matrix; fresh Opus review active before publication while PR139 gates remain watched.
 
 - 2026-11-15: Opus 5.5 high independently assesses D7l failure9d3e9d4: Standards/Spec/Security PASS, source+public run binding and closed replay verified; no markers/summary evidence, cleanup uncertainty and account removal unknown. Coordinator pin404 facts remain separately attributed. Next A10 evidence join is docs-only against accepted records, never a new native attempt.
 
