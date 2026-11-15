@@ -381,3 +381,12 @@ impl EnrollmentState {
 }
 #[cfg(test)]
 mod tests;
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Mint { .. } => "enrollment mint",
+            Self::Redeem { .. } => "enrollment redeem",
+        })
+    }
+}

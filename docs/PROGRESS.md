@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #143, `cd28bb91fb7a42307e6c48e360c96adbf36128fd` at19:18:55Z; independent Opus exact-head PASS6899732283/status58973875331 and all five required gates green. Reviewedcbd8055/squash full trees equal. M3 state-store crash probe passed hosted Windows/macOS/Ubuntu; local process-kill consistency only, not power loss or quorum.
-- Current work: publish independently reviewed M3 durable vote/log storage through exact-head review and hosted Windows/macOS/Ubuntu gates. Opus recheckc32ce57 closes all eight R1 mutants;36 cluster/eight crash probes/fmt/offlineClippy pass independently. No OpenRaft integration, quorum, power-loss or three-node claim. M2 remains incomplete; A7 FINAL NO-GO and consumed A12 cleanup uncertainty/no-retry unchanged.
+- Last merged: PR #144, `38750cf1e179e14da6fa871972027b6d66028ec9` at20:19:15Z; independent Opus corrected-head PASS6900558533/status58975979309 and all five gates green. Reviewed303f5a8/squash full trees equal. Hosted Windows/macOS/Ubuntu validate vote/log process-kill probes; ADR0023 and prominent M2 closure plan now on main.
+- Current work: publish independently reviewed OpenRaft adapter/service T1/T2/U6 through exact-head review and hosted gates. Opus source review1fc7036 PASS all axes,98cluster/fmt/Clippy and five counterfactuals independently pass. T3 snapshot catch-up locally prepared on separate follow-up branch, not yet reviewed or credited here. Shutdown descriptor-close timing and caller deadlines remain explicit integration risks. No transport/signing/fullM3 claim; M2 remains open under Ordering.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -25,6 +25,24 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-15: PR145 Windows U6 fails on an unsupported8s all-responder completion assertion after routing restore. Coordinator aligns test with reviewed contract: observe bounded-window resolution count, retain actual64uncommitted/zero permits/Busy and strict shutdown64/emptyowners/Weak/Stopped. Production unchanged, no timeout increase/retry. ExactU6Windows/fmt/offlineClippy pass; fresh Opus delta review queued after active T3 review and new hosted gates required.
+
+- 2026-11-15: Opus high1fc7036 independently passes real adapter/T1T2/U6 source/security and reruns98cluster/fmt/Clippy plus five caught counterfactuals. Reviews dependency edges and Suite partition, no fullconformance/host claim. Nonblocking shutdown finalizer timing/read catchup deadlines stay visible for later integration; T3 is separate immediate follow-up. Coordinator publishes parent for exact-head review and all hosted gates.
+
+- 2026-11-15: Sol high7b4bf62/e39535f/095504c retained93651ed/0a74643/40564a3 completes adapters, exclusive preflight, tracked service, actual Suite partition and T1/T2/U6.98cluster tests pass8.788s including old36/eightkillprobes; fmt/lockedClippy/diff pass.64 actual uncommitted entries prove cancellation bound; graceful leader/follower restarts converge. Raw-helper differences recorded honestly. Fresh Opus review active; T3 snapshot catch-up remains immediate uncredited follow-up.
+
+- 2026-11-15: Opus high496f10f retained66a9bf8 defines exclusive pre-start cross-store consistency check and ADR0005 invariant after real helper asymmetry. Independent Sol recheck passes with checked lookup/index cap and precise preflight read-only scope. Resume adapter/service/T1T2 implementation; no quorum credit until actual tests, no M2 native retry.
+
+- 2026-11-15: Sol high7d60a76/4918beb retained5cd8c6b/507905b retains reviewed-scope dependency/types/codec commit, then stops on real StorageHelper asymmetry: sameindex SMterm1/logterm2 accepted, lowerlogterm rejected. No service/T1T2/quorum proof. Coordinator confirms primary helper branch and routes narrow startup-guard correction to Opus without relaxing conflict rejection or changing merged stores.
+
+- 2026-11-15: Sol highfed7d66 retained26360a5 correctly hands back actual E0308(defaultProgressResponder vs specifiedOneshot) and additivechrono lock edges; no implementation retained or quorum proof. Coordinator verifies exact primary ProgressResponder::complete_only source and corrects the constructor plus narrow lock-edge allowlist, preserving pins/C1/C2. Implementation resumes; partial40-test draft results not counted as current consensus evidence.
+
+- 2026-11-15: Opus high1a12ad8 retainedbc90124 corrects C1 eager callback ownership and C2 tracked engine-held proposal permits. Independent Sol delta review closes both for implementation; actual unpolled callback and64-uncommitted cancellation tests mandatory. Sol real-engine/in-process3node implementation starts next; no transport/signing/fullM3 or M2 credit.
+
+- 2026-11-15: Opus high2664129 retained284b80e prepares real OpenRaft adapter/three-node contract. Independent Sol review finds cancellation gaps C1(unpolled append callback guard) and C2(caller cancellation releases permit before engine completion). D: dependency-free Rust probe confirms deferred/eager guard distinction. Narrow Opus correction requested before implementation; no actual consensus acceptance or M2 closure.
+
+- 2026-11-15: Coordinator verifies corrected PR144 head/all five gates, unwatches and merges38750cf; reviewed/squash trees equal. macOS page-fixture path now green, no production change. ADR0023/M2 closure plan reaches main as requested by babysitter. Next Opus architecture task settles concrete OpenRaft integration and real three-node test boundaries; no M2 checkbox or native grant changed.
 
 - 2026-11-15: Babysitter ordering/closure correction applied. Existing historical M3 steering is made prominent with ADR0023 and per-item M2 blocker/active-work table. No M2 acceptance waiver or new run permission; source regressions stay active, hardware closure explicitly deferred to a qualifying owner-provided host. Fresh Opus review includes this clarification and PR144 test-only macOS correction.
 

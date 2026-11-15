@@ -55,6 +55,7 @@ pub enum StoreError {
     Full,
     Conflict,
     VoteRegressed,
+    Membership,
 }
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +72,7 @@ impl std::fmt::Display for StoreError {
             Self::Full => "log full",
             Self::Conflict => "log conflict",
             Self::VoteRegressed => "vote regressed",
+            Self::Membership => "membership out of bounds",
         })
     }
 }
@@ -248,7 +250,12 @@ pub(super) fn open_db(
     }
     Ok((lock, db))
 }
+type SnapshotPositions = (Option<LogPos>, Option<(LogPos, MembershipBlob)>);
 impl StateStore {
+    pub(super) fn peek(blob: &[u8]) -> Result<SnapshotPositions, StoreError> {
+        let image = decode(blob)?;
+        Ok((image.applied, image.membership))
+    }
     pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
         let (lock, mut db) = open_db(dir, "cluster-state", 64)?;
         let tx = db.transaction()?;

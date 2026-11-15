@@ -1,0 +1,35 @@
+# OpenRaft adapter brief: independent Sol review
+
+Target Opus2664129 retained284b80e,170-line brief. Standards PASS; Spec/Security conditional on two cancellation clarifications before implementation. No product scope change, CA/transport or full M3 acceptance follows.
+
+C1: Completion must be constructed synchronously when append is called, not inside an async-fn body that only runs on first poll. Dropping an unpolled returned future otherwise drops the raw IOFlushed with no completion. Coordinator ran a dependency-free Rust probe with an equivalent no-Drop callback: deferred guard completed0 callbacks after an unpolled-future drop, while an eager outer guard completed1. Specify an outer non-async trait implementation returning an async block (where the actual trait permits it), or another verified eager ownership construction. Create the guard before collection/conversion too, and add a test dropping the actual adapter future unpolled; every failure path must complete exactly once.
+
+C2: proposal permits must cover engine-owned outstanding writes, not only caller-future lifetime. A timeout/cancel after client_write enqueues a request can drop the caller and its semaphore permit while the engine still retains the request. Repeated callers can then bypass the claimed64 in-flight bound during no quorum. Define a tracked owner task holding the permit until engine completion/fatal/shutdown, cancellation-independent reply delivery, and bounded shutdown/join of those owners. Cancellation before actual enqueue may release the permit safely. Add a test timing out/cancelling64 no-quorum proposals, proving the next proposal is Busy until completion or shutdown; no silent permit leak or detached worker.
+
+The overall real-engine/durable-stores/in-memory-network slice is appropriate. Codec technical bounds are not a new product voter-cap policy. Existing storage/source failures must not be hidden by reclassifying official Suite cases without documented evidence and review. The sorted membership bounds, startup checks, explicit sparse-SM incompatibility, no physical-clock/auth claims and no pre-vote claim are clear. Graceful restarts are not crash-during-consensus proof.
+
+Checks: brief/source-contract inspection, dependency-free Rust ownership probe on D:, UTF8/LF and whitespace. No OpenRaft build or cluster test ran. Opus should correct only C1/C2, then coordinator rechecks the delta and hands the concrete slice to Sol. M2 remains open under ADR0023; no A7/A12 native retry is authorized.
+
+## C1/C2 correction recheck
+
+Reviewed Opus1a12ad8 retainedbc90124. Standards/Spec/Security PASS for the exact in-process integration slice. C1 now uses the verified trait expansion's non-async method with an eager Completion before iteration/conversion and tests the actual unpolled adapter method. Callback completion after durable success and every drop/error path is explicit; actual compiler/API agreement remains an implementation check, not a claim already tested.
+
+C2 now tracks owner tasks in JoinSet and retains permits until the engine response/fatal path. Caller cancellation does not own that permit. Admission closes before Raft shutdown; owners are joined after core shutdown, then Raft and all adapter-owned strong store handles must be dropped before checking Weak release. The shared deadline and Orphaned result expose unfinished background work. U6 proves64 actual uncommitted entries before abandoning callers, nextBusy, then shutdown restores64 permits and no owners. Restored-quorum owner outcomes are observed rather than invented as a library guarantee.
+
+No full OpenRaft build or consensus test ran during this recheck. Ready for Sol implementation in the specified commits; compiler disagreement or incompatible actual Suite behavior requires a bounded evidence handback, not silent contract weakening. Independent Opus source review and all normal hosted gates remain mandatory. T1/T2 are required real-engine proof; any deferred T3 snapshot test remains an explicit immediate follow-up, not accepted credit. M2 stays open.
+
+## Actual API/resolver handback correction
+
+Sol implementation fed7d66 retained26360a5 stopped as required, with no implementation retained. Compiler E0308 shows the default Responder is ProgressResponder, not OneshotResponder. Coordinator read the exact0.10.0 primary source: ProgressResponder::complete_only returns the default responder and a final-result receiver, preserving C2 owner semantics without overriding the type config. The brief now names that constructor. Actual resumed compilation/tests remain required.
+
+The original byte-identical-lock-block instruction was overstrict: the crate's own new direct edges and chrono default-feature unification require additive metadata edges. Allow only arxd's necessary new direct edges and chrono's js-sys/wasm-bindgen edges while preserving every existing package's version/checksum/source and all other existing blocks. No version drift, manual incomplete lock, feature substitution or dependency patch is authorized. Compare lock blocks and feature trees before accepting the resumed dependency commit.
+
+These are narrow coordinator corrections supported by actual compiler/resolver evidence and exact primary source, not an architecture redesign. C1 eager append ownership and C2 tracked proposal/permit/shutdown requirements are unchanged. Ready for resumed Sol implementation followed by independent Opus review; no partial-draft test result counts as retained or actual consensus proof.
+
+## Startup preflight correction recheck
+
+Reviewed Opus496f10f retained66a9bf8 and ADR0005 invariant against the actual asymmetric helper evidence. Standards/Spec/Security PASS for implementation. Preflight has exclusive ownership before adapters/tasks exist, reads at most one retained row, checks index-based purged/apply consistency and exact applied-ID equality, and preserves only a genuinely ordered SM-ahead repair. Raw-helper behavior is explicitly separated from Arxcovo enforcement; own start refuses rather than inventing an upstream Fatal guarantee. Interior applied-slot mismatches are covered, not just tail equality.
+
+Coordinator adds the existing SQLite index bound and checked a+1 before the lookup, so an out-of-range state snapshot cannot panic or request an unrepresentable log index. Preflight itself writes nothing; ordinary creation of an initially absent store file is a separate open step and is not misrepresented as read-only startup. Existing valid-store refusal tests must still compare all durable content unchanged.
+
+Ready to resume commits2-4 and run actual refusal/normal-restart/T1T2 tests. No new code or consensus test ran during this recheck; retained type/codec tests do not imply quorum proof. Any legitimate restart refusal must be handed back with concrete evidence, never relaxed. C1/C2 and responder/lock exceptions remain unchanged, as do M2 no-retry boundaries.
