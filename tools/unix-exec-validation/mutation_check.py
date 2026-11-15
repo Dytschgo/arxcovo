@@ -737,10 +737,12 @@ def a12_assertion_mutants():
     """Only A12 injected ports; never execute any native adapter."""
     source=Path(driver.__file__).read_text()
     cases=[
+        ("require(A12_DELIVERY_ENABLED and A12_EXECUTION_ENABLED, 'E_TEST_ARGS')",
+         "require(A12_DELIVERY_ENABLED or A12_EXECUTION_ENABLED, 'E_TEST_ARGS')", 'test_each_closed_flag_refuses_before_effects'),
         ('    build_env = dict(cargo_env(stage), CARGO_PROFILE_DEV_DEBUG="0")',
          '    build_env = cargo_env(stage)', 'test_one_bounded_build_and_clock'),
-        ('A12_DELIVERY_ENABLED = False','A12_DELIVERY_ENABLED = True','test_closed_gates_before_effects'),
-        ('A12_EXECUTION_ENABLED = False','A12_EXECUTION_ENABLED = True','test_closed_gates_before_effects'),
+        ('A12_DELIVERY_ENABLED = True','A12_DELIVERY_ENABLED = False','test_candidate_registration_and_guard_without_host_effects'),
+        ('A12_EXECUTION_ENABLED = True','A12_EXECUTION_ENABLED = False','test_candidate_registration_and_guard_without_host_effects'),
         ("len(name) <= 32 and len(run.split('-')[1]) <= 6", "True", 'test_owned_names_refuse_paths'),
         ("require(unit_gone and not owned.get('pending'), 'E_QUARANTINE_CGROUP')", "require(unit_gone, 'E_QUARANTINE_CGROUP')",'test_partial_capture_quarantines_before_reads'),
         ("require(proc.stat().st_uid != uid, 'E_UID_LIVE')",'pass','test_uid_release_before_all_deletion'),
@@ -756,7 +758,7 @@ def a12_assertion_mutants():
             start=source.index('def a12_uid_released(');end=source.index('def cleanup_a12(',start)
             changed=source[:start]+source[start:end].replace(before,after)+source[end:]
         else:
-            assert source.count(before)==1,before
+            assert source.count(before) == (2 if before.startswith("require(A12_DELIVERY_ENABLED and") else 1), before
             changed=source.replace(before,after)
         module=types.ModuleType('a12_mutant');module.__file__=driver.__file__
         exec(compile(changed,'<mock-only-a12-mutant>','exec'),module.__dict__)

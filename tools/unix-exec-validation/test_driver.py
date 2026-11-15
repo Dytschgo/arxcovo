@@ -806,8 +806,8 @@ class A1A2(unittest.TestCase):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
 
-    def test_source_selection_is_combined_a7(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::sudo_nnp::disposable_linux_a7_a11')
+    def test_source_selection_is_a12_candidate(self):
+        self.assertEqual(driver.TEST, 'exec::a12::native::disposable_linux_a12')
 
     def test_closed_mapping(self):
         # Independent expectations: never obtain the cases/profile from the driver.
@@ -1358,6 +1358,9 @@ class SudoNnp(unittest.TestCase):
 
 class SudoNnpDelivery(unittest.TestCase):
     """No host adapters: records are pure; all descriptor/process ports mocked."""
+    def setUp(self):
+        self.enterContext(patch.object(driver, 'TEST', 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'))
+
     def record(self, libtest=True, executable=None):
         stage = Path('/var/lib/arx-ci-123-1')
         return json.dumps(dict(reason='compiler-artifact',
@@ -1514,6 +1517,9 @@ if __name__ == '__main__':
 
 
 class ControlledPolicy(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(driver, 'TEST', 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'))
+
     setup_owned = SudoNnp.setup_owned
 
     @patch.object(driver, "a7_admission", side_effect=RuntimeError("E_POLICY_UNATTESTED"))
@@ -1823,6 +1829,9 @@ class ControlledPolicy(unittest.TestCase):
 
 
 class A7Integration(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(driver, 'TEST', 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'))
+
     selected = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'
 
     def test_closed_before_host_and_package_adapter(self):
@@ -1947,6 +1956,9 @@ class A7Integration(unittest.TestCase):
 
 class AdmissionPathRefusal(unittest.TestCase):
     """Actual admission/alias/open chain; only metadata/syscall ports are fake."""
+    def setUp(self):
+        self.enterContext(patch.object(driver, 'TEST', 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'))
+
     def ports(self, bad=None, uid=0, mode=None, present=False, bad_call=1):
         import ctypes
         alias = driver.a7_alias_c2
@@ -2189,6 +2201,9 @@ class AdmissionPathRefusal(unittest.TestCase):
 
 class RuntimeAdmission(unittest.TestCase):
     """Fixed-read boundaries replaced; no native adapter is ever constructed."""
+    def setUp(self):
+        self.enterContext(patch.object(driver, 'TEST', 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'))
+
     def ports(self):
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -2442,16 +2457,51 @@ class RuntimeAdmission(unittest.TestCase):
 
 
 class A12Delivery(unittest.TestCase):
+    def test_candidate_registration_and_guard_without_host_effects(self):
+        self.assertIs(driver.A12_DELIVERY_ENABLED, True)
+        self.assertIs(driver.A12_EXECUTION_ENABLED, True)
+        self.assertEqual(driver.TEST, 'exec::a12::native::disposable_linux_a12')
+        self.assertEqual(driver.test_argv('/binary'), ['/binary', driver.TEST,
+            '--ignored', '--exact', '--test-threads=1', '--color=never'])
+        with ExitStack() as stack:
+            # Poison every module-level host/effect entry reachable from main.
+            for name in ('run', 'run_body', 'prepare_a12', 'harness', 'service',
+                         'cg_preflight', 'call', 'copy_tree', 'exclusive_file'):
+                if hasattr(driver, name):
+                    stack.enter_context(patch.object(driver, name, side_effect=AssertionError(name)))
+            stack.enter_context(patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('uid')))
+            stack.enter_context(patch.object(driver.sys, 'platform', 'linux'))
+            stack.enter_context(patch.object(driver.sys, 'argv', ['driver.py', 'guard']))
+            stack.enter_context(patch.dict(driver.os.environ, valid_env(), clear=True))
+            self.assertIsNone(driver.main())
+
     def test_closed_gates_before_effects(self):
-        self.assertFalse(driver.A12_DELIVERY_ENABLED)
-        self.assertFalse(driver.A12_EXECUTION_ENABLED)
-        with patch.object(driver.sys,'platform','linux'), patch.object(driver, 'TEST', driver.A12_TEST), patch.object(driver, 'cg_preflight', side_effect=AssertionError('host probe')), patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('uid probe')):
+        # Historical closed flags remain independent counterfactuals.
+        with patch.object(driver, "A12_DELIVERY_ENABLED", False), patch.object(driver, "A12_EXECUTION_ENABLED", False), patch.object(driver.sys,'platform','linux'), patch.object(driver, 'TEST', driver.A12_TEST), patch.object(driver, 'cg_preflight', side_effect=AssertionError('host probe')), patch.object(driver.os, 'getuid', create=True, side_effect=AssertionError('uid probe')):
             self.assertTrue(driver.standard_profile())
             self.assertEqual(driver.test_argv('/binary')[1],driver.A12_TEST)
             self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.run_body,valid_env())
             self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.main)
             self.assertRaisesRegex(RuntimeError,'E_TEST_ARGS',driver.prepare_a12,valid_env(),{})
-        self.assertEqual(driver.TEST,'exec::disposable::sudo_nnp::disposable_linux_a7_a11')
+        self.assertEqual(driver.TEST,'exec::a12::native::disposable_linux_a12')
+
+    def test_each_closed_flag_refuses_before_effects(self):
+        for delivery, execution in ((False, False), (False, True), (True, False)):
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(driver, 'A12_DELIVERY_ENABLED', delivery))
+                stack.enter_context(patch.object(driver, 'A12_EXECUTION_ENABLED', execution))
+                stack.enter_context(patch.object(driver.sys, 'platform', 'linux'))
+                for owner, name in ((driver.os, 'getuid'), (driver.os, 'open'),
+                                    (driver, 'cg_preflight'), (driver, 'call'),
+                                    (driver, 'build_a12'), (driver.Path, 'lstat'),
+                                    (driver, 'exclusive_file')):
+                    stack.enter_context(patch.object(owner, name, create=True, side_effect=AssertionError(name)))
+                self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS', driver.run_body, valid_env())
+                for mode in ('guard', 'run', 'service', 'harness'):
+                    with patch.object(driver.sys, 'argv', ['driver.py', mode]):
+                        self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS', driver.main)
+                if not delivery:
+                    self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS', driver.prepare_a12, valid_env(), {})
 
     def test_owned_names_refuse_paths(self):
         self.assertEqual(driver.a12_name('123-1'),'arxa12123x1')

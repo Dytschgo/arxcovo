@@ -3,7 +3,7 @@ use super::*;
 use std::{panic::AssertUnwindSafe, time::Instant};
 
 // A source gate, never an environment variable or delivery-file permission.
-const DELIVERY_ENABLED: bool = false;
+const DELIVERY_ENABLED: bool = true;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pin {
@@ -750,8 +750,10 @@ mod native {
     }
 
     #[test]
-    fn a12_delivery_closed() {
-        assert!(prepared_delivery().is_none());
+    fn a12_delivery_candidate_injected_reader() {
+        // Never call the enabled native reader during ordinary test discovery.
+        assert_eq!(closed_read(|| Some(17)), Some(17));
+        assert!(closed_read::<()>(|| None).is_none());
     }
 
     fn marker(bytes: &[u8]) {
@@ -995,7 +997,7 @@ fn a12_delivery_workspace_relative_cwd_contract() {
 }
 
 #[test]
-fn a12_fixed_targets_and_closed_source_gate() {
+fn a12_fixed_targets_and_candidate_source_gate() {
     assert_eq!(
         Case::Normal.spec().executable,
         PathBuf::from("/usr/bin/true")
@@ -1007,8 +1009,17 @@ fn a12_fixed_targets_and_closed_source_gate() {
     );
     assert_eq!(Case::Cancel.spec().arguments, ["15"]);
     let source = include_str!("a12.rs");
-    const { assert!(!DELIVERY_ENABLED) };
-    assert!(closed_read::<()>(|| panic!("closed gate must not read")).is_none());
+    const { assert!(DELIVERY_ENABLED) };
+    let mut reads = 0;
+    assert_eq!(
+        closed_read(|| {
+            reads += 1;
+            Some(17)
+        }),
+        Some(17)
+    );
+    assert_eq!(reads, 1);
+    assert!(closed_read::<()>(|| None).is_none());
     // Exclude portable tests, so neither the expected string nor the mutation
     // controls below can satisfy the production wiring check by matching itself.
     let wired = |text: &str| {
@@ -1021,8 +1032,11 @@ fn a12_fixed_targets_and_closed_source_gate() {
             .nth(1)
             .and_then(|rest| rest.split_once('}'))
             .map(|(body, _)| body.trim());
-        body == Some("closed_read(read_delivery)") && native.matches("read_delivery").count() == 2
+        body == Some("closed_read(read_delivery)")
+            && native.matches("read_delivery").count() == 2
+            && native.matches("prepared_delivery()").count() == 2
     };
+    assert!(source.contains("#[ignore = \"A12 source preparation only; delivery unattested; unselected; NOT granted\"]\n    fn disposable_linux_a12()"));
     assert!(wired(source));
     let bypass = source.replacen("closed_read(read_delivery)\n", "read_delivery()\n", 1);
     assert_ne!(bypass, source);
