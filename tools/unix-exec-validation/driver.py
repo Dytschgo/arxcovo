@@ -28,8 +28,228 @@ def standard_profile():
                      'exec::disposable::a4::disposable_linux_a4',
                      'exec::disposable::a4::disposable_linux_a4_omitted_kill',
                      'exec::disposable::disposable_linux_a5',
+                     'exec::a12::native::disposable_linux_a12',
                      'exec::disposable::sudo_nnp::disposable_linux_a7_a11'), 'E_TEST_ARGS')
     return TEST != 'exec::disposable::disposable_linux_a3_none'
+
+
+# Neither delivery preparation nor execution is authorized by selecting a name.
+A12_DELIVERY_ENABLED = False
+A12_EXECUTION_ENABLED = False
+A12_TEST = 'exec::a12::native::disposable_linux_a12'
+
+
+def a12_selected():
+    return TEST == A12_TEST
+
+
+def a12_open(path, directory=False, owner=None):
+    require(path.is_absolute() and '..' not in path.parts, 'E_PATH')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open('/', flags | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            info = os.fstat(fd)
+            require(stat.S_ISDIR(info.st_mode) and
+                    (info.st_uid == 0 and not info.st_mode & 0o022 or
+                     owner is not None and info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o700), 'E_PATH')
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if directory:
+            require(stat.S_ISDIR(os.fstat(fd).st_mode), 'E_PATH')
+        result, fd = fd, None
+        return result
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def a12_pin(path, binary=False, owner=None):
+    fd = a12_open(path, not binary, owner)
+    try:
+        info = os.fstat(fd)
+        digest, count = hashlib.sha256(), 0
+        if binary:
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                    4 <= info.st_size <= 128 * 1024 * 1024, 'E_ARTIFACT')
+            while chunk := os.read(fd, 65536):
+                count += len(chunk)
+                require(count <= info.st_size, 'E_ARTIFACT')
+                digest.update(chunk)
+            require(count == info.st_size, 'E_ARTIFACT')
+        require(_stable_stat(info) == _stable_stat(os.fstat(fd)), 'E_FIXTURE_INODE')
+        return dict(dev=info.st_dev, ino=info.st_ino, mode=info.st_mode,
+                    uid=info.st_uid, gid=info.st_gid, nlink=info.st_nlink,
+                    size=count, sha256=digest.hexdigest() if binary else '')
+    finally:
+        os.close(fd)
+
+
+def a12_name(run):
+    plan(run)
+    name = 'arxa12' + run.replace('-', 'x')
+    require(len(name) <= 32 and len(run.split('-')[1]) <= 6, 'E_ID')
+    return name
+
+
+def build_a12(stage):
+    # Single libtest invocation, bounded while reading, with owned wait/kill/join.
+    build_env = dict(cargo_env(stage), CARGO_PROFILE_DEV_DEBUG="0")
+    exceeded = threading.Event()
+    start = time.monotonic()
+    with (stage / 'a12-build-output').open('xb') as out:
+        with subprocess.Popen(command(stage) + ['--no-run', '--message-format=json'],
+                cwd=stage / 'source', env=build_env, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL) as child:
+            def capture():
+                try:
+                    drain_output(child.stdout, out, exceeded, 4 * 1024 * 1024)
+                except Exception:
+                    exceeded.set()
+            drain = threading.Thread(target=capture)
+            drain.start()
+            try:
+                child.wait(timeout=360)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+                drain.join(timeout=5)
+            require(not drain.is_alive() and not exceeded.is_set(), 'E_BUILD_LOG')
+            require(child.returncode == 0, 'E_BUILD')
+    require(0 <= time.monotonic() - start <= 360, 'E_BUILD')
+    data = (stage / 'a12-build-output').read_bytes()
+    require(len(data) <= 4 * 1024 * 1024, 'E_BUILD_LOG')
+    artifacts = [Path(j['executable']) for line in data.splitlines()
+                 if (j := json.loads(line)).get('reason') == 'compiler-artifact'
+                 and j.get('executable') and j.get('profile', {}).get('test')]
+    require(len(artifacts) == 1, 'E_ARTIFACT')
+    artifact = artifacts[0]
+    require(artifact.parent == stage / 'source/target/debug/deps' and
+            re.fullmatch('arxd-[0-9a-f]+', artifact.name), 'E_ARTIFACT_PATH')
+    return artifact
+
+
+def a12_local_identity(item):
+    for path, width in (('/etc/passwd', 7), ('/etc/group', 4)):
+        fd = a12_open(Path(path))
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                    not info.st_mode & 0o022 and info.st_size <= 1024 * 1024, 'E_FIXTURE_UID')
+            data = bytearray()
+            while chunk := os.read(fd, min(65536, 1024 * 1024 + 1 - len(data))):
+                data.extend(chunk)
+                require(len(data) <= 1024 * 1024, 'E_FIXTURE_UID')
+            require(len(data) == info.st_size and _stable_stat(info) == _stable_stat(os.fstat(fd)), 'E_FIXTURE_UID')
+            rows = [line.split(':') for line in data.decode('utf-8').splitlines()]
+            require(all(len(row) == width for row in rows), 'E_FIXTURE_UID')
+            key = item['uid'] if width == 7 else item['gid']
+            require([row[0] for row in rows if row[2] == str(key)] == [item['name']], 'E_FIXTURE_UID')
+            if width == 7:
+                require([row[0] for row in rows if row[3] == str(item['gid'])] == [item['name']], 'E_FIXTURE_UID')
+            else:
+                require(all(item['name'] not in row[3].split(',') for row in rows), 'E_FIXTURE_UID')
+        finally:
+            os.close(fd)
+
+
+def a12_account(item):
+    import pwd
+    import grp
+    account = pwd.getpwnam(item['name'])
+    group = grp.getgrnam(item['name'])
+    a12_local_identity(item)
+    require(account.pw_uid == item['uid'] >= 1000 and
+            account.pw_gid == group.gr_gid == item['gid'] >= 1000 and
+            account.pw_shell == '/usr/sbin/nologin' and
+            account.pw_dir == str(item['workspace']) and not group.gr_mem and
+            os.getgrouplist(item['name'], item['gid']) == [item['gid']], 'E_FIXTURE_UID')
+
+
+def prepare_a12(env, owned):
+    require(A12_DELIVERY_ENABLED and a12_selected(), 'E_TEST_ARGS')
+    import pwd
+    import grp
+    run = gate(env, sys.platform)
+    stage, _ = plan(run)
+    name = a12_name(run)
+    require(not owned, 'E_FIXTURE_COLLISION')
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        try:
+            lookup(name)
+        except KeyError:
+            continue
+        raise RuntimeError('E_ACCOUNT_COLLISION')
+    # Flags precede mutation: uncertainty always quarantines, never adopts.
+    root = Path('/var/lib') / name
+    require(not os.path.lexists(root), 'E_FIXTURE_COLLISION')
+    artifact = build_a12(stage)
+    artifact.chmod(0o700)
+    root.mkdir(mode=0o700)  # collision owns nothing
+    owned.update(name=name, workspace=root / 'workspace', pending=True)
+    owned['root'] = root.lstat()
+    call(['/usr/sbin/groupadd', name])
+    owned['gid'] = grp.getgrnam(name).gr_gid
+    call(['/usr/sbin/useradd', '--no-create-home', '--no-user-group', '--gid', name,
+          '--shell', '/usr/sbin/nologin', '--home-dir', str(owned['workspace']), name])
+    owned['uid'] = pwd.getpwnam(name).pw_uid
+    owned['workspace'].mkdir(mode=0o700)
+    os.chown(root, owned['uid'], owned['gid'])
+    owned['root'] = root.lstat()
+    os.chown(owned['workspace'], owned['uid'], owned['gid'])
+    owned['workspace_info'] = owned['workspace'].lstat()
+    a12_account(owned)
+    owned['pending'] = False
+    data = dict(version=1, run=run, source_sha=env['GITHUB_SHA'],
+                workflow_sha=env['ARX_WORKFLOW_SHA'], uid=owned['uid'], gid=owned['gid'],
+                root=a12_pin(root), workspace=a12_pin(owned['workspace'], owner=owned['uid']),
+                harness=a12_pin(artifact, True))
+    encoded = json.dumps(data, separators=(',', ':')).encode('ascii')
+    require(len(encoded) <= 4096, 'E_ARTIFACT')
+    exclusive_file(stage / 'a12-source-sha', env['GITHUB_SHA'].encode('ascii'))
+    exclusive_file(stage / 'a12-delivery.json', encoded)
+    exclusive_file(stage / 'artifact', str(artifact).encode('ascii'))
+    return artifact
+
+
+def a12_uid_released(uid):
+    count = 0
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        count += 1
+        require(count <= 20000, 'E_UID_LIVE')
+        fd = None
+        try:
+            require(proc.stat().st_uid != uid, 'E_UID_LIVE')
+            fd = os.open(proc / 'status', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            data = os.read(fd, 4097)
+            require(len(data) <= 4096, 'E_UID_LIVE')
+            rows = [line.split()[1:] for line in data.splitlines() if line.startswith(b'Uid:')]
+            require(len(rows) == 1 and len(rows[0]) == 4 and
+                    all(value.isdigit() and int(value) != uid for value in rows[0]), 'E_UID_LIVE')
+        except FileNotFoundError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def cleanup_a12(owned, unit_gone=False):
+    if not owned:
+        return
+    require(unit_gone and not owned.get('pending'), 'E_QUARANTINE_CGROUP')
+    a12_account(owned)
+    # Confirm live UID release BEFORE account, workspace, stage or runtime deletion.
+    a12_uid_released(owned['uid'])
+    same_object(owned['workspace'].parent, owned['root'])
+    same_object(owned['workspace'], owned['workspace_info'])
+    call(['/usr/sbin/userdel', owned['name']])
+    call(['/usr/sbin/groupdel', owned['name']])
+    require(shutil.rmtree.avoids_symlink_attacks, 'E_RMTREE')
+    shutil.rmtree(owned['workspace'].parent)
 
 
 def a4_selected():
@@ -1518,7 +1738,7 @@ def monitor_a1a2(stage, artifact):
         state = unit_properties()
         if state['ActiveState'] == 'active' and not acknowledged:
             ack_start = time.monotonic()
-            if a7_selected():
+            if a7_selected() or a12_selected():
                 require(ack_start - monitor_start <= 15, 'E_TEST_TIMEOUT')
             verify_runtime(stage, stage.name.removeprefix('arx-ci-'), state)
             pid = private_read(stage / 'harness-pid')
@@ -1539,7 +1759,7 @@ def monitor_a1a2(stage, artifact):
             finally:
                 os.close(fd)
             require(tasks == (pid + '\n').encode('ascii'), 'E_UNIT_CGROUP')
-            if a7_selected():
+            if a7_selected() or a12_selected():
                 require(time.monotonic() - ack_start <= 5, 'E_TEST_TIMEOUT')
             exclusive_file(stage / 'identity-ack', b'1')
             acknowledged = True
@@ -1555,6 +1775,11 @@ def monitor_a1a2(stage, artifact):
 def verify_test_result(stage, returncode):
     require((stage / 'test-output').stat().st_size <= 1024 * 1024, 'E_TEST_LOG')
     text = private_read(stage / 'test-output', 1024 * 1024)
+    if a12_selected():
+        for marker in ('ARX_A12_NORMAL_OK', 'ARX_A12_CANCEL_OK', 'ARX_A12_COMPLETE_OK'):
+            require(text.count(marker + '\n') == 1, 'E_TEST')
+            text = text.replace(marker + '\n', '')
+        require(len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]+s$', text, re.M)) == 1, 'E_TEST')
     if a7_selected():
         for marker in ('ARX_A7_A11_CASE0_OK', 'ARX_A7_A11_CASE1_OK', 'ARX_A7_A11_COMPLETE_OK'):
             require(text.count(marker + '\n') == 1, 'E_TEST')
@@ -1738,6 +1963,8 @@ def run_body(env):
     global feedback_phase, feedback_mutation, feedback_cleanup, feedback_first
     standard_profile()
     run_id = gate(env, sys.platform)  # before any mutation or privileged probe
+    if a12_selected():
+        require(A12_DELIVERY_ENABLED and A12_EXECUTION_ENABLED, 'E_TEST_ARGS')
     selected_a7 = a7_selected()
     if selected_a7:
         require(env['GITHUB_RUN_ATTEMPT'] == '1', 'E_ID')
@@ -1752,6 +1979,7 @@ def run_body(env):
     owned = []
     helper_owned = {}
     a7_accounts, a7_artifacts, a7_policy = [], {}, {}
+    a12_owned = {}
     unit_created = False
     stage_created = False
     stage_info = None
@@ -1774,7 +2002,9 @@ def run_body(env):
         copy_tree(Path('/home/runner/.cargo/registry'), stage / 'cargo/registry')
         driver = stage / 'source/tools/unix-exec-validation/driver.py'
         build_env = cargo_env(stage)
-        if selected_a7:
+        if a12_selected():
+            artifact = prepare_a12(env, a12_owned)
+        elif selected_a7:
             pins = stage_sudo_nnp(env, a7_artifacts)
             artifact = Path(private_read(stage / 'artifact'))
             prepare_controlled_sudo_nnp(run_id, a7_accounts, a7_policy)
@@ -1815,7 +2045,9 @@ def run_body(env):
         try:
             require(not installation_pending, 'E_QUARANTINE_CGROUP')
             if stage_created or owned:
-                if selected_a7:
+                if a12_selected():
+                    cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, a12_owned=a12_owned)
+                elif selected_a7:
                     cleanup_a1a2(run_id, unit, stage, stage_created, stage_info,
                                  unit_created, owned, a7_owned=(a7_accounts, a7_artifacts, a7_policy))
                 elif helper_data is not None:
@@ -1837,7 +2069,7 @@ def run_body(env):
                         os.close(assets[key])
 
 
-def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, helper_owned=None, a7_owned=None):
+def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, owned, helper_owned=None, a7_owned=None, a12_owned=None):
     global feedback_cleanup
     if unit_created:
         require(unit == 'arxd.service', 'E_UNIT_COLLISION')
@@ -1853,6 +2085,9 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
             snapshot_internal(run_id, unit, stopped)
         cg = Path('/sys/fs/cgroup/system.slice') / unit
         require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')
+    if a12_owned is not None:
+        require(not os.path.lexists('/sys/fs/cgroup/system.slice/arxd.service'), 'E_QUARANTINE_CGROUP')
+        cleanup_a12(a12_owned, unit_gone=True)
     if a7_owned is not None:
         accounts, artifacts, policy = a7_owned
         a7_uids_released(accounts)
@@ -1876,6 +2111,8 @@ def main():
     internal_trusted = False
     standard_profile()
     require(len(sys.argv) >= 2, 'E_MODE')
+    if a12_selected():
+        require(A12_DELIVERY_ENABLED and A12_EXECUTION_ENABLED, 'E_TEST_ARGS')
     mode = sys.argv[1]
     if mode in ('guard', 'run'):
         require(len(sys.argv) == 2, 'E_ARGS')

@@ -8,8 +8,8 @@ import stat
 import sys
 import types
 
-_MODULE_SHA256 = 'a92ab1ee64b8a3979d436a2d35e9baae355cb3a74a762a5efaf62acce0e599c7'
-_MODULE_SIZE = 86286
+_MODULE_SHA256 = 'a8a01bc59d694f0ab2a666a7f0135a1fc3ab46d646214c2644f70f548fb1abf5'
+_MODULE_SIZE = 96781
 _REFUSAL = '{"schema":1,"status":"refused"}'
 _ROLES = {'/': 'root', '/usr': 'usr', '/usr/local': 'usr_local',
           '/usr/local/bin': 'usr_local_bin', '/usr/bin': 'usr_bin',
