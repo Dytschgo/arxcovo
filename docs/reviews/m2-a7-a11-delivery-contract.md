@@ -51,7 +51,8 @@ existing disposable ExecStart override. Reuse setup once, MainPID/runtime checks
 READY/identity-ack and 120s harness/1MiB private capture; no production bridge activation.
 For each config retain two actual Runner calls: arxd `tool-probe`, then literal ignored
 `unix_shim::rights::linux::tests::e4_sudo_nnp_reentry` with existing fixed arguments.
-Require existing <=20s/4096-byte, identity, exact records, true/exit_nonzero, scalar
+Require the fixture budgets amended below, existing 4096-byte, identity, exact
+records, true/exit_nonzero, scalar
 C1/alias/C3-unopened/O_PATH/CLOEXEC/inode/exec-EOF/nonzero and cleanup discriminators.
 Finally stop/confirm unit+cgroup gone, no live fixture UID, then existing owned-only
 policy/account/group/root cleanup plus matching executable staging and private stage.
@@ -85,7 +86,7 @@ stage traversal, account/config mismatch, policy drift, collisions and partial c
 retain existing S8-S14/inactive inventory, E4 pin checks and driver guard suites.
 Then separate bounded qualification source/grant review; after evidence, execution
 grant pins both cases, source/artifacts/workflow/profile, one dispatch and variable
-set/absence lifecycle. D7a-g remain consumed; no retries or host reuse. Coordinator
+set/absence lifecycle. D7a-h remain consumed; no retries or host reuse. Coordinator
 automates authorized fresh-host actions through independent review and green required
 gates including ci-time-budget; no new human approval. No ADR rewrite absent spec change.
 
@@ -115,7 +116,8 @@ The following four exact pins supersede abbreviated wording above and bind the s
    `protected_directories=[stage]`, `environment={PATH:/usr/bin:/bin}`,
    `admin=false`, `cgroup_parent=/sys/fs/cgroup/system.slice/arxd.service/runs`,
    `memory_bytes=64MiB`, `pids=32`, `RunSpec.cwd=workspace`,
-   `timeout=20s`, `output_bytes=4096`; recheck owned base/workspace
+   `timeout=55s` for tool-probe / `10s` for E4 per the budget amendment below,
+   `output_bytes=4096`; recheck owned base/workspace
    dev/ino + owner + `0700` immediately before each Runner call.
 4. Executable admission TOCTOU scope. "Hold descriptors; recheck named identity"
    is insufficient unless the recheck is an `O_NOFOLLOW|O_CLOEXEC` open plus
@@ -130,3 +132,65 @@ The following four exact pins supersede abbreviated wording above and bind the s
 ## Controlled-policy amendment
 
 ADR0020 D9b supersedes the complete original-host policy-byte qualification/private-capture route for the controlled fixture only, after its review/gates/merge. The four literal read-only mount mappings and in-unit view checks establish the policy cases by construction; installed binary/plugin/default-path/floor checks and all delivery pins remain. No host-original-policy claim or list-mode oracle. Existing false/None selection gates remain until separately reviewed source and native disposition.
+
+## Binding budget amendment
+
+Documentation correction only, 2026-11-15; independent amendment review, required
+gates and merge pending. This supersedes only the old 20s RunSpec and phase/budget
+wording above. Delivery pins 1-4 otherwise stand. The accepted
+[Muse review](m2-a7-a11-integration-budget-muse-review.md) remains accepted except
+its two blocking corrections, now fixed by the
+[source-pinned proposal](m2-a7-a11-integration-budget-proposal.md) (pins 2 and 4).
+
+1. Complete fixed admission and one production setup, send READY within unchanged
+   packaged30s startup, then finish identity-ack before ANY Runner child. Driver
+   uses `systemctl start --no-block`, then its 120s monitor polls `active`, verifies
+   runtime bytes, MainPID/exe and exclusive supervisor cgroup membership, and
+   writes `identity-ack`. Only afterward can terminal `inactive`/`failed` with
+   `Result=success`, `ExecMainStatus=0`, both complete case oracles, fixed completion
+   marker and exact successful libtest summary pass. READY/ACK alone never passes.
+   Source: [driver.py:1282-1349](../../tools/unix-exec-validation/driver.py#L1282),
+   [1455-1470](../../tools/unix-exec-validation/driver.py#L1455),
+   [1571-1572](../../tools/unix-exec-validation/driver.py#L1571).
+2. Exactly two scoped workers, one owned account/Runner domain each; production
+   tool-probe then fixed E4 reentry per worker. Fixture-only RunSpec55s/10s;
+   actual nominal probe stays 9*5s+5s=50s. Keep output4096, memory64MiB/swap0/pids32
+   and per-call view/account/artifact checks. No generic framework or probe copy.
+3. Allocate exactly **10s cleanup acceptance allowance per case (5s per call)**:
+   normal cleanup has a 2s cgroup confirmation loop then a 2s reap loop, leaving
+   1s margin per call. Cleanup and guard drops are inside synchronous
+   `run_phased` return. Failed removal can retry for another 2s in Group::drop;
+   failed/error/unwind paths refuse and retain cleanup, not a 5s completion claim.
+   Source: [Runner:200-226](../../crates/arxd/src/exec/mod.rs#L200),
+   [cleanup:422-449](../../crates/arxd/src/exec/unix.rs#L422),
+   [guards:481-504](../../crates/arxd/src/exec/unix.rs#L481),
+   [cgroup:124-163](../../crates/arxd/src/exec/cgroup.rs#L124).
+   Enforce monotonic full-call elapsed <=60s/15s on return, cumulative
+   admission/check/oracle elapsed <=15s, case elapsed <=90s; excess refuses.
+   Thus 15+55+10+10=90, parallel cases do not sum. Full-call checks include
+   pre-timer work and cleanup; they do not isolate cleanup time or prove a hard
+   5s cleanup bound. Existing native loops bound polling, not syscall duration.
+4. Monitor120 includes startup after `--no-block`: reserve15s startup/setup and
+   remaining polling overhead +5s READY-to-ACK +90s cases +10s final join/completion;
+   require terminal observation before120s. Refuse phase excess. A7/A11 must
+   enforce the 5s ack envelope; shared `hold_identity_ack` currently waits120s.
+   Three 5s property-query polling deadlines plus local work/overshoot must fit
+   measured 15s case admission/checks; final child.wait() is not hard-bounded
+   ([query:542-613](../../crates/arxd/src/exec/disposable/sudo_nnp.rs#L542)).
+   Package30s, Runtime140s, build360s, workflow10min stay.
+5. Parent observes either worker failure/panic/excess, cancels caller/shutdown
+   tokens for BOTH and joins BOTH even if either join reports panic. Catch panic
+   inside scoped work to cancel before implicit joins. Retain all process-tree,
+   cleanup/residue and final driver unit/cgroup/UID checks; uncertainty quarantines.
+   Measure/refuse join/completion >10s after joining. Never detach cleanup, abort
+   a run thread or abandon a join to meet a clock. Cancellation is cooperative;
+   synchronous OS blocking can exceed envelopes, so this guarantees refusal of
+   late returned results, not hard native completion. Outer monitor/runtime
+   refusal/stop and owned-only driver cleanup remain required.
+
+No implementation before this amendment's independent review/gates/merge; D9b
+source/selection gates remain. No execution before a separate native grant for
+both cases/source/artifacts/workflow/profile/bounds on a fresh host. D7a-h remain
+consumed; the stale A1/A2 owner reply is closed. Source ceiling and pure rejection/
+scheduling/cancellation tests are as fixed in the proposal. A7/A11, M2, full F/G
+and real-Runner PA6 remain **unverified on real hardware**.
