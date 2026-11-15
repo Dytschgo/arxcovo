@@ -1,12 +1,5 @@
 # Arxcovo progress
 
-## Current state - 2026-11-15
-
-- Last merged: PR #146, `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` at22:19:44Z; independent Opus exact-head PASS6902189029/status58980320152 and all five gates green. Reviewed3476da6/squash full trees equal. Hosted three-OS actual snapshot catch-up and post-catch-up append credit is in-process only, not fullM3 acceptance.
-- Current work: bounded Sol high consensus append diagnosis; the Linux shim s9c reproduction is blocked on an available ordinary Linux environment. Consensus hotfix has priority and will be independently reviewed before publication. Member-registry Opus R1 test corrections are retained locally while these diagnoses run; no registry acceptance or M2 native retry is implied.
-- M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
-- D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
-
 ## Main CI health and merge prerequisite
 
 Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
@@ -16,7 +9,15 @@ Two red main runs were missed in prior checkpoint updates; they are now explicit
 
 PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. Coordinator live verification on2026-11-16 confirms latest main CI [43768671593](https://github.com/Dytschgo/arxcovo/actions/runs/43768671593) completed successfully on exact main0ab5038d89e86e5f726fbed7e5ef6d76e64fa306; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
 
-**Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main.
+**Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
+
+
+## Current state - 2026-11-16
+
+- Last merged: PR #147, `a318ae167e940948898affcb99da33bf17bd9dbc` at23:36:01Z; independent Opus exact-head PASS6903122978/status58983006547 and all five gates green. Reviewed9390742/squash full trees equal. Before merge, exact main0ab5038 CI43768671593 was confirmed completed green and main was re-read without drift.
+- Current work: member-registry R1 isolated rejection tests retained as7a37a68; fresh narrow Opus recheck next. Consensus callback hotfix merged as PR147; natural Ubuntu cause remains unproven. Linux s9c reproduction remains blocked on ordinary Linux capacity. M2 stays open.
+- M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
+- D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Ordering and M2 closure plan
 
@@ -37,19 +38,34 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Coordinator verifies PR147 five green gates and exact-main0ab5038 latestCI43768671593 success, re-reads main, unwatches and mergesa318ae1 at23:36:01Z. Reviewed9390742/squash trees equal. Registry R1 resumes after merging this checkpoint; Linuxs9c remains unresolved and no native M2 run is authorized.
+
 - 2026-11-16: Sol high Linux s9c diagnosis9c677b1 records no usable local Linux environment: WSL not installed, container clients absent, read-only Multipass inventory bounded at8s without establishing availability. Zero test executions and zero fix attempts; no cause, timeout change or quarantine. [Bounded repeat handoff](evidence/linux-s9c-intermittent-diagnosis.md) keeps this flake unresolved. Consensus diagnosis remains active and prioritized.
+
 
 - 2026-11-16: Two isolated Sol high bounded diagnoses are active: consensus append callback/poison test (priority hotfix) and Linux s9c bound-object test (local Linux availability must first be established). No cause is asserted yet. Latest exact-main CI43768671593 is independently confirmed green. Both fixes require independent Opus review and fresh hosted gates; no native M2 grant or retry follows.
 
+
 - 2026-11-16: Babysitter main-health correction accepted. Coordinator verifies both red-main logs and records exact tests/symptoms/runs, treats both as intermittent, prioritizes bounded consensus-flake diagnosis, and adds exact-live-main green-CI merge prerequisite independent of duration-only ci-time-budget. Registry R1 test fixes remain in progress; no owner-admin or M2 native retry follows.
+
 
 - 2026-11-15: Sol higha8118e9/38d7d96 retained71b32d9/400f901 implements member registry/Found/Remove/revoked replay and statecodec2, boundedwire64semantic16.107cluster tests pass8.77s with actualT4 snapshotrevocation, pruning and all-node reopen; eight crash probes/oldtests retained, fmt/workspaceofflineClippy/diff pass. Coordinator inspects evidence/manifests and requests fresh Opus source/security review before publication. No CA/TLS/transport/host acceptance.
 
+
 - 2026-11-15: Opus high2278908 retained2640629 closes registry staleness and bounded Found representation; independent Sol recheck passes with actual16-byteClusterId size arithmetic, pre-founding Remove gate and nonempty-founded codec invariant. Registry implementation starts with no dependency/TLS/CA change. M2 hardware blockers remain explicit and unchecked.
+
 
 - 2026-11-15: Opus high548aafa retained21e623a selects durable member registry before certificates because consumed-code bindings prune. Independent Sol review accepts direction but requests precise unbounded local-revocation staleness and bounded Found command/semantic-rejection codec contract before coding. No TLS/CA/transport activation; registry and M3 acceptance not yet credited.
 
+
 - 2026-11-15: Coordinator verifies PR146 exacthead/all five green gates, unwatches and merges0ab5038; reviewed/squash trees equal. Real full_snapshot follower recovery now has hostedWindows/macOS/Ubuntu credit for the in-process fixture. Next bounded Opus architecture task resolves enrollment certificate/key-authority boundary toward real multi-host trust, with no production endpoint or M2 closure inferred.
+
+
+- 2026-11-16: Opus high8682e80 retained7186ac9 passes independent append hotfix source review on Standards/Spec/Security. Exact-main64 tests/fmt/Clippy are separately recorded; natural Ubuntu cause remains unproven. Coordinator prepares isolated publication with both red-main records and Linux reproduction blocker; member-registry work stays on its separate branch.
+
+- 2026-11-16: Exact-main transplant of the append hotfix passes64 consensus tests in8.876s, fmt and locked/offline all-target arxd Clippy with warnings denied in34.60s. These local Windows checks are separate from the builder feature-parent65-test result. Independent Opus review remains active; hosted gates and exact-head publication review remain required.
+
+- 2026-11-16: Coordinator records both red main runs and exact-main green-CI merge prerequisite after babysitter correction. Sol high d51d3c0 retained ebdecee fixes worker store release before append completion. Natural local repeats200/200 pass before and after; controlled interleaving20/20 fails before and20/20 passes after. Independent Opus review and fresh exact-main checks are pending; no hosted natural-cause claim. Linux s9c remains blocked on ordinary Linux capacity, zero tests/fix attempts.
 
 - 2026-11-15: Coordinator verifies PR145 corrected head/all five gates, unwatches and merges765df2b; reviewed/squash trees equal. T3 branch incorporates squash retaining reviewed test-only additions and parent U6 correction; source add/add conflicts arise from squash ancestry, resolved to composed reviewed bytes. Publishing separate snapshot catch-up after parent merge, no fullM3/M2 closure.
 
