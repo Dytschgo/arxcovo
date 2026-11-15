@@ -129,3 +129,7 @@ This is a contract-conflict handback, not completed delivery source or native
 acceptance. Fresh independent Opus review and hosted Linux compile gates remain
 required before publication/merge. M2 remains incomplete; independent M3 is
 outside this assignment. Hardware remains **unverified on real hardware**.
+
+## Coordinator resolution of assignment error
+
+2026-11-15, Sol coordinator. The absolute-cwd instruction was incorrect and is withdrawn. Existing ADR0007/validate_spec/workspace_cwd semantics remain binding: RunSpec.cwd stays empty for the owned workspace root; OwnerConfig.workspace is the absolute trusted root and must be reopened/rechecked immediately before each call. The handback regression proves this actual validator contract. No production validator/backend or architecture change is needed or authorized. Resume the remaining bounded delivery source under this corrected brief; the preceding handback is historical, not an open contract blocker. No native grant or selection permission follows.

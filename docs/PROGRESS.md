@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #136, `cbab8b69f7204c81e4490da107dc1bca3282cf0c` at 15:49:50Z, independent Opus corrected-head PASS6897043625/status58966632840 and all five required gates green. Reviewedd9b6538/squash tree `59ee64a77d37f0f5c101878c8cc486b3c0905f32` identical; dormant A12 native fixture compiled by hosted Linux, no fixture execution.
-- Current work: prepare bounded A12 owned delivery/driver integration, still unselected and with source execution gate closed pending separate run disposition. Recheck account/workspace/runs/artifact before each actual call; fix delivery-dependent cwd from placeholder to owned workspace. No sudo/NNP/policy-view or A7 reuse. Fresh independent review/gates required. A7/A11 finalhostedNO-GO remains closed; M2 incomplete. Active Sol completion wake awaited.
+- Current work: resume bounded A12 delivery source after coordinator cwd instruction correction. Sol55bcf5d handback proves absolutecwd rejected, emptycwd correctly resolves beneath absolute OwnerConfig.workspace; existing production contract unchanged. Keep empty RunSpec.cwd and recheck owned absolute workspace/account/runs/artifacts per call. Delivery/execution remain closed and unselected pending reviews/gates; A7/A11 finalhostedNO-GO unchanged. Active Sol completion wake awaited.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol55bcf5d handback identifies coordinator assignmenterror: absoluteworkspacecwd contradicts ADR0007/actualvalidator, while emptycwd maps to workspace root via backendfchdir. Coordinator independently confirms source and withdraws wronginstruction, adopts existingrelativecwd contract with per-call absolute-root revalidation. Regression/evidence retained; bounded delivery implementation resumes withoutproductionchange or newgrant. Builder4A12/residue/W8/pin/fmt/Clippygreen at handback; deliverynotyetimplemented.
 
 - 2026-11-15: Coordinator verifies PR136 corrected exacthead/fivegreens, unwatches and mergescbab8b6; reviewed/squash59ee64a tree identical. DormantLinuxA12compile now credited, not nativeacceptance. Next separate delivery/driver source slice retains unselected/closedgate, owned revalidation/cleanup and fixed targets; no A7hostedreopening or nativegrant.
 
