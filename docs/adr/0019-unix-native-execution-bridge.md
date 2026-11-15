@@ -11,9 +11,11 @@ correction with its retained independent Opus high recheck. See the
 The staged architecture remains inactive and grants no production constructor
 or M2 acceptance. D7a and D7b are consumed; A1/A2 acceptance is limited to
 recorded hosted run `43627472312`. D7c is fully consumed; A3 is accepted only
-for Standard `43635131545` and None `43636804545`. D7d proposes one fresh-host
-A5 run; no run permission exists before independent Muse exact-head review,
-all five required gates and coordinator merge. All other native execution and
+for Standard `43635131545` and None `43636804545`. D7d is consumed by A5
+run `43644661407`; A5 acceptance is limited to that reviewed run. D7e proposes
+one fresh-host A4 baseline feedback run, conditional on merged PR #108 and PR #110 and a
+verified reviewed source baseline. No run permission exists before independent
+exact-head review, all five required gates, coordinator merge and candidate check. All other native execution and
 historical retries remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
@@ -231,7 +233,8 @@ slice; and an accepted, separately reviewed disposable native experiment. The
 first experiment (43091339273) failed with `E_PROTECTION` before harness
 acceptance. Its failure site and cleanup state remain unknown. That historical
 run and its environment must not be retried or reused. D7a and D7b are
-consumed, as is D7c; only D7d proposes one A5 run, subject to its gates.
+consumed, as are D7c and D7d; only D7e proposes one A4 baseline feedback
+run, subject to its prerequisite baseline and gates.
 
 ### D7a. One reviewed disposable A1/A2 run (2026-11-14)
 
@@ -450,6 +453,11 @@ failed preparation run above and do not grant execution permission.
 
 ### D7d. One source-selected A5 empty-orphan run (2026-11-14)
 
+**Historical; consumed.** Accepted dispatch `43644661407`, attempt 1, on
+`cf3a2510fc45e0cb438ae14cc41115e492bc0f41` consumed D7d regardless of outcome.
+Its A5-only acceptance and variable-clear evidence are recorded in PROGRESS.
+The terms below retain the original proposal, not current permission.
+
 **Proposed; no execution permission yet.** Independent Muse exact-head review,
 all five required gates (three platform `verify` checks, `ci-time-budget`,
 `agent-review`) and coordinator merge are required. The delegated proportionate
@@ -535,6 +543,79 @@ kills passed. Separate F0 and F0b `--mutants` commands passed 23 and 36 kills,
 with four equivalents uncredited. All three commands left driver SHA-256
 `aa8423e82006ee96a42c03e4267c1bdb777ae39b8e9a4b7f7c5ea84ff59b63de`
 unchanged. No native operation or execution permission follows from these checks.
+
+### D7e. One hosted A4 baseline feedback run (2026-11-15)
+
+**Proposed; source preparation only, no execution permission yet.** PR #106
+merged as `40adbe55672293c894abd2d49be4de630e62577e`. PR #108's privacy
+fixture is included in accepted main. PR #110's reviewed SDK-owned stdio
+fixture merged as `8e4bf824b56a2c4df141f9ef8cd78616d9b53475` at
+2026-11-15T01:53:32Z after all five gates and independent review. The coordinator
+verified its tree `d12edb06bfd87374b6f94cc8b0800a1554e4ed5e` equals reviewed
+head `bbdc71e446fa201947ed66b7c05a920775d7141f`.
+The [execution baseline inventory](../evidence/a4-d7e-execution-baseline.json)
+pins arxd source and integration tests, Unix-validation assets, both relevant
+workflows, Cargo metadata, toolchain, unit and Standard profile at that exact
+accepted baseline. This supersedes the earlier PR #108 baseline. The baseline
+is never the dispatch SHA. The candidate's full main squash SHA remains pending
+fresh exact-head review, required checks and coordinator merge.
+
+The sole dispatch candidate is the **first normal gated main squash** containing
+this amendment and `TEST = 'exec::disposable::a4::disposable_linux_a4'` after that
+accepted baseline. Compare execution blobs and the exact diff to that baseline:
+only the driver's one TEST line, the existing manual workflow's one unprivileged
+`build.py linux-candidate` compile/compare step before the privileged driver,
+the focused literal selection assertions and inverse A5 counterfactual anchor
+in `test_driver.py`/`mutation_check.py`, explicit historical A5 mode pins in the
+existing lifecycle mock fixtures in `test_driver.py`, `test_f0_blockers.py` and
+`test_f0b_transport.py`, this ADR and supporting review/progress/evidence
+documents may differ. The mode pins preserve all existing lifecycle assertions;
+A4 admission remains covered by its dedicated mocks. The non-A4 delivery refusal test explicitly
+selects historical A5; it retains refusal-before-open coverage. No other driver
+fence, helper, Rust fixture, production, package, Cargo, selector, permission or
+timeout changes are permitted. Never compile the helper as root. The fresh
+checkout has no image; this step produces ignored candidate bytes and compares
+them to the existing Linux pin without repinning or executing them.
+
+Independent different-provider exact-head review, all five required checks
+(three platform `verify`, `ci-time-budget`, `agent-review`) and coordinator
+merge are mandatory. Then verify candidate-tree/blob equality and pin the
+**actual full candidate main squash SHA**, never a branch head or baseline SHA.
+An intervening candidate or execution difference requires a new reviewed
+disposition. Record the full pins and read back main and workflow/source SHA
+before dispatch. Failed tests cannot be omitted or waived to qualify it.
+
+Only after those conditions may the coordinator set
+`UNIX_EXECUTION_REVIEWED_SHA` once to that SHA, read it back exactly, and accept
+**one** manual dispatch of `unix-execution-experiment.yml` on a fresh
+GitHub-hosted Ubuntu 24.04 host. Preserve repository `Dytschgo/arxcovo`, actor
+and triggering actor `Dytschgo`, `refs/heads/main`, and
+`GITHUB_SHA == ARX_REVIEWED_SHA == ARX_WORKFLOW_SHA` equal to the reviewed
+variable. Read-only credentials, fixed unit, packaged Standard profile,
+protected staging, collision refusal, descriptor delivery, attribution,
+MainPID/supervisor identity, bounded output/lifetime and owned cleanup remain.
+Clear the variable in a finally-style operation after completion, failure or
+rejected dispatch, and verify HTTP 404 absence. These bounded operations need
+no repeated owner confirmation once effective; this source task performs none.
+
+One accepted dispatch consumes D7e regardless of result. On failure, unknown
+result or uncertain cleanup, stop, retain only existing bounded sanitized
+feedback, exclude the host and do not retry. No old environment may be reused;
+all D7a–D7d and historical `43091339273` hosts remain excluded. No owner-PC,
+account provisioning, admin/payment, production activation, static-VM or backup
+action is included. No helper launch or native execution is authorized by
+local pure/mock validation, review preparation or a branch SHA.
+
+Select only `exec::disposable::a4::disposable_linux_a4` with the existing fixed
+helper, fixture and exact packaged Standard unit. Observe the existing exact
+test-ok, one-pass/zero-failure summary, real systemd success/zero exit and
+confirmed cleanup; retain the existing bounded sanitized feedback. This is
+**baseline native feedback only**. ADR0020 D9a's native omitted-kill negative
+case is still **unrun and NOT granted**. Pure/model assertion mutants cannot
+satisfy it. **A4 acceptance stays open** until that requirement is independently
+satisfied; no new mutation framework or waiver is introduced. A7–A12, full
+Stage F, Stage G, real-Runner PA6 and M2 remain open. Installed/dedicated paths
+are **unverified on real hardware**.
 
 ## Contract clarifications (2026-11-12)
 

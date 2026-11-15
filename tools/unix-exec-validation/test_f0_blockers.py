@@ -47,6 +47,8 @@ class F0Blockers(unittest.TestCase):
             if cleanup:
                 raise cleanup
         with ExitStack() as stack:
+            # This legacy lifecycle fixture exercises A5; A4 admission has separate mocks.
+            stack.enter_context(patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'))
             stack.enter_context(patch.object(driver, 'plan', return_value=(stage, 'arxd.service')))
             paths = stack.enter_context(patch.object(driver, 'Path', return_value=stage))
             stack.enter_context(patch.object(driver.os, 'getuid', return_value=0, create=True))
