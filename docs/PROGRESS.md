@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #142, `4f323c36e2d134b56c1f6efb3035b6cc18143c84` at18:32:43Z; independent Opus exact-head PASS6899129519/status58972231000 and all five required gates green. Reviewed9deec76/squash trees equal; first M3 pure enrollment core only, not cluster acceptance.
-- Current work: Opus settles the next bounded M3 implementation boundary under ADR0005 after the merged pure enrollment core. Priority is durable replicated-state/storage integration prerequisites and explicit commit/signing trust, not a production enrollment endpoint. M2 remains incomplete with hardware gaps open; A7 hosted FINAL NO-GO and consumed A12 no-retry/cleanup uncertainty unchanged.
+- Current work: independent Opus review of implemented M3 verifier boundary and durable SQLite enrollment state-store probe. Builder22 cluster tests/four crash probes/fmt/offline Clippy pass; broader Windows workspace run failed eight owner-security fixture setup tests (access denied, no baseline established), recorded without remediation or waiver. Hosted OS gates remain required. No quorum/signing/transport or power-loss claim; M2 gaps remain open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol high6aa2b8b/309371e retained92a4f7f/45eb7c0 implements verifier reduction and canonical SQLite store with four process-kill boundaries. Local22 cluster tests and four hot-journal/pre-post recovery probes pass, fmt/Clippy pass. Broader workspace352pass/8owner-security-access-denied failures/115unrun recorded honestly; no baseline attribution or admin action. Coordinator inspects evidence and requests fresh Opus review before publication.
 
 - 2026-11-15: Opus high33410cf retainedc736cf7 settles bounded SQLite durable enrollment state/crash probe using existing dependencies. Independent Sol review passes with explicit codec/install invariants and removal of unsupported calendar-only dependency gate. Next Sol implements verifier boundary plus canonical atomic state store; no quorum/power-loss/signing acceptance and no M2 closure.
 
