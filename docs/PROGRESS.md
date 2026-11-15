@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #143, `cd28bb91fb7a42307e6c48e360c96adbf36128fd` at19:18:55Z; independent Opus exact-head PASS6899732283/status58973875331 and all five required gates green. Reviewedcbd8055/squash full trees equal. M3 state-store crash probe passed hosted Windows/macOS/Ubuntu; local process-kill consistency only, not power loss or quorum.
-- Current work: independent Opus review of implemented M3 durable vote/log store and shared private SQLite opener. Builder reports unchanged23-test baseline and final33 cluster tests with both four-kill groups, fmt/offline Clippy/diff passing. No OpenRaft dependency/adapter, quorum or three-node claim. Hosted OS gates remain required; M2 gaps and closed A7/A12 no-retry status unchanged.
+- Current work: publish independently reviewed M3 durable vote/log storage through exact-head review and hosted Windows/macOS/Ubuntu gates. Opus recheckc32ce57 closes all eight R1 mutants;36 cluster/eight crash probes/fmt/offlineClippy pass independently. No OpenRaft integration, quorum, power-loss or three-node claim. M2 remains incomplete; A7 FINAL NO-GO and consumed A12 cleanup uncertainty/no-retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus highc32ce57 independently rechecks R1: all eight guard-removal mutants compile and fail only intended new assertions, production blob restored unchanged.36cluster/eight-kill/fmt/offlineClippy pass; evidence corrected. Coordinator publishes vote/log storage probe for exact-head review and hosted gates; no consensus/power-loss acceptance or M2 closure.
 
 - 2026-11-15: Opus highea8a25c retainedc0ef722 passes vote/log production/security but blocks Standards on eight uncovered fail-closed guards. Coordinator adds107 test-only lines covering purge/truncate regression, checksum-valid reopen inconsistency and per-read poisoning, with unchanged disk/memory/reopen assertions. All36cluster/eight crash probes/fmt/offlineClippy/diff pass. Evidence narrows membership4097 bound attribution; fresh Opus delta recheck pending, no production change.
 
