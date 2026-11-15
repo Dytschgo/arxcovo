@@ -1,9 +1,21 @@
 # Arxcovo progress
 
+## Main CI health and merge prerequisite
+
+Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
+
+- Main38750cf (after PR144), CI [43757400254](https://github.com/Dytschgo/arxcovo/actions/runs/43757400254): Ubuntu `unix_shim::rights::linux::tests::s9c_bound_object_survives_file_and_directory_swap` failed at unix_shim_rights_linux_tests.rs237, actual `unknown` versus expected `exit_zero`.
+- Main765df2b (after PR145), CI [43767515928](https://github.com/Dytschgo/arxcovo/actions/runs/43767515928): Ubuntu `cluster::consensus::tests::append_spawned_cancellation_panic_and_poison_complete_once` failed at consensus/tests.rs550, unwrap of `StoreError::Io`.
+
+PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. Coordinator live verification on2026-11-16 confirms latest main CI [43768671593](https://github.com/Dytschgo/arxcovo/actions/runs/43768671593) completed successfully on exact main0ab5038d89e86e5f726fbed7e5ef6d76e64fa306; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
+
+**Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main.
+
+
 ## Current state - 2026-11-15
 
 - Last merged: PR #145, `765df2bd1df6271ff06a961f581029544b4835d1` at22:07:38Z; independent Opus corrected-head PASS6902028887/status58979861977 and all five gates green. Reviewed7e053d2/squash full trees equal; in-process real-engine T1/T2/U6 only, no transport or fullM3 acceptance.
-- Current work: publish independently reviewed test-only T3 full-snapshot catch-up follow-up through exact-head review and hosted gates. Source reviewabf7a5e retained6553408 PASS with actual snapshot/install convergence and counterfactuals; parent PR145 merged. M2 closure plan remains active and unchecked, native gaps and A7/A12 no-retry unchanged.
+- Current work: prioritized consensus append callback ownership hotfix and independent Opus review. A deterministic worker pause reproduced callback-before-store-release Io on reopen; exact-main transplant checks and hosted gates remain required. Linux s9c remains intermittent with local Linux reproduction blocked. Member-registry work is retained on its separate branch.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -25,6 +37,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Coordinator records both red main runs and exact-main green-CI merge prerequisite after babysitter correction. Sol high d51d3c0 retained ebdecee fixes worker store release before append completion. Natural local repeats200/200 pass before and after; controlled interleaving20/20 fails before and20/20 passes after. Independent Opus review and fresh exact-main checks are pending; no hosted natural-cause claim. Linux s9c remains blocked on ordinary Linux capacity, zero tests/fix attempts.
 
 - 2026-11-15: Coordinator verifies PR145 corrected head/all five gates, unwatches and merges765df2b; reviewed/squash trees equal. T3 branch incorporates squash retaining reviewed test-only additions and parent U6 correction; source add/add conflicts arise from squash ancestry, resolved to composed reviewed bytes. Publishing separate snapshot catch-up after parent merge, no fullM3/M2 closure.
 
