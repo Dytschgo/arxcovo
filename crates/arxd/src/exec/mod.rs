@@ -16,6 +16,10 @@ use std::{
 
 pub(crate) mod hierarchy;
 
+#[cfg(test)]
+#[path = "disposable/a12.rs"]
+mod a12;
+
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(all(test, target_os = "linux"))]
