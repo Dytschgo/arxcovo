@@ -388,11 +388,20 @@ def controlled_policy_mutants():
     source = Path(driver.__file__).read_text()
     cases = [
         ("for _ in sudo_nnp_accounts(run, accounts):\n        pass", "prepare_sudo_nnp(run, accounts)", 'test_controlled_preparation_poison_legacy_writer'),
-        ("len(mappings) == 4 and set(mappings) == set(expected)", "True", 'test_literal_and_mapping_closed_sets'),
+        ("len(mappings) == 5 and set(mappings) == set(expected)", "True", 'test_literal_and_mapping_closed_sets'),
         ("require(unit_gone is True, 'E_QUARANTINE_CGROUP')\n    # Partial/unidentified", "pass\n    # Partial/unidentified", 'test_stage_is_exclusive_private_and_quarantines_short_write'),
-        ("pin is not None and controlled_pin(held, directory) == pin", "True", 'test_source_inode_and_entry_recheck'),
+        ("pin is not None and controlled_pin(held, directory, view) == pin", "True", 'test_source_inode_and_entry_recheck'),
         ("set(os.listdir(fd)) == expected", "True", 'test_source_inode_and_entry_recheck'),
         ("case0 + ' ALL=(root) NOPASSWD: /usr/bin/true", "_case1 + ' ALL=(root) NOPASSWD: /usr/bin/true", 'test_literal_and_mapping_closed_sets'),
+        # D9c fifth empty C2 view source: exact mapping, mode, emptiness and creation.
+        ("('c2-empty', '/usr/local/bin'))", "('c2-empty', '/usr/local'))", 'test_literal_and_mapping_closed_sets'),
+        ("mode = 0o755 if view else 0o700 if directory else 0o440", "mode = 0o700 if directory else 0o440", 'test_view_pin_mode_owner_and_type'),
+        ("os.fchmod(fd, 0o755)  # held new inode", "pass  # held new inode", 'test_stage_is_exclusive_private_and_quarantines_short_write'),
+        ("'fx/c2-empty': set()}", "'fx/c2-empty': {'sudo'}}", 'test_nonempty_or_replaced_view_never_deleted'),
+        ("os.mkdir(name, mode=0o755 if view else 0o700, dir_fd=parent)", "os.mkdir(name, mode=0o700, dir_fd=parent)", 'test_stage_is_exclusive_private_and_quarantines_short_write'),
+        ("len(owned.get('entries', [])) == 7", "len(owned.get('entries', [])) >= 6", 'test_source_inode_and_entry_recheck'),
+        ("                require(controlled_pin(fd, directory, view) == pin, 'E_POLICY_IDENTITY')\n            finally:\n                os.close(fd)\n            if directory:",
+         "                pass\n            finally:\n                os.close(fd)\n            if directory:", 'test_nonempty_or_replaced_view_never_deleted'),
     ]
     for before, after, name in cases:
         assert source.count(before) == 1, before
@@ -410,8 +419,11 @@ def controlled_policy_mutants():
     tests = controller[controller.index('#[test]\nfn a7_controlled_policy_discriminators'):controller.index('fn recheck_delivery(')]
     code = names + ports + tests
     mutants = [
-        ('mappings.len() == 4', 'true'),
-        ('seen == [1; 4]', 'true'),
+        ('mappings.len() == 5', 'true'),
+        ('seen == [1; 5]', 'true'),
+        ('path.starts_with("/usr/local/bin/")', 'false'),
+        ('path.starts_with("/etc/")', 'false'),
+        ('("c2-empty", "/usr/local/bin"),', '("c2-empty", "/usr/local"),'),
         ('o == "ro"', 'true'),
         ('entries.len() == 4', 'true'),
         ('*data == b', 'true'),
@@ -432,6 +444,28 @@ def controlled_policy_mutants():
             result = check(code.replace(before, after))
             assert result.returncode == 101 and 'assertion' in result.stdout, before + result.stdout
             print('KILLED controlled Rust ' + before)
+        # D9c actual pure empty-view proof over observed held/reopened facts.
+        def check_view(code):
+            built = subprocess.run(['rustc', '--edition=2024', '--test', '-', '-o', str(exe)],
+                                   input=code, text=True, capture_output=True, timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe), 'a7_c2_empty_view_discriminators', '--exact'],
+                                  text=True, capture_output=True, timeout=20)
+        result = check_view(code)
+        assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout, result.stdout
+        print('PASS actual D9c empty C2 view pure Rust proof')
+        for before, after in [('n.mode == 0o040755', 'true'), ('n.uid == 0', 'true'),
+                              ('n.gid == 0', 'true'), ('n.dev == f.source[0].dev', 'true'),
+                              ('n.ino == f.source[0].ino', 'true'),
+                              ('f.source_entries.is_empty()', 'true'),
+                              ('f.view_entries.is_empty()', 'true'),
+                              ('&& f.readonly', '&& true'),
+                              ('f.c2 == [C2::Absent; 2]', 'true'),
+                              ('f.source.iter().chain(f.view.iter()).all(same)', 'true')]:
+            assert code.count(before) == 1, before
+            result = check_view(code.replace(before, after))
+            assert result.returncode == 101 and 'assertion' in result.stdout, before + result.stdout
+            print('KILLED empty view Rust ' + before)
 
 
 def a7_integration_checks():
@@ -444,7 +478,10 @@ def a7_integration_checks():
             ("require(deadline > time.monotonic(), 'E_TEST_TIMEOUT')", 'pass', 'test_active_identity_before_ack_and_terminal_deadline'),
             ("ack_start - monitor_start <= 15", 'True', 'test_active_identity_before_ack_and_terminal_deadline'),
             ("time.monotonic() - ack_start <= 5", 'True', 'test_active_identity_before_ack_and_terminal_deadline'),
-            ("        if policy:\n            cleanup_controlled_sudo_nnp", "        if policy.get('entries'):\n            cleanup_controlled_sudo_nnp", 'test_cleanup_requires_stop_and_preserves_partial_policy')]:
+            ("        if policy:\n            cleanup_controlled_sudo_nnp", "        if policy.get('entries'):\n            cleanup_controlled_sudo_nnp", 'test_cleanup_requires_stop_and_preserves_partial_policy'),
+            ("require(proc.stat().st_uid not in uids, 'E_UID_LIVE')", 'pass', 'test_live_fixture_uid_retains_every_fixture_path'),
+            ("        a7_uids_released(accounts)\n", '', 'test_live_fixture_uid_retains_every_fixture_path'),
+            ("require(item.get('identity') is not None or not item['created'], 'E_QUARANTINE_UID_UNCAPTURED')\n        if item.get('identity') is not None:\n            uids.add", "pass\n        if item.get('identity') is not None:\n            uids.add", 'test_live_fixture_uid_retains_every_fixture_path')]:
         assert source.count(before) == 1, before
         module = types.ModuleType('a7_driver_mutant')
         exec(compile(source.replace(before, after), '<a7-mutant>', 'exec'), module.__dict__)
@@ -644,6 +681,11 @@ def admission_path_mutants():
         ('sudo_nnp_open', 'if directory:\n            a4_directory(fd)', 'if False:\n            a4_directory(fd)', 'test_each_ancestry_conjunct'),
         ('a7_alias_c2', "True, 'a7_c2_parent'", "True, 'a7_alias_root'", 'test_fixed_role_attribution'),
         ('a7_alias_c2', "feedback_mutation == 'none'", 'True', 'test_only_initial_path_code_is_attributed'),
+        # D9c controlled host split: alias/ancestry fences and attribution only.
+        ('a7_alias_controlled', "Path('/'), 'a7_alias_root'", "Path('/'), 'a7_alias_target'", 'test_fixed_role_attribution'),
+        ('a7_alias_controlled', "feedback_mutation == 'none'", 'True', 'test_only_initial_path_code_is_attributed'),
+        ('a7_alias_controlled', "usrbin = open_role(Path('/usr/bin'), 'a7_alias_target')", "usrbin = root", 'test_each_ancestry_conjunct'),
+        ('a7_admission', '    a7_alias_controlled()\n', '    a7_alias_c2()\n', 'test_controlled_split_defers_only_host_c2'),
         ('exception_record', "return dict(code='E_PATH', role=error.role)", "return dict(code='E_PATH')", 'test_fixed_role_attribution'),
         ('validate_record', "e['role'] in A7_PATH_ROLES", 'True', 'test_closed_role_schema_and_historical_compatibility'),
         ('validate_record', "record['mutation_lower_bound'] == 'none'", 'True', 'test_closed_role_schema_and_historical_compatibility'),
@@ -671,7 +713,13 @@ def execution_admission_mutants():
     for before,after,case,name in [
         ('require(result == dict(', 'require(True or result == dict(',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
         ("os.uname().machine == 'x86_64'",'True',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
-        ('    a7_alias_c2()\n    cg_preflight()', '    cg_preflight()',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ('    a7_alias_controlled()\n    cg_preflight()', '    cg_preflight()',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ('    a7_alias_controlled()\n    cg_preflight()', '    a7_alias_c2()\n    cg_preflight()',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
+        ("buffer.raw[:length] in (b'usr/bin', b'/usr/bin'), 'E_ALIAS')\n        after = os.stat('bin', dir_fd=root, follow_symlinks=False)\n        require(_stable_stat(before) == _stable_stat(after) and\n                _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')\n    finally",
+         "True, 'E_ALIAS')\n        after = os.stat('bin', dir_fd=root, follow_symlinks=False)\n        require(_stable_stat(before) == _stable_stat(after) and\n                _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')\n    finally",test_driver.RuntimeAdmission,'test_alias_controlled_with_only_fake_ports'),
+        ("                _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')\n    finally",
+         "                True, 'E_ALIAS')\n    finally",test_driver.RuntimeAdmission,'test_alias_controlled_with_only_fake_ports'),
+        ("A7_PROFILE = '99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e'", "A7_PROFILE = '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210'",test_driver.RuntimeAdmission,'test_canonical_profile_label_matches_five_view_facts'),
         ('    cg_preflight()\n    return A7_PROFILE', '    return A7_PROFILE',test_driver.RuntimeAdmission,'test_runtime_refusals_before_effects'),
         ("require(expected_profile == A7_PROFILE, 'E_POLICY_UNATTESTED')",'pass',test_driver.RuntimeAdmission,'test_profile_mismatch_before_handoff'),
         ('        a7_admission()  # before root/host probes, reservation or staging','        pass',test_driver.A7Integration,'test_closed_before_host_and_package_adapter')]:

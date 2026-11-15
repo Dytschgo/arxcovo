@@ -16,9 +16,9 @@ fn prepared_delivery() -> Option<Prepared> {
     Some(prepared)
 }
 
-// SHA256 of canonical reviewed package/default/policy facts (evidence JSON).
-// This identifier never asserts whole-host qualification or replaces live checks.
-const A7_PROFILE: &str = "51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210";
+// SHA256 of canonical reviewed package/default/policy/five-view facts (evidence
+// JSON, ADR0020 D9c). A label only: never host qualification or a live check.
+const A7_PROFILE: &str = "99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e";
 const PACKAGE: [(&str, u64, &str); 3] = [
     (
         "/usr/bin/sudo",
@@ -143,23 +143,11 @@ fn runtime_package() -> Option<Vec<std::fs::File>> {
     if alias.st_dev != target.dev() || alias.st_ino != target.ino() {
         return None;
     }
+    // D9c: inside the unit /usr/local/bin is the closed empty view, so C2 must be
+    // absent (ENOENT); presence or any other error refuses. controlled_view proves
+    // the view itself; host C2 is never consulted or claimed.
     let local = delivery_open(Path::new("/usr/local/bin"), true)?;
-    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe {
-        libc::fstatat(
-            local.as_raw_fd(),
-            c"sudo".as_ptr(),
-            info.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc == 0 {
-        held.push(package_file(
-            Path::new("/usr/local/bin/sudo"),
-            PACKAGE[0].1,
-            PACKAGE[0].2,
-        )?);
-    } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+    if view_c2(&local) != C2::Absent {
         return None;
     }
     held.extend([util, root, usrbin, local]);
@@ -633,15 +621,23 @@ fn controlled_literals(run: &str) -> Option<Vec<(&'static str, Vec<u8>)>> {
         ),
     ])
 }
+// ADR0020 D9c: exactly the four D9b policy views plus the closed empty C2 view.
+const CONTROLLED_VIEWS: [(&str, &str); 5] = [
+    ("sudoers", "/etc/sudoers"),
+    ("sudo.conf", "/etc/sudo.conf"),
+    ("nsswitch.conf", "/etc/nsswitch.conf"),
+    ("sudoers.d", "/etc/sudoers.d"),
+    ("c2-empty", "/usr/local/bin"),
+];
 fn controlled_mappings(run: &str, mappings: &[&str]) -> bool {
     if delivery_names(run).is_none() {
         return false;
     }
-    let expected: Vec<_> = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+    let expected: Vec<_> = CONTROLLED_VIEWS
         .iter()
-        .map(|n| format!("/var/lib/arx-ci-{run}/fx/{n}:/etc/{n}:rbind"))
+        .map(|(n, target)| format!("/var/lib/arx-ci-{run}/fx/{n}:{target}:rbind"))
         .collect();
-    mappings.len() == 4
+    mappings.len() == 5
         && expected
             .iter()
             .all(|e| mappings.iter().filter(|m| **m == e).count() == 1)
@@ -650,29 +646,24 @@ fn controlled_mounts(text: &str) -> bool {
     if text.len() > 1024 * 1024 {
         return false;
     }
-    let expected = [
-        "/etc/sudoers",
-        "/etc/sudo.conf",
-        "/etc/nsswitch.conf",
-        "/etc/sudoers.d",
-    ];
-    let mut seen = [0; 4];
+    let mut seen = [0; 5];
     for line in text.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() < 10 || !fields.contains(&"-") {
             return false;
         }
         let path = fields[4];
-        if let Some(i) = expected.iter().position(|p| *p == path) {
+        if let Some(i) = CONTROLLED_VIEWS.iter().position(|(_, p)| *p == path) {
             if !fields[5].split(',').any(|o| o == "ro") {
                 return false;
             }
             seen[i] += 1;
-        } else if path.starts_with("/etc/") {
+        } else if path.starts_with("/etc/") || path.starts_with("/usr/local/bin/") {
+            // No other /etc mount and no submount below the closed C2 view.
             return false;
         }
     }
-    seen == [1; 4]
+    seen == [1; 5]
 }
 fn controlled_bytes(run: &str, entries: &[(&str, &[u8])]) -> bool {
     let Some(expected) = controlled_literals(run) else {
@@ -687,11 +678,80 @@ fn controlled_bytes(run: &str, entries: &[(&str, &[u8])]) -> bool {
                 == 1
         })
 }
+// D9c closed empty C2 view facts, observed from held descriptors inside the unit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ViewNode {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum C2 {
+    Absent,
+    Present,
+    Unknown,
+}
+struct EmptyView<'a> {
+    source: [ViewNode; 2], // held fx/c2-empty, then its fresh NOFOLLOW reopen
+    view: [ViewNode; 2],   // held /usr/local/bin, then its fresh NOFOLLOW reopen
+    source_entries: &'a [String],
+    view_entries: &'a [String],
+    readonly: bool, // fstatvfs ST_RDONLY on the held view
+    c2: [C2; 2],    // fstatat(sudo, NOFOLLOW) on the held and reopened view
+}
+fn empty_view(f: &EmptyView) -> bool {
+    // Exactly root:root directory 0755. The real low-UID probe opens the C2
+    // directory O_RDONLY|O_DIRECTORY: 0700 would give EACCES (unknown, refused)
+    // instead of sudo ENOENT, and any group/other write bit is refused.
+    let node = |n: &ViewNode| n.uid == 0 && n.gid == 0 && n.mode == 0o040755;
+    // A bind keeps st_dev/st_ino: every view and reopen IS the owned source inode.
+    let same = |n: &ViewNode| n.dev == f.source[0].dev && n.ino == f.source[0].ino;
+    f.source.iter().chain(f.view.iter()).all(node)
+        && f.source.iter().chain(f.view.iter()).all(same)
+        && f.source_entries.is_empty()
+        && f.view_entries.is_empty()
+        && f.readonly
+        && f.c2 == [C2::Absent; 2]
+}
 fn controlled_read(file: &std::fs::File, bound: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut bytes = Vec::new();
     file.take(bound + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= bound).then_some(bytes)
+}
+// Held-descriptor C2 lookup without following links; only ENOENT is absence.
+fn view_c2(directory: &std::fs::File) -> C2 {
+    use std::os::fd::AsRawFd;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            c"sudo".as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        C2::Present
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        C2::Absent
+    } else {
+        C2::Unknown
+    }
+}
+// Bounded entry names of a held directory; never follows entries.
+fn held_entries(directory: &std::fs::File, bound: usize) -> Option<Vec<String>> {
+    use std::os::fd::AsRawFd;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .ok()?
+        .take(bound)
+    {
+        entries.push(entry.ok()?.file_name().into_string().ok()?);
+    }
+    Some(entries)
 }
 fn controlled_unit_mappings() -> Option<String> {
     use std::{
@@ -819,7 +879,13 @@ fn controlled_view(run: &str, accounts: &[OwnerConfig; 2]) -> Option<Vec<std::fs
         }
         if directory {
             let expected: Vec<&str> = if name.is_empty() {
-                vec!["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+                vec![
+                    "sudoers",
+                    "sudo.conf",
+                    "nsswitch.conf",
+                    "sudoers.d",
+                    "c2-empty",
+                ]
             } else {
                 vec!["10-a7-case0"]
             };
@@ -878,6 +944,39 @@ fn controlled_view(run: &str, accounts: &[OwnerConfig; 2]) -> Option<Vec<std::fs
     ) {
         return None;
     }
+    // D9c fifth view: the owned empty source IS the in-unit /usr/local/bin.
+    // Configuration text is not proof; held and reopened descriptors are.
+    let source = delivery_open(&stage.join("c2-empty"), true)?;
+    let view = delivery_open(Path::new("/usr/local/bin"), true)?;
+    let node = |file: &std::fs::File| {
+        let m = file.metadata().ok()?;
+        Some(ViewNode {
+            dev: m.dev(),
+            ino: m.ino(),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+        })
+    };
+    let source_entries = held_entries(&source, 2)?;
+    let view_entries = held_entries(&view, 2)?;
+    let mut fs = MaybeUninit::<libc::statvfs>::uninit();
+    let readonly = unsafe { libc::fstatvfs(view.as_raw_fd(), fs.as_mut_ptr()) } == 0
+        && unsafe { fs.assume_init() }.f_flag & libc::ST_RDONLY != 0;
+    let held_c2 = view_c2(&view);
+    let source_again = delivery_open(&stage.join("c2-empty"), true)?;
+    let view_again = delivery_open(Path::new("/usr/local/bin"), true)?;
+    if !empty_view(&EmptyView {
+        source: [node(&source)?, node(&source_again)?],
+        view: [node(&view)?, node(&view_again)?],
+        source_entries: &source_entries,
+        view_entries: &view_entries,
+        readonly,
+        c2: [held_c2, view_c2(&view_again)],
+    }) {
+        return None;
+    }
+    held.extend([source, view, source_again, view_again]);
     for a in accounts {
         let pin = DeliveryAccount {
             uid: a.uid,
@@ -909,45 +1008,160 @@ fn a7_controlled_policy_discriminators() {
     let mut bad = entries.clone();
     bad.push(("sudoers.d/extra", b"ALL ALL=(ALL) ALL\n"));
     assert!(!controlled_bytes(run, &bad));
-    let mappings: Vec<_> = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+    let mut mappings: Vec<_> = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
         .iter()
         .map(|n| format!("/var/lib/arx-ci-{run}/fx/{n}:/etc/{n}:rbind"))
         .collect();
+    mappings.push(format!(
+        "/var/lib/arx-ci-{run}/fx/c2-empty:/usr/local/bin:rbind"
+    ));
     let refs: Vec<_> = mappings.iter().map(String::as_str).collect();
     assert!(controlled_mappings(run, &refs));
-    assert!(!controlled_mappings(run, &refs[..3]));
+    // The D9b four-set alone (missing C2 view) and every other subset refuse.
+    for i in 0..5 {
+        let mut missing = refs.clone();
+        missing.remove(i);
+        assert!(!controlled_mappings(run, &missing));
+        let mut duplicate = missing.clone();
+        duplicate.push(refs[(i + 1) % 5]);
+        assert!(!controlled_mappings(run, &duplicate));
+    }
     let mut bad = refs.clone();
     bad.push(refs[0]);
     assert!(!controlled_mappings(run, &bad));
     let mut extra = refs.clone();
     extra.push("/foreign:/etc/other:rbind");
     assert!(!controlled_mappings(run, &extra));
-    let mut strings = mappings.clone();
-    strings[0].insert(0, '-');
-    assert!(!controlled_mappings(
-        run,
-        &strings.iter().map(String::as_str).collect::<Vec<_>>()
-    ));
-    let mounts: String = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
+    for i in [0, 4] {
+        // Optional missing-source prefix is never admitted, including the C2 view.
+        let mut strings = mappings.clone();
+        strings[i].insert(0, '-');
+        assert!(!controlled_mappings(
+            run,
+            &strings.iter().map(String::as_str).collect::<Vec<_>>()
+        ));
+    }
+    for wrong in [
+        "/var/lib/arx-ci-123-1/fx/c2-empty:/usr/local:rbind",
+        "/var/lib/arx-ci-123-1/fx/c2-empty:/usr/local/bin:norbind",
+        "/var/lib/arx-ci-123-1/fx/sudoers.d:/usr/local/bin:rbind",
+        "/usr/local/bin:/usr/local/bin:rbind",
+    ] {
+        let mut swapped = refs.clone();
+        swapped[4] = wrong;
+        assert!(!controlled_mappings(run, &swapped));
+    }
+    let mut mounts: String = ["sudoers", "sudo.conf", "nsswitch.conf", "sudoers.d"]
         .iter()
         .map(|n| format!("1 2 0:1 /fx/{n} /etc/{n} ro,nosuid - ext4 /dev/x rw\n"))
         .collect();
+    let view = "1 2 0:1 /fx/c2-empty /usr/local/bin ro,nosuid - ext4 /dev/x rw\n";
+    // ProtectSystem's own /usr and /etc lines are not extra policy mounts.
+    let protect = "3 1 0:1 /usr /usr ro - ext4 /dev/x rw\n3 1 0:1 /etc /etc ro - ext4 /dev/x rw\n";
+    assert!(!controlled_mounts(&mounts));
+    mounts = protect.to_string() + &mounts + view;
     assert!(controlled_mounts(&mounts));
     assert!(!controlled_mounts(&mounts.replacen(
         "ro,nosuid",
         "rw,nosuid",
         1
     )));
+    assert!(!controlled_mounts(&mounts.replace(
+        "/usr/local/bin ro,nosuid",
+        "/usr/local/bin rw,nosuid"
+    )));
     assert!(!controlled_mounts(
-        &mounts.lines().skip(1).collect::<Vec<_>>().join("\n")
+        &mounts.lines().skip(3).collect::<Vec<_>>().join("\n")
     ));
     assert!(!controlled_mounts(
         &(mounts.clone() + "1 2 0:1 /x /etc/other ro - ext4 /dev/x rw\n")
     ));
     assert!(!controlled_mounts(
-        &(mounts.clone() + mounts.lines().next().unwrap())
+        &(mounts.clone() + mounts.lines().nth(2).unwrap())
     ));
+    // Stacked view, submount below the view, and a missing view all refuse.
+    assert!(!controlled_mounts(&(mounts.clone() + view)));
+    assert!(!controlled_mounts(
+        &(mounts.clone() + "1 2 0:1 /x /usr/local/bin/sudo ro - ext4 /dev/x rw\n")
+    ));
+    assert!(!controlled_mounts(&mounts.replace(view, "")));
     assert!(!controlled_mappings("124-1", &refs));
+}
+
+#[test]
+fn a7_c2_empty_view_discriminators() {
+    // Observed facts: [source, source reopen, view, view reopen], then emptiness
+    // of source/view, view read-only flag, and C2 on the held/reopened view.
+    fn case(nodes: [ViewNode; 4], full: [bool; 2], readonly: bool, c2: [C2; 2]) -> bool {
+        let sudo = ["sudo".to_string()];
+        let pick = |nonempty: bool| if nonempty { &sudo[..] } else { &sudo[..0] };
+        empty_view(&EmptyView {
+            source: [nodes[0], nodes[1]],
+            view: [nodes[2], nodes[3]],
+            source_entries: pick(full[0]),
+            view_entries: pick(full[1]),
+            readonly,
+            c2,
+        })
+    }
+    let owned = ViewNode {
+        dev: 7,
+        ino: 42,
+        mode: 0o040755,
+        uid: 0,
+        gid: 0,
+    };
+    let absent = [C2::Absent; 2];
+    assert!(case([owned; 4], [false; 2], true, absent));
+    for slot in 0..4 {
+        // 0700 would make the low-UID probe see EACCES/unknown, never ENOENT;
+        // write bits, special bits, non-directories and foreign owners refuse.
+        for mode in [
+            0o040700, 0o040711, 0o040750, 0o040775, 0o040757, 0o040777, 0o041755, 0o042755,
+            0o100755, 0o120777,
+        ] {
+            let mut nodes = [owned; 4];
+            nodes[slot].mode = mode;
+            assert!(
+                !case(nodes, [false; 2], true, absent),
+                "assertion slot {slot} mode {mode:o}"
+            );
+        }
+        // Foreign owner/group, or any non-fixture inode (even a protected one).
+        for change in 0..4 {
+            let mut nodes = [owned; 4];
+            match change {
+                0 => nodes[slot].uid = 1000,
+                1 => nodes[slot].gid = 1000,
+                2 => nodes[slot].ino = 99,
+                _ => nodes[slot].dev = 8,
+            }
+            assert!(
+                !case(nodes, [false; 2], true, absent),
+                "assertion slot {slot} change {change}"
+            );
+        }
+    }
+    // A writable raw host /usr/local/bin is never admitted as the view.
+    let host = ViewNode {
+        dev: 1,
+        ino: 99,
+        mode: 0o040777,
+        uid: 0,
+        gid: 0,
+    };
+    assert!(!case([owned, owned, host, host], [false; 2], true, absent));
+    assert!(!case([owned; 4], [true, false], true, absent));
+    assert!(!case([owned; 4], [false, true], true, absent));
+    assert!(!case([owned; 4], [false; 2], false, absent));
+    for c2 in [
+        [C2::Present, C2::Absent],
+        [C2::Absent, C2::Present],
+        [C2::Unknown, C2::Absent],
+        [C2::Absent, C2::Unknown],
+    ] {
+        assert!(!case([owned; 4], [false; 2], true, c2));
+    }
 }
 
 fn recheck_delivery(config: &OwnerConfig, executable: &Path) -> Option<Vec<std::fs::File>> {

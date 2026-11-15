@@ -11,7 +11,7 @@ import tempfile
 import json
 import stat
 from types import SimpleNamespace
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import patch
 
 import driver
@@ -1557,10 +1557,17 @@ class ControlledPolicy(unittest.TestCase):
     def test_literal_and_mapping_closed_sets(self):
         expected = ('sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d')
         mappings = driver.controlled_mappings('123-1')
-        self.assertEqual(mappings, tuple('/var/lib/arx-ci-123-1/fx/' + n + ':/etc/' + n for n in expected))
+        view = '/var/lib/arx-ci-123-1/fx/c2-empty:/usr/local/bin'
+        self.assertEqual(mappings, tuple('/var/lib/arx-ci-123-1/fx/' + n + ':/etc/' + n for n in expected)
+                         + (view,))
         driver.controlled_mapping_set('123-1', mappings)
-        for bad in (mappings[:3], mappings + (mappings[0],), ('-' + mappings[0],) + mappings[1:],
-                    mappings[:3] + ('/foreign:/etc/sudoers.d',)):
+        # The D9b four-set (no C2 view), any optional prefix, duplicate or foreign
+        # mapping and any changed C2 source/target refuse.
+        for bad in (mappings[:3], mappings[:4], mappings + (mappings[0],), ('-' + mappings[0],) + mappings[1:],
+                    mappings[:4] + ('-' + view,), mappings[:3] + ('/foreign:/etc/sudoers.d', view),
+                    mappings[:4] + ('/var/lib/arx-ci-123-1/fx/c2-empty:/usr/local',),
+                    mappings[:4] + ('/usr/local/bin:/usr/local/bin',),
+                    mappings[:4] + (view, view), mappings[1:] + (view,)):
             with self.assertRaisesRegex(RuntimeError, 'E_POLICY_MAPPING'):
                 driver.controlled_mapping_set('123-1', bad)
         literals = driver.controlled_literals('123-1')
@@ -1571,7 +1578,9 @@ class ControlledPolicy(unittest.TestCase):
             'sudoers.d/10-a7-case0': b'arxsn123x1r ALL=(root) NOPASSWD: /usr/bin/true\n'})
         self.assertNotIn(b'arxsn123x1n', b''.join(literals.values()))
         override = driver.controlled_override('123-1')
-        self.assertEqual(override.count('BindReadOnlyPaths='), 4)
+        self.assertEqual(override.count('BindReadOnlyPaths='), 5)
+        self.assertEqual(override.count('BindReadOnlyPaths=' + view + '\n'), 1)
+        self.assertNotIn('BindReadOnlyPaths=-', override)
 
     def test_partial_cleanup_quarantines(self):
         with patch.object(driver.os, 'unlink') as unlink, patch.object(driver.os, 'rmdir') as rmdir:
@@ -1581,23 +1590,44 @@ class ControlledPolicy(unittest.TestCase):
             unlink.assert_not_called()
             rmdir.assert_not_called()
 
-    def test_source_inode_and_entry_recheck(self):
+    @staticmethod
+    def seven_entries():
         import hashlib
         literals = driver.controlled_literals('123-1')
-        entries = [('fx', 1, (1, 1, None)), ('fx/sudoers.d', 2, (1, 2, None))]
-        entries += [('fx/' + n, i + 3, (1, i + 3, hashlib.sha256(b).hexdigest()))
+        entries = [('fx', 1, (1, 1, None)), ('fx/sudoers.d', 2, (1, 2, None)),
+                   ('fx/c2-empty', 3, (1, 3, None))]
+        entries += [('fx/' + n, i + 4, (1, i + 4, hashlib.sha256(b).hexdigest()))
                     for i, (n, b) in enumerate(literals.items())]
+        return entries
+
+    @staticmethod
+    def listing(fd):
+        return {102: ['10-a7-case0'], 103: [],
+                101: ['sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d', 'c2-empty']}[fd]
+
+    def test_source_inode_and_entry_recheck(self):
+        entries = self.seven_entries()
         pins = {fd: pin for _, fd, pin in entries}
         pins.update({fd + 100: pin for _, fd, pin in entries})
-        def listing(fd):
-            return ['10-a7-case0'] if fd == 102 else ['sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d']
+        kinds = []
+        def pin(fd, directory=False, view=False):
+            kinds.append((fd % 100, directory, view))
+            return pins[fd]
         with patch.object(driver, 'sudo_nnp_open', side_effect=[e[1] + 100 for e in entries] * 8), \
-             patch.object(driver, 'controlled_pin', side_effect=lambda fd, directory=False: pins[fd]), \
-             patch.object(driver.os, 'listdir', side_effect=listing) as ls, patch.object(driver.os, 'close'):
+             patch.object(driver, 'controlled_pin', side_effect=pin), \
+             patch.object(driver.os, 'listdir', side_effect=self.listing) as ls, patch.object(driver.os, 'close'):
             driver.recheck_controlled_sudo_nnp('123-1', {'entries': entries})
-            pins[3] = (1, 999, entries[2][2][2])
+            # Held and reopened descriptors of the C2 source both use the 0755 view pin.
+            self.assertEqual([k for k in kinds if k[0] == 3], [(3, True, True)] * 2)
+            self.assertTrue(all(not view for fd, _, view in kinds if fd != 3))
+            self.assertEqual(sorted(c.args[0] for c in ls.call_args_list), [101, 102, 103])
+            pins[3] = (1, 999, None)
             with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
                 driver.recheck_controlled_sudo_nnp('123-1', {'entries': entries})
+        for missing in (0, 2):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
+                driver.recheck_controlled_sudo_nnp(
+                    '123-1', {'entries': entries[:missing] + entries[missing + 1:]})
         with patch.object(driver, 'controlled_pin', return_value=(1, 1, None)), \
              patch.object(driver, 'sudo_nnp_open', return_value=1), \
              patch.object(driver.os, 'listdir', return_value=['extra']), patch.object(driver.os, 'close'):
@@ -1625,6 +1655,107 @@ class ControlledPolicy(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
                 driver.controlled_pin(17)
 
+    def test_view_pin_mode_owner_and_type(self):
+        good = dict(st_dev=1, st_ino=2, st_uid=0, st_gid=0, st_mode=stat.S_IFDIR | 0o755,
+                    st_nlink=2, st_size=0)
+        def accepts(*args):
+            try:
+                return driver.controlled_pin(17, *args)
+            except RuntimeError as error:
+                return error.args[0]
+        with patch.object(driver.os, 'fstat', return_value=SimpleNamespace(**good)):
+            self.assertEqual(accepts(True, True), (1, 2, None))
+            # The searchable 0755 C2 source is never accepted as a private policy dir.
+            self.assertEqual(accepts(True), 'E_POLICY_IDENTITY')
+        # 0700 would give the low-UID probe EACCES (unknown), never sudo ENOENT.
+        for key, value in [('st_mode', stat.S_IFDIR | 0o700), ('st_mode', stat.S_IFDIR | 0o711),
+                           ('st_mode', stat.S_IFDIR | 0o750), ('st_mode', stat.S_IFDIR | 0o775),
+                           ('st_mode', stat.S_IFDIR | 0o757), ('st_mode', stat.S_IFDIR | 0o2755),
+                           ('st_mode', stat.S_IFREG | 0o755), ('st_mode', stat.S_IFLNK | 0o755),
+                           ('st_uid', 1000), ('st_gid', 1000)]:
+            with self.subTest(key=key, value=value), \
+                 patch.object(driver.os, 'fstat', return_value=SimpleNamespace(**(good | {key: value}))):
+                self.assertEqual(accepts(True, True), 'E_POLICY_IDENTITY')
+        with patch.object(driver.os, 'fstat', side_effect=[SimpleNamespace(**good),
+                                                           SimpleNamespace(**(good | {'st_ino': 3}))]):
+            self.assertEqual(accepts(True, True), 'E_POLICY_IDENTITY')
+        self.assertEqual(driver.controlled_kind('fx/c2-empty'), (True, True))
+        for name in ('fx', 'fx/sudoers.d'):
+            self.assertEqual(driver.controlled_kind(name), (True, False))
+        for name in driver.controlled_literals('123-1'):
+            self.assertEqual(driver.controlled_kind('fx/' + name), (False, False))
+
+    def test_nonempty_or_replaced_view_never_deleted(self):
+        entries = self.seven_entries()
+        pins = {fd: pin for _, fd, pin in entries}
+        def run(listing, replaced=False):
+            opened = iter([e[1] + 100 for e in entries] + [99] +
+                          [e[1] + 200 for e in reversed(entries)])
+            def pin(fd, directory=False, view=False):
+                # Optionally replace ONLY the C2 source between recheck and deletion.
+                return (1, 999, None) if replaced and fd == 203 else pins[fd % 100]
+            with patch.object(driver, 'sudo_nnp_open', side_effect=lambda *a: next(opened)), \
+                 patch.object(driver, 'controlled_pin', side_effect=pin), \
+                 patch.object(driver.os, 'listdir', side_effect=listing), \
+                 patch.object(driver.os, 'close'), \
+                 patch.object(driver.os, 'unlink') as unlink, patch.object(driver.os, 'rmdir') as rmdir:
+                try:
+                    driver.cleanup_controlled_sudo_nnp('123-1', {'entries': list(entries)}, True)
+                    code = None
+                except RuntimeError as error:
+                    code = error.args[0]
+                return code, [c.args[0] for c in unlink.call_args_list], [c.args[0] for c in rmdir.call_args_list]
+        code, unlinked, removed = run(self.listing)
+        self.assertIsNone(code)
+        # Reverse owned order: policy files, then the empty C2 source, then policy dirs.
+        self.assertEqual(removed, ['fx/c2-empty', 'fx/sudoers.d', 'fx'])
+        self.assertEqual(len(unlinked), 4)
+        for content in (['sudo'], ['.hidden'], ['sudo', 'x']):
+            listing = lambda fd, c=content: c if fd == 103 else self.listing(fd)
+            self.assertEqual(run(listing), ('E_POLICY_ENTRIES', [], []))
+        code, unlinked, removed = run(self.listing, replaced=True)
+        self.assertEqual(code, 'E_POLICY_IDENTITY')
+        self.assertNotIn('fx/c2-empty', removed)
+        self.assertEqual(removed, [])
+
+    def test_partial_or_colliding_view_creation_quarantines(self):
+        for fault in ('collision', 'open', 'pin'):
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(driver, 'a7_admission', return_value=driver.A7_PROFILE))
+                stack.enter_context(patch.object(driver.os, 'getuid', return_value=0, create=True))
+                stack.enter_context(patch.object(driver.os, 'geteuid', return_value=0, create=True))
+                stack.enter_context(patch.object(driver.os, 'fstat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)))
+                def mkdir(name, mode, dir_fd, fault=fault):
+                    if fault == 'collision' and name == 'fx/c2-empty':
+                        raise FileExistsError('foreign')
+                mkdir = stack.enter_context(patch.object(driver.os, 'mkdir', side_effect=mkdir))
+                def opener(path, directory=False, fault=fault):
+                    if fault == 'open' and str(path).endswith('c2-empty'):
+                        raise RuntimeError('E_PATH')
+                    return 17
+                stack.enter_context(patch.object(driver, 'sudo_nnp_open', side_effect=opener))
+                def pin(fd, directory=False, view=False, fault=fault):
+                    if fault == 'pin' and view:
+                        raise RuntimeError('E_POLICY_IDENTITY')
+                    return (1, 2, None)
+                stack.enter_context(patch.object(driver, 'controlled_pin', side_effect=pin))
+                stack.enter_context(patch.object(driver.os, 'fchmod', create=True))
+                stack.enter_context(patch.object(driver.os, 'close'))
+                stack.enter_context(patch.object(driver.os, 'open', side_effect=AssertionError('file after view')))
+                unlink = stack.enter_context(patch.object(driver.os, 'unlink'))
+                rmdir = stack.enter_context(patch.object(driver.os, 'rmdir'))
+                owned = {}
+                with self.assertRaises(OSError if fault == 'collision' else RuntimeError):
+                    driver.stage_controlled_sudo_nnp('123-1', owned)
+                self.assertTrue(owned['pending'])
+                self.assertEqual(len(owned['entries']), 2 if fault != 'pin' else 3)
+                self.assertEqual(mkdir.call_args_list[-1].args[0], 'fx/c2-empty')
+                # Uncaptured/foreign C2 directory: nothing is adopted or deleted.
+                with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
+                    driver.cleanup_controlled_sudo_nnp('123-1', owned, True)
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+
     def test_stage_is_exclusive_private_and_quarantines_short_write(self):
         with ExitStack() as stack:
             stack.enter_context(patch.object(driver, 'sudo_nnp_eligible', return_value=True))
@@ -1644,11 +1775,19 @@ class ControlledPolicy(unittest.TestCase):
             stack.enter_context(patch.object(driver.os, 'close'))
             stack.enter_context(patch.object(driver.os, 'unlink'))
             stack.enter_context(patch.object(driver.os, 'rmdir'))
+            pin = stack.enter_context(patch.object(driver, 'controlled_pin', return_value=(1, 2, 'digest')))
             owned = {}
             driver.stage_controlled_sudo_nnp('123-1', owned)
-            self.assertEqual(len(owned['entries']), 6)
-            self.assertEqual([c.args[0] for c in mkdir.call_args_list], ['fx', 'fx/sudoers.d'])
-            self.assertTrue(all(c.kwargs == {'mode': 0o700, 'dir_fd': 17} for c in mkdir.call_args_list))
+            self.assertEqual(len(owned['entries']), 7)
+            self.assertEqual([c.args[0] for c in mkdir.call_args_list], ['fx', 'fx/sudoers.d', 'fx/c2-empty'])
+            self.assertEqual([c.kwargs for c in mkdir.call_args_list],
+                             [{'mode': 0o700, 'dir_fd': 17}] * 2 + [{'mode': 0o755, 'dir_fd': 17}])
+            # Only the held new C2 source is chmodded 0755 (umask-independent) and
+            # pinned as the view; policy files keep their own 0440 fchmod.
+            self.assertEqual(chmod.call_args_list[0].args, (17, 0o755))
+            self.assertEqual([c.args[1] for c in chmod.call_args_list], [0o755] + [0o440] * 4)
+            self.assertEqual([c.args[1:] for c in pin.call_args_list[:3]],
+                             [(True, False), (True, False), (True, True)])
             self.assertEqual([c.args[0] for c in opened.call_args_list], ['fx/' + n for n in driver.controlled_literals('123-1')])
             self.assertTrue(all(c.args[1] & driver.os.O_EXCL and c.args[2] == 0o440 for c in opened.call_args_list))
             write.side_effect = lambda fd, b: len(b)-1
@@ -1748,6 +1887,40 @@ class A7Integration(unittest.TestCase):
         self.assertLess(cleanup.index('cleanup_controlled_sudo_nnp('), cleanup.index('shutil.rmtree(stage)'))
 
 
+    def test_live_fixture_uid_retains_every_fixture_path(self):
+        source = (ROOT / 'tools/unix-exec-validation/driver.py').read_text()
+        cleanup = source.split('def cleanup_a1a2',1)[1].split('def main',1)[0]
+        self.assertLess(cleanup.index('not os.path.lexists(cg)'), cleanup.index('a7_uids_released(accounts)'))
+        self.assertLess(cleanup.index('a7_uids_released(accounts)'), cleanup.index('cleanup_controlled_sudo_nnp('))
+        def proc(name, uid):
+            def stat_():
+                if uid is None:
+                    raise FileNotFoundError()
+                return SimpleNamespace(st_uid=uid)
+            return SimpleNamespace(name=name, stat=stat_)
+        accounts = [dict(name='r', created=True, identity=(2000, 2000)),
+                    dict(name='n', created=True, identity=(2001, 2001))]
+        for tasks, accounts_case, expected in (
+                ([proc('self', 2001), proc('7', 0), proc('8', None)], accounts, None),
+                ([proc('42', 2001)], accounts, 'E_UID_LIVE'),
+                ([proc('42', 2000)], accounts, 'E_UID_LIVE'),
+                ([], accounts[:1] + [dict(name='n', created=True, identity=None)], 'E_QUARANTINE_UID_UNCAPTURED')):
+            events = []
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(driver.Path, 'iterdir', return_value=tasks))
+                for name in ('cleanup_controlled_sudo_nnp', 'cleanup_sudo_nnp', 'cleanup_sudo_nnp_delivery', 'remove_runtime'):
+                    stack.enter_context(patch.object(driver, name, side_effect=lambda *a, n=name, **kw: events.append(n)))
+                args = ('123-1', 'arxd.service', None, False, None, False, [])
+                if expected is None:
+                    driver.cleanup_a1a2(*args, a7_owned=(accounts_case, {}, dict(entries=[1])))
+                    self.assertEqual(events, ['cleanup_controlled_sudo_nnp', 'cleanup_sudo_nnp',
+                                              'cleanup_sudo_nnp_delivery', 'remove_runtime'])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        driver.cleanup_a1a2(*args, a7_owned=(accounts_case, {}, dict(entries=[1])))
+                    # No policy file, C2 source, account or delivery is deleted.
+                    self.assertEqual(events, [])
+
     def test_cleanup_requires_stop_and_preserves_partial_policy(self):
         for residue, pending in ((True, False), (False, True), (False, False)):
             events = []
@@ -1777,6 +1950,7 @@ class AdmissionPathRefusal(unittest.TestCase):
     def ports(self, bad=None, uid=0, mode=None, present=False, bad_call=1):
         import ctypes
         alias = driver.a7_alias_c2
+        controlled = driver.a7_alias_controlled
         ports = RuntimeAdmission.ports(self)
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -1786,11 +1960,13 @@ class AdmissionPathRefusal(unittest.TestCase):
                             ('cleanup', 'not_reached'), ('first', None), ('internal', None)):
             stack.enter_context(patch.object(driver, 'feedback_' + name, value))
         stack.enter_context(patch.object(driver, 'a7_alias_c2', alias))
+        stack.enter_context(patch.object(driver, 'a7_alias_controlled', controlled))
         stack.enter_context(patch.object(driver, 'Path', PurePosixPath))
         for flag, value in [('O_NOFOLLOW', 8), ('O_CLOEXEC', 16),
                             ('O_NONBLOCK', 32), ('O_DIRECTORY', 64)]:
             stack.enter_context(patch.object(driver.os, flag, value, create=True))
-        held, closed, opened = {}, [], []
+        held, closed, opened, stats = {}, [], [], []
+        self.stats = stats
         actual_open = driver.sudo_nnp_open
         calls = 0
         def checked_open(*args):
@@ -1818,6 +1994,7 @@ class AdmissionPathRefusal(unittest.TestCase):
                     (stat.S_IFLNK | 0o777 if link else stat.S_IFDIR | 0o755))
         def stat_(name, dir_fd, follow_symlinks=True):
             path = str(PurePosixPath(held[dir_fd]) / name)
+            stats.append(path)
             if name == 'sudo':
                 if not present: raise FileNotFoundError()
                 result = metadata(path)
@@ -1843,66 +2020,131 @@ class AdmissionPathRefusal(unittest.TestCase):
             stack.enter_context(patch.object(driver, name, side_effect=AssertionError('effect reached')))
         return ports, held, closed, opened
 
+    @contextmanager
+    def chain(self, *args, **kw):
+        # Fresh mock chain per check, closed before the next one is built.
+        case = AdmissionPathRefusal()
+        try:
+            yield case.ports(*args, **kw) + (case.stats,)
+        finally:
+            case.doCleanups()
+
     def test_exact_path_refusal_loop(self):
-        ports, held, closed, opened = self.ports('/usr/local', uid=1001)
+        ports, held, closed, opened = self.ports('/usr', uid=1001, bad_call=2)
         with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
             driver.run(valid_env())
-        self.assertEqual(driver.exception_record(caught.exception)['code'], 'E_PATH')
+        self.assertEqual(driver.exception_record(caught.exception), dict(code='E_PATH', role='a7_alias_target'))
         self.assertEqual(driver.feedback_first['code'], 'E_PATH')
         self.assertEqual((driver.feedback_mutation, driver.feedback_cleanup, driver.feedback_internal),
                          ('none', 'not_reached', None))
-        self.assertEqual(opened, ['/', '/usr', '/usr/local'])
+        # Controlled admission: / then /usr/bin ancestry only; stops at the unsafe /usr.
+        self.assertEqual(opened, ['/', '/', '/usr'])
         self.assertCountEqual(closed, held)
         ports['cg_preflight'].assert_not_called()
 
     def test_qualifying_metadata_and_expected_fences(self):
-        ports, held, closed, opened = self.ports(present=True)
-        self.assertEqual(driver.a7_admission(), driver.A7_PROFILE)
-        ports['cg_preflight'].assert_called_once_with()
-        self.assertIn('/usr/local/bin/sudo', opened)
-        self.assertCountEqual(closed, held)
+        with self.chain(present=True) as (ports, held, closed, opened, stats):
+            self.assertEqual(driver.a7_admission(), driver.A7_PROFILE)
+            ports['cg_preflight'].assert_called_once_with()
+            self.assertEqual(opened, ['/', '/', '/usr', '/usr/bin'])
+            self.assertFalse(any(p.startswith('/usr/local') for p in opened + stats))
+            self.assertCountEqual(closed, held)
+        # The unchanged strict gate still opens and digests a present C2.
+        with self.chain(present=True) as (_, held, closed, opened, _stats):
+            driver.a7_alias_c2()
+            self.assertIn('/usr/local/bin/sudo', opened)
+            self.assertCountEqual(closed, held)
+
+    @staticmethod
+    def admitted():
+        # A refusal is an assertion failure here, never a test error.
+        try:
+            return driver.a7_admission()
+        except RuntimeError as error:
+            return error.args
+
+    def test_controlled_split_defers_only_host_c2(self):
+        # Writable/foreign host /usr/local(/bin) or an untrusted C2 never reaches
+        # the controlled admission, while the unchanged strict gate still refuses.
+        for path, uid, mode in (('/usr/local/bin', 0, stat.S_IFDIR | 0o777),
+                                ('/usr/local/bin', 0, stat.S_IFDIR | 0o775),
+                                ('/usr/local/bin', 1001, stat.S_IFDIR | 0o755),
+                                ('/usr/local', 0, stat.S_IFDIR | 0o777),
+                                ('/usr/local/bin', 0, stat.S_IFLNK | 0o777)):
+            with self.subTest(path=path, uid=uid, mode=mode):
+                with self.chain(path, uid, mode, present=True) as (ports, held, closed, opened, stats):
+                    self.assertEqual(self.admitted(), driver.A7_PROFILE)
+                    self.assertFalse(any(p.startswith('/usr/local') for p in opened + stats))
+                    ports['cg_preflight'].assert_called_once_with()
+                    self.assertCountEqual(closed, held)
+                with self.chain(path, uid, mode, present=True) as (ports, held, closed, opened, stats):
+                    with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+                        driver.a7_alias_c2()
+                    self.assertEqual(driver.exception_record(caught.exception),
+                                     dict(code='E_PATH', role='a7_c2_parent'))
+                    self.assertCountEqual(closed, held)
+        # A present untrusted host C2 image changes nothing for the controlled path.
+        with self.chain('/usr/local/bin/sudo', 1001, stat.S_IFREG | 0o4777, present=True,
+                        bad_call=4) as (ports, held, closed, opened, stats):
+            self.assertEqual(self.admitted(), driver.A7_PROFILE)
+            self.assertNotIn('/usr/local/bin/sudo', stats)
 
     def test_each_ancestry_conjunct(self):
+        faults = ((1001, stat.S_IFDIR | 0o755), (0, stat.S_IFDIR | 0o775), (0, stat.S_IFDIR | 0o757),
+                  (0, stat.S_IFLNK | 0o755), (0, stat.S_IFREG | 0o755))
         for path in ('/', '/usr', '/usr/local', '/usr/local/bin', '/usr/bin'):
-            for uid, mode in ((1001, stat.S_IFDIR | 0o755),
-                              (0, stat.S_IFDIR | 0o775), (0, stat.S_IFDIR | 0o757),
-                              (0, stat.S_IFLNK | 0o755), (0, stat.S_IFREG | 0o755)):
-                with self.subTest(path=path, uid=uid, mode=mode):
-                    # Close each set of mocks before constructing the next chain.
-                    case = AdmissionPathRefusal()
-                    try:
-                        ports, held, closed, _ = case.ports(path, uid, mode,
-                            bad_call=3 if path == '/usr/bin' else 1)
+            for uid, mode in faults:
+                with self.subTest(gate='strict', path=path, uid=uid, mode=mode):
+                    # Unchanged strict host gate (also the D7j diagnosis target).
+                    with self.chain(path, uid, mode, bad_call=3 if path == '/usr/bin' else 1) as (
+                            ports, held, closed, _, _stats):
+                        with self.assertRaisesRegex(RuntimeError, '^E_PATH$'):
+                            driver.a7_alias_c2()
+                        self.assertCountEqual(closed, held)
+        for path, call in (('/', 1), ('/usr', 2), ('/usr/bin', 2)):
+            for uid, mode in faults:
+                with self.subTest(gate='controlled', path=path, uid=uid, mode=mode):
+                    with self.chain(path, uid, mode, bad_call=call) as (ports, held, closed, _, _stats):
                         with self.assertRaisesRegex(RuntimeError, '^E_PATH$'):
                             driver.a7_admission()
                         self.assertCountEqual(closed, held)
                         ports['cg_preflight'].assert_not_called()
-                    finally:
-                        case.doCleanups()
 
     def test_fixed_role_attribution(self):
-        for call, path, role in ((1, '/usr/local', 'a7_c2_parent'),
-                                 (2, '/', 'a7_alias_root'),
-                                 (3, '/usr/bin', 'a7_alias_target'),
-                                 (4, '/usr/local', 'a7_c2_image')):
-            case = AdmissionPathRefusal()
-            try:
-                case.ports(path, uid=1001, present=True, bad_call=call)
+        def check(record, path):
+            line = driver.feedback_line(valid_env(), record, record)
+            self.assertEqual(driver.replay(line), {})
+            self.assertEqual(json.loads(line)['internal'], None)
+            for private in (path, '1001', 'st_uid', 'st_mode', 'sha256'):
+                self.assertNotIn(private, line)
+        # Controlled admission through the real run entry: alias roles only.
+        for call, path, role in ((1, '/', 'a7_alias_root'), (2, '/usr/bin', 'a7_alias_target')):
+            with self.chain(path, uid=1001, present=True, bad_call=call):
                 with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
                     driver.run(valid_env())
                 expected = dict(code='E_PATH', role=role)
                 self.assertEqual(driver.exception_record(caught.exception), expected)
                 self.assertEqual(driver.feedback_first, expected)
-                line = driver.feedback_line(valid_env(), expected, expected)
-                self.assertEqual(driver.replay(line), {})
-                self.assertEqual(json.loads(line)['internal'], None)
-                for private in (path, '1001', 'st_uid', 'st_mode', 'sha256'):
-                    self.assertNotIn(private, line)
-            finally:
-                case.doCleanups()
+                check(expected, path)
+        # Unchanged strict gate keeps all four historical roles.
+        for call, path, role in ((1, '/usr/local', 'a7_c2_parent'),
+                                 (2, '/', 'a7_alias_root'),
+                                 (3, '/usr/bin', 'a7_alias_target'),
+                                 (4, '/usr/local', 'a7_c2_image')):
+            with self.chain(path, uid=1001, present=True, bad_call=call):
+                with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+                    driver.a7_alias_c2()
+                expected = dict(code='E_PATH', role=role)
+                self.assertEqual(driver.exception_record(caught.exception), expected)
+                check(expected, path)
 
     def test_only_initial_path_code_is_attributed(self):
-        self.ports('/usr/local', uid=1001)
+        with self.chain('/usr/local', uid=1001):
+            with patch.object(driver, 'feedback_mutation', 'staged'):
+                with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+                    driver.a7_alias_c2()
+                self.assertEqual(driver.exception_record(caught.exception), dict(code='E_PATH'))
+        self.ports('/', uid=1001)
         with patch.object(driver, 'feedback_mutation', 'staged'):
             with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
                 driver.a7_admission()
@@ -1960,21 +2202,25 @@ class RuntimeAdmission(unittest.TestCase):
                      sudo='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff',
                      sudoers='151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c',
                      util='aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d'))}),
-                   (driver,'a7_alias_c2',{}), (driver,'cg_preflight',{})]
+                   (driver,'a7_alias_controlled',{}),
+                   (driver,'a7_alias_c2',{'side_effect':AssertionError('strict host C2 gate in controlled admission')}),
+                   (driver,'cg_preflight',{})]
         return {name: stack.enter_context(patch.object(owner,name,create=True,**kw)) for owner,name,kw in patches}
 
     def test_runtime_refusals_before_effects(self):
         ports = self.ports()
-        self.assertEqual(driver.a7_admission(), '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210')
+        self.assertEqual(driver.a7_admission(), '99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e')
+        ports['a7_alias_controlled'].assert_called_once_with()
+        ports['a7_alias_c2'].assert_not_called()
         good = ports['a7_package_read'].return_value
         for field,value in [('qualified',True),('candidate_match',False),('architecture','arm64'),
                 ('revision','unknown'),('digests',{}),('status','refused')]:
             ports['a7_package_read'].return_value = dict(good, **{field:value})
-            ports['a7_alias_c2'].reset_mock()
+            ports['a7_alias_controlled'].reset_mock()
             with self.assertRaises(RuntimeError): driver.a7_admission()
-            ports['a7_alias_c2'].assert_not_called()
+            ports['a7_alias_controlled'].assert_not_called()
         ports['a7_package_read'].return_value = good
-        for port in ('a7_alias_c2','cg_preflight'):
+        for port in ('a7_alias_controlled','cg_preflight'):
             ports[port].side_effect = RuntimeError('refuse')
             with self.assertRaises(RuntimeError): driver.a7_admission()
             ports[port].side_effect = None
@@ -2000,7 +2246,48 @@ class RuntimeAdmission(unittest.TestCase):
             self.assertIn('runtime_package()?',section)
             self.assertIn('controlled_view(',section)
             self.assertIn('read_fixed_delivery(A7_PROFILE)?',section)
-        self.assertIn('51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210',source)
+        self.assertIn('99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e',source)
+        self.assertNotIn('51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210',source)
+        # D9c: the empty-view proof is inside controlled_view, which every
+        # prepared/recheck path calls before Runner construction and each call.
+        view = source.split('fn controlled_view(',1)[1].split('#[test]',1)[0]
+        self.assertEqual(view.count('empty_view(&EmptyView'), 1)
+        self.assertLess(view.index('controlled_unit_mappings()?'), view.index('empty_view(&EmptyView'))
+        self.assertLess(view.index('controlled_mounts('), view.index('empty_view(&EmptyView'))
+        self.assertIn('delivery_open(Path::new("/usr/local/bin"), true)?', view)
+        runtime = source.split('fn runtime_package()',1)[1].split('#[derive',1)[0]
+        self.assertIn('view_c2(&local) != C2::Absent', runtime)
+        self.assertNotIn('/usr/local/bin/sudo', runtime)
+        fixture = source.split('fn disposable_linux_a7_a11() {',1)[1].split('// Raw fixed records',1)[0]
+        self.assertLess(fixture.index('recheck_delivery(config, &prepared.arxd)'), fixture.index('Runner::new('))
+        case = source.split('fn a7_case(',1)[1].split('// Fixed two-case scope',1)[0]
+        self.assertLess(case.index('recheck_delivery(config, &spec.executable)'), case.index('runner.run_phased('))
+
+    def test_canonical_profile_label_matches_five_view_facts(self):
+        import hashlib
+        stage, case0 = '/var/lib/arx-ci-123-1', driver.sudo_nnp_names('123-1')[0]
+        facts = dict(
+            architecture='amd64',
+            c2_view=dict(entries=sorted(driver.CONTROLLED_ENTRIES['fx/c2-empty']), mode='0755', owner='0:0',
+                         source='<stage>/fx/c2-empty', sudo='absent', target='/usr/local/bin'),
+            defaults=['/etc/sudo.conf', '/etc/sudoers', '/etc/nsswitch.conf', '/usr/libexec/sudo/'],
+            mappings=[m.replace(stage, '<stage>') for m in driver.controlled_mappings('123-1')],
+            payloads=[['/usr/bin/sudo', 282032, '6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff'],
+                      ['/usr/libexec/sudo/sudoers.so', 588080, '151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c'],
+                      ['/usr/libexec/sudo/libsudo_util.so.0.0.0', 133944, 'aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d']],
+            policy={k: v.decode('ascii').replace(case0, '<case0>') for k, v in driver.controlled_literals('123-1').items()},
+            revision='1.9.15p5-3ubuntu5.24.04.4')
+        data = json.dumps(facts, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        self.assertEqual(len(data), 1066)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), driver.A7_PROFILE)
+        rust = (ROOT / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+        self.assertIn('const A7_PROFILE: &str = "' + driver.A7_PROFILE + '";', rust)
+        for path, size, digest in facts['payloads']:
+            self.assertIn('"' + path + '",\n        ' + str(size) + ',\n        "' + digest + '"', rust)
+        evidence = (ROOT / 'docs/evidence/linux-a7-d9c-opus-source-preparation.md').read_text(encoding='utf-8')
+        self.assertIn(data.decode('utf-8'), evidence)
+        # The old four-view label must not survive as an admitted profile.
+        self.assertNotEqual(driver.A7_PROFILE, '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210')
 
 
     def test_alias_c2_with_only_fake_ports(self):
@@ -2051,6 +2338,60 @@ class RuntimeAdmission(unittest.TestCase):
             call.target=target
             with self.assertRaises(RuntimeError):run()
 
+
+    def test_alias_controlled_with_only_fake_ports(self):
+        import ctypes
+        class Call:
+            target = b'usr/bin'
+            def __call__(self, fd, name, buffer, limit):
+                self_test.assertEqual((fd, name, limit), (17, b'bin', 9))
+                buffer.raw = self.target.ljust(9, b'X')[:9]
+                return len(self.target)
+        self_test = self
+        call = Call()
+        fake = SimpleNamespace(CDLL=lambda _: SimpleNamespace(readlinkat=call),
+                               c_int=ctypes.c_int, c_char_p=ctypes.c_char_p, c_void_p=ctypes.c_void_p,
+                               c_size_t=ctypes.c_size_t, c_ssize_t=ctypes.c_ssize_t,
+                               create_string_buffer=ctypes.create_string_buffer)
+        common = dict(st_dev=1, st_ino=2, st_uid=0, st_gid=0, st_nlink=1, st_size=7,
+                      st_mtime_ns=1, st_ctime_ns=1, st_atime_ns=1)
+        def run(link=None, followed=None):
+            link = SimpleNamespace(**{**common, 'st_mode': stat.S_IFLNK | 0o777, **(link or {})})
+            directory = SimpleNamespace(**common, st_mode=stat.S_IFDIR | 0o755)
+            opened = []
+            def info(name, **kw):
+                self.assertNotEqual(name, 'sudo')  # host C2 is never consulted
+                if kw.get('follow_symlinks') is False:
+                    return link
+                return SimpleNamespace(**{**vars(directory), **(followed or {})})
+            def opener(path, directory_flag=False):
+                opened.append((path.as_posix(), directory_flag))
+                return 17
+            with patch.dict(sys.modules, ctypes=fake), \
+                 patch.object(driver, 'sudo_nnp_open', side_effect=opener), \
+                 patch.object(driver.os, 'stat', side_effect=info), \
+                 patch.object(driver.os, 'fstat', return_value=directory), \
+                 patch.object(driver.os, 'close') as close:
+                try:
+                    driver.a7_alias_controlled()
+                finally:
+                    self.assertEqual(close.call_count, len(opened))
+            return opened
+        opened = run()
+        self.assertEqual(opened, [('/', True), ('/usr/bin', True)])
+        call.target = b'/usr/bin'
+        run(link=dict(st_size=8))
+        call.target = b'usr/bin'
+        for link in (dict(st_mode=stat.S_IFREG | 0o777), dict(st_uid=1000), dict(st_nlink=2), dict(st_size=9)):
+            with self.subTest(link=link), self.assertRaisesRegex(RuntimeError, 'E_ALIAS'):
+                run(link=link)
+        for followed in (dict(st_ino=3), dict(st_dev=2), dict(st_mode=stat.S_IFDIR | 0o775)):
+            with self.subTest(followed=followed), self.assertRaisesRegex(RuntimeError, 'E_ALIAS'):
+                run(followed=followed)
+        for target in (b'dangling', b'usr/binXX', b'/tmp', b'usr/bi'):
+            call.target = target
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'E_ALIAS'):
+                run()
 
     def test_stable_stat_preserves_every_non_atime_fence(self):
         fields=('st_dev','st_ino','st_mode','st_uid','st_gid','st_nlink',

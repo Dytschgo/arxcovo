@@ -170,7 +170,7 @@ def remove_a4_helper(owned):
 
 
 # Fixed combined candidate. The profile labels reviewed facts, never host proof.
-A7_PROFILE = '51d4fb5f17f88e41d21472e04859c194e15cb7a4a1ec046c06a5b022a2a8f210'
+A7_PROFILE = '99e7f5b4b3b63ff13955432bf9b7cde0436c9ab57afbc93fbe99bb45eb17017e'
 
 
 def a7_selected():
@@ -268,6 +268,43 @@ def a7_alias_c2():
             os.close(fd)
 
 
+def a7_alias_controlled():
+    # ADR0020 D9c controlled fixture ONLY: protected / and /usr/bin ancestry plus
+    # the merged-/usr alias. Host /usr/local/bin is never opened or claimed safe
+    # or absent here; the unit proves its closed empty C2 view instead. The
+    # strict a7_alias_c2 gate above stays unchanged for every other caller.
+    def open_role(path, role):
+        try:
+            return sudo_nnp_open(path, True)
+        except RuntimeError as error:
+            if (type(error) is RuntimeError and error.args == ('E_PATH',) and
+                    feedback_mutation == 'none'):
+                raise A7PathRefusal(role) from None
+            raise
+    held = []
+    try:
+        root = open_role(Path('/'), 'a7_alias_root')
+        held.append(root)
+        usrbin = open_role(Path('/usr/bin'), 'a7_alias_target')
+        held.append(usrbin)
+        before = os.stat('bin', dir_fd=root, follow_symlinks=False)
+        require(stat.S_ISLNK(before.st_mode) and before.st_uid == 0 and
+                before.st_nlink == 1 and before.st_size in (7, 8), 'E_ALIAS')
+        import ctypes
+        call = ctypes.CDLL(None).readlinkat
+        call.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t)
+        call.restype = ctypes.c_ssize_t
+        buffer = ctypes.create_string_buffer(9)
+        length = call(root, b'bin', buffer, 9)
+        require(0 <= length < 9 and buffer.raw[:length] in (b'usr/bin', b'/usr/bin'), 'E_ALIAS')
+        after = os.stat('bin', dir_fd=root, follow_symlinks=False)
+        require(_stable_stat(before) == _stable_stat(after) and
+                _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')
+    finally:
+        for fd in reversed(held):
+            os.close(fd)
+
+
 def a7_admission():
     require(a7_selected() and sys.platform == 'linux' and
             os.getuid() == os.geteuid() == 0 and os.uname().machine == 'x86_64', 'E_POLICY_UNATTESTED')
@@ -278,7 +315,7 @@ def a7_admission():
                          sudoers='151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c',
                          util='aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d')),
             'E_ARTIFACT')
-    a7_alias_c2()
+    a7_alias_controlled()
     cg_preflight()
     return A7_PROFILE
 
@@ -459,16 +496,30 @@ def controlled_literals(run):
             'sudoers.d/10-a7-case0': (case0 + ' ALL=(root) NOPASSWD: /usr/bin/true\n').encode('ascii')}
 
 
+# ADR0020 D9c: exactly the four D9b policy views plus the closed empty C2 view.
+CONTROLLED_VIEWS = (('sudoers', '/etc/sudoers'), ('sudo.conf', '/etc/sudo.conf'),
+                    ('nsswitch.conf', '/etc/nsswitch.conf'), ('sudoers.d', '/etc/sudoers.d'),
+                    ('c2-empty', '/usr/local/bin'))
+CONTROLLED_DIRECTORIES = ('fx', 'fx/sudoers.d', 'fx/c2-empty')
+CONTROLLED_ENTRIES = {'fx': {'sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d', 'c2-empty'},
+                      'fx/sudoers.d': {'10-a7-case0'}, 'fx/c2-empty': set()}
+
+
+def controlled_kind(name):
+    # (directory, empty C2 view source); the view source is root 0755, never 0700.
+    return name in CONTROLLED_DIRECTORIES, name == 'fx/c2-empty'
+
+
 def controlled_mappings(run):
     sudo_nnp_names(run)
     stage, _ = plan(run)
-    return tuple((stage / 'fx' / name).as_posix() + ':/etc/' + name
-                 for name in ('sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d'))
+    return tuple((stage / 'fx' / name).as_posix() + ':' + target
+                 for name, target in CONTROLLED_VIEWS)
 
 
 def controlled_mapping_set(run, mappings):
     expected = controlled_mappings(run)
-    require(len(mappings) == 4 and set(mappings) == set(expected), 'E_POLICY_MAPPING')
+    require(len(mappings) == 5 and set(mappings) == set(expected), 'E_POLICY_MAPPING')
 
 
 def controlled_override(run):
@@ -485,9 +536,12 @@ def prepare_controlled_sudo_nnp(run, accounts, fixture):
         pass
 
 
-def controlled_pin(fd, directory=False):
+def controlled_pin(fd, directory=False, view=False):
     info = os.fstat(fd)
-    mode = 0o700 if directory else 0o440
+    # The empty C2 source must be searchable by the low-UID probe (ENOENT, not
+    # EACCES/unknown); policy directories stay private 0700 and files 0440.
+    directory = directory or view
+    mode = 0o755 if view else 0o700 if directory else 0o440
     require(info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == mode and
             (stat.S_ISDIR(info.st_mode) if directory else
              stat.S_ISREG(info.st_mode) and info.st_nlink == 1), 'E_POLICY_IDENTITY')
@@ -513,12 +567,16 @@ def stage_controlled_sudo_nnp(run, owned):
     try:
         require(stat.S_IMODE(os.fstat(parent).st_mode) == 0o700, 'E_POLICY_IDENTITY')
         owned['entries'] = []
-        for name in ('fx', 'fx/sudoers.d'):
+        for name in CONTROLLED_DIRECTORIES:
+            _, view = controlled_kind(name)
             owned['pending'] = True
-            os.mkdir(name, mode=0o700, dir_fd=parent)
+            # Exclusive creation: an existing name raises and is never adopted.
+            os.mkdir(name, mode=0o755 if view else 0o700, dir_fd=parent)
             fd = sudo_nnp_open(stage / name, True)
             owned['entries'].append((name, fd, None))
-            owned['entries'][-1] = (name, fd, controlled_pin(fd, True))
+            if view:
+                os.fchmod(fd, 0o755)  # held new inode; umask-independent exact mode
+            owned['entries'][-1] = (name, fd, controlled_pin(fd, True, view))
             owned['pending'] = False
         for name, data in controlled_literals(run).items():
             owned['pending'] = True
@@ -538,23 +596,44 @@ def stage_controlled_sudo_nnp(run, owned):
 def recheck_controlled_sudo_nnp(run, owned):
     stage, _ = plan(run)
     literals = controlled_literals(run)
-    require(not owned.get('pending') and len(owned.get('entries', [])) == 6, 'E_POLICY_IDENTITY')
+    require(not owned.get('pending') and len(owned.get('entries', [])) == 7, 'E_POLICY_IDENTITY')
     require({n for n, _, _ in owned['entries']} ==
-            {'fx', 'fx/sudoers.d'} | {'fx/' + n for n in literals}, 'E_POLICY_ENTRIES')
+            set(CONTROLLED_DIRECTORIES) | {'fx/' + n for n in literals}, 'E_POLICY_ENTRIES')
     for name, held, pin in owned['entries']:
-        directory = name in ('fx', 'fx/sudoers.d')
-        require(pin is not None and controlled_pin(held, directory) == pin, 'E_POLICY_IDENTITY')
+        directory, view = controlled_kind(name)
+        require(pin is not None and controlled_pin(held, directory, view) == pin, 'E_POLICY_IDENTITY')
         fd = sudo_nnp_open(stage / name, directory)
         try:
-            require(controlled_pin(fd, directory) == pin, 'E_POLICY_IDENTITY')
+            require(controlled_pin(fd, directory, view) == pin, 'E_POLICY_IDENTITY')
             if not directory:
                 require(pin[2] == hashlib.sha256(literals[name[3:]]).hexdigest(), 'E_POLICY_LITERAL')
             else:
-                expected = {'10-a7-case0'} if name.endswith('sudoers.d') else {
-                    'sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d'}
+                expected = CONTROLLED_ENTRIES[name]
                 require(set(os.listdir(fd)) == expected, 'E_POLICY_ENTRIES')
         finally:
             os.close(fd)
+
+
+def a7_uids_released(accounts):
+    """Read-only, after unit/cgroup removal and before ANY fixture deletion.
+
+    An uncaptured created identity or a surviving task of a captured fixture UID
+    retains every fixture path, including the empty C2 view source.
+    """
+    uids = set()
+    for item in accounts:
+        require(item.get('identity') is not None or not item['created'], 'E_QUARANTINE_UID_UNCAPTURED')
+        if item.get('identity') is not None:
+            uids.add(item['identity'][0])
+    if not uids:
+        return
+    for count, proc in enumerate(Path('/proc').iterdir()):
+        require(count < 20000, 'E_PROC_BOUND')
+        if proc.name.isdigit():
+            try:
+                require(proc.stat().st_uid not in uids, 'E_UID_LIVE')
+            except FileNotFoundError:
+                pass
 
 
 def cleanup_controlled_sudo_nnp(run, owned, unit_gone=False):
@@ -565,12 +644,13 @@ def cleanup_controlled_sudo_nnp(run, owned, unit_gone=False):
     parent = sudo_nnp_open(stage, True)
     try:
         for name, held, pin in reversed(owned['entries']):
-            fd = sudo_nnp_open(stage / name, name in ('fx', 'fx/sudoers.d'))
+            directory, view = controlled_kind(name)
+            fd = sudo_nnp_open(stage / name, directory)
             try:
-                require(controlled_pin(fd, name in ('fx', 'fx/sudoers.d')) == pin, 'E_POLICY_IDENTITY')
+                require(controlled_pin(fd, directory, view) == pin, 'E_POLICY_IDENTITY')
             finally:
                 os.close(fd)
-            if name in ('fx', 'fx/sudoers.d'):
+            if directory:
                 os.rmdir(name, dir_fd=parent)
             else:
                 os.unlink(name, dir_fd=parent)
@@ -1775,6 +1855,7 @@ def cleanup_a1a2(run_id, unit, stage, stage_created, stage_info, unit_created, o
         require(not os.path.lexists(cg), 'E_QUARANTINE_CGROUP')
     if a7_owned is not None:
         accounts, artifacts, policy = a7_owned
+        a7_uids_released(accounts)
         if policy:
             cleanup_controlled_sudo_nnp(run_id, policy, unit_gone=True)
         cleanup_sudo_nnp(accounts, unit_gone=True)
