@@ -1073,6 +1073,8 @@ all actual NNP/oracle/runtime checks. A7/A11/M2/full F/G/real-Runner PA6 remain
 
 ### D7k. Final single Opus-owned hosted A7/A11 attempt (2026-11-15)
 
+**Consumed by FINAL accepted run43728169361 attempt1/job132854558246 on main07d88692e2f1480c6e18ff5df846cfb871a18033. Failure121s: first/final E_ARTIFACT, staged lower bound, cleanup confirmed, internal null. All three pins independently absent404 after finally-clear. Pre-recorded outcome is NO-GO hosted A7/A11, unverified on real hardware pending dedicated host. No hosted retry, diagnostic leg, further grant reset or acceptance. Remaining text is historical only.**
+
 **Docs-only disposition; inactive.** Anthropic claude-opus-5-5, high. This is the
 ONE further hosted attempt allowed by the
 [Opus achievability decision](../reviews/m2-a7-a11-opus-hosted-achievability.md)
