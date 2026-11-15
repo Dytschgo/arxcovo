@@ -1,8 +1,9 @@
 # M2 normal completion and cancellation reporting join
 
-Provider: OpenAI / gpt-6.1-sol / high. Prepared head: `9047d80`;
-source baseline: `1958f99`. The initial checkout was clean. Parent-only changes
-are documentation for pending PR116 and are not part of this commit.
+Provider: OpenAI / gpt-6.1-sol / high. Builder checkout head: `9047d80`;
+source baseline: `1958f99`. The initial checkout was clean. Coordinator retained
+only this slice as `b811ae6` directly atop `1958f99`; PR116 parent documentation
+is excluded. The builder checkout ID is historical provenance, not landed parent.
 
 ## Audit and bounded gap
 
