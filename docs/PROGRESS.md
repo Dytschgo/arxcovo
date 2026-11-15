@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #145, `765df2bd1df6271ff06a961f581029544b4835d1` at22:07:38Z; independent Opus corrected-head PASS6902028887/status58979861977 and all five gates green. Reviewed7e053d2/squash full trees equal; in-process real-engine T1/T2/U6 only, no transport or fullM3 acceptance.
-- Current work: publish independently reviewed test-only T3 full-snapshot catch-up follow-up through exact-head review and hosted gates. Source reviewabf7a5e retained6553408 PASS with actual snapshot/install convergence and counterfactuals; parent PR145 merged. M2 closure plan remains active and unchecked, native gaps and A7/A12 no-retry unchanged.
+- Last merged: PR #146, `0ab5038d89e86e5f726fbed7e5ef6d76e64fa306` at22:19:44Z; independent Opus exact-head PASS6902189029/status58980320152 and all five gates green. Reviewed3476da6/squash full trees equal. Hosted three-OS actual snapshot catch-up and post-catch-up append credit is in-process only, not fullM3 acceptance.
+- Current work: Opus settles next bounded M3 enrollment/authentication slice joining committed identity/key binding to actual certificate issuance/verification without enabling a production endpoint. Consensus and snapshot tests are merged; CA-key role/storage, CSR proof, revocation and membership policy still need explicit decisions. M2 active source regression/ledger maintenance and hardware blockers remain under Ordering; A7/A12 no-retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -25,6 +25,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-15: Coordinator verifies PR146 exacthead/all five green gates, unwatches and merges0ab5038; reviewed/squash trees equal. Real full_snapshot follower recovery now has hostedWindows/macOS/Ubuntu credit for the in-process fixture. Next bounded Opus architecture task resolves enrollment certificate/key-authority boundary toward real multi-host trust, with no production endpoint or M2 closure inferred.
 
 - 2026-11-15: Coordinator verifies PR145 corrected head/all five gates, unwatches and merges765df2b; reviewed/squash trees equal. T3 branch incorporates squash retaining reviewed test-only additions and parent U6 correction; source add/add conflicts arise from squash ancestry, resolved to composed reviewed bytes. Publishing separate snapshot catch-up after parent merge, no fullM3/M2 closure.
 
