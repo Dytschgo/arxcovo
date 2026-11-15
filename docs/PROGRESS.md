@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Opus high496f10f retained66a9bf8 defines exclusive pre-start cross-store consistency check and ADR0005 invariant after real helper asymmetry. Independent Sol recheck passes with checked lookup/index cap and precise preflight read-only scope. Resume adapter/service/T1T2 implementation; no quorum credit until actual tests, no M2 native retry.
+
 - 2026-11-15: Sol high7d60a76/4918beb retained5cd8c6b/507905b retains reviewed-scope dependency/types/codec commit, then stops on real StorageHelper asymmetry: sameindex SMterm1/logterm2 accepted, lowerlogterm rejected. No service/T1T2/quorum proof. Coordinator confirms primary helper branch and routes narrow startup-guard correction to Opus without relaxing conflict rejection or changing merged stores.
 
 - 2026-11-15: Sol highfed7d66 retained26360a5 correctly hands back actual E0308(defaultProgressResponder vs specifiedOneshot) and additivechrono lock edges; no implementation retained or quorum proof. Coordinator verifies exact primary ProgressResponder::complete_only source and corrects the constructor plus narrow lock-edge allowlist, preserving pins/C1/C2. Implementation resumes; partial40-test draft results not counted as current consensus evidence.

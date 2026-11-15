@@ -91,11 +91,11 @@ ReadIndex reads, no-quorum refusal and committed enrollment outcomes on three pe
 9. **Startup is an Arxcovo preflight, then OpenRaft's helper unchanged.** The helper does not enforce equal-index ID consistency (facts). So `ConsensusNode::start`
    runs `fn preflight(log: &mut VoteLogStore, sm: &StateStore) -> Result<(), StoreError>` in one `blocking` closure on the stores it just opened and still owns, before
    any `Arc`/`Mutex`, adapter, `Raft::new`, task or writer exists. Ownership makes it atomic, so no lock order is needed; wrap the stores only after `Ok`. Reads only:
-   `sm.applied()` = A, `log.log_state()` = (P, L), then at most one store-validated `log.entries(a, a + 1, 1)`. With `a = A.index`, first match decides: (1) A `None`:
+   `sm.applied()` = A, `log.log_state()` = (P, L); reject A.index above i64::MAX, then at most one store-validated `log.entries(a, checked(a+1), 1)`. With `a = A.index`, first match decides: (1) A `None`:
    accept iff P `None`. (2) `P.index > a`: refuse (behind purged). (3) `P.index == a`: accept iff P == A. (4) L `None` or `L.index < a` (SM-ahead hole): accept iff `L < Some(A)` in
    `LogPos` order, so the helper's `purge(A)` repair runs and the store accepts it. (5) Else accept iff exactly one row has index a and its `LogPos` == A. A higher or lower term, a
    different leader or a missing row is refused even when the tail is further ahead. A refusal is `StoreError::Corrupt` (read errors pass through) wrapped as
-   `StartError::Preflight`; the stores drop, nothing is written and the helper never runs. Rows below a are not comparable (the SM keeps only A; log matching at A covers
+   `StartError::Preflight`; stores drop and preflight writes nothing (normal initial store creation is separate); the helper never runs. Rows below a are not comparable (the SM keeps only A; log matching at A covers
    them); rows above a are tail the engine may truncate. `Raft::new` then runs the unchanged helper, which may purge (hole) and rebuild the snapshot. No runtime
    cross-store check (it would race the engine); I4 after start stays protocol-held (decision 8). No `save_committed`: apply is durable, so restart never reverts.
    Reads go through the leader's ReadIndex only. If a legitimate restart (T1–T3) trips the preflight, hand back with evidence; never relax it.
