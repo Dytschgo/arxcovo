@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #136, `cbab8b69f7204c81e4490da107dc1bca3282cf0c` at 15:49:50Z, independent Opus corrected-head PASS6897043625/status58966632840 and all five required gates green. Reviewedd9b6538/squash tree `59ee64a77d37f0f5c101878c8cc486b3c0905f32` identical; dormant A12 native fixture compiled by hosted Linux, no fixture execution.
-- Current work: corrected A12 delivery source after Opus B1/B2 blockers, fresh independent delta review pending. Gate-wiring test now inspects actual native body and rejects direct/extra reader callers; A12-only build env DEBUG=0 keeps128MiBcap/sharedenv unchanged, red/green environment test+mutant added. Seven Rust/194 full portable/eight A12 mutants/13 wrapper mocks/fmt/diff pass. Gatesfalse/TESTunchanged, no nativegrant. A7 hosted finalNO-GO unchanged; review completion wake awaited.
+- Current work: publish corrected closed A12 delivery source after independent Opus80bc8c6 recheck closes B1/B2 with no new blockers. All five code blob/size/hash pins verified, gatesfalse/TESTunchanged/fixtureunrun. Coordinator7Rust/194portable/eightmutants/13wrapper/fmt/diffgreen retained. Exact-head review/full hosted Linux compilation/five required gates still pending; no nativegrant. A7 hosted finalNO-GO unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus80bc8c6 source delta recheck closes actualbody/caller gateB1 andA12-onlyDEBUG0 profileB2, no newblockingfindings. Independently verifies five codepins/wrapper96781hash and unchangedmod/S2b/workflows, attacks gate in-memory and confirmsrefusal. Optionalcombinedvisibility-edit/full-envenumeration hardenings keptnonblocking; publish unchanged reviewed source through exacthead/CIgates. No nativeA12 or A7authority.
 
 - 2026-11-15: Opusd2ee8e8 retained975f08b finds sourceguardselfmatch(B1) andA12Linuxdebugsize risk(B2), securityclear. Coordinator fixesactualbody/caller guard withbypasscontrols, records mockedbuildenvredbeforeA12-onlyDEBUG0fix andassertionkill, refreshesonlyconsumedwrapperdriverpins. All7A12Rust/194portable/eightmutants/13wrapper/fmt/diffgreen; no Linuxsize/nativeclaim. Fresh Opus delta review required beforepublication.
 
