@@ -30,6 +30,8 @@ jobs:
         run: python3 -m unittest discover -s tools/unix-exec-validation -p 'test_*.py'
       - name: Fetch locked dependencies without privilege
         run: cargo fetch --locked
+      - name: Compile and compare fixed A4 helper without privilege
+        run: python3 tools/unix-exec-validation/a4-helper/build.py linux-candidate
       - name: Guard, stage, run and finally clean (fresh hosted Linux only)
         shell: bash
         run: |

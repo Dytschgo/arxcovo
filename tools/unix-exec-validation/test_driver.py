@@ -800,8 +800,8 @@ class A1A2(unittest.TestCase):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
 
-    def test_source_selection_is_a5(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a5')
+    def test_source_selection_is_a4(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4')
 
     def test_closed_mapping(self):
         # Independent expectations: never obtain the cases/profile from the driver.
@@ -936,7 +936,7 @@ class A4Delivery(unittest.TestCase):
     selected = 'exec::disposable::a4::disposable_linux_a4'
 
     def test_closed_mapping_and_default(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::disposable_linux_a5')
+        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4')
         with patch.object(driver, 'TEST', self.selected):
             try:
                 self.assertTrue(driver.standard_profile())
@@ -945,7 +945,8 @@ class A4Delivery(unittest.TestCase):
             self.assertEqual(driver.test_argv('/binary'),
                 ['/binary', self.selected, '--ignored', '--exact', '--test-threads=1', '--color=never'])
             self.assertTrue(driver.a4_selected())
-        with patch.object(driver.os, 'open') as opened:
+        with patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'), \
+             patch.object(driver.os, 'open') as opened:
             with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
                 driver.a4_delivery()
             with self.assertRaisesRegex(RuntimeError, 'E_TEST_ARGS'):
