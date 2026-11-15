@@ -16,7 +16,7 @@ in run43666413693: success in 73s, first/final null, cleanup confirmed;
 reviewed-SHA variable deletion independently returned 404. See
 [feedback and blob pins](../evidence/linux-a4-hosted-baseline-feedback.md) and
 [bounded record](../evidence/linux-a4-baseline-run-43666413693.json).
-Independent baseline assessment is pending: these facts grant no A4 acceptance.
+Independent baseline assessment passed and PR111 merged: no A4 acceptance.
 D7e is consumed; native omitted-kill is **unrun and NOT granted**.
 
 ## One source shape
@@ -71,8 +71,8 @@ populated=1 and child.live() with positive original-deadline remainder after
 setup. Require no success reap/READY before rejection. A false bool alone, an
 earlier refusal, unexpected Ready, expiry, early death or any other panic fails.
 The retained child must still be unreaped and sole live member at attribution.
-Emit a fixed bounded rejection marker via direct std::io::Write after checks
-(bypass libtest success capture); no panic text/PIDs/paths. The assertion is killed
+Emit a fixed bounded rejection marker via raw libc::write to STDOUT_FILENO after checks
+(bypass libtest capture; fixed bytes and bounded EINTR-only completion); no panic text/PIDs/paths. The assertion is killed
 by the native omitted effect, rather than merely testing a model's false result.
 
 Only after acceptance has failed, explicitly use Child's existing owned
@@ -89,7 +89,7 @@ cleanup must independently confirm cleanup; in-fixture cleanup is insufficient.
 ## Closed driver and deterministic coverage
 
 In `tools/unix-exec-validation/driver.py`, add only the literal negative name
-to standard_profile/a4_selected and set fixed TEST to it for the later candidate.
+to standard_profile/a4_selected and keep TEST positive; only the separate run candidate selects the negative.
 Keep exact --ignored/--exact/one-thread argv, helper delivery, source/workflow
 SHA/actor/ref fences, unit/profile, bounds and existing finally cleanup.
 Require exactly one fixed rejection marker in negative mode as well as existing

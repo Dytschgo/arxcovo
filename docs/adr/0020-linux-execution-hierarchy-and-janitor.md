@@ -689,6 +689,23 @@ persist the refusal. This is non-native failure evidence; native nonremovable-le
 induction is not claimed. LeafStructure/KillInterface retain their existing
 Setup/mechanism-unavailable mapping; the three janitor failures retain quarantine.
 
+D9a clarification (test-only omitted-kill negative): permits (i) one
+additional literal `#[ignore]` test entry `disposable_linux_a4_omitted_kill`
+sharing the existing spawn/seed/placement body with the positive entry and
+fixing the negative path internally with no parameter; (ii) one test-only
+`OmitS7` CgroupFs wrapper omitting exactly `write(runs, cgroup.kill, 1)`
+(returning Ok, counting the attempt) plus test-only observed setup siblings
+returning the real `SetupOutcome` with exactly one real setup per run;
+(iii) adding the negative literal to the existing driver allowlist with
+TEST fixed to exactly one literal at a time (implementation slice keeps
+TEST=positive; only the separate one-run disposition candidate sets
+TEST=negative). It does not permit arbitrary test selection, a second
+setup per run, clock acceleration, faked events, or any production-code
+behavior change. The fixed rejection marker uses a raw file-descriptor write
+outside libtest capture and must occur exactly once. This clarification takes
+effect after independent review, required checks and coordinator merge; it
+provides no native execution grant.
+
 These five requirements bind subsequent small source slices:
 
 1. The A4 helper is one fixed standalone prebuilt waiting executable, never a
