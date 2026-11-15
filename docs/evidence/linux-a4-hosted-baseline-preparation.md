@@ -5,9 +5,9 @@ all five hosted gates and coordinator merge remain pending.
 
 Base/last merged PR #106: `40adbe55672293c894abd2d49be4de630e62577e`.
 Prepared source: `5dba9dfc840539d8df390eb4bd827c8b1a31a486` (local, never dispatch authority).
-The coordinator has now integrated accepted PR #108 baseline
-`1869175ba31e5c81386f45d293ed50365081fb1f`; its tree equals reviewed
-`76c49d2`, with five gates and independent PASS. See the accepted-baseline
+The coordinator has now integrated accepted PR #110 baseline
+`8e4bf824b56a2c4df141f9ef8cd78616d9b53475`; its tree equals reviewed
+`bbdc71e`, with five gates and independent PASS. PR #108 is included. See the accepted-baseline
 section and complete inventory below. The first qualifying normal gated main
 squash of this candidate remains pending review/checks/merge; no local source
 head is dispatch authority. Builder-stage failures and pins below are retained
@@ -141,3 +141,16 @@ No local head is dispatch authority.
 | `tools/unix-exec-validation/mutation_check.py` | `143bd308d3e4ded15ee8f25b6aa95761bab2bef1` |
 | `tools/unix-exec-validation/test_f0_blockers.py` | `4779931b8cdf8444c4b19d34faa291559e717d05` |
 | `tools/unix-exec-validation/test_f0b_transport.py` | `294568ab0cadaec82a7497f9a29858d605ccff04` |
+
+## Refreshed accepted baseline after stdio fixture correction
+
+PR110 merged as8e4bf824b56a2c4df141f9ef8cd78616d9b53475 at
+2026-11-15T01:53:32Z, all five gates and independent Muse PASS; squash tree
+d12edb06bfd87374b6f94cc8b0800a1554e4ed5e equals reviewedbbdc71e.
+This supersedes the earlier accepted PR108 baseline and includes that fix.
+The inventory now pins all arxd files, including the corrected SDK-owned
+stdio integration fixture, as well as the existing validation/build assets.
+The candidate non-doc diff remains exactly the same six paths; no new Rust,
+helper, image, driver fence, permission or timeout change. Fresh exact-head
+review and hosted gates remain mandatory. No native workflow/variable action
+has occurred. Native omitted-kill remains unrun and NOT granted.

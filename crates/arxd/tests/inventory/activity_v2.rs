@@ -438,11 +438,19 @@ async fn sdk_http_and_real_stdio_activity_visibility_storage_failures_and_bounds
                 .contains("activity unavailable")
         );
         db.execute_batch("DROP TRIGGER fail_start; CREATE TRIGGER fail_finish BEFORE UPDATE ON activity BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
-        let error = peer
-            .call_tool(call(json!({})))
-            .await
-            .unwrap_err()
-            .to_string();
+        if local {
+            // A live SDK session must outlive the helper's former 15-second
+            // subprocess lifetime, including its two-second diagnostic read.
+            tokio::time::sleep(std::time::Duration::from_secs(18)).await;
+        }
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.call_tool(call(json!({}))),
+        )
+        .await
+        .expect("finish failure must produce a bounded SDK response")
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("activity unavailable")
                 && !error.contains("activities")

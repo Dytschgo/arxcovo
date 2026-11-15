@@ -13,7 +13,7 @@ or M2 acceptance. D7a and D7b are consumed; A1/A2 acceptance is limited to
 recorded hosted run `43627472312`. D7c is fully consumed; A3 is accepted only
 for Standard `43635131545` and None `43636804545`. D7d is consumed by A5
 run `43644661407`; A5 acceptance is limited to that reviewed run. D7e proposes
-one fresh-host A4 baseline feedback run, conditional on merged PR #108 and a
+one fresh-host A4 baseline feedback run, conditional on merged PR #108 and PR #110 and a
 verified reviewed source baseline. No run permission exists before independent
 exact-head review, all five required gates, coordinator merge and candidate check. All other native execution and
 historical retries remain unauthorized. The historical E_PROTECTION diagnosis remains
@@ -547,16 +547,18 @@ unchanged. No native operation or execution permission follows from these checks
 ### D7e. One hosted A4 baseline feedback run (2026-11-15)
 
 **Proposed; source preparation only, no execution permission yet.** PR #106
-merged as `40adbe55672293c894abd2d49be4de630e62577e`. PR #108's reviewed
-privacy fixture merged as `1869175ba31e5c81386f45d293ed50365081fb1f` at
-2026-11-15T01:10:12Z after all five gates and independent review. The coordinator
-verified its tree `a1feee1deeefe47e9a266f805e3e5128f3cc930d` equals reviewed
-head `76c49d22562357d46c2f5c8ecdec92a3eda94df6`.
+merged as `40adbe55672293c894abd2d49be4de630e62577e`. PR #108's privacy
+fixture is included in accepted main. PR #110's reviewed SDK-owned stdio
+fixture merged as `8e4bf824b56a2c4df141f9ef8cd78616d9b53475` at
+2026-11-15T01:53:32Z after all five gates and independent review. The coordinator
+verified its tree `d12edb06bfd87374b6f94cc8b0800a1554e4ed5e` equals reviewed
+head `bbdc71e446fa201947ed66b7c05a920775d7141f`.
 The [execution baseline inventory](../evidence/a4-d7e-execution-baseline.json)
-pins all arxd source, Unix-validation assets, both relevant workflows, Cargo
-metadata, toolchain, unit and Standard profile at that exact accepted baseline.
-This baseline is never the dispatch SHA. The candidate's full main squash SHA
-remains pending independent review, required checks and coordinator merge.
+pins arxd source and integration tests, Unix-validation assets, both relevant
+workflows, Cargo metadata, toolchain, unit and Standard profile at that exact
+accepted baseline. This supersedes the earlier PR #108 baseline. The baseline
+is never the dispatch SHA. The candidate's full main squash SHA remains pending
+fresh exact-head review, required checks and coordinator merge.
 
 The sole dispatch candidate is the **first normal gated main squash** containing
 this amendment and `TEST = 'exec::disposable::a4::disposable_linux_a4'` after that
