@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Opus high2664129 retained284b80e prepares real OpenRaft adapter/three-node contract. Independent Sol review finds cancellation gaps C1(unpolled append callback guard) and C2(caller cancellation releases permit before engine completion). D: dependency-free Rust probe confirms deferred/eager guard distinction. Narrow Opus correction requested before implementation; no actual consensus acceptance or M2 closure.
+
 - 2026-11-15: Coordinator verifies corrected PR144 head/all five gates, unwatches and merges38750cf; reviewed/squash trees equal. macOS page-fixture path now green, no production change. ADR0023/M2 closure plan reaches main as requested by babysitter. Next Opus architecture task settles concrete OpenRaft integration and real three-node test boundaries; no M2 checkbox or native grant changed.
 
 - 2026-11-15: Babysitter ordering/closure correction applied. Existing historical M3 steering is made prominent with ADR0023 and per-item M2 blocker/active-work table. No M2 acceptance waiver or new run permission; source regressions stay active, hardware closure explicitly deferred to a qualifying owner-provided host. Fresh Opus review includes this clarification and PR144 test-only macOS correction.
