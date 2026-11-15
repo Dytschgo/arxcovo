@@ -19,7 +19,7 @@ fn pos(index: u64) -> LogPos {
         index,
     }
 }
-fn code(n: u8) -> JoinCode {
+pub(in crate::cluster) fn code(n: u8) -> JoinCode {
     let mut call = 0;
     JoinCode::generate([1; 16], [4; 32], |b: &mut [u8]| {
         call += 1;
@@ -28,7 +28,7 @@ fn code(n: u8) -> JoinCode {
     })
     .unwrap()
 }
-fn mint(n: u8, time: u64) -> Entry {
+pub(in crate::cluster) fn mint(n: u8, time: u64) -> Entry {
     let c = code(n);
     Entry::Enrollment(Command::Mint {
         cluster: init().cluster,
@@ -39,7 +39,7 @@ fn mint(n: u8, time: u64) -> Entry {
         proposed_at_ms: time,
     })
 }
-fn redeem(n: u8, time: u64) -> Entry {
+pub(in crate::cluster) fn redeem(n: u8, time: u64) -> Entry {
     let c = code(n);
     Entry::Enrollment(Command::redeem(
         init().cluster,
@@ -324,12 +324,12 @@ fn install_and_replica_determinism() {
     drop(dest);
     assert_eq!(open(b.path()).snapshot(), source.snapshot());
 }
-fn absent(bytes: &[u8], markers: &[Vec<u8>]) -> bool {
+pub(in crate::cluster) fn absent(bytes: &[u8], markers: &[Vec<u8>]) -> bool {
     markers
         .iter()
         .all(|m| !bytes.windows(m.len()).any(|w| w == m))
 }
-fn privacy_markers() -> Vec<Vec<u8>> {
+pub(in crate::cluster) fn privacy_markers() -> Vec<Vec<u8>> {
     let c = code(5);
     let text = c.expose_for_owner_transfer();
     let raw = hex::decode(&text[6..]).unwrap();
@@ -383,12 +383,12 @@ fn credentials_absent_from_files_snapshots_and_debug_with_positive_control() {
         }
     }
 }
-pub(super) fn pause(path: &Path) {
+pub(in crate::cluster) fn pause(path: &Path) {
     std::fs::write(path.join("ready"), b"ready").unwrap();
     std::thread::sleep(Duration::from_secs(10));
     panic!("parent kill deadline");
 }
-struct KillOnDrop(Child);
+pub(in crate::cluster) struct KillOnDrop(pub(in crate::cluster) Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();

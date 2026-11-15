@@ -2,12 +2,43 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #142, `4f323c36e2d134b56c1f6efb3035b6cc18143c84` at18:32:43Z; independent Opus exact-head PASS6899129519/status58972231000 and all five required gates green. Reviewed9deec76/squash trees equal; first M3 pure enrollment core only, not cluster acceptance.
-- Current work: publish independently reviewed M3 durable enrollment store through exact-head review and hosted Windows/macOS/Ubuntu gates. Opus recheck5366bf1 closes R1 with three counterfactuals; 23 cluster tests/four process-kill probes/fmt/Clippy pass independently. Broader Windows owner-security fixture failures remain recorded and unattributed; no admin remediation or waiver. Local process-kill consistency only, no quorum/signing/power-loss claim; M2 remains incomplete.
+- Last merged: PR #143, `cd28bb91fb7a42307e6c48e360c96adbf36128fd` at19:18:55Z; independent Opus exact-head PASS6899732283/status58973875331 and all five required gates green. Reviewedcbd8055/squash full trees equal. M3 state-store crash probe passed hosted Windows/macOS/Ubuntu; local process-kill consistency only, not power loss or quorum.
+- Current work: publish independently reviewed M3 durable vote/log storage through exact-head review and hosted Windows/macOS/Ubuntu gates. Opus recheckc32ce57 closes all eight R1 mutants;36 cluster/eight crash probes/fmt/offlineClippy pass independently. No OpenRaft integration, quorum, power-loss or three-node claim. M2 remains incomplete; A7 FINAL NO-GO and consumed A12 cleanup uncertainty/no-retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
+## Ordering and M2 closure plan
+
+Owner steering on2026-11-15 14:06 permits parallel work on features with few dependencies. Later delegated steering explicitly permits independent M3 after bounded remaining M2 audits. [ADR0023](adr/0023-parallel-m3-with-open-m2-hardware-gaps.md) records this exception to KICKOFF's normal milestone order. **M3 runs in parallel; M2 remains unchecked and incomplete.** PR142/143 and current PR144 are independent source/storage work, not M2 acceptance.
+
+| Remaining M2 item | Evidence and blocker | Work status / closure prerequisite |
+| --- | --- | --- |
+| A6 quarantine and A8 Ready/discovery join | Accepted injected-port/SDK/persisted-state coverage; no native failure/startup credit | Source coverage remains actively maintained by ordinary CI. Any claimed native extension needs dedicated-host evidence. |
+| A4 crash provenance; crash/A9/U9 populated-stop and production Drain | D9a present-residue accepted; PR141 only proves removal after natural exit with empty directories | Native gap **unverified on real hardware**; dedicated qualifying host needed, no new hosted diagnostic authorized. |
+| A7 sudo/NNP and A11 descriptor/alias | D7k final hosted NO-GO; no case proof | Deferred pending dedicated Linux host; **unverified on real hardware**. No more hosted bind/fix/grant/retry. |
+| A10 capability sufficiency for actual Runner | PR140 covers setup/janitor/fixture migration, not Runner self-migration/lifecycle | Source regression checks actively maintained; unmatched native operations need dedicated-host proof, **unverified on real hardware**. |
+| A12 normal/cancel residue producer | D7l sole run43741300777 failed; cleanup unconfirmed; consumer SDK joins are nonnative | Attempt consumed, host excluded, no further hosted execution authorized. Deferred dedicated-host producer evidence; **unverified on real hardware**. |
+| Full Stage F | Partial bounded credits A1-A5 and source joins do not cover every item above | Acceptance ledger/source regressions actively maintained; full credit blocked on missing native items, **unverified on real hardware**. |
+| Full Stage G | Pure/source refusal checks do not replace the real execution path | Source checks remain workable in CI; native execution/panic/security acceptance blocked on qualifying host and F, **unverified on real hardware**. |
+| Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
+
+Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
+
 ## Task history
+
+- 2026-11-15: Babysitter ordering/closure correction applied. Existing historical M3 steering is made prominent with ADR0023 and per-item M2 blocker/active-work table. No M2 acceptance waiver or new run permission; source regressions stay active, hardware closure explicitly deferred to a qualifying owner-provided host. Fresh Opus review includes this clarification and PR144 test-only macOS correction.
+
+- 2026-11-15: PR144 macOS verify fails page-size fixtureIo/Unsupported at tests448. Coordinator makes its private-file precondition explicit with exclusive0600Unix creation and private/page1024 readbacks; production unchanged. FocusedWindows and rebuilt36cluster/fmt/offlineClippy pass; exactmacOSrednotlocallyreproduced, fresh hosted gates plus Opus delta review required. No nativeM2retry or admin action.
+
+- 2026-11-15: Opus highc32ce57 independently rechecks R1: all eight guard-removal mutants compile and fail only intended new assertions, production blob restored unchanged.36cluster/eight-kill/fmt/offlineClippy pass; evidence corrected. Coordinator publishes vote/log storage probe for exact-head review and hosted gates; no consensus/power-loss acceptance or M2 closure.
+
+- 2026-11-15: Opus highea8a25c retainedc0ef722 passes vote/log production/security but blocks Standards on eight uncovered fail-closed guards. Coordinator adds107 test-only lines covering purge/truncate regression, checksum-valid reopen inconsistency and per-read poisoning, with unchanged disk/memory/reopen assertions. All36cluster/eight crash probes/fmt/offlineClippy/diff pass. Evidence narrows membership4097 bound attribution; fresh Opus delta recheck pending, no production change.
+
+- 2026-11-15: Sol highcad7f08/07da6a5 retained189bbc9/077e121 implements shared fixed-stem SQLite helper and bounded vote/log store with verifier-only codec. Builder23 baseline and33 final cluster tests/eight total crash probes/fmt/offlineClippy/diff pass. Test-helper visibility corrected to cluster scope, privacy scans account for held Windows locks without dropping assertions. Fresh Opus source/security review requested; no quorum/power-loss/OpenRaft acceptance.
+
+- 2026-11-15: Opus highcf5e1da retained48b8185 settles SQLite durable vote/log contract. Independent Sol review checks actual Suite cases, corrects accidental purge20/append11 chaining, clarifies same-leader vote regression, exact4096-byte log pages and fixed helper stems. Contract accepted for bounded implementation; cross-file ordering and callback/consensus remain future-adapter obligations. No test/native action or quorum acceptance.
+
+- 2026-11-15: Coordinator verifies PR143 exact head/all five green gates, unwatches and mergescd28bb9; reviewed/squash full trees equal. Hosted three-OS crash/journal/privacy probes now credited for state-machine backend only. Opus next architecture task settles vote/log store sync and recovery contract before implementation; no new native M2 action or full M3 credit.
 
 - 2026-11-15: Opus high5366bf1 rechecks R1 membership decoder coverage with8192-limit and decoder-only bypass counterfactuals; new test detects both while old test misses decoder bypass. Independently reran23cluster/four-kill/fmt/Clippy, all pass. Coordinator publishes durable-state probe for exact-head review and hosted OS gates. No power-loss/quorum/three-node acceptance or M2 closure.
 
