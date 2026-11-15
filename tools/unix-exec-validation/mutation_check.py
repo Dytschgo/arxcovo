@@ -14,7 +14,7 @@ import test_f0_blockers
 import test_f0b_transport
 
 CASES = [
- ('restore positive A4 selection', "TEST = 'exec::disposable::sudo_nnp::disposable_linux_a7_a11'", "TEST = 'exec::disposable::a4::disposable_linux_a4'", 'test_source_selection_is_combined_a7'),
+ ('restore positive A4 selection', "\nTEST = 'exec::a12::native::disposable_linux_a12'", "\nTEST = 'exec::disposable::a4::disposable_linux_a4'", 'test_source_selection_is_a12_candidate'),
  ('omit closed A5', "'exec::disposable::disposable_linux_a5',", "'exec::disposable::disposable_linux_a4',", 'test_closed_mapping'),
  ('A5 without Standard', "return TEST != 'exec::disposable::disposable_linux_a3_none'", "return TEST not in ('exec::disposable::disposable_linux_a3_none', 'exec::disposable::disposable_linux_a5')", 'test_closed_mapping'),
  ('A5 argv selects A3', "return [binary, TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", "return [binary, 'exec::disposable::disposable_linux_a3_none' if TEST == 'exec::disposable::disposable_linux_a5' else TEST, '--ignored', '--exact', '--test-threads=1', '--color=never']", 'test_closed_mapping'),

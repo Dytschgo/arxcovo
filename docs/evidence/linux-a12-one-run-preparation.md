@@ -171,7 +171,7 @@ Baseline entries: 223. Candidate entries: 223. This is the historical
 non-doc paths. Canonical digest input: UTF-8 rows sorted by exact path, each
 `mode\tgit_blob\tpath\n` (LF including final newline); excludes only docs/.
 Baseline SHA256: `84f8446e059f5e64a1aa7957763a7bb171c43de967410dcd23811ddaba2b9d05`.
-Candidate SHA256: `615c780a5c4ff0f58fc0f4ee4a4c171ca7e9a16bd8cde715a5546513a1f9af5d`.
+Candidate SHA256: `dbc11a5ad3a0e37d6bf659b1e1bac65c2758565d8a11cf5c500bb415e375c710`.
 Per-file SHA256/size below hash canonical committed blob bytes (LF for text), not
 platform checkout newline conversion. Binary blobs are hashed unchanged.
 
@@ -359,7 +359,7 @@ platform checkout newline conversion. Binary blobs are hashed unchanged.
 | tools/unix-exec-validation/a4-helper/test_build.py | 100644 | 1a9d6829e6bb2e40c379b8b3fc208b8440b4ea0c | cd192281a079c7258ebf47bdc68fb184ed1b5b1703e5337fe4ff3037b03d4c2e | 9901 |
 | tools/unix-exec-validation/a4-helper/tests.rs | 100644 | 27f880a5fd4881a08ab777f0e28de66fbc5cfeee | 215434d57814a8b2055582ddd84929bfcefc66253428c8a0ff40ea903b5805b4 | 6076 |
 | tools/unix-exec-validation/driver.py | 100644 | 48e4fe6e549d0b813e0c5198aeb3506366851e6c | 24dd0d6a2c8948f2092e54fff40bbb03c4364ab2a07e59c6e12d62517e5fe47f | 96767 |
-| tools/unix-exec-validation/mutation_check.py | 100644 | 78df4c66eb0d4aac8263fff8995f7548d127a0bc | d1394231112f3e86c69a3947786d58d5db7ca4165671248462773caa9680e54d | 58820 |
+| tools/unix-exec-validation/mutation_check.py | 100644 | 8e3074cebd3ac8fdb2effa28e334e2eeca99c7fe | 752a0570f53f4275370318561bc16790684e075f9bba4cffdaa2d8eda0cd5c89 | 58814 |
 | tools/unix-exec-validation/sudo_host_qualification.py | 100644 | 41ec1325a77669d34c20f00c4b04d40c9d8086a4 | b6a1891c14acfacfe2bbd2df1aefa1e79736c6be1e0592f353dea5ea55c3c5c9 | 8528 |
 | tools/unix-exec-validation/sudo_package_profile.py | 100644 | 520d341633c67dc52ec483e9b3fcc92131a3da1f | 12a122db7d30be04dd7523db046d49f4083882c318b375ccf0986ec0eb338e75 | 11180 |
 | tools/unix-exec-validation/test_driver.py | 100644 | d6d8afea18c19ba04a8825be81509091dc66949e | a5fae4a61066dc9758fcfd3d91d46455b33e81cc0ce34f035a9a62f93f04d585 | 166104 |
@@ -412,3 +412,13 @@ fixed /usr/bin/true and /usr/bin/sleep with literal15; trusted runtime metadata 
 required per call, not a fabricated host-file hash. D7j wrapper consumed MODULE
 pin is driver SHA256 24dd0d6a2c8948f2092e54fff40bbb03c4364ab2a07e59c6e12d62517e5fe47f,
 size96767. Its execution grant remains consumed.
+
+## Opus S1 correction
+
+The first historical driver mutant now anchors the exact A12 TEST assignment with
+a leading newline and names the current candidate-selection test. The prior A7
+anchor was stale and stopped the historical harness before its 40 cases. The
+coordinator ran `mutation_check.main()` after correction: 91 audited tests passed
+and all 40 historical mutants were assertion-killed. Driver bytes and wrapper
+pins are unchanged. The inventory row and candidate digest above are refreshed;
+fresh Opus recheck remains required. No native execution occurred.
