@@ -386,3 +386,7 @@ The preceding source table records builder7385785 historically. This exact four-
 | `tools/unix-exec-validation/mutation_check.py` | `c8632aa6f65525dbe8a485a0c5c076153a01eba5` | `6d838247e9553e1d83cab8185d5bea6f091c8e7b122144b88f7ec95dbc724b73` |
 
 Validation: seven focused mock tests, whole-stat refusal counterfactual, six admission assertion kills, UTF8LF and diff checks. Builder broader evidence is reused only for unchanged behavior. Fresh exact-head independent delta review, hosted Linux compilation, all five gates and coordinator merge remain required; no run authority or native acceptance granted.
+
+## Actual D7i dispatch binding
+
+PR128 merged as `0011d23a0681c0acb717064166c399e194937869` at 2026-11-15T12:44:30Z after independent exact-head Muse PASS6894433669 and five green required gates. Reviewed `e8fb22440d1aa64593e1beb436bc84936e7275a3` and squash tree both `2cfe06dad278e66bb61584b74da9c392c870570c`. Exact baseline parent7d8ab1c, eight-path100644 predicate and corrected four-source Git/SHA256 table verified. Both native/read-only pins were absent404, live main/actor verified, native pin set once/read back exact. Dispatch43715436515 attempt1 job132815838689 accepted on that exact main, workflow_dispatch actor/triggerDytschgo; direct returned URL monitor holds pin through terminal and finally clears/404. D7i consumed regardless of outcome. Run remains in progress; no acceptance or further dispatch authority.
