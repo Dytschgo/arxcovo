@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Sol / high public provenance research `00e4b2a` found pinned upstream/runner-image inputs but no complete policy literal candidate; no runtime equality claimed. Coordinator retained the note and drafted an unaccepted fixed effective-policy-query alternative for future architecture review, with status1/error and NOPASSWD ambiguities explicitly unresolved. Current exact-byte/closed qualification contract remains binding; no host reads or authority change. This reassesses concrete acceptance overhead under owner priority steering.
+
 - 2026-11-15: Muse / high `7e8f0ad` independently accepted the cancelled activity consumer join: Standards/Spec/Security zero findings. Focused SDK regression, fmt, offline Clippy and diff checks rerun green; no production/native change or A12 credit. Coordinator clarified builder-checkout versus landed-parent provenance and publishes the bounded test slice through normal exact-head and hosted gates.
 
 - 2026-11-15: Sol / high completed independent parallel M2 cancellation consumer join `de26b4a`, retained `b811ae6`: existing SDK normal0/7 regression extended with cancelled/confirmed-cleanup/null-exit response and committed/reopened exact activity lookup. Focused test, fmt, offline Clippy and diff passed. No production defect or native residue observation; A12 native/M2/full F/G/PA6 remain open. Muse source review active; PR116 A4 docs checkpoint separately awaits platform gates.
