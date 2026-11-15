@@ -1,0 +1,63 @@
+{
+  "run_id": 43693642693,
+  "attempt": 1,
+  "event": "workflow_dispatch",
+  "head_sha": "47b440a5faeaa24434e155b81d5d03a5c977e4e9",
+  "head_branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "success",
+  "job_id": 132749349754,
+  "started_at": "2026-11-15T08:15:30Z",
+  "completed_at": "2026-11-15T08:15:38Z",
+  "steps": [
+    {
+      "name": "Set up job",
+      "conclusion": "success"
+    },
+    {
+      "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      "conclusion": "success"
+    },
+    {
+      "name": "Safe mocked wrapper tests",
+      "conclusion": "success"
+    },
+    {
+      "name": "Fixed read only comparison",
+      "conclusion": "success"
+    },
+    {
+      "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      "conclusion": "success"
+    },
+    {
+      "name": "Complete job",
+      "conclusion": "success"
+    }
+  ],
+  "report": {
+    "binding": {
+      "attempt": "1",
+      "run": "43693642693",
+      "source_sha": "47b440a5faeaa24434e155b81d5d03a5c977e4e9",
+      "workflow_sha": "47b440a5faeaa24434e155b81d5d03a5c977e4e9"
+    },
+    "comparison": {
+      "architecture": "amd64",
+      "candidate_match": true,
+      "digests": {
+        "sudo": "6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff",
+        "sudoers": "151d681d51293a040dc479cb0175d1a6d461a40ff455661cf6ad485adf305d4c",
+        "util": "aae167b9da2436a31eba12d9fb20b36120fd204b2c720d62881d09e89eecd26d"
+      },
+      "qualified": false,
+      "revision": "1.9.15p5-3ubuntu5.24.04.4",
+      "schema": 1,
+      "status": "candidate_match"
+    },
+    "schema": 1
+  },
+  "dedicated_pin_absent_http404": true,
+  "native_pin_absent_http404": true
+}
