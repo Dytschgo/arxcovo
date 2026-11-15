@@ -310,3 +310,21 @@ reset follows. Hardware remains **unverified on real hardware**; M2 stays open.
 | tools/ci/a7-admission-readonly.py | 67481533a213989951a3f0881e66cdc88ffaf8e6 |
 | crates/arxd/src/exec/mod.rs (unchanged) | b150f543a894d57b25c56bab19c95b4f9bd2beeb |
 | crates/arxd/src/exec/unix.rs (unchanged) | 0d087e37f31f3e17db652a87f2a0364eb398479e |
+
+## Coordinator fixes after Opus B1/B2 source review
+
+Review d2ee8e8 retained975f08b blocks initial source for two A12-only findings. B1: the original source.contains assertion matched its own expected string. The corrected test extracts native code before portable tests, checks the actual prepared_delivery body equals closed_read(read_delivery), and requires exactly the reader definition plus that one reference. In-memory direct-reader bypass and added-reader-caller controls must both fail this wiring predicate. No execution/delivery gate is enabled.
+
+B2: embedded Linux debug data may exceed the128MiB cap; this was a source-based risk estimate, not a measured Linux size or explanation of A7 history. build_a12 now overrides CARGO_PROFILE_DEV_DEBUG=0 in its own copied build environment only. Shared cargo_env and the cap remain unchanged. Added mocked Popen environment assertion was observed red(None vs0) before the fix and green after; new in-memory mutation removing the override is assertion-killed. Consumed D7j wrapper changes only its exact driver size/SHA256 maintenance. A7 hosted NO-GO is unchanged.
+
+Actually reran after audited pure/mock callgraphs: all7 portable A12 Rust tests,14 A12 delivery mocks,eight A12 assertion mutants,13 wrapper mocks, then full194 portable guard tests (including legacy/subprocess/feedback fences). All passed; internal/outer maximum757/2447 unchanged. fmt anddiff checks pass. Build/temp outputs D:/Code/arxcovo-a12-delivery-source. No nativefixture/host/root/account/proc/sys/Runner/LinuxFs/helper/sudo/dispatch ran. Full Linux compilation remains a hosted gate; no bounded-size Linux image claim is made before it is observed. Fresh independent Opus delta review precedes publication.
+
+Current corrected source blobs (supersede the earlier table for these paths):
+
+| Path | Blob | SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/exec/disposable/a12.rs` | `da5cd1283af919e0c4310a01eb656dfc3cb924f6` | `72601ed15220d6ade109852df6a585ff125f2d26fc932c17be04c3e397fc38e0` |
+| `tools/unix-exec-validation/driver.py` | `5a7153595adae3b0adac57d0ea5fb007dfb134d8` | `a8a01bc59d694f0ab2a666a7f0135a1fc3ab46d646214c2644f70f548fb1abf5` |
+| `tools/unix-exec-validation/test_driver.py` | `eb3c8430b7d2a3d88876b2ce31d8f66349fa1422` | `8d8061c5618ddcc1482ad3a430efac86d022050e5ac7c17172b8ef5f8f71b0ab` |
+| `tools/unix-exec-validation/mutation_check.py` | `3095efd9885c9f63835da0d52953d6835dd9e50a` | `35383821a366c19a8b0e7628eddc29319bf4524f242bdc201ea459eee818adaa` |
+| `tools/ci/a7-admission-readonly.py` | `f354bab7fa1b8b04209310886898be847cad5881` | `6be7c142b49c91ccc7c42d4eb88bea8f42e4c3d8428c09debf3e1199f19ddf80` |

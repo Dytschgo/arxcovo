@@ -737,6 +737,8 @@ def a12_assertion_mutants():
     """Only A12 injected ports; never execute any native adapter."""
     source=Path(driver.__file__).read_text()
     cases=[
+        ('    build_env = dict(cargo_env(stage), CARGO_PROFILE_DEV_DEBUG="0")',
+         '    build_env = cargo_env(stage)', 'test_one_bounded_build_and_clock'),
         ('A12_DELIVERY_ENABLED = False','A12_DELIVERY_ENABLED = True','test_closed_gates_before_effects'),
         ('A12_EXECUTION_ENABLED = False','A12_EXECUTION_ENABLED = True','test_closed_gates_before_effects'),
         ("len(name) <= 32 and len(run.split('-')[1]) <= 6", "True", 'test_owned_names_refuse_paths'),

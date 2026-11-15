@@ -2540,7 +2540,9 @@ class A12Delivery(unittest.TestCase):
             if fault=='path':data=good.replace(b'/var/lib/arx-ci-123-1/source/target/debug/deps',b'/tmp')
             out=io.BytesIO(); waits=[]; commands=[]
             child=SimpleNamespace(stdout=io.BytesIO(data),returncode=1 if fault=='failure' else 0,wait=lambda timeout:waits.append(timeout),poll=lambda:0,kill=lambda:self.fail('unneeded kill'))
+            self.assertNotIn('CARGO_PROFILE_DEV_DEBUG', driver.cargo_env(Path('/var/lib/arx-ci-123-1')))
             def spawn(args,**kw):
+                self.assertEqual(kw['env'].get('CARGO_PROFILE_DEV_DEBUG'), '0')
                 commands.append(args)
                 return nullcontext(child)
             with patch.object(driver.Path,'open',return_value=nullcontext(out)),patch.object(driver.Path,'read_bytes',side_effect=lambda:out.getvalue()),patch.object(driver.subprocess,'Popen',side_effect=spawn),patch.object(driver.time,'monotonic',side_effect=[100,99 if fault=='clock-back' else 461 if fault=='late' else 101]):

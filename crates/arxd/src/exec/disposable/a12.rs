@@ -1009,7 +1009,31 @@ fn a12_fixed_targets_and_closed_source_gate() {
     let source = include_str!("a12.rs");
     const { assert!(!DELIVERY_ENABLED) };
     assert!(closed_read::<()>(|| panic!("closed gate must not read")).is_none());
-    assert!(source.contains("closed_read(read_delivery)"));
+    // Exclude portable tests, so neither the expected string nor the mutation
+    // controls below can satisfy the production wiring check by matching itself.
+    let wired = |text: &str| {
+        let native = text
+            .split("\n#[test]\nfn a12_acceptance_counterfactuals")
+            .next()
+            .unwrap();
+        let body = native
+            .split("fn prepared_delivery() -> Option<Prepared> {")
+            .nth(1)
+            .and_then(|rest| rest.split_once('}'))
+            .map(|(body, _)| body.trim());
+        body == Some("closed_read(read_delivery)") && native.matches("read_delivery").count() == 2
+    };
+    assert!(wired(source));
+    let bypass = source.replacen("closed_read(read_delivery)\n", "read_delivery()\n", 1);
+    assert_ne!(bypass, source);
+    assert!(!wired(&bypass));
+    let extra = source.replacen(
+        "    fn read_delivery()",
+        "    fn hidden_bypass() { let _ = read_delivery(); }\n    fn read_delivery()",
+        1,
+    );
+    assert_ne!(extra, source);
+    assert!(!wired(&extra));
     let fixture = source
         .split("fn disposable_linux_a12() {")
         .nth(1)

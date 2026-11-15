@@ -95,11 +95,12 @@ def a12_name(run):
 
 def build_a12(stage):
     # Single libtest invocation, bounded while reading, with owned wait/kill/join.
+    build_env = dict(cargo_env(stage), CARGO_PROFILE_DEV_DEBUG="0")
     exceeded = threading.Event()
     start = time.monotonic()
     with (stage / 'a12-build-output').open('xb') as out:
         with subprocess.Popen(command(stage) + ['--no-run', '--message-format=json'],
-                cwd=stage / 'source', env=cargo_env(stage), stdout=subprocess.PIPE,
+                cwd=stage / 'source', env=build_env, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL) as child:
             def capture():
                 try:
