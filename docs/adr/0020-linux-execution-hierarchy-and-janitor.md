@@ -666,6 +666,46 @@ pinned-identity match, never directly from bridge output.
   reset, and no owner command is added. The owner restarts the service with
   existing owner tooling.
 
+### D9c. Closed fixture-local C2 view (2026-11-15)
+
+This amendment becomes effective for source preparation only after independent
+review, all required gates and coordinator merge. Native execution remains a
+separate reviewed grant. The D7j read-only record on one fresh host observed
+root/type accepted but group/other-write present at usr_local_bin; it does not
+prove the historical D7i cause or fleet-wide image behavior.
+
+For the controlled A7 fixture ONLY, supersede D9b's exact FOUR mapping set with
+exactly FIVE: its four policy mappings plus
+`<stage>/fx/c2-empty:/usr/local/bin`. The new source is an exclusive root-owned
+empty directory, mode **0755**, no group/other writes, captured dev/ino, bound
+read-only inside the disposable unit namespace. No optional-source prefix,
+additional mapping, host chmod/chown/policy edit, copied sudo or production use.
+
+The source must be 0755 so the unprivileged real probe can open the candidate
+directory and observe ENOENT for sudo. The earlier Muse recommendation of 0700
+is superseded: `unix_shim_rights_linux.rs::directory` opens O_RDONLY|O_DIRECTORY,
+and `fd` maps EACCES to unknown, which must refuse. Protected ownership/no022
+and read-only bind remain mandatory; permissions never permit fixture writes.
+
+Before Runner construction and each call, verify the exact effective five-set,
+in-unit source/view dev+ino equality, mountinfo and statvfs read-only status,
+mode/ownership, exact empty entry set and C2 absence. Configuration text alone
+is insufficient. Include the fifth source in existing held-descriptor identity,
+collision, reverse owned-cleanup and quarantine checks; never adopt a directory.
+
+Outside the unit retain C1 installed package/plugin/util equality, protected
+/usr/bin ancestry, merged-/usr alias and existing floor checks before effects.
+Only this controlled fixture defers host C2 ancestry to the closed in-unit view;
+it makes no host C2 safety/absence claim. The ordinary strict host gate remains.
+PATH stays /usr/bin:/bin; installed C1/plugin, actual NNP, descriptor/C3 oracles,
+all case budgets/cancel-and-join, and production rights logic remain unchanged.
+Update canonical profile facts to include the fifth fixed mapping and emptiness
+contract in the later reviewed source slice, not to attest an observed host.
+
+No implementation before this amendment's gates/merge; no selection/run until
+its separate reviewed source and native disposition. D7a-j remain consumed.
+A7/A11, M2, full F/G and real-Runner PA6 remain unverified on real hardware.
+
 ### D9b. Controlled A7 policy fixture (2026-11-15)
 
 This test-contract amendment takes effect only after independent different-provider

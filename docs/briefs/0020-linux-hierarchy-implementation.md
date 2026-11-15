@@ -618,6 +618,12 @@ owner's machine:
   not the policy. ADR0020 D9b permits a source-literal fixture-local read-only
   policy view for the two cases; it makes no claim about the host original
   policy and retains installed sudo/plugin, NNP, identity and descriptor fences.
+  ADR0020 D9c changes the controlled fixture mapping set to exactly five: the
+  four D9b policy views plus an owned empty root0755 read-only source over
+  /usr/local/bin. Prove the exact in-unit mapping/mount/inode/empty/C2-absent
+  view before Runner and per call; no host permission or production change.
+  The source remains searchable/readable by the fixture account so C2 absence
+  is ENOENT rather than access denial. Source and native gates remain separate.
 - **A8** Startup discovery runs after Ready and writes one daemon row.
 - **A9** Whether systemd removes delegated children at unit stop (U9).
 - **A10** That cgroupfs writes and migration need no capability beyond the

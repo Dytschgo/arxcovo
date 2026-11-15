@@ -134,3 +134,7 @@ This diagnoses one fresh host's role/predicate only. A later D9b combined attemp
 still needs its own reviewed disposition on a NEW host and all actual NNP/oracle/
 runtime checks. A7/A11, M2, full F/G and real-Runner PA6 remain
 **unverified on real hardware**.
+
+## Actual D7j dispatch binding
+
+PR131 merged `7a26fcdd9729ee858c9fc5e1610ff4b75d408592` at2026-11-15T13:42:55Z after independent Muse exact-head PASS6895123755 and allfivegreens (agent-review58962440969). Reviewed489a5d4c2d5f950d6809c4a036920ad959c2f970/squash tree `c2d56d5e1a30262af0c9ef574d6dd507cd31ca5f` equal; baselineparent18b8fef, eight100644path predicate and allfour inventoryblobs/SHA256 verified. Allthreepins absent404; dedicatedA7_ADMISSION_REVIEWED_SHA setonce/readbackexact, live main verified. Accepted run43720496074 attempt1/job132831225756 workflow_dispatch/main/actortriggerDytschgo via directlyreturnedURL. Monitor holds pin through terminal then clears404; run in progress, D7j consumed regardless of outcome, no retry or acceptance.
