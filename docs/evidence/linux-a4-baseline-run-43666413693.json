@@ -1,0 +1,74 @@
+{
+  "schema": "a4-d7e-hosted-baseline-record-1",
+  "run": 43666413693,
+  "attempt": 1,
+  "job": 132666674807,
+  "event": "workflow_dispatch",
+  "head_sha": "a328060000b8cb7bb389d39f8785f96f6bcb0c25",
+  "branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "job_started_at": "2026-11-15T02:09:20Z",
+  "job_completed_at": "2026-11-15T02:10:33Z",
+  "conclusion": "success",
+  "steps": [
+    {
+      "name": "Set up job",
+      "conclusion": "success"
+    },
+    {
+      "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      "conclusion": "success"
+    },
+    {
+      "name": "Run dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8",
+      "conclusion": "success"
+    },
+    {
+      "name": "Safe guard tests",
+      "conclusion": "success"
+    },
+    {
+      "name": "Fetch locked dependencies without privilege",
+      "conclusion": "success"
+    },
+    {
+      "name": "Compile and compare fixed A4 helper without privilege",
+      "conclusion": "success"
+    },
+    {
+      "name": "Guard, stage, run and finally clean (fresh hosted Linux only)",
+      "conclusion": "success"
+    },
+    {
+      "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+      "conclusion": "success"
+    },
+    {
+      "name": "Complete job",
+      "conclusion": "success"
+    }
+  ],
+  "reviewed_sha_variable_absent_http404": true,
+  "feedback": {
+    "schema": "unix-protection-f0",
+    "version": 2,
+    "provenance": {
+      "source_sha": "a328060000b8cb7bb389d39f8785f96f6bcb0c25",
+      "workflow_sha": "a328060000b8cb7bb389d39f8785f96f6bcb0c25",
+      "run": "43666413693",
+      "attempt": "1"
+    },
+    "first": null,
+    "final": null,
+    "mutation_lower_bound": "cgroup",
+    "cleanup": "confirmed",
+    "internal": {
+      "service": "absent",
+      "fixture-check": "absent",
+      "harness": "absent",
+      "carried": null,
+      "refusal": null
+    }
+  }
+}
