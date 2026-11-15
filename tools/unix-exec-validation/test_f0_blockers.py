@@ -235,7 +235,8 @@ class F0Blockers(unittest.TestCase):
                 keys = {k.arg for k in node.keywords}
                 self.assertIn('stderr', keys)
                 if node.func.attr != 'check_output': self.assertIn('stdout', keys)
-        self.assertEqual(len(sites), 13)
+        self.assertEqual(len(sites), 14)
+        self.assertEqual(sites.count('run_parent'), 3)
         self.assertEqual(set(sites), set(driver.SITES) - {'service_cg', 'service_runs'})
 
 SOURCE = Path(__file__).with_name('driver.py').read_text()

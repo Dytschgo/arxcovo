@@ -3,7 +3,7 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #117, `7113a420140de8a45a17c82a25305f8794c3adb8` at 04:22:45Z, independent Muse refreshed-head PASS and all five gates green. Squash tree `f323a747839bf619eb2f140261cfb4b56b6a654a` equals reviewed `a6d9440`; SDK cancelled/confirmed-cleanup durable activity join merged (test-only).
-- Current work: publish dormant A7/A11 Slice1 after independent Muse `a4f4df5` PASS on all axes, zero findings. Reviewer reran A4 mapping, nine SudoNnp mocks, inventory/fmt/diff green; delivery=None and host/policy=False retain closed boundary. Source-only evidence; hosted Linux compile and exact-head review pending, no A7/A11 native or M2/full F/G/PA6 credit.
+- Current work: PR118 source PASS but hosted guard/E4 pin checks failed at ea34cbf. Coordinator reproduced exact failures, fixed protected-call count14/run_parent multiplicity3 and refreshed two cfg(test) source hashes only. Exact regressions red-to-green; 120 portable Unix guard and22 E4 tests pass, anchors/guards/manifests unchanged. Publishing correction for fresh-head review/CI; Linux integration/native A7/A11 remain unverified and delivery/policy gates closed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 

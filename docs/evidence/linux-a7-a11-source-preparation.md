@@ -101,3 +101,28 @@ This slice earns source/pure/mock evidence only.
 | `tools/unix-exec-validation/driver.py` | `2d8a61f9174acf2e7ce3493b851a739c91ff5dd0` |
 | `tools/unix-exec-validation/test_driver.py` | `f1ba403bfdd7be4339d7dc18a8006f58088624d9` |
 | `tools/unix-exec-validation/mutation_check.py` | `1623185403f481abfb2a838fc4c4590a3143e950` |
+
+## Coordinator CI maintenance correction
+
+Published head ea34cbf failed hosted pure guard suites on all platforms at
+`F0Blockers.test_subprocess_sinks`: 14 protected call sites versus historical
+13. The new dormant sudo preparation adds one `run_parent` call (three total);
+all prior sites remain. The assertion now expects14 and separately pins three
+run_parent calls; the existing complete site-set check is retained.
+
+Portable E4 failed `test_fixed_manifest_and_production_fragments_read_only`
+because both reviewed cfg(test) source files retained old hashes in the evidence
+harness. Recomputed SHA-256 from committed LF Git blobs:
+
+- unix_shim_rights_linux.rs: old2eb9036e2d6800d1376e3fe7bfce9f88cb1d8e38e69ddca8bd2a7de1164e3efd,
+  new3fc3e949dc0725d22d466c12f1ef3fa13d395fea586a84546c8cb4e4be8ceef4.
+- unix_shim_rights_linux_tests.rs: old102ec5720cd1ecfd1236ebea4237025e155bcef974de27ad876b550525e059fd,
+  new672bc7e57bd6251b5e4db4a51e78de5f930b962ab9b3034774b128b4cacb7048.
+
+Only those two PINS strings change; manifest SHA, mutations, all other pins,
+guards and execution bounds are unchanged. The exact two failing tests went
+red before and green after correction locally. Whole portable suites then
+passed: 120 Unix guard tests (internal757/outer2447) and22 E4 tests, including
+all11 in-memory mutation anchors applying exactly once. No native fixture,
+account, sudo, helper, LinuxFs or dispatch ran. Hosted Linux compilation remains
+a fresh-head gate; this correction creates no native credit.
