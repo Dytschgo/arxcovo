@@ -367,7 +367,7 @@ def sudo_nnp_source_checks():
         ("if index == 0:", "if False:", "test_two_cases_and_owned_cleanup"),
     ]
     for before, after, name in cases:
-        fixture = source[:source.index('def sudo_nnp_artifact')]
+        fixture = source[:source.index('# Candidate only:')]
         assert fixture.count(before) == 1
         module = types.ModuleType('sudo_nnp_mutant')
         exec(compile(source.replace(fixture, fixture.replace(before, after)), '<in-memory-mutant>', 'exec'), module.__dict__)
@@ -381,6 +381,59 @@ def sudo_nnp_source_checks():
     print('A7/A11 pure and mock source bytes unchanged')
 
 
+def controlled_policy_mutants():
+    baseline = unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.ControlledPolicy)
+    assert unittest.TextTestRunner().run(baseline).wasSuccessful()
+    source = Path(driver.__file__).read_text()
+    cases = [
+        ("for _ in sudo_nnp_accounts(run, accounts):\n        pass", "prepare_sudo_nnp(run, accounts)", 'test_controlled_preparation_poison_legacy_writer'),
+        ("len(mappings) == 4 and set(mappings) == set(expected)", "True", 'test_literal_and_mapping_closed_sets'),
+        ("require(unit_gone is True, 'E_QUARANTINE_CGROUP')\n    # Partial/unidentified", "pass\n    # Partial/unidentified", 'test_stage_is_exclusive_private_and_quarantines_short_write'),
+        ("pin is not None and controlled_pin(held, directory) == pin", "True", 'test_source_inode_and_entry_recheck'),
+        ("set(os.listdir(fd)) == expected", "True", 'test_source_inode_and_entry_recheck'),
+        ("case0 + ' ALL=(root) NOPASSWD: /usr/bin/true", "_case1 + ' ALL=(root) NOPASSWD: /usr/bin/true", 'test_literal_and_mapping_closed_sets'),
+    ]
+    for before, after, name in cases:
+        assert source.count(before) == 1, before
+        module = types.ModuleType('controlled_mutant')
+        exec(compile(source.replace(before, after), '<controlled-mutant>', 'exec'), module.__dict__)
+        with patch.object(test_driver, 'driver', module):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(
+                unittest.TestSuite([test_driver.ControlledPolicy(name)]))
+        assert result.failures and not result.errors, name + str(result.errors)
+        print('KILLED controlled ' + before)
+    root = Path(__file__).resolve().parents[2]
+    controller = (root / 'crates/arxd/src/exec/disposable/sudo_nnp.rs').read_text()
+    names = controller[controller.index('fn delivery_names('):controller.index('fn delivery_schema(')]
+    ports = controller[controller.index('const CONTROLLED_PLUGIN'):controller.index('fn controlled_read(')]
+    tests = controller[controller.index('#[test]\nfn a7_controlled_policy_discriminators'):controller.index('fn recheck_delivery(')]
+    code = names + ports + tests
+    mutants = [
+        ('mappings.len() == 4', 'true'),
+        ('seen == [1; 4]', 'true'),
+        ('o == "ro"', 'true'),
+        ('entries.len() == 4', 'true'),
+        ('*data == b', 'true'),
+    ]
+    with tempfile.TemporaryDirectory(prefix='controlled-ports-') as tmp:
+        exe = Path(tmp) / 'ports.exe'
+        def check(code):
+            built = subprocess.run(['rustc', '--edition=2024', '--test', '-', '-o', str(exe)],
+                                   input=code, text=True, capture_output=True, timeout=60)
+            assert built.returncode == 0, built.stderr
+            return subprocess.run([str(exe), 'a7_controlled_policy_discriminators', '--exact'],
+                                  text=True, capture_output=True, timeout=20)
+        result = check(code)
+        assert result.returncode == 0, result.stdout
+        print('PASS actual controlled literal/mapping/mount pure Rust ports')
+        for before, after in mutants:
+            assert code.count(before) == 1, before
+            result = check(code.replace(before, after))
+            assert result.returncode == 101 and 'assertion' in result.stdout, before + result.stdout
+            print('KILLED controlled Rust ' + before)
+
+
 if __name__ == '__main__':
     main()
     rust_mutants()
+    controlled_policy_mutants()

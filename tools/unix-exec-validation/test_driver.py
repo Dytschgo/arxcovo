@@ -1222,6 +1222,7 @@ class SudoNnp(unittest.TestCase):
         for owner, name, kw in [
             (driver, 'sudo_nnp_eligible', dict(return_value=True)),
             (driver, 'protected', {}), (driver, 'cg_scan', {}),
+            (driver, 'sudo_nnp_open', dict(return_value=17)),
             (driver, 'call', dict(side_effect=call)), (driver, 'same_object', {}),
             (driver.os, 'getuid', dict(return_value=0)), (driver.os, 'geteuid', dict(return_value=0)),
             (driver.os.path, 'lexists', dict(return_value=False)),
@@ -1318,7 +1319,7 @@ class SudoNnp(unittest.TestCase):
         owned = []
         with self.assertRaisesRegex(RuntimeError, 'E_CAPTURE'):
             driver.prepare_sudo_nnp('123-1', owned)
-        mocks['close'].assert_called_once_with(17)
+        self.assertEqual(mocks['close'].call_args_list, [unittest.mock.call(17), unittest.mock.call(17)])
         with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_PATH_UNCAPTURED'):
             driver.cleanup_sudo_nnp(owned, unit_gone=True)
         self.assertEqual(len(events), 1)
@@ -1507,3 +1508,171 @@ class SudoNnpDelivery(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ControlledPolicy(unittest.TestCase):
+    setup_owned = SudoNnp.setup_owned
+
+    def test_closed_before_effects_and_no_legacy_edge(self):
+        with patch.object(driver, 'stage_controlled_sudo_nnp') as stage, \
+             patch.object(driver, 'sudo_nnp_accounts') as accounts:
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_UNATTESTED'):
+                driver.prepare_controlled_sudo_nnp('123-1', [], {})
+            stage.assert_not_called()
+            accounts.assert_not_called()
+        tree = ast.parse(Path(driver.__file__).read_text())
+        functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        pending, seen = ['prepare_controlled_sudo_nnp'], set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            body = ast.unparse(functions[name])
+            self.assertNotIn("Path('/etc", body)
+            self.assertNotIn('visudo', body)
+            for call in ast.walk(functions[name]):
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in functions:
+                    pending.append(call.func.id)
+        self.assertNotIn('prepare_sudo_nnp', seen)
+        self.assertNotIn('run_body', seen)
+
+    def test_accounts_without_host_policy(self):
+        users, groups, events, mocks = self.setup_owned()
+        owned = []
+        # Poison the legacy writer's effects, while account effects stay mocked.
+        mocks['open'].side_effect = AssertionError('host policy write')
+        mocks['run'].side_effect = AssertionError('visudo')
+        list(driver.sudo_nnp_accounts('123-1', owned))
+        self.assertEqual(len(owned), 2)
+        self.assertTrue(all(a['policy'] is None for a in owned))
+        driver.cleanup_sudo_nnp(owned, True)
+        self.assertEqual(users, {})
+        self.assertEqual(groups, {})
+
+    def test_literal_and_mapping_closed_sets(self):
+        expected = ('sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d')
+        mappings = driver.controlled_mappings('123-1')
+        self.assertEqual(mappings, tuple('/var/lib/arx-ci-123-1/fx/' + n + ':/etc/' + n for n in expected))
+        driver.controlled_mapping_set('123-1', mappings)
+        for bad in (mappings[:3], mappings + (mappings[0],), ('-' + mappings[0],) + mappings[1:],
+                    mappings[:3] + ('/foreign:/etc/sudoers.d',)):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_MAPPING'):
+                driver.controlled_mapping_set('123-1', bad)
+        literals = driver.controlled_literals('123-1')
+        self.assertEqual(literals, {
+            'sudoers': b'#includedir /etc/sudoers.d\n',
+            'sudo.conf': b'Plugin sudoers_policy /usr/libexec/sudo/sudoers.so\n',
+            'nsswitch.conf': b'passwd: files\ngroup: files\nsudoers: files\n',
+            'sudoers.d/10-a7-case0': b'arxsn123x1r ALL=(root) NOPASSWD: /usr/bin/true\n'})
+        self.assertNotIn(b'arxsn123x1n', b''.join(literals.values()))
+        override = driver.controlled_override('123-1')
+        self.assertEqual(override.count('BindReadOnlyPaths='), 4)
+
+    def test_partial_cleanup_quarantines(self):
+        with patch.object(driver.os, 'unlink') as unlink, patch.object(driver.os, 'rmdir') as rmdir:
+            for owned in ({}, {'pending': True, 'entries': []}, {'entries': [('fx', 1, None)]}):
+                with self.assertRaises(RuntimeError):
+                    driver.cleanup_controlled_sudo_nnp('123-1', owned, True)
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+
+    def test_source_inode_and_entry_recheck(self):
+        import hashlib
+        literals = driver.controlled_literals('123-1')
+        entries = [('fx', 1, (1, 1, None)), ('fx/sudoers.d', 2, (1, 2, None))]
+        entries += [('fx/' + n, i + 3, (1, i + 3, hashlib.sha256(b).hexdigest()))
+                    for i, (n, b) in enumerate(literals.items())]
+        pins = {fd: pin for _, fd, pin in entries}
+        pins.update({fd + 100: pin for _, fd, pin in entries})
+        def listing(fd):
+            return ['10-a7-case0'] if fd == 102 else ['sudoers', 'sudo.conf', 'nsswitch.conf', 'sudoers.d']
+        with patch.object(driver, 'sudo_nnp_open', side_effect=[e[1] + 100 for e in entries] * 8), \
+             patch.object(driver, 'controlled_pin', side_effect=lambda fd, directory=False: pins[fd]), \
+             patch.object(driver.os, 'listdir', side_effect=listing) as ls, patch.object(driver.os, 'close'):
+            driver.recheck_controlled_sudo_nnp('123-1', {'entries': entries})
+            pins[3] = (1, 999, entries[2][2][2])
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
+                driver.recheck_controlled_sudo_nnp('123-1', {'entries': entries})
+        with patch.object(driver, 'controlled_pin', return_value=(1, 1, None)), \
+             patch.object(driver, 'sudo_nnp_open', return_value=1), \
+             patch.object(driver.os, 'listdir', return_value=['extra']), patch.object(driver.os, 'close'):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_ENTRIES'):
+                driver.recheck_controlled_sudo_nnp('123-1', {'entries': entries})
+
+    def test_pin_ownership_mode_type_links_and_bounded_bytes(self):
+        import hashlib
+        good = dict(st_dev=1, st_ino=2, st_uid=0, st_gid=0, st_mode=stat.S_IFREG | 0o440,
+                    st_nlink=1, st_size=3)
+        with patch.object(driver.os, 'lseek'), patch.object(driver.os, 'read', side_effect=[b'abc', b'']), \
+             patch.object(driver.os, 'fstat', return_value=SimpleNamespace(**good)):
+            self.assertEqual(driver.controlled_pin(17), (1, 2, hashlib.sha256(b'abc').hexdigest()))
+        for key, value in [('st_uid', 1000), ('st_gid', 1000), ('st_mode', stat.S_IFREG | 0o640),
+                           ('st_mode', stat.S_IFLNK | 0o440), ('st_nlink', 2)]:
+            with patch.object(driver.os, 'fstat', return_value=SimpleNamespace(**(good | {key: value}))):
+                with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
+                    driver.controlled_pin(17)
+        with patch.object(driver.os, 'lseek'), patch.object(driver.os, 'read', return_value=b'x'*4097), \
+             patch.object(driver.os, 'fstat', return_value=SimpleNamespace(**good)):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_BOUND'):
+                driver.controlled_pin(17)
+        with patch.object(driver.os, 'lseek'), patch.object(driver.os, 'read', side_effect=[b'abc', b'']), \
+             patch.object(driver.os, 'fstat', side_effect=[SimpleNamespace(**good), SimpleNamespace(**(good | {'st_ino': 3}))]):
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_IDENTITY'):
+                driver.controlled_pin(17)
+
+    def test_stage_is_exclusive_private_and_quarantines_short_write(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(driver, 'sudo_nnp_eligible', return_value=True))
+            stack.enter_context(patch.object(driver.os, 'getuid', return_value=0, create=True))
+            stack.enter_context(patch.object(driver.os, 'geteuid', return_value=0, create=True))
+            for flag in ('O_NOFOLLOW', 'O_CLOEXEC'):
+                stack.enter_context(patch.object(driver.os, flag, 0x100000, create=True))
+            stack.enter_context(patch.object(driver, 'sudo_nnp_open', return_value=17))
+            stack.enter_context(patch.object(driver, 'controlled_pin', return_value=(1, 2, 'digest')))
+            stack.enter_context(patch.object(driver, 'recheck_controlled_sudo_nnp'))
+            stack.enter_context(patch.object(driver.os, 'fstat', return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)))
+            mkdir = stack.enter_context(patch.object(driver.os, 'mkdir'))
+            opened = stack.enter_context(patch.object(driver.os, 'open', return_value=18))
+            write = stack.enter_context(patch.object(driver.os, 'write', side_effect=lambda fd, b: len(b)))
+            chmod = stack.enter_context(patch.object(driver.os, 'fchmod', create=True))
+            stack.enter_context(patch.object(driver.os, 'close'))
+            stack.enter_context(patch.object(driver.os, 'unlink'))
+            stack.enter_context(patch.object(driver.os, 'rmdir'))
+            owned = {}
+            driver.stage_controlled_sudo_nnp('123-1', owned)
+            self.assertEqual(len(owned['entries']), 6)
+            self.assertEqual([c.args[0] for c in mkdir.call_args_list], ['fx', 'fx/sudoers.d'])
+            self.assertTrue(all(c.kwargs == {'mode': 0o700, 'dir_fd': 17} for c in mkdir.call_args_list))
+            self.assertEqual([c.args[0] for c in opened.call_args_list], ['fx/' + n for n in driver.controlled_literals('123-1')])
+            self.assertTrue(all(c.args[1] & driver.os.O_EXCL and c.args[2] == 0o440 for c in opened.call_args_list))
+            write.side_effect = lambda fd, b: len(b)-1
+            partial = {}
+            with self.assertRaisesRegex(RuntimeError, 'E_POLICY_WRITE'):
+                driver.stage_controlled_sudo_nnp('123-1', partial)
+            self.assertTrue(partial['pending'])
+            self.assertIsNone(partial['entries'][-1][2])
+            with self.assertRaisesRegex(RuntimeError, 'E_QUARANTINE_CGROUP'):
+                driver.cleanup_controlled_sudo_nnp('123-1', partial, False)
+
+    def test_controlled_preparation_poison_legacy_writer(self):
+        self.setup_owned()
+        with patch.object(driver, 'stage_controlled_sudo_nnp') as stage, \
+             patch.object(driver, 'prepare_sudo_nnp', side_effect=RuntimeError('HOST_POLICY_WRITE')) as legacy:
+            owned = []
+            try:
+                driver.prepare_controlled_sudo_nnp('123-1', owned, {})
+            except RuntimeError as error:
+                self.fail(str(error))
+            self.assertEqual(len(owned), 2)
+            self.assertTrue(all(a['policy'] is None for a in owned))
+            stage.assert_called_once_with('123-1', {})
+            legacy.assert_not_called()
+
+    def test_invalid_identity_before_staging_effects(self):
+        with patch.object(driver, 'sudo_nnp_eligible', return_value=True), \
+             patch.object(driver, 'sudo_nnp_open') as opened:
+            for run in ('1-1234567', '../foreign', '0-1'):
+                with self.assertRaisesRegex(RuntimeError, 'E_IDENTITY'):
+                    driver.stage_controlled_sudo_nnp(run, {})
+            opened.assert_not_called()
