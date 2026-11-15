@@ -25,7 +25,12 @@ The research proposed keeping host two as a learner until host three joins and c
 
 A replicated `max(previous_time, leader_wall_clock)` prevents a decreasing stored timestamp; it does not alone prove real 15-minute expiry after clock rollback or a slow-clock failover. Define trusted clock/skew assumptions and fail-closed behavior, then test rollback, forward jumps and failover. Do not claim a real-time guarantee from that maximum alone.
 
-CA-key distribution across voters versus an enrollment-signing role, key rotation/revocation, certificate lifetime, retry limits and embedded storage remain design decisions. No new owner approval workflow is introduced. Resolve them through the security design before coding, without storing a private CA key in the Raft log.
+Key rotation, certificate lifetime and retry limits remain open design decisions. No new owner approval workflow is introduced. Resolve them through the security design before coding, and never store a private CA key in the Raft log.
+
+### Amendment 2026-11-15: member registry and issuer role
+
+- **Authorization source.** Committed state holds a bounded member registry (node → SPKI digest), written atomically with code consumption. Founders are registered once. Revocation means removal from the registry. Node IDs are never reused, so an allocated ID that is missing from the registry is revoked, and an expired consumed record never ends a member's binding. Peer verification checks the CA chain plus this registry on the local applied state. A certificate is never the authority on its own. A replayed Redeem for a removed node returns no grant. One key cannot be bound to two current members. Removing a node from the registry does not change Raft membership. The later membership workflow pairs the two. See [the registry brief](../briefs/m3-enrollment-certificate-next-slice.md).
+- **Issuer role.** Every voter that holds the sealed CA key may issue certificates, and learners never hold it. This keeps joins available whenever writes are, and avoids making one host a single point of failure for joins and renewals. A stolen CA key alone cannot impersonate a member, because verifiers also require the committed binding. Issuance uses only the grant committed on the leader, with fresh guards before signing and again before the certificate is released. It signs only the CSR's proven public key, and the signer builds the certificate parameters itself. CA key transfer to new voters and sealing under the daemon identity are still future work and **unverified on real hardware**.
 
 ## Required bounded probes
 
