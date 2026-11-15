@@ -250,10 +250,9 @@ pub(super) fn open_db(
     }
     Ok((lock, db))
 }
+type SnapshotPositions = (Option<LogPos>, Option<(LogPos, MembershipBlob)>);
 impl StateStore {
-    pub(super) fn peek(
-        blob: &[u8],
-    ) -> Result<(Option<LogPos>, Option<(LogPos, MembershipBlob)>), StoreError> {
+    pub(super) fn peek(blob: &[u8]) -> Result<SnapshotPositions, StoreError> {
         let image = decode(blob)?;
         Ok((image.applied, image.membership))
     }

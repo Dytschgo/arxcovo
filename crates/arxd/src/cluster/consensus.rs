@@ -210,7 +210,9 @@ use super::{
 };
 use adapter::{LogAdapter, SmAdapter, blocking};
 use openraft::{
-    Config, Raft, SnapshotPolicy,
+    Config, LinearizerOption, Raft, SnapshotPolicy,
+    errors::{ClientWriteError, LinearizableReadError, RaftError},
+    impls::ProgressResponder,
     network::{NetSnapshot, RaftNetworkFactory},
 };
 use std::{
@@ -219,7 +221,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
     task::JoinSet,
     time::{Instant, timeout_at},
 };
@@ -299,6 +301,66 @@ impl ConsensusNode {
             owners: Mutex::default(),
         })
     }
+    pub async fn propose(&self, cmd: Command) -> Result<(LogPos, Option<Outcome>), ProposeError> {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ProposeError::Busy)?;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut owners = self.owners.lock().map_err(|_| ProposeError::Stopped)?;
+            if owners.closed {
+                return Err(ProposeError::Stopped);
+            }
+            while owners.set.try_join_next().is_some() {}
+            let raft = self.raft.as_ref().ok_or(ProposeError::Stopped)?.clone();
+            owners.set.spawn(async move {
+                let (responder, reply) = ProgressResponder::<Arx, _>::complete_only();
+                let result = match raft.client_write_ff(cmd, Some(responder)).await {
+                    Err(_) => Err(ProposeError::Unknown),
+                    Ok(()) => match reply.await {
+                        Ok(Ok(r)) => Ok((pos(r.log_id), r.data.0)),
+                        Ok(Err(ClientWriteError::ForwardToLeader(f))) => {
+                            Err(ProposeError::NotLeader(f.leader_id))
+                        }
+                        _ => Err(ProposeError::Unknown),
+                    },
+                };
+                drop(permit);
+                let _ = tx.send(result);
+            });
+        }
+        rx.await.unwrap_or(Err(ProposeError::Unknown))
+    }
+    pub async fn linearizable_state(&self) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
+        let raft = self.raft.as_ref().ok_or(ReadError::Unavailable)?;
+        let read = raft
+            .ensure_linearizable(
+                LinearizerOption::new(Some(Duration::ZERO), true)
+                    .with_wait_timeout(Duration::from_millis(1500)),
+            )
+            .await
+            .map_err(|e| match e {
+                RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
+                    ReadError::NotLeader
+                }
+                RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+                    ReadError::NoQuorum
+                }
+                _ => ReadError::Unavailable,
+            })?;
+        let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
+        blocking(move || {
+            let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
+            if s.applied().is_none_or(|p| p.index < read.index()) {
+                return Err(StoreError::Corrupt);
+            }
+            Ok((s.applied(), s.snapshot()))
+        })
+        .await
+        .map_err(|_| ReadError::Unavailable)
+    }
     pub async fn shutdown(&mut self) -> Result<(), Orphaned> {
         let deadline = Instant::now() + Duration::from_secs(5);
         self.owners.lock().map_err(|_| Orphaned)?.closed = true;
@@ -339,4 +401,6 @@ impl ConsensusNode {
 }
 
 #[cfg(test)]
-use tests::mem_net;
+mod mem_net;
+#[cfg(test)]
+mod three_node;
