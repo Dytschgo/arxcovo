@@ -5,12 +5,13 @@ all five hosted gates and coordinator merge remain pending.
 
 Base/last merged PR #106: `40adbe55672293c894abd2d49be4de630e62577e`.
 Prepared source: `5dba9dfc840539d8df390eb4bd827c8b1a31a486` (local, never dispatch authority).
-PR #108 deterministic privacy fixture merge, actual full main SHA and accepted
-execution-blob baseline: **pending coordinator fill**. No remote query or merge
-was performed. Coordinator must integrate/verify that reviewed baseline, retain
-its complete execution inventory, and compare the allowed delta before candidate
-publication. The first qualifying normal gated main squash is the sole candidate;
-its actual full SHA/readback/blob comparison is still pending, never this head.
+The coordinator has now integrated accepted PR #108 baseline
+`1869175ba31e5c81386f45d293ed50365081fb1f`; its tree equals reviewed
+`76c49d2`, with five gates and independent PASS. See the accepted-baseline
+section and complete inventory below. The first qualifying normal gated main
+squash of this candidate remains pending review/checks/merge; no local source
+head is dispatch authority. Builder-stage failures and pins below are retained
+as preparation history, followed by the coordinator's corrections.
 
 Read AGENTS/KICKOFF, ADR0019 preamble/D7–D7d, all ADR0020 D9a bindings,
 helper source/build pins, fixture evidence, fixed-helper/runtime/fixture/delivery
@@ -65,7 +66,7 @@ adapter, proc/cgroup/systemd/sudo, owner, network or publication path was run.
 - `git diff --check` passed. Full mutation_check/F0/F0b runs, native tests,
   hosted helper compile and five hosted gates were not run or credited.
 
-**Integration blocker:** PR #108 must merge first and the full guard suite must
+**Builder-stage integration blocker (resolved below):** PR #108 must merge first and the full guard suite must
 pass on the accepted integrated source. If its reviewed fixture changes do not
 resolve the stale lifecycle mocks, a separate bounded source correction/review
 is needed; this scope does not authorize it. Do not merge/dispatch this candidate
@@ -81,7 +82,7 @@ push, subagent, variable change, dispatch or workflow run occurred.
 
 ## Prepared execution pins (Git blobs at source pin)
 
-These are local preparation pins, not the missing PR #108 baseline or candidate.
+These are historical local preparation pins, not the accepted PR #108 baseline or candidate.
 All unchanged helper/fixture/package blobs equal #106. The coordinator must
 re-establish full baseline/candidate pins after integration; no future SHA is
 fabricated here.
