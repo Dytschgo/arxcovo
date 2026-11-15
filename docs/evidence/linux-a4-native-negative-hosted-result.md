@@ -42,3 +42,7 @@ positive-feedback scope; it alone did not establish A4 acceptance. No new
 source/tests/builds/native reruns were performed to write this note. A4
 acceptance is pending independent assessment. M2, A7–A12, full F/G and real-Runner
 PA6 remain open; installed/dedicated paths are **unverified on real hardware**.
+
+## Independent disposition
+
+Muse assessment `21c7615` passed Standards, Spec and Security without findings after inspecting the executed source/oracle join. Combined source and hosted evidence closes only D9a A4 disposable present-residue mechanism plus native omitted-kill. Crash provenance/A9/U9, M2, full F/G and PA6 remain open. [Assessment](../reviews/m2-a4-native-negative-hosted-muse-assessment.md). No further native authority.
