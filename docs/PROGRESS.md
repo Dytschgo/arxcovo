@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #130, `18b8fef58403e5ffadfd3f580d6a2a961c6d754c` at 13:15:14Z, independent Muse exact-head PASS and all five required gates green. Squash tree `215d75d3eeb09dd513846c73143f757454e6ce7a` equals reviewed `291a08a`; four closed pre-mutation path-role labels, no fence or grant change.
-- Current work: independent Muse source/security review of finite A7 read-only admission candidate24ee0f9 retainede3cef57. New manual workflow/gated wrapper/mocks plus proposed D7j; shared driver unchanged, no host reads. Builder13 tests/seven fence assertion kills pass; baseline/mode/source inventory recorded. Fresh source/exact-head reviews, five gates and merge precede any root read. D7a-i consumed, D9b controlled policy unchanged; completion wake awaited.
+- Current work: publish independently reviewed finite A7 read-only admission candidate; Muse778a367 source/security PASS, no blockers, driver unchanged. Builder13 mocks/seven assertion kills retained as builder evidence. Exact-head review/five gates/coordinator merge and exact tree/source pins precede any D7j read-only dispatch. No A7/A11/native acceptance or combined-run authority; D7a-i consumed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Muse high778a367 independently passes finite read-only candidate Standards/Spec/Security with no blockers: source/modes/pins, gate-before-import, fixed read-only callgraph, held-FD closure and closed output inspected; 13 builder tests/seven assertion kills reused, no rerun/native operation. Coordinator retains review and publishes exact eight-path candidate through normal exact-head review/gates; D7j not yet effective.
 
 - 2026-11-15: Sol high24ee0f9 retainede3cef57 implements finite path-admission-only candidate: manual3min workflow, distinct pin, gate-before-import, source-pinned shared driver and held-descriptor local read adapter stopping before unsafe ancestors, closed role/predicate output.13 mocked tests andseven fence mutants pass; no shared driver change or host/native read. Coordinator inspected exactfive-path implementation and requests fresh independent Muse review before publication.
 
