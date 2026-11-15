@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #142, `4f323c36e2d134b56c1f6efb3035b6cc18143c84` at18:32:43Z; independent Opus exact-head PASS6899129519/status58972231000 and all five required gates green. Reviewed9deec76/squash trees equal; first M3 pure enrollment core only, not cluster acceptance.
-- Current work: independent Opus review of implemented M3 verifier boundary and durable SQLite enrollment state-store probe. Builder22 cluster tests/four crash probes/fmt/offline Clippy pass; broader Windows workspace run failed eight owner-security fixture setup tests (access denied, no baseline established), recorded without remediation or waiver. Hosted OS gates remain required. No quorum/signing/transport or power-loss claim; M2 gaps remain open.
+- Current work: publish independently reviewed M3 durable enrollment store through exact-head review and hosted Windows/macOS/Ubuntu gates. Opus recheck5366bf1 closes R1 with three counterfactuals; 23 cluster tests/four process-kill probes/fmt/Clippy pass independently. Broader Windows owner-security fixture failures remain recorded and unattributed; no admin remediation or waiver. Local process-kill consistency only, no quorum/signing/power-loss claim; M2 remains incomplete.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus high5366bf1 rechecks R1 membership decoder coverage with8192-limit and decoder-only bypass counterfactuals; new test detects both while old test misses decoder bypass. Independently reran23cluster/four-kill/fmt/Clippy, all pass. Coordinator publishes durable-state probe for exact-head review and hosted OS gates. No power-loss/quorum/three-node acceptance or M2 closure.
 
 - 2026-11-15: Opus high67bf037 retained2e7e5e1 passes durable-store source/security but finds decoder membership-limit test vacuous. Coordinator adds full4097-byte canonical image plus0/4096/4097 constructor controls; production unchanged. Reran23 cluster tests/four crash probes/fmt/offline Clippy/diff, all pass. Fresh Opus delta recheck pending; broader workspace access-denied failures remain recorded, no admin action or waiver.
 
