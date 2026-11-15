@@ -15,6 +15,7 @@ pub(super) struct MemRouter {
     pub append_max: AtomicUsize,
     pub snapshot_max: AtomicUsize,
     pub snapshots: AtomicUsize,
+    pub snapshots_to: Mutex<BTreeMap<u64, usize>>,
 }
 #[derive(Clone)]
 pub(super) struct Factory {
@@ -99,8 +100,16 @@ impl RaftNetworkV2<Arx> for MemNetwork {
         if snapshot.snapshot.len() > 16384 {
             return Err(StreamingError::Unreachable(unreachable()));
         }
+        let remote = self.remote(vote.leader_id.node_id)?;
         self.router.snapshots.fetch_add(1, Ordering::Relaxed);
-        self.remote(vote.leader_id.node_id)?
+        *self
+            .router
+            .snapshots_to
+            .lock()
+            .unwrap()
+            .entry(self.target)
+            .or_default() += 1;
+        remote
             .install_full_snapshot(vote, snapshot)
             .await
             .map_err(|_| StreamingError::Unreachable(unreachable()))

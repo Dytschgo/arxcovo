@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #144, `38750cf1e179e14da6fa871972027b6d66028ec9` at20:19:15Z; independent Opus corrected-head PASS6900558533/status58975979309 and all five gates green. Reviewed303f5a8/squash full trees equal. Hosted Windows/macOS/Ubuntu validate vote/log process-kill probes; ADR0023 and prominent M2 closure plan now on main.
-- Current work: publish independently reviewed OpenRaft adapter/service T1/T2/U6 through exact-head review and hosted gates. Opus source review1fc7036 PASS all axes,98cluster/fmt/Clippy and five counterfactuals independently pass. T3 snapshot catch-up locally prepared on separate follow-up branch, not yet reviewed or credited here. Shutdown descriptor-close timing and caller deadlines remain explicit integration risks. No transport/signing/fullM3 claim; M2 remains open under Ordering.
+- Last merged: PR #145, `765df2bd1df6271ff06a961f581029544b4835d1` at22:07:38Z; independent Opus corrected-head PASS6902028887/status58979861977 and all five gates green. Reviewed7e053d2/squash full trees equal; in-process real-engine T1/T2/U6 only, no transport or fullM3 acceptance.
+- Current work: publish independently reviewed test-only T3 full-snapshot catch-up follow-up through exact-head review and hosted gates. Source reviewabf7a5e retained6553408 PASS with actual snapshot/install convergence and counterfactuals; parent PR145 merged. M2 closure plan remains active and unchecked, native gaps and A7/A12 no-retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -25,6 +25,14 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-15: Coordinator verifies PR145 corrected head/all five gates, unwatches and merges765df2b; reviewed/squash trees equal. T3 branch incorporates squash retaining reviewed test-only additions and parent U6 correction; source add/add conflicts arise from squash ancestry, resolved to composed reviewed bytes. Publishing separate snapshot catch-up after parent merge, no fullM3/M2 closure.
+
+- 2026-11-15: Opus highabf7a5e retained6553408 passes test-only T3 all axes,99cluster and focused repeated snapshot checks plus counterfactuals independently green. Parent U6 timing correction merged into follow-up without altering T3 assertions; fresh parent exact-head delta review starts next. No T3 publication before parent gates/merge.
+
+- 2026-11-15: PR145 exact-head Opus PASS6901884167/status58979456839 delivered, hosted checks pending. Coordinator refreshes separate T3 test branch with parent review/PROGRESS only; T3 feature unchanged. Fresh Opus snapshot source review starts while parent gates are watched.
+
+- 2026-11-15: Sol high19f89e7 retained1461340 completes test-only T3 snapshot catch-up on separate follow-up branch. Actual198-byte snapshot RPC to restarted follower, purged39 versus followerapplied2, convergence/consecutiveappend and disabled-route red observed. All99cluster/fmt/offlineClippy/diff pass locally. Parent T1/T2 Opus review remains active; T3 review queued afterward, separate publication/gates required. No production change or fullM3/host acceptance.
 
 - 2026-11-15: PR145 Windows U6 fails on an unsupported8s all-responder completion assertion after routing restore. Coordinator aligns test with reviewed contract: observe bounded-window resolution count, retain actual64uncommitted/zero permits/Busy and strict shutdown64/emptyowners/Weak/Stopped. Production unchanged, no timeout increase/retry. ExactU6Windows/fmt/offlineClippy pass; fresh Opus delta review queued after active T3 review and new hosted gates required.
 
