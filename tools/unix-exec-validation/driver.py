@@ -215,13 +215,23 @@ def _stable_stat(info):
 
 def a7_alias_c2():
     # Missing final C2 is allowed; missing/unsafe ancestors and dangling links refuse.
+    def open_role(path, directory, role):
+        try:
+            return sudo_nnp_open(path, directory)
+        except RuntimeError as error:
+            # Attribute only this initial pre-mutation E_PATH fence. OS errors,
+            # later admissions and all other refusal codes keep their old form.
+            if (type(error) is RuntimeError and error.args == ('E_PATH',) and
+                    feedback_mutation == 'none'):
+                raise A7PathRefusal(role) from None
+            raise
     held = []
     try:
-        parent = sudo_nnp_open(Path('/usr/local/bin'), True)
+        parent = open_role(Path('/usr/local/bin'), True, 'a7_c2_parent')
         held.append(parent)
-        root = sudo_nnp_open(Path('/'), True)
+        root = open_role(Path('/'), True, 'a7_alias_root')
         held.append(root)
-        usrbin = sudo_nnp_open(Path('/usr/bin'), True)
+        usrbin = open_role(Path('/usr/bin'), True, 'a7_alias_target')
         held.append(usrbin)
         try:
             info = os.stat('sudo', dir_fd=parent, follow_symlinks=False)
@@ -244,7 +254,7 @@ def a7_alias_c2():
         require(_stable_stat(before) == _stable_stat(after) and
                 _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')
         if info is not None:
-            fd = sudo_nnp_open(Path('/usr/local/bin/sudo'))
+            fd = open_role(Path('/usr/local/bin/sudo'), False, 'a7_c2_image')
             try:
                 pin = sudo_nnp_digest(fd)
                 require(pin['size'] == 282032 and pin['sha256'] ==
@@ -870,10 +880,23 @@ class Refusal(RuntimeError):
         super().__init__('E_PROTECTION')
 
 
+A7_PATH_ROLES = ('a7_c2_parent', 'a7_alias_root', 'a7_alias_target', 'a7_c2_image')
+
+
+class A7PathRefusal(RuntimeError):
+    def __init__(self, role):
+        require(type(role) is str and role in A7_PATH_ROLES, 'E_RECORD')
+        self.role = role
+        super().__init__('E_PATH')
+
+
 def exception_record(error):
     # Never stringify an arbitrary payload, even a RuntimeError payload.
     if type(error) is Refusal:
         return dict(error.record)
+    if type(error) is A7PathRefusal:
+        require(type(error.role) is str and error.role in A7_PATH_ROLES, 'E_RECORD')
+        return dict(code='E_PATH', role=error.role)
     if type(error) is RuntimeError and len(error.args) == 1:
         code = error.args[0]
         if type(code) is str and code in CODES:
@@ -918,6 +941,11 @@ def validate_record(record):
         if e is None:
             continue
         require(type(e) is dict, 'E_RECORD')
+        if set(e) == {'code', 'role'}:
+            require(type(e['code']) is str and e['code'] == 'E_PATH' and
+                    type(e['role']) is str and e['role'] in A7_PATH_ROLES and
+                    record['mutation_lower_bound'] == 'none', 'E_RECORD')
+            continue
         if set(e) == {'code'} and type(e['code']) is str and e['code'] in CODES:
             continue
         validate_refusal(e)
