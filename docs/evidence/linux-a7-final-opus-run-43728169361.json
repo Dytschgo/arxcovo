@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "run": "43728169361",
+  "attempt": 1,
+  "job": "132854558246",
+  "source_sha": "07d88692e2f1480c6e18ff5df846cfb871a18033",
+  "workflow_sha": "07d88692e2f1480c6e18ff5df846cfb871a18033",
+  "event": "workflow_dispatch",
+  "branch": "main",
+  "actor": "Dytschgo",
+  "triggering_actor": "Dytschgo",
+  "conclusion": "failure",
+  "started_at": "2026-11-15T15:08:15Z",
+  "completed_at": "2026-11-15T15:10:16Z",
+  "duration_seconds": 121,
+  "steps_success": 8,
+  "steps_failure": 1,
+  "feedback": {
+    "schema": "unix-protection-f0",
+    "version": 2,
+    "provenance": {
+      "source_sha": "07d88692e2f1480c6e18ff5df846cfb871a18033",
+      "workflow_sha": "07d88692e2f1480c6e18ff5df846cfb871a18033",
+      "run": "43728169361",
+      "attempt": "1"
+    },
+    "first": {
+      "code": "E_ARTIFACT"
+    },
+    "final": {
+      "code": "E_ARTIFACT"
+    },
+    "mutation_lower_bound": "staged",
+    "cleanup": "confirmed",
+    "internal": null
+  },
+  "all_three_pins_absent_http404": true,
+  "native_credit": false,
+  "retry_authorized": false,
+  "hosted_route": "NO_GO_PENDING_DEDICATED_HOST"
+}
