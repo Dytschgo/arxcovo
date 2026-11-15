@@ -122,3 +122,7 @@ Fresh Muse exact-head source review is required before publication; this is an
 implementation handoff, not independent review or native acceptance. Fresh-host
 plugin/default-path/floor proof and a separately bounded native grant remain
 required before any activation or actual host behavior can be claimed.
+
+## Independent review and S1 resolution
+
+Muse `bce660f` passed Standards/Security and found a fail-closed mapping-form concern. Coordinator checked primary systemd v254 parser/printer sources: default recursive config is printed with :rbind, matching the current Rust property predicate. No source or parser widening. [Resolution](../reviews/m2-a7-controlled-policy-mapping-resolution.md) retains actual-host rendering and all mount/profile/native gates as unverified. Reviewer reran ControlledPolicy9 and SudoNnp15 mocks green.
