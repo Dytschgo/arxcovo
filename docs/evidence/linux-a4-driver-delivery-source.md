@@ -82,3 +82,15 @@ none was started here per task instruction. No privileged filesystem mutation,
 helper/image execution, ignored test, fork, proc/cgroup/systemd/sudo, owner action
 or toolchain installation occurred. D7d remains consumed; no native authority,
 A4/M2/full F/G/PA6 acceptance follows. Hardware paths are **unverified on real hardware**.
+
+## Coordinator hosted compile-only gate
+
+To resolve pending Linux-host image equality using ordinary hosted gates, the
+coordinator adds one Linux-only verify step: nine mocked helper-tool tests, then
+build.py linux-candidate as the standard runner account. This only compiles and
+compares source/flags/image/size/symbols to the existing reviewed image pin.
+No image execution, artifact publication, owner/provisioning action, native
+selector, permission, timeout or required-check change. The image pin is not
+overwritten; a differing output fails the step. Actual Linux result remains
+pending this PR. This explicit CI delta supersedes the builder-only scope
+statement above; it is included in the fresh independent review.
