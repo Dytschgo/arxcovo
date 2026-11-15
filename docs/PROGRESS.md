@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus high c129599 rechecks exact A1/A2 install versus A3+ verification attribution; S1 closed, all axes PASS. A10 remains open for Runner migration/lifecycle proof. Coordinator publishes evidence-only note with retained review/recheck after PR139 checkpoint merge; A9/U9 join remains active, no native authority.
+
 - 2026-11-15: Opus high ee48c84 retained f162c0e reviews A10 join: Standards/Security PASS, Spec conditional on historical attribution S1. Coordinator replaces the overbroad runtime-verification sentence with exact A1/A2 exclusive install plus R4 and later A3+ loaded-file verification. A10 remains open. Bounded A9/U9 join follows, no native proposal; then independent M3.
 
 - 2026-11-15: Sol high3ce8faf retained0d3d6cf completes docs-only A10 capability evidence join. A10 stays open: accepted setup/janitor and fixture migration do not prove Runner child self-migration or lifecycle. Local link/UTF8LF/scope/diff checks passed, no tests/build/native actions. Coordinator inspected operation matrix; fresh Opus review active before publication while PR139 gates remain watched.
