@@ -628,6 +628,44 @@ fn file()->FakeFile {FakeFile {meta:FakeMeta {kind:true,uid:0,mode:0o100755,nlin
             print('KILLED runtime '+before)
 
 
+def admission_path_mutants():
+    """Audited Python-only admission chain; no compiler, native adapter or files."""
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_driver.AdmissionPathRefusal)
+    assert unittest.TextTestRunner().run(suite).wasSuccessful()
+    path = Path(driver.__file__)
+    original = path.read_bytes()
+    source = original.decode('utf-8')
+    cases = [
+        ('a4_directory', 'info.st_uid == 0', 'True', 'test_each_ancestry_conjunct'),
+        ('a4_directory', 'not info.st_mode & 0o022', 'not info.st_mode & 0o002', 'test_each_ancestry_conjunct'),
+        ('a4_directory', 'not info.st_mode & 0o022', 'not info.st_mode & 0o020', 'test_each_ancestry_conjunct'),
+        ('a4_directory', 'stat.S_ISDIR(info.st_mode)', 'True', 'test_each_ancestry_conjunct'),
+        ('sudo_nnp_open', ' | os.O_NOFOLLOW', '', 'test_qualifying_metadata_and_expected_fences'),
+        ('sudo_nnp_open', 'if directory:\n            a4_directory(fd)', 'if False:\n            a4_directory(fd)', 'test_each_ancestry_conjunct'),
+        ('a7_alias_c2', "True, 'a7_c2_parent'", "True, 'a7_alias_root'", 'test_fixed_role_attribution'),
+        ('a7_alias_c2', "feedback_mutation == 'none'", 'True', 'test_only_initial_path_code_is_attributed'),
+        ('exception_record', "return dict(code='E_PATH', role=error.role)", "return dict(code='E_PATH')", 'test_fixed_role_attribution'),
+        ('validate_record', "e['role'] in A7_PATH_ROLES", 'True', 'test_closed_role_schema_and_historical_compatibility'),
+        ('validate_record', "record['mutation_lower_bound'] == 'none'", 'True', 'test_closed_role_schema_and_historical_compatibility'),
+    ]
+    for function, before, after, name in cases:
+        start = source.index('def ' + function + '(')
+        end = source.index('\n\ndef ', start + 1)
+        block = source[start:end]
+        assert block.count(before) == 1, before
+        changed = source[:start] + block.replace(before, after) + source[end:]
+        module = types.ModuleType('path_refusal_mutant')
+        module.__file__ = driver.__file__
+        exec(compile(changed, '<in-memory-path-mutant>', 'exec'), module.__dict__)
+        with patch.object(test_driver, 'driver', module):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(
+                unittest.TestSuite([test_driver.AdmissionPathRefusal(name)]))
+        assert result.failures and not result.errors, before + str(result.errors)
+        print('KILLED path ' + function + ': ' + before)
+    assert path.read_bytes() == original
+    print('A7 path refusal source bytes unchanged')
+
+
 def execution_admission_mutants():
     source=Path(driver.__file__).read_text()
     for before,after,case,name in [

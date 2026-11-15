@@ -1772,6 +1772,179 @@ class A7Integration(unittest.TestCase):
                     self.assertEqual(events, ['policy','cleanup_sudo_nnp','cleanup_sudo_nnp_delivery','remove_runtime'])
 
 
+class AdmissionPathRefusal(unittest.TestCase):
+    """Actual admission/alias/open chain; only metadata/syscall ports are fake."""
+    def ports(self, bad=None, uid=0, mode=None, present=False, bad_call=1):
+        import ctypes
+        alias = driver.a7_alias_c2
+        ports = RuntimeAdmission.ports(self)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # Keep unittest/traceback's own filesystem reads outside the fake port.
+        stack.enter_context(patch.object(driver, 'os', SimpleNamespace(**vars(driver.os))))
+        for name, value in (('phase', 'initial'), ('mutation', 'none'),
+                            ('cleanup', 'not_reached'), ('first', None), ('internal', None)):
+            stack.enter_context(patch.object(driver, 'feedback_' + name, value))
+        stack.enter_context(patch.object(driver, 'a7_alias_c2', alias))
+        stack.enter_context(patch.object(driver, 'Path', PurePosixPath))
+        for flag, value in [('O_NOFOLLOW', 8), ('O_CLOEXEC', 16),
+                            ('O_NONBLOCK', 32), ('O_DIRECTORY', 64)]:
+            stack.enter_context(patch.object(driver.os, flag, value, create=True))
+        held, closed, opened = {}, [], []
+        actual_open = driver.sudo_nnp_open
+        calls = 0
+        def checked_open(*args):
+            nonlocal calls
+            calls += 1
+            return actual_open(*args)
+        stack.enter_context(patch.object(driver, 'sudo_nnp_open', side_effect=checked_open))
+        def open_(name, flags, dir_fd=None):
+            self.assertTrue(flags & driver.os.O_NOFOLLOW)
+            self.assertTrue(flags & driver.os.O_CLOEXEC)
+            self.assertTrue(flags & driver.os.O_NONBLOCK)
+            path = '/' if dir_fd is None else str(PurePosixPath(held[dir_fd]) / name)
+            if path != '/usr/local/bin/sudo':
+                self.assertTrue(flags & driver.os.O_DIRECTORY)
+            fd = len(opened) + 100
+            held[fd] = path
+            opened.append(path)
+            return fd
+        def metadata(path, link=False):
+            failing = path == bad and calls == bad_call
+            return SimpleNamespace(st_dev=1, st_ino=2 if path == '/usr/bin' else 3,
+                st_uid=uid if failing else 0, st_gid=0, st_nlink=1,
+                st_size=7, st_mtime_ns=1, st_ctime_ns=1,
+                st_mode=mode if failing and mode is not None else
+                    (stat.S_IFLNK | 0o777 if link else stat.S_IFDIR | 0o755))
+        def stat_(name, dir_fd, follow_symlinks=True):
+            path = str(PurePosixPath(held[dir_fd]) / name)
+            if name == 'sudo':
+                if not present: raise FileNotFoundError()
+                result = metadata(path)
+                result.st_mode = stat.S_IFREG | 0o4755
+                return result
+            return metadata('/usr/bin' if follow_symlinks else path, not follow_symlinks)
+        def readlink(fd, name, buffer, limit):
+            self.assertEqual((held[fd], name, limit), ('/', b'bin', 9))
+            buffer.raw = b'usr/bin\0\0'
+            return 7
+        call = unittest.mock.Mock(side_effect=readlink)
+        fake = SimpleNamespace(**{k: getattr(ctypes, k) for k in
+            ('c_int', 'c_char_p', 'c_void_p', 'c_size_t', 'c_ssize_t', 'create_string_buffer')},
+            CDLL=lambda _: SimpleNamespace(readlinkat=call))
+        stack.enter_context(patch.dict(sys.modules, ctypes=fake))
+        stack.enter_context(patch.object(driver.os, 'open', side_effect=open_))
+        stack.enter_context(patch.object(driver.os, 'fstat', side_effect=lambda fd: metadata(held[fd])))
+        stack.enter_context(patch.object(driver.os, 'stat', side_effect=stat_))
+        stack.enter_context(patch.object(driver.os, 'close', side_effect=closed.append))
+        stack.enter_context(patch.object(driver, 'sudo_nnp_digest', return_value=dict(
+            size=282032, sha256='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff')))
+        for name in ('call', 'reserve_unit', 'prepare_controlled_sudo_nnp'):
+            stack.enter_context(patch.object(driver, name, side_effect=AssertionError('effect reached')))
+        return ports, held, closed, opened
+
+    def test_exact_path_refusal_loop(self):
+        ports, held, closed, opened = self.ports('/usr/local', uid=1001)
+        with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+            driver.run(valid_env())
+        self.assertEqual(driver.exception_record(caught.exception)['code'], 'E_PATH')
+        self.assertEqual(driver.feedback_first['code'], 'E_PATH')
+        self.assertEqual((driver.feedback_mutation, driver.feedback_cleanup, driver.feedback_internal),
+                         ('none', 'not_reached', None))
+        self.assertEqual(opened, ['/', '/usr', '/usr/local'])
+        self.assertCountEqual(closed, held)
+        ports['cg_preflight'].assert_not_called()
+
+    def test_qualifying_metadata_and_expected_fences(self):
+        ports, held, closed, opened = self.ports(present=True)
+        self.assertEqual(driver.a7_admission(), driver.A7_PROFILE)
+        ports['cg_preflight'].assert_called_once_with()
+        self.assertIn('/usr/local/bin/sudo', opened)
+        self.assertCountEqual(closed, held)
+
+    def test_each_ancestry_conjunct(self):
+        for path in ('/', '/usr', '/usr/local', '/usr/local/bin', '/usr/bin'):
+            for uid, mode in ((1001, stat.S_IFDIR | 0o755),
+                              (0, stat.S_IFDIR | 0o775), (0, stat.S_IFDIR | 0o757),
+                              (0, stat.S_IFLNK | 0o755), (0, stat.S_IFREG | 0o755)):
+                with self.subTest(path=path, uid=uid, mode=mode):
+                    # Close each set of mocks before constructing the next chain.
+                    case = AdmissionPathRefusal()
+                    try:
+                        ports, held, closed, _ = case.ports(path, uid, mode,
+                            bad_call=3 if path == '/usr/bin' else 1)
+                        with self.assertRaisesRegex(RuntimeError, '^E_PATH$'):
+                            driver.a7_admission()
+                        self.assertCountEqual(closed, held)
+                        ports['cg_preflight'].assert_not_called()
+                    finally:
+                        case.doCleanups()
+
+    def test_fixed_role_attribution(self):
+        for call, path, role in ((1, '/usr/local', 'a7_c2_parent'),
+                                 (2, '/', 'a7_alias_root'),
+                                 (3, '/usr/bin', 'a7_alias_target'),
+                                 (4, '/usr/local', 'a7_c2_image')):
+            case = AdmissionPathRefusal()
+            try:
+                case.ports(path, uid=1001, present=True, bad_call=call)
+                with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+                    driver.run(valid_env())
+                expected = dict(code='E_PATH', role=role)
+                self.assertEqual(driver.exception_record(caught.exception), expected)
+                self.assertEqual(driver.feedback_first, expected)
+                line = driver.feedback_line(valid_env(), expected, expected)
+                self.assertEqual(driver.replay(line), {})
+                self.assertEqual(json.loads(line)['internal'], None)
+                for private in (path, '1001', 'st_uid', 'st_mode', 'sha256'):
+                    self.assertNotIn(private, line)
+            finally:
+                case.doCleanups()
+
+    def test_only_initial_path_code_is_attributed(self):
+        self.ports('/usr/local', uid=1001)
+        with patch.object(driver, 'feedback_mutation', 'staged'):
+            with self.assertRaisesRegex(RuntimeError, '^E_PATH$') as caught:
+                driver.a7_admission()
+            self.assertEqual(driver.exception_record(caught.exception), dict(code='E_PATH'))
+        for error, code in ((OSError('/private payload'), 'E_OS'),
+                            (RuntimeError('E_ARTIFACT'), 'E_ARTIFACT'),
+                            (RuntimeError('/private payload'), 'E_RUNTIME')):
+            with patch.object(driver.os, 'open', side_effect=error):
+                with self.assertRaises(type(error)) as caught:
+                    driver.a7_admission()
+                self.assertEqual(driver.exception_record(caught.exception), dict(code=code))
+
+    def test_closed_role_schema_and_historical_compatibility(self):
+        with patch.object(driver.sys, 'platform', 'linux'), \
+             patch.object(driver, 'feedback_mutation', 'none'), \
+             patch.object(driver, 'feedback_cleanup', 'not_reached'), \
+             patch.object(driver, 'feedback_internal', None):
+            for role in ('a7_c2_parent', 'a7_alias_root', 'a7_alias_target', 'a7_c2_image'):
+                e = dict(code='E_PATH', role=role)
+                line = driver.feedback_line(valid_env(), e, e)
+                self.assertEqual(driver.replay(line), {})
+                good = json.loads(line)
+                for bad in (dict(e, role='/private'), dict(e, role=7),
+                            dict(e, code='E_OS'), dict(e, uid=1001),
+                            dict(e, metadata={}), dict(e, payload='secret')):
+                    record = dict(good, first=bad, final=bad)
+                    with self.assertRaises(RuntimeError): driver.encode_record(record)
+                for changes in (dict(mutation_lower_bound='staged'),
+                                dict(cleanup='confirmed'), dict(final=dict(code='E_PATH')),
+                                dict(internal={})):
+                    with self.assertRaises(RuntimeError): driver.encode_record(dict(good, **changes))
+            historical = json.loads((ROOT / 'docs/evidence/linux-a7-a11-run-43715436515.json').read_text())['feedback']
+            self.assertEqual(driver.replay(driver.encode_record(historical)), {})
+            self.assertEqual(historical['first'], dict(code='E_PATH'))
+        for bad in ('/private', 7):
+            with self.assertRaisesRegex(RuntimeError, '^E_RECORD$'): driver.A7PathRefusal(bad)
+        for mode in driver.PRECEDENCE:
+            with self.assertRaisesRegex(RuntimeError, '^E_RECORD$'):
+                driver.validate_internal(dict(schema='unix-protection-f0-internal', version=1,
+                    mode=mode, refusal=dict(code='E_PATH', role='a7_c2_parent')), mode)
+
+
 class RuntimeAdmission(unittest.TestCase):
     """Fixed-read boundaries replaced; no native adapter is ever constructed."""
     def ports(self):
