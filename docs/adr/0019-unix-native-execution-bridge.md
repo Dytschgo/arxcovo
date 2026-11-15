@@ -12,10 +12,10 @@ The staged architecture remains inactive and grants no production constructor
 or M2 acceptance. D7a and D7b are consumed; A1/A2 acceptance is limited to
 recorded hosted run `43627472312`. D7c is fully consumed; A3 is accepted only
 for Standard `43635131545` and None `43636804545`. D7d is consumed by A5
-run `43644661407`; A5 acceptance is limited to that reviewed run. D7e proposes
-one fresh-host A4 baseline feedback run, conditional on merged PR #108 and PR #110 and a
-verified reviewed source baseline. No run permission exists before independent
-exact-head review, all five required gates, coordinator merge and candidate check. All other native execution and
+run `43644661407`; A5 acceptance is limited to that reviewed run. D7e is consumed by accepted A4 baseline dispatch
+`43666413693` on `a328060000b8cb7bb389d39f8785f96f6bcb0c25`.
+Positive baseline feedback does not satisfy the native omitted-kill requirement
+or grant A4/M2 acceptance. No further D7e run is authorized. All other native execution and
 historical retries remain unauthorized. The historical E_PROTECTION diagnosis remains
 unresolved and its environment excluded. Every other implementation,
 native-acceptance and production-activation gate remains.
@@ -546,7 +546,14 @@ unchanged. No native operation or execution permission follows from these checks
 
 ### D7e. One hosted A4 baseline feedback run (2026-11-15)
 
-**Proposed; source preparation only, no execution permission yet.** PR #106
+**Consumed by accepted dispatch `43666413693`, attempt1, exact main
+`a328060000b8cb7bb389d39f8785f96f6bcb0c25`.** Job success and confirmed
+cleanup are recorded in [baseline feedback](../evidence/linux-a4-hosted-baseline-feedback.md);
+independent baseline assessment remains pending. The reviewed-SHA variable
+is absent. No retry or further execution is authorized. The preparation
+conditions below are retained as the record of this consumed grant.
+
+PR #106
 merged as `40adbe55672293c894abd2d49be4de630e62577e`. PR #108's privacy
 fixture is included in accepted main. PR #110's reviewed SDK-owned stdio
 fixture merged as `8e4bf824b56a2c4df141f9ef8cd78616d9b53475` at
