@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #141, `8e802070fb6b6f7de663adf6fdf8420d3a8eea6a` at18:12:33Z; independent Opus exact-head PASS6898850222/status58971457086 and all five required gates green. Reviewed f90027e/squash full trees equal. Bounded A9/U9 evidence only; populated stop/crash/production Drain remain open.
-- Current work: Sol implements the independently reviewed first pure M3 enrollment core (Opus corrected contract1fbad65, Sol recheck9867540). Deterministic bounded mint/redeem/retry and injected-time issuance guard only; no signing, transport, Raft, endpoints or native activation. M2 remains incomplete with A9/U9/A10/A12/full F/G/PA6 hardware gaps open; A7 hosted FINAL NO-GO and consumed A12 no-retry remain closed.
+- Current work: publish independently reviewed first M3 pure enrollment core through exact-head review and hosted gates. Opus source review ac14a63 PASS all axes; reviewer reran13 tests/fmt/Clippy and independently verified hash vectors. No signing, transport, consensus, real expiry or host activation. M2 remains incomplete: A9/U9/A10/A12/full F/G/PA6 native gaps open, A7 hosted FINAL NO-GO and A12 consumed/no retry unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus highac14a63 independently reviews Sol M3 pure enrollment implementation, Standards/Spec/Security PASS with no blockers. Reran13 focused nextest/fmt/Clippy, independent hash vectors and scratch counterfactuals; future-adapter replay/key policies and low test-gap advisories remain explicit and do not grant acceptance. Coordinator publishes one-concern pure-core PR; no runtime endpoint/signing/Raft storage integration.
 
 - 2026-11-15: Sol high730a18a retained493106a implements exactly five Rust paths plus evidence for the reviewed M3 pure enrollment core. Builder ran13 focused nextest tests, fmt and locked offline workspace Clippy, all passed. Coordinator inspected actual diff and starts fresh Opus source/security review before publication. No network/CA/Raft/host integration or physical expiry claim; M2 remains incomplete.
 
