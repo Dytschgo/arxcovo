@@ -401,6 +401,8 @@ class EntryRun(unittest.TestCase):
         if anomaly=='captured':fs.files['feedback-service']=payload()
         if anomaly=='unknown':fs.bad_component='var'
         with ExitStack() as stack:
+            # This legacy lifecycle fixture exercises A5; A4 admission has separate mocks.
+            stack.enter_context(patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'))
             for name,value in [('phase','initial'),('mutation','none'),('cleanup','not_reached'),('first',None),('internal',None)]:
                 stack.enter_context(patch.object(driver,'feedback_'+name,value))
             stack.enter_context(patch.object(driver,'os',fs))

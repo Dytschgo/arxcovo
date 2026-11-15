@@ -563,8 +563,11 @@ accepted baseline. Compare execution blobs and the exact diff to that baseline:
 only the driver's one TEST line, the existing manual workflow's one unprivileged
 `build.py linux-candidate` compile/compare step before the privileged driver,
 the focused literal selection assertions and inverse A5 counterfactual anchor
-in `test_driver.py`/`mutation_check.py`, this ADR and supporting review/progress/
-evidence documents may differ. The non-A4 delivery refusal test explicitly
+in `test_driver.py`/`mutation_check.py`, explicit historical A5 mode pins in the
+existing lifecycle mock fixtures in `test_driver.py`, `test_f0_blockers.py` and
+`test_f0b_transport.py`, this ADR and supporting review/progress/evidence
+documents may differ. The mode pins preserve all existing lifecycle assertions;
+A4 admission remains covered by its dedicated mocks. The non-A4 delivery refusal test explicitly
 selects historical A5; it retains refusal-before-open coverage. No other driver
 fence, helper, Rust fixture, production, package, Cargo, selector, permission or
 timeout changes are permitted. Never compile the helper as root. The fresh
@@ -595,7 +598,7 @@ no repeated owner confirmation once effective; this source task performs none.
 One accepted dispatch consumes D7e regardless of result. On failure, unknown
 result or uncertain cleanup, stop, retain only existing bounded sanitized
 feedback, exclude the host and do not retry. No old environment may be reused;
-all D7a–D7d and historical `43091339273` hosts remain excluded. No owner-PC,
+all D7aâ€“D7d and historical `43091339273` hosts remain excluded. No owner-PC,
 account provisioning, admin/payment, production activation, static-VM or backup
 action is included. No helper launch or native execution is authorized by
 local pure/mock validation, review preparation or a branch SHA.
@@ -607,7 +610,7 @@ confirmed cleanup; retain the existing bounded sanitized feedback. This is
 **baseline native feedback only**. ADR0020 D9a's native omitted-kill negative
 case is still **unrun and NOT granted**. Pure/model assertion mutants cannot
 satisfy it. **A4 acceptance stays open** until that requirement is independently
-satisfied; no new mutation framework or waiver is introduced. A7–A12, full
+satisfied; no new mutation framework or waiver is introduced. A7â€“A12, full
 Stage F, Stage G, real-Runner PA6 and M2 remain open. Installed/dedicated paths
 are **unverified on real hardware**.
 

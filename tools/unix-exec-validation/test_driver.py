@@ -445,6 +445,8 @@ class A1A2(unittest.TestCase):
             raise FileExistsError('mock exclusive collision')
         lock = unittest.mock.MagicMock()
         with ExitStack() as stack:
+            # This legacy lifecycle fixture exercises A5; A4 admission has separate mocks.
+            stack.enter_context(patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'))
             stack.enter_context(patch.object(driver, 'Path', PurePosixPath))
             stack.enter_context(patch.object(PurePosixPath, 'lstat', metadata, create=True))
             stack.enter_context(patch.object(PurePosixPath, 'mkdir', mkdir, create=True))
@@ -688,6 +690,8 @@ class A1A2(unittest.TestCase):
         stage.read_text.return_value = json.dumps(dict(reason='compiler-artifact', executable='/artifact', profile={'test':True}))
         events = []
         with ExitStack() as stack:
+            # This legacy lifecycle fixture exercises A5; A4 admission has separate mocks.
+            stack.enter_context(patch.object(driver, 'TEST', 'exec::disposable::disposable_linux_a5'))
             for name, value in [('phase','initial'), ('mutation','none'), ('cleanup','not_reached'), ('first',None), ('internal',None)]:
                 stack.enter_context(patch.object(driver, 'feedback_' + name, value))
             stack.enter_context(patch.object(driver.sys, 'platform', 'linux'))

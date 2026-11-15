@@ -12,7 +12,7 @@ its complete execution inventory, and compare the allowed delta before candidate
 publication. The first qualifying normal gated main squash is the sole candidate;
 its actual full SHA/readback/blob comparison is still pending, never this head.
 
-Read AGENTS/KICKOFF, ADR0019 preamble/D7–D7d, all ADR0020 D9a bindings,
+Read AGENTS/KICKOFF, ADR0019 preamble/D7â€“D7d, all ADR0020 D9a bindings,
 helper source/build pins, fixture evidence, fixed-helper/runtime/fixture/delivery
 reviews, Linux comparison evidence and existing manual workflow. The existing
 Linux pin is 3,680 bytes, full image SHA-256
@@ -75,7 +75,7 @@ One accepted fresh Ubuntu 24.04 baseline dispatch would consume D7e regardless
 of outcome; failed/unknown cleanup means stop, exclude host, no retry. No old
 environment reuse. Baseline feedback earns no A4 acceptance: D9a's native
 omitted-kill negative remains **unrun and NOT granted**, independently required.
-A4, A7–A12, full F/G, PA6 and M2 remain open. Hardware paths are
+A4, A7â€“A12, full F/G, PA6 and M2 remain open. Hardware paths are
 **unverified on real hardware**. No owner-PC/account/admin/payment action,
 push, subagent, variable change, dispatch or workflow run occurred.
 
@@ -101,3 +101,20 @@ fabricated here.
 | `crates/arxd/src/exec/hierarchy/a4.rs` | `64e1ddb679ed3517e776735933dc59b2442256d6` |
 | `packaging/linux/arxd.service` | `0b337773c60e49fe84de76db018d2235ae076254` |
 | `packaging/linux/50-arxcovo-standard-rights.conf` | `93a3abcce9782cc7fddf4c2c1dcc5fc74ec18a74` |
+
+## Coordinator mock-boundary correction
+
+Four existing shared lifecycle fixtures now explicitly select historical A5:
+A1A2.parent_attempt, A1A2.test_runtime_attribution_lifecycle,
+F0Blockers.scenario and EntryRun.scenario. They retain every assertion and
+mock/effect boundary; A4-specific admission fixtures and literal-default tests
+remain selected independently. No production/driver fence changes. D7e now
+names these additional mock-only files in its strict candidate delta.
+The builder source had isolated legacy Windows dash bytes in this ADR/evidence;
+coordinator normalized only invalid bytes to UTF-8 before publication.
+
+Checks: full ordinary Python discovery109tests passed; audited89tests and
+36 driver assertion mutants passed; F0 23 assertion kills and F0b36kills plus
+4 documented equivalents passed. All original failed audit counts above stay
+uncredited. Source driver hash remains c44d027c82abce854bef26ebe77554308619f1098d332179e13b48a503f41671.
+PR108 merge/actual baseline pins and fresh independent review remain pending.
