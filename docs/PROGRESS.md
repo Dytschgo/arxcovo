@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Sol high3ce8faf retained0d3d6cf completes docs-only A10 capability evidence join. A10 stays open: accepted setup/janitor and fixture migration do not prove Runner child self-migration or lifecycle. Local link/UTF8LF/scope/diff checks passed, no tests/build/native actions. Coordinator inspected operation matrix; fresh Opus review active before publication while PR139 gates remain watched.
+
 - 2026-11-15: Opus 5.5 high independently assesses D7l failure9d3e9d4: Standards/Spec/Security PASS, source+public run binding and closed replay verified; no markers/summary evidence, cleanup uncertainty and account removal unknown. Coordinator pin404 facts remain separately attributed. Next A10 evidence join is docs-only against accepted records, never a new native attempt.
 
 - 2026-11-15: Coordinator records sole D7l A12 failure on exact2a1d5ad after67s. Closed schema validated, cleanup unconfirmed; no cause or native credit inferred. Independent post-terminal all-three404 verified. No retry or host reuse; fresh Opus assessment requested. A12 **unverified on real hardware**, M2 incomplete.
