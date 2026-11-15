@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #128, `0011d23a0681c0acb717064166c399e194937869` at 12:44:30Z, independent Muse exact-head PASS6894433669 and all five required gates green. Squash tree `2cfe06dad278e66bb61584b74da9c392c870570c` equals reviewed `e8fb224`; D7i eight-path/mode and corrected four-source pins verified.
-- Current work: independently assess failed D7i run43715436515 and diagnose first/final E_PATH with source/mock evidence only. Exact0011d23 run failed18s, mutation none/cleanup not_reached/internalnull; both pins absent404. D7i consumed, host excluded, no retries or native A7/A11 credit. Muse133eb7f retained7de3eaf independently accepts this no-credit disposition; docs checkpoint publication review/gates and bounded Sol source/mock diagnosis remain active. Any later run needs a new reviewed disposition.
+- Current work: independently assess failed D7i run43715436515 and diagnose first/final E_PATH with source/mock evidence only. Exact0011d23 run failed18s, mutation none/cleanup not_reached/internalnull; both pins absent404. D7i consumed, host excluded, no retries or native A7/A11 credit. Muse133eb7f retained7de3eaf independently accepts this no-credit disposition; docs checkpoint publication review/gates and Sol diagnosis a36e2e8 completed with no proved historical cause or logic defect; four closed pre-mutation path-role labels are now under independent Muse source review on a separate branch. PR129 checkpoint gates remain awaited. Any later run needs a new reviewed disposition.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol higha36e2e8 produced bounded attribution after source/mock diagnosis, no historical cause proved and no fence relaxed. Four fixed role labels for pre-mutation E_PATH only; 41 mocked compatibility tests and17 assertion mutants pass, original expected-refusal loop remains protective. Coordinator inspected actual four-path delta and queues fresh independent source/security review; PR129 docs checkpoint separately awaitsCI. No retry/grant/native actions.
 
 - 2026-11-15: Muse high133eb7f retained7de3eaf independently assesses failed D7i checkpoint Standards/Spec/Security PASS with limits, no cause inferred from multisite E_PATH and no native credit. Coordinator publishes six-doc consumed-grant/sanitized-record checkpoint; Sol diagnosis3a06c769 continues separately without rerun or new authority.
 
