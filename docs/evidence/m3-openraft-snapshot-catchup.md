@@ -1,12 +1,12 @@
 # M3 OpenRaft T3 snapshot catch-up
 
-Status: local test-only proof passed; fresh independent Opus review and hosted
+Status: local test-only proof and independent Opus source review passed; exact-head review and hosted
 gates remain required. Sol high, 2026-11-15. Parent
 `3fb24d280d60a8a83e6e34e8493c2b6c03932b84`; main
 `38750cf1e179e14da6fa871972027b6d66028ec9` (PR #144).
-T1/T2 source remains separately pending independent review. This follow-up is
-for separate publication after the parent review, gates and merge; no acceptance
-or publication is inferred from these local checks.
+T1/T2 parent PR145 is now merged as765df2b after corrected-head independent review and all five gates.
+This follow-up has independent source reviewabf7a5e retained6553408 and needs its own exact-head review
+and green gates. No hosted acceptance is inferred from the local checks below.
 
 ## Retained test
 
@@ -94,3 +94,5 @@ and T3 below the typical 20-second target; hosted OS results and full CI under
 15 minutes remain unverified. No push, PR, merge, watch, subagent, native M2,
 admin, VM, Lab Manager, dispatch, repository-variable or owner-data action occurred.
 M2 remains open: A7 FINAL NO-GO; A12 consumed with cleanup uncertain, no retry.
+
+Coordinator publication refresh: parent U6 observation-window correction7e053d2 is retained without changing T3 assertions. The squash merge changes ancestry but leaves the composed parent+T3 source delta exactly the two test modules described above. No production code differs from merged main.
