@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Sol / high completed independent parallel M2 cancellation consumer join `de26b4a`, retained `b811ae6`: existing SDK normal0/7 regression extended with cancelled/confirmed-cleanup/null-exit response and committed/reopened exact activity lookup. Focused test, fmt, offline Clippy and diff passed. No production defect or native residue observation; A12 native/M2/full F/G/PA6 remain open. Muse source review active; PR116 A4 docs checkpoint separately awaits platform gates.
+
 - 2026-11-15: Sol / high implemented the accepted fixed native omitted-S7 test-only source contract: four Rust and three validation Python files plus exact blob/evidence note. Reported 20 selected Rust tests, 91 mocks, 40 Python and eight compiled Rust counterfactuals, fmt/source fences/diff and locked offline workspace Clippy passed; Linux check stopped before arxd at missing cross gcc. Coordinator inspected marker/driver/owned-cleanup delta, retained exact commits and queued Muse independent source review. TEST remains positive; no native/helper execution, publication, execution grant or A4/M2/F/G/PA6 closure.
 
 - 2026-11-15: Muse / high reviewed native omitted-kill plan (`c44b8ba`): Standards/Security PASS, Spec conditional on raw-fd marker B1 and exact D9a clarification. Coordinator applied both minimal corrections, retained the review, and kept TEST/source unchanged. Docs-only publication gates precede implementation; separate native disposition still required. No A4/M2/F/G/PA6 acceptance.
