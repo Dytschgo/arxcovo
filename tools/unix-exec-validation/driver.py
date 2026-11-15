@@ -11,7 +11,7 @@ import sys
 import time
 import threading
 
-TEST = 'exec::disposable::a4::disposable_linux_a4'
+TEST = 'exec::disposable::a4::disposable_linux_a4_omitted_kill'
 TOOLCHAIN = '1.95.0-x86_64-unknown-linux-gnu'
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 

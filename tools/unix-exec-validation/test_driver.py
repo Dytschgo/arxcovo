@@ -806,8 +806,8 @@ class A1A2(unittest.TestCase):
             with self.subTest(tasks=tasks), self.assertRaisesRegex(RuntimeError, 'E_UNIT_CGROUP'):
                 self.monitor(['active', 'inactive'], tasks=tasks)
 
-    def test_source_selection_is_a4(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4')
+    def test_source_selection_is_a4_omitted_kill(self):
+        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
 
     def test_closed_mapping(self):
         # Independent expectations: never obtain the cases/profile from the driver.
@@ -920,13 +920,15 @@ class A1A2(unittest.TestCase):
                 driver.capture_size(Path('/stage'))
 
     def test_exact_summary(self):
+        marker = ('ARX_A4_OMITTED_S7_REJECTED\n'
+                  if driver.TEST == 'exec::disposable::a4::disposable_linux_a4_omitted_kill' else '')
         stage = unittest.mock.MagicMock()
         (stage / 'test-output').stat.return_value.st_size = 100
         for summary in ('0 passed; 0 failed;', '11 passed; 0 failed;', '1 passed; 1 failed;'):
-            text = f'test {driver.TEST} ... ok\ntest result: ok. {summary}'
+            text = marker + f'test {driver.TEST} ... ok\ntest result: ok. {summary}'
             with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
                 driver.verify_test_result(stage, 0)
-        text = f'test {driver.TEST} ... ok\ntest result: ok. 1 passed; 0 failed;'
+        text = marker + f'test {driver.TEST} ... ok\ntest result: ok. 1 passed; 0 failed;'
         with patch.object(driver, 'private_read', return_value=text.replace(driver.TEST, 'wrong')), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
             driver.verify_test_result(stage, 0)
         with patch.object(driver, 'private_read', return_value=text), self.assertRaisesRegex(RuntimeError, 'E_TEST'):
@@ -942,7 +944,7 @@ class A4Delivery(unittest.TestCase):
     selected = 'exec::disposable::a4::disposable_linux_a4'
 
     def test_closed_mapping_and_default(self):
-        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4')
+        self.assertEqual(driver.TEST, 'exec::disposable::a4::disposable_linux_a4_omitted_kill')
         with patch.object(driver, 'TEST', self.selected):
             try:
                 self.assertTrue(driver.standard_profile())
