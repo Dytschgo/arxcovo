@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #125, `833fd55bb2590dbca70f956cf8ec6592e004160a` at 08:34:03Z, independent Muse exact-head PASS and all five required gates green. Squash tree `99ad03f5f53e8d187722cf45ef42cc2a930b609d` equals reviewed `e544c41`; docs-only FILE-leg checkpoint, no new authority.
-- Current work: active Sol / high isolated builder closes the two accepted A7/A11 integration budget contract pins (existing --no-block identity-ack ordering and exact cleanup allowance with cancel/join guarantee). Task 7a872bb8 completion wakes coordinator; then independent review and normal publication/gates, followed by integration source. D7h FILE leg checkpointed; no new native authority. Stale A1/A2 exception is closed: acceptance already recorded in PR88; do not re-pin or revisit it.
+- Current work: publish the six-doc A7/A11 integration budget amendment for independent exact-head review and five required gates. Sol high correction 8ebcab2 retained as 6f42821 fixes --no-block identity-ack ordering and exact elapsed/refusal cleanup allowances without detaching cleanup. Next after merge: bounded controller/driver integration with strict both-case oracle and pure counterfactual tests. D7a-h remain consumed; no native authority. Stale A1/A2 reply closed.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol high contract correction 8ebcab2 retained as 6f42821: 10s per-case cleanup acceptance allowance, full synchronous-call elapsed 60s/15s with RunSpecs55s/10s, exact --no-block/ACK ordering, both-worker cancellation/join, 120s monitor including startup and unchanged140s runtime/package30s. Source assertions, 30 links/targets, UTF8LF/scope/diff checks passed; no application tests or native actions. Coordinator inspected actual diff and publishes six-doc amendment; independent exact-head review and green gates precede implementation.
 
 - 2026-11-15: Babysitter idle correction accepted. Coordinator resumes M2 with active Sol high contract-correction delegate 7a872bb8, limited to the two Muse budget findings and minimal delivery-contract amendment, then independent review/publication. Completion wake is awaited; stale A1/A2 owner reply is closed without dispatch. No root/host/native operations or gates changed.
 
