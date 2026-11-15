@@ -108,6 +108,41 @@ def inventory(data):
     return sorted(symbols, key=lambda s: (s["name"], s["value"]))
 
 
+
+def image_layout(data):
+    """Bounded static ELF facts for an already inventory-validated image."""
+    h = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
+    ph = [list(struct.unpack_from("<IIQQQQQQ", data, h[4] + i * h[8]))
+          for i in range(h[9])]
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, h[5] + i * h[10])
+                for i in range(h[11])]
+    names = sections[h[12]]
+    names = data[names[4]:names[4] + names[5]]
+    allowed = ("", ".text", ".rodata", ".eh_frame", ".comment", ".symtab",
+               ".strtab", ".shstrtab", ".bss", ".data", ".eh_frame_hdr")
+    result = []
+    for section in sections:
+        end = names.find(b"\0", section[0])
+        name = names[section[0]:end].decode("ascii")
+        result.append({"name": name if name in allowed else "other",
+                       "type": section[1], "flags": section[2], "address": section[3],
+                       "size": section[5], "alignment": section[8],
+                       "sha256": None if section[1] == 8 else
+                       sha(data[section[4]:section[4] + section[5]])})
+    loads = []
+    for segment in ph:
+        if segment[0] == 1:
+            start, size = segment[2], segment[5]
+            mapped = bytearray(data[start:start + size])
+            # Comparison evidence only: e_shoff locates the non-runtime section
+            # table. Keep every other loaded byte, including all loader fields.
+            if start <= 40 and start + size >= 48:
+                mapped[40 - start:48 - start] = bytes(8)
+            loads.append({"offset": start, "size": size, "sha256": sha(mapped)})
+    return {"entry": h[3], "elf_header": list(h), "program_headers": ph,
+            "loads_without_section_table_offset": loads, "sections": result}
+
+
 def main():
     if sys.argv[1:] not in (["build"], ["verify"], ["linux-candidate"]):
         raise ValueError("use build, verify or linux-candidate")
@@ -163,6 +198,9 @@ def main():
                                   "image_sha256": observed["image_sha256"],
                                   "image_size": observed["image_size"],
                                   "symbol_count": len(observed["symbols"]),
+                                  "compiler_sha256": observed["compiler_sha256"],
+                                  "linker_sha256": observed["linker_sha256"],
+                                  "layout": image_layout(data),
                                   "symbol_names_match": [s["name"] for s in observed["symbols"]]
                                   == [s["name"] for s in pin["symbols"]]}, sort_keys=True))
                 raise ValueError("Linux candidate differs from independently reviewed image")

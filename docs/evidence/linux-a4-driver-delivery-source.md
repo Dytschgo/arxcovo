@@ -118,3 +118,22 @@ symbol count and name-equality boolean. No paths, raw image, compiler output
 or symbol names are emitted. Ten tool tests verify its schema and failure
 behavior. Pin/recipe/flags/source and admission are unchanged; comparison
 continues to fail on any mismatch. Assess the hosted report before a fix.
+
+## Equal symbols, different file bytes
+
+Headf4adf7c run43658446256 job132642186283 reports actual Linux image
+cee895412d58718016dd0db9883526ef8e0b13f8ed00cf213c6f77536b206369,
+3680 bytes, versus reviewed cross-image3696. Source,flags and full symbols
+match; image hash/size differ. No replacement is admitted. Coordinator
+rebuilds the Windows cross-image compile-only and reproduces fc814889...a92e.
+Expected .comment is153bytes; executable .text is1332bytes SHA256
+cc1a943206e25a739c49f02cf06a81ec7690e112578939891e2b281695cd812d.
+Add bounded ELF section/header/load comparison facts to the failure report,
+not admission. Load comparison masks only e_shoff (non-runtime section-table
+location) and retains every other mapped byte/loader field. Expected entry
+2102124; first mapped876bytes normalized SHA256
+f784e75f73cc8661a0008502709a1e1da56a7afb1fc3472498383dab0c9074c2;
+second mapped1332bytes has the .text hash above. Expected complete layout is
+retained in ignored out/windows-layout.json. Ten mocked tests pass. Actual
+Linux section/load comparison remains pending; no metadata-only conclusion
+or image fix is claimed before that evidence. No helper image is executed.

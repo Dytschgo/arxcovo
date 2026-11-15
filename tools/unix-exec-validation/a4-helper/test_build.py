@@ -56,7 +56,7 @@ class InventoryTests(unittest.TestCase):
         source = build.read(build.ROOT / 'helper.rs')
         pin = json.loads(build.read(build.ROOT / 'image-pin.json'))
         identity = pin['compiler_identity'].replace('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu')
-        data = b'synthetic static image'
+        data = bytes(elf())
         # Synthetic authorized identity stands in for the independently held pin.
         pin['image_sha256'], pin['image_size'] = build.sha(data), len(data)
         for differs in (False, True):
@@ -78,13 +78,16 @@ class InventoryTests(unittest.TestCase):
                     with contextlib.redirect_stdout(output), self.assertRaisesRegex(ValueError, 'independently reviewed image'):
                         build.main()
                     report = json.loads(output.getvalue())
-                    self.assertEqual(set(report), {"kind", "matches", "image_sha256", "image_size", "symbol_count", "symbol_names_match"})
+                    self.assertEqual(set(report), {"kind", "matches", "image_sha256", "image_size", "symbol_count", "symbol_names_match", "compiler_sha256", "linker_sha256", "layout"})
                     self.assertEqual(report["kind"], "a4-compile-comparison")
                     self.assertEqual(report["image_size"], len(data) + 1)
                     self.assertFalse(report["matches"]["image_sha256"])
                     self.assertFalse(report["matches"]["image_size"])
                     self.assertTrue(report["matches"]["source_sha256"])
                     self.assertTrue(report["symbol_names_match"])
+                    self.assertEqual(report["layout"]["entry"], 4096)
+                    self.assertEqual(len(report["layout"]["sections"]), 4)
+                    self.assertNotIn("synthetic static image", output.getvalue())
                 else:
                     build.main()
                 self.assertEqual(command.call_count, 3)
