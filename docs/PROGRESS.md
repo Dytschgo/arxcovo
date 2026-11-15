@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #112, `f15e9acc46b4534eb9d760b546f358f83a47a12d` at 02:39:57Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `8903812`; fixed test-only omitted-kill contract is effective, with no native execution grant.
-- Current work: Sol / high implementing the reviewed fixed native omitted-kill fixture and closed driver mapping. TEST stays positive. Pure/mock tests and fresh independent review precede publication; a separate native disposition remains required. D7e is consumed and native negative remains unrun.
+- Current work: Muse / high independent source review of Sol fixed native omitted-kill implementation `d29d085`/`7043a6c`, retained `3f1fad4`/`78bc3a2`. TEST stays positive; local pure/mock checks passed. Linux-only compilation remains unverified locally (missing cross gcc). Publication and separate native disposition remain gated; no native negative run or A4 acceptance.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. Native A4 omitted-kill, A4 acceptance, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Sol / high implemented the accepted fixed native omitted-S7 test-only source contract: four Rust and three validation Python files plus exact blob/evidence note. Reported 20 selected Rust tests, 91 mocks, 40 Python and eight compiled Rust counterfactuals, fmt/source fences/diff and locked offline workspace Clippy passed; Linux check stopped before arxd at missing cross gcc. Coordinator inspected marker/driver/owned-cleanup delta, retained exact commits and queued Muse independent source review. TEST remains positive; no native/helper execution, publication, execution grant or A4/M2/F/G/PA6 closure.
 
 - 2026-11-15: Muse / high reviewed native omitted-kill plan (`c44b8ba`): Standards/Security PASS, Spec conditional on raw-fd marker B1 and exact D9a clarification. Coordinator applied both minimal corrections, retained the review, and kept TEST/source unchanged. Docs-only publication gates precede implementation; separate native disposition still required. No A4/M2/F/G/PA6 acceptance.
 
