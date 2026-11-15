@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Independent Muse `25bbbdc` rejected the effective-policy-query proposal: exit1 conflates denial/errors and root list success does not establish target NOPASSWD. Coordinator retains NO-GO; no query-based weakening or implementation. Next architecture investigation compares a source-pinned fixture-local policy construction with the existing complete-host-byte private-review route, preserving both cases and actual NNP exec assertions. Any fixture-policy amendment still needs independent review/gates; current contract stays binding.
+
 - 2026-11-15: Sol / high public provenance research `00e4b2a` found pinned upstream/runner-image inputs but no complete policy literal candidate; no runtime equality claimed. Coordinator retained the note and drafted an unaccepted fixed effective-policy-query alternative for future architecture review, with status1/error and NOPASSWD ambiguities explicitly unresolved. Current exact-byte/closed qualification contract remains binding; no host reads or authority change. This reassesses concrete acceptance overhead under owner priority steering.
 
 - 2026-11-15: Muse / high `7e8f0ad` independently accepted the cancelled activity consumer join: Standards/Spec/Security zero findings. Focused SDK regression, fmt, offline Clippy and diff checks rerun green; no production/native change or A12 credit. Coordinator clarified builder-checkout versus landed-parent provenance and publishes the bounded test slice through normal exact-head and hosted gates.
