@@ -126,4 +126,3 @@ The following four exact pins supersede abbreviated wording above and bind the s
    no pre-existing adoption). State the load-bearing assumption: only
    root-writable ancestry makes path-based exec after recheck safe; build
    accounts hold no write bit on any ancestor.
-
