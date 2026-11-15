@@ -1837,6 +1837,7 @@ class RuntimeAdmission(unittest.TestCase):
             def __call__(self,fd,name,buffer,limit):
                 self_test.assertEqual((fd,name,limit),(17,b'bin',9))
                 buffer.raw = self.target.ljust(9,b'X')[:9]
+                link.st_atime_ns += 1  # readlink may update relatime
                 return len(self.target)
         self_test=self
         call=Call()
@@ -1844,21 +1845,26 @@ class RuntimeAdmission(unittest.TestCase):
              c_int=ctypes.c_int,c_char_p=ctypes.c_char_p,c_void_p=ctypes.c_void_p,
              c_size_t=ctypes.c_size_t,c_ssize_t=ctypes.c_ssize_t,
              create_string_buffer=ctypes.create_string_buffer)
-        link=SimpleNamespace(st_mode=stat.S_IFLNK|0o777,st_uid=0,st_nlink=1,st_size=7)
-        directory=object()
-        c2=SimpleNamespace(st_mode=stat.S_IFREG|0o4755,st_uid=0,st_nlink=1)
+        common=dict(st_dev=1,st_ino=2,st_uid=0,st_gid=0,st_nlink=1,st_size=7,
+                    st_mtime_ns=1,st_ctime_ns=1,st_atime_ns=1)
+        link=SimpleNamespace(**common,st_mode=stat.S_IFLNK|0o777)
+        directory=SimpleNamespace(**common,st_mode=stat.S_IFDIR|0o755)
+        c2=SimpleNamespace(**common,st_mode=stat.S_IFREG|0o4755)
         def run(present=False,pin=None):
+            def digest():
+                c2.st_atime_ns += 1
+                return pin
             def info(name,**kw):
                 if name=='sudo':
                     if not present: raise FileNotFoundError()
-                    return c2
-                return link if kw.get('follow_symlinks') is False else directory
+                    return SimpleNamespace(**vars(c2))
+                return SimpleNamespace(**vars(link if kw.get('follow_symlinks') is False else directory))
             with patch.dict(sys.modules,ctypes=fake), \
                  patch.object(driver,'sudo_nnp_open',return_value=17), \
                  patch.object(driver.os,'stat',side_effect=info), \
                  patch.object(driver.os,'fstat',return_value=directory), \
                  patch.object(driver.os,'close'), \
-                 patch.object(driver,'sudo_nnp_digest',return_value=pin):
+                 patch.object(driver,'sudo_nnp_digest',side_effect=lambda _: digest()):
                 driver.a7_alias_c2()
         run()
         good=dict(size=282032,sha256='6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff')
@@ -1871,6 +1877,20 @@ class RuntimeAdmission(unittest.TestCase):
         for target in (b'dangling',b'usr/binXX',b'/tmp'):
             call.target=target
             with self.assertRaises(RuntimeError):run()
+
+
+    def test_stable_stat_preserves_every_non_atime_fence(self):
+        fields=('st_dev','st_ino','st_mode','st_uid','st_gid','st_nlink',
+                'st_size','st_mtime_ns','st_ctime_ns')
+        original=SimpleNamespace(**dict.fromkeys(fields, 1),st_atime_ns=1)
+        atime=SimpleNamespace(**vars(original))
+        atime.st_atime_ns=99
+        self.assertEqual(driver._stable_stat(original),driver._stable_stat(atime))
+        for field in fields:
+            changed=SimpleNamespace(**vars(original))
+            setattr(changed,field,2)
+            with self.subTest(field=field):
+                self.assertNotEqual(driver._stable_stat(original),driver._stable_stat(changed))
 
 
     def test_fixed_loader_hash_before_adapter(self):

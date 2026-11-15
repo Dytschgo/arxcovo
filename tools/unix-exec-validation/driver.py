@@ -206,6 +206,13 @@ def a7_package_read():
         os.close(fd)
 
 
+def _stable_stat(info):
+    # Reads may update atime; identity, permissions and content metadata must hold.
+    return tuple(getattr(info, field) for field in (
+        "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+        "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
 def a7_alias_c2():
     # Missing final C2 is allowed; missing/unsafe ancestors and dangling links refuse.
     held = []
@@ -234,14 +241,15 @@ def a7_alias_c2():
         length = call(root, b'bin', buffer, 9)
         require(0 <= length < 9 and buffer.raw[:length] in (b'usr/bin', b'/usr/bin'), 'E_ALIAS')
         after = os.stat('bin', dir_fd=root, follow_symlinks=False)
-        require(before == after and os.stat('bin', dir_fd=root) == os.fstat(usrbin), 'E_ALIAS')
+        require(_stable_stat(before) == _stable_stat(after) and
+                _stable_stat(os.stat('bin', dir_fd=root)) == _stable_stat(os.fstat(usrbin)), 'E_ALIAS')
         if info is not None:
             fd = sudo_nnp_open(Path('/usr/local/bin/sudo'))
             try:
                 pin = sudo_nnp_digest(fd)
                 require(pin['size'] == 282032 and pin['sha256'] ==
                         '6ae6665cc51295ea8aaba94a3377dafa563f950aafc6296c0704fb33401a31ff'
-                        and os.stat('sudo', dir_fd=parent, follow_symlinks=False) == info,
+                        and _stable_stat(os.stat('sudo', dir_fd=parent, follow_symlinks=False)) == _stable_stat(info),
                         'E_C2')
             finally:
                 os.close(fd)

@@ -924,7 +924,7 @@ regular100644 paths may differ:
 - tools/unix-exec-validation/mutation_check.py
 - docs/adr/0019-unix-native-execution-bridge.md
 - docs/evidence/linux-a7-a11-execution-preparation.md (new)
-- docs/reviews/m2-a7-a11-execution-source-muse-review.md (new retained fresh review)
+- docs/reviews/m2-a7-a11-execution-candidate-muse-review.md (new retained fresh review)
 - docs/PROGRESS.md (existing parent/coordinator checkpoint only; builder does not edit)
 
 The four source blobs must equal the reviewed inventory; every other non-doc

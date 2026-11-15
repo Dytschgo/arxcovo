@@ -371,3 +371,18 @@ Coordinator must compare all these records, not just the four changed paths.
 100644 blob 041854f74501ecbb719e93f24f73e471596ab572	ui/vite.config.ts
 100644 blob b916fd8d80a9ae1434207a621d8cfc15291c271a	ui/vitest.config.ts
 ```
+
+## Coordinator correction after independent review C1
+
+Independent Muse review6b225a3 retainedb635e13 passes Standards/Spec and requires C1 before dispatch. `_stable_stat` now compares dev/ino/mode/uid/gid/nlink/size/mtime_ns/ctime_ns, excluding atime for link, alias directory and C2 stability. Fake readlink and digest ports update atime between copied snapshots; all seven RuntimeAdmission tests pass. Whole-stat in-memory counterfactual fails the alias regression as expected; all six existing admission assertion mutants are killed. Non-atime field regression checks all nine fields. No actual host/adapter/native read occurred. D7i allowed review filename corrected to the actual retained candidate review.
+
+The preceding source table records builder7385785 historically. This exact four-source inventory supersedes it for the corrected publication candidate; all other baseline non-doc blobs/modes remain unchanged:
+
+| Path | Git blob | SHA256 |
+| --- | --- | --- |
+| `crates/arxd/src/exec/disposable/sudo_nnp.rs` | `7f35fecc5504563c867eb6b568567cecbde533e9` | `0bcddcd6bce6713eb2a8280e701190e44c39c2ad937b23a725861fad99694c2e` |
+| `tools/unix-exec-validation/driver.py` | `79ea9be6ad554e64c10e88bc5265655ccf4b3a59` | `978eb656973f0ff010bb79fffdf63fdbd0d7ae40d2914e33295650898bea3d96` |
+| `tools/unix-exec-validation/test_driver.py` | `e61ed0864a245719e8add3820ec2904813985d3d` | `a670bc80b85ae56ac33ae0b2b3537b68e96fb0b5fa74ba54051d96a2d3f8e11c` |
+| `tools/unix-exec-validation/mutation_check.py` | `c8632aa6f65525dbe8a485a0c5c076153a01eba5` | `6d838247e9553e1d83cab8185d5bea6f091c8e7b122144b88f7ec95dbc724b73` |
+
+Validation: seven focused mock tests, whole-stat refusal counterfactual, six admission assertion kills, UTF8LF and diff checks. Builder broader evidence is reused only for unchanged behavior. Fresh exact-head independent delta review, hosted Linux compilation, all five gates and coordinator merge remain required; no run authority or native acceptance granted.
