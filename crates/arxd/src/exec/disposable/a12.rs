@@ -521,6 +521,40 @@ fn a12_owned_call_mock_counterfactuals() {
 }
 
 #[test]
+fn a12_delivery_cwd_contract_conflict() {
+    // Pure call-boundary validation only: never construct or call a Runner.
+    // The delivery brief requests cwd = config.workspace, an absolute path.
+    // Both existing entry validators reject that before the native call.
+    let workspace = if cfg!(windows) {
+        PathBuf::from("C:/arxcovo-a12-contract/workspace")
+    } else {
+        PathBuf::from("/var/lib/arxcovo-a12-contract/workspace")
+    };
+    assert!(workspace.is_absolute());
+    for case in [Case::Normal, Case::Cancel] {
+        let mut spec = case.spec();
+        // Use a platform-native absolute spelling for this portable validator
+        // test; Linux's fixed targets are separately pinned below.
+        if cfg!(windows) {
+            spec.executable = PathBuf::from("C:/arxcovo-a12-contract/target.exe");
+        }
+        assert!(validate_spec(&spec).is_ok());
+        assert!(validate_phased_spec(&spec).is_ok());
+        spec.cwd = workspace.clone();
+        for result in [validate_spec(&spec), validate_phased_spec(&spec)] {
+            assert!(matches!(
+                result,
+                Err(ExecError::Invalid(
+                    "absolute executable and workspace-relative cwd required"
+                ))
+            ));
+        }
+        spec.cwd = PathBuf::new();
+        assert!(validate_phased_spec(&spec).is_ok());
+    }
+}
+
+#[test]
 fn a12_fixed_targets_and_closed_source_gate() {
     assert_eq!(
         Case::Normal.spec().executable,
