@@ -441,10 +441,26 @@ fn reopen_rejects_row_meta_inconsistency_versions_clusters_locks_sidecars() {
         );
     }
     let small = private_temp();
-    let db = Connection::open(small.path().join("cluster-log.sqlite3")).unwrap();
+    let path = small.path().join("cluster-log.sqlite3");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(&path).unwrap());
+    crate::security::private(&path).unwrap();
+    let db = Connection::open(&path).unwrap();
     db.execute_batch("PRAGMA page_size=1024; CREATE TABLE sentinel(x);")
         .unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "page_size", |r| r.get::<_, u64>(0))
+            .unwrap(),
+        1024
+    );
     drop(db);
+    crate::security::private(&path).unwrap();
     assert_eq!(
         VoteLogStore::open(small.path(), [1; 16]).unwrap_err(),
         StoreError::Unsupported

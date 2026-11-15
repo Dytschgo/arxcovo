@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: PR144 macOS verify fails page-size fixtureIo/Unsupported at tests448. Coordinator makes its private-file precondition explicit with exclusive0600Unix creation and private/page1024 readbacks; production unchanged. FocusedWindows and rebuilt36cluster/fmt/offlineClippy pass; exactmacOSrednotlocallyreproduced, fresh hosted gates plus Opus delta review required. No nativeM2retry or admin action.
+
 - 2026-11-15: Opus highc32ce57 independently rechecks R1: all eight guard-removal mutants compile and fail only intended new assertions, production blob restored unchanged.36cluster/eight-kill/fmt/offlineClippy pass; evidence corrected. Coordinator publishes vote/log storage probe for exact-head review and hosted gates; no consensus/power-loss acceptance or M2 closure.
 
 - 2026-11-15: Opus highea8a25c retainedc0ef722 passes vote/log production/security but blocks Standards on eight uncovered fail-closed guards. Coordinator adds107 test-only lines covering purge/truncate regression, checksum-valid reopen inconsistency and per-read poisoning, with unchanged disk/memory/reopen assertions. All36cluster/eight crash probes/fmt/offlineClippy/diff pass. Evidence narrows membership4097 bound attribution; fresh Opus delta recheck pending, no production change.
