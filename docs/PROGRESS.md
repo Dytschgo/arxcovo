@@ -26,6 +26,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-15: Opus high2278908 retained2640629 closes registry staleness and bounded Found representation; independent Sol recheck passes with actual16-byteClusterId size arithmetic, pre-founding Remove gate and nonempty-founded codec invariant. Registry implementation starts with no dependency/TLS/CA change. M2 hardware blockers remain explicit and unchecked.
+
 - 2026-11-15: Opus high548aafa retained21e623a selects durable member registry before certificates because consumed-code bindings prune. Independent Sol review accepts direction but requests precise unbounded local-revocation staleness and bounded Found command/semantic-rejection codec contract before coding. No TLS/CA/transport activation; registry and M3 acceptance not yet credited.
 
 - 2026-11-15: Coordinator verifies PR146 exacthead/all five green gates, unwatches and merges0ab5038; reviewed/squash trees equal. Real full_snapshot follower recovery now has hostedWindows/macOS/Ubuntu credit for the in-process fixture. Next bounded Opus architecture task resolves enrollment certificate/key-authority boundary toward real multi-host trust, with no production endpoint or M2 closure inferred.

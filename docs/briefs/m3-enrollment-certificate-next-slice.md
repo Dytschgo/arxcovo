@@ -47,7 +47,7 @@ needs and closes the replay gap. It needs no new dependencies. The certificate s
      Only (c) changes state. Replay is **current-pair idempotence**: the original list is not stored, so `replay:true` does not prove equality with the bootstrap
      set (a subset, or a pair a later Redeem added, also replays). Nothing authorizes from this outcome. `next_node_id` is untouched. In production the founder
      initializes node 1 with `first_free = 2`, then proposes `Found[(1, own key)]`. The test fixture registers nodes 1, 2 and 3.
-   - `Remove { cluster, node, proposed_at_ms }` returns `UnknownNode` if `node >= next_node_id` and `LastMember` if it would empty `members`. Otherwise it deletes the
+   - `Remove { cluster, node, proposed_at_ms }` returns `NotFounded` before founding, else `UnknownNode` if `node >= next_node_id` and `LastMember` if it would empty `members`. Otherwise it deletes the
      member and returns `Removed{replay:false}`, or `replay:true` if the node was already absent (idempotent for `ProposeError::Unknown` retries).
 3. **Gated enrollment.** Mint and Redeem return `NotFounded` before founding. On a fresh Redeem, apply checks key uniqueness before consuming: a key held by any current
    member gives `KeyInUse` (A3: one key, two nodes). A full registry gives `MembersFull`. In both cases nothing is consumed, and the code stays redeemable with a
@@ -70,13 +70,13 @@ needs and closes the replay gap. It needs no new dependencies. The certificate s
    `consensus::registry_covers(&Members, &EnrollmentState) -> bool` (every membership node is a member) is a test helper for that workflow.
 7. **Codec v2. v1 is refused, not migrated.** The state image keeps `ARXSM1\0\0`, and the version u16 becomes `2`. After the records, append `founded` (flag), `u8`
    count 0..=16, then ascending `node u64 BE ‖ key[32]`. Decode rejects: count > 16; unsorted or duplicate nodes; duplicate keys; member `>= next_node_id`;
-   members or records present while unfounded; a consumed record whose node is a member under a different key; trailing bytes; a non-canonical re-encode. A
+   members or records present while unfounded, or an empty founded registry; a consumed record whose node is a member under a different key; trailing bytes; a non-canonical re-encode. A
    version-1 blob, on open or in `install`/`peek`, gives `StoreError::Unsupported` and leaves the store byte-identical. No production v1 state exists; every v1
    store is a test temp directory. The SQLite `user_version` stays 1 (schema unchanged).
-   **Log rows (R2).** Tag 4: `cluster[32] ‖ proposed_at_ms u64 BE ‖ count u8 ‖ count × (node u64 BE ‖ key[32])` in stored order. Tag 5: `cluster[32] ‖ node u64 BE ‖
-   proposed_at_ms u64 BE`. Sealed sizes: Found = 106 + 40n B (16 pairs 746 B, 64 pairs 2666 B; the earlier 730 B figure was wrong), Remove = 113 B. Because every
+   **Log rows (R2).** Tag 4: `cluster[16] ‖ proposed_at_ms u64 BE ‖ count u8 ‖ count × (node u64 BE ‖ key[32])` in stored order. Tag 5: `cluster[16] ‖ node u64 BE ‖
+   proposed_at_ms u64 BE`. Sealed sizes: Found = 90 + 40n B (16 pairs 730 B, 64 pairs 2650 B; ClusterId stays16bytes), Remove = 97 B. Because every
    `Command` is bounded by type, `encode_command(&Command, &mut Vec<u8>)` and `encode_row(..) -> Vec<u8>` stay infallible with unchanged signatures. The one count
-   cast is on a length the constructor proved ≤ 64. `log_store.rs` adds `const _: () = assert!(106 + 40 * MAX_FOUND_WIRE <= MAX_ROW);`. Decode reads the count and
+   cast is on a length the constructor proved ≤ 64. `log_store.rs` adds `const _: () = assert!(90 + 40 * MAX_FOUND_WIRE <= MAX_ROW);`. Decode reads the count and
    returns `Corrupt` if it is > 64 before reserving anything, reserves ≤ 64, reads the pairs, and builds through `FoundMembers::new`. It accepts semantically
    invalid lists, so committed `BadFounders` entries stay decodable on restart, catch-up and snapshot rebuild. Checksum, `MAX_ROW` read bound and canonical
    re-encode checks are unchanged. An over-bound Found cannot be represented, so it never reaches propose or append. Append's `TooLarge` check and the adapter's
@@ -98,12 +98,12 @@ first; update them, never weaken them. The coordinator keeps PROGRESS.
 
 ## Tests (each behavior fails without its fix; three-node ≤ 45 s under `timeout`)
 
-- **Pure.** Found validation table, replay and `AlreadyFounded`. `NotFounded` for Mint and Redeem. Redeem inserts a member. `KeyInUse` against a founder key and
+- **Pure.** Found validation table, replay and `AlreadyFounded`. `NotFounded` for Mint, Redeem and Remove. Redeem inserts a member. `KeyInUse` against a founder key and
   another joiner's key, where a later Redeem of the same code with a fresh key succeeds. `MembersFull`. Remove gives `UnknownNode`, `LastMember`, success and
   replay. A replay after Remove gives `Revoked` and no grant. `authorize_peer` matrix: wrong cluster, unallocated, removed, wrong key, current. Registry outlives
   prune: after commands past `expires_ms + TOMBSTONE_MS`, the record is gone, `authorize_peer` still passes, and a replay gives `UnknownCode`.
 - **Found wire bound.** `FoundMembers::new` accepts 0, 1, 16, 17 and 64 pairs and refuses 65. A counting iterator of 10^6 items is pulled at most 65 times. Each
-  accepted size round-trips `encode_row`/`decode_row` byte-identically, with the full-row SHA-256 recomputed (not length only); 64 pairs is 2666 B. Sealed rows
+  accepted size round-trips `encode_row`/`decode_row` byte-identically, with the full-row SHA-256 recomputed (not length only); 64 pairs is 2650 B. Sealed rows
   with count 65, count 64 carrying 63 pairs, or trailing bytes give `Corrupt`; no truncation panics.
 - **Codec and store.** v2 round trip at maximum size. Every rejection in decision 7, with no panic at any truncation. v1 blob gives `Unsupported` with the file
   byte-identical. Tags 4 and 5 round trip, and tag 6 gives `Corrupt`. Kill/reopen and `install` carry the registry. The privacy marker scan covers the new files.
@@ -111,7 +111,7 @@ first; update them, never weaken them. The coordinator keeps PROGRESS.
   follower, then commit `Remove(4)` and enough entries to purge (T3 params). The restarted follower catches up via snapshot and refuses node 4, while the founders
   still pass. Advance past prune: node 4's record is gone, and the founders and registry state match on every node. `registry_covers` holds for the initial
   membership. Semantic Found on the same engine: before founding, 0-, 17- and 64-pair, unsorted, duplicate-key and unallocated Founds each commit with
-  `BadFounders` and unchanged state. After the valid Found, empty and 17-pair Founds give `BadFounders`, a subset gives `replay:true`, and a conflicting key gives
+  `BadFounders` with registry/node counter unchanged (only the common time/prune prefix may advance). After the valid Found, empty and 17-pair Founds give `BadFounders`, a subset gives `replay:true`, and a conflicting key gives
   `AlreadyFounded`. Kill/reopen and a snapshot-installed follower reach identical state bytes on every node.
 
 ## Operational advisories: not fixed here, assigned
