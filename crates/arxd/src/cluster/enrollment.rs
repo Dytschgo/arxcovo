@@ -1,5 +1,6 @@
 //! Pure proposal-time enrollment. This module performs no I/O and proves no consensus commit.
 mod code;
+pub(super) mod codec;
 pub use code::{CodeError, CodeVerifier, JoinCode, JoinSecret, RedeemProof};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, num::NonZeroU64};
@@ -37,6 +38,9 @@ impl KeyDigest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Propose only from a fresh in-memory JoinCode::generate value. Retry that
+    /// value only before first_proposal + CODE_TTL_MS - 4*SKEW_MS, then discard.
+    /// Never re-propose a Mint decoded from storage/wire or accept a peer verifier.
     Mint {
         cluster: ClusterId,
         actor: ActorId,
@@ -49,10 +53,32 @@ pub enum Command {
         cluster: ClusterId,
         request: RequestId,
         code: CodeId,
-        proof: RedeemProof,
+        presented: CodeVerifier,
         key: KeyDigest,
         proposed_at_ms: u64,
     },
+}
+impl Command {
+    /// Reduce the bearer proof before proposing or forwarding. Future ingress must accept
+    /// proofs only, never client verifiers. Committed members have trusted cluster authority;
+    /// apply's verifier comparison is consistency checking, not member authentication.
+    pub fn redeem(
+        cluster: ClusterId,
+        request: RequestId,
+        code: CodeId,
+        proof: &RedeemProof,
+        key: KeyDigest,
+        proposed_at_ms: u64,
+    ) -> Self {
+        Self::Redeem {
+            cluster,
+            request,
+            code,
+            presented: CodeVerifier::of_proof(proof),
+            key,
+            proposed_at_ms,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -305,15 +331,14 @@ impl EnrollmentState {
             Command::Redeem {
                 request,
                 code,
-                proof,
+                presented,
                 key,
                 ..
             } => {
                 let Some(record) = self.records.get_mut(code) else {
                     return Outcome::Rejected(Reject::UnknownCode);
                 };
-                let actual = CodeVerifier::of_proof(proof);
-                if !bool::from(record.verifier.bytes().ct_eq(actual.bytes())) {
+                if !bool::from(record.verifier.bytes().ct_eq(presented.bytes())) {
                     return Outcome::Rejected(Reject::BadProof);
                 }
                 let (node, replay) = if let Some(consumed) = &record.consumed {

@@ -45,6 +45,9 @@ impl fmt::Debug for JoinCode {
     }
 }
 impl CodeVerifier {
+    pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
     pub fn of_proof(proof: &RedeemProof) -> Self {
         Self(
             Sha256::new()

@@ -28,14 +28,14 @@ fn mint(c: &JoinCode, request: u8, time: u64) -> Command {
     }
 }
 fn redeem(c: &JoinCode, request: u8, k: u8, time: u64) -> Command {
-    Command::Redeem {
-        cluster: CLUSTER,
-        request: [request; 16],
-        code: c.code_id(),
-        proof: c.proof(),
-        key: key(k),
-        proposed_at_ms: time,
-    }
+    Command::redeem(
+        CLUSTER,
+        [request; 16],
+        c.code_id(),
+        &c.proof(),
+        key(k),
+        time,
+    )
 }
 fn grant(o: Outcome) -> EnrollmentGrant {
     match o {
@@ -207,8 +207,8 @@ fn first_applier_wins_and_proof_precedes_consumed_or_expired_status() {
         let mut s = state();
         s.apply(&mint(&c, 1, 0));
         let mut wrong = redeem(&c, 5, winner, 1);
-        if let Command::Redeem { proof, .. } = &mut wrong {
-            *proof = code(2).proof();
+        if let Command::Redeem { presented, .. } = &mut wrong {
+            *presented = code(2).verifier();
         }
         let before = s.clone();
         reject(&mut s, wrong.clone(), Reject::BadProof);
@@ -510,4 +510,20 @@ fn pending_precedes_total_cap_and_rejects_still_prune() {
     reject(&mut s, redeem(&code(65), 65, 1, prune), Reject::UnknownCode);
     assert!(s.records.is_empty());
     assert_eq!(s.next_node_id, next);
+}
+
+#[test]
+fn wrong_proof_on_expired_pending_is_bad_proof() {
+    let mut s = state();
+    let c = code(7);
+    s.apply(&mint(&c, 1, 0));
+    let cmd = Command::redeem(
+        CLUSTER,
+        [9; 16],
+        c.code_id(),
+        &code(8).proof(),
+        key(4),
+        CODE_TTL_MS,
+    );
+    assert_eq!(s.apply(&cmd), Outcome::Rejected(Reject::BadProof));
 }

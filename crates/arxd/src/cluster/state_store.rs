@@ -1,0 +1,365 @@
+//! Local state-machine persistence probe. No quorum, transport or credential ingress.
+use super::enrollment::{
+    ClusterId, Command, EnrollmentState, NodeId, Outcome,
+    codec::{self, Reader},
+};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{File, OpenOptions},
+    path::Path,
+    time::Duration,
+};
+const LIMIT: usize = 16384;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogPos {
+    pub term: u64,
+    pub leader: u64,
+    pub index: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipBlob(Vec<u8>);
+impl MembershipBlob {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, StoreError> {
+        if bytes.is_empty() || bytes.len() > 4096 {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(Self(bytes))
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Blank,
+    Enrollment(Command),
+    Membership(MembershipBlob),
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Init {
+    pub cluster: ClusterId,
+    pub first_free: NodeId,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreError {
+    Io,
+    Sql,
+    Corrupt,
+    Unsupported,
+    WrongCluster,
+    OutOfOrder,
+    Poisoned,
+    TooLarge,
+    StaleSnapshot,
+}
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Io => "private state unavailable",
+            Self::Sql => "state storage failed",
+            Self::Corrupt => "corrupt state",
+            Self::Unsupported => "unsupported state version",
+            Self::WrongCluster => "wrong cluster",
+            Self::OutOfOrder => "out of order",
+            Self::Poisoned => "state store poisoned",
+            Self::TooLarge => "snapshot too large",
+            Self::StaleSnapshot => "stale snapshot",
+        })
+    }
+}
+impl std::error::Error for StoreError {}
+impl From<rusqlite::Error> for StoreError {
+    fn from(_: rusqlite::Error) -> Self {
+        Self::Sql
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Image {
+    applied: Option<LogPos>,
+    membership: Option<(LogPos, MembershipBlob)>,
+    state: EnrollmentState,
+}
+fn put_pos(b: &mut Vec<u8>, p: LogPos) {
+    b.extend(p.term.to_be_bytes());
+    b.extend(p.leader.to_be_bytes());
+    b.extend(p.index.to_be_bytes());
+}
+fn get_pos(r: &mut Reader<'_>) -> Result<LogPos, StoreError> {
+    Ok(LogPos {
+        term: r.u64()?,
+        leader: r.u64()?,
+        index: r.u64()?,
+    })
+}
+fn encode(i: &Image) -> Vec<u8> {
+    let mut b = b"ARXSM1\0\0".to_vec();
+    b.extend(1u16.to_be_bytes());
+    b.push(u8::from(i.applied.is_some()));
+    if let Some(p) = i.applied {
+        put_pos(&mut b, p);
+    }
+    b.push(u8::from(i.membership.is_some()));
+    if let Some((p, m)) = &i.membership {
+        put_pos(&mut b, *p);
+        b.extend((m.0.len() as u16).to_be_bytes());
+        b.extend(&m.0);
+    }
+    codec::encode(&i.state, &mut b);
+    let hash = Sha256::digest(&b);
+    b.extend(hash);
+    b
+}
+fn decode(b: &[u8]) -> Result<Image, StoreError> {
+    if b.len() > LIMIT || b.len() < 32 {
+        return Err(StoreError::Corrupt);
+    }
+    let (payload, hash) = b.split_at(b.len() - 32);
+    if Sha256::digest(payload).as_slice() != hash {
+        return Err(StoreError::Corrupt);
+    }
+    let mut r = Reader(payload);
+    if r.bytes(8)? != b"ARXSM1\0\0" || r.u16()? != 1 {
+        return Err(StoreError::Corrupt);
+    }
+    let applied = if r.flag()? {
+        Some(get_pos(&mut r)?)
+    } else {
+        None
+    };
+    let membership = if r.flag()? {
+        let p = get_pos(&mut r)?;
+        let len = r.u16()? as usize;
+        let m = MembershipBlob::new(r.bytes(len)?.to_vec())?;
+        let a = applied.ok_or(StoreError::Corrupt)?;
+        if p.index > a.index || p.term > a.term || (p.index == a.index && p != a) {
+            return Err(StoreError::Corrupt);
+        }
+        Some((p, m))
+    } else {
+        None
+    };
+    let state = codec::decode(&mut r)?;
+    if !r.0.is_empty() {
+        return Err(StoreError::Corrupt);
+    }
+    let i = Image {
+        applied,
+        membership,
+        state,
+    };
+    if encode(&i) != b {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(i)
+}
+pub struct StateStore {
+    db: Connection,
+    image: Image,
+    blob: Vec<u8>,
+    poisoned: bool,
+    _lock: File,
+    #[cfg(test)]
+    hook: Option<(std::path::PathBuf, bool)>,
+}
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateStore")
+            .field("image", &self.image)
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
+}
+fn private(path: &Path) -> Result<(), StoreError> {
+    crate::config::checked_path(path).map_err(|_| StoreError::Io)?;
+    crate::security::private(path).map_err(|_| StoreError::Io)
+}
+fn options() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+impl StateStore {
+    pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
+        private(dir)?;
+        for name in [
+            "cluster-state.lock",
+            "cluster-state.sqlite3",
+            "cluster-state.sqlite3-journal",
+            "cluster-state.sqlite3-wal",
+            "cluster-state.sqlite3-shm",
+        ] {
+            let path = dir.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) => {
+                    private(&path)?;
+                    if !m.is_file() {
+                        return Err(StoreError::Io);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(StoreError::Io),
+            }
+        }
+        let lock_path = dir.join("cluster-state.lock");
+        let lock = options().open(&lock_path).map_err(|_| StoreError::Io)?;
+        lock.try_lock().map_err(|_| StoreError::Io)?;
+        private(&lock_path)?;
+        let path = dir.join("cluster-state.sqlite3");
+        let file = options().open(&path).map_err(|_| StoreError::Io)?;
+        private(&path)?;
+        drop(file);
+        let mut db = Connection::open(&path)?;
+        db.busy_timeout(Duration::from_millis(250))?;
+        db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA max_page_count=64;")?;
+        let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+        for (key, max, exact) in [
+            ("synchronous", 2, true),
+            ("busy_timeout", 250, true),
+            ("fullfsync", 1, true),
+            ("max_page_count", 64, true),
+            ("page_size", 4096, false),
+            ("page_count", 64, false),
+        ] {
+            let v: u64 = db.pragma_query_value(None, key, |r| r.get(0))?;
+            if (exact && v != max) || v > max {
+                return Err(StoreError::Unsupported);
+            }
+        }
+        if mode != "truncate" {
+            return Err(StoreError::Unsupported);
+        }
+        let tx = db.transaction()?;
+        let v: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if v == 0 {
+            let blob = encode(&Image {
+                applied: None,
+                membership: None,
+                state: EnrollmentState::new(init.cluster, init.first_free),
+            });
+            tx.execute_batch("CREATE TABLE sm(singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot BLOB NOT NULL CHECK(length(snapshot)<=16384)); PRAGMA user_version=1;")?;
+            tx.execute("INSERT INTO sm VALUES(1,?1)", [&blob])?;
+        } else if v != 1 {
+            return Err(StoreError::Unsupported);
+        }
+        let blob:Vec<u8>=tx.query_row("SELECT snapshot FROM sm WHERE singleton=1 AND typeof(snapshot)='blob' AND length(snapshot)<=16384",[],|r|r.get(0))?;
+        let rows: u64 =
+            tx.query_row("SELECT count(*) FROM (SELECT 1 FROM sm LIMIT 2)", [], |r| {
+                r.get(0)
+            })?;
+        if rows != 1 {
+            return Err(StoreError::Corrupt);
+        }
+        let image = decode(&blob)?;
+        if codec::cluster(&image.state) != init.cluster {
+            return Err(StoreError::WrongCluster);
+        }
+        tx.commit()?;
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let p = dir.join(format!("cluster-state.sqlite3{suffix}"));
+            if p.exists() {
+                private(&p)?;
+            }
+        }
+        Ok(Self {
+            db,
+            image,
+            blob,
+            poisoned: false,
+            _lock: lock,
+            #[cfg(test)]
+            hook: None,
+        })
+    }
+    pub fn applied(&self) -> Option<LogPos> {
+        self.image.applied
+    }
+    pub fn membership(&self) -> Option<&(LogPos, MembershipBlob)> {
+        self.image.membership.as_ref()
+    }
+    pub fn state(&self) -> &EnrollmentState {
+        &self.image.state
+    }
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.blob.clone()
+    }
+    fn persist(&mut self, image: Image) -> Result<(), StoreError> {
+        let blob = encode(&image);
+        if blob.len() > LIMIT {
+            return Err(StoreError::TooLarge);
+        }
+        let result = (|| -> Result<(), StoreError> {
+            let tx = self.db.transaction()?;
+            if tx.execute("UPDATE sm SET snapshot=?1 WHERE singleton=1", [&blob])? != 1 {
+                return Err(StoreError::Sql);
+            }
+            #[cfg(test)]
+            if let Some((path, false)) = &self.hook {
+                tx.cache_flush()?;
+                tests::pause(path);
+            }
+            tx.commit()?;
+            #[cfg(test)]
+            if let Some((path, true)) = &self.hook {
+                tests::pause(path);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+            result?;
+        }
+        self.image = image;
+        self.blob = blob;
+        Ok(())
+    }
+    pub fn apply(&mut self, pos: LogPos, entry: &Entry) -> Result<Option<Outcome>, StoreError> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        if self.image.applied.map_or(pos.index != 0, |p| {
+            p.index.checked_add(1) != Some(pos.index) || pos.term < p.term
+        }) {
+            return Err(StoreError::OutOfOrder);
+        }
+        let mut image = self.image.clone();
+        image.applied = Some(pos);
+        let outcome = match entry {
+            Entry::Blank => None,
+            Entry::Enrollment(c) => Some(image.state.apply(c)),
+            Entry::Membership(m) => {
+                image.membership = Some((pos, m.clone()));
+                None
+            }
+        };
+        self.persist(image)?;
+        Ok(outcome)
+    }
+    pub fn install(&mut self, blob: &[u8]) -> Result<(), StoreError> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        if blob.len() > LIMIT {
+            return Err(StoreError::TooLarge);
+        }
+        let image = decode(blob)?;
+        if codec::cluster(&image.state) != codec::cluster(&self.image.state) {
+            return Err(StoreError::WrongCluster);
+        }
+        let p = image.applied.ok_or(StoreError::StaleSnapshot)?;
+        if self
+            .applied()
+            .is_some_and(|a| p.index <= a.index || p.term < a.term)
+        {
+            return Err(StoreError::StaleSnapshot);
+        }
+        self.persist(image)
+    }
+}
+#[cfg(test)]
+mod tests;
