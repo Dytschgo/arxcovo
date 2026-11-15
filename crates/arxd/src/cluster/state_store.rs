@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 const LIMIT: usize = 16384;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LogPos {
     pub term: u64,
     pub leader: u64,
@@ -52,6 +52,9 @@ pub enum StoreError {
     Poisoned,
     TooLarge,
     StaleSnapshot,
+    Full,
+    Conflict,
+    VoteRegressed,
 }
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +68,9 @@ impl std::fmt::Display for StoreError {
             Self::Poisoned => "state store poisoned",
             Self::TooLarge => "snapshot too large",
             Self::StaleSnapshot => "stale snapshot",
+            Self::Full => "log full",
+            Self::Conflict => "log conflict",
+            Self::VoteRegressed => "vote regressed",
         })
     }
 }
@@ -80,12 +86,12 @@ struct Image {
     membership: Option<(LogPos, MembershipBlob)>,
     state: EnrollmentState,
 }
-fn put_pos(b: &mut Vec<u8>, p: LogPos) {
+pub(super) fn put_pos(b: &mut Vec<u8>, p: LogPos) {
     b.extend(p.term.to_be_bytes());
     b.extend(p.leader.to_be_bytes());
     b.extend(p.index.to_be_bytes());
 }
-fn get_pos(r: &mut Reader<'_>) -> Result<LogPos, StoreError> {
+pub(super) fn get_pos(r: &mut Reader<'_>) -> Result<LogPos, StoreError> {
     Ok(LogPos {
         term: r.u64()?,
         leader: r.u64()?,
@@ -184,56 +190,67 @@ fn options() -> OpenOptions {
     }
     o
 }
-impl StateStore {
-    pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
-        private(dir)?;
-        for name in [
-            "cluster-state.lock",
-            "cluster-state.sqlite3",
-            "cluster-state.sqlite3-journal",
-            "cluster-state.sqlite3-wal",
-            "cluster-state.sqlite3-shm",
-        ] {
-            let path = dir.join(name);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) => {
-                    private(&path)?;
-                    if !m.is_file() {
-                        return Err(StoreError::Io);
-                    }
+pub(super) fn open_db(
+    dir: &Path,
+    stem: &str,
+    max_pages: u64,
+) -> Result<(File, Connection), StoreError> {
+    if !matches!(stem, "cluster-state" | "cluster-log") {
+        return Err(StoreError::Unsupported);
+    }
+    private(dir)?;
+    for name in [
+        &format!("{stem}.lock"),
+        &format!("{stem}.sqlite3"),
+        &format!("{stem}.sqlite3-journal"),
+        &format!("{stem}.sqlite3-wal"),
+        &format!("{stem}.sqlite3-shm"),
+    ] {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) => {
+                private(&path)?;
+                if !m.is_file() {
+                    return Err(StoreError::Io);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(StoreError::Io),
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(StoreError::Io),
         }
-        let lock_path = dir.join("cluster-state.lock");
-        let lock = options().open(&lock_path).map_err(|_| StoreError::Io)?;
-        lock.try_lock().map_err(|_| StoreError::Io)?;
-        private(&lock_path)?;
-        let path = dir.join("cluster-state.sqlite3");
-        let file = options().open(&path).map_err(|_| StoreError::Io)?;
-        private(&path)?;
-        drop(file);
-        let mut db = Connection::open(&path)?;
-        db.busy_timeout(Duration::from_millis(250))?;
-        db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA max_page_count=64;")?;
-        let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
-        for (key, max, exact) in [
-            ("synchronous", 2, true),
-            ("busy_timeout", 250, true),
-            ("fullfsync", 1, true),
-            ("max_page_count", 64, true),
-            ("page_size", 4096, false),
-            ("page_count", 64, false),
-        ] {
-            let v: u64 = db.pragma_query_value(None, key, |r| r.get(0))?;
-            if (exact && v != max) || v > max {
-                return Err(StoreError::Unsupported);
-            }
-        }
-        if mode != "truncate" {
+    }
+    let lock_path = dir.join(format!("{stem}.lock"));
+    let lock = options().open(&lock_path).map_err(|_| StoreError::Io)?;
+    lock.try_lock().map_err(|_| StoreError::Io)?;
+    private(&lock_path)?;
+    let path = dir.join(format!("{stem}.sqlite3"));
+    let file = options().open(&path).map_err(|_| StoreError::Io)?;
+    private(&path)?;
+    drop(file);
+    let db = Connection::open(&path)?;
+    db.busy_timeout(Duration::from_millis(250))?;
+    db.execute_batch(&format!("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA max_page_count={max_pages};"))?;
+    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    for (key, max, exact) in [
+        ("synchronous", 2, true),
+        ("busy_timeout", 250, true),
+        ("fullfsync", 1, true),
+        ("max_page_count", max_pages, true),
+        ("page_size", 4096, stem == "cluster-log"),
+        ("page_count", max_pages, false),
+    ] {
+        let v: u64 = db.pragma_query_value(None, key, |r| r.get(0))?;
+        if (exact && v != max) || v > max {
             return Err(StoreError::Unsupported);
         }
+    }
+    if mode != "truncate" {
+        return Err(StoreError::Unsupported);
+    }
+    Ok((lock, db))
+}
+impl StateStore {
+    pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
+        let (lock, mut db) = open_db(dir, "cluster-state", 64)?;
         let tx = db.transaction()?;
         let v: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if v == 0 {
@@ -362,4 +379,4 @@ impl StateStore {
     }
 }
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
