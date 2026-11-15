@@ -61,14 +61,48 @@ async fn server(config: Config) -> (String, tokio::task::JoinHandle<()>) {
     });
     (format!("http://{addr}/mcp"), task)
 }
-async fn client(url: &str, token: &str) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+// Keep a subprocess owned by its live SDK session. A shutdown deadline must not
+// become a lifetime limit for a client still issuing requests.
+struct InventoryPeer {
+    service: rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    child: Option<tokio::process::Child>,
+}
+impl std::ops::Deref for InventoryPeer {
+    type Target = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+impl InventoryPeer {
+    async fn cancel(self) -> Result<rmcp::service::QuitReason, tokio::task::JoinError> {
+        let result = self.service.cancel().await;
+        if let Some(mut child) = self.child {
+            let status =
+                tokio::time::timeout(std::time::Duration::from_secs(15), child.wait()).await;
+            if !matches!(status, Ok(Ok(status)) if status.success()) {
+                // Diagnostics are only read after exit/kill, so a live process
+                // cannot hold its stderr pipe open until the diagnostic timeout.
+                child.kill().await.unwrap();
+                let diagnostic = child_diagnostic(&mut child).await;
+                panic!("bridge shutdown failed; diagnostic={diagnostic}");
+            }
+        }
+        result
+    }
+}
+async fn client(url: &str, token: &str) -> InventoryPeer {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url.to_owned()).auth_header(token),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(10), ().serve(transport))
+    let service = tokio::time::timeout(std::time::Duration::from_secs(10), ().serve(transport))
         .await
         .unwrap()
-        .unwrap()
+        .unwrap();
+    InventoryPeer {
+        service,
+        child: None,
+    }
 }
 #[tokio::test]
 async fn sdk_initialize_inventory_activity_restart_and_secrets() {
@@ -873,7 +907,7 @@ async fn child_diagnostic(child: &mut tokio::process::Child) -> String {
     .unwrap_or("unclassified")
     .into()
 }
-async fn stdio_peer(path: &Path) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+async fn stdio_peer(path: &Path) -> InventoryPeer {
     use std::process::Stdio;
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_arxd"))
         .arg("mcp-stdio")
@@ -909,14 +943,10 @@ async fn stdio_peer(path: &Path) -> rmcp::service::RunningService<rmcp::RoleClie
             );
         }
     };
-    tokio::spawn(async move {
-        let status = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait()).await;
-        if !matches!(status, Ok(Ok(status)) if status.success()) {
-            let diagnostic = child_diagnostic(&mut child).await;
-            eprintln!("bridge completion status={status:?}; diagnostic={diagnostic}");
-        }
-    });
-    service
+    InventoryPeer {
+        service,
+        child: Some(child),
+    }
 }
 #[tokio::test]
 async fn early_disconnected_and_malformed_clients_do_not_kill_listener() {
