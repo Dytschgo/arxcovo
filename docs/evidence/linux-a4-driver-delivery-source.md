@@ -106,3 +106,15 @@ the concrete failing gate on the next ordinary hosted build. No admission,
 recipe/image pin or runtime behavior changes. Ten helper-tool tests pass,
 including planted-private-marker suppression; diff checks pass. Pending hosted
 result must be diagnosed before any repin or native disposition.
+
+## Localized image comparison refusal
+
+Headcf41d28 run43658154150 job132641266990 reports image-pin after
+10 mocked helper-tool tests pass. This proves the Linux candidate reached
+comparison and disagreed with at least one pinned image field; it does not
+establish a correct replacement image. Coordinator adds a fixed closed
+comparison report with five field-equality booleans, actual image hash/size,
+symbol count and name-equality boolean. No paths, raw image, compiler output
+or symbol names are emitted. Ten tool tests verify its schema and failure
+behavior. Pin/recipe/flags/source and admission are unchanged; comparison
+continues to fail on any mismatch. Assess the hosted report before a fix.

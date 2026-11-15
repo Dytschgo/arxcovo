@@ -1,6 +1,8 @@
 """Pure manifest/ELF rejection tests. No waiting image or native adapter runs."""
 
 import copy
+import contextlib
+import io
 import json
 import struct
 import sys
@@ -72,8 +74,17 @@ class InventoryTests(unittest.TestCase):
                  patch.object(build, 'tool_sha', return_value='a' * 64), \
                  patch.object(build, 'inventory', return_value=pin['symbols']):
                 if differs:
-                    with self.assertRaisesRegex(ValueError, 'independently reviewed image'):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), self.assertRaisesRegex(ValueError, 'independently reviewed image'):
                         build.main()
+                    report = json.loads(output.getvalue())
+                    self.assertEqual(set(report), {"kind", "matches", "image_sha256", "image_size", "symbol_count", "symbol_names_match"})
+                    self.assertEqual(report["kind"], "a4-compile-comparison")
+                    self.assertEqual(report["image_size"], len(data) + 1)
+                    self.assertFalse(report["matches"]["image_sha256"])
+                    self.assertFalse(report["matches"]["image_size"])
+                    self.assertTrue(report["matches"]["source_sha256"])
+                    self.assertTrue(report["symbol_names_match"])
                 else:
                     build.main()
                 self.assertEqual(command.call_count, 3)
