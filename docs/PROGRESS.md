@@ -14,8 +14,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #147, `a318ae167e940948898affcb99da33bf17bd9dbc` at23:36:01Z; independent Opus exact-head PASS6903122978/status58983006547 and all five gates green. Reviewed9390742/squash full trees equal. Before merge, exact main0ab5038 CI43768671593 was confirmed completed green and main was re-read without drift.
-- Current work: member-registry R1 isolated rejection tests retained as7a37a68; narrow Opus recheck PASS; publication exact-head review and hosted gates next. Consensus callback hotfix merged as PR147; natural Ubuntu cause remains unproven. Linux s9c reproduction remains blocked on ordinary Linux capacity. M2 stays open.
+- Last merged: PR #148, `6e9edd5a51d1df41cdb412af6031f959de2d9d60` at23:58:14Z; independent Opus exact-head PASS6903410475/status58983834998 and all five gates green. Reviewed45dec89/squash full trees equal. Before merge, exact maina318ae1 CI43775693200 was confirmed completed green and main was re-read without drift.
+- Current work: Opus architecture contract for the next bounded certificate issuance/test trust slice, building on the merged durable registry. Sol independently reviews the brief before source work. No production transport, key sealing or real-host acceptance is implied. Consensus hotfix PR147 is merged; Linux s9c remains unresolved with local reproduction blocked. M2 remains open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -37,6 +37,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Coordinator verifies PR148 all five green gates and exact-maina318ae1 latestCI43775693200 success, re-reads main, unwatches and merges6e9edd5 at23:58:14Z; reviewed45dec89/squash trees equal. Registry has pure/in-process hosted credit only. Next Opus contract settles certificate issuance and test-only trust from committed bindings before Sol implementation; no M2 closure or native authority.
 
 - 2026-11-16: Opus high b1efd7b retained1f1db75 closes registry R1: each of three guard mutants compiles and fails only its new isolating assertion (108/1); restored cluster109/109 passes, fmt/workspace locked-offline Clippy/diff pass. Coordinator corrects historical coverage overstatement and two test blob pins before publication. No CA/TLS/transport or fullM3 acceptance; exact-head review, five gates and latest exact-main green CI remain required.
 
