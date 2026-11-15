@@ -9,6 +9,8 @@
 
 ## Task history
 
+- 2026-11-15: Opus high33410cf retainedc736cf7 settles bounded SQLite durable enrollment state/crash probe using existing dependencies. Independent Sol review passes with explicit codec/install invariants and removal of unsupported calendar-only dependency gate. Next Sol implements verifier boundary plus canonical atomic state store; no quorum/power-loss/signing acceptance and no M2 closure.
+
 - 2026-11-15: Coordinator verifies PR142 exact head/all five gates, unwatches and merges4f323c3; reviewed/squash full trees equal. Next Opus architecture task selects one bounded implementable M3 durable-state/commit boundary under ADR0005. No new owner/native/production authority; M3 acceptance and M2 hardware gaps remain open.
 
 - 2026-11-15: Opus highac14a63 independently reviews Sol M3 pure enrollment implementation, Standards/Spec/Security PASS with no blockers. Reran13 focused nextest/fmt/Clippy, independent hash vectors and scratch counterfactuals; future-adapter replay/key policies and low test-gap advisories remain explicit and do not grant acceptance. Coordinator publishes one-concern pure-core PR; no runtime endpoint/signing/Raft storage integration.

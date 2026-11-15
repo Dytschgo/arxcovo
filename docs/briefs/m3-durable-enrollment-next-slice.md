@@ -83,7 +83,7 @@ Existing deps only (`rusqlite`, `sha2`, `hex`; dev `tempfile`). Commits: boundar
   and commit, then swap memory and return. Any SQLite error poisons; memory stays at the pre-state
   until reopen reloads disk.
 - **Install:** over 16 KiB → `TooLarge`; failed full decode → `Corrupt`; other cluster →
-  `WrongCluster`; applied `None` or not strictly above current → `StaleSnapshot`; all unchanged.
+  `WrongCluster`; applied `None`, index not above current or term below current → `StaleSnapshot`; all unchanged.
   Otherwise one transaction, then swap.
 - `StoreError` `Display` is static: no IDs, paths, SQLite text or bytes. No logging.
 
@@ -95,10 +95,10 @@ bytes; `cluster16`, `next_node u64`, `committed u64`, `u16` count, records sorte
 trailer SHA-256 of all preceding bytes (corruption detection, not authentication).
 
 Decode rejects: wrong header/version or digest; flag not 0/1; trailing or missing bytes;
-membership without applied, membership `index > applied.index`, or blob length outside 1–4096;
+membership without applied, index/term above applied or unequal same-index positions, or blob length outside 1–4096;
 over `MAX_RECORDS` or unsorted/duplicate code IDs; `next_node` 0; consumed node 0, not below
 `next_node`, or duplicated; `committed > MAX_TIME_MS`; `expires` outside
-`CODE_TTL_MS..=MAX_TIME_MS+CODE_TTL_MS` or `expires+TOMBSTONE_MS <= committed`; over `MAX_PENDING`
+`CODE_TTL_MS..=committed+CODE_TTL_MS` or `expires+TOMBSTONE_MS <= committed`; duplicate `(actor,request)`; over `MAX_PENDING`
 usable pending at `committed`. Canonical: `encode(decode(b)) == b`.
 
 ## Required tests (`cluster::state_store::tests`; reuse `private_temp`)
@@ -136,5 +136,5 @@ hosted runners only. Power-loss durability, quorum commit, three-node availabili
 expiry, signing and mTLS stay open and **unverified on real hardware**.
 
 **Next, not this slice:** (1) durable vote/log storage (ack only after sync; truncate/purge crash
-tests); (2) OpenRaft 0.10 adapter over this store, pinned once two weeks old, in-process three-node
+tests); (2) OpenRaft 0.10 adapter over this store, pinned after the adapter API/source review, in-process three-node
 test; (3) transport, mTLS and issuance design, deciding A3.
