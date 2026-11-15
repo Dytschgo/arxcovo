@@ -2,8 +2,8 @@
 
 ## Current state - 2026-11-15
 
-- Last merged: PR #109, `a328060000b8cb7bb389d39f8785f96f6bcb0c25` at 02:05:45Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `bcff99c`; all 113 baseline pins and the strict six-file execution delta verified before dispatch.
-- Current work: publish independently assessed D7e A4 baseline run `43666413693`, attempt1/job132666674807 on exact `a328060`. Job succeeded in73s; first/final null and cleanup confirmed; monitor finally deleted the SHA variable and an independent API read verified404. D7e is consumed. No A4 acceptance or further run is credited; native omitted-kill remains unrun and NOT granted.
+- Last merged: PR #111, `e476ce36467fc1a5ea3280ed5e96d4ea8d0d8fbc` at 02:27:49Z, independent Muse exact-head PASS and all five gates green. Squash tree equals reviewed `8bd2e39`; docs-only baseline feedback checkpoint, with no A4 acceptance or further native authority.
+- Current work: independently review the fixed native omitted-kill plan; D7e baseline checkpoint is merged. Independently assessed D7e A4 baseline run `43666413693`, attempt1/job132666674807 on exact `a328060`. Job succeeded in73s; first/final null and cleanup confirmed; monitor finally deleted the SHA variable and an independent API read verified404. D7e is consumed. No A4 acceptance or further run is credited; native omitted-kill remains unrun and NOT granted.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. Native A4 omitted-kill, A4 acceptance, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
