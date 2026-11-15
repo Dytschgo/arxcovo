@@ -3,11 +3,13 @@
 ## Current state - 2026-11-15
 
 - Last merged: PR #138, `2a1d5ad32cfb62cac3fb87c8a799b857e1a5f59c` at 17:28:03Z, independent Opus exact-head PASS6898267544/status58969899019 and all five gates green. Reviewed3cf4a33/squash tree68db17fb identical; complete223-file inventory digestdbc11a5a verified.
-- Current work: independent Opus assessment of consumed D7l A12 failure43741300777 (67s, E_SERVICE_OR_TEST -> E_COMMAND_FAILED, cgroup lower bound, cleanup unconfirmed). All three pins independently HTTP404; host excluded with no retry/diagnostic leg/grant. No A12 acceptance; remaining independent M2 source work and then independent M3 continue after checkpoint. A7 hosted FINAL NO-GO remains closed.
+- Current work: publish the independently assessed consumed D7l A12 failure checkpoint, then join existing accepted evidence for the remaining A10 capability-limits claim (docs only, no native run). Opus assessment9d3e9d4 PASS all axes: no A12 credit, cleanup unconfirmed, host excluded, no retry/diagnostic/grant. A7 hosted FINAL NO-GO stays closed; M2 incomplete; independent M3 follows remaining source work.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Task history
+
+- 2026-11-15: Opus 5.5 high independently assesses D7l failure9d3e9d4: Standards/Spec/Security PASS, source+public run binding and closed replay verified; no markers/summary evidence, cleanup uncertainty and account removal unknown. Coordinator pin404 facts remain separately attributed. Next A10 evidence join is docs-only against accepted records, never a new native attempt.
 
 - 2026-11-15: Coordinator records sole D7l A12 failure on exact2a1d5ad after67s. Closed schema validated, cleanup unconfirmed; no cause or native credit inferred. Independent post-terminal all-three404 verified. No retry or host reuse; fresh Opus assessment requested. A12 **unverified on real hardware**, M2 incomplete.
 
