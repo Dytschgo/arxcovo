@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main pending:** PR160 merged as688f1ad; CI43875610482 in progress. Prior e601caa CI43862021319 was green immediately before merge. No further merge until the new exact-main run is green.
+**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -26,8 +26,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 pending.
-- Current work: PR161 push2 has exact-head Opus PASS6917477824/status59027550095; Ubuntu566/566, both new controls and S8/S9c passed, macOS green, Windows pending at review snapshot. Local merge integrates PR160 without changing any attribution/harness source; final push3/3 will require fresh gates/review. Windows phase/history diagnostics source reviewed with complementary cleanup PASS; PR159 held. M2 open/M3 unchecked/eight quarantines unchanged.
+- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
+- Current work: PR161 push2 all platform jobs succeeded on7f71652; independent Opus PASS6917477824/status59027550095. Parent integration9fb217d imports reviewed PR160 only, attribution/harness bytes unchanged. Preparing final integration push3/3 and fresh exact-head gates/review; other merges wait for this head to settle. Windows phase/history diagnostics reviewed with complementary cleanup PASS, publication after this integration. PR159 held; M2 open/M3 unchecked/eight quarantines unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 

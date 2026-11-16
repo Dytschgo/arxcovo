@@ -199,3 +199,20 @@ for the old run's terminal result and exact-main CI43875610482. No push merely
 for green and no fourth observability push are authorized. A new exact-head
 review and allfive gates will be required on the combined head, with no old-head
 credit. Linux fixes remain0/3; original S8/S9c unresolved and distinct.
+
+
+## Final parent-integration publication
+
+Old run43873234554 completed success on7f71652 (Windows556s, Ubuntu212s,
+macOS218s active jobs). No hidden late failure is discarded. Main after PR160,
+688f1ad, CI43875610482 completed success: Ubuntu179s, Windows590s, macOS317s.
+Root revalidated those exact SHA/run pairs before the final integration push.
+Git diff of all four attribution/harness files against7f71652 is empty; only
+PR160's separately reviewed consensus tests and documentation came from main.
+
+Final observability push3/3 integrates the newly required parent rather than
+rerunning a failed head. New combined-head checks and exact-head review must
+pass independently. No other merge is queued ahead of this one, preventing
+avoidable further parent churn. No fourth observability push is authorized;
+an attributed S8/S9c red still stops for diagnosis. Linux fix0/3 and hardware/
+M2/M3 acceptance limits remain unchanged.
