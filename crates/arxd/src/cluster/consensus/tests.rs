@@ -861,8 +861,12 @@ async fn preflight_rejects_unrepresentable_snapshot_index() {
 }
 
 // Single-node runtime controls: Weak expiry is deliberately observed before Drop ends.
-async fn store_close_completion_shutdown(deadline: bool) {
-    use crate::cluster::state_store::DropGate;
+enum CloseStore {
+    State,
+    Log,
+}
+async fn store_close_completion_shutdown(store: CloseStore, deadline: bool) {
+    use crate::cluster::state_store::{DropGate, Released};
     use std::sync::mpsc;
     let dir = private_temp();
     let network = || super::mem_net::Factory {
@@ -872,15 +876,28 @@ async fn store_close_completion_shutdown(deadline: bool) {
     let mut node = ConsensusNode::start(1, dir.path(), init(), Params::default(), network())
         .await
         .unwrap();
-    let held = node.sm.as_ref().unwrap().0.clone();
-    let weak = Arc::downgrade(&held);
-    let released = held.lock().unwrap().released();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    held.lock().unwrap().hold_drop(DropGate {
+    let gate = DropGate {
         entered: entered_tx,
         release: release_rx,
-    });
+    };
+    // Type erasure lets the same assertions exercise either real store destructor.
+    let (held, released): (Arc<dyn std::any::Any + Send + Sync>, Released) = match store {
+        CloseStore::State => {
+            let held = node.sm.as_ref().unwrap().0.clone();
+            let released = held.lock().unwrap().released();
+            held.lock().unwrap().hold_drop(gate);
+            (held, released)
+        }
+        CloseStore::Log => {
+            let held = node.log_weak.upgrade().unwrap();
+            let released = held.lock().unwrap().released();
+            held.lock().unwrap().hold_drop(gate);
+            (held, released)
+        }
+    };
+    let weak = Arc::downgrade(&held);
     let start = Instant::now();
     let mut shutdown = tokio::spawn(async move { node.shutdown().await });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -937,9 +954,14 @@ async fn store_close_completion_shutdown(deadline: bool) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_close_completion_shutdown_waits() {
-    store_close_completion_shutdown(false).await;
+    store_close_completion_shutdown(CloseStore::State, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_close_completion_shutdown_deadline() {
-    store_close_completion_shutdown(true).await;
+    store_close_completion_shutdown(CloseStore::State, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_close_completion_shutdown_waits_for_log() {
+    store_close_completion_shutdown(CloseStore::Log, false).await;
 }
