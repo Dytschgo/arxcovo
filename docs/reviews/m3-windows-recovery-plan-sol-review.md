@@ -1,0 +1,14 @@
+# Sol contract review: Opus Windows recovery plan
+
+Reviewed Opusd3e2a02 retained1bdad09 against restored main6f6e9d2. Main CI43809711957 completed success on that exact live SHA, independently read after watcher completion. This permits parallel M3 work; it does not credit quarantined Windows fixtures.
+
+Standards PASS and Spec/Security CONDITIONAL PASS for local test-only instrumentation D1, with mandatory constraints below. No product fix or Windows re-enable is approved by this review. Opus owns implementation; Sol reviews it. No fourth Sol fix.
+
+- Scope D1 to test-only bounded telemetry plus deterministic positive controls and evidence. No workflow change or non-gating hosted step in D1 yet: that requires a measured separate contract review under the actual12-minute job cap, not merely15-minute global CI budget. Keep all8 Windows ignores and the exact guard unchanged.
+- Every metrics watcher and lag probe is owned, cancelled and joined in fixture teardown. Failure Drop must not await, block on a poisoned/held mutex or panic while unwinding; use nonblocking snapshots and hard8KiB output ceiling. Rings and counters never contain payloads, paths, SQL, keys or addresses. Document that metrics watch history may coalesce updates.
+- Before/after observed same-term Leader metrics do not prove no transient churn or a production defect. S3(b) is a diagnostic candidate requiring engine-consistent evidence, not an automatic fault verdict from stale snapshots. Isolate-between-read controls may cause ForwardToLeader before a new term is observed; correlate bounded history without inventing guaranteed term change.
+- A fixed200ms delay is not universally guaranteed to exceed the shutdown budget. Build a controlled queued-apply positive control that actually exceeds the unchanged5s budget and verify Owners attribution; record the measured delay/backlog. Do not change deadlines or claim a failing unrelated seam as success.
+- Use unique task-owned D: targets and temp; do not reuse another reviewer's mutant target or delete blocked scratch directories. Local loop cap is20 iterations or5minutes after build, whichever first, stopping on first attributed red. The filter stays anchored to cluster::consensus to exclude all native M2 fixtures.
+- Two bounded Opus fix attempts remain a proposed later budget: instrumentation itself is authorized now, but a source fix needs this coordinator's evidence/contract review before dispatch. No helper retries, deadline increases, quarantine changes or scheduling masks. Re-enable remains separate reviewed work with allfive gates and subsequent green main.
+
+With those constraints, proceed with Opus D1 local instrumentation, positive controls and one bounded loop. No build/test was run for this contract review. M2 remains open, M3 unchecked and Windows three-node coverage unverified on hosted Windows and **unverified on real hardware**.

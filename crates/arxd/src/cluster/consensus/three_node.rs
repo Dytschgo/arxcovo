@@ -1,18 +1,20 @@
+use super::diagnostics::{Diag, Fail, Helper};
 use super::mem_net::{Factory, MemRouter};
 use super::*;
 use crate::cluster::enrollment::{CODE_TTL_MS, JoinCode, KeyDigest, Reject};
 use crate::service::application::tests::private_temp;
 use std::sync::atomic::Ordering;
 use tokio::time::timeout;
-struct Cluster {
+pub(super) struct Cluster {
     dirs: Vec<tempfile::TempDir>,
     nodes: Vec<Option<Arc<ConsensusNode>>>,
-    router: Arc<MemRouter>,
+    pub(super) router: Arc<MemRouter>,
     params: Params,
     acknowledged: Mutex<Vec<LogPos>>,
+    pub(super) diag: Diag,
 }
 impl Cluster {
-    async fn new(params: Params) -> Self {
+    pub(super) async fn new(params: Params) -> Self {
         let c = Self::unfounded(params).await;
         c.write(founders()).await;
         c
@@ -24,7 +26,9 @@ impl Cluster {
             router: Arc::default(),
             params,
             acknowledged: Mutex::default(),
+            diag: Diag::new(),
         };
+        c.diag.start_probe();
         for i in 0..3 {
             c.start(i).await;
         }
@@ -42,7 +46,7 @@ impl Cluster {
         c.leader().await;
         c
     }
-    fn node(&self, i: usize) -> &Arc<ConsensusNode> {
+    pub(super) fn node(&self, i: usize) -> &Arc<ConsensusNode> {
         self.nodes[i].as_ref().unwrap()
     }
     async fn start(&mut self, i: usize) {
@@ -61,6 +65,8 @@ impl Cluster {
         )
         .await
         .unwrap();
+        let stores = [n.log_weak.as_ptr() as usize, n.sm_weak.as_ptr() as usize];
+        self.diag.watch(i, n.raft.as_ref().unwrap(), stores);
         self.router
             .nodes
             .lock()
@@ -75,16 +81,24 @@ impl Cluster {
         let mut n = Arc::try_unwrap(self.nodes[i].take().unwrap())
             .ok()
             .expect("caller still owns node");
-        n.shutdown().await.unwrap();
+        diagnostics_count(&self.diag.helpers.stops);
+        let result = n.shutdown().await;
+        if let Err(Orphaned(r)) = &result {
+            self.attribute_stop(i, *r);
+        }
+        result.unwrap();
+        self.diag.forget(i);
         assert!(n.log_weak.upgrade().is_none());
         assert!(n.sm_weak.upgrade().is_none());
         assert_eq!(n.permits.available_permits(), 64);
         assert!(n.owners.lock().unwrap().set.is_empty());
         assert_eq!(n.propose(unknown(250)).await, Err(ProposeError::Stopped));
     }
-    async fn leader(&self) -> usize {
-        timeout(Duration::from_secs(5), async {
+    pub(super) async fn leader(&self) -> usize {
+        let mut polls = 0u32;
+        let result = timeout(Duration::from_secs(5), async {
             loop {
+                polls = polls.saturating_add(1);
                 for (i, n) in self.nodes.iter().enumerate() {
                     if let Some(n) = n
                         && n.raft.as_ref().unwrap().metrics().borrow_watched().state
@@ -96,29 +110,94 @@ impl Cluster {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("leader deadline")
+        .await;
+        self.diag.leader_polls(polls);
+        if result.is_err() {
+            let mut a = self.diag.attribution(Helper::Leader, Fail::Elapsed, 0);
+            a.polls = polls;
+            self.attribute(a);
+        }
+        result.expect("leader deadline")
     }
-    async fn write(&self, cmd: Command) -> (LogPos, Option<Outcome>) {
-        timeout(Duration::from_secs(5), async {
+    pub(super) async fn write(&self, cmd: Command) -> (LogPos, Option<Outcome>) {
+        let mut retries = 0u32;
+        let mut target = 0;
+        let result = timeout(Duration::from_secs(5), async {
             loop {
                 let i = self.leader().await;
+                target = i;
                 match self.node(i).propose(cmd.clone()).await {
                     Ok(r) => {
                         self.acknowledged.lock().unwrap().push(r.0);
                         return r;
                     }
-                    Err(ProposeError::NotLeader(_)) => tokio::task::yield_now().await,
-                    e => panic!("proposal: {e:?}"),
+                    Err(ProposeError::NotLeader(_)) => {
+                        retries = retries.saturating_add(1);
+                        tokio::task::yield_now().await
+                    }
+                    e => {
+                        let fail = match e {
+                            Err(ProposeError::Busy) => Fail::Busy,
+                            Err(ProposeError::Stopped) => Fail::Stopped,
+                            _ => Fail::Unknown,
+                        };
+                        let mut a = self.diag.attribution(Helper::Write, fail, i);
+                        a.retries = retries;
+                        self.attribute(a);
+                        panic!("proposal: {e:?}")
+                    }
                 }
             }
         })
-        .await
-        .unwrap()
+        .await;
+        self.diag.write_retries(retries);
+        if result.is_err() {
+            let mut a = self.diag.attribution(Helper::Write, Fail::Elapsed, target);
+            a.retries = retries;
+            self.attribute(a);
+        }
+        result.unwrap()
     }
-    async fn converge(&self) {
+    // Test-only attribution: records integers and enums, never changes the outcome.
+    fn attribute(&self, mut a: super::diagnostics::Attribution) {
+        for (i, n) in self.nodes.iter().enumerate() {
+            a.at[i] = n
+                .as_ref()
+                .and_then(|n| n.raft.as_ref())
+                .map(|r| self.diag.sample(r));
+        }
+        self.diag.record(a);
+    }
+    pub(super) fn attribute_stop(&self, i: usize, r: ShutdownReport) {
+        let mut a = self.diag.attribution(Helper::Stop, Fail::Orphaned, i);
+        a.report = Some(r);
+        self.attribute(a);
+    }
+    /// The converge read with S3 before/after snapshots; same result as the bare read.
+    pub(super) async fn attributed_read(
+        &self,
+        l: usize,
+    ) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
+        let raft = self.node(l).raft.as_ref().unwrap();
+        let before = self.diag.sample(raft);
+        let result = self.node(l).linearizable_state().await;
+        if let Err(e) = &result {
+            let after = self.diag.sample(raft);
+            let fail = match e {
+                ReadError::NotLeader => Fail::NotLeader,
+                ReadError::NoQuorum => Fail::NoQuorum,
+                ReadError::Unavailable => Fail::Unavailable,
+            };
+            let mut a = self.diag.attribution(Helper::Converge, fail, l);
+            a.read = Some((before, after, self.diag.read_class(l, before, after)));
+            self.attribute(a);
+        }
+        result
+    }
+    pub(super) async fn converge(&self) {
+        diagnostics_count(&self.diag.helpers.converge_calls);
         let l = self.leader().await;
-        let (p, b) = self.node(l).linearizable_state().await.unwrap();
+        let (p, b) = self.attributed_read(l).await.unwrap();
         assert!(
             self.acknowledged
                 .lock()
@@ -126,14 +205,19 @@ impl Cluster {
                 .iter()
                 .all(|a| p.is_some_and(|p| p.index >= a.index))
         );
-        for n in self.nodes.iter().flatten() {
-            n.raft
+        for (i, n) in self.nodes.iter().enumerate() {
+            let Some(n) = n else { continue };
+            let waited = n
+                .raft
                 .as_ref()
                 .unwrap()
                 .wait(Some(Duration::from_secs(5)))
                 .applied_index_at_least(p.map(|p| p.index), "convergence")
-                .await
-                .unwrap();
+                .await;
+            if waited.is_err() {
+                self.attribute(self.diag.attribution(Helper::ConvergeWait, Fail::Wait, i));
+            }
+            waited.unwrap();
             let sm = n.sm.as_ref().unwrap().clone();
             let expected = b.clone();
             blocking(move || {
@@ -146,7 +230,7 @@ impl Cluster {
             .unwrap();
         }
     }
-    async fn finish(&mut self) {
+    pub(super) async fn finish(&mut self) {
         for i in 0..3 {
             if self.nodes[i].is_some() {
                 self.stop(i).await;
@@ -187,7 +271,12 @@ impl Cluster {
                 }
             }
         }
+        self.diag.close().await;
+        eprintln!("{}", self.diag.summary());
     }
+}
+fn diagnostics_count(a: &std::sync::atomic::AtomicU32) {
+    let _ = a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1));
 }
 
 // Real RPC catch-up: no direct snapshot installation or fabricated acknowledgments.
@@ -245,6 +334,8 @@ async fn t3_snapshot_catchup_then_consecutive_append() {
 }
 impl Drop for Cluster {
     fn drop(&mut self) {
+        // Bounded failure dump first: nonblocking, no await, no panic.
+        self.diag.on_drop();
         self.router.nodes.lock().unwrap().clear();
     }
 }
@@ -279,7 +370,7 @@ fn redeem(c: &JoinCode, r: u8, k: u8, t: u64) -> Command {
         t,
     )
 }
-fn unknown(r: u8) -> Command {
+pub(super) fn unknown(r: u8) -> Command {
     redeem(&code(100), r, 1, 1000)
 }
 fn grant(o: Option<Outcome>, n: u64, replay: bool) {
@@ -776,7 +867,7 @@ async fn t4_registry_revocation_snapshot_and_prune() {
 }
 
 // These are attribution tests, not acceptance of Orphaned as healthy shutdown.
-async fn report_cleanup(n: &ConsensusNode) {
+pub(super) async fn report_cleanup(n: &ConsensusNode) {
     timeout(Duration::from_secs(2), async {
         while n.log_weak.strong_count() != 0
             || n.sm_weak.strong_count() != 0
@@ -788,7 +879,7 @@ async fn report_cleanup(n: &ConsensusNode) {
     .await
     .expect("actual stores and permits released after gate release");
 }
-fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
+pub(super) fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
     c.router.isolated.lock().unwrap().insert(i as u64 + 1);
     c.router.nodes.lock().unwrap().remove(&(i as u64 + 1));
     Arc::try_unwrap(c.nodes[i].take().unwrap())

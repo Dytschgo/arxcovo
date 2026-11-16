@@ -60,6 +60,9 @@ impl RaftLogReader<Arx> for LogAdapter {
             Bound::Excluded(v) => *v,
             Bound::Unbounded => u64::MAX,
         };
+        #[cfg(test)]
+        let _span =
+            super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Other);
         self.run(move |s| {
             s.entries(start, end, MAX_LIVE)?
                 .into_iter()
@@ -135,6 +138,9 @@ impl RaftLogStorage<Arx> for LogAdapter {
         v: &Vote<openraft::impls::leader_id_adv::LeaderId<u64, u64>>,
     ) -> io::Result<()> {
         let v = stored_vote(*v);
+        #[cfg(test)]
+        let _span =
+            super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Vote);
         self.run(move |s| s.save_vote(v)).await
     }
     fn append<I>(
@@ -169,7 +175,16 @@ impl RaftLogStorage<Arx> for LogAdapter {
             match prepared {
                 Err(e) => Err(e),
                 Ok((b, guard)) => {
+                    #[cfg(test)]
+                    let _span = super::diagnostics::span(
+                        Arc::as_ptr(&store) as usize,
+                        super::diagnostics::Op::Append,
+                    );
+                    #[cfg(test)]
+                    let submitted = std::time::Instant::now();
                     blocking(move || {
+                        #[cfg(test)]
+                        super::diagnostics::started(Arc::as_ptr(&store) as usize, submitted, false);
                         let r = store
                             .lock()
                             .map_err(|_| StoreError::Poisoned)
@@ -202,9 +217,15 @@ impl RaftLogStorage<Arx> for LogAdapter {
         }
     }
     async fn truncate_after(&mut self, p: Option<Id>) -> io::Result<()> {
+        #[cfg(test)]
+        let _span =
+            super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Other);
         self.run(move |s| s.truncate_after(p.map(pos))).await
     }
     async fn purge(&mut self, p: Id) -> io::Result<()> {
+        #[cfg(test)]
+        let _span =
+            super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Other);
         self.run(move |s| s.purge(pos(p))).await
     }
 }
@@ -225,6 +246,11 @@ impl SmAdapter {
         blocking(move || f(&mut *s.lock().map_err(|_| StoreError::Poisoned)?)).await
     }
     async fn snapshot(&self) -> io::Result<Snap> {
+        #[cfg(test)]
+        let _span = super::diagnostics::span(
+            Arc::as_ptr(&self.0) as usize,
+            super::diagnostics::Op::Snapshot,
+        );
         self.run(|s| {
             Ok(Snapshot {
                 meta: SnapshotMeta {
@@ -286,7 +312,16 @@ impl RaftStateMachine<Arx> for SmAdapter {
             let (e, responder) = e?;
             let (p, e) = to_stored(e).map_err(err)?;
             let store = self.0.clone();
+            #[cfg(test)]
+            let _span = super::diagnostics::span(
+                Arc::as_ptr(&store) as usize,
+                super::diagnostics::Op::Apply,
+            );
+            #[cfg(test)]
+            let submitted = std::time::Instant::now();
             let outcome = blocking(move || {
+                #[cfg(test)]
+                super::diagnostics::started(Arc::as_ptr(&store) as usize, submitted, true);
                 #[cfg(test)]
                 pause_apply(Arc::as_ptr(&store) as usize);
                 store.lock().map_err(|_| StoreError::Poisoned)?.apply(p, &e)
@@ -311,6 +346,9 @@ impl RaftStateMachine<Arx> for SmAdapter {
         blob: Vec<u8>,
     ) -> io::Result<()> {
         let meta = meta.clone();
+        #[cfg(test)]
+        let _span =
+            super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Other);
         self.run(move |s| {
             let (p, m) = StateStore::peek(&blob)?;
             if p.map(id) != meta.last_log_id || membership(m.as_ref())? != meta.last_membership {

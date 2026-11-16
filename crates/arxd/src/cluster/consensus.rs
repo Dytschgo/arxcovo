@@ -496,6 +496,8 @@ impl ConsensusNode {
 }
 
 #[cfg(test)]
+mod diagnostics;
+#[cfg(test)]
 mod mem_net;
 #[cfg(test)]
 mod three_node;
