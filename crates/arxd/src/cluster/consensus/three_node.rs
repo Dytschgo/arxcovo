@@ -8,6 +8,27 @@ use tokio::time::timeout;
 
 // Own the single adapter pause slot across each complete async fixture.
 static APPLY_PAUSE_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+fn read_fail(error: &ReadError) -> Fail {
+    match error {
+        ReadError::NotLeader => Fail::NotLeader,
+        ReadError::NoQuorum => Fail::NoQuorum,
+        ReadError::Unavailable => Fail::Unavailable,
+        ReadError::Busy => Fail::Busy,
+    }
+}
+
+#[test]
+fn read_failure_attribution_covers_all_errors() {
+    for (error, expected) in [
+        (ReadError::NotLeader, Fail::NotLeader),
+        (ReadError::NoQuorum, Fail::NoQuorum),
+        (ReadError::Unavailable, Fail::Unavailable),
+        (ReadError::Busy, Fail::Busy),
+    ] {
+        assert_eq!(read_fail(&error), expected);
+    }
+}
+
 pub(super) struct Cluster {
     dirs: Vec<tempfile::TempDir>,
     nodes: Vec<Option<Arc<ConsensusNode>>>,
@@ -186,11 +207,7 @@ impl Cluster {
         let result = self.node(l).linearizable_state().await;
         if let Err(e) = &result {
             let after = self.diag.sample(raft);
-            let fail = match e {
-                ReadError::NotLeader => Fail::NotLeader,
-                ReadError::NoQuorum => Fail::NoQuorum,
-                ReadError::Unavailable => Fail::Unavailable,
-            };
+            let fail = read_fail(e);
             let mut a = self.diag.attribution(Helper::Converge, fail, l);
             a.read = Some((before, after, self.diag.read_class(l, before, after)));
             self.attribute(a);
