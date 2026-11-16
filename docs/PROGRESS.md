@@ -42,6 +42,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Sol0ee4d3f nextest scheduling repair verifies actual resolvedgroup exactlyeight three-node tests; allothers@global. Configured consensus68/68 passes27.459s at-j4, two resourceguardtests and196existingguards pass, fmt/diff pass. No Rust/deadline/retry/skip changes. Fresh Opus review next; mainremainsred and no merge exception implied. HostedWindowsbudget and suitefixattempt3 stoprule remain binding.
+
 - 2026-11-16: Opusde6a8f1 retainedd00a94f diagnoses exact-main01a42d5 leader-deadline failures under shared-flush contention; serialized three-node group removes leader signature under the controlled model. T3/T4 link remains inferred and hostedcauseunproven. Sol1ee25f0 independently approves narrow scheduling repair (ADR0024), no Rust/assertion/deadline/retry/skip change. Two new Python resource-contract tests and196 existing guards pass; actual nextest mapping/run validation active. Suitefixattempt3; another hosted cluster failure escalates, no fourth tweak.
 
 - 2026-11-16: Opus05a3a2f retained815f6c4 closes diagnostic B1: counts-before-own-handle-drop mutant compiles then fails exactlyone external-reference assertion, restoredR6 tests/fmt/lockedofflinearxdClippy pass. Coordinator separatelyR6/fmt pass. Productionreport unchanged; fresh exact-head review/five gates/latestexactmainCI remain publication/merge prerequisites. No manual CI rerun; first finite changed-diagnostic hosted attempt next.
