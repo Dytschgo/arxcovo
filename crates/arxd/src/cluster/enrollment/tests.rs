@@ -772,3 +772,39 @@ fn founder_count_cap_is_independent_of_allocation_and_other_structure() {
         }
     }
 }
+#[test]
+fn retained_grant_check_matrix() {
+    let mut s = state();
+    let c = code(77);
+    s.apply(&mint(&c, 1, 1000));
+    let g = grant(s.apply(&redeem(&c, 2, 9, 1000)));
+    assert_eq!(s.check_grant(&g, &c.code_id()), Ok(()));
+    let mut changed = g.clone();
+    changed.request = [88; 16];
+    assert_eq!(s.check_grant(&changed, &c.code_id()), Err(Reject::Consumed));
+    changed = g.clone();
+    changed.node = node(99);
+    assert_eq!(s.check_grant(&changed, &c.code_id()), Err(Reject::Consumed));
+    changed = g.clone();
+    changed.key = key(88);
+    assert_eq!(
+        s.check_grant(&changed, &c.code_id()),
+        Err(Reject::KeyConflict)
+    );
+    changed = g.clone();
+    changed.cluster = [99; 16];
+    assert_eq!(
+        s.check_grant(&changed, &c.code_id()),
+        Err(Reject::WrongCluster)
+    );
+    s.members.remove(&g.node);
+    assert_eq!(s.check_grant(&g, &c.code_id()), Ok(()));
+    assert_eq!(
+        s.authorize_peer(g.cluster(), g.node(), g.key()),
+        Err(PeerRefusal::NotMember)
+    );
+    s.records.remove(&c.code_id());
+    assert_eq!(s.check_grant(&g, &c.code_id()), Err(Reject::UnknownCode));
+    s.apply(&mint(&c, 1, 1000));
+    assert_eq!(s.check_grant(&g, &c.code_id()), Err(Reject::Consumed));
+}

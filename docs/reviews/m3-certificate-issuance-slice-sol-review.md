@@ -25,3 +25,13 @@ Standards PASS; Spec PASS for A0; Security PASS for the bounded-read contract. A
 ## A0 refusal-policy recheck
 
 Sol accepts Opus55e56a6: an absolute deadline reports Unavailable without claiming proven quorum failure. R2 permits this only at or after READ_BUDGET and keeps a single2.5s bound from call start through permit return; T2 admits this non-success outcome only in its isolated-read pattern. No shorter engine sub-budget, later caller deadline or timeout relabelling is introduced. Production code stays unchanged; existing NoQuorum/NotLeader mappings remain. PR A must map NoQuorum to Unavailable. Source-backed contract correction accepted before test edits; fresh verification/recheck still required.
+
+## PR A readiness check on integrated A0 (2026-11-16)
+
+Sol accepts Opus c4761e2 (retained1f84412) E1-E6, applied to the brief. Actual ProposeError and PeerRefusal variants match the proposed mappings. One visibility
+precision is added: cluster-scoped issue module/ticket type lets sibling pki/ca name IssueTicket, while its fields/constructor and committed remain private to issue.
+This preserves the trusted construction boundary without claiming forged ClientWriteResponse is impossible. New tests remain required on every OS; guard additions
+also reject Unix shorthand/target_family selectors, rather than only the listed Windows spellings. Max4 bounds live caller parse/sign/DER, not abandoned engine
+work; owned64proposal/8read bounds remain. Synchronous crypto is not preempted by the5s budget. No source or dependency approval follows automatically: builder
+must stop on real API conflict, and fresh Opus source review/five gates are required. Source start still waits for exact-main CI on PR149 squash f1c399d.
+No build/test was run for this prose check. M2 open/M3 unchecked and hardware paths unverified.

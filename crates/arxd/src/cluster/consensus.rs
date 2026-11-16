@@ -203,6 +203,7 @@ impl std::fmt::Display for StartError {
 }
 impl std::error::Error for StartError {}
 mod adapter;
+pub(in crate::cluster) mod issue;
 
 use super::{
     log_store::VoteLogStore,
@@ -301,6 +302,7 @@ struct Owners {
 pub(super) struct ConsensusNode {
     id: u64,
     read_permits: Arc<Semaphore>,
+    issue_permits: Semaphore,
     #[cfg(test)]
     read_blocking: Arc<std::sync::atomic::AtomicUsize>,
     raft: Option<Engine>,
@@ -341,6 +343,7 @@ impl ConsensusNode {
             .map_err(|_| StartError::Fatal)?;
         Ok(Self {
             id: node,
+            issue_permits: Semaphore::new(issue::MAX_ISSUING),
             read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
             #[cfg(test)]
             read_blocking: Arc::default(),
@@ -353,6 +356,13 @@ impl ConsensusNode {
         })
     }
     pub async fn propose(&self, cmd: Command) -> Result<(LogPos, Option<Outcome>), ProposeError> {
+        let r = self.propose_response(cmd).await?;
+        Ok((pos(r.log_id), r.data.0))
+    }
+    async fn propose_response(
+        &self,
+        cmd: Command,
+    ) -> Result<openraft::raft::ClientWriteResponse<Arx>, ProposeError> {
         let permit = self
             .permits
             .clone()
@@ -371,7 +381,7 @@ impl ConsensusNode {
                 let result = match raft.client_write_ff(cmd, Some(responder)).await {
                     Err(_) => Err(ProposeError::Unknown),
                     Ok(()) => match reply.await {
-                        Ok(Ok(r)) => Ok((pos(r.log_id), r.data.0)),
+                        Ok(Ok(r)) => Ok(r),
                         Ok(Err(ClientWriteError::ForwardToLeader(f))) => {
                             Err(ProposeError::NotLeader(f.leader_id))
                         }

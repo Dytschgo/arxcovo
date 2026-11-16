@@ -72,7 +72,7 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
      reads share only the store mutex, on blocking threads. A wedged RaftCore yields `Busy`, not leaks. Shutdown keeps `closed`, `try_shutdown` (engine units resolve
      `Fatal`), the 5 s drain, `abort_all` and the weak check. A unit still in its closure gives `Err(Orphaned)` in time: responsiveness, not hard termination.
 2. **Commit evidence: a reviewed adapter, with no claim of forgery-proofing.** `propose` delegates to a private `propose_response(cmd) -> Result<ClientWriteResponse<Arx>,
-   ProposeError>`. The new private module `consensus/issue.rs` alone holds `fn committed(&self, resp: ClientWriteResponse<Arx>) -> Result<Commit, IssueError>`. It
+   ProposeError>`. The module `consensus/issue.rs` alone holds `fn committed(&self, resp: ClientWriteResponse<Arx>) -> Result<Commit, IssueError>`. It
    requires `resp.log_id.leader_id.node_id == self.id` (`WrongNode`) and `Outcome::Enrolled(grant)`, and records `(term, node, index)`. Each guard requires the
    fresh read's `committed_leader_id() == commit.leader` (`StaleIssuer`), so a re-election between commit and guard, even of this same node, refuses. The client
    retries the same request, gets a `replay:true` grant in the new term and is issued. **Honest limit:** `ClientWriteResponse` fields are public, and anyone can
@@ -144,9 +144,13 @@ inside the blocking worker **before** acquiring the store mutex) and `three_node
   evidence diffs the old and new lock name/version lists.
 - **New files:** `cluster/pki.rs` (`#![allow(dead_code)]`, mods, `MAX_CSR`, URI helpers), `pki/csr.rs`, `pki/ca.rs`, `pki/tests.rs`, `consensus/issue.rs`,
   `consensus/issue_tests.rs`, `pki/fixtures/{p384_sha256,rsa2048_sha256}.csr.der`, and `docs/evidence/m3-certificate-issuance.md`.
-- **Changed files:** `enrollment.rs` (`check_grant`, test), `consensus.rs` (`propose_response`, `enroll`, a test-only `ISSUE_PAUSE` at {AfterCommit, AfterSign} keyed by
-  node ID), and `three_node.rs` (`Cluster` and helpers become `pub(super)`, and `finish` scans markers including the CA key's PKCS#8 DER/hex). Fixture CSRs carry
-  only public data: Sol generates them once with openssl, discards the keys, and records the command and sha256 in the evidence.
+- **Changed files:** `enrollment.rs` (`check_grant`, test); `consensus.rs` (`pub(super) mod issue;` and private `propose_response`, with `propose` delegating unchanged).
+  `enroll`, test-only `ISSUE_PAUSE`, private `committed` and `IssueTicket` live in `issue.rs` as an `impl ConsensusNode`. Ticket type is visible only within
+  `cluster` for `pki/ca.rs` to name it; fields and constructor remain private to `issue.rs`, with read-only accessors as needed. Parent code cannot call `committed`.
+  `issue_tests.rs` is a child of `issue`. `three_node.rs`: expose only `APPLY_PAUSE_OWNER`, `code`, `mint`, `founders` as `pub(super)`; Cluster/D1 helpers already are.
+  Add an empty-by-default extra-marker list scanned by `finish` as raw bytes/hex alongside all existing markers and its positive control. Existing helper behavior,
+  diagnostics, deadlines and Params are unchanged. Add `tools/ci/test_windows_cluster_quarantine.py` to the allowlist only for the E3 no-bypass assertions below.
+  Fixture CSRs carry only public data: generate once with openssl, discard keys, record command and sha256. No private key is committed.
 
 **Pure tests (`pki/tests.rs`, `enrollment/tests.rs`)**, each of which fails without its check:
 - P-256 and Ed25519 CSRs give `digest == of_spki(keypair.subject_public_key_info())`.
@@ -209,7 +213,31 @@ inside the blocking worker **before** acquiring the store mutex) and `three_node
 ## CI, routing and limits
 
 A and B each record the measured Windows `verify` time and the clippy and nextest step times. If a hosted Windows job exceeds 660 s or times out, the coordinator
-lands a separate `ci-speed` PR first: for example caching the Playwright browsers (199 s) or a cargo cache, with a measured reduction. **No timeout-minutes
+lands a separate `ci-speed` PR first, naming a measured component and reduction. The old Playwright 199 s caching example is stale after C1. **No timeout-minutes
 increase, no ci-time-budget or agent-review bypass**, and no test is skipped. Sol builds A0, A and B. Opus reviews each one against this brief. Every merge needs all
 five gates plus a green CI run on the exact current main. Deferred, explicitly: transport ingress (`no_client_auth` enrollment config), sealed CA transfer to new
 voters, voter membership changes, crash and power-loss probes, renewal, and real-host three-process acceptance. All of these are **unverified on real hardware**.
+
+## Issuance readiness corrections (E1–E6, 2026-11-16)
+
+This section supersedes conflicting historical handoff wording above. Source work requires PR149 merged and exact-main CI green, plus the Sol contract check.
+E1 module placement and narrow ticket visibility are reflected in the file list. The compiler protects ticket construction, not authenticity of a public write response.
+
+E2: Append to the ISSUE_PAUSE text: "The test-only `ISSUE_PAUSE` is keyed by the node's store pointer (`Arc::as_ptr(&sm.0) as usize`, as `APPLY_PAUSE` is), not by node ID. It releases through a `tokio::sync::oneshot` and never blocks a runtime worker. It compiles out of non-test builds. `APPLY_PAUSE_OWNER` becomes `pub(super)`, and every test that arms `APPLY_PAUSE` or `ISSUE_PAUSE` holds it for the hook's whole lifetime. This is a test-correctness lock for shared static slots, not a scheduling change. Unit test: a pause armed for one node instance does not fire for a second instance with the same ID."
+
+E3: Add to engine tests: "I1–I9 are ordinary required tests on all three OS. No `ignore`, platform `cfg`, filter, test group, retry or timeout change is added, and none of them is covered by the existing quarantine of 8. Their module path stays outside `^cluster::consensus::three_node::`, so the sampler's exact-8 inventory is unchanged. The quarantine guard gains one assertion: `issue_tests.rs` and `pki/tests.rs` contain no `ignore` or platform-dependent `cfg`/`cfg_attr` (including windows/unix shorthand, target_os and target_family). A mutation that inserts an `ignore` must fail the guard. A red follows the resumption brief's pre-registered red handling: no rerun, no quarantine, no deadline or permit change. A green gives no Windows stability credit."
+
+E4: Append to decision 6: "Order: absolute `deadline = now + ISSUE_BUDGET`, then `try_acquire` on the issue permit, then parse. The permit is held by the caller's future, and `enroll` spawns no task. Only its proposal unit and read units outlive a cancellation, under their existing owners and permits. `ShutdownReport` and its cap of 72 are unchanged. An elapsed budget gives `Unavailable`. `ProposeError::Busy` gives `Busy`, `NotLeader(l)` gives `NotLeader(l)`, and `Stopped`/`Unknown` give `Unavailable`. CSR parsing and signing run synchronously inline: at most 4096 B, one verify, one P-256 sign and one `getrandom` call. The budget is responsiveness at await points, not preemption. I4 also asserts that the issue permits are all free as soon as the old leader returns, and that its read units return within 2 s."
+
+E5: Append to decision 6: "`RedeemInput { cluster, request, code: CodeId, proof: RedeemProof }` derives no `Clone` and is consumed by value. The proof is dropped right after `Command::redeem`, before the first await. It is never captured by guard closures, pause hooks, errors or `IssuedLeaf`. Dropping is not erasure: this slice adds no zeroize. `trait SignerClock: Send + Sync`. A compile-time test asserts that the `enroll` future is `Send`. `check_grant` returns `Result<(), Reject>` using existing variants only (`UnknownCode`, `Consumed`, `KeyConflict`, `WrongCluster`). `authorize_peer`'s `NotMember`/`KeyMismatch` gives `Revoked`, and its `WrongCluster` gives `Rejected(WrongCluster)`."
+
+E6: In I6, arm APPLY_PAUSE on the leader's store and write W. Release AfterCommit only after entered fires (W is committed). Advance the clock only when
+read_permits.available_permits() == READ_PERMITS - 1; release the pause before guard 1's deadline. No cached pre-wait clock reading can satisfy the test.
+Baseline for PR A is the post-PR149 exact-main Windows job. Prior reference: a18e95c CI43836099670, 433 s, nextest239 s, install6 s after C1. Old585/716 s and
+Playwright199 s figures are historical. Added compile/test cost remains unmeasured; the660 s rule remains, with no new optimization/pin/version authorized.
+
+## E7: new I4 fixture lifecycle correction
+
+Coordinator Sol accepts Opus8de6d99 (retained0f6d0ff): the local I4 red is supported by cross-node term history as cleanup selecting the intentionally isolated old leader before it observes the new term. E3 still stops on the first red. After other-provider diagnosis and root contract check, one changed version may correct this new test's protocol ordering: record old term before isolation; after heal, wait at most5s for that node's metrics current_term to exceed it, with an explicit failure label, then unchanged converge. This is the same cleanup ordering used by the D1 S3 control. No Cluster helper, existing test, timeout constant, retry loop, quarantine or production behavior changes.
+
+Also require an actual committed same-request replay response on the new leader (replay=true, same node and CSR key digest), followed by issuance retry and comparison of leaf SPKI to the original CSR. Keep oldissuer refusal and permit return, newleader success and all-node convergence assertions. The recorded first I4 red is the before-version evidence; do not rerun that head. This correction targets a new fixture, not the three failed shared-suite fixes, and is not a quarantined-test recovery claim. Any further local engine red stops again for disposition; no automatic additional tweak. Final I7 and the final-source PKI changes remain unverified until the new version's single verification round. No owner approval is needed for this ordinary reversible new-test correction under the authorized development scope.

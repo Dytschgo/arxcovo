@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use tokio::time::timeout;
 
 // Own the single adapter pause slot across each complete async fixture.
-static APPLY_PAUSE_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static APPLY_PAUSE_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn read_fail(error: &ReadError) -> Fail {
     match error {
         ReadError::NotLeader => Fail::NotLeader,
@@ -34,6 +34,7 @@ pub(super) struct Cluster {
     nodes: Vec<Option<Arc<ConsensusNode>>>,
     pub(super) router: Arc<MemRouter>,
     params: Params,
+    pub(super) extra_markers: Vec<Vec<u8>>,
     acknowledged: Mutex<Vec<LogPos>>,
     pub(super) diag: Diag,
 }
@@ -49,6 +50,7 @@ impl Cluster {
             nodes: vec![None, None, None],
             router: Arc::default(),
             params,
+            extra_markers: Vec::new(),
             acknowledged: Mutex::default(),
             diag: Diag::new(),
         };
@@ -269,6 +271,17 @@ impl Cluster {
         for dir in &self.dirs {
             for file in std::fs::read_dir(dir.path()).unwrap() {
                 let bytes = std::fs::read(file.unwrap().path()).unwrap();
+                for marker in &self.extra_markers {
+                    assert!(!marker.is_empty());
+                    for m in [marker.clone(), hex::encode(marker).into_bytes()] {
+                        let contains = |b: &[u8]| b.windows(m.len()).any(|w| w == m);
+                        assert!(
+                            contains(&[b"prefix".as_slice(), &m, b"suffix"].concat()),
+                            "extra privacy positive control"
+                        );
+                        assert!(!contains(&bytes), "persisted extra secret marker");
+                    }
+                }
                 for seed in [1u8, 2, 3, 4, 11, 12, 13, 100] {
                     use sha2::{Digest, Sha256};
                     let c = code(seed);
@@ -359,7 +372,7 @@ impl Drop for Cluster {
         self.router.nodes.lock().unwrap().clear();
     }
 }
-fn code(seed: u8) -> JoinCode {
+pub(super) fn code(seed: u8) -> JoinCode {
     JoinCode::generate([1; 16], [2; 32], |b| {
         b.fill(if b.len() == 32 {
             seed.wrapping_add(128)
@@ -370,7 +383,7 @@ fn code(seed: u8) -> JoinCode {
     })
     .unwrap()
 }
-fn mint(c: &JoinCode, r: u8, t: u64) -> Command {
+pub(super) fn mint(c: &JoinCode, r: u8, t: u64) -> Command {
     Command::Mint {
         cluster: [1; 16],
         actor: [3; 16],
@@ -649,7 +662,7 @@ async fn u6_cancelled_callers_keep_engine_permits_until_resolution() {
     .unwrap();
 }
 
-fn founders() -> Command {
+pub(super) fn founders() -> Command {
     use crate::cluster::enrollment::{FoundMembers, NodeId};
     Command::Found {
         cluster: [1; 16],

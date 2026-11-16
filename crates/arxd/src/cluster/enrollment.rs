@@ -264,6 +264,21 @@ impl EnrollmentState {
             records: BTreeMap::new(),
         }
     }
+    /// Check the retained consumption, independently of local membership.
+    pub fn check_grant(&self, grant: &EnrollmentGrant, code: &CodeId) -> Result<(), Reject> {
+        if grant.cluster != self.cluster {
+            return Err(Reject::WrongCluster);
+        }
+        let record = self.records.get(code).ok_or(Reject::UnknownCode)?;
+        let consumed = record.consumed.as_ref().ok_or(Reject::Consumed)?;
+        if consumed.request != grant.request || consumed.node != grant.node {
+            return Err(Reject::Consumed);
+        }
+        if consumed.key != grant.key {
+            return Err(Reject::KeyConflict);
+        }
+        Ok(())
+    }
     pub fn apply(&mut self, command: &Command) -> Outcome {
         let (cluster, proposed) = match command {
             Command::Mint {
