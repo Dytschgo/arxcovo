@@ -273,3 +273,11 @@ certificate. It does not accept a caller-supplied raw certificate list as eviden
 These functions are trusted reviewed adapters used with this module's configs, not a claim that arbitrary crate code or an insecure external rustls config cannot forge evidence.
 The target-node mismatch must fail even when both presented identities are enrolled under the same cluster root. Tests distinguish real handshake identity from
 synthetic matching-founder identities; no real-founder-certificate claim is inferred from assume.
+
+## PR B private fixture correction
+
+The first local B engine red stopped before verifier/shutdown assertions: new single-node fixture used plain tempfile::tempdir, whereas open_db's first operation
+requires security::private(dir). Root's focused privacy-precondition probe failed on that raw directory under the exact builder TEMP, without rerunning the engine.
+One changed fixture version now uses the existing application::tests::private_temp and retains explicit privacy assertions. No production privacy check, shared
+Cluster helper, timeout, retry or quarantine changes. This is an ordinary new-fixture precondition correction, separate from the store-close advisory and the
+quarantined Windows failures. Any subsequent natural engine red stops again; no automatic retry or scope expansion follows.

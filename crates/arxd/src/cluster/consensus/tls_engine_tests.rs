@@ -278,7 +278,11 @@ async fn store_lock_wait_does_not_block_runtime() {
 async fn live_verifier_does_not_retain_store_and_poison_refuses() {
     timeout(Duration::from_secs(45), async {
         use super::super::mem_net::{Factory, MemRouter};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::service::application::tests::private_temp();
+        assert!(
+            crate::security::private(dir.path()).is_ok(),
+            "TLS store directory must be private before startup"
+        );
         let router = Arc::new(MemRouter::default());
         let mut n = ConsensusNode::start(
             1,
@@ -318,4 +322,13 @@ async fn live_verifier_does_not_retain_store_and_poison_refuses() {
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn tls_single_node_directory_precondition() {
+    let dir = crate::service::application::tests::private_temp();
+    assert!(
+        crate::security::private(dir.path()).is_ok(),
+        "TLS store directory must pass the first open_db check"
+    );
 }
