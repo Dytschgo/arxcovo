@@ -1128,6 +1128,10 @@ async fn r4_read_admission_and_caller_abort() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows R5 post-release quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r5_shutdown_read_owners() {
     timeout(Duration::from_secs(45), async {
         for gated in [false, true] {

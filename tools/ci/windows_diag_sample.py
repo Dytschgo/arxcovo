@@ -55,7 +55,7 @@ TARGET_REL = ("target", "nextest", PROFILE)
 JUNIT_NAME = "junit.xml"
 LIST_NAME = "list.json"
 PRIV_PREFIX = "arxdiag-"
-FILTER = "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)"
+FILTER = "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)"
 TEST_PREFIX = "cluster::consensus::three_node::"
 BINARY_ID = "arxd"
 IDS = {

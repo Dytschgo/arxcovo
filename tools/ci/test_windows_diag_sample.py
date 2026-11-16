@@ -11,6 +11,7 @@ import signal
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from xml.sax.saxutils import escape
 
 import windows_diag_sample as w
@@ -354,6 +355,28 @@ class InventoryTests(unittest.TestCase):
                 case["filter-match"] = {"status": "matches"}
                 self.check(json.dumps(doc).encode(), "inventory")
                 case["filter-match"] = {"status": "mismatch", "reason": "ignored"}
+
+    def test_unsampled_filter_matches_verified_guard_inventory(self):
+        # Capture the namespace executed by the real verified-bytes loader.
+        with patch("builtins.exec", wraps=exec) as execute:
+            self.assertEqual(sorted(w.load_expected(w.RealFs(), str(REPO))), sorted(NAMES))
+        execute.assert_called_once()
+        namespace = execute.call_args.args[1]
+        excluded = re.findall(r" & not test\(=cluster::consensus::three_node::([a-z0-9_]+)\)", w.FILTER)
+        self.assertEqual(excluded, namespace["WINDOWS_UNSAMPLED"])
+        self.assertEqual(excluded, ["r5_shutdown_read_owners"])
+        self.assertTrue(set(excluded).isdisjoint(NAMES))
+
+    def test_ignored_r5_expression_mismatch_passes_but_match_gates(self):
+        doc = json.loads(listing())
+        cases = doc["rust-suites"]["arxd"]["testcases"]
+        case = {"kind": "test", "ignored": True,
+                "filter-match": {"status": "mismatch", "reason": "expression"}}
+        cases[w.TEST_PREFIX + "r5_shutdown_read_owners"] = case
+        doc["test-count"] = len(cases)
+        w.check_inventory(json.dumps(doc).encode(), NAMES, FROOT)
+        case["filter-match"] = {"status": "matches"}
+        self.check(json.dumps(doc).encode(), "inventory")
 
     def test_rejections(self):
         self.check(listing(NAMES[:7]), "inventory")
@@ -974,7 +997,7 @@ class SourceTests(unittest.TestCase):
         head = ["--workspace", "--locked", "--cargo-quiet", "--user-config-file", "none",
                 "--config-file", "tools/ci/windows-diag-sample.nextest.toml", "-P", "diag-sample",
                 "--run-ignored", "only"]
-        expr = ["-E", "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)"]
+        expr = ["-E", "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)"]
         # `list` has no --no-tests flag in nextest 0.9.151 (usage error, exit 2).
         self.assertEqual(w.cargo_argv("list"),
                          ["cargo", "nextest", "list", "-T", "json"] + head + expr)
