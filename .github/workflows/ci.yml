@@ -21,6 +21,10 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
+      - name: Anchor Windows diagnostic sample budget
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "ARX_DIAG_T0=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
@@ -91,3 +95,7 @@ jobs:
       - name: Electron smoke on Windows and macOS
         if: runner.os != 'Linux'
         run: npm run test:desktop
+      - name: Windows three-node diagnostic sample
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python -I -B -m unittest discover -s tools/ci -p 'test_windows_diag_sample.py' && python -I -B tools/ci/windows_diag_sample.py
