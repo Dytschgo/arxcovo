@@ -1,0 +1,104 @@
+# M3 certificate issuance PR A — stopped implementation
+
+Builder: GPT-6.1 Sol, high, 2026-11-16. Prepared base `8961772`; coordinator supplied exact-main CI `43841341548` green on merged `f1c399d` (Windows 517 s, clippy 110 s, nextest 279 s, install 9 s, sampler all eight 28.766 s). Those baseline figures were supplied, not independently rerun here.
+
+## Disposition
+
+**Incomplete / blocked for coordinator disposition.** The first execution of the new issuance engine tests was red. No rerun or cluster fix was attempted after observing it. No deadline, Params, helper assertion, diagnostic, quarantine, filter, retry or workflow was changed. This is not a fourth Sol cluster fix. No push, PR, hosted dispatch, native M2, tooling installation, VM, admin step or PROGRESS edit occurred.
+
+The failed test was `cluster::consensus::issue::issue_tests::i4_leadership_loss`. After the isolated issuer returned without a leaf, the new leader issued the retry, routing was healed and the unchanged `Cluster::converge` called `attributed_read(l).await.unwrap()`. That returned `ReadError::NotLeader`, panicking at `three_node.rs:222:52` in the executed source. This is a fresh-read helper refusal, not a timeout or Orphaned claim. The E3 red/no-rerun instruction is the stop boundary.
+
+Bounded failure attribution (integer/enum data only):
+
+```text
+[DIAG-3n] attr helper=Converge fail=NotLeader node=1 t=3539 polls=0 retries=0
+[DIAG-3n] s3 before=3539,1,L,1,4,4,4,3238 after=3539,1,L,1,4,4,4,3238 class=Churn
+[DIAG-3n] at n1=3539,1,L,1,4,4,4,3239 n2=3539,2,F,3,6,6,6,- n3=3539,2,L,3,6,6,6,0
+```
+
+No cause or safe fixture correction is established. Coordinator disposition is required; do not infer permission to retry or weaken the fixture from this evidence.
+
+## Actual commands and results
+
+All Cargo compilation used a new task-owned target directory `D:/arxcovo-m3-a-20261116-d46c67c8/target` and temp directory under the same root. No cache cleanup or installs.
+
+- `cargo update -p rustls-pki-types --precise 1.15.1` initially reported package not found because the baseline had no rcgen dependencies. `cargo metadata --format-version 1 --no-deps`, then `cargo update --workspace`, then the precise update and `cargo fetch --locked` succeeded. No existing version was upgraded.
+- `cargo check --locked -p arxd --tests`: initial compile rejected my use of a struct literal for non-exhaustive `CertificateParams`. Corrected to default plus field assignments, preserving every specified field. This was an implementation syntax error, not a contract substitution.
+- `cargo test --locked -p arxd cluster::pki --lib`: **4 passed**, 0 failed/ignored, 0.01 s test execution; cold build 64 s. This predates the subsequently added P-256/SHA384 OID mismatch check.
+- First two attempts to compile the engine tests failed on missing/wrong `WatchReceiver` imports. The existing three-node source supplied the correct trait import. No test bodies executed in those attempts.
+- First engine execution, `cargo test --locked -p arxd cluster::consensus::issue --lib`: **9 passed, 1 failed, 0 ignored**, 4.47 s execution, 21.19 s compile. I1/I2/I3/I5/I6/I8/I9 and hook identity/admission passed. The initial I7 was an insufficient adapter test; while that command was running, it was replaced with actual response and fresh-guard checks. The replacement I7 has **not been compiled or run**. I4 failed as above. No engine rerun.
+- `cargo fmt --all`: completed successfully after those final test additions.
+- `python -m unittest discover -s tools/ci -p test_windows_cluster_quarantine.py`: **2 passed**, 0.020 s. The added test runs the production guard on both new source files and proves injected ignore/windows/unix/target_os/target_family mutations are rejected.
+
+Not run: final-source compile, locked workspace clippy, final-source pure/enrollment tests, full nextest, existing cluster/crash probes and controls, sampler, sampler unit suite, workflow tests, full fmt check, final diff check, crypto/field-discard/guard/privacy behavioral mutants. No pass is claimed for them. The added engine wall-time result is below 25 s on that single execution but is red and gives no stability or acceptance credit. Hosted Windows added cost remains unmeasured; the 660 s rule is unchanged.
+
+## Dependency and source pins
+
+Pinned `rcgen =0.14.10` with only crypto/ring/x509-parser, `x509-parser =0.18.1` without defaults, `time =0.3.55` without defaults, and transitive rustls-pki-types 1.15.1. Cargo.lock contains exactly +38 packages and zero removed packages. All old name/version/source/checksum identities remain identical. Cargo necessarily qualifies old windows-sys and synstructure dependency strings when duplicate versions appear; after normalizing only those qualifications all old third-party dependency records are identical. arxd adds the three requested direct edges. No rustls package is added.
+
+Added name/version inventory:
+
+```text
+asn1-rs 0.7.2
+asn1-rs-derive 0.6.0
+asn1-rs-impl 0.2.0
+bit-vec 0.9.1
+data-encoding 2.11.1
+der-parser 10.0.0
+deranged 0.5.9
+getrandom 0.2.17
+lazy_static 1.5.1
+minimal-lexical 0.2.1
+nom 7.1.3
+num-bigint 0.4.8
+num-conv 0.2.2
+num-integer 0.1.47
+oid-registry 0.8.1
+powerfmt 0.2.1
+rcgen 0.14.10
+ring 0.17.14
+rusticata-macros 4.1.0
+rustls-pki-types 1.15.1
+synstructure 0.13.2
+time 0.3.55
+time-core 0.1.9
+time-macros 0.2.32
+untrusted 0.9.0
+windows-sys 0.52.0
+windows-targets 0.52.6
+windows_aarch64_gnullvm 0.52.6
+windows_aarch64_msvc 0.52.6
+windows_i686_gnu 0.52.6
+windows_i686_gnullvm 0.52.6
+windows_i686_msvc 0.52.6
+windows_x86_64_gnu 0.52.6
+windows_x86_64_gnullvm 0.52.6
+windows_x86_64_msvc 0.52.6
+x509-parser 0.18.1
+yasna 0.6.0
+zeroize 1.9.1
+```
+
+Primary implementation sources inspected: locally fetched rcgen 0.14.10 `src/csr.rs`, `src/certificate.rs`, `src/lib.rs`; OpenRaft 0.10.0 `src/raft/message/client_write.rs`; existing project fresh-read ownership and adapter source. Lock checksums bind fetched source. No real API/lock design conflict was found. This is not source/security approval.
+
+## Public fixture provenance
+
+Used the already installed Git OpenSSL executable; no install. Commands (temporary keys removed immediately after generation, never read into evidence):
+
+```text
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-384 -sha256 -nodes -subj /CN=public-fixture -keyout <task-temp>/p384.key -outform DER -out crates/arxd/src/cluster/pki/fixtures/p384_sha256.csr.der
+openssl req -new -newkey rsa:2048 -sha256 -nodes -subj /CN=public-fixture -keyout <task-temp>/rsa.key -outform DER -out crates/arxd/src/cluster/pki/fixtures/rsa2048_sha256.csr.der
+```
+
+SHA256:
+
+- p384_sha256.csr.der: `46633e68786c8b01fd14f46b518242a548aaf0478814328cf26aec292b1f8e9f`
+- rsa2048_sha256.csr.der: `0ad090e754249a5434781a574e8f952dca00cc0b847da6236936dcf3453b11aa`
+
+## Review limits and unfinished acceptance
+
+Source implements caller-owned max-four admission, 5 s absolute await budget, no enrollment spawn, private ticket fields/constructor in issue.rs, fresh pre/post read guards, clock sampling after waits, proof dropped before the first await (no erasure claim), test-only ephemeral CA constructors, exact CSR algorithm/SPKI checks and fresh leaf parameters. Shared hooks are store-pointer keyed and async for issuance. Existing 64 proposal/eight read ownership and shutdown cap remain unchanged. These statements describe code intent, not approval.
+
+Before readiness, finish all missing verification and meaningful mutants, assess I1 SPKI/serial and I4 replay evidence explicitly, strengthen any remaining test assertions and complete independent fresh Opus source review/five gates. Final I7 is unverified. Error privacy coverage and complete serial/SPKI assertions need review. No test-slice work establishes transport or production CA safety.
+
+M2 remains open (A7 NO-GO, consumed A12 no retry); M3 remains unchecked. Store-file advisory 1 stays open: Weak expiry does not prove file closure. No production restart caller was added. All hardware paths are **unverified on real hardware**.
