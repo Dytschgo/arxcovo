@@ -13,7 +13,7 @@ class QuarantineTests(unittest.TestCase):
         gate = '#[cfg_attr(target_os = "windows", ignore = "' + REASON + '")]'
         functions = re.findall(r'^async fn ([a-z0-9_]+)\(', source, re.M)
         self.assertEqual(set(functions) & set(EXPECTED), set(EXPECTED))
-        actual = re.findall(re.escape(gate) + r'\nasync fn ([a-z0-9_]+)\(', source)
+        actual = re.findall(r'#\[cfg_attr\(\s*target_os\s*=\s*"windows",\s*ignore\s*=\s*"' + re.escape(REASON) + r'"\s*\)\]\s*async fn ([a-z0-9_]+)\(', source)
         self.assertEqual(sorted(actual), sorted(EXPECTED))
         self.assertEqual(source.count('ignore'), len(EXPECTED))
         self.assertNotIn('#[cfg(target_os', source)
