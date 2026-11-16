@@ -257,6 +257,8 @@ pub fn client_config(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert], key)?;
     config.enable_sni = false;
+    // Resumed handshakes skip certificate verification, including local revocation.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 pub fn server_config(
@@ -265,10 +267,13 @@ pub fn server_config(
     key: PrivateKeyDer<'static>,
     time: Arc<dyn TimeProvider>,
 ) -> Result<ServerConfig, Error> {
-    ServerConfig::builder_with_details(verifier.provider.clone(), time)
+    let mut config = ServerConfig::builder_with_details(verifier.provider.clone(), time)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(vec![cert], key)?;
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    Ok(config)
 }
 pub const SERVER_NAME: &str = "arxcovo.invalid";
 /// Trusted adapter for this module's reviewed configs; arbitrary insecure rustls

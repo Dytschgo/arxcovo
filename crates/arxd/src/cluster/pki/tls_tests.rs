@@ -75,10 +75,10 @@ pub(in crate::cluster) fn connections(
     )
 }
 /// Call only on std threads / blocking pool. No sockets, at most 32 rounds.
-pub(in crate::cluster) fn pump(
+fn complete(
     mut c: ClientConnection,
     mut s: ServerConnection,
-) -> Result<(AuthenticatedPeer, AuthenticatedPeer), Error> {
+) -> Result<(ClientConnection, ServerConnection), Error> {
     for _ in 0..32 {
         let mut bytes = Vec::new();
         c.write_tls(&mut bytes).unwrap();
@@ -91,13 +91,20 @@ pub(in crate::cluster) fn pump(
         if !c.is_handshaking() && !s.is_handshaking() {
             assert_eq!(c.protocol_version(), Some(ProtocolVersion::TLSv1_3));
             assert_eq!(s.protocol_version(), Some(ProtocolVersion::TLSv1_3));
-            return Ok((
-                AuthenticatedPeer::from_client(&c)?,
-                AuthenticatedPeer::from_server(&s)?,
-            ));
+            return Ok((c, s));
         }
     }
     panic!("handshake exceeded 32 rounds")
+}
+pub(in crate::cluster) fn pump(
+    c: ClientConnection,
+    s: ServerConnection,
+) -> Result<(AuthenticatedPeer, AuthenticatedPeer), Error> {
+    let (c, s) = complete(c, s)?;
+    Ok((
+        AuthenticatedPeer::from_client(&c)?,
+        AuthenticatedPeer::from_server(&s)?,
+    ))
 }
 pub(in crate::cluster) fn refusal(e: Error) -> VerifyRefusal {
     let Error::InvalidCertificate(CertificateError::Other(e)) = e else {
@@ -183,12 +190,9 @@ fn bounds_root_key_time_and_static_errors() {
             pump(c, s).unwrap();
         }
         for seconds in [939, 941 + 30 * 86400] {
-            assert!(matches!(
-                direct(&v, &der, seconds),
-                Err(Error::InvalidCertificate(_))
-            ));
+            assert_time_error(direct(&v, &der, seconds).unwrap_err(), seconds == 939);
             let (c, s) = connections(&ca, &der, &key, registry(&key), node(4), seconds);
-            assert!(matches!(pump(c, s), Err(Error::InvalidCertificate(_))));
+            assert_time_error(pump(c, s).err().unwrap(), seconds == 939);
         }
 
         let server = server_config(
@@ -318,4 +322,172 @@ fn strict_san_der_and_self_signed() {
     }
     let selfsigned = CertificateParams::default().self_signed(&key).unwrap();
     assert!(direct(&v, selfsigned.der(), 1001).is_err());
+}
+
+fn assert_time_error(error: Error, early: bool) {
+    match (early, error) {
+        (true, Error::InvalidCertificate(CertificateError::NotValidYetContext { .. }))
+        | (false, Error::InvalidCertificate(CertificateError::ExpiredContext { .. })) => (),
+        (_, other) => panic!("unexpected certificate time refusal: {other:?}"),
+    }
+}
+
+#[test]
+fn client_certificate_chain_time_and_registry_refusals() {
+    let ca = ClusterCa::ephemeral([1; 16], NOW);
+    let key = KeyPair::generate().unwrap();
+    let der = leaf(&ca, &key);
+    let v = verifier(&ca, registry(&key));
+    let check = |v: &PeerVerifier, der: &[u8], seconds| {
+        v.verify_client_cert(
+            &CertificateDer::from(der),
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(seconds)),
+        )
+        .map(|_| ())
+    };
+    check(&v, &der, 1001).unwrap();
+    let foreign = ClusterCa::ephemeral([1; 16], NOW);
+    for bad in [
+        leaf(&foreign, &key),
+        CertificateParams::default()
+            .self_signed(&key)
+            .unwrap()
+            .der()
+            .to_vec(),
+    ] {
+        assert!(matches!(
+            check(&v, &bad, 1001),
+            Err(Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+                    | CertificateError::BadSignature
+                    | CertificateError::NotValidYetContext { .. }
+            ))
+        ));
+    }
+    for seconds in [939, 941 + 30 * 86400] {
+        assert_time_error(check(&v, &der, seconds).unwrap_err(), seconds == 939);
+    }
+    let wrong = KeyPair::generate().unwrap();
+    assert_eq!(
+        refusal(check(&v, &leaf(&ca, &wrong), 1001).unwrap_err()),
+        VerifyRefusal::KeyMismatch
+    );
+    let absent = verifier(&ca, Arc::new(|_, _, _| Err(VerifyRefusal::NotMember)));
+    assert_eq!(
+        refusal(check(&absent, &der, 1001).unwrap_err()),
+        VerifyRefusal::NotMember
+    );
+    let other_cluster = PeerVerifier::new(
+        ca.cert_der().to_vec().into(),
+        [2; 16],
+        Arc::new(|_, _, _| Ok(())),
+    )
+    .unwrap();
+    assert_eq!(
+        refusal(check(&other_cluster, &der, 1001).unwrap_err()),
+        VerifyRefusal::WrongCluster
+    );
+}
+
+#[derive(Debug)]
+struct MutableTime(std::sync::atomic::AtomicU64);
+impl TimeProvider for MutableTime {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(Duration::from_secs(
+            self.0.load(std::sync::atomic::Ordering::SeqCst),
+        )))
+    }
+}
+fn reused_connections(
+    c: &Arc<rustls::ClientConfig>,
+    s: &Arc<rustls::ServerConfig>,
+) -> (ClientConnection, ServerConnection) {
+    (
+        ClientConnection::new(c.clone(), ServerName::try_from(SERVER_NAME).unwrap()).unwrap(),
+        ServerConnection::new(s.clone()).unwrap(),
+    )
+}
+#[test]
+fn reused_configs_always_perform_full_handshakes_and_recheck_revocation() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let ca = ClusterCa::ephemeral([1; 16], NOW);
+    let key = KeyPair::generate().unwrap();
+    let der = leaf(&ca, &key);
+    let member = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reg: Registry = {
+        let member = member.clone();
+        let calls = calls.clone();
+        Arc::new(move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if member.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(VerifyRefusal::NotMember)
+            }
+        })
+    };
+    let c = Arc::new(
+        client_config(
+            verifier(&ca, reg.clone()).client(node(4)),
+            der.clone().into(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            Arc::new(FixedTime(1001)),
+        )
+        .unwrap(),
+    );
+    let s = Arc::new(
+        server_config(
+            verifier(&ca, reg).server(),
+            der.into(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            Arc::new(FixedTime(1001)),
+        )
+        .unwrap(),
+    );
+    for expected_calls in [2, 4] {
+        let (client, server) = reused_connections(&c, &s);
+        let (client, server) = complete(client, server).unwrap();
+        assert_eq!(client.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        assert_eq!(server.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+    }
+    member.store(false, Ordering::SeqCst);
+    let (client, server) = reused_connections(&c, &s);
+    assert_eq!(
+        refusal(pump(client, server).err().unwrap()),
+        VerifyRefusal::NotMember
+    );
+}
+#[test]
+fn reused_configs_recheck_expiry() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let ca = ClusterCa::ephemeral([1; 16], NOW);
+    let key = KeyPair::generate().unwrap();
+    let der = leaf(&ca, &key);
+    let time = Arc::new(MutableTime(AtomicU64::new(940 + 30 * 86400 - 1800)));
+    let c = Arc::new(
+        client_config(
+            verifier(&ca, registry(&key)).client(node(4)),
+            der.clone().into(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            time.clone(),
+        )
+        .unwrap(),
+    );
+    let s = Arc::new(
+        server_config(
+            verifier(&ca, registry(&key)).server(),
+            der.into(),
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            time.clone(),
+        )
+        .unwrap(),
+    );
+    let (client, server) = reused_connections(&c, &s);
+    pump(client, server).unwrap();
+    time.0.store(940 + 30 * 86400 + 3600, Ordering::SeqCst);
+    let (client, server) = reused_connections(&c, &s);
+    assert_time_error(pump(client, server).err().unwrap(), false);
 }
