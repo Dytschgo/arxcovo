@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
+**Current main RED:** exact c612152 after PR161, CI43880904887 Windows job133346204427 failed R5 post-release cleanup at three_node.rs1195 (Elapsed). Both preceding shutdown results matched their assertions; the remaining predicate is unidentified. No rerun or shared-helper fix. Main688f1ad CI43875610482 was green before merge; further merges held. See [R5 evidence](evidence/m3-main-r5-postrelease-failure.md). The completed run also exceeds the15-minute wall-clock gate at1475s; macOS executed333s after a long queue. PR159 ci-time-budget failed59033483192. No gate waiver or rerun.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -26,8 +26,12 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
-- Current work: PR161 push2 all platform jobs succeeded on7f71652; independent Opus PASS6917477824/status59027550095. Parent integration9fb217d imports reviewed PR160 only, attribution/harness bytes unchanged. Preparing final integration push3/3 and fresh exact-head gates/review; other merges wait for this head to settle. Windows phase/history diagnostics reviewed with complementary cleanup PASS, publication after this integration. PR159 held; M2 open/M3 unchecked/eight quarantines unchanged.
+- Last merged: PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba` at13:58:00Z, exact-head Opus PASS6918203486/status59030073651 and all five gates. Reviewed/merge trees equal; premerge main688f1ad CI43875610482 green. New main Windows R5 post-release cleanup failed; merges held.
+- Current work: Opus R5 observations f0b9418 pass independent Sol high review831dd66 (Standards/Spec/Security, zero findings). Preparing diagnostic publication; original two-second wait, five-second shutdown and all eight Windows quarantines unchanged. Main c612152 RED and1475s budget failure block merge. No ci-speed label, rerun or waiver. Windows phase diagnostics/founder source/PR159 remain held; M2 open, M3 unchecked.
+- 2026-11-16: Root accepts R5 observation scope after independent review: four pure units, three quarantine/config guards,58sampler tests,fmt/diff passed in the reviewer run. Original local6.883s R5 pass reused without repetition; no hosted cause, repair or stability credit.
+- 2026-11-16: Applied delegated babysitter housekeeping: PR151 closed at14:05:38Z with a note pointing to PR152 quarantine and PR153 diagnostics. Failed shared-suite attempt3 remains counted; Windows recovery Opus0/2, Sol3/3.
+- 2026-11-16: Coordinator accepts the capacity blocker after comparing policy.mjs wall-clock/budget logic with Opus disposition. A naturally shorter queue is not a measured repository speed improvement; R5 observations do not qualify as ci-speed. Prepare the concrete independently reviewed diagnostic change before settling any main-red/budget policy decision.
+- 2026-11-16: Main CI43880904887 Windows R5 failed after its expected gated Owners report and gate release;152 run/151 pass/1 fail/16 skipped. Root retained bounded evidence and stopped publication/merges immediately. No common cause with prior cluster or S8 failures is established.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 

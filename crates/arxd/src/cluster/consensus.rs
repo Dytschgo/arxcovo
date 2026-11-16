@@ -305,6 +305,8 @@ pub(super) struct ConsensusNode {
     issue_permits: Semaphore,
     #[cfg(test)]
     read_blocking: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    read_stages: std::sync::OnceLock<Arc<ReadStages>>,
     raft: Option<Engine>,
     sm: Option<SmAdapter>,
     log_released: Released,
@@ -351,6 +353,8 @@ impl ConsensusNode {
             read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
             #[cfg(test)]
             read_blocking: Arc::default(),
+            #[cfg(test)]
+            read_stages: std::sync::OnceLock::new(),
             raft: Some(raft),
             sm: Some(sm),
             log_released,
@@ -423,6 +427,8 @@ impl ConsensusNode {
             let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
             #[cfg(test)]
             let read_blocking = self.read_blocking.clone();
+            #[cfg(test)]
+            let read_stages = self.read_stages.get().cloned();
             owners.set.spawn(async move {
                 let result = async {
                     if Instant::now() >= deadline || tx.is_closed() {
@@ -470,17 +476,29 @@ impl ConsensusNode {
                     blocking(move || {
                         #[cfg(test)]
                         read_blocking.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        #[cfg(test)]
+                        let stages = read_stages.filter(|s| s.claim());
+                        #[cfg(test)]
+                        ReadStages::stamp(&stages, ReadStage::Entered);
                         let result = (|| {
                             let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
+                            #[cfg(test)]
+                            ReadStages::stamp(&stages, ReadStage::Locked);
                             if s.applied().is_none_or(|p| p.index < index) {
                                 Err(StoreError::Corrupt)
                             } else {
                                 f(&s).map(|value| (leader, value))
                             }
                         })();
+                        #[cfg(test)]
+                        ReadStages::stamp(&stages, ReadStage::Returned);
                         // Guard, store Arc, permit, then completion (#147).
                         drop(sm);
+                        #[cfg(test)]
+                        ReadStages::stamp(&stages, ReadStage::StoreDropped);
                         drop(permit);
+                        #[cfg(test)]
+                        ReadStages::stamp(&stages, ReadStage::PermitDropped);
                         result
                     })
                     .await
@@ -598,6 +616,41 @@ impl ConsensusNode {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Test-only read-closure stage stamps for one armed node (R5 observation).
+/// Only the first closure entering after arming claims the stamps; each stage
+/// keeps its first monotonic instant. Holds no store, permit or other resource.
+#[cfg(test)]
+#[derive(Default)]
+struct ReadStages {
+    claimed: std::sync::atomic::AtomicBool,
+    at: [std::sync::OnceLock<std::time::Instant>; 5],
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadStage {
+    Entered,
+    Locked,
+    /// Read function and its store guard scope completed.
+    Returned,
+    /// `drop(sm)` returned, including any inline store teardown.
+    StoreDropped,
+    PermitDropped,
+}
+#[cfg(test)]
+impl ReadStages {
+    fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+    fn stamp(stages: &Option<Arc<Self>>, stage: ReadStage) {
+        if let Some(s) = stages {
+            let _ = s.at[stage as usize].set(std::time::Instant::now());
+        }
+    }
+    fn get(&self, stage: ReadStage) -> Option<std::time::Instant> {
+        self.at[stage as usize].get().copied()
     }
 }
 

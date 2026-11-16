@@ -1127,6 +1127,371 @@ async fn r4_read_admission_and_caller_abort() {
     .await
     .unwrap();
 }
+// R5 post-release observation: raw bounded facts only, never a causal label.
+// Times are microseconds after the anchor taken just before `gate.open()`;
+// `pre` means observed before the anchor, `none` never observed. A seen-clear
+// value is the first sample that observed the predicate clear, not the exact
+// release time and not proof that it stayed clear.
+const R5_LINE_MAX: usize = 1024;
+const R5_US_CAP: u128 = 9_999_999;
+const R5_COUNT_CAP: usize = 9_999_999;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R5Mark {
+    Missing,
+    BeforeOpen,
+    Us(u64),
+    Overflow,
+}
+impl R5Mark {
+    fn of(at: Option<std::time::Instant>, anchor: std::time::Instant) -> Self {
+        let Some(at) = at else { return Self::Missing };
+        match at.checked_duration_since(anchor) {
+            None => Self::BeforeOpen,
+            Some(d) if d.as_micros() > R5_US_CAP => Self::Overflow,
+            Some(d) => Self::Us(d.as_micros() as u64),
+        }
+    }
+    fn render(self) -> String {
+        match self {
+            Self::Missing => "none".into(),
+            Self::BeforeOpen => "pre".into(),
+            Self::Us(us) => us.to_string(),
+            Self::Overflow => "ovf".into(),
+        }
+    }
+}
+fn r5_count(v: usize) -> String {
+    if v > R5_COUNT_CAP {
+        "ovf".into()
+    } else {
+        v.to_string()
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct R5Snap {
+    sm: usize,
+    log: usize,
+    permits: usize,
+    sm_rel: bool,
+    log_rel: bool,
+    rb: usize,
+}
+impl R5Snap {
+    // Strong counts and flags only; never upgrades a store.
+    fn take(n: &ConsensusNode) -> Self {
+        Self {
+            sm: n.sm_weak.strong_count(),
+            log: n.log_weak.strong_count(),
+            permits: n.read_permits.available_permits(),
+            sm_rel: n.sm_released.is_set(),
+            log_rel: n.log_released.is_set(),
+            rb: n.read_blocking.load(Ordering::SeqCst),
+        }
+    }
+    fn render(&self) -> String {
+        format!(
+            "sm:{},log:{},rp:{},smrel:{},logrel:{},rb:{}",
+            r5_count(self.sm),
+            r5_count(self.log),
+            r5_count(self.permits),
+            u8::from(self.sm_rel),
+            u8::from(self.log_rel),
+            r5_count(self.rb)
+        )
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R5Observer {
+    Joined,
+    Panicked,
+}
+#[derive(Clone, Copy)]
+struct R5Facts {
+    wait_ok: bool,
+    end_at: R5Mark,
+    rb_shutdown: usize,
+    open: R5Snap,
+    end: R5Snap,
+    // sm strong 0, log strong 0, all read permits, sm released, log released.
+    seen_clear: [R5Mark; 5],
+    // Entered, Locked, Returned, StoreDropped, PermitDropped.
+    stage: [R5Mark; 5],
+    samples: u64,
+    observer: R5Observer,
+}
+fn r5_render(f: &R5Facts) -> String {
+    // Raw counts cannot attribute an owner; any remaining store strong count is unknown.
+    let holder = if f.end.sm == 0 && f.end.log == 0 {
+        "none"
+    } else {
+        "unknown"
+    };
+    let [c0, c1, c2, c3, c4] = f.seen_clear.map(R5Mark::render);
+    let [s0, s1, s2, s3, s4] = f.stage.map(R5Mark::render);
+    let mut line = format!(
+        "[R5-post] v1 wait={} end_at={} rb_shutdown={} open={} end={} \
+         seen_clear=sm:{c0},log:{c1},rp:{c2},smrel:{c3},logrel:{c4} \
+         stage=enter:{s0},lock:{s1},fn:{s2},store:{s3},permit:{s4} \
+         samples={} observer={} store_holder={holder}",
+        if f.wait_ok { "ok" } else { "elapsed" },
+        f.end_at.render(),
+        r5_count(f.rb_shutdown),
+        f.open.render(),
+        f.end.render(),
+        r5_count(usize::try_from(f.samples).unwrap_or(usize::MAX)),
+        match f.observer {
+            R5Observer::Joined => "joined",
+            R5Observer::Panicked => "panicked",
+        },
+    );
+    line.truncate(R5_LINE_MAX);
+    line
+}
+type R5Seen = ([Option<std::time::Instant>; 5], u64);
+// Holds Weak handles, the read semaphore and release flags; never upgrades.
+struct R5Sampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<R5Seen>>,
+}
+impl R5Sampler {
+    fn start(n: &ConsensusNode) -> Self {
+        let (sm, log) = (n.sm_weak.clone(), n.log_weak.clone());
+        let permits = n.read_permits.clone();
+        let (sm_rel, log_rel) = (n.sm_released.clone(), n.log_released.clone());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halt = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut seen = [None; 5];
+            let mut samples = 0u64;
+            while !halt.load(Ordering::SeqCst) {
+                let clear = [
+                    sm.strong_count() == 0,
+                    log.strong_count() == 0,
+                    permits.available_permits() == READ_PERMITS,
+                    sm_rel.is_set(),
+                    log_rel.is_set(),
+                ];
+                let now = std::time::Instant::now();
+                for (slot, clear) in seen.iter_mut().zip(clear) {
+                    if clear && slot.is_none() {
+                        *slot = Some(now);
+                    }
+                }
+                samples = samples.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (seen, samples)
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn join(&mut self) -> Option<std::thread::Result<R5Seen>> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread.take().map(std::thread::JoinHandle::join)
+    }
+}
+impl Drop for R5Sampler {
+    // A no-op after `finish`; while unwinding it still stops and joins the thread.
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+struct R5Post {
+    anchor: std::time::Instant,
+    open: R5Snap,
+    rb_shutdown: usize,
+    stages: Arc<ReadStages>,
+    sampler: R5Sampler,
+}
+impl R5Post {
+    fn open(n: &ConsensusNode, stages: Arc<ReadStages>, rb_shutdown: usize) -> Self {
+        let sampler = R5Sampler::start(n);
+        let anchor = std::time::Instant::now();
+        let open = R5Snap::take(n);
+        Self {
+            anchor,
+            open,
+            rb_shutdown,
+            stages,
+            sampler,
+        }
+    }
+    // Snapshot, then stop and join the sampler; returns its panic for the caller.
+    fn finish(
+        mut self,
+        n: &ConsensusNode,
+        wait_ok: bool,
+    ) -> (String, Option<Box<dyn std::any::Any + Send>>) {
+        let end_at = std::time::Instant::now();
+        let end = R5Snap::take(n);
+        let (seen, samples, observer, panic) = match self.sampler.join() {
+            Some(Ok((seen, samples))) => (seen, samples, R5Observer::Joined, None),
+            Some(Err(p)) => ([None; 5], 0, R5Observer::Panicked, Some(p)),
+            None => ([None; 5], 0, R5Observer::Panicked, None),
+        };
+        let mark = |at| R5Mark::of(at, self.anchor);
+        let stage = [
+            ReadStage::Entered,
+            ReadStage::Locked,
+            ReadStage::Returned,
+            ReadStage::StoreDropped,
+            ReadStage::PermitDropped,
+        ]
+        .map(|s| mark(self.stages.get(s)));
+        let line = r5_render(&R5Facts {
+            wait_ok,
+            end_at: mark(Some(end_at)),
+            rb_shutdown: self.rb_shutdown,
+            open: self.open,
+            end,
+            seen_clear: seen.map(mark),
+            stage,
+            samples,
+            observer,
+        });
+        (line, panic)
+    }
+}
+#[test]
+fn r5_mark_renders_missing_before_open_seen_and_overflow() {
+    let anchor = std::time::Instant::now();
+    let us = |v| anchor + Duration::from_micros(v);
+    assert_eq!(R5Mark::of(None, anchor), R5Mark::Missing);
+    assert_eq!(R5Mark::of(Some(anchor), us(1)), R5Mark::BeforeOpen);
+    assert_eq!(R5Mark::of(Some(anchor), anchor), R5Mark::Us(0));
+    assert_eq!(R5Mark::of(Some(us(240)), anchor), R5Mark::Us(240));
+    assert_eq!(
+        R5Mark::of(Some(us(9_999_999)), anchor),
+        R5Mark::Us(9_999_999)
+    );
+    assert_eq!(R5Mark::of(Some(us(10_000_000)), anchor), R5Mark::Overflow);
+    let rendered = [
+        R5Mark::Missing,
+        R5Mark::BeforeOpen,
+        R5Mark::Us(240),
+        R5Mark::Overflow,
+    ]
+    .map(R5Mark::render);
+    assert_eq!(rendered, ["none", "pre", "240", "ovf"]);
+    assert_eq!(r5_count(R5_COUNT_CAP), "9999999");
+    assert_eq!(r5_count(R5_COUNT_CAP + 1), "ovf");
+}
+#[test]
+fn r5_line_renders_fixed_fields() {
+    let open = R5Snap {
+        sm: 2,
+        log: 0,
+        permits: 7,
+        sm_rel: false,
+        log_rel: true,
+        rb: 2,
+    };
+    let end = R5Snap { sm: 1, ..open };
+    let facts = R5Facts {
+        wait_ok: false,
+        end_at: R5Mark::Us(2_000_123),
+        rb_shutdown: 2,
+        open,
+        end,
+        seen_clear: [
+            R5Mark::Missing,
+            R5Mark::BeforeOpen,
+            R5Mark::Missing,
+            R5Mark::Missing,
+            R5Mark::BeforeOpen,
+        ],
+        stage: [
+            R5Mark::BeforeOpen,
+            R5Mark::Us(120),
+            R5Mark::Us(130),
+            R5Mark::Missing,
+            R5Mark::Missing,
+        ],
+        samples: 1500,
+        observer: R5Observer::Joined,
+    };
+    assert_eq!(
+        r5_render(&facts),
+        "[R5-post] v1 wait=elapsed end_at=2000123 rb_shutdown=2 \
+         open=sm:2,log:0,rp:7,smrel:0,logrel:1,rb:2 \
+         end=sm:1,log:0,rp:7,smrel:0,logrel:1,rb:2 \
+         seen_clear=sm:none,log:pre,rp:none,smrel:none,logrel:pre \
+         stage=enter:pre,lock:120,fn:130,store:none,permit:none \
+         samples=1500 observer=joined store_holder=unknown"
+    );
+    let clear = R5Snap {
+        sm: 0,
+        permits: READ_PERMITS,
+        sm_rel: true,
+        ..open
+    };
+    let line = r5_render(&R5Facts {
+        wait_ok: true,
+        end: clear,
+        observer: R5Observer::Panicked,
+        ..facts
+    });
+    assert!(line.starts_with("[R5-post] v1 wait=ok "), "{line}");
+    assert!(
+        line.contains(" end=sm:0,log:0,rp:8,smrel:1,logrel:1,rb:2 "),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(" observer=panicked store_holder=none"),
+        "{line}"
+    );
+    let log_held = r5_render(&R5Facts {
+        end: R5Snap { log: 1, ..clear },
+        ..facts
+    });
+    assert!(log_held.contains(" end=sm:0,log:1,"), "{log_held}");
+    assert!(log_held.ends_with(" store_holder=unknown"), "{log_held}");
+}
+#[test]
+fn r5_line_is_bounded_ascii_at_maximum_width() {
+    let max = R5Snap {
+        sm: usize::MAX,
+        log: R5_COUNT_CAP,
+        permits: usize::MAX,
+        sm_rel: true,
+        log_rel: true,
+        rb: usize::MAX,
+    };
+    let line = r5_render(&R5Facts {
+        wait_ok: false,
+        end_at: R5Mark::Overflow,
+        rb_shutdown: R5_COUNT_CAP,
+        open: max,
+        end: max,
+        seen_clear: [R5Mark::Us(9_999_999); 5],
+        stage: [R5Mark::Overflow; 5],
+        samples: u64::MAX,
+        observer: R5Observer::Panicked,
+    });
+    assert!(line.is_ascii() && !line.contains('\n'), "{line}");
+    // Fixed fields fit without truncation; the cap is a backstop, not a cut.
+    assert!(line.len() < R5_LINE_MAX, "{}", line.len());
+    assert!(line.contains(" open=sm:ovf,log:9999999,rp:ovf,smrel:1,logrel:1,rb:ovf "));
+    assert!(line.contains(" stage=enter:ovf,lock:ovf,fn:ovf,store:ovf,permit:ovf "));
+    assert!(line.ends_with(" samples=ovf observer=panicked store_holder=unknown"));
+}
+#[test]
+fn r5_read_stages_claim_once_and_keep_first_instant() {
+    let stages = Some(Arc::new(ReadStages::default()));
+    let s = stages.as_ref().unwrap();
+    assert!(s.claim());
+    assert!(!s.claim());
+    assert_eq!(s.get(ReadStage::Locked), None);
+    ReadStages::stamp(&stages, ReadStage::Locked);
+    let first = s.get(ReadStage::Locked).unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    ReadStages::stamp(&stages, ReadStage::Locked);
+    assert_eq!(s.get(ReadStage::Locked), Some(first));
+    assert_eq!(s.get(ReadStage::PermitDropped), None);
+    ReadStages::stamp(&None, ReadStage::Entered);
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r5_shutdown_read_owners() {
     timeout(Duration::from_secs(45), async {
@@ -1140,6 +1505,12 @@ async fn r5_shutdown_read_owners() {
                 c.router.isolated.lock().unwrap().insert(l as u64 + 1);
                 None
             };
+            // Arm this node's own stamps before its gated read enters.
+            let r5_stages = gated.then(|| {
+                let stages = Arc::<ReadStages>::default();
+                let _ = c.node(l).read_stages.set(stages.clone());
+                stages
+            });
             let n = c.node(l).clone();
             let caller = tokio::spawn(async move { n.linearizable_state().await });
             timeout(Duration::from_secs(1), async {
@@ -1157,6 +1528,7 @@ async fn r5_shutdown_read_owners() {
                 let _ = caller.await;
             }
             c.router.nodes.lock().unwrap().remove(&(l as u64 + 1));
+            let r5_rb_shutdown = c.node(l).read_blocking.load(Ordering::SeqCst);
             let mut n = Arc::try_unwrap(c.nodes[l].take().unwrap()).ok().unwrap();
             let started = Instant::now();
             let result = n.shutdown().await;
@@ -1180,10 +1552,12 @@ async fn r5_shutdown_read_owners() {
                 result,
                 started.elapsed()
             );
+            let r5_post = r5_stages.map(|stages| R5Post::open(&n, stages, r5_rb_shutdown));
             if let Some(gate) = gate {
                 gate.open();
             }
-            timeout(Duration::from_secs(2), async {
+            // Bound only to emit the observation line before the unchanged unwrap.
+            let r5_wait = timeout(Duration::from_secs(2), async {
                 while n.sm_weak.upgrade().is_some()
                     || n.log_weak.upgrade().is_some()
                     || n.read_permits.available_permits() != READ_PERMITS
@@ -1191,8 +1565,15 @@ async fn r5_shutdown_read_owners() {
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            if let Some(post) = r5_post {
+                let (line, sampler_panic) = post.finish(&n, r5_wait.is_ok());
+                eprintln!("{line}");
+                if let Some(panic) = sampler_panic {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            r5_wait.unwrap();
             assert!(n.owners.lock().unwrap().set.is_empty());
             assert_eq!(n.linearizable_state().await, Err(ReadError::Unavailable));
             c.finish().await;
