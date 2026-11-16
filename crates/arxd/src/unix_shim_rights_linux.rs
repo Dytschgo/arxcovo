@@ -143,6 +143,163 @@ fn observe(update: impl FnOnce(&mut Observation)) {
         slot.set(value);
     });
 }
+// Test-only payload-free attribution, separate from identity-bearing Observation.
+#[cfg(test)]
+mod attribution {
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Site {
+        #[default]
+        None,
+        Anchor,
+        Classify,
+        Null,
+        Cwd,
+        Pipe,
+        Fdwrap,
+        Fork,
+        Deadline,
+        ReapedBad,
+        WaitErr,
+    }
+    impl Site {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::None => "none",
+                Self::Anchor => "anchor",
+                Self::Classify => "classify",
+                Self::Null => "null",
+                Self::Cwd => "cwd",
+                Self::Pipe => "pipe",
+                Self::Fdwrap => "fdwrap",
+                Self::Fork => "fork",
+                Self::Deadline => "deadline",
+                Self::ReapedBad => "reaped_bad",
+                Self::WaitErr => "wait_err",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Read {
+        #[default]
+        Na,
+        Byte,
+        Eof,
+        Eagain,
+        Other,
+    }
+    impl Read {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Byte => "byte",
+                Self::Eof => "eof",
+                Self::Eagain => "eagain",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Status {
+        #[default]
+        Na,
+        Exited,
+        SignaledKill,
+        SignaledOther,
+        Other,
+    }
+    impl Status {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Exited => "exited",
+                Self::SignaledKill => "signaled_kill",
+                Self::SignaledOther => "signaled_other",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Wait {
+        #[default]
+        Na,
+        Pending,
+        Reaped,
+        Interrupted,
+        Echild,
+        Other,
+    }
+    impl Wait {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Pending => "pending",
+                Self::Reaped => "reaped",
+                Self::Interrupted => "interrupted",
+                Self::Echild => "echild",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Attribution {
+        pub site: Site,
+        pub pre_ms: u32,
+        pub wait_ms: u32,
+        pub polls: u32,
+        pub deadline_ms: u32,
+        pub read: Read,
+        pub status: Status,
+        pub wait: Wait,
+    }
+    std::thread_local! {
+        pub(super) static ATTRIBUTION: std::cell::Cell<Attribution> = Default::default();
+    }
+    pub(super) fn attribute(update: impl FnOnce(&mut Attribution)) {
+        ATTRIBUTION.with(|slot| {
+            let mut value = slot.get();
+            update(&mut value);
+            slot.set(value);
+        });
+    }
+    pub(super) fn ms(duration: Duration) -> u32 {
+        duration.as_millis().min(60_000) as u32
+    }
+    // Created before Child: final timing includes its unchanged parent cleanup.
+    pub(super) struct Timing {
+        start: Instant,
+        forked: Option<Instant>,
+    }
+    impl Timing {
+        pub(super) fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                forked: None,
+            }
+        }
+        pub(super) fn parent_fork_returned(&mut self) {
+            let now = Instant::now();
+            attribute(|a| a.pre_ms = ms(now.duration_since(self.start)));
+            self.forked = Some(now);
+        }
+    }
+    impl Drop for Timing {
+        fn drop(&mut self) {
+            attribute(|a| match self.forked {
+                Some(start) => a.wait_ms = ms(start.elapsed()),
+                None => a.pre_ms = ms(self.start.elapsed()),
+            });
+        }
+    }
+}
+#[cfg(test)]
+use attribution::{ATTRIBUTION, Attribution, Site, Timing, attribute};
+
 fn fd(raw: i32) -> Result<OwnedFd, &'static str> {
     // Keep every prepared descriptor outside stdio even if the caller closed it.
     if (0..3).contains(&raw) {
@@ -245,11 +402,22 @@ fn alias(root: &OwnedFd, owner: u32) -> Result<bool, &'static str> {
     }
 }
 fn run(settings: &Settings, #[cfg(test)] hook: impl FnOnce()) -> &'static str {
+    #[cfg(test)]
+    ATTRIBUTION.with(|slot| {
+        slot.set(Attribution {
+            deadline_ms: attribution::ms(settings.deadline()),
+            ..Attribution::default()
+        })
+    });
+    #[cfg(test)]
+    attribute(|a| a.site = Site::Anchor);
     let root = match directory(libc::AT_FDCWD, settings.anchor(), settings.owner()) {
         Ok(root) => root,
         Err("untrusted") => return "untrusted",
         Err(_) => return "unknown",
     };
+    #[cfg(test)]
+    attribute(|a| a.site = Site::None);
     // Anchor trust failure is distinct from open failure.
     classify_and_execute(
         root,
@@ -309,6 +477,8 @@ fn classify_and_execute(
         return "untrusted";
     }
     if unknown {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Classify);
         return "unknown";
     }
     let Some(chosen) = chosen else {
@@ -342,21 +512,31 @@ impl Drop for Child {
     }
 }
 fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
+    #[cfg(test)]
+    let mut timing = Timing::new();
     let argv = settings.argv();
     let env = settings.env();
     let Ok(null) = fd(unsafe { libc::open(NULL.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) }) else {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Null);
         return "unknown";
     };
     let Ok(cwd) = directory(libc::AT_FDCWD, CWD, OWNER) else {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Cwd);
         return "unknown";
     };
     let mut pipe = [-1; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Pipe);
         return "unknown";
     }
     let read_result = fd(pipe[0]);
     let write_result = fd(pipe[1]);
     let (Ok(read), Ok(write)) = (read_result, write_result) else {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Fdwrap);
         return "unknown";
     };
     #[cfg(test)]
@@ -371,7 +551,13 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
         o.gid = unsafe { libc::getgid() };
     });
     let pid = unsafe { libc::fork() };
+    #[cfg(test)]
+    if pid != 0 {
+        timing.parent_fork_returned();
+    }
     if pid < 0 {
+        #[cfg(test)]
+        attribute(|a| a.site = Site::Fork);
         return "unknown";
     }
     if pid == 0 {
@@ -401,15 +587,64 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
     let deadline = Instant::now() + settings.deadline();
     loop {
         if Instant::now() >= deadline {
+            #[cfg(test)]
+            attribute(|a| a.site = Site::Deadline);
             return "unknown";
         }
         let mut status = 0;
+        #[cfg(test)]
+        attribute(|a| a.polls = a.polls.saturating_add(1));
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        #[cfg(test)]
+        {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            attribute(|a| {
+                a.wait = if result == pid {
+                    attribution::Wait::Reaped
+                } else if result == 0 {
+                    attribution::Wait::Pending
+                } else {
+                    match errno {
+                        Some(libc::EINTR) => attribution::Wait::Interrupted,
+                        Some(libc::ECHILD) => attribution::Wait::Echild,
+                        _ => attribution::Wait::Other,
+                    }
+                }
+            });
+        }
         if result == pid {
             child.reaped = true;
+            #[cfg(test)]
+            attribute(|a| {
+                a.status = if libc::WIFEXITED(status) {
+                    attribution::Status::Exited
+                } else if libc::WIFSIGNALED(status) {
+                    if libc::WTERMSIG(status) == libc::SIGKILL {
+                        attribution::Status::SignaledKill
+                    } else {
+                        attribution::Status::SignaledOther
+                    }
+                } else {
+                    attribution::Status::Other
+                }
+            });
             let mut error = [0u8; 1];
             let count = unsafe { libc::read(read.as_raw_fd(), error.as_mut_ptr().cast(), 1) };
+            #[cfg(test)]
+            {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                attribute(|a| {
+                    a.read = match count {
+                        0 => attribution::Read::Eof,
+                        1 => attribution::Read::Byte,
+                        _ if errno == Some(libc::EAGAIN) => attribution::Read::Eagain,
+                        _ => attribution::Read::Other,
+                    }
+                });
+            }
             if count != 0 || !libc::WIFEXITED(status) {
+                #[cfg(test)]
+                attribute(|a| a.site = Site::ReapedBad);
                 return "unknown";
             }
             #[cfg(test)]
@@ -424,6 +659,12 @@ fn execute(executable: OwnedFd, settings: &Settings) -> &'static str {
             };
         }
         if result < 0 {
+            #[cfg(test)]
+            attribute(|a| {
+                if a.wait != attribution::Wait::Interrupted {
+                    a.site = Site::WaitErr;
+                }
+            });
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }

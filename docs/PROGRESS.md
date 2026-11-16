@@ -2,7 +2,9 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main green:** e601caa (PR158), exact CI43862021319 success; Windows477s. Fresh exact-main verification remains required before each merge.
+**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
+
+**PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
 **Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
@@ -24,8 +26,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #158 as `e601caa594f591cc585007be8a455c07282cde8b` at11:55:45Z; independent Opus exact-head PASS6915691909/status59021295297, all five gates green, Windows543s. Fresh premerge6231da9 CI43854991316 green; postmerge exact-main CI43862021319 green, Windows477s.
-- Current work: log-store shutdown wait regression e6e7a88 has independent Opus5.5 high PASSd2bd45d retaineda3dc153, with3focused control passes and isolated missing-log-wait mutant caught. Historical last-merged entries restored from8e1db8f; preparing exact-head gates. TLS PR159 remains blocked on Ubuntu S8 and Windows engine failures; Linux attribution builder and Opus Windows diagnosis active. Main e601caa CI43862021319 green. M2 open, M3 unchecked, eight quarantines unchanged.
+- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
+- Current work: PR161 push2 all platform jobs succeeded on7f71652; independent Opus PASS6917477824/status59027550095. Parent integration9fb217d imports reviewed PR160 only, attribution/harness bytes unchanged. Preparing final integration push3/3 and fresh exact-head gates/review; other merges wait for this head to settle. Windows phase/history diagnostics reviewed with complementary cleanup PASS, publication after this integration. PR159 held; M2 open/M3 unchecked/eight quarantines unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3121,3 +3123,14 @@ Sol high source `2a4d9d3` and independent Muse high review `59f2780` accept the 
 - 2026-11-15: Independent baseline assessment PASS(Muse high59a5b96), Standards/Spec/Security no findings. Pins/sourcejoin/run43666413693(73s,first/finalnull,cleanupconfirmed,variableabsence) verified; credit limited to disposable positivebaselinefeedback, notA4acceptance. Publish docs-only consumed-grant/evidence checkpoint; nativeomittedkill plan remains separateandungranted. No further native authority, M2/A4/F/G/PA6 open,hardware paths **unverified on real hardware**.
 
 - A12 candidate Opus review S1: corrected the stale historical mutant anchor; coordinator ran 91 audited tests and all 40 historical assertion kills. Candidate inventory refreshed; fresh Opus delta recheck pending. No native execution; A12 **unverified on real hardware**. Provider: Sol, effort high, outcome: review correction verified.
+
+
+### Linux S8 attribution contract checkpoint
+
+Opus5.5 high disposition2a8f92b proposes test-only branch attribution; root Sol
+medium contract review accepts with exact-once assertion capture, zero-poll
+deadline validity, closed enums/reset/512byte output clarifications. No causal
+claim or Linux execution. Sol high implementation next, independently reviewed
+before a normal main-based PR; no dispatch or blind rerun. PR159 remains held on
+both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
+separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
