@@ -23,7 +23,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-16
 
 - Last merged: PR #155, `87c994048efd660dce279a847c0bd233a888d06c` at07:25:59Z; independent Opus exact-head PASS6910044655, allfive required gates green. Reviewed67b038e/squash trees equal. Reviewed red-main S2b repair under delegated clarification; next exact-main CI must be green before feature/sampling. OptionalS2bnative-evidence success grants no newnative acceptance.
-- Current work: resume bounded reads after exact-main a18e95c CI43836099670 green. Windows job433s/sample29031ms all8pass/orphans0; quarantine unchanged and no stability/re-enable claim. Reviewed resumption brief preserves R1-R5 as required on all OS; Sol transplant starts with stop-on-local-red. M2 open/M3 unchecked.
+- Current work: publish resumed PR149 bounded reads on green maina18e95c. Sol8b5b0a0 and independent Opus f57d8cf (retained360b9a8) pass resumption:119cluster,58sampler,exact8 guard; oldA0behavior preserved with main diagnostics. R1-R5 required allOS, original8 Windowsquarantined. Fresh exact-head review/five gates required, no reruns or stability claim. M2 open/M3 unchecked.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 

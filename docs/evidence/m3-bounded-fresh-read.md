@@ -275,3 +275,9 @@ M3 remains unchecked. Windows three-node remains **unverified on hosted Windows*
 for this head and **unverified on real hardware**; real transport/hosts and all
 hardware paths are **unverified on real hardware**. No native M2, VM, admin,
 external dispatch/rerun, status, push, PR, external merge or watch action occurred.
+
+## Resumption review and publication checkpoint
+
+Opus `f57d8cf` retained `360b9a8` passes the integration. Reviewer independently ran119cluster nextest,58sampler and exact8 guard; actual list confirms five R fixtures plus C2 unit mismatch as ignored under sample selection. Other builder checks remain attributed to the builder. The review recomputed the changed-line proof without excluding a Cluster pair: no exclusion was required, so the earlier evidence describes a weaker comparison than the actual proof. No source correction follows the review.
+
+Coordinator re-read exact live main `a18e95c20b7340127d746fb3632f3b0eab32e586` and CI43836099670 success before publication. PR149 is updated by fast-forward, preserving old8eaed30 ancestry and all reviewed histories. New hosted gates and separate exact-head review remain pending. Required merge evidence includes R1-R5 execution/pass on each OS, exactly8 quarantine/sampler IDs and Windows job within budget. This is a new source head, not a rerun of the historical failed head; the original U6 failure remains unresolved and quarantined.
