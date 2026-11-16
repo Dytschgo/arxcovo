@@ -712,12 +712,12 @@ class OutcomeTests(unittest.TestCase):
                 self.assertLessEqual(int(h.field("run_ms")), 60_000)
 
     def test_run_deadline_is_clipped_by_absolute_step_budget(self):
+        # 10 s already spent before list (slow validation): D - 8 s binds before run + 60 s.
         h = Harness(run_s=None, list_kwargs={"run_s": 19.0})
-        h.clock.t += 0  # start
-        code, _ = h.run()
-        self.assertEqual(code, 0)
+        code, h.lines = w.run(h.ctx, start=h.clock.t - 10.0)
+        self.assertEqual((code, h.field("outcome")), (0, "diag_incomplete"))
         self.assertLessEqual(int(h.field("wall_ms")), 90_000)
-        self.assertLessEqual(int(h.field("list_ms")) + int(h.field("run_ms")), 82_000)
+        self.assertAlmostEqual(int(h.field("run_ms")), 72_000 - 19_000, delta=300)
 
     def test_gating_outcomes(self):
         cases = [
