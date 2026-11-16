@@ -182,3 +182,29 @@ VM/admin/native M2 or old Lab Manager action occurred. No secrets, keys or
 proofs are committed or released in evidence. No transport or production CA
 exists in this slice. M2 remains open; M3 unchecked; all hardware paths are
 **unverified on real hardware**.
+
+
+## Coordinator private-fixture correction and final local checks
+
+Sol diagnosed the first startup failure with a focused precondition test on the
+same plain temporary-directory setup: the directory failed the existing security
+privacy check before any node could start. That diagnostic failed at its explicit
+privacy assertion (D:/Temp/arx-tls-private-precondition-red.log). Commit34902ca
+uses the established private_temp helper in this new fixture and keeps an explicit
+privacy precondition regression. Production privacy checks and shared cluster
+helpers are unchanged. This is a new-fixture correction, not a historical Windows
+cluster fix. The original failed engine run above remains recorded.
+
+At34902ca, one changed-source cluster nextest run passed145/145 in10.315s.
+Quarantine guard2, sampler58, Node29, format and diff checks passed. Logs are
+D:/Temp/arx-tls-private-{cluster,guard,sampler,node}.log. Clippy then stopped on
+self_named_constructors in the private certificate extraction helper. Commit
+d1c207d renamed that helper to from_verified_certificates with no behavior change
+or suppression. Final workspace all-target locked/offline Clippy passed in8.72s
+(D:/Temp/arx-tls-final-clippy.log), and in-process cluster tests passed145/145,
+13ignored, in9.29s (D:/Temp/arx-tls-final-inprocess.log).
+
+These are coordinator runs, separate from the builder's evidence. Behavioral
+mutants, full independent TLS/security source review and hosted timing are still
+pending. No Windows stability, production transport, production CA or hardware
+acceptance is claimed. M2 remains open and M3 unchecked.
