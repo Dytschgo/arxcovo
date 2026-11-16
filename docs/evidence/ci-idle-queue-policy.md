@@ -231,3 +231,31 @@ required contexts and original app bindings; no settings were modified.
 The administration guide now states the concrete proposed one-use activation
 route. It remains unauthorized and requires separate acceptance of the KICKOFF
 wall-clock deviation after exact-head review and platform results exist.
+
+
+## PR163 first hosted run and lint correction
+
+PR163 d635d88 CI43903996401 Ubuntujob133427808041 passed567/567 Rust tests,
+22skipped, then npm lint failed at policy.test.mjs76/97: structuredClone was
+not declared in the configured ESLint globals. This is introduced by the new
+test file and is deterministic; no original S8 or cluster failure is attributed.
+Root qualifies both calls as globalThis.structuredClone, preserving behavior
+and leaving lint configuration unchanged. Actual root npm run lint (tsc+eslint)
+passes and full Node48/48 passes in7483.71ms on the corrected test source.
+No dependency install, workflow change, runtime-policy or history change occurs.
+The first raw-log extraction hit a local stdout encoding error; reading the
+saved UTF-8 log then isolated the actual hosted lint failure above.
+
+Independent publication PASS6921895097/status59044541434 on d635d88 remains
+historical. Its SA1/SA2 activation advisories are incorporated: check for zero
+armed auto-merges before removing a gate and again immediately before merge;
+write all app bindings explicitly, with-1 for the original null binding.
+The official GitHub API documents-1 semantics. Its exact readback representation
+remains unverified until a separately authorized operation. No auto-merge state,
+protection or status was modified by this documentation change. New-head source
+review and platform gates are required; old-head passes do not carry forward.
+
+Root log hashes:
+
+- arx-ci-queue-lint-fixed.log: `3806a30a0c4866a8d8cfc5bfc34cb421ece106e0efef98646b4d780ce0d1095f`.
+- arx-ci-queue-lint-node.log: `6a8ceaaee1e911795d0fa9f570173780cbec1b8647c918ff29a78d8032827405`.

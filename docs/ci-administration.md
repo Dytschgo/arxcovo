@@ -64,11 +64,16 @@ one-use route requires explicit acceptance of ADR0025's KICKOFF deviation and
 permission for a named executor to bootstrap ONLY that pinned amendment PR while
 main remains red. It grants nothing for PR162, PR159 or feature work.
 
-If separately authorized, the executor must snapshot the live required-check
-configuration, recheck head/base/main and all four other gates, temporarily
+If separately authorized, the executor must first confirm that no open PR has an armed auto-merge request,
+then snapshot the live required-check configuration and recheck head/base/main and all four other gates.
+Check again for zero armed auto-merges immediately before the pinned merge; abort if any is armed. Keep the
+protection window short and perform no unrelated action within it. Then temporarily
 remove ONLY ci-time-budget from the required-check list, and perform the pinned
 squash merge. Restore strict and the original five context/app bindings in a
-finally block even if the merge fails, then read back and compare them exactly.
+finally block even if the merge fails, then read back and compare them exactly. Send every check with an
+explicit app_id: retain15368 for Actions checks and encode the snapshot null binding as-1 for agent-review.
+GitHub documents-1 as allowing any app; do not omit app_id and let the API infer a recent app. The-1-to-null
+readback representation is unverified until an authorized operation; a mismatch stops work for owner recovery.
 Leave admin enforcement, reviews, linear history, force-push/deletion fences and
 all other protection untouched. Abort on drift; do not use manual success status,
 force push, an admin bypass or a ci-speed label. A restoration failure stops all
@@ -79,3 +84,5 @@ that exact new main. Failed main gets no idle credit; no other merge follows
 until main is green and normal required gates pass. Record the approved scope,
 executor, before/after settings and result in PROGRESS and ADR0025. Any further
 exception requires a new decision; the route is not reusable.
+
+Source for explicit app binding: [GitHub protected-branch status-check API](https://docs.github.com/en/rest/branches/branch-protection#update-status-check-protection).

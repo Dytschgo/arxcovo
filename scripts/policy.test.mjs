@@ -73,7 +73,7 @@ test('every metadata defect withholds credit and cannot authorize ci-speed', () 
   ];
   for (const [target, key, value] of changes) {
     const data = sample();
-    const listed = structuredClone(data.run);
+    const listed = globalThis.structuredClone(data.run);
     (target === 'run' ? data.run : target === 'payload' ? data.jobs : data.jobs.jobs[0])[key] = value;
     const result = queueMeasurement({ ...duration(listed), seconds: 1000 }, data.run, data.jobs, listed, 'main');
     assert.equal(result.chargedSeconds, null, `${target}.${key}=${value}`);
@@ -94,7 +94,7 @@ test('every metadata defect withholds credit and cannot authorize ci-speed', () 
   duplicatePlatform.jobs.jobs[0].name = duplicatePlatform.jobs.jobs[1].name;
   duplicatePlatform.jobs.jobs[0].labels = duplicatePlatform.jobs.jobs[1].labels;
   assert.equal(measure(duplicatePlatform).credit, 'unavailable:jobs-invalid');
-  const tooMany = sample(); tooMany.jobs.jobs.push(structuredClone(tooMany.jobs.jobs[0]));
+  const tooMany = sample(); tooMany.jobs.jobs.push(globalThis.structuredClone(tooMany.jobs.jobs[0]));
   assert.equal(measure(tooMany).credit, 'unavailable:jobs-invalid');
   const missing = sample(); missing.jobs.jobs[0] = null;
   assert.equal(measure(missing).credit, 'unavailable:jobs-invalid');
