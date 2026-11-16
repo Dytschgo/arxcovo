@@ -1,6 +1,6 @@
 # 0025: Charge the CI time budget for execution, not idle job queue
 
-Status: **Proposed 2026-11-16 — prepared, not accepted, not active.** Opus design sub-agent, exact main `c612152`.
+Status: **Proposed 2026-11-16 — implemented locally for review, not accepted, not active.** Opus design sub-agent, exact main `c612152`.
 
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
