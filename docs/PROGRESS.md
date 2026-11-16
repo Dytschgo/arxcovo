@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opusf8e945b retaineddf0d42e finds local cargo-test R1/R6 pause-slot race (production integration PASS). Sol6eb5ad8 adds test-only async slot ownership; mainadapter unchanged, brief/evidence corrected. Focused8concurrent tests pass8.71s, full117cluster pass9.50s, fmt/workspaceClippy3.58s/diff pass. Fresh narrow Opus recheck active; remotePR149notyetpushed and finitehostedattempt2notstarted.
+
 - 2026-11-16: PR149 remote conflict from PR150 is resolved locally in34bf2d6; fresh integrated117cluster tests pass9.54s with actual R5 held-read attribution and unchanged mainR6 assertions. No conflict markers or working-tree changes remain after checkpoint. Lint and independent integration review still active before push; no hosted attempt2 has started and U6 remains unresolved.
 
 - 2026-11-16: Coordinator verifies PR150 all five gates and exactmain6e9edd5 CI43777637580 green, re-reads main, unwatches and merges01a42d5 at01:50:48Z; reviewed/squash trees equal. Parent diagnostics integrated into PR149 with main apply hook retained, read-held snapshot before abort and R5 attribution; fresh checks/review pending. This is finite changed-diagnostic attempt2, no manual rerun and no U6 fix claim.
