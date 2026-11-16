@@ -208,3 +208,55 @@ These are coordinator runs, separate from the builder's evidence. Behavioral
 mutants, full independent TLS/security source review and hosted timing are still
 pending. No Windows stability, production transport, production CA or hardware
 acceptance is claimed. M2 remains open and M3 unchecked.
+
+
+## Opus findings and coordinator resumption correction
+
+Opus reviewa647147 retainedb344df7 found B1: reusable rustls configs resumed
+TLS1.3 without calling either certificate verifier. Local removal and expiry
+could therefore be bypassed. Required gaps R1/R2 were independent server-side
+chain/time coverage and exact native time-refusal assertions. None is dismissed
+by the earlier green tests.
+
+Sol4c16354 disables client resumption, replaces server session storage with
+NoServerSessionStorage and sends zero TLS1.3 tickets. Reused configs must now
+perform full handshakes with both registry checks; removal then gives NotMember.
+The expiry regression first signs in near the leaf's end and advances only
+90minutes, keeping session-ticket age short while crossing certificate expiry.
+Direct client-certificate checks independently cover foreign same-DN CA,
+self-signed certificate, NotValidYetContext, ExpiredContext, KeyMismatch,
+NotMember and WrongCluster. Existing client-side direct/handshake time tests now
+assert the exact native variants. The handshake pump was factored to expose
+completed connections for full-handshake assertions; its32round cap is unchanged.
+
+Before the production correction, the reused-config test failed with Resumed
+rather than Full (D:/Temp/arx-tls-review-red.log). An initial expiry test advanced
+30days and passed because its ticket had aged out; that inadequate setup was
+replaced. The corrected near-expiry test failed on old production code because
+the resumed connection succeeded (D:/Temp/arx-tls-expiry-red.log). After correction,
+all7pureTLS tests passed (D:/Temp/arx-tls-review-fixed.log). Removing only the
+server-side chain call compiled and failed the new direct-client test at its
+foreign-CA refusal assertion (D:/Temp/arx-tls-server-chain-mutant.log); original
+bytes were restored in a finally block and compared exactly.
+
+Merge277c3e9 integrates reviewed store-close main e601caa. Source merged without
+conflicts; the two doc conflicts retain B addenda and refresh PROGRESS. Combined
+nextest passed152/152 in9.591s, in-process tests152/152 with13ignored in9.17s,
+and workspace all-target Clippy passed7.14s, all locked/offline. Guard2, sampler58,
+Node29, fmt and diff checks pass. Logs: D:/Temp/arx-tls-resumption-{cluster,
+inprocess,clippy,node}.log. After those runs, the self-signed direct-client fixture
+was strengthened to be in-date with the correct URI/EKU, and its expected native
+refusal narrowed to UnknownIssuer or BadSignature. That final focused test passes
+(D:/Temp/arx-tls-server-final.log), and final arxd all-target Clippy passes3.57s
+(D:/Temp/arx-tls-server-final-clippy.log). No broad rerun is credited for this
+last test-only refinement; production and engine source remain identical.
+
+Opus recheck of the correction remains required. Main e601caa CI43862021319 is
+in progress at this checkpoint; no TLS publication/merge credit is granted.
+PR158 merged only after all5gates and fresh exact-main6231da9 green. Its Windows
+PR verify was543s; the new main and PR B timing are not yet known. M2 open, M3
+unchecked, eight Windows quarantines unchanged, hardware unverified.
+
+Final changed source pins (supersede earlier pins only for these paths):
+- `crates/arxd/src/cluster/pki/verify.rs`: `c8c198f4ee784c093c339930f83c91214b617f22`.
+- `crates/arxd/src/cluster/pki/tls_tests.rs`: `dd5ef2b3ade262ddc8fa35eca660c73122b35d49`.

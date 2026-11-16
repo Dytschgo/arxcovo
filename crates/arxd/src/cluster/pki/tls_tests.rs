@@ -348,20 +348,21 @@ fn client_certificate_chain_time_and_registry_refusals() {
     };
     check(&v, &der, 1001).unwrap();
     let foreign = ClusterCa::ephemeral([1; 16], NOW);
+    let mut self_signed = CertificateParams::default();
+    self_signed.not_before = time::OffsetDateTime::from_unix_timestamp(940).unwrap();
+    self_signed.not_after = time::OffsetDateTime::from_unix_timestamp(10000).unwrap();
+    self_signed.subject_alt_names = vec![rcgen::SanType::URI(
+        super::node_uri([1; 16], node(4)).try_into().unwrap(),
+    )];
+    self_signed.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     for bad in [
         leaf(&foreign, &key),
-        CertificateParams::default()
-            .self_signed(&key)
-            .unwrap()
-            .der()
-            .to_vec(),
+        self_signed.self_signed(&key).unwrap().der().to_vec(),
     ] {
         assert!(matches!(
             check(&v, &bad, 1001),
             Err(Error::InvalidCertificate(
-                CertificateError::UnknownIssuer
-                    | CertificateError::BadSignature
-                    | CertificateError::NotValidYetContext { .. }
+                CertificateError::UnknownIssuer | CertificateError::BadSignature
             ))
         ));
     }
