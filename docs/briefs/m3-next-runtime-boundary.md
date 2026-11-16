@@ -188,3 +188,17 @@ and the state store shows no applied position and `founded() == false`.
 
 Sol (high) implements F1 exactly as above in one PR on the post-PR161 main: the allowlisted files only, all F1–F10 and pure tests, and evidence recording the
 measured test and Windows times. Opus reviews it against this brief.
+
+
+## Coordinator execution-order amendment (2026-11-16)
+
+The root Sol contract recheck455d8ea accepts B1-B3. PR161 mergedc612152, but
+its main CI is red on the unrelated R5 post-release wait and over budget due
+to macOS capacity. Local isolated founder implementation may proceed under
+this accepted contract while those recovery gates run. This replaces only the
+source-start timing prerequisite above. Publication and merge still require a
+fresh green exact main, independent Opus source review and the normal five gates.
+No production CA, endpoint, native authority or shared-suite correction follows.
+This feature's tests use one voter; do not change an existing helper to obtain
+green. Any natural engine red stops the local verification round for disposition,
+without rerun or source tuning. The Windows recovery counters remain separate.
