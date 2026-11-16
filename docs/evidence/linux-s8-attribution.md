@@ -152,3 +152,12 @@ and diff checks pass. No Linux cross-check was repeated: native gcc is still
 missing. New source9e5667f has no hosted Linux result yet. Independent recheck
 pending before push2/3; no same-head rerun. Linux fixes0/3, observability1/3used.
 M2/M3/hardware and native-execution limits remain unchanged.
+
+
+Windows job133310209022 in the same first-push run43870536050 also failed
+p_scan_checked_nonempty_inventory at514 with forbidden diagnostic. It ran
+259pass/1fail/16skip/334unrun in58.674s test execution. This independently
+confirms the same all-platform scanner incompatibility; no second cause or
+new behavior failure was observed. Log D:/Temp/arx-pr161-windows-job.log.
+No rerun or extra observability push occurred. Correction9e5667f remains in
+independent review at2ae20f2; this later checkpoint is docs-only.
