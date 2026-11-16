@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus516356b0 retained0da693b confirms shutdown report source correct but requests test-only B1: count-before-own-handle-drop mutant survives >=1. Sole code deltaec67681 requires exactlyone externalSMreference; focused local verification and fresh narrow Opus recheck active. Second diagnostic seam attempt, no behaviorfix/timeoutchange; PR149 remains blocked.
+
 - 2026-11-16: Sol high39bbbd9 retained4c909a6 implements bounded shutdown phase report with cancelled-caller proposal/store/normal/reaped-error tests.112cluster pass/2ownedignored, eight unchangedU6 sanity runs pass, fmt/offlineworkspaceClippy/diff pass; two compilable misattribution mutants fail runtime assertions. One implementation attempt. Diagnostic only, natural hostedcauseunknown; fresh Opus review active before separate PR. PR149 remains blocked pending diagnostic parent/integration.
 
 - 2026-11-16: Sol diagnostic643416e hands back evidence before implementation: live propose caller conflicts with exclusive shutdown borrow. Coordinator settles cancellation seam consistent with U6: abort/join caller, retain direct pending-owner/permit proof, then shutdown report and post-release cleanup. No new proposal API or weakened shutdown outcome;0/2 implementation attempts and0/3 behavior fixes used.

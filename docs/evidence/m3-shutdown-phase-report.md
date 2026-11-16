@@ -120,4 +120,8 @@ unless explicitly retained by the coordinator.
 | --- | --- |
 | consensus.rs | `62332494fa343b462dde0f7917e8ff5e18ccdb15` |
 | consensus/adapter.rs | `aca96cd5d5f2a50ee2e941c2994a055a9563c72b` |
-| consensus/three_node.rs | `3e5641178661cc4075c1c1e8db525e107c9c6221` |
+| consensus/three_node.rs | `4633123c1be95376150dbcd8b6a4c3dc6d565245` |
+
+## B1 test-strength correction
+
+Opus516356b0 (retained0da693b) confirms source report timing is correct but the store-only >=1 assertion also admits counting the node's own handle. Sole code delta ec67681 makes that assertion exactly1, isolating the external holder. No production code changed. Fresh focused verification and independent recheck are pending; earlier source/cluster checks remain historical evidence, not a claimed final-head rerun. This is the second seam implementation attempt, not a behavior fix.
