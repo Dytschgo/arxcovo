@@ -581,7 +581,7 @@ impl ConsensusNode {
         self.raft.take();
         self.sm.take();
         if timeout_at(deadline, async {
-            while self.log_weak.upgrade().is_some() || self.sm_weak.upgrade().is_some() {
+            while !(self.log_released.is_set() && self.sm_released.is_set()) {
                 tokio::task::yield_now().await;
             }
         })
