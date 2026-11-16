@@ -3121,3 +3121,14 @@ Sol high source `2a4d9d3` and independent Muse high review `59f2780` accept the 
 - 2026-11-15: Independent baseline assessment PASS(Muse high59a5b96), Standards/Spec/Security no findings. Pins/sourcejoin/run43666413693(73s,first/finalnull,cleanupconfirmed,variableabsence) verified; credit limited to disposable positivebaselinefeedback, notA4acceptance. Publish docs-only consumed-grant/evidence checkpoint; nativeomittedkill plan remains separateandungranted. No further native authority, M2/A4/F/G/PA6 open,hardware paths **unverified on real hardware**.
 
 - A12 candidate Opus review S1: corrected the stale historical mutant anchor; coordinator ran 91 audited tests and all 40 historical assertion kills. Candidate inventory refreshed; fresh Opus delta recheck pending. No native execution; A12 **unverified on real hardware**. Provider: Sol, effort high, outcome: review correction verified.
+
+
+### Linux S8 attribution contract checkpoint
+
+Opus5.5 high disposition2a8f92b proposes test-only branch attribution; root Sol
+medium contract review accepts with exact-once assertion capture, zero-poll
+deadline validity, closed enums/reset/512byte output clarifications. No causal
+claim or Linux execution. Sol high implementation next, independently reviewed
+before a normal main-based PR; no dispatch or blind rerun. PR159 remains held on
+both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
+separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
