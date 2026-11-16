@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
+**Latest supplied main state:** exact c612152 CI43880904887 terminal red on Windows R5 and over budget (1475 s, macOS capacity). Historical exact688f1ad CI43875610482 was green; it is not the current publication gate. Isolated founder implementation is authorized by the final brief amendment; publication/merge remain held pending fresh green exact main. No remote status was queried by the implementation child.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -26,7 +26,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
+- Last merged (coordinator-supplied pin): PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba`; exact-main CI43880904887 red. Prior PR #160/688f1ad green evidence remains historical.
 - Current work: PR162 R5 observations published atbf86f4a with independent exact-head Sol PASS; platform checks pending, main c612152 Windows R5 and1475s budget block merging. Root permits isolated single-voter founder implementation under accepted contract455d8ea; publication waits for green main. PR159/Windows recovery holds and all counters remain unchanged. M2 open, M3 unchecked.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3134,3 +3134,25 @@ claim or Linux execution. Sol high implementation next, independently reviewed
 before a normal main-based PR; no dispatch or blind rerun. PR159 remains held on
 both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
 separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
+
+
+### Founder F1 local implementation — 2026-11-16
+
+Provider Sol, effort high; prepared base ff4eece89ca0c76870cda6d971acec7e6cebf8ad,
+source main c6121523417089bc0afaf307470183dd4a7f47ba and accepted contract455d8ea.
+Implements sealed founder subjects, persisted allocation precheck, owned bounded
+bootstrap snapshot, single-voter initialization and two fresh guards. F1–F10,
+pure identity/CA tests and seal/binding mutation guards are local only. See
+[evidence](evidence/m3-founder-bootstrap.md) for exact commands, hashes and limits.
+No shared-suite correction, production CA, custody, transport, native or owner-admin
+work. Sol Windows recovery remains3/3 exhausted; Opus recovery0/2 unused.
+M2 open, M3 unchecked; hardware paths **unverified on real hardware**.
+Root independent review then Opus source review and green exact main remain
+publication prerequisites; no push, PR, merge or hosted action was performed.
+
+Local founder source committed as `ec3e5d2228fe1d06564d3e7e4bfad40b5b1f53aa`. Natural nextest and in-process
+cluster runs each pass155 tests; Clippy/fmt pass; guard3/sampler58/workflow4 pass.
+All15 expected Rust mutation probes fail meaningfully and restore exact bytes.
+No natural red, compiler/lint fix or implementation correction (0/2) occurred.
+Full hosted Windows verify timing/660s headroom remains unmeasured; the existing
+eight quarantines were not forced. All owned build/test processes exited.
