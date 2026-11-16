@@ -90,3 +90,9 @@ The local loop cannot reach the hosted conditions, and D1 has no hosted samples 
 - No installs, no cache deletion, no cleanup of other agents' scratch, no VM, admin or Hyper-V step, nothing from the old Lab Manager, and no native M2 fixtures (the filter is anchored). The task-owned D: target is left in place.
 - A0 PR149's unmerged source is not on this base and is untouched.
 - Status: M2 remains open (A7 NO-GO; A12 consumed, no retry). M3 remains unchecked. Windows three-node coverage stays quarantined and **unverified on hosted Windows** and **unverified on real hardware**. Sol's review of this local commit is next.
+
+## Sol source review and observer correction
+
+Independent Sol review of the Opus implementation identifies R1: finished observer handles were dropped by watch() without join, and close() ignored observer JoinError. Solf426eb5 removes that pruning, joins every retained handle and surfaces any observer panic only after draining tasks and unregistering stores. A completed-observer-panic regression would reject the old silent success. No production/helper/quarantine change follows; complementary independent Opus review of this Sol correction is pending.
+
+Fresh Sol Windows checks use unique D:/Temp/arxcovo-d1-sol-review-target: nine diagnostic unit tests passed; locked/offline all-target arxd Clippy passed25.46s; the three explicitly selected ignored positive controls passed5.43s after the correction. S4 showed40 queued/250ms controlled delay, Owners/Joined/21 owners left/total5013ms, with apply max257ms and Store candidate. S3 churn and timer-lag controls also pass. Fmt/diff checks pass. These controls are intentional seam attribution, not reproduced natural hosted failures or Windows acceptance. Opus's20-run natural loop remains its own evidence, not rerun by Sol.
