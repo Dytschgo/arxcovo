@@ -161,3 +161,19 @@ confirms the same all-platform scanner incompatibility; no second cause or
 new behavior failure was observed. Log D:/Temp/arx-pr161-windows-job.log.
 No rerun or extra observability push occurred. Correction9e5667f remains in
 independent review at2ae20f2; this later checkpoint is docs-only.
+
+
+## Compatibility source approval before push2
+
+Opus recheck931088b passes Standards, Spec and Security on source9e5667f:
+all4enum variants/defaults/labels identical to the old macro; all8extracted real
+source guards pass. Its old-source red control independently fails p_scan and
+s13_e4, confirming the shared macro cause without weakening either guard. All
+5E4source hashes and manifest hash match; only the intended mutation row context
+changes and all11in-memory patches still apply. Pure E4 tests22/22 pass. Root's
+later Windows evidence-only checkpoint eee5e07 is separate from that source review.
+
+Preparing observability push2/3 with no further source changes; a fresh
+publication review and all5new-head gates remain required. There is no S8/S9c
+attribution result yet, and no native mutation-kill or hardware credit. The
+compatibility correction is not a Linux behavior fix (still0/3).
