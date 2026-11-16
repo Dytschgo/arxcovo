@@ -1205,6 +1205,7 @@ enum R5Observer {
     Joined,
     Panicked,
 }
+#[derive(Clone, Copy)]
 struct R5Facts {
     wait_ok: bool,
     end_at: R5Mark,
@@ -1441,6 +1442,12 @@ fn r5_line_renders_fixed_fields() {
         line.ends_with(" observer=panicked store_holder=none"),
         "{line}"
     );
+    let log_held = r5_render(&R5Facts {
+        end: R5Snap { log: 1, ..clear },
+        ..facts
+    });
+    assert!(log_held.contains(" end=sm:0,log:1,"), "{log_held}");
+    assert!(log_held.ends_with(" store_holder=unknown"), "{log_held}");
 }
 #[test]
 fn r5_line_is_bounded_ascii_at_maximum_width() {
