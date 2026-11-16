@@ -4,8 +4,8 @@
 
 **Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
 `r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
-outside the eight quarantines. The cause is unknown. This local change adds a Windows-only
-R5 quarantine pending independent review: an exception, not a fix. PR162 diagnostics remain
+outside the eight quarantines. The cause is unknown. This independently reviewed change adds a Windows-only
+R5 quarantine: an exception, not a fix. PR162 diagnostics remain
 held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
 under the active wall policy; 738 s charged remains uncredited because the run is red.
 ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
@@ -3147,3 +3147,5 @@ both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
 separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 
 - 2026-11-16: Root verified corrected R5 quarantine source5350d22: guard2, sampler60, fmt and workspace Clippy pass. Real inventory exactly8 with ignoredR5/expression mismatch; ordinary R5 selection runs0tests/571skipped, expected no-tests exit4. No engine rerun. Opus source review pending, main remains RED and budget exception unauthorized.
+
+- 2026-11-16: Retained Opus high source PASS d14e98c for5350d22; its own guard2/sampler60 and7additionalguardmutants pass. Root final verification in30fa749 additionally proves real8-test inventory/R5expression exclusion, ordinaryR5 skip and workspaceClippy. Source unchanged since reviewedc7d1367. Publishing bounded recovery for hosted gates; no merge or budget exception authorized.
