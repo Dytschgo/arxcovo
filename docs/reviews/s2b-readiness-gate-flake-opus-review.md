@@ -104,10 +104,10 @@ covered unrelated coordinator latency, not synchronization.
   pass falsely. No nextest per-test terminate is configured. Adding one
   would be a separate CI concern and is not needed for this repair.
 - **Residual risk (advisory).** The separate 5 s arrival observation
-  (`rx.recv_timeout` at line 136) is unchanged. It bounds whether the
+  (`rx.recv_timeout` at line 138) is unchanged. It bounds whether the
   worker reaches the seam, which is a legitimate rendezvous bound.
   Extreme hosted starvation could in principle still trip it. That would
-  be a different signal (`Timeout` at 136 before the panic dispatch) and
+  be a different signal (`Timeout` at 138 before the panic dispatch) and
   would be a new item, not this repair.
 
 ## Reviewer-run checks (own target root, Windows, locked, offline)
