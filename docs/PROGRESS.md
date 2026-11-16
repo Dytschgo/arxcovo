@@ -2,7 +2,9 @@
 
 ## Main CI health and merge prerequisite
 
-**PR159 blocked, main green:** CI43865758301 Ubuntu failed existing Linux `s8_outcomes_and_reap` at112 (unknown vs exit_nonzero);528pass/1fail/22skip/50unrun. All15new TLS cases passed. No shared cause with earlier S9c is proved; no rerun/fix/quarantine attempted. Evidence: linux-s8-intermittent-diagnosis.md. Exact main e601caa CI43862021319 remains green.
+**Current main pending:** PR160 merged as688f1ad; CI43875610482 in progress. Prior e601caa CI43862021319 was green immediately before merge. No further merge until the new exact-main run is green.
+
+**PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
 **Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
@@ -24,8 +26,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #158 as `e601caa594f591cc585007be8a455c07282cde8b` at11:55:45Z, independent Opus PASS6915691909/status59021295297 and all five gates. Exact-main CI43862021319 green; Windows477s.
-- Current work: PR161 corrected source9e5667f has independent Opus5.5 high PASS931088b;8sourceguards and22E4puretests pass, sameenumlabels and same mutation semantics confirmed. Preparing push2/3 then exact-head review; no S8/S9c result or behavior-fix claim. PR159 remains held. Opus Windows diagnostics returned without reproducing F1; its evidence awaits root review, fixbudget0/2. PR160 gates pending. M2 open/M3 unchecked/eight quarantines unchanged.
+- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 pending.
+- Current work: PR161 push2 has exact-head Opus PASS6917477824/status59027550095; Ubuntu566/566, both new controls and S8/S9c passed, macOS green, Windows pending at review snapshot. Local merge integrates PR160 without changing any attribution/harness source; final push3/3 will require fresh gates/review. Windows phase/history diagnostics source reviewed with complementary cleanup PASS; PR159 held. M2 open/M3 unchecked/eight quarantines unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -692,14 +694,14 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 ## Historical parent checkpoint
 
 - Queue priority: publish/review Stage C PR53 integration on main after #54, then normal five-gate merge, followed by PR55 and PR56 in dependency order. Stage C production shim/scanner/routing bytes remain identical to reviewed `2ce79ca`; parent refresh carries the separately reviewed CI recovery and policy repair unchanged. No native execution backend is activated.
-- Last merged: PR #137, `fb23b58ed5a333044af746bdfe15afb7c0bec64f` at 16:50:34Z, independent Opus exact-head PASS6897800328/status58968647772 and all five required gates green. Reviewedb80f888/squash tree `1b861b4a175c00a63ca7e64ec35b017442d4e7a7` identical; closed A12 delivery Linux compilation credited, no native fixture run.
+- Last merged: PR54 `79276b93e14a483ff63a189545d148cd2f6f0b0e`, 2026-11-13 16:26:36Z. All five required gates and independent Opus integration review passed on `d276f7f`; first integration CI `43461011104` succeeded in 528s. Squash tree equals that reviewed head. Original performance attempt 3 qualification remains recorded, no reset. Main after #54 is pending, not claimed green.
 - Main after #57 passed run `43459116760` attempt1 in 590s. All five original protection contexts/app pins and strict mode are restored; owner-authorized bootstrap exception is exhausted. No gate bypass applies to this or later product PRs.
 - Provider: coordinator OpenAI / gpt-6.1-sol / medium integrates; fresh independent Anthropic / Opus 5.5 / high exact-head review required. Prior Stage C checks remain credited to their exact pins. M2 incomplete; production native execution inactive. Native/installed/dedicated paths **unverified on real hardware**. E1/E5 held locally, ExecutionFailed/E_PROTECTION unresolved without retry.
 
 ## Historical state before Stage C integration after CI recovery
 
 - Queue priority: main run `43459116760` attempt 1 after #57 at `f1340a4` SUCCEEDED in 590s (2026-11-13T16:05:13Z to 2026-11-13T16:15:03Z), below 900s. Publish reviewed #54 integration refresh and merge only after fresh normal gates. The repaired bot now posts ci-time-budget SUCCESS on qualifying measured head `c5bb191`. Strict main protection and all five requirements are restored.
-- Last merged: PR #137, `fb23b58ed5a333044af746bdfe15afb7c0bec64f` at 16:50:34Z, independent Opus exact-head PASS6897800328/status58968647772 and all five required gates green. Reviewedb80f888/squash tree `1b861b4a175c00a63ca7e64ec35b017442d4e7a7` identical; closed A12 delivery Linux compilation credited, no native fixture run.
+- Last merged: PR57 `f1340a4`, 2026-11-13 16:05:11Z. After separate explicit owner approval, the coordinator temporarily removed ONLY ci-time-budget, merged pinned reviewed `a5ee45f`, and restored the original configuration in a finally block; readback verified all five checks, app pins and strict=true. [Executed exception](adr/0022-ci-policy-buffer-bootstrap.md). No exception applies to #54 or product PRs.
 - New-head rule: the successful `c5bb191` performance attempt 3 is retained, not reset. This base-integration run is not a fourth performance-fix attempt; it still requires all normal new-head gates. A slow/failing first integration run stops delivery and is handed to the other provider/owner with evidence, with no repeat-to-green, waiver or claimed old-head success on new bytes. Budget success on c5 against old906 does not carry over; the bot must independently evaluate the new head against the authoritative baseline or its own qualifying first run.
 - #54 integration refresh inherits only the reviewed policy repair from new main. Original performance attempt 3 remains qualified at 567s/88s/0.946; no new performance fix, rerun or reset is claimed. New-head CI and independent integration review are required because main changed. Existing 21 Node checks remain plus seven inherited buffer regressions (28 total). Other performance and coverage criteria remain.
 - One PROGRESS conflict retains both complete histories below; no product source conflict. Provider: coordinator OpenAI / gpt-6.1-sol / medium. No product PR exception or native activation; M2 incomplete, hardware paths **unverified on real hardware**.

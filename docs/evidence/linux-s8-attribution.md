@@ -177,3 +177,25 @@ Preparing observability push2/3 with no further source changes; a fresh
 publication review and all5new-head gates remain required. There is no S8/S9c
 attribution result yet, and no native mutation-kill or hardware credit. The
 compatibility correction is not a Linux behavior fix (still0/3).
+
+
+## PR160 parent integration preparation
+
+Root merged PR160's reviewed main688f1ad into the attribution branch after its
+five gates and fresh previous-main health check. Only PROGRESS conflicted;
+resolution keeps both evidence histories and main's restored PR54/PR57 entries.
+No attribution, E4 driver or manifest byte changed. The only source imported is
+the separately reviewed log-store wait regression in consensus/tests.rs.
+
+The prior head7f71652 has independent Opus PASS6917477824/status59027550095.
+Ubuntu CI43873234554 passed566tests/22skipped; formatter0.032s,
+attribution control0.263s, S8 0.512s, S9c0.205s, scanner0.023s. New control
+execution totals0.295s, under the1s incremental target; whole-job cost is separate.
+This is one passing Ubuntu observation, not a flake fix or failure-rate claim.
+MacOS passed; Windows was pending in the review snapshot. No attributed red.
+
+Final parent-integration push3/3 is not yet sent at this checkpoint; root waits
+for the old run's terminal result and exact-main CI43875610482. No push merely
+for green and no fourth observability push are authorized. A new exact-head
+review and allfive gates will be required on the combined head, with no old-head
+credit. Linux fixes remain0/3; original S8/S9c unresolved and distinct.
