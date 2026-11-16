@@ -97,3 +97,23 @@ checks and different-provider review gates remain.
 M2 open; M3 unchecked; A7/A11 FINAL NO-GO; A12 consumed, no retry.
 Native M2, VM, admin, old Lab Manager and protected hardware paths were not
 exercised. Hardware paths are **unverified on real hardware**.
+
+
+## Source approval and first publication
+
+Opus5.5 high reviewc52e982 passes Standards, Spec and Security with0findings.
+It independently checked all18inserted production-file blocks are cfg(test),
+unchanged non-test/fork-child/Child bytes and assertions/hooks, enum/errno/reset
+semantics and245byte maximum output. Its extracted host formatter test passes
+with rustc-Dwarnings; those are host-only checks. No Linux compile, Clippy or
+runtime result is claimed before the first normal Ubuntu PR job.
+
+Only the two shim files change in source. The PR also retains the originating
+failure evidence, Opus disposition, root contract, source evidence/review and
+current PROGRESS checkpoint. No source changed after70d9d06. First publication
+is observability push1/3 (no behavioral fix; Linux fix0/3). An attributed red
+must be recorded and stops pushes for green. Required Ubuntu acceptance includes
+s8_attribution_controls, s8_attribution_formatter, S8 and S9c execution/durations;
+five exact-head gates and independent publication review remain pending.
+Fresh main at publication: e601caa CI43862021319 success. PR159's Windows reds
+are separate and not waived. No install, native M2, VM or owner action occurred.

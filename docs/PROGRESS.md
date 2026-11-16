@@ -4,9 +4,9 @@
 
 **PR159 blocked, main green:** CI43865758301 Ubuntu failed existing Linux `s8_outcomes_and_reap` at112 (unknown vs exit_nonzero);528pass/1fail/22skip/50unrun. All15new TLS cases passed. No shared cause with earlier S9c is proved; no rerun/fix/quarantine attempted. Evidence: linux-s8-intermittent-diagnosis.md. Exact main e601caa CI43862021319 remains green.
 
-**Current main restored:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
+**Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
-**Current merge blocker:** exactmain9074a85 CI43819925277 failed Windows s2b_latched_readiness_gate before Playwright install;507pass/1fail/16skip/58unrun. Sampler and feature merges held; no rerun.
+**Historical merge blocker:** exactmain9074a85 CI43819925277 failed Windows s2b_latched_readiness_gate before Playwright install;507pass/1fail/16skip/58unrun. Sampler and feature merges held; no rerun.
 
 **Restored:** exact live main6f6e9d2 CI [43809711957](https://github.com/Dytschgo/arxcovo/actions/runs/43809711957) completed success after the reviewed Windows quarantine. Parallel independent M3 work may resume; Windows three-node coverage remains unverified. Earlier failures remain historical evidence.
 
@@ -24,8 +24,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #155, `87c994048efd660dce279a847c0bd233a888d06c` at07:25:59Z; independent Opus exact-head PASS6910044655, allfive required gates green. Reviewed67b038e/squash trees equal. Reviewed red-main S2b repair under delegated clarification; next exact-main CI must be green before feature/sampling. OptionalS2bnative-evidence success grants no newnative acceptance.
-- Current work: PR159 TLS exact-head Opus PASS6916343381/status59023565588 on3d702d1; Ubuntu gate red on existing Linux S8 outcome test, all15TLS cases pass. Sol coordinator medium recorded failure and confirmed no local Linux runtime;0fixes/0repeats. Opus feedback/disposition task next. Separate log-close regression e6e7a88 remains local/review queued. M2 open, M3 unchecked, eight Windows quarantines unchanged.
+- Last merged: PR #158 as `e601caa594f591cc585007be8a455c07282cde8b` at11:55:45Z, independent Opus PASS6915691909/status59021295297 and all five gates. Exact-main CI43862021319 green; Windows477s.
+- Current work: Linux S8 attribution70d9d06/evidence3540a28 has independent Opus5.5 high source PASSc52e982 (three axes0findings). Host-only formatter/static checks pass; missing Linux cross-compiler prevents local Linux validation. Preparing first normal PR push (observability1/3 planned), no cause/fix claimed. PR159 blocked on Ubuntu S8 and Windows engine failures; Opus Windows diagnostics implementation active. PR160 log-close test gates pending. M2 open/M3 unchecked/eight quarantines unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
