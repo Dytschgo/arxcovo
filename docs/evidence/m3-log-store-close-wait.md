@@ -45,3 +45,18 @@ not guaranteed by the acknowledgement, and no historical flake is claimed fixed.
 No restart caller, dependency, Cargo, workflow, platform ignore, scheduling or
 retry change. M2 stays open, M3 unchecked, eight Windows quarantines unchanged.
 All hardware paths are **unverified on real hardware**.
+
+
+## Independent review and publication checkpoint
+
+Opus reviewd2bd45d retaineda3dc153 passes Standards, Spec and Security, closing
+P1. Its own control3/3, missing-log-wait mutant (only Log failed), cleanup and
+restored3/3 passed; fmt/diff passed. It reused root Clippy rather than claiming
+another run. No test source changed after e6e7a88.
+
+A1 is corrected before publication: root's blanket Last merged replacement
+incorrectly rewrote two historical sections. Both entries are restored byte for
+byte from8e1db8f (PR54 and PR57 respectively), rather than retaining the earlier
+corrupted PR137 labels. Only the separately scoped Current state carries PR158.
+This is documentation repair, with no new execution, waiver or historical gate
+authority. Exact-head publication review and five hosted gates remain pending.
