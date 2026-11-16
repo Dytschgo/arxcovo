@@ -78,6 +78,17 @@ async fn i1_happy_retry() {
         assert_eq!(first.node.get(), 4);
         assert_eq!(first.node, second.node);
         assert_ne!(first.der, second.der);
+        use x509_parser::prelude::*;
+        let (_, request) = X509CertificationRequest::from_der(&der).unwrap();
+        let (first_rest, first_cert) = X509Certificate::from_der(&first.der).unwrap();
+        let (second_rest, second_cert) = X509Certificate::from_der(&second.der).unwrap();
+        assert!(first_rest.is_empty() && second_rest.is_empty());
+        assert_eq!(
+            first_cert.public_key().raw,
+            request.certification_request_info.subject_pki.raw
+        );
+        assert_eq!(second_cert.public_key().raw, first_cert.public_key().raw);
+        assert_ne!(first_cert.raw_serial(), second_cert.raw_serial());
         c.converge().await;
         for i in 0..3 {
             assert_eq!(

@@ -155,15 +155,18 @@ impl ConsensusNode {
             .try_acquire()
             .map_err(|_| IssueError::Busy)?;
         let csr = ProvenCsr::parse(csr).map_err(IssueError::BadCsr)?;
-        let RedeemInput {
-            cluster,
-            request,
-            code,
-            proof,
-        } = input;
-        let command = Command::redeem(cluster, request, code, &proof, csr.digest(), clock.now_ms());
-        // Drop is not erasure: no zeroization guarantee is made.
-        drop(proof);
+        let (code, command) = {
+            let RedeemInput {
+                cluster,
+                request,
+                code,
+                proof,
+            } = input;
+            let command =
+                Command::redeem(cluster, request, code, &proof, csr.digest(), clock.now_ms());
+            // The proof's scope ends before any await; this is not erasure.
+            (code, command)
+        };
         let work = async {
             let resp = self.propose_response(command).await.map_err(|e| match e {
                 ProposeError::Busy => IssueError::Busy,

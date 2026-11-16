@@ -124,7 +124,14 @@ fn fresh_leaf_discards_requested_authority_and_contains_exact_identity() {
     assert_eq!(leaf.key_usage().unwrap().unwrap().value.flags, 1);
     let eku = leaf.extended_key_usage().unwrap().unwrap().value;
     assert!(
-        eku.server_auth && eku.client_auth && !eku.any && !eku.code_signing && eku.other.is_empty()
+        eku.server_auth
+            && eku.client_auth
+            && !eku.any
+            && !eku.code_signing
+            && !eku.email_protection
+            && !eku.time_stamping
+            && !eku.ocsp_signing
+            && eku.other.is_empty()
     );
     let san = leaf.subject_alternative_name().unwrap().unwrap().value;
     assert_eq!(
