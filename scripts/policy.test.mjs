@@ -137,3 +137,14 @@ test('exact public attempt-1 fixtures reproduce ADR0025; PR162 cannot claim ci-s
   assert.throws(() => budget(results[0], results[1], true));
   assert.throws(() => budget(results[0], null, false));
 });
+
+
+test('successful run with one failed job receives no idle credit below wall budget', () => {
+  const data = sample([[0, 600, 1000], [0, 600, 1000], [0, 600, 1000]], 1000);
+  data.jobs.jobs[0].conclusion = 'failure';
+  const result = measure(data);
+  assert.equal(result.conclusion, 'success');
+  assert.equal(result.chargedSeconds, 400);
+  assert.equal(result.credit, 'withheld:not-green');
+  assert.throws(() => budget(result, null, false));
+});

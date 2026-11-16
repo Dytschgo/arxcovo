@@ -64,8 +64,9 @@ The evaluator keeps its existing read, `GET repos/{repo}/actions/runs/{id}/attem
 follows pagination. The fields were confirmed today against live responses for both runs, and `actions: read`
 already covers the new read. Logs, annotations, step names and free text are never read.
 
-A defect sets `chargedSeconds` to null with a reason code, and the gate falls back to wall time. The amendment adds
-no throw path, so it cannot create a new deadlock and never grants credit when data is in doubt.
+An optional-credit metadata defect sets `chargedSeconds` to null and falls back to wall time. Existing
+`duration(run)` completion and time checks run first and still throw; fallback never accepts a partial baseline.
+The amendment adds no metadata-validation throw path and never grants queue credit when its data is in doubt.
 
 **`run-invalid`** is set when any of these holds: `id` is not the listed id; `run_attempt ≠ 1`;
 `path ≠ .github/workflows/ci.yml`; `status ≠ completed`; the event is wrong (main must be `push` with `head_branch`
@@ -127,7 +128,8 @@ it stays charged.
    and idle time with nothing pending stay charged.
 2. **Slow execution.** 1000s of execution plus 600s of queue gives charged >900, so a normal PR fails.
 3. **Defects.** Each `run-invalid` and `jobs-invalid` clause gives null charged, its code, the wall gate and a
-   denied `ci-speed`. Include `total_count` 2, 4 and 101, and assert that no second page is read.
+   denied `ci-speed`. Include `total_count` 2, 4 and 101, and assert that no second page is read. Existing
+   unfinished-attempt rejection precedes credit validation at the entrypoint, even below900s and in `--record`.
 4. **Failed jobs.** A complete failed job gives `uncredited (not-green)`. A failed 800s run passes as today, and a
    failed 1475s run fails.
 5. **`ci-speed`.** A queue-only reduction is denied. A reduction on both metrics passes. An uncreditable candidate

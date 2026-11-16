@@ -191,3 +191,31 @@ source, fixtures and history remain unchanged by the probe. Temporary files:
 D:/Temp/arx-ci-fast-incomplete-probe.mjs and its JSON output. Output SHA-256:
 9cd32bb4edcf48037c280f836eb9bd9b5ba6b6c2acded3fe9a3f377738531033.
 No queue metric or gate activation is accepted from this reproduction.
+
+
+## Root S1 correction and A2 test closure
+
+Independent Opus95ecbce confirms S1: forcing completed status weakens the old
+baseline validation. Root restores duration(run), updates the1200s unfinished
+scenario to require the original exception, and adds800s unfinished and record
+scenarios. All three unfinished-attempt tests fail with runtime assertions on
+the old forced-completion code before correction. The record case writes nothing.
+ADR fallback wording is clarified: optional credit metadata may fall back to
+wall time; original completion/time validation still runs first and can throw.
+
+Root also closes advisory A2 with a success run containing one failed job and
+400s charged versus1000s wall. It receives no credit and the budget rejects it.
+Deleting the credit-marker condition compiles under node --check then fails this
+runtime assertion; restored source passes the focused test. No unrelated source
+change, live policy call or status action occurred. Final full Node suite48/48
+passes in8165.94ms; diff check passes. No UI/Cargo/native or hosted run is credited.
+This is one narrow independent-review correction round, not a CI-speed change.
+
+Root log hashes:
+
+- arx-ci-completion-red.log: `24365ccff78bb2ebe479725e474724584116be57aa0dc6880a9cd14f0d9ebc62`.
+- arx-ci-completion-green.log: `aeeae4eedc8574e8aebf29c41361f785dc89fed034af8d8897fcc8c613ce06d3`.
+- arx-ci-credit-marker-mutant.log: `c565c725bc9703d75ffde87e530a8ccd1e7c312215dbae401c2b274da4d46eb6`.
+
+Fresh Opus recheck remains required. ADR0025 stays Proposed and inactive; no
+bootstrap, KICKOFF deviation, protection change or merge has been authorized.

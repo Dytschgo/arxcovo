@@ -11,8 +11,8 @@ const firstAttempt = run => api(`actions/runs/${run.id}/attempts/1`);
 const measure = (listed, kind, repositoryId) => {
   const run = firstAttempt(listed);
   const jobs = api(`actions/runs/${listed.id}/attempts/1/jobs?per_page=100`);
-  // Completion is a credit validator. Retain calculable wall on a status defect.
-  return queueMeasurement(duration({ ...run, status: 'completed' }), run, jobs, listed, kind, repositoryId);
+  // Keep the existing completed-attempt baseline validation before optional credit.
+  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId);
 };
 const getMainRun = () => {
   const run = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];

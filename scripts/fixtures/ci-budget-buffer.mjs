@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
 
 const scenario = process.argv[2];
+const incompleteMain = ['incomplete-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario);
+const mainSeconds = ['fast-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario) ? 800 : 1200;
 const head = 'a'.repeat(40);
 const repository = scenario === 'invalid-repository' ? 'https://unsafe' : 'example/arxcovo';
 const prefix = 'repos/example/arxcovo/';
@@ -39,12 +41,12 @@ function response(path, args) {
   if (path === 'actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100') {
     return { workflow_runs: [run(19, 1), run(20, 1, {run_attempt: 2})], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
   }
-  if (path === 'actions/runs/20/attempts/1') return run(20, scenario === 'fast-main' ? 800 : 1200, scenario === 'attempt2-main' ? {run_attempt: 2} : scenario === 'incomplete-main' ? {status: 'in_progress'} : {});
+  if (path === 'actions/runs/20/attempts/1') return run(20, mainSeconds, scenario === 'attempt2-main' ? {run_attempt: 2} : incompleteMain ? {status: 'in_progress'} : {});
   const jobsPath = path.match(/^actions\/runs\/(20|11)\/attempts\/1\/jobs\?per_page=100$/);
   if (jobsPath) {
     if (scenario === 'missing-jobs') throw Error('Synthetic unavailable jobs transport');
     const id = Number(jobsPath[1]);
-    const seconds = id === 20 ? (scenario === 'fast-main' ? 800 : 1200) : (scenario === 'slow-first-attempt' ? 1300 : 600);
+    const seconds = id === 20 ? (mainSeconds) : (scenario === 'slow-first-attempt' ? 1300 : 600);
     const r = run(id, seconds);
     const jobs = ['ubuntu', 'windows', 'macos'].map((os, i) => ({id: i+1, run_id: id, run_attempt: scenario === 'attempt2-jobs' ? 2 : 1, head_sha: head, name: `verify (${os}-latest)`, labels: [`${os}-latest`], status: 'completed', conclusion: 'success', created_at: r.run_started_at, started_at: r.run_started_at, completed_at: r.updated_at}));
     return {total_count: scenario === 'partial-jobs' ? 101 : 3, jobs, ...(scenario === 'oversized-jobs' ? {padding:'x'.repeat(9*1024*1024)} : {})};
