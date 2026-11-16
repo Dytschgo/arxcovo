@@ -2,10 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
+**Current merge blocker:** exact main01a42d5 CI [43788629298](https://github.com/Dytschgo/arxcovo/actions/runs/43788629298) failed Windows nextest. No further merge is permitted until latest exact-main CI is green.
+
 Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
 
 - Main38750cf (after PR144), CI [43757400254](https://github.com/Dytschgo/arxcovo/actions/runs/43757400254): Ubuntu `unix_shim::rights::linux::tests::s9c_bound_object_survives_file_and_directory_swap` failed at unix_shim_rights_linux_tests.rs237, actual `unknown` versus expected `exit_zero`.
 - Main765df2b (after PR145), CI [43767515928](https://github.com/Dytschgo/arxcovo/actions/runs/43767515928): Ubuntu `cluster::consensus::tests::append_spawned_cancellation_panic_and_poison_complete_once` failed at consensus/tests.rs550, unwrap of `StoreError::Io`.
+
+- Main01a42d5 (after PR150), CI [43788629298](https://github.com/Dytschgo/arxcovo/actions/runs/43788629298): Windows `cluster::consensus::three_node::t2_leader_offline_reads_and_unknown_retry` failed14.281s at three_node.rs100 with `leader deadline: Elapsed(())`. The same run failed U6 at the same leader deadline (7.996s), T3 at the write helper deadline (13.582s), and T4 at the write helper deadline (12.773s). Summary82pass/4fail/5skip,479unrun. Treat as intermittent until diagnosed; no cause asserted. PR149 read bounds do not address election/write helper deadlines.
 
 PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. Coordinator live verification on2026-11-16 confirms latest main CI [43768671593](https://github.com/Dytschgo/arxcovo/actions/runs/43768671593) completed successfully on exact main0ab5038d89e86e5f726fbed7e5ef6d76e64fa306; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
 
@@ -37,6 +41,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Babysitter third-red-main correction verified live:43788629298 on exact01a42d5 fails T2 andU6 leader wait plusT3/T4 write waits. Main-health section records all four signals. PR149 boundedreads does not repair this path. No merge while mainred; recurring consensus suite instability handed to other-provider Opus for bounded actual-seam diagnosis and separate reviewed repair/quarantine plan. Count under suite-level three-attempt oversight going forward; no blind rerun or timeout increase.
 
 - 2026-11-16: Opusf8e945b retaineddf0d42e finds local cargo-test R1/R6 pause-slot race (production integration PASS). Sol6eb5ad8 adds test-only async slot ownership; mainadapter unchanged, brief/evidence corrected. Focused8concurrent tests pass8.71s, full117cluster pass9.50s, fmt/workspaceClippy3.58s/diff pass. Fresh narrow Opus recheck active; remotePR149notyetpushed and finitehostedattempt2notstarted.
 
