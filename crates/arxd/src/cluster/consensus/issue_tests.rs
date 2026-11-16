@@ -167,6 +167,14 @@ async fn i4_leadership_loss() {
         let start = Instant::now();
         let task = tokio::spawn(async move { n.enroll(&ca2, &*clock2, req, &der2).await });
         entered(wait).await;
+        let old_term = c
+            .node(l)
+            .raft
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .borrow_watched()
+            .current_term;
         c.router.isolated.lock().unwrap().insert(l as u64 + 1);
         let new = timeout(Duration::from_secs(4), async {
             loop {
@@ -203,13 +211,52 @@ async fn i4_leadership_loss() {
         })
         .await
         .unwrap();
+        let digest = ProvenCsr::parse(&der).unwrap().digest();
+        let replay = c
+            .node(new)
+            .propose_response(Command::redeem(
+                code.cluster(),
+                [2; 16],
+                code.code_id(),
+                &code.proof(),
+                digest,
+                NOW,
+            ))
+            .await
+            .unwrap();
+        let Some(Outcome::Enrolled(grant)) = replay.data.0 else {
+            panic!("new leader must commit the identical enrollment replay");
+        };
+        assert!(grant.replay());
+        assert_eq!(grant.node().get(), 4);
+        assert_eq!(grant.key(), digest);
         let leaf = c
             .node(new)
             .enroll(&ca, &*clock, input(&code, 2), &der)
             .await
             .unwrap();
-        assert_eq!(leaf.node.get(), 4);
+        assert_eq!(leaf.node, grant.node());
+        use x509_parser::prelude::*;
+        let (rest, cert) = X509Certificate::from_der(&leaf.der).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(KeyDigest::of_spki(cert.public_key().raw).unwrap(), digest);
+        let (_, request) = X509CertificationRequest::from_der(&der).unwrap();
+        assert_eq!(
+            cert.public_key().raw,
+            request.certification_request_info.subject_pki.raw
+        );
         c.router.isolated.lock().unwrap().clear();
+        c.node(l)
+            .raft
+            .as_ref()
+            .unwrap()
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(
+                |m| m.current_term > old_term,
+                "I4 deposed issuer observes new term",
+            )
+            .await
+            .expect("I4 deposed issuer observes new term before convergence");
         c.converge().await;
         c.finish().await;
     })
