@@ -42,6 +42,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus57f23e4 recheck closes PR149 local hook race and stale integration docs:pair8/8pass,removingR6lock4/4fail,117cluster/fmt/arxdClippypass. Coordinator retains review but holds publication/hostedattempt2 while exact-main01a42d5 remains red on separate election/write deadlines. Other-provider recurring-suite diagnosis stays active; no merge or CI rerun.
+
 - 2026-11-16: Babysitter third-red-main correction verified live:43788629298 on exact01a42d5 fails T2 andU6 leader wait plusT3/T4 write waits. Main-health section records all four signals. PR149 boundedreads does not repair this path. No merge while mainred; recurring consensus suite instability handed to other-provider Opus for bounded actual-seam diagnosis and separate reviewed repair/quarantine plan. Count under suite-level three-attempt oversight going forward; no blind rerun or timeout increase.
 
 - 2026-11-16: Opusf8e945b retaineddf0d42e finds local cargo-test R1/R6 pause-slot race (production integration PASS). Sol6eb5ad8 adds test-only async slot ownership; mainadapter unchanged, brief/evidence corrected. Focused8concurrent tests pass8.71s, full117cluster pass9.50s, fmt/workspaceClippy3.58s/diff pass. Fresh narrow Opus recheck active; remotePR149notyetpushed and finitehostedattempt2notstarted.
