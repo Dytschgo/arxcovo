@@ -849,7 +849,7 @@ def run_phase(api, spawner, clock, cancel, phase, privdir, deadline, cleanup_dea
     """Spawn -> assign -> IsProcessInJob -> cancel check -> go; then bounded cleanup."""
     cleanup_deadline = deadline + CLEANUP_RESERVE_S if cleanup_deadline is None else cleanup_deadline
     if clock.monotonic() >= deadline:
-        return Phase("killed")
+        return Phase("expired")
     try:
         job = api.create()
     except Exception:
@@ -857,7 +857,7 @@ def run_phase(api, spawner, clock, cancel, phase, privdir, deadline, cleanup_dea
     try:
         start = clock.monotonic()
         if start >= deadline:
-            return Phase("killed")
+            return Phase("expired")
         try:
             proc = spawner.spawn(phase, privdir)
         except Exception:
@@ -873,12 +873,12 @@ def run_phase(api, spawner, clock, cancel, phase, privdir, deadline, cleanup_dea
             elif cancel.is_set():
                 reason = "cancelled"
             elif clock.monotonic() >= deadline:
-                reason = "killed"
+                reason = "expired"
         except Exception:
             reason = "job"
         if reason is not None:
             _reap_unassigned(proc, clock, cleanup_deadline)
-            if reason in ("cancelled", "killed"):
+            if reason in ("cancelled", "expired"):
                 return Phase(reason, ms=_ms(start, clock.monotonic()))
             raise Guard(reason)
         try:
@@ -992,6 +992,8 @@ def sample(ctx, rep, start):
         if lp.status == "cancelled":
             rep.outcome = "cancelled"
             return rep
+        if lp.status == "expired":
+            raise Guard("deadline")
         if lp.status == "killed":
             raise Guard("deadline_list")
         if lp.rc != 0:
@@ -1015,6 +1017,8 @@ def sample(ctx, rep, start):
         if rp.status == "cancelled":
             rep.outcome = "cancelled"
             return rep
+        if rp.status == "expired":
+            raise Guard("deadline")
         if rp.status == "killed":
             rep.nextest = "killed"
             rep.outcome = "diag_incomplete"  # JUnit missing or truncated: not parsed

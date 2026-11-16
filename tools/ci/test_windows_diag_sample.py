@@ -658,6 +658,62 @@ class OwnershipTests(unittest.TestCase):
 
 
 class OutcomeTests(unittest.TestCase):
+    def test_pre_go_expiry_inside_step_budget_is_integrity_failure(self):
+        for seam in ("create", "spawn", "assign", "stale_junit"):
+            with self.subTest(seam=seam):
+                h = Harness()
+                if seam == "create":
+                    original = h.api.create
+                    def create():
+                        job = original()
+                        if h.api.created == 2:
+                            h.clock.sleep(65)
+                        return job
+                    h.api.create = create
+                elif seam == "spawn":
+                    original = h.spawner.spawn
+                    def spawn(phase, privdir):
+                        proc = original(phase, privdir)
+                        if phase == "run":
+                            h.clock.sleep(65)
+                        return proc
+                    h.spawner.spawn = spawn
+                elif seam == "assign":
+                    def assign():
+                        if h.api.created == 2:
+                            h.clock.sleep(65)
+                    h.api.on_assign = assign
+                else:
+                    h.fs.files[JUNIT] = b"stale"
+                    original = h.fs.unlink
+                    def unlink(p):
+                        original(p)
+                        if p == JUNIT and "spawn:run" not in h.log:
+                            h.clock.sleep(82)
+                    h.fs.unlink = unlink
+                code, lines = h.run()
+                self.assertLess(h.clock.t - 1000, w.STEP_S)
+                self.assertEqual(code, 1)
+                self.assertIn("guard reason=deadline", "\n".join(lines))
+                self.assertEqual(h.field("outcome"), "guard")
+                if len(h.spawner.procs) > 1:
+                    self.assertIsNone(h.spawner.procs[1].go_at)
+                    self.assertEqual(h.spawner.procs[1].kills, 1)
+
+    def test_unexpected_cleanup_kind_is_never_removed_and_gates(self):
+        h = Harness()
+        read = h.fs.read_capped
+        def changed(p, cap):
+            data = read(p, cap)
+            if p == JUNIT:
+                h.fs.kinds[LISTING] = "reparse"
+            return data
+        h.fs.read_capped = changed
+        self.assertEqual(h.run()[0], 1)
+        self.assertNotIn(LISTING, h.fs.unlinked)
+        self.assertIn(PRIV, h.fs.removed)
+        self.assertIn("guard reason=cleanup", "\n".join(h.lines))
+
     def test_expired_launch_never_sends_go(self):
         for phase in ("list", "run"):
             h = Harness()

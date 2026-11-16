@@ -46,7 +46,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
-- 2026-11-16: Coordinator independently verifies main87c9940 CI43823823164success, Windowsjob133152799712396s(07:26:06â€“07:32:42)/install7s(07:32:22â€“29)/browser3s/Electron7ssuccess. Restores feature work; distinct S2b-repair measurement confirms C1component/headroom target<=500s without replacing originalfailedfirstC1run. Retained correctedOpusbrief26ac2d6/Solcontractrecheck permits samplerimplementation under90sbudget,ownedprocesscleanup,typedoutput and unchangedquarantine; no CIrerun or fixcredit.
+- 2026-11-16: Coordinator independently verifies main87c9940 CI43823823164success, Windowsjob133152799712396s(07:26:06–07:32:42)/install7s(07:32:22–29)/browser3s/Electron7ssuccess. Restores feature work; distinct S2b-repair measurement confirms C1component/headroom target<=500s without replacing originalfailedfirstC1run. Retained correctedOpusbrief26ac2d6/Solcontractrecheck permits samplerimplementation under90sbudget,ownedprocesscleanup,typedoutput and unchangedquarantine; no CIrerun or fixcredit.
 
 - 2026-11-16: Coordinatorverifies PR155 allfive requiredgates and independentexactheadPASS, re-readsmain9074a85 withoutdrift, unwatches/merges87c9940 at07:25:59Z; reviewed/squash trees equal. Optionalnative-evidencegreenrecordedwithoutacceptancecredit. AwaitexactmainCIbeforefeatures/sampling; no rerun/nativegrant.
 
@@ -58,7 +58,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - 2026-11-16: Coordinator records revised C1 criterion in PR154 body, verifiesall5gates/latestexactmain58d06c1CI43815774741green/re-readno drift, unwatches/merges9074a85 at06:53:45Z; squash/reviewed trees equal. Awaitfirstmergemainrun for install/job/smokes confirmation before sampler; no rerun or replacingoriginalPRmeasurement.
 
-- 2026-11-16: Opus51357c2 timing disposition proposes explicit C1R1â€“R4 revision; Sol accepts in writing. Originalwholejobcriterionnotmetagainstfasterbaseline; newmergecriterioninstall<=39s plusrequiredsmokes/fivegates/exactmaingreen, anchoredoriginalrun7s. Firstmerge-mainrunmustconfirminstall<=39s/job<=500s before sampler;501â€“585written decision,>585/failheld;install>79reviewedrevert. No rerun or fixedwholejobspeedup claim.
+- 2026-11-16: Opus51357c2 timing disposition proposes explicit C1R1–R4 revision; Sol accepts in writing. Originalwholejobcriterionnotmetagainstfasterbaseline; newmergecriterioninstall<=39s plusrequiredsmokes/fivegates/exactmaingreen, anchoredoriginalrun7s. Firstmerge-mainrunmustconfirminstall<=39s/job<=500s before sampler;501–585written decision,>585/failheld;install>79reviewedrevert. No rerun or fixedwholejobspeedup claim.
 
 - 2026-11-16: PR154 allfivegatesgreen exact5ba2cf6; Windowsjob493s/install7s, smokesgreen, nextest304s. Against598/542sbaselines wholejob saves105/49s; against151/139s install saves144/132s. Conservative49s job saving trips declared60sstopthreshold; coordinator holdsmerge/sample and requestsOpus measured-evidence disposition instead of silently changing criterion. Main58d06c1CI43815774741green;no rerun/newoptimization.
 
@@ -300,11 +300,11 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - 2026-11-15: Sol / high prepared the 120-line native A4 omitted-S7-kill plan `23b0f84`, retained as `d632863`. Coordinator inspected its fixed test-only wrapper, one-setup timeout attribution and failure-only owned cleanup. Muse Spark 1.3 / high independent design review is active; implementation and native execution remain gated. PR111 baseline checkpoint has independent exact-head PASS; Ubuntu/macOS/budget/review passed and Windows was still running at the single read. D7e consumed; no new run authority or A4/M2/F/G/PA6 acceptance.
 
-- 2026-11-15: Sol / gpt-6.1-sol / high prepared conditional hosted A4 baseline source `5dba9dfc840539d8df390eb4bd827c8b1a31a486` after last merged PR106 `40adbe55672293c894abd2d49be4de630e62577e`. D7e proposes one baseline-feedback dispatch only after PR108 deterministic privacy fixture merge (full future baseline SHA/blob pins pending coordinator fill), independent review, all five gates, coordinator merge and exact candidate check. One non-root compile/compare manual-workflow step; one driver TEST line; focused literal/inverse assertions only. 20 focused tests, 10 mocked build-tool tests and eight assertion mutants pass; full 89-test audited baseline remains blocked (21 failure events/10 stale lifecycle tests, no errors), no waiver or broader mock edits. [Exact pins, initial failures and limits](evidence/linux-a4-hosted-baseline-preparation.md). No push/native/helper launch/variable/dispatch/workflow operation. D7aâ€“D7d consumed; native omitted-kill negative unrun and NOT granted, A4 acceptance stays OPEN pending independent satisfaction. A7â€“A12/F/G/PA6/M2 OPEN; hardware **unverified on real hardware**.
+- 2026-11-15: Sol / gpt-6.1-sol / high prepared conditional hosted A4 baseline source `5dba9dfc840539d8df390eb4bd827c8b1a31a486` after last merged PR106 `40adbe55672293c894abd2d49be4de630e62577e`. D7e proposes one baseline-feedback dispatch only after PR108 deterministic privacy fixture merge (full future baseline SHA/blob pins pending coordinator fill), independent review, all five gates, coordinator merge and exact candidate check. One non-root compile/compare manual-workflow step; one driver TEST line; focused literal/inverse assertions only. 20 focused tests, 10 mocked build-tool tests and eight assertion mutants pass; full 89-test audited baseline remains blocked (21 failure events/10 stale lifecycle tests, no errors), no waiver or broader mock edits. [Exact pins, initial failures and limits](evidence/linux-a4-hosted-baseline-preparation.md). No push/native/helper launch/variable/dispatch/workflow operation. D7a–D7d consumed; native omitted-kill negative unrun and NOT granted, A4 acceptance stays OPEN pending independent satisfaction. A7–A12/F/G/PA6/M2 OPEN; hardware **unverified on real hardware**.
 
-- 2026-11-15: Sol high implementation sub-agent reproduced the PR109 activity test's matching diagnostic/assertion failure with a controlled 18-second live-session delay, then fixed only test-helper subprocess ownership. The existing 15-second bound now starts after SDK cancellation; child exit is awaited/asserted. Exact regression red 19.23s â†’ green 19.21s, retention and exactly-once store tests, fmt, locked offline workspace/all-target Clippy and diff check passed. [Evidence](evidence/m2-activity-bridge-lifetime.md). Historical CI scheduling cause remains unknown; production unchanged. Local commit only, independent other-provider review/hosted gates pending; last merged PR unchanged. M2/F/G/PA6 open; hardware paths **unverified on real hardware**.
+- 2026-11-15: Sol high implementation sub-agent reproduced the PR109 activity test's matching diagnostic/assertion failure with a controlled 18-second live-session delay, then fixed only test-helper subprocess ownership. The existing 15-second bound now starts after SDK cancellation; child exit is awaited/asserted. Exact regression red 19.23s → green 19.21s, retention and exactly-once store tests, fmt, locked offline workspace/all-target Clippy and diff check passed. [Evidence](evidence/m2-activity-bridge-lifetime.md). Historical CI scheduling cause remains unknown; production unchanged. Local commit only, independent other-provider review/hosted gates pending; last merged PR unchanged. M2/F/G/PA6 open; hardware paths **unverified on real hardware**.
 
-- 2026-11-15: Sol high implementation sub-agent prepared the dormant A4â†’Standard driver and exclusive fixed helper delivery after PR105 `fafb8d4f4bd460eff51328d781966d2e57f0fa22` (last merged PR unchanged). TEST remains A5; Rust helper/fixture, workflow, Cargo/package, production and ADR unchanged. Fixed source/recipe/pin/image checks precede mutation; Linux compile-only candidate observations cannot repin a differing image; owned descriptor cleanup refuses collisions/replacements. 89 audited pure/mock tests, 36 driver mutation kills, nine helper-tool tests, F0 23/F0b 36 kills (four equivalents uncredited) passed. [Evidence](evidence/linux-a4-driver-delivery-source.md). Actual Linux-host candidate equality and independent other-provider review remain pending; no compile, helper/ignored/native run, publication, push or subagents. D7d consumed, no new native authority or A4/M2/full F/G/PA6 claim; hardware **unverified on real hardware**.
+- 2026-11-15: Sol high implementation sub-agent prepared the dormant A4→Standard driver and exclusive fixed helper delivery after PR105 `fafb8d4f4bd460eff51328d781966d2e57f0fa22` (last merged PR unchanged). TEST remains A5; Rust helper/fixture, workflow, Cargo/package, production and ADR unchanged. Fixed source/recipe/pin/image checks precede mutation; Linux compile-only candidate observations cannot repin a differing image; owned descriptor cleanup refuses collisions/replacements. 89 audited pure/mock tests, 36 driver mutation kills, nine helper-tool tests, F0 23/F0b 36 kills (four equivalents uncredited) passed. [Evidence](evidence/linux-a4-driver-delivery-source.md). Actual Linux-host candidate equality and independent other-provider review remain pending; no compile, helper/ignored/native run, publication, push or subagents. D7d consumed, no new native authority or A4/M2/full F/G/PA6 claim; hardware **unverified on real hardware**.
 
 - 2026-11-15: Sol high implementation sub-agent completed the local A8 nonnative lifecycle/discovery join. One three-case regression uses actual Host/StartupDomain/readiness/discovery/dispatch/audits and reopened SQLite: Pending has zero rows/probes, Ready produces exactly one correctly scoped daemon discovery, setup failure and janitor quarantine produce none. Eight exact tests, fmt, locked offline workspace/all-target Clippy and diff check passed; production unchanged. Inline module declaration pinned in existing inactive-source inventory; tests.rs/S2b pin unchanged, no driver edit. [Evidence](evidence/linux-a8-startup-discovery-join.md). Local commit only; independent review/hosted gates pending, last merged PR unchanged. A8 native acceptance/M2/full F/G/PA6 open; hardware **unverified on real hardware**.
 
@@ -312,13 +312,13 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Independent Muse high source review `3887304` accepts A6 nonnative joined evidence `f49388b` plus coordinator pin maintenance `21c8085`, no findings. Reviewer reran all seven exact tests, fmt/Clippy and 11 portable S2b tests; production diff empty and pin matches committed LF module declaration. Three actual-setup janitor failures and shutdown join real readiness/executor refusal/zero runner calls/reopened committed activity/same-domain latch; builder four compiled mutants restored exactly. Publishing through exact-head review/gates; no native nonremovability, A4, M2/F/G/PA6 claim. A4 helper correction remains separately queued for recheck. Hardware paths **unverified on real hardware**.
 
-- Sol high A6 joined test source `f49388b` (retained `ee0ba79`) is integrated and queued for Muse review after active A4 architecture review. Three actual-setup injected failure cases plus shutdown-Stopping drive readiness, zero runner calls, persisted refusal and same-domain latch behavior. Seven exact tests, fmt/Clippy and four compiled assertion kills with exact restoration passed at builder. Coordinator included the single S2b tests.rs hash refresh caused by the module declaration; 11 portable driver tests passed, all guards unchanged, avoiding a stale-pin regression. Nonnative evidence only; M2/A4/A6â€“A12/F/G/PA6 open, hardware **unverified on real hardware**.
+- Sol high A6 joined test source `f49388b` (retained `ee0ba79`) is integrated and queued for Muse review after active A4 architecture review. Three actual-setup injected failure cases plus shutdown-Stopping drive readiness, zero runner calls, persisted refusal and same-domain latch behavior. Seven exact tests, fmt/Clippy and four compiled assertion kills with exact restoration passed at builder. Coordinator included the single S2b tests.rs hash refresh caused by the module declaration; 11 portable driver tests passed, all guards unchanged, avoiding a stale-pin regression. Nonnative evidence only; M2/A4/A6–A12/F/G/PA6 open, hardware **unverified on real hardware**.
 
-- PR98 merged `b0849c2761f3cff77c0ee1ed4b50558717d07e28` at 2026-11-14 22:03:16Z after five gates/Muse exact PASS `6884813814`; A5 bounded hosted acceptance is recorded. Muse high recheck `5fe2b8f` passes Sol medium A4/A6 amendment `b4ffb43`, no remaining blockers: A4 native present-residue mechanism excludes crash provenance, A6 joined injected-port quarantine evidence excludes native nonremovability, A9/U9 retained, five safety/evidence requirements bind future source. Publishing docs-only contract through exact-head review/checks; implementation only after merge, native execution separate. No production/package/bounds/mapping change. M2/A4/A6â€“A12/F/G/PA6 open, hardware paths **unverified on real hardware**.
+- PR98 merged `b0849c2761f3cff77c0ee1ed4b50558717d07e28` at 2026-11-14 22:03:16Z after five gates/Muse exact PASS `6884813814`; A5 bounded hosted acceptance is recorded. Muse high recheck `5fe2b8f` passes Sol medium A4/A6 amendment `b4ffb43`, no remaining blockers: A4 native present-residue mechanism excludes crash provenance, A6 joined injected-port quarantine evidence excludes native nonremovability, A9/U9 retained, five safety/evidence requirements bind future source. Publishing docs-only contract through exact-head review/checks; implementation only after merge, native execution separate. No production/package/bounds/mapping change. M2/A4/A6–A12/F/G/PA6 open, hardware paths **unverified on real hardware**.
 
-- Independent Muse high acceptance review `f15af57` accepts A5 only for exact `cf3a251` hosted run `43644661407`, attempt 1, job `132599634797` (88 seconds). Guarded empty-orphan seeder, one setup call, one removal, S9, READY/sole-PID hold, exact summary, real systemd exit and owned cleanup verified; reviewed-SHA variable absent, no findings. Publishing the docs-only checkpoint. A4 crash-survivor unproven; Sol high practical A4/A6 assessment remains active. D7d consumed, no new native authority. M2/A4/A6â€“A12/full F/G/PA6 open; installed/dedicated paths **unverified on real hardware**.
+- Independent Muse high acceptance review `f15af57` accepts A5 only for exact `cf3a251` hosted run `43644661407`, attempt 1, job `132599634797` (88 seconds). Guarded empty-orphan seeder, one setup call, one removal, S9, READY/sole-PID hold, exact summary, real systemd exit and owned cleanup verified; reviewed-SHA variable absent, no findings. Publishing the docs-only checkpoint. A4 crash-survivor unproven; Sol high practical A4/A6 assessment remains active. D7d consumed, no new native authority. M2/A4/A6–A12/full F/G/PA6 open; installed/dedicated paths **unverified on real hardware**.
 
-- A5 run `43644661407` attempt 1 on exact `cf3a251` succeeded: job `132599634797`, 21:47:30â€“21:48:58Z (88 seconds), bounded feedback first/final null, cleanup confirmed. Completion cleared the reviewed-SHA variable; separate API read confirms 404. D7d consumed. Muse independent acceptance review is active before any A5 credit. In parallel Sol high is resolving practical A4/A6 acceptance scope against unchanged package/primary documentation, aiming for a concrete narrow disposition rather than optional harness expansion. No native run authorized; M2/A4/A5/A6â€“A12/F/G/PA6 open, hardware paths **unverified on real hardware**.
+- A5 run `43644661407` attempt 1 on exact `cf3a251` succeeded: job `132599634797`, 21:47:30–21:48:58Z (88 seconds), bounded feedback first/final null, cleanup confirmed. Completion cleared the reviewed-SHA variable; separate API read confirms 404. D7d consumed. Muse independent acceptance review is active before any A5 credit. In parallel Sol high is resolving practical A4/A6 acceptance scope against unchanged package/primary documentation, aiming for a concrete narrow disposition rather than optional harness expansion. No native run authorized; M2/A4/A5/A6–A12/F/G/PA6 open, hardware paths **unverified on real hardware**.
 
 - PR97 merged as `cf3a2510fc45e0cb438ae14cc41115e492bc0f41` at 2026-11-14 21:47:07Z after five green gates and Muse exact-head PASS `6884617004`; tree equals `762fcad`. Live remote main remained `c7f44ec` before merge (a reviewer stale-local-main note was disproved by API; no branch refresh needed). D7d comparison verifies six allowed paths and one-line runtime TEST delta. A5 dispatch `43644661407` attempt 1 accepted on exact `cf3a251`, expected actor/trigger Dytschgo; job `132599634797` is in progress. D7d consumed, monitor clears/verifies variable at completion; no result or A5 acceptance yet. M2/A4/A5/F/G/PA6 open; hardware paths **unverified on real hardware**.
 
@@ -334,7 +334,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - A5 source `8b347bb` and independent Muse high review `174a402` accepted for ordinary publication, no blockers. Corrected plan and retained plan reviews accompany the test-only private-descriptor seeder, ignored empty-orphan fixture, fake janitor and Pending-readiness tests. Both providers ran all 15 exact filters, fmt and Windows Clippy; six test-only mutants received assertion-sensitivity credit only. Linux-only fixture/seeder still need hosted compilation; native selection remains A3 None, no A5 run authority. A4 stays unresolved and independent; M2/A5/remaining F/G/PA6 open, hardware paths **unverified on real hardware**.
 
-- Independent Muse high review `14cf414` accepts A3 None and combined A3 only on two recorded disposable-hosted paths: Standard `43635131545`/`beb7117` (92 seconds) and None `43636804545`/`4bb1561` (86 seconds). Exact source/profile/parser/runtime attribution/one-test summary/systemd exit and owned cleanup verified; reviewed-SHA variable absent, no findings. D7c fully consumed, no further native authority. Publishing the docs-only A3 checkpoint; Sol high prepares the next startup janitor A4/A5 plan. M2/A4â€“A12/full F/G/PA6 remain open; installed/dedicated paths **unverified on real hardware**. Historical causes unchanged, optional diagnostics parked.
+- Independent Muse high review `14cf414` accepts A3 None and combined A3 only on two recorded disposable-hosted paths: Standard `43635131545`/`beb7117` (92 seconds) and None `43636804545`/`4bb1561` (86 seconds). Exact source/profile/parser/runtime attribution/one-test summary/systemd exit and owned cleanup verified; reviewed-SHA variable absent, no findings. D7c fully consumed, no further native authority. Publishing the docs-only A3 checkpoint; Sol high prepares the next startup janitor A4/A5 plan. M2/A4–A12/full F/G/PA6 remain open; installed/dedicated paths **unverified on real hardware**. Historical causes unchanged, optional diagnostics parked.
 
 - PR92 merged as `4bb15612e30ec5bbf0c019bab347c83fd60a9d0a` at 2026-11-14 20:18:21Z after five green gates and Muse exact-head PASS `6883527010`; squash tree equals `a816058`. D7c None candidate has exactly the permitted one-line TEST change plus supporting review/progress docs from accepted Standard squash `beb7117`. None dispatch `43636804545`, attempt 1, accepted on exact `4bb1561` with expected actor/trigger; job `132575292404` is in progress. Final D7c grant consumed; completion monitor clears/verifies the reviewed-SHA variable. No None result or acceptance yet, no further native authority. M2/A3/remaining F/G/PA6 remain open; hardware paths **unverified on real hardware**.
 
@@ -350,9 +350,9 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Sol high A3 driver source `9a78227` (retained `1b5544c`) and evidence `4742ad8` are integrated for independent Muse review. Three closed test selections derive profile presence; A1/A2 remains default. Exact fragment/drop-in bytes, modes and sets are checked before start, while held and before cleanup; sole supervisor PID is checked before ack. Builder reports 72 audited pure/mock tests, focused/historical assertion mutation checks, three exact pure Rust tests, fmt and Windows Clippy passed. Linux fixture changes remain uncompiled/unrun locally. No A3 selection, workflow/profile/production change or new run authority. M2/A3/remaining F/G/PA6 open; hardware **unverified on real hardware**.
 
-- PR88 merged as `09d3478826274cb02de7ee61ab3505a4955c5bc4` at 2026-11-14 19:03:41Z with five green gates and Muse exact-head PASS `6882651191`; A1/A2 accepted only for the recorded disposable hosted run. Sol high A3 source `cd561e0` and Muse high review `6570213` have no blockers (cosmetic notes only): synthetic production-parser coverage and two ignored profile-on/off assertions, production/profile/workflow/driver selection unchanged. Both providers ran three exact pure tests, fmt and Windows Clippy. Publishing for ordinary hosted Linux compilation; no ignored tests selected or native acceptance claimed. M2, A3â€“A12, G and PA6 remain open; hardware paths **unverified on real hardware**. No further run is authorized.
+- PR88 merged as `09d3478826274cb02de7ee61ab3505a4955c5bc4` at 2026-11-14 19:03:41Z with five green gates and Muse exact-head PASS `6882651191`; A1/A2 accepted only for the recorded disposable hosted run. Sol high A3 source `cd561e0` and Muse high review `6570213` have no blockers (cosmetic notes only): synthetic production-parser coverage and two ignored profile-on/off assertions, production/profile/workflow/driver selection unchanged. Both providers ran three exact pure tests, fmt and Windows Clippy. Publishing for ordinary hosted Linux compilation; no ignored tests selected or native acceptance claimed. M2, A3–A12, G and PA6 remain open; hardware paths **unverified on real hardware**. No further run is authorized.
 
-- Muse high independent evidence review `50fef47` accepts A1/A2 only for the disposable hosted path on exact `1e9d8818de1e337b1402ca7e2b71ac02456b82f3`: run `43627472312` attempt 1, job `132546488843`, 74 seconds, setup/MainPID/exe/supervisor/READY/cleanup assertions verified. Fixed feedback has no failures and cleanup confirmed; reviewed-SHA variable is absent. D7b consumed. M2, remaining Stage F A3â€“A12, Stage G and real-Runner PA6 remain open. No further execution authority; installed/dedicated paths are **unverified on real hardware**. Publishing the bounded evidence checkpoint; optional diagnostics stay parked.
+- Muse high independent evidence review `50fef47` accepts A1/A2 only for the disposable hosted path on exact `1e9d8818de1e337b1402ca7e2b71ac02456b82f3`: run `43627472312` attempt 1, job `132546488843`, 74 seconds, setup/MainPID/exe/supervisor/READY/cleanup assertions verified. Fixed feedback has no failures and cleanup confirmed; reviewed-SHA variable is absent. D7b consumed. M2, remaining Stage F A3–A12, Stage G and real-Runner PA6 remain open. No further execution authority; installed/dedicated paths are **unverified on real hardware**. Publishing the bounded evidence checkpoint; optional diagnostics stay parked.
 
 - PR87 merged as `c23e0b4ae33878cff0d28d84738d11ea03986bf9` at 2026-11-14 18:49:33Z after five green gates and Muse exact-head PASS `6882383201`; squash tree equals `dceece9`. Windows read-side EOF correction is delivered; no historical main71 cause claim. D7b run `43627472312` attempt 1 on exact `1e9d881` succeeded (job 132546488843, 74 seconds), with fixed feedback first/final null and cleanup confirmed. Variable deletion is independently confirmed by API 404. Grant consumed; no retry. Evidence retained for independent A1/A2 acceptance review; M2/full F/G/PA6 remain open and installed/dedicated paths **unverified on real hardware**.
 
@@ -765,10 +765,10 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 ## Historical checkpoint before Stage C Unix lint follow-up
 
 
-- Stage C local implementation is committed at `656dde3c4c221b0048487a738ede5f0782f078c5`: standalone Unix exec-child/tool-probe, early reserved-prefix routing, one silent shim-only hook/catch, owned-temp S1â€“S7 tests and extended P-SCAN. [Evidence](evidence/unix-shim-stage-c.md) records the source manifest, commands, failure and coverage limits.
+- Stage C local implementation is committed at `656dde3c4c221b0048487a738ede5f0782f078c5`: standalone Unix exec-child/tool-probe, early reserved-prefix routing, one silent shim-only hook/catch, owned-temp S1–S7 tests and extended P-SCAN. [Evidence](evidence/unix-shim-stage-c.md) records the source manifest, commands, failure and coverage limits.
 - Own Windows validation: fmt/whitespace and locked workspace all-target Clippy passed. Focused scanner/identity: 4 passed (`5a120636`). Exactly ONE final default-concurrency workspace nextest after final source: **308 passed, 2 skipped**, `be7440d0-0f61-4a24-8201-90a42bf1f5c5`, 10.608s. No Unix execution or mutation credit: Linux cross-check failed before arxd because the cross C compiler is unavailable. Unix tests/Clippy and compiled shim mutations remain pending hosted verification.
 - Queue: fresh Anthropic / Opus 5.5 / high source/security review BEFORE publication, then all five hosted checks at the actual candidate head before any merge. This implementation sub-agent performs no publication or delegation. Stages D/E/F/G remain unbuilt here; production native execution stays inactive. ExecutionFailed and E_PROTECTION remain unexplained, without a fix, waiver or retry.
-- Provider/outcome: OpenAI / gpt-6.1-sol / high â€” Stage C implemented locally; independent review and Unix acceptance pending. M2 remains incomplete; native, installed and dedicated paths remain **unverified on real hardware**.
+- Provider/outcome: OpenAI / gpt-6.1-sol / high — Stage C implemented locally; independent review and Unix acceptance pending. M2 remains incomplete; native, installed and dedicated paths remain **unverified on real hardware**.
 - Last merged PR remains #52 at `1604db1fbd686d3bf59e81f4d2702eaecc6b8bc0`; inherited five-gate/review credit only. Main after #52 is pending, not claimed green. All earlier provider rows and queue history are retained below.
 
 ## Historical checkpoint before Stage C implementation
@@ -895,7 +895,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Last merged PR: #48 at `77dcce64f097ecbf5c66601920a60fb03436c57b`, 11:55:37 UTC, all five gates on `21638d9` and independent Opus review; squash tree equals reviewed head. Main CI after #48 is not yet claimed green.
 - Milestone 1 accepted; Milestone 2 incomplete. Native, installed and dedicated paths remain **unverified on real hardware**. No owner CLI or native executor activation.
 - Queue priority: close S2 SP-3R with a real Windows native Verify adapter test, independent recheck and hosted gates, then S3 (invalid install test first). Unix build/tests remain pending; native Mode is protected only through result conversion and source review, without a claimed Mode mutation kill.
-- Provider/effort/outcome: OpenAI / gpt-6.1-sol / high correction attempt 1 at `fd57bbd20181c807df296a623fb43f8e7f63cda7` on prepared `0890dc1`: SP-1â€“SP-8 implemented within S2 scope; Windows fmt/locked workspace all-target Clippy/focused15 passed; seven compiled assertion-kill mutations restored; exactly one final normal workspace run **286 passed, 2 skipped** (`b51167a4-e3aa-4305-9673-b5a423869e12`). [Correction evidence](evidence/owner-cli-s2-correction1.md). Unix-only coverage remains pending hosted; no local Unix pass claimed.
+- Provider/effort/outcome: OpenAI / gpt-6.1-sol / high correction attempt 1 at `fd57bbd20181c807df296a623fb43f8e7f63cda7` on prepared `0890dc1`: SP-1–SP-8 implemented within S2 scope; Windows fmt/locked workspace all-target Clippy/focused15 passed; seven compiled assertion-kill mutations restored; exactly one final normal workspace run **286 passed, 2 skipped** (`b51167a4-e3aa-4305-9673-b5a423869e12`). [Correction evidence](evidence/owner-cli-s2-correction1.md). Unix-only coverage remains pending hosted; no local Unix pass claimed.
 - ST-1 evidence is corrected while retaining historical source results. Trivial result wrapper and duplicate final-parent check removed (ST-2/ST-3); optional ST-4/ST-5 deferred. Fresh independent Opus recheck is REQUIRED before publication. No publication/acceptance is authorized by these local passes.
 - S1 is merged/reviewed with follow-up; ALL S1 follow-up source/test bytes and lib.rs private module declaration remain inherited unchanged. Main history/provider rows below are retained.
 - ExecutionFailed remains unexplained; no pass is a fix or waiver. No production create, valid owner argv, owner/admin/service, old Lab Manager/VM, experiment retry, third S4U probe, public GitHub operation or babysitter change. Inactive Unix bridge remains separately prepared, unimplemented.
@@ -914,7 +914,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
-- Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), d70e80818569491238656255ee415669f04a731d, 10:51:46 UTC, all five gates and independent review. Main run43204089423 passed in564s (10:51:49â€“11:01:13 UTC).
+- Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), d70e80818569491238656255ee415669f04a731d, 10:51:46 UTC, all five gates and independent review. Main run43204089423 passed in564s (10:51:49–11:01:13 UTC).
 - Queue priority: S1 library prerequisites publication and mandatory hosted Unix compilation/tests, then S2 credential writer and S3 wiring. S2 is active in a distinct verified worktree on the private S1 base; it cannot clear or bypass S1's gate.
 - Provider/outcome: OpenAI / gpt-6.1-sol / high S1 implementation813dd1e passed fmt/locked Clippy/full271 with2 skips. Anthropic / Opus 5.5 / high full review b4b8154 passes Standards and conditionally Spec; Unix-only code has not compiled locally. Coordinator Sol medium adds the private-directory0750 negative and accurately renames the fake-session test; final fmt/Clippy/exact test1/1 pass. [Follow-up](evidence/owner-cli-s1-review-followup.md).
 - Fresh published-head recheck and every hosted OS gate remain required. No claim of Unix compilation, real WindowsOwnerSession behavior or actual native wiring-test coverage is made. Residual review advisories remain tracked.
@@ -929,7 +929,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#47](https://github.com/Dytschgo/arxcovo/pull/47), `d70e80818569491238656255ee415669f04a731d`, 10:51:46 UTC, all five gates on d9b6fa3 and exact-head Opus review. Its squash tree equals the reviewed head.
-- Main after #46 passed in 614s (run 43200970512, 10:30:28â€“10:40:42 UTC). Main after #47 is pending, not claimed green.
+- Main after #46 passed in 614s (run 43200970512, 10:30:28–10:40:42 UTC). Main after #47 is pending, not claimed green.
 - Queue priority: owner CLI S1 library prerequisites, then S2 private credential writer and S3 wiring; inactive Unix bridge architecture work continues separately. S1 starts only after the merged contract gate; no valid owner command, production NativeOps or production credential create is permitted in tests.
 - Provider assignment: OpenAI / gpt-6.1-sol / high implements S1 in an isolated worktree; Anthropic / Opus 5.5 / high independently reviews its source before publication/merge. A separate Opus high architect is active on Unix legacy-error/panic contracts. At most two builders and one reviewer; S2 awaits S1's shared path predicate and a builder slot.
 - Coordinator OpenAI / gpt-6.1-sol / medium directly clarifies the remaining non-blocking contract wording: own-PR gate, current scope outside historical headings and inherited no-later-operation/no-reopen/empty-stdout/wipe assertions for invalid fixtures. No behavior or code changes in this preparation commit.
@@ -940,8 +940,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No owner CLI or native executor is activated.
 - Last merged PR: [#46](https://github.com/Dytschgo/arxcovo/pull/46), `1d828ca7f4cddc74495f2d8eeca36bb4553a7ad9`, 10:30:26 UTC, all five gates on exact head `ddd698e2bbef4dd9a730ae52a2c2c9f94aa42a15` and independent Opus review. Its squash tree equals the reviewed head.
 - Main after #46 run 43200970512 is in_progress, not claimed green.
-- Queue priority: owner CLI contract publication, then inactive Unix native bridge contract. S1â€“S3 implementation remains gated until this contract's published-head review and required checks; no valid owner command may be invoked by tests.
-- Contract provider/outcome: original Opus high design and first correction retain independent Sol high reviews; coordinator OpenAI / gpt-6.1-sol / medium correction-2 and advisory clarification retain independent Anthropic / Opus 5.5 / high PASS reviews (48757f0, 1c80075). All N1â€“N5 and small follow-up advisories are specified in the brief; tests described are future requirements, not executed evidence. Fresh published-head recheck remains required.
+- Queue priority: owner CLI contract publication, then inactive Unix native bridge contract. S1–S3 implementation remains gated until this contract's published-head review and required checks; no valid owner command may be invoked by tests.
+- Contract provider/outcome: original Opus high design and first correction retain independent Sol high reviews; coordinator OpenAI / gpt-6.1-sol / medium correction-2 and advisory clarification retain independent Anthropic / Opus 5.5 / high PASS reviews (48757f0, 1c80075). All N1–N5 and small follow-up advisories are specified in the brief; tests described are future requirements, not executed evidence. Fresh published-head recheck remains required.
 - E2 merge disposition remains explicit in PR46: accept the remaining pre-existing baseline intermittency risk for the reviewed library-only slice after exact-head green checks. The old bdbf032b red remains a failure with unknown cause; no fix, rate claim or current-check waiver. No installed-service/M2 acceptance follows.
 - No Rust source, workflow or runtime behavior changes in this contract PR. No owner/admin/service operation, experiment retry, third S4U probe, old Lab Manager/VM or babysitter change.
 
@@ -949,7 +949,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#45](https://github.com/Dytschgo/arxcovo/pull/45), `2b805c450880fd12b9f0cd9771974e4fa1337a55`, 10:11:09 UTC, all five gates on 8687ae8 plus independent Opus review. Its squash tree equals the reviewed head exactly.
-- Main after #44 passed in 613s (run 43195912105, 09:56:35â€“10:06:48 UTC). Main after #45 run 43198102900 is in progress, not claimed green.
+- Main after #44 passed in 613s (run 43195912105, 09:56:35–10:06:48 UTC). Main after #45 run 43198102900 is in progress, not claimed green.
 - Queue priority: E2 draft candidate for hosted verification; then accepted owner CLI and inactive Unix bridge design publication. No CLI/native implementation begins before its prerequisite gates.
 - E2 coordinator disposition: permit draft publication only, following the independent Opus assessment at 000835d (report 8e40f5a). Merge remains held pending exact-head independent status, every required hosted gate and a separate explicit coordinator decision addressing the open intermittent failure. Any hosted failure remains held; no blind rerun. [Assessment](reviews/0016-e2-current-parent-assessment.md).
 - Original ExecutionFailed run bdbf032b at 780ca41 remains open, with phase, Win32 code and cause unknown. A prior occurrence also predates E2 on main, as recorded by the assessment. Neither instrumented passes nor new-parent passes are a fix or waiver; no rate or causal claim is made.
@@ -960,7 +960,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#44](https://github.com/Dytschgo/arxcovo/pull/44), `0fbf8df0b9dbe204a196bc3422c81d12d1bec94c`, 09:56:33 UTC, all five gates on e20036f plus independent Opus review. Its squash tree equals the reviewed head exactly.
-- Main after #43 passed in 623s (run 43194236390, 09:45:11â€“09:55:34 UTC). Main after #44 run 43195912105 is in progress, not claimed green.
+- Main after #43 passed in 623s (run 43194236390, 09:45:11–09:55:34 UTC). Main after #44 run 43195912105 is in progress, not claimed green.
 - Queue priority: state-permission exit correction, then the remaining E2/design work. Sol high E2 current-parent integration is active and remains held on unexplained ExecutionFailed run bdbf032b; no pass alone can release that hold.
 - State-exit provider/outcome: OpenAI / gpt-6.1-sol / medium coordinator ports reviewed source byte-identically from 8c6f69c; Anthropic / Opus 5.5 / high integration PASS is retained (4b2e489). New parent adds only inherited artifact CI and the SYSTEM test. Refreshed fmt/Clippy and exact classifier test 1/1 passed (cebb11b1); earlier full242 run stays credited to 8c6f69c. Published-head recheck and all hosted gates remain required. [Evidence](evidence/state-permission-exit-current-main-port.md).
 - The real Native::store call site remains source-reviewed rather than directly exercised; typed Layout errors still map to 5 as before. No complete layout-exit-contract fix is claimed. ADR0018 disposition remains local at 29068df with all prerequisite gates retained.
@@ -970,7 +970,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**. No native executor or owner CLI is activated.
 - Last merged PR: [#43](https://github.com/Dytschgo/arxcovo/pull/43), `b3e1d13888ae5967b095d4151144aa240169ed77`, 09:45:08 UTC, all five gates on c7cb551 plus independent Opus review. The squash tree equals the reviewed head exactly.
-- Main after #42 passed in 596s, run 43192357855 (09:32:25â€“09:42:21 UTC). Main after #43 run 43194236390 is queued at the last observation, not claimed green.
+- Main after #42 passed in 596s, run 43192357855 (09:32:25–09:42:21 UTC). Main after #43 run 43194236390 is queued at the last observation, not claimed green.
 - Queue priority: publish the SYSTEM-refusal regression, then the state-permission exit correction. The state-exit local candidate 8c6f69c passed one full nextest run (242/242, 2 skips) and is under Opus high review. E2 remains held on unexplained ExecutionFailed run bdbf032b.
 - SYSTEM test provider/outcome: OpenAI / gpt-6.1-sol / medium coordinator refreshes the exact reviewed test onto main after #43; product base is unchanged. Anthropic / Opus 5.5 / high integration review passed at a1ce4cf and is retained. Formatting/Clippy/exact test passed at that boundary; no repeat is claimed for ancestry/docs-only refresh. Fresh published-head recheck and all hosted gates remain required. [Evidence](evidence/system-refusal-current-main-port.md).
 - Coverage is limited to non-SYSTEM refusal; real SYSTEM acceptance, exact SID constant and every startup guard call are unverified. No SID is printed. ADR0018 accepted-contract disposition remains local at 29068df with all prerequisite gates retained.
@@ -993,7 +993,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Queue priority: publish N2 report validation/output privacy as its own PR; then remaining small service corrections. E2 stays held by unexplained ExecutionFailed run bdbf032b, with no fix or waiver from instrumented passes.
 - Provider/outcome: coordinator OpenAI / gpt-6.1-sol / medium ports reviewed Sol high N2 source unchanged; Anthropic / Opus 5.5 / high integration review passed at df60b22. Full local nextest passed 241/241, 2 skipped (ce6a9bc3); reviewer focused36 passed. Fresh published-head recheck and hosted gates remain required.
 - [Current integration evidence](evidence/n2-current-main-integration.md) and [independent review](reviews/0017-current-main-integration-review.md) retain exact pins and limits. Refresh onto #41 changes only ancestry/docs; no new full test run is claimed.
-- ADR0018 accepted-contract disposition remains local on docs/owner-cli-final-contract-corrections (29068df); N1â€“N5 must be settled before S2 and all prerequisite gates remain. ADR0019 passed for inactive design. Neither is runtime activation.
+- ADR0018 accepted-contract disposition remains local on docs/owner-cli-final-contract-corrections (29068df); N1–N5 must be settled before S2 and all prerequisite gates remain. ADR0019 passed for inactive design. Neither is runtime activation.
 - No experiment retry, third S4U probe, owner administration, old Lab Manager/VM operation or babysitter change.
 
 ## Historical checkpoint before N3 merged
@@ -1002,17 +1002,17 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main884a301, 08:56:09 UTC, through all five gates and independent review. Main CI run43187047371 passed in428s.
 - Queue priority: PR41 shutdown fix awaits Windows CI (Opus review, Ubuntu, macOS and budget pass); N2 report validation is a separate local child candidate, awaiting fresh Opus integration review before publication. E2 stays held by unexplained ExecutionFailed runbdbf032b.
 - N2 runtime/tests match reviewed local port95f06d3 byte-for-byte; E1 owner and client changes stay inherited. Coordinator fmt/locked all-target Clippy and one full nextest run passed241/241 with2 skipped (ce6a9bc3). No new mutation or native acceptance is claimed.
-- ADR0018's accepted local contract disposition remains on docs/owner-cli-final-contract-corrections (29068df), with N1â€“N5 due before S2 and all implementation gates retained. ADR0019 has inactive-design PASS. E2's three instrumented passes did not waive its red run.
+- ADR0018's accepted local contract disposition remains on docs/owner-cli-final-contract-corrections (29068df), with N1–N5 due before S2 and all implementation gates retained. ADR0019 has inactive-design PASS. E2's three instrumented passes did not waive its red run.
 - No experiment retry, third S4U probe, owner admin, old Lab Manager/VM or babysitter operation.
 
 ## Historical checkpoint before report-validation integration
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated paths remain **unverified on real hardware**; no native executor or owner CLI is activated.
 - Last merged PR: [#40](https://github.com/Dytschgo/arxcovo/pull/40), main `884a301eaa1e6dda6d218e439315ecdf3902ae82`, 08:56:09 UTC, all five gates on 190c1c7 plus independent Opus review.
-- Main after #40 passed: run 43187047371 at 884a301, 08:56:12â€“09:03:20 UTC, 428s. Main after #39 passed in 559s, run 43182044209.
+- Main after #40 passed: run 43187047371 at 884a301, 08:56:12–09:03:20 UTC, 428s. Main after #39 passed in 559s, run 43182044209.
 - Queue priority: N3 late-dispatch drain fix, then N2 typed report validation/privacy, as separate reviewed PRs. E2 remains held by unexplained local ExecutionFailed run bdbf032b; instrumented passes did not fix or waive it.
 - Coordinator Sol medium ports N3's two executor files byte-identically from reviewed boundary 1976afb onto actual main884a301; fmt, locked all-target Clippy and one normal full nextest run passed (235/235, 2 skipped; 1e0fe360). Fresh Opus integration review and hosted gates remain required before merge. E1 owner and #39 client changes stay inherited unchanged.
-- ADR0018 correction-2 independent Opus PASS closes A-SP1/A-ST1; local docs contract disposition 29068df is accepted with all implementation gates retained and N1â€“N5 advisories due before S2. ADR0019 has inactive-design PASS only. Neither design is activated.
+- ADR0018 correction-2 independent Opus PASS closes A-SP1/A-ST1; local docs contract disposition 29068df is accepted with all implementation gates retained and N1–N5 advisories due before S2. ADR0019 has inactive-design PASS only. Neither design is activated.
 - No native experiment retry, third S4U probe, owner admin, old Lab Manager/VM operation or babysitter change.
 
 ## Historical checkpoint before N3 publication
@@ -1020,21 +1020,21 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Milestone 1 accepted; Milestone 2 incomplete. Native/installed/dedicated paths remain **unverified on real hardware**; no owner CLI or native execution is activated.
 - Last merged PR: #39, `79b7879e7330e2f8de408723f15ddfac399dd75f`, 08:19:48 UTC, through all five gates and independent Opus review.
 - Queue priority: publish one-concern owner E1/E2 and shutdown/report-validation library slices after independent integration review, then complete their hosted gates. Sol review passes ADR0019 for inactive design; ADR0018 corrections are active with Opus. No implementation before accepted contracts or gate bypass.
-- Main push run43168305535 at0937cac succeeded on attempt1 in580s (06:27:48â€“06:37:28 UTC). Main39 CI43182044209 passed on attempt1 in559s (08:19:51â€“08:29:10 UTC).
+- Main push run43168305535 at0937cac succeeded on attempt1 in580s (06:27:48–06:37:28 UTC). Main39 CI43182044209 passed on attempt1 in559s (08:19:51–08:29:10 UTC).
 - This E1 port retains reviewed source and both parents' evidence/provider rows. Only PROGRESS conflicted. The latest client endpoint correction is inherited intact; no unrelated local candidate is activated. Prior focused/full tests are attributed to their exact source boundaries; fresh review and hosted checks remain mandatory.
 - N3 1976afb and N2 95f06d3 are ready locally (27/32 focused and231 full tests passed); owner E1 c4c010a/E2 c73e5c7 passed41/59 focused and247 full tests before this main refresh. E1 integration review now passes; publish E1 for hosted gates. E2 publication is held after its refreshed full test run failed ExecutionFailed; bounded diagnosis is active.
 - No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager/VM operation or babysitter schedule change. Review/delegate completions provide pending wakes.
 
-## E1 owner authority narrowing publication â€” 2026-11-12
+## E1 owner authority narrowing publication — 2026-11-12
 
 - Opus high integration review `1128a1e` passes E1 Standards/Spec atb79786c againstmain79b7879; [retained report](reviews/0016-e1-e2-current-main-integration-review.md). Source matches independently reviewed4a5919e. The report separately holds E2 because its refreshed full run is red; this E1 PR does not include E2 provisioning.
 - E1's current-main focused owner/SCM tests passed41/41 (run23277874-8835-4ddd-961f-34a4fd36e376); builder fmt/Clippy and earlier byte-equivalent source reviews are attributed to their original boundaries. Hosted CI will provide the first full-suite signal for this E1 head. No full-suite pass is invented and no waived check is requested.
 - OwnerGuard acquisition/narrow wrappers, proof-first uninstall_flow and private store/right adapters remain library-only, without CLI/MCP/Plan activation. Privilege/pin/lock ordering is unchanged. No production constructor, owner/admin or SCM/LSA operation was run. Native/installed/dedicated M2 stays **unverified on real hardware**.
 - Independent design correction and ExecutionFailed diagnosis are active pending wakes. Root runs no competing process tests during diagnosis. All required hosted checks and exact-head review remain necessary before merge.
 
-## Historical checkpoint before current-main M2 port â€” 2026-11-12
+## Historical checkpoint before current-main M2 port — 2026-11-12
 
-- Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), actual main `0937cacfcdb5be036edcd1a126ba0f65521599df`, merged 06:27:45 UTC. Main CI run43168305535 succeeded attempt 1, 06:27:48â€“06:37:28 UTC, 580s. This is inherited coordinator evidence, not a run executed by this builder.
+- Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), actual main `0937cacfcdb5be036edcd1a126ba0f65521599df`, merged 06:27:45 UTC. Main CI run43168305535 succeeded attempt 1, 06:27:48–06:37:28 UTC, 580s. This is inherited coordinator evidence, not a run executed by this builder.
 - M1 accepted; M2 incomplete. E1 owner library port is local only; hosted gates and fresh coordinator Opus high review pending. E2 is the next separate stack layer. No GitHub writes or runtime activation.
 - Retained E1 source `4a5919e` and full/follow-up independent PASS reports are historical review evidence, not approval of this port. Production owner/SCM/LSA paths remain **unverified on real hardware**.
 
@@ -1042,23 +1042,23 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 | --- | --- | --- | --- |
 | E1 port onto actual main0937cac | OpenAI / gpt-6.1-sol | high | Four owner/SCM files copied byte-equivalent to reviewed4a5919e; 41 focused owner/SCM tests passed; fmt and locked workspace/all-target Clippy passed; retained reviews and contract status reconciled. |
 
-## Historical checkpoint before owner-library port â€” 2026-11-12
+## Historical checkpoint before owner-library port — 2026-11-12
 - Milestone 1 accepted; Milestone 2 remains incomplete. Installed/native/dedicated M2 is **unverified on real hardware**; no native executor or owner CLI is activated.
 - Last merged PR: [#36](https://github.com/Dytschgo/arxcovo/pull/36), `0937cacfcdb5be036edcd1a126ba0f65521599df`, 06:27:45 UTC, after all five required gates passed on `1f6a42f` and independent review succeeded.
 - Queue priority: publish the reviewed Windows client endpoint correction, then the owner E1/E2, shutdown/report-validation and service followups as one-concern PRs. Independent Sol review of proposed ADR0018/0019 designs is assigned next. Every merge needs exact-head independent review and green checks; M2 is not accepted.
-- Main push CI after #26 passed on attempt 1: run43166128223 atffe502f, 06:09:14â€“06:18:58 UTC,584s. Main after #36 passed on attempt1: run43168305535 at0937cac, 06:27:48â€“06:37:28 UTC,580s (9m40s). Earlier main runs after #38/#9/#34 passed in600/567/562s respectively.
+- Main push CI after #26 passed on attempt 1: run43166128223 atffe502f, 06:09:14–06:18:58 UTC,584s. Main after #36 passed on attempt1: run43168305535 at0937cac, 06:27:48–06:37:28 UTC,580s (9m40s). Earlier main runs after #38/#9/#34 passed in600/567/562s respectively.
 - Hosted Ubuntu package installation and browser/Electron smoke now pass with the retained mirror-list configuration. The original network cause and fallback under a Kernel outage remain unproven. Old stuck queue records were not successfully cancelled; no account-level cause is established.
 - PR36 fixture correction passed hosted Windows on its published head. Its controlled counterexample explains a possible invalid test assumption; the original failure's scheduling history remains unknown. No claim that unrelated ExecutionFailed intermittency is fixed.
 - No native experiment retry, third S4U probe, owner-PC administration, old Lab Manager or VM work. Proposed ADR0018/0019 and full M2 acceptance remain open. Babysitter unchanged.
 
-## Windows client endpoint correction publication â€” 2026-11-12
+## Windows client endpoint correction publication — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium coordinator ports the already implemented and independently reviewed file from `bd22e05` onto actual main0937cac; no new implementation choice. Windows connect validates the strict local endpoint before any pipe I/O and requires SYSTEM for the fixed service name under all suffix casing. Development names keep their configured server pin. Two pure tests cover malformed/remote addresses, casing, SYSTEM pins and legitimate development names.
 - Retained independent Opus high reviews: [case guard](reviews/service-pipe-case-independent-review.md) and [direct endpoint validation](reviews/service-client-endpoint-followup-review.md). Their safety deviation/limits are historical and are not repeated. No mutation may run the fixed production-pipe parent test. Product source is byte-identical to reviewedbd22e05; fresh published-head review and hosted checks remain required.
 - Coordinator validation on the integrated client candidate: `cargo fmt --all -- --check`, locked workspace/all-target Clippy with warnings denied, and normal workspace nextest **223/223**, two parent-exercised fixture skips, passed; run `9eaa11d0-3acd-446e-8e74-13985f31c231`,10.423s test phase. No source mutation or fixed production pipe operation was run during this port.
 - Main push run43168305535 is independently confirmed green in580s. Babysitter08:03 resume steering applied: no idle handback while M2 work is listed; bounded owner integration and design-review delegates will provide pending wakes. No owner admin/native experiment/third S4U operation.
 
-### M2 active delivery assignments â€” coordinator record revision 1
+### M2 active delivery assignments — coordinator record revision 1
 
 | Work | Provider / effort | State and next wake |
 | --- | --- | --- |
@@ -1068,54 +1068,54 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 | Shutdown/report validation and small service followups | Sol high integration / Opus high review | Retained local reviewed candidates; prepare after owner integration begins, no native activation |
 
 
-## Historical checkpoint before PR36 merged â€” 2026-11-12
+## Historical checkpoint before PR36 merged — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#26](https://github.com/Dytschgo/arxcovo/pull/26), `ffe502fa7c43594bef1f2c8cf60b6f69ef43481b`, 06:09:12 UTC, through all five gates.
 - Queue priority: finish existing #36 through independent review and every required check. No new feature PRs or bypasses.
-- Main push CI after #34 passed on attempt 1: run43164763220 at3b418cd, 05:57:09â€“06:06:31 UTC,562s. New main after #26 is pending, not claimed green.
+- Main push CI after #34 passed on attempt 1: run43164763220 at3b418cd, 05:57:09–06:06:31 UTC,562s. New main after #26 is pending, not claimed green.
 - PR36's test-only cancellation-fixture correction passed independent Opus high review at6ccfce9: focused2/2, five stress iterations, cancellation guard/early-timer mutations caught, full221/221 passed with two parent-only skips. The actual hosted failure's cause remains unproven. Source is retained unchanged; merged main adds only reviewed docs/history.
 - Native execution and owner CLI remain unactivated. No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work.
 
 
-## PR36 reviewed fixture publication â€” 2026-11-12
+## PR36 reviewed fixture publication — 2026-11-12
 
 - Anthropic / claude-opus-5-5 / high independently reviewed Sol fixture `7f47d8d..bd99d5c` and integration6ccfce9: Standards/Spec PASS, no blockers; [report](reviews/pr36-sdk-cancellation-fixture-opus-review.md). Real automatic200ms SDK timeout and explicit cancellation tests both assert durable failed/cancelled before shutdown. Controlled counterexample is not proof of the hosted scheduling history.
 - Coordinator OpenAI / gpt-6.1-sol / medium retained report4e5eaf1 and merged actual mainffe502f. Only PROGRESS conflicted; both parent histories/table rows are preserved. Fixture/product crate bytes remain identical to reviewed6ccfce9/bd99d5c. Added a heading to separate inherited historical main claims from the Sol fixture report (advisory A1). Hosted Windows validation is mandatory on the published head; no runtime policy, schema or timeout change.
 
-## Historical checkpoint before PR9 queue refresh â€” 2026-11-12
+## Historical checkpoint before PR9 queue refresh — 2026-11-12
 
 - Milestone 1 accepted; Milestone 2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#34](https://github.com/Dytschgo/arxcovo/pull/34), `3b418cd2254c05b90de460e2d78101b31a76f944`, 05:57:07 UTC, through all five required gates.
 - Queue priority: finish #36 and #26 with independent reviews and every required check. #36's test-only cancellation-fixture correction is integrated locally and awaits Opus review; its exact hosted failure cause remains unproven. No new feature PRs or bypasses.
-- Main push CI after #9 passed on attempt 1: run43163250474 at6f18686, 05:43:16â€“05:52:43 UTC,567s. Main after #34 is pending, not claimed green.
+- Main push CI after #9 passed on attempt 1: run43163250474 at6f18686, 05:43:16–05:52:43 UTC,567s. Main after #34 is pending, not claimed green.
 - Sol high fixture `bd99d5c` remains byte-identical in crates. The coordinator merged main without changing production behavior; only PROGRESS conflicted. Both parent histories/provider rows are kept. Builder reports221/221 normal tests; coordinator integrated focused2/2, Node19/19 and Python39pass/3Unixskips.
 - Coordinator corrected one isolated legacy-encoded dash in the builder PROGRESS entry. A command-chain error briefly committed conflict markers in an unpublished local merge; this amended merge removes them before publication. Strict UTF-8, conflict-marker, table-row and whitespace checks are required below.
 - No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work. Native/installed/dedicated M2 remains unaccepted.
 
-## Historical checkpoint before cancellation fixture integration â€” 2026-11-12
+## Historical checkpoint before cancellation fixture integration — 2026-11-12
 - Last merged PR: [#34](https://github.com/Dytschgo/arxcovo/pull/34), `3b418cd2254c05b90de460e2d78101b31a76f944`, 05:57:07 UTC, through all five gates.
 - Queue priority: finish #36 and #26 through independent review and every required check. No new feature PRs or gate bypasses. #36's fake SDK cancellation test failed hosted Windows; a Sol high diagnosis is active, with Opus review required before publication.
-- Main push CI after #9 passed on attempt 1: run 43163250474 at6f18686, 05:43:16â€“05:52:43 UTC,567s. The new main push after #34 is pending, not claimed green.
+- Main push CI after #9 passed on attempt 1: run 43163250474 at6f18686, 05:43:16–05:52:43 UTC,567s. The new main push after #34 is pending, not claimed green.
 - PR26 refresh retains published history and both parents' provider/evidence rows. Only PROGRESS conflicted; the read-only manager observer step and helper tests are inherited unchanged from reviewed #34. Product crates/Cargo/UI/packaging are unchanged.
 - No native experiment retry, third S4U probe, owner-PC administration or old Lab Manager/VM work. Historical checkpoints below retain their task-time claims.
 
-## Historical checkpoint before PR9 queue refresh â€” 2026-11-12
+## Historical checkpoint before PR9 queue refresh — 2026-11-12
 
 - Milestone1 accepted; Milestone2 incomplete. Installed/native/dedicated M2 remains **unverified on real hardware**.
 - Last merged PR: [#9](https://github.com/Dytschgo/arxcovo/pull/9), `6f18686af7a8498bf887f833f278f43d152867f2`, 05:43:13 UTC, through all five required gates.
 - Queue priority: finish #36, #26 and #34 through fresh independent reviews and all required checks. No new feature PRs or bypasses.
-- Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57â€“05:40:57 UTC,600s. The new main push after #9 is pending; it is not claimed green.
+- Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57–05:40:57 UTC,600s. The new main push after #9 is pending; it is not claimed green.
 - PR36 refresh retains published history and both parents' provider/evidence rows. The merge conflict was documentation only. Product source, helper safety, checks/timeouts, inactive native execution and experiment limits are unchanged; inherited #9 policy test correction is already reviewed and merged.
 - No owner-PC administration, old Lab Manager/VM operation, native experiment retry or third S4U probe. Historical checkpoints below retain their task-time claims.
 
-## PR36 hosted cancellation-test failure â€” 2026-11-12
+## PR36 hosted cancellation-test failure — 2026-11-12
 
 - CI run43163554382, Windows job131000066825, exacthead `c044b72` failed `local::execution_tests::dedicated_fake_sdk_cancellation_propagates_without_shutdown` at local_execution_tests.rs123: generic condition-not-reached. The helper is used twice in that test, so the log alone does not establish whether backend entry or durable completion was missing. No ExecutionFailed or production cause is inferred.
 - Coordinator OpenAI / gpt-6.1-sol / medium ran the exact normal focused nextest once:1/1 passed, run4494eb3b-5d65-4671-bc57-b4bb07d05409. No unchanged hosted rerun. The SDK timeout200ms and fake backend3s lifetime are leads only, not a proven cause.
 - A scoped Sol high diagnosis/fixture correction is delegated, followed by fresh independent Opus review before publication. Distinguish both waits, reproduce the actual failure, prefer event-based synchronization if supported, preserve cancellation/audit assertions and cleanup; do not weaken checks or alter production behavior. No native executor, owner/admin or direct ignored-fixture operation.
 
-## PR36 cancellation fixture correction â€” Sol high, 2026-11-12
+## PR36 cancellation fixture correction — Sol high, 2026-11-12
 
 - OpenAI / gpt-6.1-sol / high, implementation sub-agent, local only; prepared base `7f47d8dc26ae0cbc0a39e7fe045a96fa32ba789e` verified clean. Published PR36 head `c044b723ff0863df85aca90ea0b85567593fff44` remains unchanged. No subagents or GitHub writes.
 - Controlled real-SDK/private-pipe counterexample reproduced the backend-entry failure: cancellation during held preflight produced durable `failed/cancelled` with zero backend calls. This does **not** prove which wait failed in hosted run43163554382/job131000066825. No ExecutionFailed or ETW cause is inferred.
@@ -1126,31 +1126,31 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 - Last merged PR: [#9](https://github.com/Dytschgo/arxcovo/pull/9), `6f18686af7a8498bf887f833f278f43d152867f2`, 05:43:13 UTC, through all five gates.
 - Queue priority: finish #36, #26 and #34 through fresh independent reviews and all required checks. No new feature PRs or bypasses.
-- Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57â€“05:40:57 UTC,600s. The new main push after #9 is pending, not claimed green.
+- Main push CI after #38 passed on attempt1: run43161887014 at441978d, 05:30:57–05:40:57 UTC,600s. The new main push after #9 is pending, not claimed green.
 - PR26 refresh preserves both parents' provider/evidence rows and published history; only PROGRESS conflicted. Product behavior is unchanged; the inherited #9 policy test correction is already reviewed and merged.
 - PR34 refresh preserves both parents' provider/evidence rows and published history; only PROGRESS conflicted. Product behavior is unchanged; the inherited #9 policy test correction is already reviewed and merged.
 - No owner-PC administration, old Lab Manager/VM work, native experiment retry or third S4U probe. Historical checkpoints below retain their task-time claims.
 
-## Historical checkpoint before PR9 queue refresh â€” 2026-11-12
+## Historical checkpoint before PR9 queue refresh — 2026-11-12
 
-- Milestone 1 is accepted. Milestone 2 remains incomplete; milestones3â€“6 have no acceptance.
+- Milestone 1 is accepted. Milestone 2 remains incomplete; milestones3–6 have no acceptance.
 - Last merged PR: [#38](https://github.com/Dytschgo/arxcovo/pull/38), `441978dd486f5f0299a6968aa4a3104f33996714`, 05:30:55 UTC, through all five required gates.
 - Queue priority: drain existing #36, #9, #26 and #34 with the merged CI fix, independent exact-head reviews and all required checks. No new feature PRs or bypasses.
 - PR38 run43160541603 on `1226c74` passed all platforms on attempt1 in613s; Ubuntu job130990508941 passed in151s, including signed indexes/packages and browser/Electron smoke. Kernel was reachable; this does not prove fallback during an outage or the original network cause. Main push CI after #38 is pending, not claimed green.
 - The old12 queue records rejected cancellation; fresh scheduling works. No repeat unchanged runs or native experiments are authorized by this refresh. Historical unsuccessful attempts are retained below.
 - Reviewed local owner provisioning/report-validation followups remain separate, unpublished and unactivated. Installed/native/dedicated M2 remains **unverified on real hardware**. No third S4U probe, owner-PC administration, old Lab Manager or VM work.
 
-## PR36 refresh after merged CI unblock â€” 2026-11-12
-## PR26 refresh after merged CI unblock â€” 2026-11-12
-## PR34 refresh after merged CI unblock â€” 2026-11-12
-## PR9 refresh after merged CI unblock â€” 2026-11-12
+## PR36 refresh after merged CI unblock — 2026-11-12
+## PR26 refresh after merged CI unblock — 2026-11-12
+## PR34 refresh after merged CI unblock — 2026-11-12
+## PR9 refresh after merged CI unblock — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium coordinator merged actual main441978d without rewriting published history. No product source change is introduced by the refresh; PR-specific code remains as independently reviewed at its previous head. Main's reviewed helper/concurrency/lint correction is inherited intact. Current state is first, with one queue row; all provider/history table rows from both parents are retained.
 - Local verification is scoped to unchanged-source equivalence, the CI helper/Node suites and whitespace. Fresh published-head independent recheck, platform CI and required statuses remain mandatory. No acceptance, measured speedup, native experiment or account/service operation.
 
-## Historical checkpoint before merged PR38 refresh â€” 2026-11-12
+## Historical checkpoint before merged PR38 refresh — 2026-11-12
 
-- Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3â€“6 remain unimplemented apart from research and scaffolding.
+- Milestone 1 is accepted. Milestone 2 is incomplete; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC on November 11.
 - Queue priority: Opus high has committed a local Ubuntu CI fallback correction at `821d496` under the three-failure handoff (see below). Independent Sol review now passes (29 Python,19 Node tests; five independently caught mutations). Next: ONE coordinator hosted validation and exact-head review to land the CI unblock, then re-dispatch and drain existing #36/#9/#26/#34 through every gate. No new feature PRs or gate bypass.
 - User-authorized queue reset: all 12 old queued runs rejected normal and force cancellation (409); five reruns rejected (403). Fresh CI dispatches were accepted for main and all four PR branches; actual jobs started on main and PR36. All five fresh Ubuntu jobs have failed; all macOS jobs passed. Fresh main, PR9 and PR34 Windows passed; PR36 and PR26 Windows were still running at this snapshot. The original #10 main push is not claimed green. See [reset evidence](reviews/actions-queue-reset.md).
@@ -1159,17 +1159,17 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Native execution/owner CLI remain unactivated. No native experiment retry, third S4U probe or owner-PC administration. Installed/native/dedicated M2 remains **unverified on real hardware**.
 
 
-## PR38 first hosted validation â€” lint correction, 2026-11-12
+## PR38 first hosted validation — lint correction, 2026-11-12
 
 - Published head `6da6224`, CI run43160202605, Ubuntu job130989275950 failed `npm run lint`: ESLint no-regex-spaces rejected two literal-space regexes in the Sol-authored workflow test. The helper/package-fetch step was never reached; this is not another mirror/network failure and provides no fallback acceptance.
 - Coordinator OpenAI / gpt-6.1-sol / medium made the mechanical lint correction to equivalent space quantifiers `{2}` and `{4}`. No helper, workflow behavior, gate, timeout or test assertion is weakened. Locally ran `npm run lint` successfully, Node policy/workflow tests19/19, Python CI helpers29/29 and diff whitespace check. Earlier local validation omitted the full lint command; the hosted check caught that omission.
 - Publish a changed head through its automatic PR CI; no unchanged rerun or duplicate dispatch. Exact-head review must cover this two-line test correction; all gates remain mandatory. Real APT fallback and installed/native/dedicated M2 remain unverified.
 
-## Ubuntu fallback candidate publication review â€” 2026-11-12
+## Ubuntu fallback candidate publication review — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium independently reviewed Opus candidate `1361864..bfa177f`: Standards/Spec pass with no blockers; [report](reviews/ubuntu-fallback-sol-review.md). The earlier Sol concurrency correction retains its independent Opus recheck. Publish this CI unblock as the explicit babysitter queue-recovery exception, without opening a feature PR. Native/M2 acceptance is unchanged; real fallback and all hosted gates remain mandatory.
 
-## Ubuntu package-fetch three-failure handoff â€” 2026-11-12
+## Ubuntu package-fetch three-failure handoff — 2026-11-12
 
 - OpenAI / gpt-6.1-sol / medium coordinator applies the babysitter's three-attempt handoff steering. Stop coordinator fix attempts; Anthropic / claude-opus-5-5 / high takes the Ubuntu CI fix, followed by independent Sol review. This handoff is active, not an unattended pause; delegate completion resumes this thread.
 - Failure evidence 1: original Ubuntu package retrieval failed with name-resolution errors in run [43032348219](https://github.com/Dytschgo/arxcovo/actions/runs/43032348219), source `4ead112`, jobs `130562335529` / `130573258883`.
@@ -1195,9 +1195,9 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Not run: real APT, root publication, sudo and any hosted run. Fallback timing, cross-mirror sync and a green Ubuntu job are **pending hosted confirmation**. The root cause of both network failures is unknown.
 - This counts as one corrective patch toward the three-failure rule. If the coordinator's single hosted validation fails, record it with logs instead of retrying blindly. Sol must independently review before publication; the implementer does not self-approve.
 
-## Historical checkpoint from main before the Actions reset â€” 2026-11-11
+## Historical checkpoint from main before the Actions reset — 2026-11-11
 
-- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3â€“6 remain unimplemented apart from research and scaffolding.
+- Milestone 1 is accepted. Milestone 2 is in progress; milestones 3–6 remain unimplemented apart from research and scaffolding.
 - Last merged PR: [#10](https://github.com/Dytschgo/arxcovo/pull/10), `b5e65561b001a3616fa8a6623512e7ff8aa0e346`, 20:23:38 UTC, through all five gates. Its feasibility notes remain proposed/historical; the owner-only development-host checklist is prepared before M4 and proves no hardware acceptance.
 - Main includes service, owner and Unix execution libraries plus accepted opt-in Windows development execution. Native backends, owner provisioning/CLI and installed/dedicated M2 acceptance remain incomplete. macOS owner parsing still refuses Unknown; no Unix execution route is activated.
 - Queue priority: obtain a fresh independent recheck of corrected #36 and finish existing #9/#26/#34. No new feature PRs while the four-PR queue drains. Windows owner API narrowing E1 and fixed Linux protection-site diagnostics remain local and unreviewed.
@@ -1208,7 +1208,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - OpenAI / gpt-6.1-sol / high, implementation sub-agent, LOCALONLY on prepared base `bc2e4a84876db4298c84475c5818d31d50a61d25` (actual #14 main `5b4f6b2` plus public candidate `a52d360`). Read the [full independent review](https://github.com/Dytschgo/arxcovo/pull/36#issuecomment-6805972686). No subagents, push, PR mutation, workflow, settings, watch, approval or merge. E1 remains separate and untouched.
 - S1: preserve original discovery metadata through invalid-table shaping, normalize cleanup/identity precedence, and quarantine invalid discovery or failed discovery stops. S2: cancelled requests exit after preflight/capacity without entering the backend; backend contract requires cancellation/shutdown rechecks immediately before actual spawn. S3: dedicated command/discovery starts commit dedicated mode transactionally, including rejection/refusal; completion forces dedicated mode even for malicious backend metadata. Schema remains 3. N4: shutdown reconciliation failure preserves an earlier endpoint failure.
 - Coordinator inspected the four production-file deltas and reran formatting plus **29/29 focused executor/Application tests**, run `1a84a896-1cbf-4c45-90de-92747c56e319` (188 tests skipped by filter), 1.616-second test phase. Full 216-test/Clippy/mutation evidence below belongs to the builder, not a coordinator rerun. Production remains MechanismUnavailable; publication is for fresh independent review, not activation or acceptance.
-- Coordinator N5 follow-up (OpenAI / gpt-6.1-sol / medium): added lexical rejection of console aliases, superscript COM/LPT device suffixes and reserved bases padded before extensions. Three actual Windows guard tests failed first at `CONIN$`, `COMÂ¹` and `CON `, run `2da9bc7d-9823-406f-aaf5-d77d9253d657`. Ordinary device-like names and Unicode filenames remain positive controls. The builder's earlier N5-open disposition below is historical; N1â€“N3 remain open. Sources: [Microsoft naming rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file) and [console handles](https://learn.microsoft.com/en-us/windows/console/console-handles).
+- Coordinator N5 follow-up (OpenAI / gpt-6.1-sol / medium): added lexical rejection of console aliases, superscript COM/LPT device suffixes and reserved bases padded before extensions. Three actual Windows guard tests failed first at `CONIN$`, `COM¹` and `CON `, run `2da9bc7d-9823-406f-aaf5-d77d9253d657`. Ordinary device-like names and Unicode filenames remain positive controls. The builder's earlier N5-open disposition below is historical; N1–N3 remain open. Sources: [Microsoft naming rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file) and [console handles](https://learn.microsoft.com/en-us/windows/console/console-handles).
 - After that guard change, coordinator formatting, locked workspace/all-target Clippy and **220/220 normal nextest** passed, run `48b7eb00-dca3-4f09-8398-658daf0591dd`, 13.389-second test phase; two direct-only fixtures were exercised through parents. No filesystem/device open or native backend was added. Fresh independent recheck remains required.
 - Regression coverage: gated preflight cancellation with no sleeps; malicious report mode; started-row readback and completion relabelling refusal; discovery cleanup/identity/invalid-table/failed-stop facts; both Failed spawn phases; HTTP-only principal rejection; simultaneous dedicated/development composition; exact dedicated inventory fields; dedicated discovery argument rejection; endpoint failure with cleanup held pending and no stop audit; earlier endpoint versus later reconciliation failure.
 - Nonblocking dispositions: N1 retains the settled dedicated identity-mismatch outcome without adding quarantine policy; Opus must decide any policy alignment with development. N2 fixes mode enforcement under S3; configured-rights and remaining report-field validation are deferred to native-adapter contract review, and production stays MechanismUnavailable. N3 remains open: a late stopping-only dispatch can miss the JoinSet taken by drain (no backend run); no concurrent-drain policy is introduced here. N5 remains open: extended Windows reserved names are defence in depth, with child path revalidation still required before native activation. Standards observations about duplicated argument handling and closure size remain advisory; quarantine decisions now share one gate. Public PR description remains coordinator-owned and stale until publication.
@@ -1248,7 +1248,7 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 - Main push CI after #29 passed on its first attempt, run 43088994955: **461 seconds**, below 15 minutes. Main push CI after #14 also passed on its first attempt, run 43091130349: **549 seconds**. The first reviewed disposable Linux experiment failed with `E_PROTECTION`; the reviewed-SHA variable is cleared, no retry or runtime acceptance is claimed. No third S4U probe or owner-PC administration is authorized.
 
 
-## PR29 compatibility integration â€” Sol high, 2026-11-11
+## PR29 compatibility integration — Sol high, 2026-11-11
 
 - Integrated implementation commit: `79959a33a0422cf9bd594cb99d1323d85051740d`, parents exactly `06c7f6b646b64adf615c98353b9a5a9111636b5d` and `4f2b0c7177c8b7370d34484e4739082364859f4a`. Following documentation-only evidence commits do not alter tested code.
 - Files changed relative to prepared base: `crates/arxd/src/service/config.rs`, `mod.rs`, `owner_plan.rs`, `owner_transactions.rs`, `owner_transactions_tests.rs`; `docs/PROGRESS.md`, `docs/adr/0009-service-lifecycle-and-dedicated-execution.md`, `docs/adr/0012-windows-owner-transaction-and-right-provenance.md`, `docs/reviews/0012-owner-contract-review.md`, `docs/service-foundation.md`, `docs/service-install.md`. The provenance module/contract/review come from actual main; the shared plan resolves compatibility, Unix call sites use None, and the cross-platform test is strengthened. No new ADR was needed.
@@ -1370,7 +1370,7 @@ The rows below preserve task-time reports from the prior progress records. Pendi
 
 | Task | Provider/model | Effort | Task-time outcome |
 | --- | --- | --- | --- |
-| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1â€“2 merged; full protection read back; first baseline verified |
+| Coordination, integration and settings | Codex / gpt-6.1-sol | medium | PRs #1–2 merged; full protection read back; first baseline verified |
 | Initial scaffold/CI builder | Codex / gpt-6.1-sol | medium | PR #1 built and locally verified |
 | CI gate architecture | Claude / claude-opus-5-5 | high | App-free workflow_run design and staged installation advised |
 | PR #1 review round 1 | Claude / claude-opus-5-5 | high | Failure on 835d06c: history deadlock, error handling, labels and extra approval requirements |
@@ -1488,7 +1488,7 @@ Exact provider allowances and costs are not exposed; no percentages or spend are
   `t3/native-service-adapters`; implementation commit `678287d`.
   Added service/native.rs, native_windows.rs, native_unix.rs plus necessary
   module/Cargo wiring. No other task branch or development/store/MCP file edited.
-  This task changes no acceptance status: M1 is accepted and M2â€“6 remain unchecked.
+  This task changes no acceptance status: M1 is accepted and M2–6 remain unchecked.
 - Unchanged Windows baseline: `cargo test --workspace` passed 61 tests, one
   directly ignored subprocess fixture exercised by its parent. Added nine
   native/policy tests: real current-token/local-SAM observations (positive
@@ -1574,7 +1574,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - ADR 0010 is integrated from the Opus architecture candidate d4725f1 (read by the coordinator). The owner explicitly authorized the existing unelevated user for development testing; no additional approval is requested. Implementation will keep that mode explicit, local-only, bounded and audited, without persisting or returning private owner identity. Production dedicated-account acceptance remains open.
 - Starting from the integrated activity candidate, the next Sol high task implements the Windows Job-based current-user executor and real MCP tools. No owner account, rights, service or task mutation is part of this assignment.
 
-## Windows development execution candidate â€” implementation handoff (2026-11-11)
+## Windows development execution candidate — implementation handoff (2026-11-11)
 
 - Provider/effort: GPT-6.1 Sol, high. Outcome: incomplete candidate; stopped under
   the task's three-different-failed-fixes rule. Independent other-provider review
@@ -1587,7 +1587,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   unnamed Job memory/process/UI limits; token comparison before resume;
   cancellation/shutdown/output/time bounds; cleanup confirmation and quarantine;
   MCP execution/discovery/capability wiring; worker-owned audit completion;
-  transactional explicit v2â†’v3 identity_mode migration and development-row CHECKs.
+  transactional explicit v2→v3 identity_mode migration and development-row CHECKs.
 - Actual validation: `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed after final code
   edits. The last full `cargo test --workspace --no-fail-fast` failed: 12/13
@@ -1624,7 +1624,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   coordinator's post-review private acceptance are in
   `docs/windows-development-execution.md`.
 
-## Windows development execution â€” Opus continuation (2026-11-11)
+## Windows development execution — Opus continuation (2026-11-11)
 
 - Provider/effort: Anthropic claude-opus-5-5, high (other-provider continuation
   under the three-failed-fixes rule). Outcome: candidate complete locally and
@@ -2231,7 +2231,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   Clippy with warnings denied, and all three portable owner_unix tests. Native
   Unix manager behavior was not exercised by these Windows checks.
 
-## ADR0014 implementation foundation â€” incomplete
+## ADR0014 implementation foundation — incomplete
 
 - Provider/effort: OpenAI / gpt-6.1-sol / medium. Prepared base verified as
   `d1e2425e8b37c038b65076b799bcbddc332dc597`; initial worktree clean.
@@ -2452,7 +2452,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
   **unverified on real hardware**. PR29 remains a work in progress.
 
 
-### ADR0014 phase 3b â€” bounded local implementation (2026-11-11)
+### ADR0014 phase 3b — bounded local implementation (2026-11-11)
 
 - Provider/effort/outcome: OpenAI gpt-6.1-sol / medium; implemented locally,
   independent review pending. Prepared base verified exactly as
@@ -2722,7 +2722,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 
 - Codex / gpt-6.1-sol, medium prepared existing #36 locally on refreshed Unix owner branch `9c25864`. Crate, packaging, Cargo/toolchain and script trees remain identical to published `12aa968`; CI workflows/helpers match the parent. Only PROGRESS conflicted; both historical provider tables and task evidence are retained, with Current state first and #21 recorded merged. Formatting and 26/26 helper tests passed. No Rust suites were repeated for unchanged source, no push/new PR and no privileged operation.
 - Full independent interface/MCP review remains required after parent integration. Production dedicated execution still reports MechanismUnavailable; no current-user fallback, actual identity switch or dedicated-account acceptance is added by this history/CI refresh. Known test-only ETW handle fixture correction is retained separately and is not silently folded in. Installed/native M2 execution remains **unverified on real hardware**.
-## Windows owner adapter prerequisite handoff â€” 2026-11-11
+## Windows owner adapter prerequisite handoff — 2026-11-11
 
 - Provider/effort: Codex / gpt-6.1-sol high, implementation sub-agent working
   alone from `1a45ba15640b608ee4c953a104c06e451a85d07b`, branch
@@ -2846,7 +2846,7 @@ These task-time records retain the failed Sol handoff and later Opus resolution;
 - Codex / gpt-6.1-sol, medium verified #25 merged as `63b6555` at 17:59:09 UTC through all five gates. Its tree equals independently reviewed `7af3eac`. The local Application already contained that exact parent; duplicate-history squash conflicts retained the current Application tree. Crate/packaging/Cargo/toolchain/script bytes remain identical to public `a08187c` pending the separate sharing fix. No source fix or new acceptance is claimed by this alignment.
 - Main configuration run 43071362527 was independently read from its first-attempt API, success, 2026-11-11T17:46:22Z to 2026-11-11T17:54:32Z = 490 seconds. Current state records the actual latest merge first. PR27 remains blocked by its review finding until the sharing fix, fresh independent review and hosted gates pass. No push/new feature PR or privileged operation; installed-service/dedicated-account paths remain **unverified on real hardware**.
 
-## PR27 blocking ancestor-sharing correction â€” local candidate
+## PR27 blocking ancestor-sharing correction — local candidate
 
 - Provider/effort/task/outcome: OpenAI / gpt-6.1-sol / high; implement only the confirmed retained-ancestor sharing blocker from the [Opus review](https://github.com/Dytschgo/arxcovo/pull/27#issuecomment-6803252091). Prepared base `4f29ecf843c01d82fe38da16e8ef42e0b53a7611` on parentpreparedApplication (crate source identical to public `a08187c1e14a5722d4c37bfc9f2690d273d62eb3`). Local implementation complete; independent review/hosted gates pending. Current state and last merged PR above are unchanged; no acceptance claim.
 - Only production change: service `native_windows::open_impl` adds FILE_SHARE_WRITE for non-leaf ancestors, preserving FILE_READ_DATA, retained handles and no FILE_SHARE_DELETE. Immutable final leaves still exclude writers; mutable DB/journal/lock leaves still share read/write without delete sharing. Structural, owner, DACL and namespace checks are unchanged. Owner Windows and development executor source/policies, other protected source and the separate handle-marker patch are untouched. ADR0013 and service-foundation now describe ACL namespace authority and retained nondelete handles accurately, without claiming pins freeze all modification.
