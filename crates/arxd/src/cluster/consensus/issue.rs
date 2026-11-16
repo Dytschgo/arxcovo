@@ -289,3 +289,26 @@ pub(in crate::cluster) fn test_ticket(key: KeyDigest) -> IssueTicket {
         index: 1,
     }
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+pub(in crate::cluster) trait LeafSubject: sealed::Sealed {
+    fn cluster(&self) -> ClusterId;
+    fn node(&self) -> NodeId;
+    fn key(&self) -> KeyDigest;
+}
+impl sealed::Sealed for IssueTicket {}
+impl LeafSubject for IssueTicket {
+    fn cluster(&self) -> ClusterId {
+        self.cluster()
+    }
+    fn node(&self) -> NodeId {
+        self.node()
+    }
+    fn key(&self) -> KeyDigest {
+        self.key()
+    }
+}
+#[path = "found.rs"]
+pub(in crate::cluster) mod found;

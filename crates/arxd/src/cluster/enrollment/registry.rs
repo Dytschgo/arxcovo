@@ -39,6 +39,13 @@ impl std::fmt::Display for PeerRefusal {
     }
 }
 impl EnrollmentState {
+    pub(in crate::cluster) fn founded(&self) -> bool {
+        self.founded
+    }
+    pub(in crate::cluster) fn next_node_id(&self) -> NodeId {
+        self.next_node_id
+    }
+
     /// Local applied state only. Insufficient for production control/execution under isolation.
     pub fn authorize_peer(
         &self,
