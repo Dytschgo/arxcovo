@@ -15,7 +15,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-16
 
 - Last merged: PR #147, `a318ae167e940948898affcb99da33bf17bd9dbc` at23:36:01Z; independent Opus exact-head PASS6903122978/status58983006547 and all five gates green. Reviewed9390742/squash full trees equal. Before merge, exact main0ab5038 CI43768671593 was confirmed completed green and main was re-read without drift.
-- Current work: independent Opus review of the main-based shutdown phase diagnostic seam; PR149 bounded reads remains blocked by hosted U6 Orphaned. Report-only implementation preserves5s deadline and failure assertions. Natural hosted cause remains unknown; no fix or hardware acceptance is claimed. M2 remains open.
+- Current work: main-based shutdown phase diagnostics passed independent Opus source review and exact-store-count recheck; publication exact-head review and fresh hosted gates next. PR149 bounded reads remains blocked until this diagnostic parent merges and its read-owner report integration is reviewed. Natural hosted U6 cause remains unknown; no fix or hardware acceptance is claimed. M2 remains open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -37,6 +37,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Opus05a3a2f retained815f6c4 closes diagnostic B1: counts-before-own-handle-drop mutant compiles then fails exactlyone external-reference assertion, restoredR6 tests/fmt/lockedofflinearxdClippy pass. Coordinator separatelyR6/fmt pass. Productionreport unchanged; fresh exact-head review/five gates/latestexactmainCI remain publication/merge prerequisites. No manual CI rerun; first finite changed-diagnostic hosted attempt next.
 
 - 2026-11-16: Opus516356b0 retained0da693b confirms shutdown report source correct but requests test-only B1: count-before-own-handle-drop mutant survives >=1. Sole code deltaec67681 requires exactlyone externalSMreference; focused local verification and fresh narrow Opus recheck active. Second diagnostic seam attempt, no behaviorfix/timeoutchange; PR149 remains blocked.
 
