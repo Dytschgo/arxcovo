@@ -2,6 +2,8 @@
 
 ## Main CI health and merge prerequisite
 
+**Current merge blocker:** exactmain9074a85 CI43819925277 failed Windows s2b_latched_readiness_gate before Playwright install;507pass/1fail/16skip/58unrun. Sampler and feature merges held; no rerun.
+
 **Restored:** exact live main6f6e9d2 CI [43809711957](https://github.com/Dytschgo/arxcovo/actions/runs/43809711957) completed success after the reviewed Windows quarantine. Parallel independent M3 work may resume; Windows three-node coverage remains unverified. Earlier failures remain historical evidence.
 
 Delegated clarification on2026-11-16 supersedes the pending owner exception question: the narrow reviewed Windows quarantine may merge after allfive PR gates pass to restore red main. Feature PRs remain blocked until the resulting exact-main CI is green. No fourth Sol repair or manual rerun.
@@ -41,6 +43,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: FIRSTC1mergemain9074a85 CI43819925277failsWindowsjob133140434354 onservice::unix_bridge::tests::s2b::s2b_latched_readiness_gate9.271s: expectedcontrolpanic106,unexpectedgatewaitTimeout132, finalactualbridgegateenteredafteradmission assertion178 left1.507pass/1fail/16skip/58unrun; Ubuntu/macOSpass. Changedinstall/smokesnotreached,so noC1mainconfirmation/attribution. Mainred sampler/featuresheld;new bounded S2b diagnosis next, no manualrerun.
 
 - 2026-11-16: Coordinator records revised C1 criterion in PR154 body, verifiesall5gates/latestexactmain58d06c1CI43815774741green/re-readno drift, unwatches/merges9074a85 at06:53:45Z; squash/reviewed trees equal. Awaitfirstmergemainrun for install/job/smokes confirmation before sampler; no rerun or replacingoriginalPRmeasurement.
 
