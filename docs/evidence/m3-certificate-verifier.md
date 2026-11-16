@@ -294,3 +294,19 @@ Main e601caa CI43862021319 completed green: Ubuntu221s, Windows477s,
 macOS269s active job duration. This confirms main after PR158; it grants no
 TLS PR B hosted timing or Windows stability credit. Opus R3 recheck remains
 pending. M2 open, M3 unchecked, eight quarantines unchanged.
+
+
+## Publication checkpoint
+
+Opus R3 recheck6930dc6 retained4852d17 closes the last blocker at c2eceeb.
+It independently ran15TLS/engine controls, isolated per-side reverts (9pass/1fail
+each), both reverts and removal-only probes; restored10pure tests, Clippy,
+format/diff and guard2 pass. Those are Opus runs, separate from root's focused
+single-test mutant logs. No source changed after c2eceeb. Earlier full review and
+correction recheck remain retained, including their initial blockers and limits.
+
+Source review is now PASS on Standards, Spec and Security. Hosted verification,
+exact-head publication review and Windows<=660s still pending. Current main
+e601caa CI43862021319 is green (Windows477s); re-read before merge. The separate
+log-close regression e6e7a88 is not included in this TLS PR. No transport,
+production CA, quarantine recovery, M2 or full M3 acceptance credit is given.
