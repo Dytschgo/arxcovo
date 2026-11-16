@@ -38,3 +38,22 @@ One Sol high builder, source two-file scope plus evidence, no publishing. All
 three existing pushes/stop rules apply after independent Opus source review.
 No nextest/workflow/deadline/assertion weakening/quarantine change. S8 fix0/3,
 observability0/3 before publication. M2 open, M3 unchecked, hardware unverified.
+
+
+## Compatibility amendment after first hosted observation
+
+PR161 push1 failed the existing all-platform source payload scanner because
+macro_rules is forbidden even in the new cfg(test) attribution module. Root
+reproduced the exact same guard failure locally before correction; guard code
+and expectations stay unchanged. Replace the four generated enums with explicit
+enums/label matches, preserving all variants/defaults/labels.
+
+The optional native-evidence job also failed its pure E4 driver pin test. Scope
+now includes only two source hash values and the manifest hash in e4-native/driver.py,
+and the old/new context of S8_timeout_nonzero in mutations.jsonl. The inserted
+cfg(test) deadline-site line must be in both halves of that exact-match context;
+the mutation remains the same unknown-to-exit_nonzero outcome flip. All other
+manifest rows, challenge IDs/assertions, driver guards/policy and pins stay exact.
+Pure harness tests must apply every fixed edit in memory. No native run, grant,
+policy bypass or new mutation-kill claim is authorized. Independent recheck is
+required before push2; Linux behavioral fixes remain0/3, observability1/3 used.

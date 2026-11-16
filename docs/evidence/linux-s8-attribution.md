@@ -117,3 +117,38 @@ s8_attribution_controls, s8_attribution_formatter, S8 and S9c execution/duration
 five exact-head gates and independent publication review remain pending.
 Fresh main at publication: e601caa CI43862021319 success. PR159's Windows reds
 are separate and not waived. No install, native M2, VM or owner action occurred.
+
+
+## Push1 compatibility failure and local correction
+
+PR161 head93f07d1, CI43870536050 Ubuntu job133310209058: Clippy and fmt passed,
+then p_scan_checked_nonempty_inventory failed with forbidden diagnostic at514.
+262pass/1fail/22skip/303unrun. S8/S9c/newcontrols were not reached, so no
+ARX_S8_ATTR red or runtime acceptance exists. This is the first hosted Linux
+compile/Clippy credit for70d9d06, not a local Linux run or a behavior fix.
+The optional native-evidence pure harness also failed stale pins. The Opus
+publication reviewer posted no PASS or status and identified both issues.
+
+Root Sol coordinator medium reproduced the exact scanner failure on Windows:
+`cargo test -p arxd --lib --locked --offline exec::stage_b_tests::p_scan_checked_nonempty_inventory -- --exact`
+exited101 with forbidden diagnostic (D:/Temp/arx-pr161-scan-red.log). Source
+9e5667f replaces only the helper macro with explicit enums/label matches. All
+four sets of labels/defaults and the formatter output are preserved; the scanner
+is unchanged. The exact test then passes (D:/Temp/arx-pr161-scan-fixed.log), and
+all3p_scan controls pass (D:/Temp/arx-pr161-scan-controls.log).
+
+Root refreshed the two changed LF source hashes in the E4 driver. The first
+pure harness run then exposed one stale exact-match fragment, so its
+S8_timeout_nonzero context now includes the attribution line in BOTH old/new
+halves and retains the same unknown-to-exit_nonzero flip. Manifest hash updated;
+other10rows, challenge assertions/IDs, driver logic and3other source hashes
+unchanged. Final pure harness22/22 pass (D:/Temp/arx-pr161-e4-pure-fixed.log).
+The prior failed pure run is D:/Temp/arx-pr161-e4-pure.log. These are in-memory
+patch/schema/pin checks with mocks, not native experiment execution or kill credit.
+
+A source-extracted host Rust formatter harness for final manual enums compiles
+and passes1/1 in0.01s (D:/Temp/arx-linux-attr-compat/formatter.rs/.exe). Format
+and diff checks pass. No Linux cross-check was repeated: native gcc is still
+missing. New source9e5667f has no hosted Linux result yet. Independent recheck
+pending before push2/3; no same-head rerun. Linux fixes0/3, observability1/3used.
+M2/M3/hardware and native-execution limits remain unchanged.
