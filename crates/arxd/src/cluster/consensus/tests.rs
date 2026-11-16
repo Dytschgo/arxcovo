@@ -859,3 +859,87 @@ async fn preflight_rejects_unrepresentable_snapshot_index() {
         assert_eq!(disk(dir.path()), before);
     }
 }
+
+// Single-node runtime controls: Weak expiry is deliberately observed before Drop ends.
+async fn store_close_completion_shutdown(deadline: bool) {
+    use crate::cluster::state_store::DropGate;
+    use std::sync::mpsc;
+    let dir = private_temp();
+    let network = || super::mem_net::Factory {
+        source: 1,
+        router: Arc::default(),
+    };
+    let mut node = ConsensusNode::start(1, dir.path(), init(), Params::default(), network())
+        .await
+        .unwrap();
+    let held = node.sm.as_ref().unwrap().0.clone();
+    let weak = Arc::downgrade(&held);
+    let released = held.lock().unwrap().released();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    held.lock().unwrap().hold_drop(DropGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let start = Instant::now();
+    let mut shutdown = tokio::spawn(async move { node.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&held) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let dropping = std::thread::spawn(move || drop(held));
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(!released.is_set());
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "fixture consumed shutdown deadline"
+    );
+    if deadline {
+        let result = tokio::time::timeout(Duration::from_secs(6), &mut shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(Orphaned(report)) = result else {
+            panic!("shutdown returned while store destructor held its lock");
+        };
+        assert_eq!(report.first, Phase::StoreRelease);
+        assert_eq!(report.engine, EngineEnd::Joined);
+        assert_eq!(report.sm_strong, 0);
+        assert_eq!(report.log_strong, 0);
+        assert!(report.total_ms >= 5000);
+        assert!(start.elapsed() < Duration::from_secs(6));
+    } else {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned while store destructor held its lock"
+        );
+    }
+    release_tx.send(()).unwrap();
+    dropping.join().unwrap();
+    assert!(released.is_set());
+    if !deadline {
+        tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    let mut restarted = ConsensusNode::start(1, dir.path(), init(), Params::default(), network())
+        .await
+        .unwrap();
+    restarted.shutdown().await.unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_close_completion_shutdown_waits() {
+    store_close_completion_shutdown(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_close_completion_shutdown_deadline() {
+    store_close_completion_shutdown(true).await;
+}

@@ -928,3 +928,29 @@ fn registry_rows_match_independent_raw_format_and_bounds() {
     assert_eq!(decode_row(&row), Ok((pos(42), c)));
     bad_row(&row, |b| b[32] = 6);
 }
+
+#[test]
+fn store_close_completion() {
+    use crate::cluster::state_store::DropGate;
+    use std::sync::mpsc;
+    let dir = private_temp();
+    let mut store = VoteLogStore::open(dir.path(), [1; 16]).unwrap();
+    let released = store.released();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    store.hold_drop(DropGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let dropping = std::thread::spawn(move || drop(store));
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!released.is_set(), "ack preceded field destruction");
+    assert!(
+        matches!(VoteLogStore::open(dir.path(), [1; 16]), Err(StoreError::Io)),
+        "gate must hold the real file lock"
+    );
+    release_tx.send(()).unwrap();
+    dropping.join().unwrap();
+    assert!(released.is_set());
+    drop(VoteLogStore::open(dir.path(), [1; 16]).unwrap());
+}
