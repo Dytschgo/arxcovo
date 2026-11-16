@@ -1,10 +1,10 @@
 # Brief: M3 next runtime boundary, founder identity bootstrap (F1)
 
-Status: **proposed, corrected** (Opus 5.5 high, 2026-11-16). Original `3b4919f` on base `b52cd9c` (main `688f1ad`). This revision closes B1, B2 and the
-test and wording corrections of the [Sol contract review](../reviews/m3-founder-bootstrap-sol-contract.md) (`c925d9c`). Docs only, nothing built or run. Root Sol
-rechecks it before any source work. It amends no ADR and adds no architectural deviation. ADR 0005 (with its 2026-11-15 amendment), ADR 0023 and the
-[issuance brief](m3-certificate-issuance-first-slice.md) with E1–E7 and V1–V9 stay binding. M2 stays open, M3 stays unchecked, and no M4 work follows.
-Full M3 stays **unverified on real hardware**.
+Status: **proposed, corrected** (Opus 5.5 high, 2026-11-16) on `bda1cdc`. `1c9d036` closed B1, B2 and the other findings of the
+[Sol contract review](../reviews/m3-founder-bootstrap-sol-contract.md) of `3b4919f`; this revision closes its recheck's B3 (preflight ownership). Docs only,
+nothing built or run; root Sol rechecks it before source work. No ADR is amended and no deviation added. ADR 0005 (with its 2026-11-15 amendment), ADR 0023
+and the [issuance brief](m3-certificate-issuance-first-slice.md) with E1–E7 and V1–V9 stay binding. M2 open, M3 unchecked, no M4 work; full M3 stays
+**unverified on real hardware**.
 
 ## Decision: founder identity comes before transport
 
@@ -45,12 +45,12 @@ the Windows quarantine and the PR159 holds.
    `let deadline = Instant::now() + ISSUE_BUDGET;`, then `try_acquire` an issue permit (`Busy`). Everything after the permit is one `work` future, finished by
    `match timeout_at(deadline, work).await { Ok(r) if Instant::now() < deadline => r, _ => Err(FoundError::Unavailable) }`. Inline CSR parsing, signing and
    clock calls are not preemptible; a result completed at or after the deadline is discarded, so no leaf DER is ever returned late.
-   a. **Pre-initialize checks (B2).** Require `self.id == 1` (`NotFounder`). Then one bounded `blocking` read of the local `StateStore` (`self.sm`, lock held
-      only for the read) takes `cluster = codec::cluster(state)`, `state.founded()`, `state.next_node_id()`, `applied()` and `membership()`. Founded, or any
-      applied position or membership, gives `AlreadyInitialized`. `next_node_id() != 2` gives `FounderAllocation`. Parse `ProvenCsr` (`BadCsr`). Require
-      `ca.leaf_fits(clock.now_ms())` (`CaExpiring`). **All happen before any Raft call**, so a refusal leaves the node uninitialized. The invariant is
-      checked against persisted state on every call, not a caller convention or startup metadata: a directory created with any other `first_free`
-      (1, 4, ...) is refused forever, and a restart with any matching-cluster `Init` sees the persisted value because reopen ignores `first_free`.
+   a. **Pre-initialize checks (B2).** Require `self.id == 1` (`NotFounder`). Then one owned local snapshot, `preflight()` (B3, below), copies `cluster =
+      codec::cluster(state)`, `state.founded()`, `state.next_node_id()`, `applied()` and `membership().is_some()`. Founded, or any applied position or
+      membership, gives `AlreadyInitialized`. `next_node_id() != 2` gives `FounderAllocation`. Parse `ProvenCsr` (`BadCsr`). Require
+      `ca.leaf_fits(clock.now_ms())` (`CaExpiring`). **All happen before any Raft call**, so a refusal leaves the node uninitialized. The invariant is checked
+      against persisted state on every call, not a caller convention or startup metadata: a directory created with any other `first_free` (1, 4, ...) is refused
+      forever, and a restart with any matching-cluster `Init` sees the persisted value because reopen ignores `first_free`.
    b. `raft.initialize(BTreeMap::from([(1, addr)]))`. `Err(RaftError::APIError(InitializeError::NotAllowed(_)))` gives `AlreadyInitialized` with nothing
       proposed. Any other error gives `Unavailable`. This is the only initialize call in production code, and it never re-initializes. If the outer deadline
       drops this await, the engine may still initialize; a later `found` then refuses (item 5). `addr` is opaque here; address validation is endpoint work.
@@ -70,6 +70,26 @@ the Windows quarantine and the PR159 holds.
 5. **Not resumable, stated honestly.** Once `initialize` succeeds, a later failure (budget, sign, guard) leaves a founded or half-founded directory that
    `found` refuses with `AlreadyInitialized`. Recovery is a fresh directory and a new cluster ID chosen by the caller. No code path deletes, truncates, renames
    or overwrites the old directory, automatically or on error. With no custody, the founder key and CA live only in memory and are lost at process exit.
+
+## Preflight ownership (B3)
+
+Private `preflight(&self) -> Result<Pre, FoundError>` in `found.rs` (`Pre`: `Copy` only) reuses `fresh_read`'s unit and `Owners` accounting, minus the linearizer:
+1. `let permit = self.read_permits.clone().try_acquire_owned()` takes a unit of the existing shared `READ_PERMITS` (8) pool; none left gives `Busy`.
+2. `let (tx, rx) = oneshot::channel();`. Under `self.owners` (poisoned: `Unavailable`), `closed` gives `Unavailable` with no spawn, dropping the permit;
+   else it reaps (`while owners.set.try_join_next().is_some() {}`), clones `self.sm` (`None`: `Unavailable`) and calls `owners.set.spawn(owner)` before the
+   lock drops. No await lies between acquire and spawn, so admission and owner registration share one poll.
+3. `owner = async move { let r = blocking(move || { let r = (|| { let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?; Ok(Pre { .. }) })(); drop(sm);
+   drop(permit); r }).await.map_err(|_| FoundError::Unavailable); let _ = tx.send(r); }`: guard, store `Arc`, permit, then completion (#147). The owner never
+   tests `tx` first, so an admitted preflight always runs its closure, which alone releases the unit (bar a shutdown abort before it is scheduled).
+4. The caller awaits `rx` in `work` (closed: `Unavailable`); cancelling it (drop or outer `timeout_at`) frees `rx` and the issue permit, never owner or unit.
+
+So with the store lock held at most 8 closures (shared with `fresh_read`) can be pending, then `found` and fresh reads give `Busy`, whatever issue permits do.
+Each stray is an `Owners` member: `shutdown` waits for it in its existing 5 s budget and, if still blocked, returns `Orphaned` counting it in `owners_left`,
+`read_held` and `sm_strong`; `abort_all` drops only the async owner, and the closure holds its `Arc` and unit until its guard drops. Nothing is detached; no
+semaphore, capacity, timeout, retry, scheduling or helper changes; `blocking`, `fresh_read`, `shutdown` and `ShutdownReport` stay byte-identical. **Feasible:**
+`found.rs` descends from `consensus`, so privacy lets it name private `read_permits`, `owners`, `sm`, `blocking` and `SmAdapter.0`; no `consensus.rs` helper or
+allowlist entry is needed. **Not an authorization read:** a local, non-fresh, non-linearizable snapshot deciding only whether to try `initialize`. `NotAllowed`
+(4b) refuses a racing or crash-left initialize; signing needs this node's commit and both `fresh_read` guards; `read_blocking` is untouched.
 
 ## Security invariants (each one a review item)
 
@@ -120,14 +140,20 @@ and the state store shows no applied position and `founded() == false`.
 - **F6 adapter units.** Crafted responses: another leader node gives `WrongNode`, `Founded { replay: true }` gives `Rejected(AlreadyFounded)`, `Enrolled` gives a
   refusal, and a ticket with a different leader term gives `StaleIssuer` from the guard. A pure `init_refusal` maps a crafted `NotAllowed { last_log_id:
   None, vote }` to `AlreadyInitialized` and `NotInMembers` to `Unavailable`.
-- **F7 clock, deterministic.** A `ScriptClock` returns a fixed value per call index (calls: `leaf_fits`, `t0`, `pre_now`, `post_now`) and is never stepped
-  externally. At each call it records the node's `read_blocking` count (shared `Arc`), so the test proves `pre_now` is read only after guard 1's read completed
-  (count 1) and `post_now` only after guard 2's (count 2). Script `[n, 1000, 999]` gives `ClockRollback` with `ca.signs` unchanged;
-  `[n, 1000, 1000, 999]` gives `ClockRollback` with one sign and no leaf. Exact call counts are asserted. *Mutant: sampling `pre_now`
-  before the guard await fails the recorded count.*
+- **F7 clock, deterministic.** A `ScriptClock` returns a fixed value per call index (`leaf_fits`, `t0`, `pre_now`, `post_now`), never stepped externally, and
+  records the node's `read_blocking` count (shared `Arc`) per call: 0, 0 (preflight excluded), 1 after guard 1's read, 2 after guard 2's. Script `[n, 1000, 999]`
+  gives `ClockRollback` with `ca.signs` unchanged; `[n, 1000, 1000, 999]` gives `ClockRollback`, one sign, no leaf. Exact call counts are asserted. *Mutant:
+  sampling `pre_now` before the guard await fails the recorded count.*
 - **F8 privacy.** Store files contain no `ca.private_marker()`, no founder PKCS#8 and no CSR signature bytes. A positive control finds the founder digest bytes.
 - **F9 post-deadline.** The `post_now` call blocks the thread for `ISSUE_BUDGET + 200 ms` (non-preemptible inline work) and then returns a valid time:
   `found` gives `Unavailable`, `ca.signs == 1`, and no leaf. *Mutant: dropping the final elapsed check returns the leaf.*
+- **F10 preflight ownership (B3), deterministic.** The test holds `node.sm.0`'s guard and polls `found` in a biased `select!` until read permits are 7
+  (admission and spawn share that poll). (a) **Caller drop:** then issue permits are 4, read permits 7, `owners.set.len()` 1, `sm_weak` strong count
+  baseline + 1. Eight drops leave 0 read permits and 8 owners; a ninth `found` and `linearizable_state()` give `Busy`, issue permits 4, `ca.signs` 0. (b) **Outer
+  budget:** an undropped `found` gives `Unavailable` after `ISSUE_BUDGET`, issue permits 4, read permits 7. After each, releasing the guard restores 8 permits
+  and the baseline; the node is uninitialized and a following `found` succeeds. (c) **Shutdown:** after one drop, `shutdown` gives `Orphaned(r)` with
+  `owners_waited`, `owners_left`, `read_held` 1, `sm_strong >= 1`; read permits stay 7 until release, then `sm_weak` drops by exactly 1, permits are 8, and
+  `found` gives `Unavailable` (`closed` and `None` store alike). *Mutants: a caller-held permit fails (a); an owner-held one fails (c).*
 - **Pure (`pki/tests.rs`).** For `generate_cluster_id`, deterministic fill bytes pass through, an all-zero fill gives `Rng` and a fill error gives `Rng`.
   `leaf_fits` returns false at `30 d + 59 s` and true at `+ 60 s`, matching `sign_leaf`. `fingerprint` is stable and distinct per CA. Display text has no markers.
 - Existing T1–T4, U6, crash probes, I1–I9 and A0 R1–R5 pass unmodified. Module path `cluster::consensus::issue::found::found_tests` stays outside
@@ -136,8 +162,8 @@ and the state store shows no applied position and `founded() == false`.
 
 ## Parent prerequisites and acceptance limits
 
-- Source starts only after PR161 merges (no merge ahead of it), exact-main CI on that merge SHA is green, and root Sol accepts this corrected contract. F1
-  does not need PR159. It must not change PR159, `work/m3-windows-phase-attribution` (`0a81f12`), the hold policy, or retry/deadline/quarantine state.
+- Source starts only after exact-main CI on PR161's merge `c612152` (run 43880904887) is green and root Sol accepts this corrected contract. F1 does not need
+  PR159. It must not change PR159, `work/m3-windows-phase-attribution` (`0a81f12`), the hold policy, or retry/deadline/quarantine state.
 - Acceptance claims for F1 are limited to single-process founding on a temp directory. There is no multi-host behavior, transport, custody or restartable
   founder key, and nothing is verified on real hardware.
 
@@ -145,8 +171,8 @@ and the state store shows no applied position and `founded() == false`.
 
 - **F2** (after PR159 merges): a real-identity mutual TLS 1.3 handshake between F1's founder leaf and an F5 joiner leaf under PR159 configs, with
   `AuthenticatedPeer` giving 1 and 2 and no `assume`.
-- **Membership workflow:** learner add, catch-up and guarded promotion, using authenticated mem_net identities.
-- **Custody:** CA sealing and node key persistence under the daemon identity, once owner prerequisites exist.
+- **Membership workflow:** learner add, catch-up and guarded promotion over authenticated mem_net identities. **Custody:** CA sealing and node keys
+  under the daemon identity, once owner prerequisites exist.
 - **Endpoint separation** and real sockets; **freshness policy** for control and execution traffic; **remote execution** of a build on another host.
 
 ## Unresolved owner and runtime prerequisites
@@ -160,5 +186,5 @@ and the state store shows no applied position and `founded() == false`.
 
 ## First builder task
 
-Sol (high) implements F1 exactly as above in one PR on the post-PR161 main: the allowlisted files only, all F1–F9 and pure tests, and evidence recording the
+Sol (high) implements F1 exactly as above in one PR on the post-PR161 main: the allowlisted files only, all F1–F10 and pure tests, and evidence recording the
 measured test and Windows times. Opus reviews it against this brief.
