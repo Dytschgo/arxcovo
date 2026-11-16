@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: PR149 Windows U6 fails Orphaned (run43782024400/job133021152770), cause unknown. Sol144 repeats do not reproduce; Opus storage-latency probes reproduce compatible proposal-drain mechanism but not hosted cause. Opus8eea512 diagnostic report accepted by Sol with dependency split: independent main-based proposal/store phase seam first, then A0 read-owner integration on PR149. No deadline/assertion relaxation or claimed fix; finite changed-diagnostic CI budget, no blind reruns.
+
 - 2026-11-16: Opus high b1efd7b retained1f1db75 closes registry R1: each of three guard mutants compiles and fails only its new isolating assertion (108/1); restored cluster109/109 passes, fmt/workspace locked-offline Clippy/diff pass. Coordinator corrects historical coverage overstatement and two test blob pins before publication. No CA/TLS/transport or fullM3 acceptance; exact-head review, five gates and latest exact-main green CI remain required.
 
 - 2026-11-16: Coordinator verifies PR147 five green gates and exact-main0ab5038 latestCI43768671593 success, re-reads main, unwatches and mergesa318ae1 at23:36:01Z. Reviewed9390742/squash trees equal. Registry R1 resumes after merging this checkpoint; Linuxs9c remains unresolved and no native M2 run is authorized.

@@ -1,0 +1,9 @@
+# Sol review: shutdown diagnostic disposition
+
+Reviewed Opus8eea512 against main6e9edd5 and unmerged A0 PR149. Standards/Spec/Security PASS for bounded failure-only attribution, subject to this concrete dependency split. No source fix is inferred; induced slow apply is sufficient but hosted cause is unknown. No build/test ran for this review.
+
+The requested independent PR from main cannot use A0-only read_permits, R5 or APPLY_PAUSE. Main has proposal owners only. The first diagnostic PR therefore reports read_held=0 (no read-owner API on that base), caps owner counts at64, and adds the minimal cfg(test) APPLY_PAUSE hook in adapter.rs for its proposal-drain proof. The source allowlist becomes consensus.rs, consensus/adapter.rs and consensus/three_node.rs; evidence plus retained design/review/PROGRESS follow normal publication practice. It keeps the5s deadline, failure semantics, no detached work and Cluster::stop unwrap unchanged.
+
+Main tests cover a paused one-proposal apply (Owners), an independently held state-store Arc (StoreRelease), and normal shutdown. A0 read-gated R5 assertions and read_held based on its actual semaphore are integrated into PR149 only after the diagnostic parent merges. Each slice gets separate independent Opus review and hosted gates; PR149 remains blocked meanwhile. No artificial EngineEnd outcomes are claimed covered. Report shape assertions demonstrate added observability, not a preexisting behavior fix; reverting the seam must make those assertions fail on missing/misattributed diagnostic data, not merely a compile error.
+
+At most two implementation attempts on the seam, then hand back. At most two changed-diagnostic hosted runs as specified by Opus; no manual rerun to obtain green. A green diagnostic run never proves the natural U6 flake fixed. M2 and all hardware limits remain unchanged, **unverified on real hardware**.
