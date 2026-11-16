@@ -316,7 +316,7 @@ async fn i6_actual_post_wait_clock() {
         let _owner = APPLY_PAUSE_OWNER.lock().await;
         let mut c = Cluster::new(Params::default()).await;
         let l = c.leader().await;
-        for case in 0..5u8 {
+        for case in 0..6u8 {
             let code = code(40 + case);
             let base = NOW + u64::from(case) * 2_000_000;
             c.write(mint(&code, 40 + case, base)).await;
@@ -332,7 +332,7 @@ async fn i6_actual_post_wait_clock() {
                 .await;
                 clock.set(base + 40_000);
             }
-            let point = if case == 1 || case == 2 {
+            let point = if case == 1 || case == 2 || case == 5 {
                 PausePoint::AfterSign
             } else {
                 PausePoint::AfterCommit
@@ -355,7 +355,7 @@ async fn i6_actual_post_wait_clock() {
                 }
                 _ => IssueError::Signer(IssueRefusal::GrantExpired),
             };
-            if case == 4 {
+            if case == 4 || case == 5 {
                 let (apply_entered, apply_wait) = oneshot::channel();
                 let (apply_release, apply_resume) = std::sync::mpsc::channel();
                 *adapter::APPLY_PAUSE.lock().unwrap() = Some(adapter::ApplyPause {
@@ -393,7 +393,7 @@ async fn i6_actual_post_wait_clock() {
             assert!(matches!(task.await.unwrap(),Err(e) if e==expected));
             assert_eq!(
                 ca.signs.load(Ordering::SeqCst),
-                usize::from(case == 1 || case == 2)
+                usize::from(case == 1 || case == 2 || case == 5)
             );
         }
         c.finish().await;
@@ -603,6 +603,69 @@ async fn hook_store_identity_and_admission() {
         drop(permits);
         a.finish().await;
         b.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_record_is_required_even_while_member_remains_authorized() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        let l = c.leader().await;
+        let code = code(91);
+        c.write(mint(&code, 90, NOW)).await;
+        let der = csr();
+        let key = ProvenCsr::parse(&der).unwrap().digest();
+        let response = c
+            .node(l)
+            .propose_response(Command::redeem(
+                code.cluster(),
+                [92; 16],
+                code.code_id(),
+                &code.proof(),
+                key,
+                NOW,
+            ))
+            .await
+            .unwrap();
+        let ticket = c.node(l).committed(response).unwrap();
+        c.node(l)
+            .issue_guard(&ticket, code.code_id(), key)
+            .await
+            .unwrap();
+        let prune = NOW
+            + crate::cluster::enrollment::CODE_TTL_MS
+            + crate::cluster::enrollment::TOMBSTONE_MS;
+        c.write(Command::Remove {
+            cluster: code.cluster(),
+            node: NodeId::new(99).unwrap(),
+            proposed_at_ms: prune,
+        })
+        .await;
+        assert_eq!(
+            c.node(l)
+                .local_authorize(code.cluster(), ticket.node(), key)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            c.node(l).issue_guard(&ticket, code.code_id(), key).await,
+            Err(IssueError::Rejected(Reject::UnknownCode))
+        );
+        c.write(mint(&code, 93, prune)).await;
+        assert_eq!(
+            c.node(l)
+                .local_authorize(code.cluster(), ticket.node(), key)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            c.node(l).issue_guard(&ticket, code.code_id(), key).await,
+            Err(IssueError::Rejected(Reject::Consumed))
+        );
+        c.converge().await;
+        c.finish().await;
     })
     .await
     .unwrap();

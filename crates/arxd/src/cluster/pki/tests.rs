@@ -199,3 +199,37 @@ fn strict_uri_and_static_errors() {
         assert!(!format!("{e} {e:?}").contains("untrusted-marker"));
     }
 }
+
+#[test]
+fn signature_algorithm_parameters_are_refused() {
+    let der = request(&KeyPair::generate().unwrap());
+    let alg = [
+        0x30u8, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+    ];
+    let pos = der.windows(alg.len()).rposition(|w| w == alg).unwrap();
+    assert_eq!(der[0], 0x30);
+    let (hl, len) = match der[1] {
+        0x81 => (3, der[2] as usize),
+        0x82 => (4, ((der[2] as usize) << 8) | der[3] as usize),
+        n if n < 0x80 => (2, n as usize),
+        _ => panic!("length form"),
+    };
+    assert_eq!(hl + len, der.len());
+    let mut body = der[hl..pos].to_vec();
+    body.extend_from_slice(&[
+        0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02, 0x05, 0x00,
+    ]);
+    body.extend_from_slice(&der[pos + alg.len()..]);
+    let n = body.len();
+    let mut out = vec![0x30u8];
+    if n < 0x80 {
+        out.push(n as u8)
+    } else if n < 0x100 {
+        out.extend([0x81, n as u8])
+    } else {
+        out.extend([0x82, (n >> 8) as u8, n as u8])
+    }
+    out.extend(body);
+    let r = ProvenCsr::parse(&out);
+    assert!(matches!(r, Err(CsrError::UnsupportedKey)));
+}
