@@ -283,15 +283,17 @@ impl AuthenticatedPeer {
         if c.is_handshaking() || c.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
             return Err(VerifyRefusal::Incomplete);
         }
-        Self::authenticated_peer(c.peer_certificates())
+        Self::from_verified_certificates(c.peer_certificates())
     }
     pub fn from_server(c: &ServerConnection) -> Result<Self, VerifyRefusal> {
         if c.is_handshaking() || c.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
             return Err(VerifyRefusal::Incomplete);
         }
-        Self::authenticated_peer(c.peer_certificates())
+        Self::from_verified_certificates(c.peer_certificates())
     }
-    fn authenticated_peer(certs: Option<&[CertificateDer<'_>]>) -> Result<Self, VerifyRefusal> {
+    fn from_verified_certificates(
+        certs: Option<&[CertificateDer<'_>]>,
+    ) -> Result<Self, VerifyRefusal> {
         let certs = certs.ok_or(VerifyRefusal::Malformed)?;
         let [cert] = certs else {
             return Err(VerifyRefusal::Malformed);
