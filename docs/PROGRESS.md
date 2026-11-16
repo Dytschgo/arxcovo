@@ -21,7 +21,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-16
 
 - Last merged: PR #154, `9074a85a4e36ba86dadd836e2508a0484ef6eba2` at06:53:45Z; Opus exact-head PASS6909366108 and allfive gates green; reviewed5ba2cf6/squash trees equal. Premerge exactmain58d06c1 CI43815774741 freshlygreen. Explicit component-based timing revision accepted/reproduced publicly in PR body before merge; originalmixed105/49swholejob evidence retained.
-- Current work: await FIRST exact-main CI after C1 merge9074a85, no rerun. Sampler implementation held until green install<=39s/smokespass and job<=500s, or written evidence decision at501–585s; over585/failureheld, install>79reviewedrevert. Windowsquarantine unchanged, M2open/M3unchecked.
+- Current work: publish reviewed S2b explicit-release test barrier repair for exact-head review/five gates. First C1 main9074a85 CI43819925277 is red before install; sampling and feature merges remain held. No C1mainconfirmation, no rerun/nativeexecution; Windowsclusterquarantine/M2open/M3unchecked unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -43,6 +43,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Opushigh563a459/37ec983 independently passes S2b source repair:4S2b/27E6E7S2b/11portableharness,30originalgaterepeats/fmt/diff; oldtimerrestoredproducesexactTimeout+1!=2,forcedcoordinatorpanicdisconnectsworkerwithout hang. Sourcepinall7/manifestverified. Coordinatorpreparespublication; freshheadreview/gates/mainrestorationrequired.
 
 - 2026-11-16: Solhigh711b454/b0fee0a retainedeaae28f/c1902d8 repairs separate S2b test synchronization: explicitrelease instead of elapsed5sheld-barrier expiry,5200mscontrolledregression retainsallgate/Runnerassertions. Natural40/40passes;controlledexactTimeout+1!=2failsbefore/passesafter.4S2b/28guards/11portableharness/fmt/workspaceClippypass,productionunchanged/S2bpinrefreshed. FreshOpusreviewactive;mainredsampler/featuresheld,no nativeexecution.
 
