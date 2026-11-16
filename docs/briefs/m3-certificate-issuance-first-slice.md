@@ -1,11 +1,11 @@
 # Brief: M3 certificate issuance, first slice
 
-Status: **proposed** (Opus 5.5 high, 2026-11-16) on main `6e9edd5` (checkpoint `1ba305d`). Sol reviews this brief before any source work. Nothing here is built
-or run. There is no M3 acceptance, transport, listener, sealed CA, owner keystore, voter membership workflow or real-host claim, and full M3 stays **unverified on
-real hardware**. M2 stays incomplete: A7 is FINAL NO-GO, and the consumed A12 attempt with unconfirmed cleanup gets no retry or native rerun. The settled handoff in
-[the registry brief](m3-enrollment-certificate-next-slice.md#ca-handoff-next-slice-settled-here) and ADR 0005 (amended 2026-11-15) bind this slice. **ADR 0005 is not
-amended.** No new architectural deviation is introduced. Two corrections stay inside the handoff's own scope: the SPKI-source correction (decision 3) and settling
-the certificate lifetime value for the test slice (decision 5).
+Status: **proposed, corrected** (Opus 5.5 high, 2026-11-16, main `6e9edd5`). It closes C1-C3 of the [Sol review](../reviews/m3-certificate-issuance-slice-sol-review.md),
+and Sol rechecks it before any source work. Nothing here is built or run. There is no M3 acceptance, transport, listener, sealed CA, owner keystore, voter
+membership workflow or real-host claim, and full M3 stays **unverified on real hardware**. M2 stays incomplete: A7 is FINAL NO-GO, and the consumed A12 attempt
+with unconfirmed cleanup gets no retry or native rerun. The settled handoff in [the registry brief](m3-enrollment-certificate-next-slice.md#ca-handoff-next-slice-settled-here)
+and ADR 0005 (amended 2026-11-15) bind this slice. **ADR 0005 is not amended**, and no new architectural deviation is introduced. Two corrections stay inside the
+handoff's scope: the SPKI source (decision 3) and the test-slice certificate lifetime (decision 5).
 
 ## Size decision: three PRs, in this order
 
@@ -35,6 +35,10 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
   acknowledgement. That wait starts once RaftCore dequeues the request, so time spent in the queue is unbounded. `get_read_linearizer` and
   `Linearizer::try_await_ready(&raft, Some(d))` return `Ok(Err(state))` on timeout. `ReadLogId::committed_leader_id()` is the **current leader's** (term, node),
   because the read log ID is the max of the leader's noop and the committed ID. `ClientWriteResponse` has pub fields (`log_id`, `data`, `membership`).
+  **Read queue** (`raft_inner.rs`, `raft_core.rs`, `pending_read_queue.rs`): `get_read_linearizer` awaits `tx_api.send(GetLinearizer)` on a **bounded** mpsc
+  (`api_channel_size` 1024 here, shared with writes), then a oneshot. A drop before the send enqueues nothing, and once enqueued **nothing withdraws it**. At dequeue
+  it answers or becomes a `PendingRead` (`deadline = dequeue + wait_timeout`), which drain_satisfied, drain_expired or drain_all_with_error resolves with
+  `tx.send(..).ok()`. A stop gives `Fatal`. `try_await_ready` is a droppable watch wait. Tokio cannot abort a running `spawn_blocking` closure.
 - **rustls 0.23.46.** The default features are `aws_lc_rs`, `logging`, `prefer-post-quantum`, `std` and `tls12`, and `ring`/`std` are separate.
   `WebPkiClientVerifier::builder_with_provider`, `rustls::client::verify_server_cert_signed_by_trust_anchor(&ParsedCertificate, roots, intermediates, now, algs)`
   (which checks no name) and `verify_tls13_signature` are public.
@@ -48,11 +52,25 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
 
 ## Decisions
 
-1. **A0: one total read deadline.** Add `READ_BUDGET = 1500 ms` and `ConsensusNode::fresh_read(f) -> Result<(LeaderId, T), ReadError>`. It sets one `deadline` and
-   puts `timeout_at(deadline, ..)` around `get_read_linearizer(LinearizerOption::new(Some(ZERO), true).with_wait_timeout(READ_BUDGET))`, then
-   `try_await_ready(raft, Some(remaining))`, then the blocking store read (`applied >= read index`, the existing Corrupt check). `Ok(Err(_))`, `Fatal` and an elapsed
-   deadline all map to `Unavailable`. `linearizable_state` becomes a wrapper with an unchanged signature. A dropped linearizer request stays in RaftCore for at most
-   `READ_BUDGET`. Add `ConsensusNode.id: u64`, set in `start`.
+1. **A0: one caller deadline over owned, admission-bounded read units.** Add `READ_BUDGET = 1500 ms`, `READ_PERMITS = 8`, `ReadError::Busy`, `ConsensusNode.id`
+   (set in `start`), a separate `read_permits: Arc<Semaphore>` (proposal permits untouched) and `fresh_read(f) -> Result<(LeaderId, T), ReadError>`, with a pure
+   `f: FnOnce(&StateStore) -> Result<T, StoreError> + Send + 'static` (no await, no Raft call). `linearizable_state` wraps it with an unchanged signature.
+   - **Caller.** Take `deadline = now + READ_BUDGET` first. Then `try_acquire_owned`, else `Busy`. Under the `owners` mutex (check `closed`, else `Unavailable`; reap;
+     spawn; no await), spawn the owned task into `owners.set` with the permit, as `propose` does. Then `timeout_at(deadline, rx)`, where elapsed or dropped is
+     `Unavailable`, and drop `rx`, so a late result is never observable. That one deadline covers queue, quorum, apply and store-lock wait.
+   - **Owned task (keeps the permit until its work actually ends).** (1) If the deadline has passed or `tx.is_closed()`, stop before submitting. (2) Await
+     `get_read_linearizer(LinearizerOption::new(Some(ZERO), true).with_wait_timeout(remaining))` **to completion, with no timeout**, because it is the only signal
+     that an enqueued request has ended. ForwardToLeader→`NotLeader`, QuorumNotEnough→`NoQuorum`, other/Fatal→`Unavailable`. (3) Re-check, then `try_await_ready(raft,
+     Some(remaining))` (`Ok(Err)`/Fatal→`Unavailable`). (4) Re-check, then `spawn_blocking` a closure **owning the permit and the `SmAdapter` clone**: lock, check
+     `applied >= read index` (else `Corrupt`), run `f`, and drop the guard, Arc and permit in that order (#147). Await it, then `tx.send(..).ok()`.
+   - **Honest limits.** The deadline bounds **caller waiting only**, not queue residence or the blocking closure. OpenRaft 0.10.0 cannot withdraw an enqueued read: it
+     lives until dequeue (not time-bounded here; it depends on RaftCore progress), then at most `remaining` as a `PendingRead`, or until leadership loss or stop. A
+     store read lasts as long as the lock holder. **Bounded:** at most `READ_PERMITS` units per node exist anywhere (queue, pending set, apply wait, blocking pool),
+     because a permit returns only after the engine reply or the closure finishes. Excess callers get `Busy` before submitting. Nothing detaches silently: an
+     abort happens only after `closed`, and if RaftCore did not stop, shutdown reports `Orphaned`.
+   - **No deadlock or shutdown overclaim.** All acquisitions (issuing, then proposal, then read) use `try_acquire`. No mutex is held across an await, and apply and
+     reads share only the store mutex, on blocking threads. A wedged RaftCore yields `Busy`, not leaks. Shutdown keeps `closed`, `try_shutdown` (engine units resolve
+     `Fatal`), the 5 s drain, `abort_all` and the weak check. A unit still in its closure gives `Err(Orphaned)` in time: responsiveness, not hard termination.
 2. **Commit evidence: a reviewed adapter, with no claim of forgery-proofing.** `propose` delegates to a private `propose_response(cmd) -> Result<ClientWriteResponse<Arx>,
    ProposeError>`. The new private module `consensus/issue.rs` alone holds `fn committed(&self, resp: ClientWriteResponse<Arx>) -> Result<Commit, IssueError>`. It
    requires `resp.log_id.leader_id.node_id == self.id` (`WrongNode`) and `Outcome::Enrolled(grant)`, and records `(term, node, index)`. Each guard requires the
@@ -73,40 +91,49 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
    and for every accepted CSR the value is identical.
 4. **Ephemeral CA (`cluster/pki/ca.rs`).** `ClusterCa { issuer: rcgen::Issuer<'static, KeyPair>, cert_der, not_after_s }` has no Debug, Clone, serialize, load or
    save. **`ClusterCa::ephemeral(cluster, now_ms)` is `#[cfg(test)]`**, so production builds contain no CA constructor and no real private key can enter. It uses a P-256
-   key, `IsCa::Ca(Constrained(0))`, KU keyCertSign+cRLSign, CN `arxcovo test cluster CA` with no owner data, and a validity of `now-60 s ..= now+1 day`. Only the
-   leader (by definition a voter, never a learner) signs. Key bytes never reach entries, forwards, state, snapshots, logs, evidence or MCP.
+   key, `IsCa::Ca(Constrained(0))`, KU keyCertSign+cRLSign, CN `arxcovo test cluster CA` (no owner data) and test validity `ca_nb = floor_s(now) - 120 s ..= ca_nb
+   + 31 d`. It contains every decision 5 leaf whose signer time is in `[ca_now - 60 s, ca_now + 1 d - 60 s]` (all engine tests; `CODE_TTL_MS` is 15 min). The
+   `#[cfg(test)] ephemeral_with_validity` gives the near-expiry control. This is test arithmetic, **not production CA policy.** Only the leader (a voter) signs.
+   Key bytes never reach entries, forwards, state, snapshots, logs, evidence or MCP.
 5. **Leaf parameters, built only by the signer.** `IsCa::NoCa` (explicit CA:false is not required), KU digitalSignature, EKU exactly {serverAuth, clientAuth}, an empty
    subject, and exactly one SAN URI `arxcovo://cluster/<32 lowercase hex>/node/<decimal id>` from the ticket. The serial is 16 `getrandom` bytes with the top bit
    cleared and bit 6 set. Validity: `not_before = floor_s(signer_now) - 60 s` (2×`SKEW_MS`), `not_after = not_before + 30 days`. If `not_after` exceeds the CA's, the
-   result is `CaExpiring`. The DER must be ≤ 4096 B. `pki::node_uri`/`parse_node_uri` are strict: lowercase hex only, no leading zeros, id ≥ 1, no trailing bytes.
-   **Why 30 days:** verifiers check expiry on their local clock, so a removed member's leaf stops working on an isolated, stale verifier within at most 30 days. That
-   bounds the stale-acceptance window, though it adds no freshness guarantee. Renewal and rotation are not built, and an expired member fails closed. Production
-   lifetime and renewal are decided before production wiring.
+   result is `CaExpiring`, with nothing signed. The DER must be ≤ 4096 B. `pki::node_uri`/`parse_node_uri` are strict: lowercase hex only, no leading zeros,
+   id ≥ 1, no trailing bytes. **Stale-acceptance bound.** A returned leaf was signed at true time `T_s` (signer reading `s`), and guard 2's later ReadIndex still saw
+   the member, so any Remove commits after `T_s`. A verifier accepts while its clock reads `<= not_after <= s + 30 d - 60 s`. **Under the unenforced assumption** that
+   signer and verifier clocks differ by ≤ `SKEW_MS` (30 s), an isolated stale verifier stops by `T_s + 30 d - 30 s`. Conservatively: **≤ 30 days + `SKEW_MS` after
+   signing, and so after removal.** A clock outside the assumption accepts without bound. This is a test-slice ceiling, **not** production revocation freshness;
+   renewal and rotation are not built, an expired member fails closed, and production lifetime is decided before production wiring.
 6. **Issue path (`ConsensusNode::enroll(&self, ca, clock: &dyn SignerClock, input: RedeemInput, csr: &[u8]) -> Result<IssuedLeaf, IssueError>`).** The whole call
    runs under `ISSUE_BUDGET = 5 s`. A `try_acquire` on `MAX_ISSUING = 4` permits returns `Busy` when none is free. Steps:
-   1. Parse the CSR (decision 3) **before** proposing.
-   2. Propose `Command::redeem(.., &proof, csr.digest(), clock.now_ms())`, then drop the proof.
-   3. Call `committed`.
-   4. Guard 1 (`fresh_read`): leadership equality; `EnrollmentState::check_grant(&grant, &code)`, which requires a present record consumed by exactly (request, key,
-      node) and `authorize_peer(grant)`; `grant.key() == csr.digest()`; `check_issuable(pre_now)`.
-   5. Sign with `pre_now`.
-   6. Guard 2 is the same check with a new ReadIndex and `post_now`, plus `post_now >= pre_now` (`ClockRollback`).
-   7. Only then return `IssuedLeaf { der, node }`. A failed guard drops the DER unreturned.
+   1-3. Parse the CSR (decision 3) **before** proposing. Propose `Command::redeem(.., &proof, csr.digest(), clock.now_ms())` (proposal data, never a guard time),
+      drop the proof, then call `committed`.
+   4. Guard 1: `fresh_read`, whose returned leader must equal `commit.leader` and whose `f` runs `check_grant(&grant, &code)` (a present record consumed by exactly
+      (request, key, node)) and `authorize_peer(grant)`, plus `grant.key() == csr.digest()`. **Only after it returns** (queue, quorum, apply and store waits done),
+      sample `pre_now` and run `check_issuable(pre_now)`. Then (5) sign with that `pre_now`, with no await in between.
+   6. Guard 2: the same `fresh_read` with a new ReadIndex. Only then sample `post_now`, run `check_issuable(post_now)` and require `post_now >= pre_now`
+      (`ClockRollback`). No clock value sampled before a wait is used after it. (7) Only then return `IssuedLeaf { der, node }`. A failed guard drops the DER.
    `IssueError` = `Busy | NotLeader(Option<u64>) | Unavailable | BadCsr(CsrError) | Rejected(Reject) | WrongNode | StaleIssuer | Revoked | Signer(IssueRefusal) |
-   ClockRollback | CaExpiring | Sign`. Display text is static. `joiner_reply()` collapses to the existing `JoinerReply`, where `NotLeader`, `Unavailable`, `Busy` and
-   `StaleIssuer` map to `RetryLater`. Nothing is cached between guards, and no endpoint or owner approval exists. A follower gets `NotLeader` with nothing appended.
-   An `ISSUE_BUDGET` timeout leaves the write's outcome unknown, so the caller retries the same request, which is idempotent.
+   ClockRollback | CaExpiring | Sign`, and `ReadError::Busy` becomes `Busy`. Display text is static. `joiner_reply()` maps `NotLeader`, `Unavailable`, `Busy` and
+   `StaleIssuer` to `RetryLater` in the existing `JoinerReply`. Nothing is cached between guards, and no endpoint or owner approval exists. A follower gets
+   `NotLeader` with nothing appended. An `ISSUE_BUDGET` timeout leaves the outcome unknown, so the caller retries the same idempotent request. Abandoned read units
+   stay owned and permit-bounded.
 7. **Staleness stays as ADR 0005 states.** `authorize_peer` is local and its staleness is unbounded. It is insufficient for control or execution traffic. B uses it
    only for Raft peer TLS, so peers never need a quorum to form one. Fresh quorum checks exist only inside issuance.
 
 ## PR A0 files and tests
 
-`consensus.rs` (`fresh_read`, `id`), `consensus/adapter.rs` (a `#[cfg(test)]` async `APPLY_PAUSE` keyed by the `SmAdapter` Arc pointer, awaited **before** `run`, so
-it holds no lock), and `consensus/three_node.rs`. The tests run on actual OpenRaft with `mem_net` under `timeout(45 s)`:
-- **R1.** Pause the leader's apply. A write commits on the followers. `linearizable_state()` on the leader returns `Unavailable` within ≤ 2.5 s. Before the fix it
-  hangs until the test's 4 s timeout, so the test fails by construction. After release, the write and the read succeed and `converge` holds.
-- **R2.** On an isolated leader the read returns `NotLeader`/`NoQuorum` within ≤ 2.5 s.
-- All existing tests pass unchanged.
+`consensus.rs` (`fresh_read`, `id`, `read_permits`, `Busy`), `consensus/adapter.rs` (`#[cfg(test)]` async `APPLY_PAUSE` keyed by the `SmAdapter` Arc pointer,
+awaited **before** `run`, so it holds no lock) and `three_node.rs`. No new dependencies. Actual OpenRaft, `mem_net`, `timeout(45 s)`. The **store gate** is a
+`std::thread` holding the leader's `SmAdapter` mutex until an mpsc release (never a Tokio worker). R1 and R3 hang past the old 4 s test timeout before the fix:
+- **R1 apply wait.** Pause the leader's apply, then commit a write on the followers. The leader's `linearizable_state()` gives `Unavailable` in ≤ 2.5 s. Release,
+  and the write and a read succeed and `converge` holds. **R2:** an isolated leader gives `NotLeader`/`NoQuorum` in ≤ 2.5 s, and all permits return in 2.5 s.
+- **R3 store wait.** With the gate held, `Unavailable` in ≤ 2.5 s, while a concurrent `interval(10 ms)` counts ≥ 50 ticks. Still gated, `available_permits() ==
+  READ_PERMITS - 1` because the closure owns its unit. Release: the permit returns in 1 s, the late result is never delivered, and the next read is current.
+- **R4 admission and cancel.** Gated: start `READ_PERMITS` reads and abort one caller early. The next call is `Busy` in ≤ 50 ms before any spawn, and the 64 proposal
+  permits are unchanged. No aborted caller frees its permit early. Release, and all units return in 2 s with `owners.set` reaped.
+- **R5 shutdown.** (a) Units in flight on an isolated leader: `shutdown()` is `Ok(())` in ≤ 5.5 s. (b) Gated with a unit in its closure: `Err(Orphaned)` in ≤ 5.5 s,
+  not a hang. After release, the store Arcs drop in 2 s. All existing tests pass unchanged.
 
 ## PR A files and tests (Sol high; Cargo adds only the pins below)
 
@@ -130,7 +157,9 @@ it holds no lock), and `consensus/three_node.rs`. The tests run on actual OpenRa
 - **Untrusted CSR fields are discarded.** A CSR asking for CA:unconstrained, keyCertSign, EKU any/codeSigning, a DNS SAN, a foreign-cluster URI and a CN is accepted.
   The issued leaf has none of these: no CA, KU digitalSignature only, EKU exactly {serverAuth, clientAuth}, one SAN for the ticket's node, an empty subject.
 - **Leaf.** It verifies under the CA SPKI and fails under a second CA. Its SPKI raw equals the CSR's. Validity is exact to the second. Two issues give distinct
-  positive 16-byte serials. `CaExpiring` fires. The DER is ≤ 4096 B.
+  positive 16-byte serials. The DER is ≤ 4096 B.
+- **CA arithmetic (C1).** Containment needs `validity >= 30 d + 60 s + (floor_s(signer) - floor_s(ca_now))`. `ephemeral` (31 d) issues at whole-second `ca_now` and
+  `ca_now + 1 d - 60 s` (both fail under a 1-day CA). Near-expiry control: `30 d + 59 s` gives `CaExpiring` (sign counter 0), and `30 d + 60 s` issues.
 - URI parse rejects uppercase, leading zeros, 0, trailing `/`, overlong input and other schemes.
 - `check_grant` matrix: pruned record, different request/key/node, removed, wrong cluster, and current.
 - Error Display/Debug output contains no input marker.
@@ -145,7 +174,8 @@ it holds no lock), and `consensus/three_node.rs`. The tests run on actual OpenRa
   budget, with no leaf. Retrying the same request and CSR on the new leader issues the same node ID (`replay`). Heal and converge.
 - **I5 Remove between guards.** Pause AfterSign, `write(Remove(4))`, resume. The result is `Revoked` with no leaf, and a later retry gives `Rejected(Revoked)`.
 - **I6 signer time.** `FakeClock` produces `GrantExpired` before signing (a test-only sign counter stays 0). Advancing past expiry during AfterSign gives guard 2
-  `GrantExpired`. Rolling back gives `ClockRollback`. A future-dated committed command makes `applied_ms` large and gives `SignerClockBehind`.
+  `GrantExpired`. Rolling back gives `ClockRollback`. A future-dated committed command makes `applied_ms` large and gives `SignerClockBehind`. **No cached time:**
+  advance the clock past expiry while guard 1's `fresh_read` waits on `APPLY_PAUSE`, and the result is `GrantExpired` with the sign counter at 0.
 - **I7 adapter units.** A crafted response from another node gives `WrongNode`, a non-Enrolled response gives `Rejected`, a term or node mismatch gives
   `StaleIssuer`, and a ticket key ≠ CSR digest is refused.
 - **I8 Remove after issue.** Issue node 4, then mark follower F isolated (it stays running). Commit `Remove(4)`. The leader and the other follower refuse
