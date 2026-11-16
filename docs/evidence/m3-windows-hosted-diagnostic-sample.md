@@ -103,3 +103,11 @@ PROGRESS was rebuilt from the known-good UTF-8 bytes at `a38ae7a`, retaining exa
 ## Publication checkpoint
 
 Sol full source review retained `a38ae7a` and complementary Opus final correction recheck retained `45ecc1a` now pass together. The original local-only status above is a dated builder report. Publication adds the settled brief/contract review and repaired-main C1 admission checkpoint already in the local base, along with this implementation and its review history. Production Rust, Cargo, quarantines and existing gate values are unchanged. Latest exact main `87c994048efd660dce279a847c0bd233a888d06c` run `43823823164` was read again and is green. Fresh exact-head publication review and hosted results remain pending; no hosted sampler result is claimed.
+
+## First hosted sample and merge
+
+PR156 head `c9cfaa0a1ca95a9cf71772239f378f6b45157572`: five required gates green, exact-head Sol PASS comment6911877734 and agent-review status59008101439. Coordinator re-read live main `87c9940` and latest exact-main CI43823823164 success immediately before merge. Squash `a18e95c20b7340127d746fb3632f3b0eab32e586`, merged 2026-11-16T09:01:40Z, has the same tree `4c9348ecd1408e55644fc028159dbbca9cb53619` as the reviewed head.
+
+Windows run43834877637/job133188912061 took476s (08:53:09–09:01:05Z); nextest step287s, Playwright install7s, both smokes green. The final sample step took33s; wrapper reported `all_pass`, nextest0, wall32047ms, list703ms, run31328ms, cleanup0ms, orphans0, admission E452s. All eight test kinds were pass. This was a real hosted sample, not skipped, but grants no fix/re-enable credit.
+
+Typed summaries show Store candidates, natural per-fixture maxima such as T1 Apply394ms and T2 Append254ms, and small worst timer lag14–20ms. Leadership changes were recorded; induced R6 apply delay5132ms is not natural latency evidence. Those summaries alone do not attribute the historical failure or establish stable leadership. The quarantine and original failure record remain. New exact-main run43836099670 on the squash is pending; no green-main claim yet and no further feature merge before it succeeds.
