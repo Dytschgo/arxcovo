@@ -42,6 +42,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus3f15736 independently passes Solobservercorrection:69defaultconsensus/3controls/fmt/workspaceClippy, two compilable panic-swallow mutants fail. SolfullD1source review closesPASS. Prepare test-only diagnostic publication, no hosted sampling or productionfix/quarantinechange; M3uncheckedWindowsunverified/M2open.
+
 - 2026-11-16: OpusD1 commits6b70689/01a2e0d/fb84986 retained73cae0c/97430a5/8dd128b implement bounded test-only diagnostics, three opt-in controls and20green naturaliterations (nohostedrepro/fix). Solreview finds observerJoinErrorloss; smallf426eb5correction joinsallobservers then surfacespanic,9units/3controls/lockedarxdClippy/fmtdiff pass. ComplementaryOpusreviewactive;nohostedsampling/workflow/quarantinechange or re-enable.
 
 - 2026-11-16: Exact-main6f6e9d2 CI43809711957 success confirmed live; quarantine restoration prerequisite met. Opusd3e2a02 retained1bdad09 recovery plan receives Sol contract review with owned bounded telemetry, honest metrics limits, controlled red-capable probes and local-loop cap; workflow sampling deferred under12minjobbudget. Opus D1 next, no fourthSolfix or Windowscoveragecredit.

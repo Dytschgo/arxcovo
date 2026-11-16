@@ -11,3 +11,7 @@ R1: watch() discarded finished JoinHandles without joining; close() ignored Join
 Security: PASS on content boundaries: only IDs/indexes/timing/counters/enums reach output; raw store addresses only index the internal registry, never render. No secret/code/SQL/path payloads are stored or printed. All changes are test-only and controls do not invoke M2 fixtures. stdout/stderr delivery is not a hard nonblocking OS guarantee; try-lock rendering avoids application mutex stalls.
 
 Reusable evidence: Opusfmt/workspaceClippy/default68consensus/threecontrols and20natural iterations are reported as its actual runs, not coordinator reruns. Coordinator correction verification remains pending at this review checkpoint. Production/shared-helper semantics remain unchanged; M2 open, M3 unchecked, Windows three-node unverified on hosted Windows and **unverified on real hardware**.
+
+## Closure
+
+R1 is closed by Solf426eb5 and complementary Opus3f15736 review. Opus independently ran69 default consensus tests and three controls, and two compilable old-close/removed-assert mutants fail the new regression. Root separately ran9 diagnostic units/3controls/lockedarxdClippy/fmtdiff, recorded in evidence. Standards PASS, Spec PASS, Security PASS for D1 test-only source. No hosted sampling, product fix, quarantine removal or hardware acceptance is approved. Fresh exact-head publication review and five green gates remain required.
