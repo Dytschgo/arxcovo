@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT)))
 
 # --- Fixed bounds (seconds) -------------------------------------------------------
 STEP_S = 90.0          # one absolute wrapper deadline D = start + 90 s
+VALIDATION_S = 2.0
 LIST_S = 20.0
 RUN_S = 60.0
 CLEANUP_RESERVE_S = 8.0
@@ -76,7 +77,7 @@ OUTCOMES = ("all_pass", "diag_fail", "diag_unparsed", "diag_incomplete",
             "skipped_budget", "skipped_event", "cancelled", "guard")
 GUARDS = ("anchor", "platform", "reparse", "job", "spawn", "cleanup", "list_exit",
           "list_parse", "inventory", "deadline_list", "nextest_exit", "junit_missing",
-          "junit_type", "junit_inventory", "internal")
+          "junit_type", "junit_inventory", "deadline", "internal")
 KINDS = ("pass", "fail", "abort", "timeout", "leak", "exec_fail", "not_run")
 
 U8, U16, U32, U64 = 2**8 - 1, 2**16 - 1, 2**32 - 1, 2**64 - 1
@@ -819,8 +820,8 @@ def _nap(clock, until):
     clock.sleep(max(0.0, min(POLL_S, until - clock.monotonic())))
 
 
-def _wait_exit(proc, clock, seconds):
-    end = clock.monotonic() + seconds
+def _wait_exit(proc, clock, seconds, deadline=float("inf")):
+    end = min(clock.monotonic() + seconds, deadline)
     while True:
         if proc.poll() is not None:
             return True
@@ -829,7 +830,7 @@ def _wait_exit(proc, clock, seconds):
         _nap(clock, end)
 
 
-def _reap_unassigned(proc, clock):
+def _reap_unassigned(proc, clock, deadline=float("inf")):
     """Kill our own blocked child (never in the job) and wait <= 2 s."""
     try:
         if proc.stdin is not None:
@@ -840,18 +841,23 @@ def _reap_unassigned(proc, clock):
         proc.kill()  # TerminateProcess on this wrapper's own Popen handle
     except OSError:
         pass
-    if not _wait_exit(proc, clock, UNASSIGNED_REAP_S):
+    if not _wait_exit(proc, clock, UNASSIGNED_REAP_S, deadline):
         raise Guard("cleanup")
 
 
-def run_phase(api, spawner, clock, cancel, phase, privdir, deadline):
+def run_phase(api, spawner, clock, cancel, phase, privdir, deadline, cleanup_deadline=None):
     """Spawn -> assign -> IsProcessInJob -> cancel check -> go; then bounded cleanup."""
+    cleanup_deadline = deadline + CLEANUP_RESERVE_S if cleanup_deadline is None else cleanup_deadline
+    if clock.monotonic() >= deadline:
+        return Phase("killed")
     try:
         job = api.create()
     except Exception:
         raise Guard("job") from None
     try:
         start = clock.monotonic()
+        if start >= deadline:
+            return Phase("killed")
         try:
             proc = spawner.spawn(phase, privdir)
         except Exception:
@@ -866,12 +872,14 @@ def run_phase(api, spawner, clock, cancel, phase, privdir, deadline):
                 reason = "job"  # child already reaped before go
             elif cancel.is_set():
                 reason = "cancelled"
+            elif clock.monotonic() >= deadline:
+                reason = "killed"
         except Exception:
             reason = "job"
         if reason is not None:
-            _reap_unassigned(proc, clock)
-            if reason == "cancelled":
-                return Phase("cancelled", ms=_ms(start, clock.monotonic()))
+            _reap_unassigned(proc, clock, cleanup_deadline)
+            if reason in ("cancelled", "killed"):
+                return Phase(reason, ms=_ms(start, clock.monotonic()))
             raise Guard(reason)
         try:
             proc.stdin.write(b"G")
@@ -900,9 +908,9 @@ def run_phase(api, spawner, clock, cancel, phase, privdir, deadline):
             api.terminate(job)  # exactly once per phase
         except Exception:
             pass
-        if not _wait_exit(proc, clock, CHILD_EXIT_S):
+        if not _wait_exit(proc, clock, CHILD_EXIT_S, cleanup_deadline):
             raise Guard("cleanup")
-        until = clock.monotonic() + ACTIVE_POLL_S
+        until = min(clock.monotonic() + ACTIVE_POLL_S, cleanup_deadline)
         while True:
             try:
                 left = api.active(job)
@@ -961,6 +969,7 @@ def sample(ctx, rep, start):
         require(fs, d, ("dir", "missing"))
     junit = os.path.join(tdirs[-1], JUNIT_NAME)
     require(fs, junit, ("file", "missing"))
+    check_deadline(clock, start + VALIDATION_S)
     e, admitted = admission(check_anchor(env.get("ARX_DIAG_T0"), clock.time()))
     rep.e_s = e
     if not admitted:
@@ -978,7 +987,7 @@ def sample(ctx, rep, start):
         require(fs, privdir, ("dir",))
         now = clock.monotonic()
         lp = run_phase(api, ctx.spawner, clock, ctx.cancel, "list", privdir,
-                       min(now + LIST_S, deadline - CLEANUP_RESERVE_S))
+                       min(now + LIST_S, deadline - CLEANUP_RESERVE_S), deadline)
         rep.list_ms, rep.cleanup_ms, rep.orphans = lp.ms, lp.cleanup_ms, lp.orphans
         if lp.status == "cancelled":
             rep.outcome = "cancelled"
@@ -991,6 +1000,7 @@ def sample(ctx, rep, start):
         if require(fs, listing, ("file", "missing")) == "missing":
             raise Guard("list_parse")
         check_inventory(fs.read_capped(listing, READ_CAP), expected, root)
+        check_deadline(clock, deadline - CLEANUP_RESERVE_S)
         if require(fs, junit, ("file", "missing")) == "file":
             fs.unlink(junit)
         if ctx.cancel.is_set():
@@ -998,7 +1008,7 @@ def sample(ctx, rep, start):
             return rep
         now = clock.monotonic()
         rp = run_phase(api, ctx.spawner, clock, ctx.cancel, "run", privdir,
-                       min(now + RUN_S, deadline - CLEANUP_RESERVE_S))
+                       min(now + RUN_S, deadline - CLEANUP_RESERVE_S), deadline)
         rep.run_ms = rp.ms
         rep.cleanup_ms += rp.cleanup_ms
         rep.orphans += rp.orphans
@@ -1019,13 +1029,27 @@ def sample(ctx, rep, start):
         rep.outcome, rep.tests = parse_junit(fs.read_capped(junit, READ_CAP), rp.rc)
         return rep
     finally:
-        for p, rm in ((os.path.join(privdir, LIST_NAME), fs.unlink),
-                      (junit, fs.unlink), (privdir, fs.rmdir)):
+        failed = False
+        for p, kind, rm in ((os.path.join(privdir, LIST_NAME), "file", fs.unlink),
+                            (junit, "file", fs.unlink), (privdir, "dir", fs.rmdir)):
             try:
-                if fs.kind(p) in ("file", "dir"):
+                actual = fs.kind(p)
+                if actual == kind:
                     rm(p)
+                elif actual != "missing":
+                    failed = True
             except Exception:
-                pass
+                failed = True
+        if failed:
+            raise Guard("cleanup")
+        check_deadline(clock, deadline)
+
+
+def check_deadline(clock, deadline):
+    # Synchronous OS/interpreter stalls cannot be preempted. Refuse subsequent
+    # work and successful reporting once control returns after the deadline.
+    if clock.monotonic() >= deadline:
+        raise Guard("deadline")
 
 
 def run(ctx, start=None):
@@ -1035,11 +1059,17 @@ def run(ctx, start=None):
     try:
         try:
             sample(ctx, rep, start)
+            check_deadline(ctx.clock, start + STEP_S)
         except Guard as g:
             rep.outcome, rep.guard = "guard", g.reason
             rep.tests = []
         rep.wall_ms = _ms(start, ctx.clock.monotonic())
-        return (1 if rep.guard else 0), render(rep)
+        lines = render(rep)
+        if not rep.guard and ctx.clock.monotonic() >= start + STEP_S:
+            rep.outcome, rep.guard, rep.tests = "guard", "deadline", []
+            rep.wall_ms = _ms(start, ctx.clock.monotonic())
+            lines = render(rep)
+        return (1 if rep.guard else 0), lines
     except BaseException:
         return 1, [LINE_PREFIX + "guard reason=internal"]
 

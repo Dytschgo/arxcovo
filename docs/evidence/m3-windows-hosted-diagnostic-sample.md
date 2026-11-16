@@ -81,3 +81,13 @@ All of these ran on this Windows 11 dev host with Python 3.12.10, cargo-nextest 
 ## Branch note
 
 `work/m3-windows-hosted-sample` is checked out in the coordinator's main checkout at `50087fe` and was not touched. These commits sit on the implementation worktree branch `t3/hosted-diagnostic-sample`, a fast-forward of `50087fe`.
+
+## Sol review corrections (2026-11-16)
+
+Independent Sol review `fc6add5` (retained `a38ae7a`) blocked publication on B1 (late launch/finalization) and B2 (suppressed file cleanup errors). Coordinator Sol corrected both without changing Rust, quarantine, test selection, workflow scheduling or any existing timeout value.
+
+The common deadline now bounds launch admission, the go decision, process cleanup polling and finalization. Validation is checked against its 2 s allowance. Expired synchronous operations cannot be interrupted by Python; once they return, subsequent work and success reporting are refused. Mandatory owned-child termination and owned-file cleanup are still attempted, including after expiry. The closed integrity reason `deadline` is added; a test run killed at its ordinary phase deadline remains diagnostic `diag_incomplete`.
+
+Final cleanup attempts each fixed owned path, rejects unexpected path kinds without deleting them, and reports `cleanup` if any removal fails. Raw JUnit retention can therefore no longer accompany `all_pass`. No recursive deletion is used.
+
+Before source correction, four new regression methods failed on the old implementation: delayed validation, expired inventory, expired launch and failed final cleanup. After correction, 55 pure sampler tests pass, including assignment expiry and cleanup polling under the common deadline; 29 Node tests and the unchanged quarantine guard pass. `git diff --check` passes. Logs: `D:/Temp/arx-sampler-red.log`, `D:/Temp/arx-sampler-corrected.log`, `D:/Temp/arx-sampler-node.log`, `D:/Temp/arx-sampler-guard.log`. These are coordinator runs, separate from the original Opus evidence. No new native wrapper/Job Object controls or full npm/UI test were run. Fresh complementary Opus review is required for these Sol changes. Hosted behavior remains unverified.

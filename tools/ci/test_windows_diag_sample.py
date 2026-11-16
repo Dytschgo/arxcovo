@@ -658,6 +658,87 @@ class OwnershipTests(unittest.TestCase):
 
 
 class OutcomeTests(unittest.TestCase):
+    def test_expired_launch_never_sends_go(self):
+        for phase in ("list", "run"):
+            h = Harness()
+            spawn = h.spawner.spawn
+            def delayed(p, d):
+                proc = spawn(p, d)
+                if p == phase:
+                    h.clock.sleep(95)
+                return proc
+            h.spawner.spawn = delayed
+            self.assertEqual(h.run()[0], 1)
+            self.assertIsNone(h.spawner.procs[-1].go_at)
+            self.assertEqual(h.spawner.procs[-1].kills, 1)
+
+    def test_expired_assignment_reaps_without_go(self):
+        h = Harness()
+        h.api.on_assign = lambda: h.clock.sleep(95)
+        self.assertEqual(h.run()[0], 1)
+        self.assertIsNone(h.spawner.procs[0].go_at)
+        self.assertEqual(h.spawner.procs[0].kills, 1)
+
+    def test_phase_cleanup_poll_uses_common_deadline(self):
+        h = Harness(run_s=None, api_kwargs={"active": [1]})
+        # A live owned child still must be killed, even with no wait budget.
+        h.spawner.makers["run"] = lambda: FakeProc(h.clock, run_s=None)
+        with self.assertRaises(w.Guard) as caught:
+            w.run_phase(h.api, h.spawner, h.clock, h.cancel, "run", PRIV,
+                        h.clock.t + 1, h.clock.t + 2)
+        self.assertEqual(caught.exception.reason, "cleanup")
+        self.assertLessEqual(h.clock.t, 1002.0001)
+        self.assertEqual(h.api.terminated, 1)
+        self.assertEqual(h.api.closed, 1)
+
+    def test_expired_inventory_never_starts_run(self):
+        h = Harness()
+        read = h.fs.read_capped
+        def delayed(p, cap):
+            data = read(p, cap)
+            if p == LISTING:
+                h.clock.sleep(82)
+            return data
+        h.fs.read_capped = delayed
+        self.assertEqual(h.run()[0], 1)
+        self.assertNotIn("spawn:run", h.log)
+
+    def test_delayed_validation_final_read_and_cleanup_cannot_pass(self):
+        for where in ("validation", "junit", "cleanup"):
+            h = Harness()
+            read, remove = h.fs.read_capped, h.fs.rmdir
+            def delayed(p, cap):
+                data = read(p, cap)
+                if ((where == "validation" and p.endswith(w.GUARD_REL[-1]))
+                        or (where == "junit" and p == JUNIT)):
+                    h.clock.sleep(95 if where == "junit" else 3)
+                return data
+            def delayed_remove(p):
+                remove(p)
+                h.clock.sleep(95)
+            h.fs.read_capped = delayed
+            if where == "cleanup":
+                h.fs.rmdir = delayed_remove
+            self.assertEqual(h.run()[0], 1)
+            self.assertEqual(h.field("outcome"), "guard")
+            if where == "validation":
+                self.assertFalse(h.spawner.procs)
+
+    def test_failed_final_cleanup_gates_and_attempts_remaining_paths(self):
+        for failed in (LISTING, JUNIT, PRIV):
+            h = Harness()
+            unlink, rmdir = h.fs.unlink, h.fs.rmdir
+            attempts = []
+            def remove(p):
+                attempts.append(p)
+                if p == failed:
+                    raise PermissionError("private")
+                (rmdir if p == PRIV else unlink)(p)
+            h.fs.unlink = h.fs.rmdir = remove
+            self.assertEqual(h.run()[0], 1)
+            self.assertEqual(h.field("outcome"), "guard")
+            self.assertEqual(attempts[-3:], [LISTING, JUNIT, PRIV])
+
     def test_all_pass_exit_zero_and_order(self):
         h = Harness()
         code, lines = h.run()
@@ -712,9 +793,16 @@ class OutcomeTests(unittest.TestCase):
                 self.assertLessEqual(int(h.field("run_ms")), 60_000)
 
     def test_run_deadline_is_clipped_by_absolute_step_budget(self):
-        # 10 s already spent before list (slow validation): D - 8 s binds before run + 60 s.
+        # 10 s inventory processing: D - 8 s binds before run + 60 s.
         h = Harness(run_s=None, list_kwargs={"run_s": 19.0})
-        code, h.lines = w.run(h.ctx, start=h.clock.t - 10.0)
+        read = h.fs.read_capped
+        def delayed(p, cap):
+            data = read(p, cap)
+            if p == LISTING:
+                h.clock.sleep(10)
+            return data
+        h.fs.read_capped = delayed
+        code, h.lines = w.run(h.ctx)
         self.assertEqual((code, h.field("outcome")), (0, "diag_incomplete"))
         self.assertLessEqual(int(h.field("wall_ms")), 90_000)
         self.assertAlmostEqual(int(h.field("run_ms")), 72_000 - 19_000, delta=300)
