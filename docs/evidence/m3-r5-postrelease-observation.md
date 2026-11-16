@@ -153,3 +153,15 @@ No previous target was used or deleted.
   No implementation correction was spent: `c49f297` is a pre-review test
   addition. M2 open, M3 unchecked, eight Windows quarantines unchanged.
   Hardware paths are **unverified on real hardware**.
+
+
+## Coordinator publication checkpoint
+
+Independent Sol high review831dd66 passes Standards, Spec and Security with zero
+findings at f0b9418. It ran four pure units, three quarantine/config guards,
+58sampler tests, fmt and diff checks; the one natural R5 control is reused.
+Merge84b8269 adds only root's final failure/capacity evidence and PROGRESS notes;
+the four implementation/config/guard files remain byte-identical to f0b9418.
+Publication requests new-head platform checks, not merge authority. Exact main
+c612152 is red and its1475s run fails ci-time-budget. No ci-speed label, waiver,
+rerun, historical-flake fix or Windows stability credit is claimed.
