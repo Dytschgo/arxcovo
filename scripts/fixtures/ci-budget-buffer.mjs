@@ -39,7 +39,7 @@ function response(path, args) {
   if (path === 'actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100') {
     return { workflow_runs: [run(19, 1), run(20, 1, {run_attempt: 2})], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
   }
-  if (path === 'actions/runs/20/attempts/1') return run(20, scenario === 'fast-main' ? 800 : 1200, scenario === 'attempt2-main' ? {run_attempt: 2} : {});
+  if (path === 'actions/runs/20/attempts/1') return run(20, scenario === 'fast-main' ? 800 : 1200, scenario === 'attempt2-main' ? {run_attempt: 2} : scenario === 'incomplete-main' ? {status: 'in_progress'} : {});
   const jobsPath = path.match(/^actions\/runs\/(20|11)\/attempts\/1\/jobs\?per_page=100$/);
   if (jobsPath) {
     if (scenario === 'missing-jobs') throw Error('Synthetic unavailable jobs transport');

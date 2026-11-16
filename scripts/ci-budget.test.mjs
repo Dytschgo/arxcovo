@@ -59,7 +59,7 @@ test('invalid repository fails before synthetic API access', () => {
   assert.deepEqual(result.posts, []);
 });
 
-for (const scenario of ['partial-jobs', 'attempt2-main', 'attempt2-candidate', 'attempt2-jobs', 'missing-jobs', 'oversized-jobs']) {
+for (const scenario of ['partial-jobs', 'attempt2-main', 'attempt2-candidate', 'attempt2-jobs', 'incomplete-main', 'missing-jobs', 'oversized-jobs']) {
   test(`VM entrypoint fails closed: ${scenario}; bounded attempt1 jobs, no second page`, () => {
     const result = evaluate(scenario);
     assert.equal(result.posts.at(-1).state, 'failure');
@@ -69,6 +69,10 @@ for (const scenario of ['partial-jobs', 'attempt2-main', 'attempt2-candidate', '
     if (scenario === 'oversized-jobs') assert.deepEqual(result.transportErrors, ['ENOBUFS']);
     if (scenario === 'missing-jobs') assert.ok(result.error);
     if (scenario.startsWith('attempt2') || scenario === 'partial-jobs') assert.equal(result.error, null);
+    if (scenario === 'incomplete-main') {
+      assert.equal(result.error, null);
+      assert.match(result.posts.at(-1).description, /wall 1200s, charged n\/a \(run-invalid\)/);
+    }
   });
 }
 
