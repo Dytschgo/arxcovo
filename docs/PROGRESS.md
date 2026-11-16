@@ -2,7 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
+**Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
+`r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
+outside the eight quarantines. The cause is unknown. This local change adds a Windows-only
+R5 quarantine pending independent review: an exception, not a fix. PR162 diagnostics remain
+held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
+under the active wall policy; 738 s charged remains uncredited because the run is red.
+ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
+cannot clear the budget gate. Main stays RED until a merged recovery's next exact-main CI
+is green. No hypothetical new-main green claim or budget exception is granted.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -26,8 +34,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
-- Current work: PR161 push2 all platform jobs succeeded on7f71652; independent Opus PASS6917477824/status59027550095. Parent integration9fb217d imports reviewed PR160 only, attribution/harness bytes unchanged. Preparing final integration push3/3 and fresh exact-head gates/review; other merges wait for this head to settle. Windows phase/history diagnostics reviewed with complementary cleanup PASS, publication after this integration. PR159 held; M2 open/M3 unchecked/eight quarantines unchanged.
+- Last merged: PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba`; its known exact-main CI43880904887 failed on Windows R5 and took 1475 s wall / 738 s charged (uncredited). This checkpoint uses the accepted contract's known evidence, with no new hosted query or credit.
+- Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
+- Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -49,6 +58,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Sol high bounded R5 quarantine implementation: source/guard/filter/tests plus ADR0024/sample brief/current health correction. Initial pure guard run: 2 tests, 3 failing subtests caused by no-op fixtures, not an R5 runtime execution. One routine fixture correction; natural-failure stop honored with no rerun or further tests. No hosted evidence, source repair credit, publication or merge. Root inspection then Opus high independent review remain pending.
 
 - 2026-11-16: Coordinator independently verifies main87c9940 CI43823823164success, Windowsjob133152799712396s(07:26:06–07:32:42)/install7s(07:32:22–29)/browser3s/Electron7ssuccess. Restores feature work; distinct S2b-repair measurement confirms C1component/headroom target<=500s without replacing originalfailedfirstC1run. Retained correctedOpusbrief26ac2d6/Solcontractrecheck permits samplerimplementation under90sbudget,ownedprocesscleanup,typedoutput and unchangedquarantine; no CIrerun or fixcredit.
 
