@@ -62,3 +62,37 @@ consistent with that arithmetic. No cryptographic or hosted result is claimed.
 PR161 must merge and exact-main CI must be green before founder source starts.
 PR159's holds remain independent. M2 open, M3 unchecked, eight Windows
 quarantines unchanged; hardware paths are **unverified on real hardware**.
+
+
+## Recheck of 1c9d036
+
+B1 and B2 are closed in the revised text: the trait and private seal share the
+issue module, and persisted allocation is checked before initialize. The
+immutable-node test, exact metrics API, outer budget/final check, clock ordering
+and registry-only restart wording are specified. No source test is credited.
+
+One new blocking ownership gap remains (B3). The pre-initialize local read is
+specified as bounded blocking work, but adapter::blocking is a plain
+spawn_blocking wrapper. Dropping its awaiting future does not cancel a queued
+or running closure. If the store mutex stays held, repeated timed-out found
+calls release their four issue permits while leaving store-owning closures
+behind. The caller deadline neither bounds that population nor makes it visible
+to shutdown. fresh_read cannot be used as-is because uninitialized Raft cannot
+supply its read linearizer.
+
+Specify a pre-initialize local read under existing owned read-unit and Owners
+accounting: acquire an owned read permit before scheduling, register the async
+owner before work starts, retain the store and permit in the blocking closure
+until its lock and handle are dropped, and deliver through a caller channel.
+Closed owners refuse scheduling. Caller cancellation must not cancel the owner
+or release its unit early. This is a local bootstrap snapshot, not a fresh or
+linearizable authorization read. Use the unchanged shared capacity and shutdown
+budget/report; no new limit, retry, timeout or detached task.
+
+Require a deterministic held-lock/cancelled-caller proof of bounded admission,
+tracked read ownership and release after unblocking. Check both caller-drop and
+outer-budget paths, and ensure the F7 counter excludes the preflight snapshot
+so its two authorization-read observations remain meaningful. Update the exact
+allowlist if an internal helper is necessary. Source remains unauthorized until
+this ownership contract is closed and root rechecks it. This is a new source
+path, not a fourth Sol shared-suite fix or an Opus recovery attempt.
