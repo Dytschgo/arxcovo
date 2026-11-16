@@ -12,10 +12,10 @@ import sys
 import threading
 import time
 
-PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '3fc3e949dc0725d22d466c12f1ef3fa13d395fea586a84546c8cb4e4be8ceef4', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': '672bc7e57bd6251b5e4db4a51e78de5f930b962ab9b3034774b128b4cacb7048', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
+PINS = {'crates/arxd/src/unix_shim_rights_linux.rs': '34ab007813993cb2cdfd1f86a4e4e3112e0e13bc46551a14f9a851f888cd0cc2', 'crates/arxd/src/unix_shim.rs': '5e7a01094733e882b1ac67376cba5e24cbb1ad1db771d06a944806b747361fd4', 'crates/arxd/src/unix_shim_rights.rs': '17310f10a8035d2a732c7b2e87a3be4dae1d4caabdee8dade8c6cea8a7017928', 'crates/arxd/src/unix_shim_rights_linux_tests.rs': 'f60a73cc74adc0c7af9bdf3980d3a214012c7e088ea32698b18329791a6c2b92', 'crates/arxd/tests/unix_shim.rs': '20d0f61736d7d57c973ad19a9b027fa7d38bd05e45857c3dcee199570d905b7a'}
 TARGETS = tuple(PINS)
 MANIFEST = "tools/ci/e4-native/mutations.jsonl"
-MANIFEST_SHA = '15980053ce88457578407686d309af95a6dd18cb175fd777d82ac0e70b850671'
+MANIFEST_SHA = '6461e043931cde6e8f32eabcfd839d1ad0ecc0e36510b9f59b4660330c796e29'
 PREFIX = 'unix_shim::rights::linux::tests::'
 NAMES = ('s8_outcomes_and_reap', 's9_all_candidates_before_exec', 's9b_exact_alias', 's9c_bound_object_survives_file_and_directory_swap', 's10_path_is_irrelevant', 's12_production_constants', 's11_nnp_parser', 's11_nnp_observed_in_child', 's9_final_object_owner_check')
 TESTS = tuple(PREFIX + name for name in NAMES)

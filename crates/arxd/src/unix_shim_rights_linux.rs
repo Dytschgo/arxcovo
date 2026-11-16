@@ -148,25 +148,103 @@ fn observe(update: impl FnOnce(&mut Observation)) {
 mod attribution {
     use std::time::{Duration, Instant};
 
-    macro_rules! closed_enum {
-        ($name:ident { $first:ident => $text:literal $(, $variant:ident => $label:literal)* $(,)? }) => {
-            #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-            pub(super) enum $name { #[default] $first, $($variant),* }
-            impl $name {
-                pub(super) fn label(self) -> &'static str {
-                    match self { Self::$first => $text, $(Self::$variant => $label),* }
-                }
-            }
-        };
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Site {
+        #[default]
+        None,
+        Anchor,
+        Classify,
+        Null,
+        Cwd,
+        Pipe,
+        Fdwrap,
+        Fork,
+        Deadline,
+        ReapedBad,
+        WaitErr,
     }
-    closed_enum!(Site {
-        None => "none", Anchor => "anchor", Classify => "classify", Null => "null",
-        Cwd => "cwd", Pipe => "pipe", Fdwrap => "fdwrap", Fork => "fork",
-        Deadline => "deadline", ReapedBad => "reaped_bad", WaitErr => "wait_err",
-    });
-    closed_enum!(Read { Na => "na", Byte => "byte", Eof => "eof", Eagain => "eagain", Other => "other" });
-    closed_enum!(Status { Na => "na", Exited => "exited", SignaledKill => "signaled_kill", SignaledOther => "signaled_other", Other => "other" });
-    closed_enum!(Wait { Na => "na", Pending => "pending", Reaped => "reaped", Interrupted => "interrupted", Echild => "echild", Other => "other" });
+    impl Site {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::None => "none",
+                Self::Anchor => "anchor",
+                Self::Classify => "classify",
+                Self::Null => "null",
+                Self::Cwd => "cwd",
+                Self::Pipe => "pipe",
+                Self::Fdwrap => "fdwrap",
+                Self::Fork => "fork",
+                Self::Deadline => "deadline",
+                Self::ReapedBad => "reaped_bad",
+                Self::WaitErr => "wait_err",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Read {
+        #[default]
+        Na,
+        Byte,
+        Eof,
+        Eagain,
+        Other,
+    }
+    impl Read {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Byte => "byte",
+                Self::Eof => "eof",
+                Self::Eagain => "eagain",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Status {
+        #[default]
+        Na,
+        Exited,
+        SignaledKill,
+        SignaledOther,
+        Other,
+    }
+    impl Status {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Exited => "exited",
+                Self::SignaledKill => "signaled_kill",
+                Self::SignaledOther => "signaled_other",
+                Self::Other => "other",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) enum Wait {
+        #[default]
+        Na,
+        Pending,
+        Reaped,
+        Interrupted,
+        Echild,
+        Other,
+    }
+    impl Wait {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Na => "na",
+                Self::Pending => "pending",
+                Self::Reaped => "reaped",
+                Self::Interrupted => "interrupted",
+                Self::Echild => "echild",
+                Self::Other => "other",
+            }
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(super) struct Attribution {
