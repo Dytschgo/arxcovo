@@ -15,7 +15,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-16
 
 - Last merged: PR #148, `6e9edd5a51d1df41cdb412af6031f959de2d9d60` at23:58:14Z; independent Opus exact-head PASS6903410475/status58983834998 and all five gates green. Reviewed45dec89/squash full trees equal. Before merge, exact maina318ae1 CI43775693200 was confirmed completed green and main was re-read without drift.
-- Current work: Opus architecture contract for the next bounded certificate issuance/test trust slice, building on the merged durable registry. Sol independently reviews the brief before source work. No production transport, key sealing or real-host acceptance is implied. Consensus hotfix PR147 is merged; Linux s9c remains unresolved with local reproduction blocked. M2 remains open.
+- Current work: A0 bounded fresh reads ready for exact-head publication review and fresh hosted gates. Independent Opus source review and refusal-policy recheck pass;114 cluster tests/fmt/workspaceClippy pass independently. Caller deadline1500ms and eight owned units preserve permits through actual completion. PKI/issuance A/B remain deferred; no production caller or dependency change. M2 remains open and Linuxs9c unresolved.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -37,6 +37,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Opus312be8b retained08f8832 independently rechecks A0 correction:114pass/0fail/2ownedignored, R2Unavailable1.5088s/permits1.5091s, R1/R3bounded, fmt/workspaceofflineClippy pass. Source unchanged since review; final publication requires exact-head review and five gates. Latest main6e9edd5 CI43777637580 independently confirmed green before publication, to be rechecked before merge.
 
 - 2026-11-16: Opus55e56a6 retainedc0bf702 approves truthful A0 deadline refusal policy; Sol8237db1 corrects only R2/T2 assertions and brief, preserving strict lower/upper/time-to-permit bounds. Fresh local cluster114pass/0fail/2ownedignored in9.33s, fmt/workspace locked-offline Clippy34.17s/diff pass. Independent delta recheck is active; no hosted or hardware credit yet.
 
