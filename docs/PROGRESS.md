@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus29ea8a4 retainedb4e29b7 proposes A0 bounded reads, A issuance, B verifier. Independent Sol review requests C1 testCA1day versus leaf30days contradiction, C2 queue/blocking ownership limits behind outer read deadline, and C3 skew-aware lifetime wording. No implementation starts before corrected contract review; CI headroom remains a gate, no timeout increase or M2 retry.
+
 - 2026-11-16: Coordinator verifies PR148 all five green gates and exact-maina318ae1 latestCI43775693200 success, re-reads main, unwatches and merges6e9edd5 at23:58:14Z; reviewed45dec89/squash trees equal. Registry has pure/in-process hosted credit only. Next Opus contract settles certificate issuance and test-only trust from committed bindings before Sol implementation; no M2 closure or native authority.
 
 - 2026-11-16: Opus high b1efd7b retained1f1db75 closes registry R1: each of three guard mutants compiles and fails only its new isolating assertion (108/1); restored cluster109/109 passes, fmt/workspace locked-offline Clippy/diff pass. Coordinator corrects historical coverage overstatement and two test blob pins before publication. No CA/TLS/transport or fullM3 acceptance; exact-head review, five gates and latest exact-main green CI remain required.
