@@ -1,0 +1,11 @@
+# Sol review: three-node nextest contention repair
+
+Target: Opusde6a8f1 retainedd00a94f, exact reproduction baseline main01a42d5. Standards PASS; Spec PASS for the narrow scheduling repair; Security PASS. No production behavior or credential surface changes are approved.
+
+The controlled shared-flush queue reproduces the exact leader-deadline signature at unchanged5s deadlines; fewer concurrent three-node fixtures remove that signature under the same model. Accept one nextest resource group restricted to arxd library tests in the three_node module, max one concurrent member. All other scheduling stays at the existing machine default, not a new globally fixed four threads. No assertions, timeout, retry, skip, production SQLite setting or source is changed. Actual nextest show-config mapping and configured test execution must be verified; a static TOML test alone is insufficient evidence.
+
+Precision corrections to the diagnosis: T3/T4 write-helper failure remains inferred, not separately reproduced, despite the disposition's opening summary grouping all four. A one-CPU passing control does not universally rule out CPU starvation; it rules it out under that tested control. Hosted cause remains supported but unproven. U6 Orphaned remains a distinct residual risk. These are evidence limits, not reasons to lengthen deadlines or broaden the repair.
+
+This is suite-level fix attempt3 under the user's oversight. If the repair's hosted run fails on a cluster deadline or Orphaned, stop and escalate with the concrete evidence rather than a fourth change. Main remains red, so this PR cannot merge under the standing exact-main-green rule without subsequent green main or explicit owner steering. Prepare and review the repair first; do not bypass that rule or rerun main to manufacture green.
+
+Exact files: .config/nextest.toml, tools/ci/test_nextest_groups.py, existing CI Python guard step, ADR0024, PROGRESS, this review, retained diagnosis and concise evidence. No Rust, dependency, job-timeout or test-selection changes. Independent Opus implementation/exact-head review and green required gates are still required. All real-hardware paths remain **unverified on real hardware**; M2 remains open.
