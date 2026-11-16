@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Sol high bounded U6 diagnosis runs144 exact U6 executions:142pass,2distinct post-shutdown marker-scan file-lock failures,0target Orphaned reproductions. Loaded cluster runs also expose separate R3/R4/T4 failures, not target credit. Zero fix attempts/source changes; phase/pending-task identity remains unknown. Coordinator preserves evidence and hands focused diagnostic design to Opus; PR149 remains blocked, no blind CI retry or timeout change.
+
 - 2026-11-16: PR149 Windows head8eaed30 CI43782024400/job133021152770 fails U6 at three_node.rs78: shutdown unwrap Err(Orphaned),20.678s; routing-restored observation43/64 within8s window. R1-R5/T2 passed. Job287s, not timeout. Coordinator records failure and starts bounded actual-shutdown diagnosis; no CI rerun, timeout increase, assertion weakening or merge. Exact cause not yet established.
 
 - 2026-11-16: Opus312be8b retained08f8832 independently rechecks A0 correction:114pass/0fail/2ownedignored, R2Unavailable1.5088s/permits1.5091s, R1/R3bounded, fmt/workspaceofflineClippy pass. Source unchanged since review; final publication requires exact-head review and five gates. Latest main6e9edd5 CI43777637580 independently confirmed green before publication, to be rechecked before merge.
