@@ -49,7 +49,7 @@ A run with a known failed platform gets no credit and keeps the exact old wall r
 today's and never stricter for a normal PR. A red main still holds feature merges through the separate
 baseline-health rule (ADR 0024 / coordinator). This gate does not enforce that rule.
 A PR passes if `gate ≤ 900`. Otherwise, with the label still re-read live, `ci-speed` passes only if all of these
-hold: the candidate is green and creditable, both charged values are non-null,
+hold: both the baseline and candidate are green and creditable, both charged values are non-null,
 `cand.chargedSeconds < latest.chargedSeconds`, and `cand.longestJobSeconds < latest.longestJobSeconds`.
 The last condition is needed because charged time keeps queue that overlaps execution. Without it, a Windows job
 starting 200s earlier while Ubuntu runs would count as a reduction made of queue alone. The old wall-reduction path
@@ -84,7 +84,8 @@ succeed gives `not-green`: its charged time is computed but not credited.
 `ci-workflow.test.mjs` pins trusted main to one job, `verify`, with matrix `os` exactly the three labels. It also
 pins: no `needs`, job-level `if`, `environment` or `services`, and one top-level `concurrency`. With these pins,
 created→started on main is runner assignment only. A PR-controlled workflow cannot hide execution, because of the
-invariant. It cannot fake a `ci-speed` win either, because `longestJobSeconds` does not depend on queue.
+invariant. The longest-job check rejects a queue-only win with unchanged execution times. Runtime noise can
+still change that value; a `ci-speed` PR must name and independently review the actual execution-time change.
 
 ## Status description (≤140 chars, `Main run {id}:` invalidation marker unchanged)
 
