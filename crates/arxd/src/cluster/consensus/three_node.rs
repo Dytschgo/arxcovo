@@ -763,7 +763,7 @@ async fn r1_apply_wait_deadline() {
         c.converge().await;
         let l = c.leader().await;
         let (entered, wait) = oneshot::channel();
-        let (release, resume) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
         *adapter::APPLY_PAUSE.lock().unwrap() = Some(adapter::ApplyPause {
             store: Arc::as_ptr(&c.node(l).sm.as_ref().unwrap().0) as usize,
             entered,
@@ -1016,7 +1016,20 @@ async fn r5_shutdown_read_owners() {
             let started = Instant::now();
             let result = n.shutdown().await;
             assert!(started.elapsed() <= Duration::from_millis(5500));
-            assert_eq!(result, if gated { Err(Orphaned) } else { Ok(()) });
+            if gated {
+                let Err(Orphaned(r)) = &result else {
+                    panic!("gated read must fail shutdown: {result:?}")
+                };
+                assert_eq!(r.first, Phase::Owners);
+                assert_eq!(r.engine, EngineEnd::Joined);
+                assert_eq!(r.read_held, 1);
+                assert_eq!(r.propose_held, 0);
+                assert_eq!(r.owners_left, 1);
+                assert!(r.sm_strong >= 1);
+                assert_eq!(r.log_strong, 0);
+            } else {
+                assert_eq!(result, Ok(()));
+            }
             eprintln!(
                 "R5 gated={gated}, shutdown={:?}, elapsed={:?}",
                 result,
@@ -1039,6 +1052,165 @@ async fn r5_shutdown_read_owners() {
             assert_eq!(n.linearizable_state().await, Err(ReadError::Unavailable));
             c.finish().await;
         }
+    })
+    .await
+    .unwrap();
+}
+
+// These are attribution tests, not acceptance of Orphaned as healthy shutdown.
+async fn report_cleanup(n: &ConsensusNode) {
+    timeout(Duration::from_secs(2), async {
+        while n.log_weak.strong_count() != 0
+            || n.sm_weak.strong_count() != 0
+            || n.permits.available_permits() != 64
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual stores and permits released after gate release");
+}
+fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
+    c.router.isolated.lock().unwrap().insert(i as u64 + 1);
+    c.router.nodes.lock().unwrap().remove(&(i as u64 + 1));
+    Arc::try_unwrap(c.nodes[i].take().unwrap())
+        .ok()
+        .expect("caller joined and node Arc dropped")
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r6_shutdown_report_cancelled_proposal() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let (entered_tx, entered) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        *adapter::APPLY_PAUSE.lock().unwrap() = Some(adapter::ApplyPause {
+            store: Arc::as_ptr(&c.node(l).sm.as_ref().unwrap().0) as usize,
+            entered: entered_tx,
+            release: gate,
+        });
+        let node = c.node(l).clone();
+        let caller = tokio::spawn(async move { node.propose(unknown(240)).await });
+        timeout(Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.node(l).permits.available_permits(), 63);
+        caller.abort();
+        assert!(
+            timeout(Duration::from_secs(2), caller)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(c.node(l).permits.available_permits(), 63);
+        {
+            let mut owners = c.node(l).owners.lock().unwrap();
+            assert_eq!(owners.set.len(), 1);
+            assert!(
+                owners.set.try_join_next().is_none(),
+                "owner still pending after caller cancellation"
+            );
+            // The apply gate prevents resolution after cancellation.
+        }
+        let mut n = report_take_node(&mut c, l);
+        let start = Instant::now();
+        let result = timeout(Duration::from_millis(5500), n.shutdown())
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        // Always unblock the real worker before any report assertion can panic.
+        release.send(()).unwrap();
+        report_cleanup(&n).await;
+        let Err(Orphaned(r)) = result else {
+            panic!("paused apply must fail shutdown: {result:?}")
+        };
+        eprintln!("R6 proposal: {r:?}, elapsed={elapsed:?}");
+        assert!(elapsed <= Duration::from_millis(5500));
+        assert_eq!(r.first, Phase::Owners);
+        assert_eq!(r.engine, EngineEnd::Joined);
+        assert_eq!(r.owners_waited, 1);
+        assert_eq!(r.owners_left, 1);
+        assert_eq!(r.propose_held, 1);
+        assert_eq!(r.read_held, 0);
+        assert_eq!(r.owners_panicked, 0);
+        assert!(r.sm_strong >= 1);
+        assert!((5000..=5500).contains(&r.total_ms));
+        c.finish().await;
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r6_shutdown_report_store_only() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let held = c.node(l).sm.as_ref().unwrap().clone();
+        let mut n = report_take_node(&mut c, l);
+        let result = timeout(Duration::from_millis(5500), n.shutdown())
+            .await
+            .unwrap();
+        drop(held);
+        report_cleanup(&n).await;
+        let Err(Orphaned(r)) = result else {
+            panic!("held store must fail shutdown: {result:?}")
+        };
+        eprintln!("R6 store: {r:?}");
+        assert_eq!(r.first, Phase::StoreRelease);
+        assert_eq!(r.engine, EngineEnd::Joined);
+        assert_eq!(r.owners_waited, 0);
+        assert_eq!(r.owners_left, 0);
+        assert_eq!(r.propose_held, 0);
+        assert_eq!(r.read_held, 0);
+        assert_eq!(r.log_strong, 0);
+        assert_eq!(r.sm_strong, 1);
+        c.finish().await;
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r6_shutdown_report_normal_and_reaped_panic() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        // Normal shutdown remains Ok and releases actual stores/permits.
+        let l = c.leader().await;
+        c.stop(l).await;
+        let i = (l + 1) % 3;
+        let mut n = report_take_node(&mut c, i);
+        let task = n
+            .owners
+            .lock()
+            .unwrap()
+            .set
+            .spawn(async { panic!("test owner panic") });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let Err(Orphaned(r)) = n.shutdown().await else {
+            panic!("reaped panic must fail shutdown")
+        };
+        eprintln!("R6 reaped panic: {r:?}");
+        assert_eq!(r.first, Phase::Owners);
+        assert_eq!(r.engine, EngineEnd::Joined);
+        assert_eq!(r.owners_done_at_start, 1);
+        assert_eq!(r.owners_panicked, 1);
+        assert_eq!(r.owners_waited, 0);
+        assert_eq!(r.owners_left, 0);
+        report_cleanup(&n).await;
+        c.finish().await;
     })
     .await
     .unwrap();

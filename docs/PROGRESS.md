@@ -14,8 +14,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #148, `6e9edd5a51d1df41cdb412af6031f959de2d9d60` at23:58:14Z; independent Opus exact-head PASS6903410475/status58983834998 and all five gates green. Reviewed45dec89/squash full trees equal. Before merge, exact maina318ae1 CI43775693200 was confirmed completed green and main was re-read without drift.
-- Current work: A0 bounded fresh reads ready for exact-head publication review and fresh hosted gates. Independent Opus source review and refusal-policy recheck pass;114 cluster tests/fmt/workspaceClippy pass independently. Caller deadline1500ms and eight owned units preserve permits through actual completion. PKI/issuance A/B remain deferred; no production caller or dependency change. M2 remains open and Linuxs9c unresolved.
+- Last merged: PR #150, `01a42d5adfedbdbd3d6e6d35648b8adb0d76cad9` at01:50:48Z; independent Opus exact-head PASS6904986238/status58988237107 and all five gates green. Reviewed3bb81e9/squash full trees equal. Before merge, exact main6e9edd5 CI43777637580 was confirmed green and main re-read without drift.
+- Current work: integrate merged shutdown phase diagnostics into PR149 bounded reads, report actual held read permits and assert gated R5 attribution, then fresh independent Opus review and hosted attempt2. Diagnostic attempt1 passed but natural hosted U6 flake remains unresolved, not fixed. M2 remains open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -38,21 +38,41 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Coordinator verifies PR150 all five gates and exactmain6e9edd5 CI43777637580 green, re-reads main, unwatches and merges01a42d5 at01:50:48Z; reviewed/squash trees equal. Parent diagnostics integrated into PR149 with main apply hook retained, read-held snapshot before abort and R5 attribution; fresh checks/review pending. This is finite changed-diagnostic attempt2, no manual rerun and no U6 fix claim.
+
 - 2026-11-16: Sol high bounded U6 diagnosis runs144 exact U6 executions:142pass,2distinct post-shutdown marker-scan file-lock failures,0target Orphaned reproductions. Loaded cluster runs also expose separate R3/R4/T4 failures, not target credit. Zero fix attempts/source changes; phase/pending-task identity remains unknown. Coordinator preserves evidence and hands focused diagnostic design to Opus; PR149 remains blocked, no blind CI retry or timeout change.
+
 
 - 2026-11-16: PR149 Windows head8eaed30 CI43782024400/job133021152770 fails U6 at three_node.rs78: shutdown unwrap Err(Orphaned),20.678s; routing-restored observation43/64 within8s window. R1-R5/T2 passed. Job287s, not timeout. Coordinator records failure and starts bounded actual-shutdown diagnosis; no CI rerun, timeout increase, assertion weakening or merge. Exact cause not yet established.
 
+
 - 2026-11-16: Opus312be8b retained08f8832 independently rechecks A0 correction:114pass/0fail/2ownedignored, R2Unavailable1.5088s/permits1.5091s, R1/R3bounded, fmt/workspaceofflineClippy pass. Source unchanged since review; final publication requires exact-head review and five gates. Latest main6e9edd5 CI43777637580 independently confirmed green before publication, to be rechecked before merge.
+
 
 - 2026-11-16: Opus55e56a6 retainedc0bf702 approves truthful A0 deadline refusal policy; Sol8237db1 corrects only R2/T2 assertions and brief, preserving strict lower/upper/time-to-permit bounds. Fresh local cluster114pass/0fail/2ownedignored in9.33s, fmt/workspace locked-offline Clippy34.17s/diff pass. Independent delta recheck is active; no hosted or hardware credit yet.
 
+
 - 2026-11-16: Sol high0e48f21/24a147b hands back A0 with a refusal-contract conflict: absolute caller deadline yields Unavailable before OpenRaft dequeue-based quorum timeout, while R2/unchangedT2 require NoQuorum or NotLeader. Cluster112pass/2fail is not green; fmt/workspaceClippy pass. Both deadline/permit counterfactuals fail as intended.49 unrelated workspace failures reproduce on exact base. Narrow Opus decision/review requested before changing assertions; no publication or acceptance.
+
 
 - 2026-11-16: Opus25a16e7 retained2c549fd closes testCA lifetime and read ownership C1/C2; Sol recheck corrects C3 to the existing per-clock true-time skew assumption (pairwise agreement alone insufficient). A0 bounded fresh read is approved for Sol implementation: caller1500ms, eight owned units, permit retained through underlying work, honest shutdown Orphaned; no new dependency or CA/TLS implementation yet.
 
+
 - 2026-11-16: Opus29ea8a4 retainedb4e29b7 proposes A0 bounded reads, A issuance, B verifier. Independent Sol review requests C1 testCA1day versus leaf30days contradiction, C2 queue/blocking ownership limits behind outer read deadline, and C3 skew-aware lifetime wording. No implementation starts before corrected contract review; CI headroom remains a gate, no timeout increase or M2 retry.
 
+
 - 2026-11-16: Coordinator verifies PR148 all five green gates and exact-maina318ae1 latestCI43775693200 success, re-reads main, unwatches and merges6e9edd5 at23:58:14Z; reviewed45dec89/squash trees equal. Registry has pure/in-process hosted credit only. Next Opus contract settles certificate issuance and test-only trust from committed bindings before Sol implementation; no M2 closure or native authority.
+
+
+- 2026-11-16: Opus05a3a2f retained815f6c4 closes diagnostic B1: counts-before-own-handle-drop mutant compiles then fails exactlyone external-reference assertion, restoredR6 tests/fmt/lockedofflinearxdClippy pass. Coordinator separatelyR6/fmt pass. Productionreport unchanged; fresh exact-head review/five gates/latestexactmainCI remain publication/merge prerequisites. No manual CI rerun; first finite changed-diagnostic hosted attempt next.
+
+- 2026-11-16: Opus516356b0 retained0da693b confirms shutdown report source correct but requests test-only B1: count-before-own-handle-drop mutant survives >=1. Sole code deltaec67681 requires exactlyone externalSMreference; focused local verification and fresh narrow Opus recheck active. Second diagnostic seam attempt, no behaviorfix/timeoutchange; PR149 remains blocked.
+
+- 2026-11-16: Sol high39bbbd9 retained4c909a6 implements bounded shutdown phase report with cancelled-caller proposal/store/normal/reaped-error tests.112cluster pass/2ownedignored, eight unchangedU6 sanity runs pass, fmt/offlineworkspaceClippy/diff pass; two compilable misattribution mutants fail runtime assertions. One implementation attempt. Diagnostic only, natural hostedcauseunknown; fresh Opus review active before separate PR. PR149 remains blocked pending diagnostic parent/integration.
+
+- 2026-11-16: Sol diagnostic643416e hands back evidence before implementation: live propose caller conflicts with exclusive shutdown borrow. Coordinator settles cancellation seam consistent with U6: abort/join caller, retain direct pending-owner/permit proof, then shutdown report and post-release cleanup. No new proposal API or weakened shutdown outcome;0/2 implementation attempts and0/3 behavior fixes used.
+
+- 2026-11-16: PR149 Windows U6 fails Orphaned (run43782024400/job133021152770), cause unknown. Sol144 repeats do not reproduce; Opus storage-latency probes reproduce compatible proposal-drain mechanism but not hosted cause. Opus8eea512 diagnostic report accepted by Sol with dependency split: independent main-based proposal/store phase seam first, then A0 read-owner integration on PR149. No deadline/assertion relaxation or claimed fix; finite changed-diagnostic CI budget, no blind reruns.
 
 - 2026-11-16: Opus high b1efd7b retained1f1db75 closes registry R1: each of three guard mutants compiles and fails only its new isolating assertion (108/1); restored cluster109/109 passes, fmt/workspace locked-offline Clippy/diff pass. Coordinator corrects historical coverage overstatement and two test blob pins before publication. No CA/TLS/transport or fullM3 acceptance; exact-head review, five gates and latest exact-main green CI remain required.
 

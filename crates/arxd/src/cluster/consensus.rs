@@ -253,7 +253,46 @@ pub(super) enum ReadError {
     Unavailable,
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Orphaned;
+pub(super) struct Orphaned(pub ShutdownReport);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EngineEnd {
+    Absent,
+    Joined,
+    JoinFailed,
+    Deadline,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Phase {
+    Lock,
+    Engine,
+    Owners,
+    StoreRelease,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ShutdownReport {
+    pub first: Phase,
+    pub engine: EngineEnd,
+    pub engine_ms: u16,
+    pub owners_done_at_start: u8,
+    pub owners_waited: u8,
+    pub owners_left: u8,
+    pub owners_panicked: u8,
+    pub last_owner_join_ms: u16,
+    pub propose_held: u8,
+    // Captured before abort, alongside proposal units.
+    pub read_held: u8,
+    pub log_strong: u8,
+    pub sm_strong: u8,
+    pub total_ms: u16,
+}
+impl ShutdownReport {
+    fn fail(&mut self, failed: &mut bool, phase: Phase) {
+        if !*failed {
+            self.first = phase;
+        }
+        *failed = true;
+    }
+}
 #[derive(Default)]
 struct Owners {
     closed: bool,
@@ -448,27 +487,80 @@ impl ConsensusNode {
             .map(|(_, state)| state)
     }
     pub async fn shutdown(&mut self) -> Result<(), Orphaned> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        self.owners.lock().map_err(|_| Orphaned)?.closed = true;
-        let mut failed = match &self.raft {
-            Some(raft) => !matches!(timeout_at(deadline, raft.try_shutdown()).await, Ok(Ok(()))),
-            None => false,
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        let elapsed = || start.elapsed().as_millis().min(u16::MAX as u128) as u16;
+        let count = |n: usize| n.min(64 + READ_PERMITS) as u8;
+        let mut report = ShutdownReport {
+            first: Phase::Lock,
+            engine: EngineEnd::Absent,
+            engine_ms: 0,
+            owners_done_at_start: 0,
+            owners_waited: 0,
+            owners_left: 0,
+            owners_panicked: 0,
+            last_owner_join_ms: 0,
+            propose_held: 0,
+            read_held: 0,
+            log_strong: 0,
+            sm_strong: 0,
+            total_ms: 0,
         };
+        let mut failed = false;
+        self.owners.lock().map_err(|_| Orphaned(report))?.closed = true;
+        report.engine = match &self.raft {
+            Some(raft) => match timeout_at(deadline, raft.try_shutdown()).await {
+                Ok(Ok(())) => EngineEnd::Joined,
+                Ok(Err(_)) => EngineEnd::JoinFailed,
+                Err(_) => EngineEnd::Deadline,
+            },
+            None => EngineEnd::Absent,
+        };
+        report.engine_ms = elapsed();
+        if matches!(report.engine, EngineEnd::JoinFailed | EngineEnd::Deadline) {
+            report.fail(&mut failed, Phase::Engine);
+        }
         let mut set = {
-            let mut o = self.owners.lock().map_err(|_| Orphaned)?;
+            let mut o = self.owners.lock().map_err(|_| {
+                report.fail(&mut failed, Phase::Lock);
+                report.total_ms = elapsed();
+                Orphaned(report)
+            })?;
             std::mem::take(&mut o.set)
         };
+        while let Some(r) = set.try_join_next() {
+            report.owners_done_at_start = count(report.owners_done_at_start as usize + 1);
+            report.last_owner_join_ms = elapsed();
+            if r.is_err() {
+                report.owners_panicked = count(report.owners_panicked as usize + 1);
+                report.fail(&mut failed, Phase::Owners);
+            }
+        }
+        report.owners_waited = count(set.len());
         if timeout_at(deadline, async {
             while let Some(r) = set.join_next().await {
-                failed |= r.is_err();
+                report.last_owner_join_ms = elapsed();
+                if r.is_err() {
+                    report.owners_panicked = count(report.owners_panicked as usize + 1);
+                    report.fail(&mut failed, Phase::Owners);
+                }
             }
         })
         .await
         .is_err()
         {
+            report.fail(&mut failed, Phase::Owners);
+            // Capture owners and held permits BEFORE abort/join releases them.
+            report.owners_left = count(set.len());
+            report.propose_held = count(64usize.saturating_sub(self.permits.available_permits()));
+            report.read_held =
+                count(READ_PERMITS.saturating_sub(self.read_permits.available_permits()));
             set.abort_all();
             while set.join_next().await.is_some() {}
-            failed = true;
+        } else {
+            report.propose_held = count(64usize.saturating_sub(self.permits.available_permits()));
+            report.read_held =
+                count(READ_PERMITS.saturating_sub(self.read_permits.available_permits()));
         }
         self.raft.take();
         self.sm.take();
@@ -480,9 +572,16 @@ impl ConsensusNode {
         .await
         .is_err()
         {
-            failed = true;
+            report.fail(&mut failed, Phase::StoreRelease);
         }
-        if failed { Err(Orphaned) } else { Ok(()) }
+        report.log_strong = count(self.log_weak.strong_count());
+        report.sm_strong = count(self.sm_weak.strong_count());
+        report.total_ms = elapsed();
+        if failed {
+            Err(Orphaned(report))
+        } else {
+            Ok(())
+        }
     }
 }
 
