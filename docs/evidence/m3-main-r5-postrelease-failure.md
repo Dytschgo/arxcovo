@@ -50,3 +50,15 @@ but natural hosted failure was not reproduced. No hypothesis or fix is credited.
 Root contractc761aed authorizes a bounded observation implementation, followed
 by independent Sol review and exact-head checks. Main-red merge authority is
 unchanged; no feature or diagnostic merge has occurred after this red.
+
+
+## Separate wall-clock budget blocker
+
+PR159 ci-time-budget status59033483192 failed at14:23:39Z: latest completed
+main CI43880904887 took1475s, exceeding the required15-minute wall clock.
+Created13:58:02Z, final update14:22:37Z. The macOS job executed14:17:04Z to
+14:22:37Z (333s), so most wall time preceded macOS execution. This is separate
+from Windows R5. Existing policy deliberately includes the complete run wall
+clock; queue time is not subtracted and the gate is not waived. No rerun or
+ci-speed label was applied to unrelated TLS or diagnostic work. A successful
+reviewed measured CI reduction is needed under the existing ci-speed rule.

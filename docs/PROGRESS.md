@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main RED:** exact c612152 after PR161, CI43880904887 Windows job133346204427 failed R5 post-release cleanup at three_node.rs1195 (Elapsed). Both preceding shutdown results matched their assertions; the remaining predicate is unidentified. No rerun or shared-helper fix. Main688f1ad CI43875610482 was green before merge; further merges held. See [R5 evidence](evidence/m3-main-r5-postrelease-failure.md).
+**Current main RED:** exact c612152 after PR161, CI43880904887 Windows job133346204427 failed R5 post-release cleanup at three_node.rs1195 (Elapsed). Both preceding shutdown results matched their assertions; the remaining predicate is unidentified. No rerun or shared-helper fix. Main688f1ad CI43875610482 was green before merge; further merges held. See [R5 evidence](evidence/m3-main-r5-postrelease-failure.md). The completed run also exceeds the15-minute wall-clock gate at1475s; macOS executed333s after a long queue. PR159 ci-time-budget failed59033483192. No gate waiver or rerun.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
