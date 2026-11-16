@@ -44,6 +44,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Solhigh711b454/b0fee0a retainedeaae28f/c1902d8 repairs separate S2b test synchronization: explicitrelease instead of elapsed5sheld-barrier expiry,5200mscontrolledregression retainsallgate/Runnerassertions. Natural40/40passes;controlledexactTimeout+1!=2failsbefore/passesafter.4S2b/28guards/11portableharness/fmt/workspaceClippypass,productionunchanged/S2bpinrefreshed. FreshOpusreviewactive;mainredsampler/featuresheld,no nativeexecution.
+
 - 2026-11-16: FIRSTC1mergemain9074a85 CI43819925277failsWindowsjob133140434354 onservice::unix_bridge::tests::s2b::s2b_latched_readiness_gate9.271s: expectedcontrolpanic106,unexpectedgatewaitTimeout132, finalactualbridgegateenteredafteradmission assertion178 left1.507pass/1fail/16skip/58unrun; Ubuntu/macOSpass. Changedinstall/smokesnotreached,so noC1mainconfirmation/attribution. Mainred sampler/featuresheld;new bounded S2b diagnosis next, no manualrerun.
 
 - 2026-11-16: Coordinator records revised C1 criterion in PR154 body, verifiesall5gates/latestexactmain58d06c1CI43815774741green/re-readno drift, unwatches/merges9074a85 at06:53:45Z; squash/reviewed trees equal. Awaitfirstmergemainrun for install/job/smokes confirmation before sampler; no rerun or replacingoriginalPRmeasurement.
