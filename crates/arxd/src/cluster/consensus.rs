@@ -3,7 +3,7 @@
 use super::{
     enrollment::{Command, Outcome, codec::Reader},
     log_store::StoredVote,
-    state_store::{Entry as StoredEntry, LogPos, MembershipBlob, StoreError},
+    state_store::{Entry as StoredEntry, LogPos, MembershipBlob, Released, StoreError},
 };
 use openraft::{BasicNode, Entry, EntryPayload, LogId, Membership, Vote};
 use std::collections::{BTreeMap, BTreeSet};
@@ -307,6 +307,8 @@ pub(super) struct ConsensusNode {
     read_blocking: Arc<std::sync::atomic::AtomicUsize>,
     raft: Option<Engine>,
     sm: Option<SmAdapter>,
+    log_released: Released,
+    sm_released: Released,
     log_weak: Weak<Mutex<VoteLogStore>>,
     sm_weak: Weak<Mutex<StateStore>>,
     pub permits: Arc<Semaphore>,
@@ -333,6 +335,8 @@ impl ConsensusNode {
         })
         .await
         .map_err(|_| StartError::Open(StoreError::Poisoned))??;
+        let log_released = ls.released();
+        let sm_released = sm.released();
         let ls = LogAdapter(Arc::new(Mutex::new(ls)));
         let sm = SmAdapter(Arc::new(Mutex::new(sm)));
         let log_weak = Arc::downgrade(&ls.0);
@@ -349,6 +353,8 @@ impl ConsensusNode {
             read_blocking: Arc::default(),
             raft: Some(raft),
             sm: Some(sm),
+            log_released,
+            sm_released,
             log_weak,
             sm_weak,
             permits: Arc::new(Semaphore::new(64)),

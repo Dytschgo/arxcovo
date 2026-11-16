@@ -1,5 +1,8 @@
 //! Bounded synchronous vote/log persistence. Checksums detect corruption, not forgery.
 //! SQL failure has an unknown commit outcome: memory stays pre-state; reopen before reuse.
+#[cfg(test)]
+use super::state_store::DropGate;
+use super::state_store::{ReleaseAck, Released, release_pair};
 use super::{
     enrollment::{
         ClusterId,
@@ -157,9 +160,13 @@ pub struct VoteLogStore {
     db: Connection,
     meta: Meta,
     poisoned: bool,
+    #[cfg(test)]
+    gate: Option<DropGate>,
     _lock: File,
     #[cfg(test)]
     hook: Option<(std::path::PathBuf, bool)>,
+    // Must stay last: struct fields drop in declaration order.
+    release: ReleaseAck,
 }
 impl std::fmt::Debug for VoteLogStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -170,6 +177,13 @@ impl std::fmt::Debug for VoteLogStore {
     }
 }
 impl VoteLogStore {
+    pub(super) fn released(&self) -> Released {
+        self.release.released()
+    }
+    #[cfg(test)]
+    pub(in crate::cluster) fn hold_drop(&mut self, gate: DropGate) {
+        self.gate = Some(gate);
+    }
     pub fn open(dir: &Path, cluster: ClusterId) -> Result<Self, StoreError> {
         let (lock, mut db) = open_db(dir, "cluster-log", 2048)?;
         let tx = db.transaction()?;
@@ -231,9 +245,12 @@ impl VoteLogStore {
             db,
             meta,
             poisoned: false,
+            #[cfg(test)]
+            gate: None,
             _lock: lock,
             #[cfg(test)]
             hook: None,
+            release: release_pair().0,
         })
     }
     fn healthy(&self) -> Result<(), StoreError> {
