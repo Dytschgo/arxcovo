@@ -42,6 +42,10 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus high01c0761 passes independent C1 implementation review; Sol local3workflowtests/diff pass, repeatedbyreviewer. SameChromiumbinaryandrequiredsmokesverifiedsource; no timingbenefitclaimed. Publishprobe with bothWindows baselines598/542s andinstall151/139s; source-onlyPASS, fresh exacthead/gates/timingmeasurement required. No sampler/quarantinechange.
+
+- 2026-11-16: Sol prepares separate C1 CI timing probe per Opus2e3a388/Solcontractreview: Windows Playwright install omits --with-deps, Ubuntu/macOS keepit, all browser/Electron smokes remainrequired. No claimed savings until measuredPR+mainruns; no caching/timeout/quarantinechange. Sampler contract corrections stay withOpus, no sampler implementation yet.
+
 - 2026-11-16: Opus3f15736 independently passes Solobservercorrection:69defaultconsensus/3controls/fmt/workspaceClippy, two compilable panic-swallow mutants fail. SolfullD1source review closesPASS. Prepare test-only diagnostic publication, no hosted sampling or productionfix/quarantinechange; M3uncheckedWindowsunverified/M2open.
 
 - 2026-11-16: OpusD1 commits6b70689/01a2e0d/fb84986 retained73cae0c/97430a5/8dd128b implement bounded test-only diagnostics, three opt-in controls and20green naturaliterations (nohostedrepro/fix). Solreview finds observerJoinErrorloss; smallf426eb5correction joinsallobservers then surfacespanic,9units/3controls/lockedarxdClippy/fmtdiff pass. ComplementaryOpusreviewactive;nohostedsampling/workflow/quarantinechange or re-enable.

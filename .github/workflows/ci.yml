@@ -78,7 +78,12 @@ jobs:
         run: |
           python3 -B -m unittest discover -s tools/ci -p 'test_ubuntu_mirror.py'
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,CI,GITHUB_REPOSITORY /usr/bin/python3 -I -B tools/ci/ubuntu_mirror.py
-      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Install Chromium shell with platform dependencies
+        if: runner.os != 'Windows'
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: Install Chromium shell on Windows
+        if: runner.os == 'Windows'
+        run: npx playwright install --only-shell chromium
       - run: npm run smoke
       - name: Electron smoke on Linux
         if: runner.os == 'Linux'
