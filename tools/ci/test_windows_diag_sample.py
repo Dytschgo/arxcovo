@@ -808,12 +808,15 @@ class SourceTests(unittest.TestCase):
             self.assertNotIn(token, self.SRC)
 
     def test_fixed_argv_matches_brief(self):
-        tail = ["--workspace", "--locked", "--cargo-quiet", "--user-config-file", "none",
+        head = ["--workspace", "--locked", "--cargo-quiet", "--user-config-file", "none",
                 "--config-file", "tools/ci/windows-diag-sample.nextest.toml", "-P", "diag-sample",
-                "--run-ignored", "only", "--no-tests", "fail", "-E",
-                "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)"]
-        self.assertEqual(w.cargo_argv("list"), ["cargo", "nextest", "list", "-T", "json"] + tail)
-        self.assertEqual(w.cargo_argv("run"), ["cargo", "nextest", "run"] + tail)
+                "--run-ignored", "only"]
+        expr = ["-E", "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)"]
+        # `list` has no --no-tests flag in nextest 0.9.151 (usage error, exit 2).
+        self.assertEqual(w.cargo_argv("list"),
+                         ["cargo", "nextest", "list", "-T", "json"] + head + expr)
+        self.assertEqual(w.cargo_argv("run"),
+                         ["cargo", "nextest", "run"] + head + ["--no-tests", "fail"] + expr)
         with self.assertRaises(w.Guard):
             w.cargo_argv("anything")
 

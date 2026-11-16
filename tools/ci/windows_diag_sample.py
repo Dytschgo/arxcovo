@@ -100,13 +100,18 @@ class Guard(Exception):
 
 
 def cargo_argv(phase):
-    """Fixed argv from module constants only; the same cargo args as the gate."""
+    """Fixed argv from module constants only; the same cargo args as the gate.
+
+    nextest 0.9.151 accepts `--no-tests` only on `run`; `list` rejects it with a
+    usage error, and the inventory gate already refuses an empty match.
+    """
     if phase not in PHASES:
         raise Guard("internal")
     verb = ["list", "-T", "json"] if phase == "list" else ["run"]
+    no_tests = [] if phase == "list" else ["--no-tests", "fail"]
     return ["cargo", "nextest", *verb, "--workspace", "--locked", "--cargo-quiet",
             "--user-config-file", "none", "--config-file", "/".join(CONFIG_REL),
-            "-P", PROFILE, "--run-ignored", "only", "--no-tests", "fail", "-E", FILTER]
+            "-P", PROFILE, "--run-ignored", "only", *no_tests, "-E", FILTER]
 
 
 # --- Budget ------------------------------------------------------------------------
