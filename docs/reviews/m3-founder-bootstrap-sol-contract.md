@@ -96,3 +96,28 @@ so its two authorization-read observations remain meaningful. Update the exact
 allowlist if an internal helper is necessary. Source remains unauthorized until
 this ownership contract is closed and root rechecks it. This is a new source
 path, not a fourth Sol shared-suite fix or an Opus recovery attempt.
+
+
+## Final contract recheck of 8d26424
+
+Standards PASS, Spec PASS, Security PASS at the contract level. B3 is closed:
+preflight consumes the existing owned read unit, registers under Owners before
+any await, and moves its store and permit into the non-abortable closure. The
+caller only owns the receiver. Guard, store, permit, completion ordering matches
+existing fresh_read; shutdown visibility and held-unit accounting remain intact.
+No linearizer is used before initialization and no authorization freshness is
+inferred from this snapshot. The new closure never increments read_blocking,
+so the deterministic clock observations still identify the two guarded reads.
+The held-lock/drop/budget/shutdown tests explicitly protect these properties.
+
+This is static acceptance, not compilation or behavioral evidence. During source
+implementation preserve existing sign_leaf error distinctions and validity
+arithmetic while sharing its computation; a bool convenience must not collapse
+an existing Sign overflow refusal into a different public error accidentally.
+No unrelated module may construct either ticket or implement the private seal.
+
+Source remains held: mainc612152 CI43880904887 is now terminal RED (Windows R5
+post-release cleanup). Do not start a founder builder until a qualifying exact
+main is green. PR159 and Windows recovery holds remain separate. This contract
+acceptance does not change a fix counter, any quarantine, or the main prerequisite.
+M2 open,M3 unchecked; hardware paths are **unverified on real hardware**.
