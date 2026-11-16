@@ -2,6 +2,8 @@
 
 ## Main CI health and merge prerequisite
 
+**Restored:** exact live main6f6e9d2 CI [43809711957](https://github.com/Dytschgo/arxcovo/actions/runs/43809711957) completed success after the reviewed Windows quarantine. Parallel independent M3 work may resume; Windows three-node coverage remains unverified. Earlier failures remain historical evidence.
+
 Delegated clarification on2026-11-16 supersedes the pending owner exception question: the narrow reviewed Windows quarantine may merge after allfive PR gates pass to restore red main. Feature PRs remain blocked until the resulting exact-main CI is green. No fourth Sol repair or manual rerun.
 
 Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
@@ -17,7 +19,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-16
 
 - Last merged: PR #152, `6f6e9d2a45861a32d3af83937f96ed996ae96e54` at05:21:32Z; independent Opus PASS6907922037 and exact-head agent-review plus all five required gates green. Reviewed7bf2d53/squash trees equal. Authorized quarantine repair of red main under delegated clarification; subsequent exact-main CI must pass before any further merge or M3 implementation.
-- Current work: await CI on exact quarantine merge6f6e9d2 before resuming parallel M3. Eight Windows three-node fixtures now quarantined, compile/lint retained, Ubuntu/macOS execute all8 and other tests remain required everywhere. Windows coverage unverified on hosted Windows and real hardware; M3 unchecked. Opus recovery plan d3e2a02 awaits Sol contract review after main is green; no further Sol fix.
+- Current work: main6f6e9d2 CI43809711957 confirmed green. Resume parallel M3 with Opus-owned Windows diagnostic instrumentation D1 under reviewed bounded-local scope; no workflow sampling or fix/re-enable yet. A0 PR149 remains separate pending quarantine integration assessment; M2 remains open, M3 unchecked.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -39,6 +41,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Exact-main6f6e9d2 CI43809711957 success confirmed live; quarantine restoration prerequisite met. Opusd3e2a02 retained1bdad09 recovery plan receives Sol contract review with owned bounded telemetry, honest metrics limits, controlled red-capable probes and local-loop cap; workflow sampling deferred under12minjobbudget. Opus D1 next, no fourthSolfix or Windowscoveragecredit.
 
 - 2026-11-16: Coordinator verifies PR152 allfive exacthead gates and OpusPASS, re-reads main01a42d5, unwatches and merges6f6e9d2 at05:21:32Z under explicit delegated repair clarification. Reviewed/squash trees equal. LocalWindows104clusterpass/10ignored (8quarantined+2ownedcrashchildren),2.79s; fmt/scopeguard pass. Waiting resultingmainCI before anothermerge/M3; Windows recovery belongsOpus, not anotherSolattempt.
 
