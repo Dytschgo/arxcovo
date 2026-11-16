@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus25a16e7 retained2c549fd closes testCA lifetime and read ownership C1/C2; Sol recheck corrects C3 to the existing per-clock true-time skew assumption (pairwise agreement alone insufficient). A0 bounded fresh read is approved for Sol implementation: caller1500ms, eight owned units, permit retained through underlying work, honest shutdown Orphaned; no new dependency or CA/TLS implementation yet.
+
 - 2026-11-16: Opus29ea8a4 retainedb4e29b7 proposes A0 bounded reads, A issuance, B verifier. Independent Sol review requests C1 testCA1day versus leaf30days contradiction, C2 queue/blocking ownership limits behind outer read deadline, and C3 skew-aware lifetime wording. No implementation starts before corrected contract review; CI headroom remains a gate, no timeout increase or M2 retry.
 
 - 2026-11-16: Coordinator verifies PR148 all five green gates and exact-maina318ae1 latestCI43775693200 success, re-reads main, unwatches and merges6e9edd5 at23:58:14Z; reviewed45dec89/squash trees equal. Registry has pure/in-process hosted credit only. Next Opus contract settles certificate issuance and test-only trust from committed bindings before Sol implementation; no M2 closure or native authority.

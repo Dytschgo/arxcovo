@@ -101,8 +101,9 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
    result is `CaExpiring`, with nothing signed. The DER must be ≤ 4096 B. `pki::node_uri`/`parse_node_uri` are strict: lowercase hex only, no leading zeros,
    id ≥ 1, no trailing bytes. **Stale-acceptance bound.** A returned leaf was signed at true time `T_s` (signer reading `s`), and guard 2's later ReadIndex still saw
    the member, so any Remove commits after `T_s`. A verifier accepts while its clock reads `<= not_after <= s + 30 d - 60 s`. **Under the unenforced assumption** that
-   signer and verifier clocks differ by ≤ `SKEW_MS` (30 s), an isolated stale verifier stops by `T_s + 30 d - 30 s`. Conservatively: **≤ 30 days + `SKEW_MS` after
-   signing, and so after removal.** A clock outside the assumption accepts without bound. This is a test-slice ceiling, **not** production revocation freshness;
+   each signer and verifier clock remains within `SKEW_MS` (30 s) of true time throughout the interval (the existing contract), an isolated stale verifier stops
+   by `T_s + 30 d`: signer error contributes at most30 s, verifier error at most30 s, offset by the60 s backdate (flooring only shortens it). Conservatively:
+   **≤ 30 days + 2×SKEW_MS after signing, and so after removal.** Pairwise clock agreement alone proves no real-time bound; a clock outside the assumption accepts without bound. This is a test-slice ceiling, **not** production revocation freshness;
    renewal and rotation are not built, an expired member fails closed, and production lifetime is decided before production wiring.
 6. **Issue path (`ConsensusNode::enroll(&self, ca, clock: &dyn SignerClock, input: RedeemInput, csr: &[u8]) -> Result<IssuedLeaf, IssueError>`).** The whole call
    runs under `ISSUE_BUDGET = 5 s`. A `try_acquire` on `MAX_ISSUING = 4` permits returns `Busy` when none is free. Steps:

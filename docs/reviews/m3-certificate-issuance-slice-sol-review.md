@@ -13,3 +13,11 @@ Spec: CONDITIONAL; corrections required before issuance implementation.
 Security: no source finding; conditional on the above and future independent implementation review. CSR algorithm-pair/original-SPKI checks improve the settled handoff. The private issue ticket accurately narrows trusted code rather than claiming unforgeable commit evidence. Keep fresh pre/post issuance time checks at actual guard boundaries, not a timestamp cached before queue waits; no private key bytes in logs/state/evidence.
 
 A0 may proceed only after C2 wording and ownership are settled. A/B remain pending the revised brief. M2 remains incomplete; A7 final NO-GO and A12 no-retry are unchanged. All hardware paths remain **unverified on real hardware**.
+
+## Recheck of Opus25a16e7 (retained2c549fd)
+
+C1 closes with31-day testCA containment and exact near-expiry boundary controls. C2 closes by separating caller deadline from actual work lifetime: eight owned read units, nonwithdrawable engine request awaited to reply, permit transferred into the blocking closure, no permit return on caller cancellation, bounded shutdown with honest Orphaned. No assertion of hard termination is accepted.
+
+C3 is closed with a coordinator wording correction: pairwise clock agreement alone cannot establish elapsed true time (two clocks could stop together). Retain the existing each-clock-within30s-of-true-time assumption throughout; the60s backdate offsets both30s errors, with a conservative30days+2SKEW ceiling. No production revocation freshness is inferred. This changes prose only; no different source algorithm is introduced.
+
+Standards PASS; Spec PASS for A0; Security PASS for the bounded-read contract. A0 may be implemented now within its exact files/tests and no dependency changes. A/B remain subsequent separately reviewed source slices, not pre-approved cryptographic implementations. No build/test ran in this design recheck.
