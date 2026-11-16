@@ -1,0 +1,99 @@
+diff --git a/crates/arxd/src/cluster/consensus/adapter.rs b/crates/arxd/src/cluster/consensus/adapter.rs
+index 181e9dce..a23d0bb5 100644
+--- a/crates/arxd/src/cluster/consensus/adapter.rs
++++ b/crates/arxd/src/cluster/consensus/adapter.rs
+@@ -141,7 +141,14 @@ impl RaftLogStorage<Arx> for LogAdapter {
+         #[cfg(test)]
+         let _span =
+             super::diagnostics::span(Arc::as_ptr(&self.0) as usize, super::diagnostics::Op::Vote);
+-        self.run(move |s| s.save_vote(v)).await
++        #[cfg(test)]
++        let inj = Arc::as_ptr(&self.0) as usize; // [DIAG-INJ]
++        self.run(move |s| {
++            #[cfg(test)]
++            super::diagnostics::inject(inj, super::diagnostics::Op::Vote); // [DIAG-INJ]
++            s.save_vote(v)
++        })
++        .await
+     }
+     fn append<I>(
+         &mut self,
+@@ -198,6 +205,11 @@ impl RaftLogStorage<Arx> for LogAdapter {
+                                         panic!("injected blocking append panic");
+                                     }
+                                 }
++                                #[cfg(test)]
++                                super::diagnostics::inject(
++                                    Arc::as_ptr(&store) as usize,
++                                    super::diagnostics::Op::Append,
++                                ); // [DIAG-INJ]
+                                 s.append(&b)
+                             });
+                         #[cfg(test)]
+diff --git a/crates/arxd/src/cluster/consensus/diagnostics.rs b/crates/arxd/src/cluster/consensus/diagnostics.rs
+index 61396264..edcfba07 100644
+--- a/crates/arxd/src/cluster/consensus/diagnostics.rs
++++ b/crates/arxd/src/cluster/consensus/diagnostics.rs
+@@ -194,6 +194,9 @@ pub(super) struct NodeStats {
+     queue: Buckets,
+     /// Controlled per-apply delay in the blocking worker (positive controls only).
+     pub apply_delay_ms: AtomicU32,
++    // [DIAG-INJ] temporary experiment: per-store injected vote/append latency under the store lock.
++    pub vote_delay_ms: AtomicU32,
++    pub append_delay_ms: AtomicU32,
+     pub ring: Mutex<Ring>,
+ }
+ impl NodeStats {
+@@ -203,6 +206,8 @@ impl NodeStats {
+             ops: Default::default(),
+             queue: Buckets::default(),
+             apply_delay_ms: AtomicU32::new(0),
++            vote_delay_ms: AtomicU32::new(0),
++            append_delay_ms: AtomicU32::new(0),
+             ring: Mutex::default(),
+         }
+     }
+@@ -270,6 +275,30 @@ pub(super) fn span(store: usize, op: Op) -> Option<Span> {
+         start: Instant::now(),
+     })
+ }
++// [DIAG-INJ] temporary experiment: sleep the injected per-store delay for `op`.
++pub(super) fn inject(store: usize, op: Op) {
++    let Some(s) = lookup(store) else { return };
++    let d = match op {
++        Op::Vote => s.vote_delay_ms.load(Relaxed),
++        Op::Append => s.append_delay_ms.load(Relaxed),
++        _ => 0,
++    };
++    if d > 0 {
++        std::thread::sleep(Duration::from_millis(d as u64));
++    }
++}
++// [DIAG-INJ] temporary experiment: `ARX_DIAG_INJECT_MS=vote,append,apply`, each <= 1250, all nodes.
++fn inject_from_env(nodes: &[Arc<NodeStats>; 3]) {
++    let Ok(v) = std::env::var("ARX_DIAG_INJECT_MS") else { return };
++    let d: Vec<u32> = v.split(',').map(|x| x.trim().parse().unwrap()).collect();
++    assert!(d.len() == 3 && d.iter().all(|x| *x <= 1250), "[DIAG-INJ] bad {v}");
++    for n in nodes {
++        n.vote_delay_ms.store(d[0], Relaxed);
++        n.append_delay_ms.store(d[1], Relaxed);
++        n.apply_delay_ms.store(d[2], Relaxed);
++    }
++    eprintln!("[DIAG-INJ] vote={} append={} apply={} nodes=3", d[0], d[1], d[2]);
++}
+ /// Called first inside a blocking closure: records blocking-pool queue delay and,
+ /// for applies only, sleeps any controlled delay before the store lock.
+ pub(super) fn started(store: usize, submitted: Instant, apply: bool) {
+@@ -412,9 +441,11 @@ pub(super) struct Diag {
+ }
+ impl Diag {
+     pub fn new() -> Self {
++        let nodes = std::array::from_fn(|i| Arc::new(NodeStats::new(i as u8 + 1)));
++        inject_from_env(&nodes); // [DIAG-INJ]
+         Self {
+             t0: Instant::now(),
+-            nodes: std::array::from_fn(|i| Arc::new(NodeStats::new(i as u8 + 1))),
++            nodes,
+             lag: Arc::default(),
+             helpers: Helpers::default(),
+             first: Mutex::new(None),
