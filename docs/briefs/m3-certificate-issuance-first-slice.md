@@ -64,7 +64,7 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
      Some(remaining))` (`Ok(Err)`/Fatal→`Unavailable`). (4) Re-check, then `spawn_blocking` a closure **owning the permit and the `SmAdapter` clone**: lock, check
      `applied >= read index` (else `Corrupt`), run `f`, and drop the guard, Arc and permit in that order (#147). Await it, then `tx.send(..).ok()`.
    - **Honest limits.** The deadline bounds **caller waiting only**, not queue residence or the blocking closure. OpenRaft 0.10.0 cannot withdraw an enqueued read: it
-     lives until dequeue (not time-bounded here; it depends on RaftCore progress), then at most `remaining` as a `PendingRead`, or until leadership loss or stop. A
+     lives until dequeue (not time-bounded here; it depends on RaftCore progress), then at most `remaining` as a `PendingRead`, or until leadership loss or stop. The engine timer starts at dequeue, so caller deadline `Unavailable` may precede engine `NoQuorum`; no shorter sub-budget or timeout relabelling is used. A
      store read lasts as long as the lock holder. **Bounded:** at most `READ_PERMITS` units per node exist anywhere (queue, pending set, apply wait, blocking pool),
      because a permit returns only after the engine reply or the closure finishes. Excess callers get `Busy` before submitting. Nothing detaches silently: an
      abort happens only after `closed`, and if RaftCore did not stop, shutdown reports `Orphaned`.
@@ -115,7 +115,7 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
    6. Guard 2: the same `fresh_read` with a new ReadIndex. Only then sample `post_now`, run `check_issuable(post_now)` and require `post_now >= pre_now`
       (`ClockRollback`). No clock value sampled before a wait is used after it. (7) Only then return `IssuedLeaf { der, node }`. A failed guard drops the DER.
    `IssueError` = `Busy | NotLeader(Option<u64>) | Unavailable | BadCsr(CsrError) | Rejected(Reject) | WrongNode | StaleIssuer | Revoked | Signer(IssueRefusal) |
-   ClockRollback | CaExpiring | Sign`, and `ReadError::Busy` becomes `Busy`. Display text is static. `joiner_reply()` maps `NotLeader`, `Unavailable`, `Busy` and
+   ClockRollback | CaExpiring | Sign`, and `ReadError::Busy` becomes `Busy` while `ReadError::NoQuorum` maps to `Unavailable`. Display text is static. `joiner_reply()` maps `NotLeader`, `Unavailable`, `Busy` and
    `StaleIssuer` to `RetryLater` in the existing `JoinerReply`. Nothing is cached between guards, and no endpoint or owner approval exists. A follower gets
    `NotLeader` with nothing appended. An `ISSUE_BUDGET` timeout leaves the outcome unknown, so the caller retries the same idempotent request. Abandoned read units
    stay owned and permit-bounded.
@@ -128,13 +128,13 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
 awaited **before** `run`, so it holds no lock) and `three_node.rs`. No new dependencies. Actual OpenRaft, `mem_net`, `timeout(45 s)`. The **store gate** is a
 `std::thread` holding the leader's `SmAdapter` mutex until an mpsc release (never a Tokio worker). R1 and R3 hang past the old 4 s test timeout before the fix:
 - **R1 apply wait.** Pause the leader's apply, then commit a write on the followers. The leader's `linearizable_state()` gives `Unavailable` in ≤ 2.5 s. Release,
-  and the write and a read succeed and `converge` holds. **R2:** an isolated leader gives `NotLeader`/`NoQuorum` in ≤ 2.5 s, and all permits return in 2.5 s.
+  and the write and a read succeed and `converge` holds. **R2:** an isolated leader gives `NotLeader`/`NoQuorum`, or `Unavailable` only at or after READ_BUDGET. Both caller return and all read permits returning must occur within2.5s measured from the original call start.
 - **R3 store wait.** With the gate held, `Unavailable` in ≤ 2.5 s, while a concurrent `interval(10 ms)` counts ≥ 50 ticks. Still gated, `available_permits() ==
   READ_PERMITS - 1` because the closure owns its unit. Release: the permit returns in 1 s, the late result is never delivered, and the next read is current.
 - **R4 admission and cancel.** Gated: start `READ_PERMITS` reads and abort one caller early. The next call is `Busy` in ≤ 50 ms before any spawn, and the 64 proposal
   permits are unchanged. No aborted caller frees its permit early. Release, and all units return in 2 s with `owners.set` reaped.
 - **R5 shutdown.** (a) Units in flight on an isolated leader: `shutdown()` is `Ok(())` in ≤ 5.5 s. (b) Gated with a unit in its closure: `Err(Orphaned)` in ≤ 5.5 s,
-  not a hang. After release, the store Arcs drop in 2 s. All existing tests pass unchanged.
+  not a hang. After release, the store Arcs drop in 2 s. All existing tests pass unchanged except T2's isolated-read pattern also admits deadline `Unavailable`; its non-success requirement and every other assertion stay unchanged.
 
 ## PR A files and tests (Sol high; Cargo adds only the pins below)
 

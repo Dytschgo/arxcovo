@@ -21,3 +21,7 @@ C1 closes with31-day testCA containment and exact near-expiry boundary controls.
 C3 is closed with a coordinator wording correction: pairwise clock agreement alone cannot establish elapsed true time (two clocks could stop together). Retain the existing each-clock-within30s-of-true-time assumption throughout; the60s backdate offsets both30s errors, with a conservative30days+2SKEW ceiling. No production revocation freshness is inferred. This changes prose only; no different source algorithm is introduced.
 
 Standards PASS; Spec PASS for A0; Security PASS for the bounded-read contract. A0 may be implemented now within its exact files/tests and no dependency changes. A/B remain subsequent separately reviewed source slices, not pre-approved cryptographic implementations. No build/test ran in this design recheck.
+
+## A0 refusal-policy recheck
+
+Sol accepts Opus55e56a6: an absolute deadline reports Unavailable without claiming proven quorum failure. R2 permits this only at or after READ_BUDGET and keeps a single2.5s bound from call start through permit return; T2 admits this non-success outcome only in its isolated-read pattern. No shorter engine sub-budget, later caller deadline or timeout relabelling is introduced. Production code stays unchanged; existing NoQuorum/NotLeader mappings remain. PR A must map NoQuorum to Unavailable. Source-backed contract correction accepted before test edits; fresh verification/recheck still required.

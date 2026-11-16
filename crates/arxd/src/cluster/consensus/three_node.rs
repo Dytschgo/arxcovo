@@ -410,7 +410,7 @@ async fn t2_leader_offline_reads_and_unknown_retry() {
             .unwrap();
         assert!(matches!(
             read,
-            Err(ReadError::NoQuorum | ReadError::NotLeader)
+            Err(ReadError::NoQuorum | ReadError::NotLeader | ReadError::Unavailable)
         ));
         c.start((new + 1) % 3).await;
         let result = c.write(unacked.clone()).await;
@@ -878,17 +878,23 @@ async fn r2_isolated_read_refusal() {
         let started = Instant::now();
         let result = c.node(l).linearizable_state().await;
         let elapsed = started.elapsed();
-        read_units_return(c.node(l), Duration::from_millis(2500)).await;
+        timeout_at(
+            started + Duration::from_millis(2500),
+            read_units_return(c.node(l), Duration::from_millis(2500)),
+        )
+        .await
+        .unwrap();
         eprintln!(
             "R2 refusal={result:?}, caller={elapsed:?}, units returned by={:?}",
             started.elapsed()
         );
         c.router.isolated.lock().unwrap().clear();
         c.finish().await;
-        assert!(matches!(
-            result,
-            Err(ReadError::NotLeader | ReadError::NoQuorum)
-        ));
+        assert!(match result {
+            Err(ReadError::NotLeader | ReadError::NoQuorum) => true,
+            Err(ReadError::Unavailable) => elapsed >= READ_BUDGET,
+            _ => false,
+        });
         assert!(elapsed <= Duration::from_millis(2500));
     })
     .await
