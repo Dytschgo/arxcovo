@@ -336,6 +336,25 @@ class InventoryTests(unittest.TestCase):
     def test_exact_eight_ignored_pass(self):
         w.check_inventory(listing(), NAMES, FROOT)
 
+    def test_nonignored_a0_cases_mismatch_and_unexpected_match_gates(self):
+        doc = json.loads(listing())
+        cases = doc["rust-suites"]["arxd"]["testcases"]
+        names = ["r1_apply_wait_deadline", "r2_isolated_read_refusal",
+                 "r3_store_wait_deadline_and_heartbeat", "r4_read_admission_and_caller_abort",
+                 "r5_shutdown_read_owners"]
+        for name in names:
+            cases[w.TEST_PREFIX + name] = {
+                "kind": "test", "ignored": False,
+                "filter-match": {"status": "mismatch", "reason": "ignored"}}
+        doc["test-count"] = len(cases)
+        w.check_inventory(json.dumps(doc).encode(), NAMES, FROOT)
+        for name in names:
+            with self.subTest(name=name):
+                case = cases[w.TEST_PREFIX + name]
+                case["filter-match"] = {"status": "matches"}
+                self.check(json.dumps(doc).encode(), "inventory")
+                case["filter-match"] = {"status": "mismatch", "reason": "ignored"}
+
     def test_rejections(self):
         self.check(listing(NAMES[:7]), "inventory")
         self.check(listing(NAMES + ["t9_extra_fixture"]), "inventory")

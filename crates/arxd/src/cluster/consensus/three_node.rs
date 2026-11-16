@@ -5,6 +5,30 @@ use crate::cluster::enrollment::{CODE_TTL_MS, JoinCode, KeyDigest, Reject};
 use crate::service::application::tests::private_temp;
 use std::sync::atomic::Ordering;
 use tokio::time::timeout;
+
+// Own the single adapter pause slot across each complete async fixture.
+static APPLY_PAUSE_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+fn read_fail(error: &ReadError) -> Fail {
+    match error {
+        ReadError::NotLeader => Fail::NotLeader,
+        ReadError::NoQuorum => Fail::NoQuorum,
+        ReadError::Unavailable => Fail::Unavailable,
+        ReadError::Busy => Fail::Busy,
+    }
+}
+
+#[test]
+fn read_failure_attribution_covers_all_errors() {
+    for (error, expected) in [
+        (ReadError::NotLeader, Fail::NotLeader),
+        (ReadError::NoQuorum, Fail::NoQuorum),
+        (ReadError::Unavailable, Fail::Unavailable),
+        (ReadError::Busy, Fail::Busy),
+    ] {
+        assert_eq!(read_fail(&error), expected);
+    }
+}
+
 pub(super) struct Cluster {
     dirs: Vec<tempfile::TempDir>,
     nodes: Vec<Option<Arc<ConsensusNode>>>,
@@ -183,11 +207,7 @@ impl Cluster {
         let result = self.node(l).linearizable_state().await;
         if let Err(e) = &result {
             let after = self.diag.sample(raft);
-            let fail = match e {
-                ReadError::NotLeader => Fail::NotLeader,
-                ReadError::NoQuorum => Fail::NoQuorum,
-                ReadError::Unavailable => Fail::Unavailable,
-            };
+            let fail = read_fail(e);
             let mut a = self.diag.attribution(Helper::Converge, fail, l);
             a.read = Some((before, after, self.diag.read_class(l, before, after)));
             self.attribute(a);
@@ -513,7 +533,7 @@ async fn t2_leader_offline_reads_and_unknown_retry() {
             .unwrap();
         assert!(matches!(
             read,
-            Err(ReadError::NoQuorum | ReadError::NotLeader)
+            Err(ReadError::NoQuorum | ReadError::NotLeader | ReadError::Unavailable)
         ));
         c.start((new + 1) % 3).await;
         let result = c.write(unacked.clone()).await;
@@ -866,6 +886,309 @@ async fn t4_registry_revocation_snapshot_and_prune() {
     .unwrap();
 }
 
+// A0 uses the actual engine: apply is paused before acquiring the store mutex.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r1_apply_wait_deadline() {
+    timeout(Duration::from_secs(45), async {
+        let _pause_owner = APPLY_PAUSE_OWNER.lock().await;
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let (entered, wait) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *adapter::APPLY_PAUSE.lock().unwrap() = Some(adapter::ApplyPause {
+            store: Arc::as_ptr(&c.node(l).sm.as_ref().unwrap().0) as usize,
+            entered,
+            release: resume,
+        });
+        let n = c.node(l).clone();
+        let write = tokio::spawn(async move { n.propose(unknown(233)).await });
+        timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let committed = c
+            .node(l)
+            .raft
+            .as_ref()
+            .unwrap()
+            .metrics()
+            .borrow_watched()
+            .last_log_index
+            .unwrap();
+        for i in 0..3 {
+            if i != l {
+                c.node(i)
+                    .raft
+                    .as_ref()
+                    .unwrap()
+                    .wait(Some(Duration::from_secs(2)))
+                    .applied_index_at_least(
+                        Some(committed),
+                        "followers commit while leader apply paused",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let started = Instant::now();
+        // Keep the old four-second hang detector for controlled pre-fix reproduction.
+        let result = timeout(Duration::from_secs(4), c.node(l).linearizable_state()).await;
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(result.unwrap(), Err(ReadError::Unavailable));
+        assert!(elapsed <= Duration::from_millis(2500));
+        eprintln!("R1 apply caller elapsed={elapsed:?}");
+        c.converge().await;
+        c.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+// RAII release also makes failed assertions safe: no Tokio worker holds this lock.
+struct StoreGate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl StoreGate {
+    async fn hold(sm: SmAdapter) -> Self {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, ready) = oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let guard = sm.0.lock().unwrap();
+            let _ = entered.send(());
+            let _ = wait.recv();
+            drop(guard);
+            drop(sm);
+        });
+        ready.await.unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+    fn open(mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+impl Drop for StoreGate {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+async fn read_units_return(n: &ConsensusNode, budget: Duration) {
+    timeout(budget, async {
+        loop {
+            let done = {
+                let mut owners = n.owners.lock().unwrap();
+                while owners.set.try_join_next().is_some() {}
+                n.read_permits.available_permits() == READ_PERMITS && owners.set.is_empty()
+            };
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r2_isolated_read_refusal() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        assert_eq!(c.node(l).id, l as u64 + 1);
+        c.router.isolated.lock().unwrap().insert(l as u64 + 1);
+        let started = Instant::now();
+        let result = c.node(l).linearizable_state().await;
+        let elapsed = started.elapsed();
+        timeout_at(
+            started + Duration::from_millis(2500),
+            read_units_return(c.node(l), Duration::from_millis(2500)),
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "R2 refusal={result:?}, caller={elapsed:?}, units returned by={:?}",
+            started.elapsed()
+        );
+        c.router.isolated.lock().unwrap().clear();
+        c.finish().await;
+        assert!(match result {
+            Err(ReadError::NotLeader | ReadError::NoQuorum) => true,
+            Err(ReadError::Unavailable) => elapsed >= READ_BUDGET,
+            _ => false,
+        });
+        assert!(elapsed <= Duration::from_millis(2500));
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r3_store_wait_deadline_and_heartbeat() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let gate = StoreGate::hold(c.node(l).sm.as_ref().unwrap().clone()).await;
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ticks.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let started = Instant::now();
+        let result = timeout(Duration::from_secs(4), c.node(l).linearizable_state()).await;
+        let elapsed = started.elapsed();
+        let count = ticks.load(Ordering::Relaxed);
+        heartbeat.abort();
+        assert_eq!(result.unwrap(), Err(ReadError::Unavailable));
+        assert!(elapsed <= Duration::from_millis(2500));
+        assert!(count >= 50, "Tokio heartbeat ticks={count}");
+        assert_eq!(c.node(l).read_permits.available_permits(), READ_PERMITS - 1);
+        gate.open();
+        read_units_return(c.node(l), Duration::from_secs(1)).await;
+        c.write(unknown(234)).await;
+        c.converge().await;
+        eprintln!("R3 caller elapsed={elapsed:?}, heartbeat ticks={count}");
+        c.finish().await;
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r4_read_admission_and_caller_abort() {
+    timeout(Duration::from_secs(45), async {
+        let mut c = Cluster::new(Params::default()).await;
+        c.converge().await;
+        let l = c.leader().await;
+        let gate = StoreGate::hold(c.node(l).sm.as_ref().unwrap().clone()).await;
+        let baseline = c.node(l).read_blocking.load(Ordering::SeqCst);
+        let mut callers = Vec::new();
+        for _ in 0..READ_PERMITS {
+            let n = c.node(l).clone();
+            callers.push(tokio::spawn(async move { n.linearizable_state().await }));
+        }
+        timeout(Duration::from_secs(1), async {
+            while c.node(l).read_permits.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Observe every actual blocking closure before aborting a caller.
+        timeout(Duration::from_secs(1), async {
+            while c.node(l).read_blocking.load(Ordering::SeqCst) < baseline + READ_PERMITS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let aborted = callers.remove(0);
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        let started = Instant::now();
+        assert_eq!(c.node(l).linearizable_state().await, Err(ReadError::Busy));
+        assert!(started.elapsed() <= Duration::from_millis(50));
+        assert_eq!(c.node(l).permits.available_permits(), 64);
+        for caller in callers {
+            assert_eq!(caller.await.unwrap(), Err(ReadError::Unavailable));
+        }
+        assert_eq!(c.node(l).read_permits.available_permits(), 0);
+        assert_eq!(c.node(l).permits.available_permits(), 64);
+        gate.open();
+        read_units_return(c.node(l), Duration::from_secs(2)).await;
+        c.finish().await;
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r5_shutdown_read_owners() {
+    timeout(Duration::from_secs(45), async {
+        for gated in [false, true] {
+            let mut c = Cluster::new(Params::default()).await;
+            c.converge().await;
+            let l = c.leader().await;
+            let gate = if gated {
+                Some(StoreGate::hold(c.node(l).sm.as_ref().unwrap().clone()).await)
+            } else {
+                c.router.isolated.lock().unwrap().insert(l as u64 + 1);
+                None
+            };
+            let n = c.node(l).clone();
+            let caller = tokio::spawn(async move { n.linearizable_state().await });
+            timeout(Duration::from_secs(1), async {
+                while c.node(l).read_permits.available_permits() == READ_PERMITS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if gated {
+                assert_eq!(caller.await.unwrap(), Err(ReadError::Unavailable));
+                assert_eq!(c.node(l).read_permits.available_permits(), READ_PERMITS - 1);
+            } else {
+                caller.abort();
+                let _ = caller.await;
+            }
+            c.router.nodes.lock().unwrap().remove(&(l as u64 + 1));
+            let mut n = Arc::try_unwrap(c.nodes[l].take().unwrap()).ok().unwrap();
+            let started = Instant::now();
+            let result = n.shutdown().await;
+            assert!(started.elapsed() <= Duration::from_millis(5500));
+            if gated {
+                let Err(Orphaned(r)) = &result else {
+                    panic!("gated read must fail shutdown: {result:?}")
+                };
+                assert_eq!(r.first, Phase::Owners);
+                assert_eq!(r.engine, EngineEnd::Joined);
+                assert_eq!(r.read_held, 1);
+                assert_eq!(r.propose_held, 0);
+                assert_eq!(r.owners_left, 1);
+                assert!(r.sm_strong >= 1);
+                assert_eq!(r.log_strong, 0);
+            } else {
+                assert_eq!(result, Ok(()));
+            }
+            eprintln!(
+                "R5 gated={gated}, shutdown={:?}, elapsed={:?}",
+                result,
+                started.elapsed()
+            );
+            if let Some(gate) = gate {
+                gate.open();
+            }
+            timeout(Duration::from_secs(2), async {
+                while n.sm_weak.upgrade().is_some()
+                    || n.log_weak.upgrade().is_some()
+                    || n.read_permits.available_permits() != READ_PERMITS
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(n.owners.lock().unwrap().set.is_empty());
+            assert_eq!(n.linearizable_state().await, Err(ReadError::Unavailable));
+            c.finish().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 // These are attribution tests, not acceptance of Orphaned as healthy shutdown.
 pub(super) async fn report_cleanup(n: &ConsensusNode) {
     timeout(Duration::from_secs(2), async {
@@ -893,6 +1216,7 @@ pub(super) fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
 )]
 async fn r6_shutdown_report_cancelled_proposal() {
     timeout(Duration::from_secs(45), async {
+        let _pause_owner = APPLY_PAUSE_OWNER.lock().await;
         let mut c = Cluster::new(Params::default()).await;
         c.converge().await;
         let l = c.leader().await;
