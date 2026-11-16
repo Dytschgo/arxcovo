@@ -125,3 +125,5 @@ unless explicitly retained by the coordinator.
 ## B1 test-strength correction
 
 Opus516356b0 (retained0da693b) confirms source report timing is correct but the store-only >=1 assertion also admits counting the node's own handle. Sole code delta ec67681 makes that assertion exactly1, isolating the external holder. No production code changed. Fresh focused verification and independent recheck are pending; earlier source/cluster checks remain historical evidence, not a claimed final-head rerun. This is the second seam implementation attempt, not a behavior fix.
+
+Coordinator fresh Windows verification at ec67681 used D:/Temp/arxcovo-phase-b1-root-target: `cargo test -p arxd --lib --locked --offline r6_shutdown_report -- --nocapture` passed3 tests,0 failures,5.44s. Paused proposal reports Owners/Joined/one pending proposal, total5003ms (measured5.0039204s); exact store-only external-reference assertion passes. `cargo fmt --all --check` and `git diff --check` passed. Independent B1 mutation recheck remains pending. No full final-head cluster or hosted pass is inferred from this focused run.
