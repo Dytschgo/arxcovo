@@ -42,6 +42,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opusd22788f recheck closes guard propagation B1 under GitHub-style PowerShell/bash wrappers: firstfailurestopschainnonzero,secondfailurepropagates,bothsuccesspass;oldPSmultilinecontrolmasksfailure. Actual196+2 guards passbothshells. Narrow repair ready for exact-head publication and hosted budget measurement. Suitefixattempt3,mainredmergeblock and no-fourth-tweak escalation remain explicit; PR149 held.
+
 - 2026-11-16: Opus862fbcaa retained32dde4b requests Windows guard fail-fast B1. Solf63536e changes only multiline workflow guard to && chain; actual PowerShell failure control returns nonzero with second command unexecuted, real196+2 guards pass. No scheduling/deadline change or fourth suite attempt; fresh narrow review next, mainredmergeblock unchanged.
 
 - 2026-11-16: Sol0ee4d3f nextest scheduling repair verifies actual resolvedgroup exactlyeight three-node tests; allothers@global. Configured consensus68/68 passes27.459s at-j4, two resourceguardtests and196existingguards pass, fmt/diff pass. No Rust/deadline/retry/skip changes. Fresh Opus review next; mainremainsred and no merge exception implied. HostedWindowsbudget and suitefixattempt3 stoprule remain binding.
