@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: PR149 Windows head8eaed30 CI43782024400/job133021152770 fails U6 at three_node.rs78: shutdown unwrap Err(Orphaned),20.678s; routing-restored observation43/64 within8s window. R1-R5/T2 passed. Job287s, not timeout. Coordinator records failure and starts bounded actual-shutdown diagnosis; no CI rerun, timeout increase, assertion weakening or merge. Exact cause not yet established.
+
 - 2026-11-16: Opus312be8b retained08f8832 independently rechecks A0 correction:114pass/0fail/2ownedignored, R2Unavailable1.5088s/permits1.5091s, R1/R3bounded, fmt/workspaceofflineClippy pass. Source unchanged since review; final publication requires exact-head review and five gates. Latest main6e9edd5 CI43777637580 independently confirmed green before publication, to be rechecked before merge.
 
 - 2026-11-16: Opus55e56a6 retainedc0bf702 approves truthful A0 deadline refusal policy; Sol8237db1 corrects only R2/T2 assertions and brief, preserving strict lower/upper/time-to-permit bounds. Fresh local cluster114pass/0fail/2ownedignored in9.33s, fmt/workspace locked-offline Clippy34.17s/diff pass. Independent delta recheck is active; no hosted or hardware credit yet.
