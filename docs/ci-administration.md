@@ -48,3 +48,34 @@ This is preparation only, pending root review and independent Opus high exact-so
 ## Acceptance remaining
 
 After the reviewed installation merge: measure main CI, commit the first baseline, install/read back protection and settings, demonstrate an allowlisted trivial PR auto-merging after all gates, and demonstrate a slow-main probe remaining blocked plus measured ci-speed recovery. Unit tests do not prove this end-to-end acceptance. Nothing has merged yet.
+
+
+## Proposed ADR0025 bootstrap (not authorized)
+
+The owner authorized preparation of the reviewed amendment, not activation.
+On2026-11-16 the live mainc612152 snapshot requires all three verify jobs
+(App15368), agent-review (no app pin), and ci-time-budget (App15368), with
+strict=true and enforce_admins=true. The amendment cannot satisfy its own old
+budget gate and is not a ci-speed PR. ADR0022's prior exception is exhausted.
+
+After this amendment PR has an exact-head independent PASS and three successful
+platform jobs, present its full head SHA and results to the owner. The proposed
+one-use route requires explicit acceptance of ADR0025's KICKOFF deviation and
+permission for a named executor to bootstrap ONLY that pinned amendment PR while
+main remains red. It grants nothing for PR162, PR159 or feature work.
+
+If separately authorized, the executor must snapshot the live required-check
+configuration, recheck head/base/main and all four other gates, temporarily
+remove ONLY ci-time-budget from the required-check list, and perform the pinned
+squash merge. Restore strict and the original five context/app bindings in a
+finally block even if the merge fails, then read back and compare them exactly.
+Leave admin enforcement, reviews, linear history, force-push/deletion fences and
+all other protection untouched. Abort on drift; do not use manual success status,
+force push, an admin bypass or a ci-speed label. A restoration failure stops all
+work for owner recovery. No command or protection update has run from this plan.
+
+Verify the actual merge SHA/tree, the first trusted policy evaluation, and CI on
+that exact new main. Failed main gets no idle credit; no other merge follows
+until main is green and normal required gates pass. Record the approved scope,
+executor, before/after settings and result in PROGRESS and ADR0025. Any further
+exception requires a new decision; the route is not reusable.

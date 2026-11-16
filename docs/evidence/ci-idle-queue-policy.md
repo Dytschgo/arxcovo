@@ -219,3 +219,15 @@ Root log hashes:
 
 Fresh Opus recheck remains required. ADR0025 stays Proposed and inactive; no
 bootstrap, KICKOFF deviation, protection change or merge has been authorized.
+
+
+## Coordinator publication checkpoint
+
+Independent Opus recheckdfd6ceb closes S1/A2 at sourcef5b3361. It actually ran
+48/48Node tests in8058.70ms using synthetic API fixtures only. Root retains the
+full review and recheck. Publication bookkeeping adds no script, fixture, workflow,
+protection or history change. A read-only protection snapshot confirms the five
+required contexts and original app bindings; no settings were modified.
+The administration guide now states the concrete proposed one-use activation
+route. It remains unauthorized and requires separate acceptance of the KICKOFF
+wall-clock deviation after exact-head review and platform results exist.
