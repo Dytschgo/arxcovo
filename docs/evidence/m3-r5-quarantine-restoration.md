@@ -114,3 +114,36 @@ The active budget gate cannot pass the known 1475 s main. ADR0025 acceptance alo
 cannot clear it; bootstrap remains unauthorized. All five hosted gates remain pending;
 a concrete reviewed PR precedes any later owner exception decision. No new-main green
 claim or extension of the previous restoration exception is made.
+
+
+## Root verification of corrected source 5350d22
+
+Root inspected the fixture correction: the three original no-op search strings now
+match rustfmt's multiline R5 attribute. This is new-source test-fixture verification,
+not a retry of failed engine behavior. No further source correction was necessary.
+
+Actual checks on Windows:
+- Guard unittest: 2/2 pass, 0.045 s, including the changed-source mutation cases.
+- Sampler unittest: 60/60 pass, 0.102 s.
+- cargo fmt --all --check: passed.
+- Workspace/all-targets Clippy, locked/offline, -D warnings: passed.
+- Sampler's actual fixed nextest list argv: exit0; check_inventory accepted exactly8;
+  real R5 case has ignored=true and mismatch reason expression.
+- Ordinary focused R5 run: exit4 (nextest no-tests), Starting0tests, Summary0run,
+  571skipped. No ignored or engine test was executed. This confirms skip, not a
+  passing behavioral test. No rerun was performed to replace this expected result.
+
+Root logs are under D:/Temp/arx-r5-root-kq8bqnnh. Build artifacts use the existing
+normal checkout target directory, preserved rather than cleaned. Cargo was offline
+with CARGO_PROFILE_DEV_DEBUG=0. The scratch logging runner mistakenly treated the
+expected no-tests exit4 as a failure and then hit a cp1252 console print error;
+raw logs were already saved, inspected separately, and are intact. Source unchanged.
+
+clippy combined stdout/stderr SHA256: `72fed63a2808a4887aa48e9d48846b9d7c5c57531bae0a0699a9210bfa8289cf`.
+
+inventory combined stdout/stderr SHA256: `a2e4083716ca0a4cc270c35a75306b6e98c943665dbf20195ddb95e2794f95d0`.
+
+r5-skipped combined stdout/stderr SHA256: `f1b4ba4ebb24b1e3e25364dca6a612c7879333854cf01970e7314a9095167469`.
+
+Independent Opus source review is running. No hosted, merge, budget exception or
+Windows stability credit. M2 open, M3 unchecked; hardware **unverified on real hardware**.

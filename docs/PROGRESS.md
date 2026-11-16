@@ -3145,3 +3145,5 @@ claim or Linux execution. Sol high implementation next, independently reviewed
 before a normal main-based PR; no dispatch or blind rerun. PR159 remains held on
 both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
 separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
+
+- 2026-11-16: Root verified corrected R5 quarantine source5350d22: guard2, sampler60, fmt and workspace Clippy pass. Real inventory exactly8 with ignoredR5/expression mismatch; ordinary R5 selection runs0tests/571skipped, expected no-tests exit4. No engine rerun. Opus source review pending, main remains RED and budget exception unauthorized.

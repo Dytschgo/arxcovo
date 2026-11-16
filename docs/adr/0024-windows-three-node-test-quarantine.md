@@ -24,11 +24,12 @@ R5 remains required. A green eight-test sample cannot provide R5 re-enable credi
 The contract's separately reviewed observation path and ten natural hosted Windows
 passes with maximum clear time <=1000 ms are required before re-enabling R5.
 
-Local implementation is incomplete in verification: the initial guard unittest run
-failed on three no-op mutation fixtures. One routine fixture correction is recorded,
-without rerun under the natural-failure stop rule. See
-[local evidence](../evidence/m3-r5-quarantine-restoration.md). Independent Opus review
-and root inspection precede publication; no hosted credit or merge authorization exists.
+Initial builder verification stopped on three no-op mutation fixtures. Root inspected
+and verified the corrected source: guard2/2, sampler60/60, fmt and workspace Clippy
+passed. Actual nextest inventory has exactly8 sampled matches and R5 excluded;
+ordinary focused R5 ran0tests/571skipped (expected no-tests exit4). The historical
+stop and logging-console error remain in [evidence](../evidence/m3-r5-quarantine-restoration.md).
+Independent Opus source review remains pending; no hosted credit or merge authority.
 
 Known main `c612152` / CI43880904887 is RED: 1475 s wall / 738 s charged,
 uncredited because Windows failed. ADR0025 acceptance alone cannot clear the active
