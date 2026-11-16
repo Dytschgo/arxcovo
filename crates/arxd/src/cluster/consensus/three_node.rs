@@ -865,7 +865,7 @@ async fn r6_shutdown_report_store_only() {
         assert_eq!(r.propose_held, 0);
         assert_eq!(r.read_held, 0);
         assert_eq!(r.log_strong, 0);
-        assert!(r.sm_strong >= 1);
+        assert_eq!(r.sm_strong, 1);
         c.finish().await;
     })
     .await
