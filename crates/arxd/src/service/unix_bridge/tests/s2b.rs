@@ -91,7 +91,7 @@ fn s2b_real_group_unwinds_before_bridge_returns() {
     );
 }
 
-async fn stale_admission(panic_first: bool) {
+async fn stale_admission(panic_first: bool, after_panic_delay: Duration) {
     let residue = Arc::new(AtomicBool::new(false));
     let flag = residue.clone();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -126,10 +126,9 @@ async fn stale_admission(panic_first: bool) {
     e.admission_barrier_for_test(Arc::new(move || {
         if seq.fetch_add(1, Ordering::AcqRel) == 0 {
             tx.send(()).unwrap();
-            held.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
+            // Only the coordinator may release this pre-admitted request.
+            // Dropping its sender on failure disconnects this wait as well.
+            held.lock().unwrap().recv().unwrap();
         }
     }));
     let dir = private_temp();
@@ -143,6 +142,7 @@ async fn stale_admission(panic_first: bool) {
     if panic_first {
         assert!(call(&e, &a, false).await.is_ok(), "panic dispatch returned");
         assert_eq!(calls.load(Ordering::Acquire), 1);
+        tokio::time::sleep(after_panic_delay).await;
         assert_eq!(
             observed.preflight(),
             Err(Unavailable::MechanismUnavailable),
@@ -195,11 +195,18 @@ async fn stale_admission(panic_first: bool) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2b_latched_readiness_gate() {
-    stale_admission(true).await;
+    stale_admission(true, Duration::ZERO).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2b_independent_residue_gate() {
-    stale_admission(false).await;
+    stale_admission(false, Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2b_latched_readiness_gate_delayed_release() {
+    // Replay a coordinator stall beyond the old five-second barrier lifetime.
+    // The real dispatch, slot, latch, gate-entry and Runner-count checks all apply.
+    stale_admission(true, Duration::from_millis(5200)).await;
 }
 
 // Deliberately partial lexical guard. It does not parse Rust or prove ownership.

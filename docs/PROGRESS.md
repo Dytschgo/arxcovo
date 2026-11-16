@@ -2,6 +2,8 @@
 
 ## Main CI health and merge prerequisite
 
+**Current merge blocker:** exactmain9074a85 CI43819925277 failed Windows s2b_latched_readiness_gate before Playwright install;507pass/1fail/16skip/58unrun. Sampler and feature merges held; no rerun.
+
 **Restored:** exact live main6f6e9d2 CI [43809711957](https://github.com/Dytschgo/arxcovo/actions/runs/43809711957) completed success after the reviewed Windows quarantine. Parallel independent M3 work may resume; Windows three-node coverage remains unverified. Earlier failures remain historical evidence.
 
 Delegated clarification on2026-11-16 supersedes the pending owner exception question: the narrow reviewed Windows quarantine may merge after allfive PR gates pass to restore red main. Feature PRs remain blocked until the resulting exact-main CI is green. No fourth Sol repair or manual rerun.
@@ -18,8 +20,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #152, `6f6e9d2a45861a32d3af83937f96ed996ae96e54` at05:21:32Z; independent Opus PASS6907922037 and exact-head agent-review plus all five required gates green. Reviewed7bf2d53/squash trees equal. Authorized quarantine repair of red main under delegated clarification; subsequent exact-main CI must pass before any further merge or M3 implementation.
-- Current work: main6f6e9d2 CI43809711957 confirmed green. Resume parallel M3 with Opus-owned Windows diagnostic instrumentation D1 under reviewed bounded-local scope; no workflow sampling or fix/re-enable yet. A0 PR149 remains separate pending quarantine integration assessment; M2 remains open, M3 unchecked.
+- Last merged: PR #154, `9074a85a4e36ba86dadd836e2508a0484ef6eba2` at06:53:45Z; Opus exact-head PASS6909366108 and allfive gates green; reviewed5ba2cf6/squash trees equal. Premerge exactmain58d06c1 CI43815774741 freshlygreen. Explicit component-based timing revision accepted/reproduced publicly in PR body before merge; originalmixed105/49swholejob evidence retained.
+- Current work: publish reviewed S2b explicit-release test barrier repair for exact-head review/five gates. First C1 main9074a85 CI43819925277 is red before install; sampling and feature merges remain held. No C1mainconfirmation, no rerun/nativeexecution; Windowsclusterquarantine/M2open/M3unchecked unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -41,6 +43,18 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Opushigh563a459/37ec983 independently passes S2b source repair:4S2b/27E6E7S2b/11portableharness,30originalgaterepeats/fmt/diff; oldtimerrestoredproducesexactTimeout+1!=2,forcedcoordinatorpanicdisconnectsworkerwithout hang. Sourcepinall7/manifestverified. Coordinatorpreparespublication; freshheadreview/gates/mainrestorationrequired.
+
+- 2026-11-16: Solhigh711b454/b0fee0a retainedeaae28f/c1902d8 repairs separate S2b test synchronization: explicitrelease instead of elapsed5sheld-barrier expiry,5200mscontrolledregression retainsallgate/Runnerassertions. Natural40/40passes;controlledexactTimeout+1!=2failsbefore/passesafter.4S2b/28guards/11portableharness/fmt/workspaceClippypass,productionunchanged/S2bpinrefreshed. FreshOpusreviewactive;mainredsampler/featuresheld,no nativeexecution.
+
+- 2026-11-16: FIRSTC1mergemain9074a85 CI43819925277failsWindowsjob133140434354 onservice::unix_bridge::tests::s2b::s2b_latched_readiness_gate9.271s: expectedcontrolpanic106,unexpectedgatewaitTimeout132, finalactualbridgegateenteredafteradmission assertion178 left1.507pass/1fail/16skip/58unrun; Ubuntu/macOSpass. Changedinstall/smokesnotreached,so noC1mainconfirmation/attribution. Mainred sampler/featuresheld;new bounded S2b diagnosis next, no manualrerun.
+
+- 2026-11-16: Coordinator records revised C1 criterion in PR154 body, verifiesall5gates/latestexactmain58d06c1CI43815774741green/re-readno drift, unwatches/merges9074a85 at06:53:45Z; squash/reviewed trees equal. Awaitfirstmergemainrun for install/job/smokes confirmation before sampler; no rerun or replacingoriginalPRmeasurement.
+
+- 2026-11-16: Opus51357c2 timing disposition proposes explicit C1R1–R4 revision; Sol accepts in writing. Originalwholejobcriterionnotmetagainstfasterbaseline; newmergecriterioninstall<=39s plusrequiredsmokes/fivegates/exactmaingreen, anchoredoriginalrun7s. Firstmerge-mainrunmustconfirminstall<=39s/job<=500s before sampler;501–585written decision,>585/failheld;install>79reviewedrevert. No rerun or fixedwholejobspeedup claim.
+
+- 2026-11-16: PR154 allfivegatesgreen exact5ba2cf6; Windowsjob493s/install7s, smokesgreen, nextest304s. Against598/542sbaselines wholejob saves105/49s; against151/139s install saves144/132s. Conservative49s job saving trips declared60sstopthreshold; coordinator holdsmerge/sample and requestsOpus measured-evidence disposition instead of silently changing criterion. Main58d06c1CI43815774741green;no rerun/newoptimization.
 
 - 2026-11-16: Opus high01c0761 passes independent C1 implementation review; Sol local3workflowtests/diff pass, repeatedbyreviewer. SameChromiumbinaryandrequiredsmokesverifiedsource; no timingbenefitclaimed. Publishprobe with bothWindows baselines598/542s andinstall151/139s; source-onlyPASS, fresh exacthead/gates/timingmeasurement required. No sampler/quarantinechange.
 
