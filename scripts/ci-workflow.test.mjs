@@ -6,7 +6,12 @@ const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
 
 test('CI installs the headless shell used by its unchanged browser smoke tests', () => {
-  assert.match(workflow, /^ {6}- run: npx playwright install --with-deps --only-shell chromium\r?$/m);
+  assert.match(workflow, /^ {6}- name: Install Chromium shell with platform dependencies\r?\n {8}if: runner.os != 'Windows'\r?\n {8}run: npx playwright install --with-deps --only-shell chromium\r?$/m);
+  assert.match(workflow, /^ {6}- name: Install Chromium shell on Windows\r?\n {8}if: runner.os == 'Windows'\r?\n {8}run: npx playwright install --only-shell chromium\r?$/m);
+  assert.equal((workflow.match(/run: npx playwright install /g) ?? []).length, 2);
+  for (const command of ['npm run smoke', 'npm run test:desktop']) {
+    assert.ok(workflow.includes(command), 'browser and Electron smoke remain required');
+  }
   assert.match(workflow, /^ {8}os: \[ubuntu-latest, windows-latest, macos-latest\]\r?$/m);
   assert.doesNotMatch(playwrightConfig, /\bchannel\s*:/, 'a browser channel needs a reviewed install change');
   assert.doesNotMatch(playwrightConfig, /\bheadless\s*:\s*false\b/, 'headed smoke needs a reviewed install change');
