@@ -143,3 +143,135 @@ Coordinator post-F1 verification at6eb5ad8: locked/offline focused `cluster::con
 Independent Opus recheck57f23e4 closes F1/F2 at6eb5ad8: the exact R1/R6 pair passes8/8 after formerly failing8/8; focused eight-test group passes3 default-thread runs and2 four-thread runs; full cluster117 passes in9.48s. Removing R6's ownership lock compiles and fails4/4; source restored clean. Independent arxd Clippy/fmt/diff pass; production correctness reuses the unchanged34bf2d6 review. The reviewer target contains a restored-source but stale mutant binary and must not be reused.
 
 Publication is held despite these local results: latest exact-main01a42d5 CI43788629298 is red on T2/U6 election waits and T3/T4 write waits. A0 does not address those paths. No finite changed-diagnostic attempt2 push has occurred; the other-provider recurring-suite diagnosis is active. No further merge until exact-main CI is green. Local/shared-hook fixes do not resolve the natural hosted U6 failure.
+
+
+## A0 resumption on sampler main — 2026-11-16
+
+Builder: OpenAI GPT-6.1 Sol, high, implementation sub-agent; no children.
+Authorization: `docs/briefs/m3-bounded-read-resumption.md` and coordinator
+clarifications. Prerequisite supplied by the coordinator: exact-main
+`a18e95c20b7340127d746fb3632f3b0eab32e586` CI43836099670 success, Windows 433 s,
+sampler all eight pass in 29 s. This agent did not query or rerun hosted CI.
+
+### History, scope and source identity
+
+Prepared base `9cf98a4b829491b9e91fd3aa0858cb7d8fef3708` already contains sampler
+main. Merge `9137ef3a90a80de14e73fb2c675ba422923e1bbf` has that first parent
+and reviewed local A0 `8a8c1fd11fe783a44af21fc022303712684e2b92` second.
+Both histories and old PR149 head `8eaed305b1a32b7097f7a46685904976f336fc84`
+are ancestors. No source file was restored from the old branch: Git auto-merged
+consensus.rs and the instrumented fixture; only the Cluster declaration conflict
+was resolved to keep `pub(super)` and add the reviewed APPLY_PAUSE_OWNER static.
+The other conflict takes prepared main's PROGRESS byte for byte. Root owns progress.
+
+Ordered added/removed-line comparison of `git diff --unified=0 01a42d5 8a8c1fd
+-- crates/…` against `git diff --unified=0 9cf98a4 9137ef3 -- crates/…` passed:
+144 changed lines in consensus.rs and 309 in three_node.rs. Hunk positions and
+unchanged diagnostic context are excluded; the old private Cluster remove/add
+pair is excluded because main's public visibility is retained. Every A0 behavior
+line matches. This proves the reviewed production delta without erasing main D1.
+Retained reviews: c0bf702, 08f8832, df0d42e and 62bfd25.
+
+C2 `d1736417219c9abf796536a4ffbd35612ade19b4` adds exhaustive test-only
+`read_fail(&ReadError) -> Fail`, preserving the three mappings and adding
+Busy => Fail::Busy; the new unit asserts all four variants. No wildcard.
+C3 `7420f1dd275f636f5712fb26af73a8363edbf75b` adds one pure sampler fixture:
+five non-ignored R1–R5 cases mismatch with reason `ignored` pass inventory;
+each individually changed to `matches` must raise Guard("inventory").
+No sampler production, selection, workflow, guard, ignore or test-group changes.
+Wrapper/inventory integrity failures still gate CI; only test outcomes are
+non-gating. Exactly eight Windows ignores remain.
+
+Verified source head: `7420f1dd275f636f5712fb26af73a8363edbf75b`.
+Git blob pins (evidence-only descendant leaves these unchanged):
+
+- consensus.rs: `b7d1f350afb64409b82677ed04e2fe1315993c06`
+- three_node.rs: `ddd35c4cf52eb40cf0a2c0c57ee989f7d0ef00a2`
+- adapter.rs: `181e9dce6765b1db9339c254ec2dcead9b88a0b9`
+- diagnostics.rs: `6139626427dbc4449a8923a3b2e3459e727e876f`
+- windows_diag_sample.py: `6ba6f257152964cbde7722a3f6a633cdbb3fa056`
+- quarantine guard: `bb376fccf99e786bfbe1c84e712cab892dd58d05`
+- CI workflow: `0c7af38b33f6c127029d8312a0c9ecd92f6361da`
+- PROGRESS: `69594c883c1db6c1786ad2624df468a10420b8f5`
+
+Adapter, diagnostics, sampler production, guard, workflow and PROGRESS are
+byte-identical to prepared main. Production has no changes after the merge.
+The reviewed helper assertions, deadlines, routing, 64 proposal + 8 read permits,
+1500 ms absolute caller budget and 5 s shutdown remain. No fourth cluster fix,
+scheduling/timeout/retry change, quarantine extension or filter move.
+
+### Single local verification round
+
+Local Windows x86_64 MSVC, pinned Rust 1.95.0, cargo-nextest 0.9.151
+(commit 6b3f994577a98874a2e0ea5bef77fbbab3434044). Unique run root:
+`D:/Temp/arxcovo-a0-resume-7420f1d-d466393d`; CARGO_TARGET_DIR is its `target`,
+TEMP and TMP its `tmp`; CARGO_NET_OFFLINE=true. All Cargo build/test/lint
+commands below used `--locked --offline`. No install or cache cleanup.
+Raw output is retained locally under that root's `logs/` (not committed).
+No three-node red occurred; no test command was repeated and no fix followed testing.
+
+| Command (additional nextest output flags: --success-output immediate --failure-output immediate) | Result / log |
+| --- | --- |
+| cargo nextest run -p arxd -E 'test(/cluster::/)' | PASS 119/119, 468 skipped, 8.157 s execution; initial clean build 1m14s; cluster-nextest.log |
+| cargo test -p arxd --lib cluster:: -- --nocapture | PASS 119, 0 failed, 13 ignored, 417 filtered, 7.78 s; cluster-inprocess.log |
+| cargo nextest run -p arxd --run-ignored only -E 'test(/cluster::consensus::diagnostics::controls::/)' | PASS 3/3, 5.496 s; d1-controls.log |
+| cargo nextest run -p arxd --lib --run-ignored only -E 'test(/^cluster::consensus::three_node::/)' | PASS exact eight, 7.840 s, local sanity only; quarantined-eight.log |
+| python -I -B -m unittest discover -s tools/ci -p test_windows_cluster_quarantine.py | PASS 1, exactly eight; guard.log |
+| python -I -B -m unittest discover -s tools/ci -p test_windows_diag_sample.py | PASS 58, including C3; sampler.log |
+| node --test scripts/ci-workflow.test.mjs | PASS 4/4; node-workflow.log |
+| cargo clippy --workspace --all-targets -- -D warnings | PASS, 28.20 s; clippy.log |
+| cargo fmt --all --check | PASS; fmt.log |
+| git diff --check 9cf98a4 HEAD | PASS on verified source head; diff.log |
+
+The ordinary in-process run exercises shared REGISTRY and R1's APPLY_PAUSE_OWNER
+in one libtest process; Windows-ignored R6c remains ignored there. R6c runs once
+in its own nextest process in the eight-test sanity run, so this round does not
+claim a fresh same-process R1/R6c contention test. The retained 62bfd25 review's
+pair/mutation evidence covers the unchanged lock, without repeating tests here.
+
+Actual inventory command (with the same offline/locked flags):
+`cargo nextest list -p arxd --lib --message-format json --run-ignored only -E
+'package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)'`.
+Saved nextest-list.json proves all five non-ignored R1–R5 cases have exactly
+`{"status":"mismatch","reason":"ignored"}` on 0.9.151. Only the eight guard IDs
+match. Calling unchanged check_inventory on those bytes passes, using the unique
+run root whose target directory is the actual CARGO_TARGET_DIR. C2's non-ignored
+unit is also excluded. Logs: inventory-confirmation.log and source-identity.txt.
+The hosted sampler wrapper itself was not run locally; no hosted admission,
+Windows job-budget or wrapper Job Object execution claim is made.
+
+R1 caller 1.509327 s; R2 Unavailable at 1.5091323 s, units returned by
+1.5095165 s; R3 caller 1.5135221 s, 150 heartbeat ticks. R4 and C2's all-four-error
+unit pass in both ordinary suites. R5 clean shutdown passes; gated shutdown is
+expected Orphaned at 5.0087458 s in nextest (5.0038663 s in-process), with
+Owners/Joined/read_held=1/propose_held=0/owners_left=1/log_strong=0/sm_strong=2.
+No observer panic occurs in R5, the controls or the eight. The ordinary suites do
+print "diagnostic observer panicked" solely from the passing, intentional
+`completed_observer_panic_is_joined_and_reported` should_panic unit; that is not
+an R5 fixture failure or observer leak.
+
+All three positive controls PASS while confirming induced attribution:
+S3 Err(NotLeader), Helper::Converge and Churn; S4 queued=40/backlog=40,
+apply_high=20, Candidate::Store and expected Owners/Orphaned at 5.0093002 s;
+timer burn=400 ms gives lag=399 ms, store_high_delta=0, Candidate::Cpu.
+These induced control results and all R1/R3/R4/R5 store/apply-gate diagnostics
+carry **no natural-latency credit**. Do not pool their pass lines with sampler
+evidence. The local eight are sanity only and confer no hosted recovery,
+stability or re-enable credit. Their R6 fixtures also deliberately hold resources;
+no aggregate natural-store bound is claimed from this round.
+
+### Remaining gates and risks
+
+Fresh Opus delta review of the merge/C2/C3/evidence, a separate exact-head review,
+and all five hosted gates remain required before coordinator-only publication
+and merge. R1–R5 must execute and pass on all three OS; exact-eight guard and
+sampler inventory must pass; Windows must meet the unchanged budget. Any red is
+handled by the resumption brief, without rerun, new ignore or deadline change.
+The future A0 merge is a sampler epoch boundary because convergence now uses
+fresh_read and can return Busy/Unavailable; never pool samples across it.
+No claim that the natural Windows seam is fixed. Advisory 1 (Weak expiry does not
+prove file closure) remains open. M2 stays open, A7 FINAL NO-GO and A12 no retry;
+M3 remains unchecked. Windows three-node remains **unverified on hosted Windows**
+for this head and **unverified on real hardware**; real transport/hosts and all
+hardware paths are **unverified on real hardware**. No native M2, VM, admin,
+external dispatch/rerun, status, push, PR, external merge or watch action occurred.
