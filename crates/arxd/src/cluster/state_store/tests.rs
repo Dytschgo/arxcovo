@@ -736,3 +736,29 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
         x[flag + 1] = 0;
     });
 }
+
+#[test]
+fn store_close_completion() {
+    use crate::cluster::state_store::DropGate;
+    use std::sync::mpsc;
+    let dir = private_temp();
+    let mut store = StateStore::open(dir.path(), init()).unwrap();
+    let released = store.released();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    store.hold_drop(DropGate {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let dropping = std::thread::spawn(move || drop(store));
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!released.is_set(), "ack preceded field destruction");
+    assert!(
+        matches!(StateStore::open(dir.path(), init()), Err(StoreError::Io)),
+        "gate must hold the real file lock"
+    );
+    release_tx.send(()).unwrap();
+    dropping.join().unwrap();
+    assert!(released.is_set());
+    drop(StateStore::open(dir.path(), init()).unwrap());
+}

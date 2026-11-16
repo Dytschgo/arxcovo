@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 const LIMIT: usize = 16384;
@@ -166,14 +170,53 @@ fn decode(b: &[u8]) -> Result<Image, StoreError> {
     }
     Ok(i)
 }
+/// Observes completion of preceding field destructors, not SQLite/OS close success.
+#[derive(Clone)]
+pub(super) struct Released(Arc<AtomicBool>);
+impl Released {
+    pub(super) fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+pub(super) struct ReleaseAck(Arc<AtomicBool>);
+impl ReleaseAck {
+    pub(super) fn released(&self) -> Released {
+        Released(self.0.clone())
+    }
+}
+impl Drop for ReleaseAck {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+pub(super) fn release_pair() -> (ReleaseAck, Released) {
+    let flag = Arc::new(AtomicBool::new(false));
+    (ReleaseAck(flag.clone()), Released(flag))
+}
+#[cfg(test)]
+pub(in crate::cluster) struct DropGate {
+    pub(in crate::cluster) entered: std::sync::mpsc::Sender<()>,
+    pub(in crate::cluster) release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl Drop for DropGate {
+    fn drop(&mut self) {
+        let _ = self.entered.send(());
+        let _ = self.release.recv();
+    }
+}
 pub struct StateStore {
     db: Connection,
     image: Image,
     blob: Vec<u8>,
     poisoned: bool,
+    #[cfg(test)]
+    gate: Option<DropGate>,
     _lock: File,
     #[cfg(test)]
     hook: Option<(std::path::PathBuf, bool)>,
+    // Must stay last: struct fields drop in declaration order.
+    release: ReleaseAck,
 }
 impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -257,6 +300,13 @@ pub(super) fn open_db(
 }
 type SnapshotPositions = (Option<LogPos>, Option<(LogPos, MembershipBlob)>);
 impl StateStore {
+    pub(super) fn released(&self) -> Released {
+        self.release.released()
+    }
+    #[cfg(test)]
+    pub(in crate::cluster) fn hold_drop(&mut self, gate: DropGate) {
+        self.gate = Some(gate);
+    }
     pub(super) fn peek(blob: &[u8]) -> Result<SnapshotPositions, StoreError> {
         let image = decode(blob)?;
         Ok((image.applied, image.membership))
@@ -300,9 +350,12 @@ impl StateStore {
             image,
             blob,
             poisoned: false,
+            #[cfg(test)]
+            gate: None,
             _lock: lock,
             #[cfg(test)]
             hook: None,
+            release: release_pair().0,
         })
     }
     pub fn applied(&self) -> Option<LogPos> {
