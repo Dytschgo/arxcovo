@@ -243,6 +243,29 @@ impl RaftSnapshotBuilder<Arx> for SnapBuilder {
         self.0.snapshot().await
     }
 }
+#[cfg(test)]
+pub(super) struct ApplyPause {
+    pub store: usize,
+    pub entered: tokio::sync::oneshot::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+pub(super) static APPLY_PAUSE: Mutex<Option<ApplyPause>> = Mutex::new(None);
+#[cfg(test)]
+fn pause_apply(store: usize) {
+    let pause = {
+        let mut hook = APPLY_PAUSE.lock().unwrap();
+        if hook.as_ref().is_some_and(|p| p.store == store) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
+}
 impl RaftStateMachine<Arx> for SmAdapter {
     type SnapshotData = Vec<u8>;
     type SnapshotBuilder = SnapBuilder;
@@ -262,7 +285,13 @@ impl RaftStateMachine<Arx> for SmAdapter {
         while let Some(e) = entries.next().await {
             let (e, responder) = e?;
             let (p, e) = to_stored(e).map_err(err)?;
-            let outcome = self.run(move |s| s.apply(p, &e)).await?;
+            let store = self.0.clone();
+            let outcome = blocking(move || {
+                #[cfg(test)]
+                pause_apply(Arc::as_ptr(&store) as usize);
+                store.lock().map_err(|_| StoreError::Poisoned)?.apply(p, &e)
+            })
+            .await?;
             if let Some(r) = responder {
                 r.send(Applied(outcome));
             }

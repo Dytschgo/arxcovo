@@ -1,76 +1,123 @@
-# Shutdown phase report: implementation handoff
+# Shutdown phase report: implementation evidence
 
-2026-11-16. Sol high. Status: blocked at the proposal-test API boundary;
-no diagnostic implementation or behavior fix claimed. No publication occurred.
+2026-11-16. Sol high. Implemented on input
+`3ed100b4b33aa918549c64ca7972fba43a1b568b`, with source base
+main `6e9edd5a51d1df41cdb412af6031f959de2d9d60`.
+The prior `643416e` evidence-only ownership handback remains correct historically;
+the final Caller/shutdown borrow correction in
+`docs/reviews/m3-u6-shutdown-diagnostic-sol-review.md` settles its blocker.
 
-Pinned input: `d1ad3b3ebd557e07218fc8880a5ae4cf487edee7`, based on
-main `6e9edd5a51d1df41cdb412af6031f959de2d9d60`. The assigned checkout is
-`t3/shutdown-phase-report`; the coordinator branch
-`work/m3-shutdown-phase-report` resolves to the same pinned input.
-The three allowed source files have no diff against that main base.
+## Implemented contract
 
-## Stop condition
+`Orphaned(ShutdownReport)` carries only Copy enums and bounded counts/timings.
+Counts saturate at 64; elapsed milliseconds saturate at u16::MAX. Main has no
+read-owner units, so read_held is logically zero. The first failure retains
+Lock/Engine/Owners/StoreRelease attribution. Completed owners are reaped before
+the timed owner wait, and reaped errors still mark failure. Successful shutdown
+still returns Ok. The shared five-second deadline, abort-and-join, weak-reference
+polling and Cluster::stop unwrap remain in place.
 
-The disposition requires a paused proposal, exclusive node shutdown, then
-release and a caller result (success or `Unknown`) within two seconds. The
-current API cannot retain that caller across exclusive shutdown:
+Snapshot timing: owners_done_at_start counts the initial nonblocking reap;
+owners_waited is JoinSet length after that reap; owners_left and propose_held
+are captured at owner timeout **before abort/join** releases owners and permits.
+last_owner_join_ms covers progress before abort, excluding cancellation joins.
+Store strong counts and total_ms are captured at return after weak polling.
 
-- `consensus.rs:304`: `propose(&self, ...)` borrows the node through the
-  final `rx.await` at line 334. Its spawned owner sends the result at line 331.
-- A spawned caller must retain its node `Arc` while awaiting that receiver.
-  `three_node.rs:75` requires `Arc::try_unwrap` before calling shutdown;
-  line 77 explicitly rejects a caller that still owns the node.
-- `consensus.rs:364`: `shutdown(&mut self)` requires exclusive access.
-  Using a borrowed caller future instead of an `Arc` does not permit that
-  mutable borrow while the future remains alive.
-- Cancelling and joining the caller frees the node, as existing U6 does at
-  `three_node.rs:491`, but drops its receiver. It cannot then observe the
-  required success/`Unknown` result after releasing apply.
+The minimal cfg(test) APPLY_PAUSE runs in the actual apply blocking closure,
+before locking its exact state store. The proposal test waits for that gate,
+observes one held proposal permit, aborts AND joins its caller, then proves the
+permit remains held and its owner is pending. The caller Arc is dropped by the
+joined cancellation before removing/unwrapping the node. Shutdown must report
+Owners/Joined, owners_waited=1, owners_left=1, propose_held=1, read_held=0 within
+5.5 seconds. Only after shutdown returns is apply released; actual weak store
+references and permits must then clean up within two seconds. No cancelled
+caller result is asserted. No new proposal API or unsafe aliasing is used.
 
-This is a source-level ownership finding, not a measured engine hang, failed
-runtime test, or red-before observability result. It does not establish that
-OpenRaft shutdown itself waits for the proposed gate. No detached task,
-unsafe aliasing, changed shutdown signature, or production proposal refactor
-was introduced to work around the boundary. The user's explicit API handoff
-stop condition takes precedence over finishing a weaker test silently.
+A separate held-state-store Arc produces StoreRelease/Joined with zero owners
+waiting/left, zero held permits and a retained state store. Dropping that Arc
+must release actual stores within two seconds. The normal leg exercises the
+unchanged Ok shutdown. An already completed owner panic is reaped and still
+reports Owners failure with owners_panicked=1; the induced panic is expected.
+EngineEnd::JoinFailed and EngineEnd::Deadline remain uncovered.
 
-The coordinator needs to settle the test contract: either permit explicit
-caller cancellation and joined cancellation before shutdown, with post-release
-owner/store/permit cleanup assertions, or authorize a narrowly scoped way to
-retain the proposal result receiver independently of the node borrow. The
-current source allowlist restricts consensus changes to report types and
-construction, so this handoff makes neither API change.
+## Actual local validation
 
-## Validation and remaining work
+One implementation attempt consumed (1 of 2); no failed implementation attempt.
+Two deliberate temporary mutants are evidence probes, not attempted fixes:
 
-Read AGENTS, KICKOFF, the Opus disposition and the required Sol dependency
-correction. Verified the full input SHA, branch pointers, source equality with
-main, and the caller/shutdown definitions and existing cancellation path.
-No implementation attempt, build, test, fmt, Clippy, U6 repetition, mutation
-check, or real hardware exercise ran. The required compilable red-before
-mutant, green-after tests, eight sequential unchanged U6 sanity runs, full
-cluster tests, fmt, offline workspace Clippy and final source diff review
-remain outstanding. The known 49 baseline workspace test failures were not
-rerun. Fresh independent Opus review remains required before publication.
+- Replace every owner-phase failure label with StoreRelease. This compiles,
+  runs the cancelled-proposal test, then fails its new phase assertion:
+  left StoreRelease, right Owners; exit 101.
+- Replace the store-release failure label with Owners. This compiles,
+  runs the store-only test, then fails its new phase assertion:
+  left Owners, right StoreRelease; exit 101.
 
-Implementation attempt budget consumed: 0 of 2. Behavior-fix budget consumed:
-0 of 3. No PROGRESS, ADR, Cargo, workflow, PKI or unrelated marker-lock change;
-no push, PR, merge, watch, child agent, VM or admin operation.
+The original source was restored in a finally block after the probes. The full
+cluster run below rebuilds and validates the restored implementation, including
+the strengthened post-cancellation pending-owner assertion. These are runtime
+red-before attribution checks, not missing-type compilation failures and not
+a demonstration of a preexisting behavior bug.
 
-The natural hosted U6 cause remains unknown. Opus's induced state-machine
-latency demonstrates a compatible sufficient mechanism, not the hosted cause.
-This diagnostic is not a fix. A0 production reads remain excluded; read-held
-must be logically zero on main, proposal capacity is 64, and R5 integration
-belongs to future PR149 after the diagnostic parent merges. Engine join-failure
-and engine-deadline outcomes remain uncovered. Hardware paths remain
+All commands used a new unique D: target and TEMP/TMP directory. Dependencies
+were already available; Cargo commands used --offline; no cache install ran.
+Commands and observed results:
+
+| Check | Result |
+| --- | --- |
+| cargo test -p arxd --offline r6_shutdown_report -- --nocapture | 3 passed; initial green |
+| cargo test -p arxd --lib --offline cluster:: -- --nocapture | 112 passed, 2 ignored, 0 failed; 8.67 s |
+| Exact built U6 executable, --exact --nocapture, eight sequential processes, each capped at 60 s | 8/8 passed; unchanged U6 body |
+| cargo fmt --all -- --check | exit 0 |
+| cargo clippy --workspace --all-targets --offline -- -D warnings | exit 0; 26.55 s |
+| git diff --check | exit 0 |
+
+Final cluster proposal report: first=Owners, engine=Joined, owners_waited=1,
+owners_left=1, propose_held=1, read_held=0, log_strong=1, sm_strong=2,
+total_ms=5003, measured shutdown=5.0032432 s. Store-only report:
+first=StoreRelease, engine=Joined, owners_waited=0, owners_left=0,
+propose_held=0, read_held=0, log_strong=0, sm_strong=1, total_ms=5007.
+
+Source diff against main is restricted to the three allowed files; U6 and
+Cluster::stop are unchanged. No workspace-wide test pass is claimed. No
+PROGRESS, Cargo, workflow, ADR, PKI or A0 read-path change. No child agent,
+push, PR, merge, watch, VM, admin or owner-data SQL operation occurred.
+Fresh independent Opus source review is required before publication.
+
+The natural hosted U6 cause remains unknown. Induced state-machine latency is
+a compatible sufficient mechanism, not the established hosted cause. This is
+diagnostic attribution, not a fix. Hardware paths remain
 **unverified on real hardware**.
 
-## Full input Git blob identities
+## Retained actual evidence blobs
 
-| Input | Git blob |
+These Git objects contain actual captured command output, with only absolute
+workspace and isolated-run path prefixes replaced to avoid retaining private
+local path data. Read with `git show <blob>`. Empty fmt/diff output shares the
+empty-blob identity. Objects are local evidence and do not travel with a commit
+unless explicitly retained by the coordinator.
+
+| Log | Git blob |
 | --- | --- |
-| `consensus.rs` | `d331442ec2d69433d0293bc3e97b48b66ea95ab6` |
-| `consensus/adapter.rs` | `fee90a6488b672fcd6a8317c54817817e449a29b` |
-| `consensus/three_node.rs` | `9999af2fba30e3b5af9f31a65911e84d1287748b` |
-| Opus disposition | `3dc6b42b6a69cbc1377f42c236e42e687541bf47` |
-| Required Sol correction | `821992e6c9c2d8d452c1db4bbf8668a79f166254` |
+| `r6` | `e4d62520661a542457c8935aa5e4f44eebcaf723` |
+| `owners-phase` | `249ddcd871c30d9aa4e06119e9b16e4436ec29df` |
+| `store-phase` | `5206d34126b1011c9bdda26e08e16ea802c00d49` |
+| `cluster` | `9ea2f1d9247a97475de9ce8a0d5ef6bd83cfe02c` |
+| `fmt` | `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391` |
+| `clippy` | `371a28f1d08a2cc657826ce7cea74f2e301cd349` |
+| `diff` | `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391` |
+| `u6-1` | `8e8d7f93c40baa9991ca5a484e270f7dd1b9ca8e` |
+| `u6-2` | `8e8d7f93c40baa9991ca5a484e270f7dd1b9ca8e` |
+| `u6-3` | `a55fa642bf59782d87c961222b72b731d4b784cf` |
+| `u6-4` | `6f90dd86aeed561471ec277e28e1334f3126329b` |
+| `u6-5` | `a55fa642bf59782d87c961222b72b731d4b784cf` |
+| `u6-6` | `b7db5bd15a865e3181bc55297ae8a7b1e48f39c1` |
+| `u6-7` | `6f90dd86aeed561471ec277e28e1334f3126329b` |
+| `u6-8` | `615d981afe01034fe0299b189b74886e7bc0f447` |
+
+## Final source blob identities
+
+| Source | Git blob |
+| --- | --- |
+| consensus.rs | `62332494fa343b462dde0f7917e8ff5e18ccdb15` |
+| consensus/adapter.rs | `aca96cd5d5f2a50ee2e941c2994a055a9563c72b` |
+| consensus/three_node.rs | `3e5641178661cc4075c1c1e8db525e107c9c6221` |
