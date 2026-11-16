@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: PR149 remote conflict from PR150 is resolved locally in34bf2d6; fresh integrated117cluster tests pass9.54s with actual R5 held-read attribution and unchanged mainR6 assertions. No conflict markers or working-tree changes remain after checkpoint. Lint and independent integration review still active before push; no hosted attempt2 has started and U6 remains unresolved.
+
 - 2026-11-16: Coordinator verifies PR150 all five gates and exactmain6e9edd5 CI43777637580 green, re-reads main, unwatches and merges01a42d5 at01:50:48Z; reviewed/squash trees equal. Parent diagnostics integrated into PR149 with main apply hook retained, read-held snapshot before abort and R5 attribution; fresh checks/review pending. This is finite changed-diagnostic attempt2, no manual rerun and no U6 fix claim.
 
 - 2026-11-16: Sol high bounded U6 diagnosis runs144 exact U6 executions:142pass,2distinct post-shutdown marker-scan file-lock failures,0target Orphaned reproductions. Loaded cluster runs also expose separate R3/R4/T4 failures, not target credit. Zero fix attempts/source changes; phase/pending-task identity remains unknown. Coordinator preserves evidence and hands focused diagnostic design to Opus; PR149 remains blocked, no blind CI retry or timeout change.
