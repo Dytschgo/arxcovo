@@ -443,7 +443,6 @@ impl Diag {
     }
     /// Registers a node's stores and spawns its owned event-driven metrics watcher.
     pub fn watch(&mut self, i: usize, raft: &Engine, stores: [usize; 2]) {
-        self.tasks.retain(|t| !t.is_finished());
         self.forget(i);
         for s in stores {
             register(s, &self.nodes[i]);
@@ -530,13 +529,17 @@ impl Diag {
         for t in &self.tasks {
             t.abort();
         }
+        let mut observer_panicked = false;
         for t in self.tasks.drain(..) {
-            let _ = t.await;
+            if let Err(error) = t.await {
+                observer_panicked |= error.is_panic();
+            }
         }
         for i in 0..3 {
             self.forget(i);
         }
         self.finished = true;
+        assert!(!observer_panicked, "diagnostic observer panicked");
     }
     fn maxima(&self) -> (u32, u32, u32) {
         let q = self
@@ -793,6 +796,18 @@ mod tests {
         s.is_ascii()
             && !s.contains(['/', '\\', '"'])
             && s.lines().all(|l| l.starts_with("[DIAG-3n] "))
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "diagnostic observer panicked")]
+    async fn completed_observer_panic_is_joined_and_reported() {
+        let mut d = diag();
+        d.tasks
+            .push(tokio::spawn(async { panic!("observer control") }));
+        while !d.tasks[0].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        d.close().await;
     }
 
     #[test]
