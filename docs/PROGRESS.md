@@ -3136,12 +3136,12 @@ both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
 separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 
 
-### Founder F1 local implementation — 2026-11-16
+### Founder F1 local implementation â€” 2026-11-16
 
 Provider Sol, effort high; prepared base ff4eece89ca0c76870cda6d971acec7e6cebf8ad,
 source main c6121523417089bc0afaf307470183dd4a7f47ba and accepted contract455d8ea.
 Implements sealed founder subjects, persisted allocation precheck, owned bounded
-bootstrap snapshot, single-voter initialization and two fresh guards. F1–F10,
+bootstrap snapshot, single-voter initialization and two fresh guards. F1â€“F10,
 pure identity/CA tests and seal/binding mutation guards are local only. See
 [evidence](evidence/m3-founder-bootstrap.md) for exact commands, hashes and limits.
 No shared-suite correction, production CA, custody, transport, native or owner-admin

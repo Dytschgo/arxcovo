@@ -1,4 +1,4 @@
-# Founder bootstrap F1 — local implementation evidence
+# Founder bootstrap F1 â€” local implementation evidence
 
 Prepared base `ff4eece89ca0c76870cda6d971acec7e6cebf8ad`; source exact main `c6121523417089bc0afaf307470183dd4a7f47ba`; accepted contract `455d8ea63463f426d4d829c73965dac2738948d1`. Final execution-order amendment permits isolated local work only. Provider Sol, high effort. No implementation correction was needed (0/2 consumed). No natural red occurred.
 
@@ -19,7 +19,7 @@ All Cargo commands used `CARGO_TARGET_DIR=<workspace>/target-founder-local` and 
 | `node --test scripts/ci-workflow.test.mjs` | PASS 4 tests |
 | `cargo fmt --all --check` | PASS, after exact mutation restoration |
 
-The natural cluster nextest and in-process runs include all F1–F10 cases, pure PKI and enrollment tests, existing issuance I1–I9, active R1–R5 and crash probes. Existing eight Windows quarantines were not forced or repeated; process-child ignores also remain unchanged. No full native, hosted or Windows `verify` run was authorized or performed. The 660 s hosted rule is unchanged, but this local evidence cannot establish its hosted headroom. No comparable baseline was run to claim an overhead reduction.
+The natural cluster nextest and in-process runs include all F1â€“F10 cases, pure PKI and enrollment tests, existing issuance I1â€“I9, active R1â€“R5 and crash probes. Existing eight Windows quarantines were not forced or repeated; process-child ignores also remain unchanged. No full native, hosted or Windows `verify` run was authorized or performed. The 660 s hosted rule is unchanged, but this local evidence cannot establish its hosted headroom. No comparable baseline was run to claim an overhead reduction.
 
 Founder test durations reported by nextest:
 
@@ -114,3 +114,37 @@ was moved, without deletion, to ignored `<workspace>/target/founder-local` after
 all Cargo commands exited. Final process inspection found no cargo, rustc,
 cargo-nextest or arxd process; all owned test gate threads ended with their test
 processes. No cache deletion occurred. The local target is retained for review.
+
+
+## Root R1/R2 review correction
+
+Opus review5284df3 passes source Security/Spec and requires registry-refusal
+coverage plus UTF-8 repair. Root adds a positive F6 current-leader ticket guard
+and negative wrong-key (Revoked) and wrong-cluster (Rejected WrongCluster)
+assertions. No production code changes. Exactly six invalid Windows-1252 dash
+bytes were replaced with their Unicode UTF-8 equivalents: two in PROGRESS, four
+in this evidence. Previously valid UTF-8 bytes were preserved.
+
+One initial F6 compile attempt failed because the test treated of_spki's Result
+as a KeyDigest. No runtime test ran. Adding unwrap corrected the test construction.
+Corrected focused F6 passed1/1 in0.09s. Two compiled mutants then failed the new
+runtime assertions: authorization bypass returned Ok rather than Revoked;
+wrong-cluster mapping returned Revoked rather than Rejected(WrongCluster).
+Both were restored byte-for-byte; final focused F6 passed1/1. Production source
+matches2c6c096, including found.rs, issue.rs and ca.rs. This is test-strength and
+docs correction round1, not a Windows recovery behavior fix.
+
+Actual root checks: Python quarantine/seal guard3/3, strict UTF-8 decoding,
+fmt and diff pass; arxd all-target locked/offline Clippy31.15s passes. No broad
+suite, natural loop or hosted result is repeated or credited. Main remains held.
+Local log hashes follow (all commands used --locked --offline):
+
+- arx-founder-r2-control.log: `c9ca50c6b6025e4587e5eebf0640ee3c1d94487ae45d189e3ae8e9733590d832`.
+- arx-founder-r2-control-corrected.log: `1152bcfdd636563c898e1e9e8edd3b9839590b80b560075d13d4fa2da59eee27`.
+- arx-founder-r2-bypass.log: `e3f205e7523a240c62aecc709b7679ce349539dfe4ad5e2624e07a727cf62133`.
+- arx-founder-r2-cluster-map.log: `b279b7e6853d79d0ffe97f424dd8db4f2905bd3ac315ca3a595ac1bb2028806e`.
+- arx-founder-r2-restored.log: `954b662352aa953f5220055bb37e516bc754fb408499f7951b749adc1bd9d20b`.
+- arx-founder-r2-clippy.log: `ecbaee8538af5733f8c60fb4c30c5c9b8efd73bfdd9c95e00e0833843a2f5592`.
+
+Fresh Opus correction recheck is required before publication. M2 open, M3
+unchecked; hardware paths are **unverified on real hardware**.

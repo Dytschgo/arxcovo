@@ -355,6 +355,24 @@ bounded!(f6_adapters, async {
         index: 7,
     };
     assert_eq!(n.founder_guard(&t).await, Err(FoundError::StaleIssuer));
+    let (leader, ()) = n.fresh_read(|_| Ok(())).await.unwrap();
+    let current = |cluster, key| FounderTicket {
+        cluster,
+        key,
+        leader,
+        index: 7,
+    };
+    assert_eq!(n.founder_guard(&current([1; 16], key)).await, Ok(()));
+    let other_key = KeyDigest::of_spki(b"different founder key").unwrap();
+    assert_ne!(other_key, key);
+    assert_eq!(
+        n.founder_guard(&current([1; 16], other_key)).await,
+        Err(FoundError::Revoked)
+    );
+    assert_eq!(
+        n.founder_guard(&current([2; 16], key)).await,
+        Err(FoundError::Rejected(Reject::WrongCluster))
+    );
     assert_eq!(
         init_refusal(RaftError::APIError(InitializeError::NotAllowed(
             NotAllowed {
