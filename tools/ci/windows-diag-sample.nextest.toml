@@ -1,0 +1,17 @@
+# Non-gating Windows three-node diagnostic sample only. Never a product gate.
+# Contract: docs/briefs/m3-windows-hosted-diagnostic-sample.md
+[profile.diag-sample]
+retries = 0
+fail-fast = false
+test-threads = 4
+success-output = "never"
+failure-output = "never"
+status-level = "none"
+final-status-level = "none"
+global-timeout = "50s"
+slow-timeout = { period = "24s", terminate-after = 2, grace-period = "2s" }
+
+[profile.diag-sample.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
