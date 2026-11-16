@@ -1,4 +1,4 @@
-# M3 certificate issuance PR A � stopped implementation
+# M3 certificate issuance PR A — stopped implementation
 
 Builder: GPT-6.1 Sol, high, 2026-11-16. Prepared base `8961772`; coordinator supplied exact-main CI `43841341548` green on merged `f1c399d` (Windows 517 s, clippy 110 s, nextest 279 s, install 9 s, sampler all eight 28.766 s). Those baseline figures were supplied, not independently rerun here.
 
@@ -102,3 +102,31 @@ Source implements caller-owned max-four admission, 5 s absolute await budget, no
 Before readiness, finish all missing verification and meaningful mutants, assess I1 SPKI/serial and I4 replay evidence explicitly, strengthen any remaining test assertions and complete independent fresh Opus source review/five gates. Final I7 is unverified. Error privacy coverage and complete serial/SPKI assertions need review. No test-slice work establishes transport or production CA safety.
 
 M2 remains open (A7 NO-GO, consumed A12 no retry); M3 remains unchecked. Store-file advisory 1 stays open: Weak expiry does not prove file closure. No production restart caller was added. All hardware paths are **unverified on real hardware**.
+
+
+## Prepared-head verification: compile stop (2026-11-16)
+
+Verifier: GPT-6.1 Sol, high, acting only as the test sub-agent; no delegation. Source pin: `f547459811d6e313728b923e6628ddd6c2870314`. Read AGENTS.md, KICKOFF, the issuance brief including E1–E7, Opus disposition `0f6d0ff`, and prior evidence `8c3436e`. The E7 I4 test body has old-term capture before isolation, the explicit new-leader `propose_response(Command::redeem(...))` asserting replay/node/key before `enroll`, raw leaf-SPKI equality with the original CSR, and the bounded higher-term wait after heal before unchanged convergence. This is source inspection only; it has not executed successfully. No production/helper/quarantine changes were made.
+
+**STOP: final-source test compilation failed.** The single requested ordinary cluster nextest invocation reached Rust compilation and exited 101; no test body executed and there is no natural engine-red attribution. The previously uncompiled I7 calls `response.clone()` at `crates/arxd/src/cluster/consensus/issue_tests.rs:414` and `:420`. Both produce E0599: no method named `clone` for `ClientWriteResponse<consensus::Arx>`. No weaker adapter contract, source correction, rerun, or subsequent test command was attempted. This is the user's compile-error stop boundary, separate from E3's runtime-red rule and from deliberately expected mutant failures (none attempted).
+
+Actual invocation (PowerShell environment scoped to that process):
+
+```text
+CARGO_TARGET_DIR=D:/arxcovo-a-verify-5aa012816b594d00b4707d580fb54fa5/target
+TEMP=TMP=D:/arxcovo-a-verify-5aa012816b594d00b4707d580fb54fa5/tmp
+CARGO_NET_OFFLINE=true
+cargo nextest run --locked --offline -p arxd -E 'test(/^cluster::/)'
+```
+
+The target/temp/log directories were newly created under that unique D: root. No install, fetch, dependency resolution or cache cleanup occurred. The log covers 10:07:44–10:08:36 UTC (file timestamps, approximately 52 s; not test execution time). Output was redirected, then only its bounded compiler tail read. Full local log: `D:/arxcovo-a-verify-5aa012816b594d00b4707d580fb54fa5/logs/01-cluster-nextest.log`, SHA256 `649da943444de947204c2f45fa3940123ee3ad1caaa133c113f9ff9f6c70c884`. No raw private key was printed or captured by a test because no tests ran. This does not establish the requested behavioral secret-privacy coverage.
+
+Read-only static pin validation completed against `8961772:Cargo.lock` using Python `tomllib`, `git show`, and SHA256, without Cargo re-resolution. Old count 243, final count 281: exactly +38, no removed or changed name/version/source/checksum identities. All old package metadata and dependency edges match after only the existing windows-sys/synstructure qualification exceptions; arxd adds exactly rcgen/time/x509-parser after the same normalization. Nine old package dependency records have textual differences including arxd. Final lock SHA256 `2fdb57ec3e214aea2e4716c1ff90ce5ba4f5ec0aa85ed1e41834e7a88a477c03`. Both public CSR hashes independently match the provenance entries above. No fixture bytes or keys were printed.
+
+Static-validator bookkeeping: the first script incorrectly compared arxd's dependency strings before normalizing its existing windows-sys qualification and raised AssertionError. The corrected static validator applies the documented qualification exceptions to arxd as well as third-party records; it passed. This was a verifier-script assertion, not an engine/test failure or source change. Scripts and logs are retained under the task root: `verify-pins.py`, `logs/02-lock-fixtures.log` (initial assertion), `logs/02-lock-fixtures-final.log` (full inventory/edge/hash result, SHA256 `8ba9ddf2377710ad7ea79dbf479475a3f1099d249e562634377b174126fc0b97`). No behavior test was rerun. `git diff --quiet` returned 0 before this evidence update, confirming unchanged tracked source at the pin.
+
+**Not run after the compile stop:** pure PKI including final exact-algorithm/OID check; enrollment matrix; I1–I9 and hook identity/admission; old crash and T/R tests; the single in-process `cargo test --locked --offline -p arxd --lib cluster::` interaction run; three opt-in D1 controls; quarantined eight sanity execution; fmt check; workspace all-target locked/offline Clippy; the two quarantine-guard tests and their injected platform/ignore cases; the 58 sampler unit tests; Node workflow tests. No focused engine rerun occurred. The planned first nextest command selected all ordinary cluster tests but compiled none to completion.
+
+**Counterfactual gaps for Opus:** no staging copy or mutation execution occurred because compilation triggered STOP. Still required: focused exact-algorithm removal and original-SPKI defense (including the P-384/SHA256 case with the algorithm gate removed, then both defenses removed); CSR field-discard mutants; check_grant, fresh pre/post guards and clock sampling mutants; privacy scanner positive-control and persisted raw/hex marker counterfactuals. No expected mutant reds or surviving mutants are claimed. Existing static marker assertions do not substitute for these behavioral checks. Error privacy tests and fixture assertions remain unverified on this final source. Full-source independent Opus review remains next; this evidence is not a readiness approval.
+
+Only this evidence file was edited. Bookkeeping repaired its known first-line byte 0x97 at offset 31 to UTF-8 em dash; the remaining historical bytes were preserved and the resulting document decodes strictly as UTF-8. No PROGRESS update (per this task's evidence-only constraint), network dispatch, native M2 run, VM/admin action, push, PR/status/merge/watch action, or TLS/production CA work. M2 remains open, M3 unchecked, and the eight Windows ignores unchanged. Hosted Windows stability is unverified; hardware paths remain **unverified on real hardware**.
