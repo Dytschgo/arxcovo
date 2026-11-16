@@ -42,6 +42,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus51357c2 timing disposition proposes explicit C1R1–R4 revision; Sol accepts in writing. Originalwholejobcriterionnotmetagainstfasterbaseline; newmergecriterioninstall<=39s plusrequiredsmokes/fivegates/exactmaingreen, anchoredoriginalrun7s. Firstmerge-mainrunmustconfirminstall<=39s/job<=500s before sampler;501–585written decision,>585/failheld;install>79reviewedrevert. No rerun or fixedwholejobspeedup claim.
+
 - 2026-11-16: PR154 allfivegatesgreen exact5ba2cf6; Windowsjob493s/install7s, smokesgreen, nextest304s. Against598/542sbaselines wholejob saves105/49s; against151/139s install saves144/132s. Conservative49s job saving trips declared60sstopthreshold; coordinator holdsmerge/sample and requestsOpus measured-evidence disposition instead of silently changing criterion. Main58d06c1CI43815774741green;no rerun/newoptimization.
 
 - 2026-11-16: Opus high01c0761 passes independent C1 implementation review; Sol local3workflowtests/diff pass, repeatedbyreviewer. SameChromiumbinaryandrequiredsmokesverifiedsource; no timingbenefitclaimed. Publishprobe with bothWindows baselines598/542s andinstall151/139s; source-onlyPASS, fresh exacthead/gates/timingmeasurement required. No sampler/quarantinechange.
