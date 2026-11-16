@@ -127,3 +127,19 @@ claim that any historical flake is fixed. Scenario 17's historical startup retry
 is unchanged. No new retry was added. M2 remains open, M3 unchecked, all eight
 Windows three-node quarantines unchanged; hardware paths remain
 **unverified on real hardware**. Hosted Windows three-node remains unverified.
+
+
+## Coordinator full-cluster checkpoint
+
+After the TLS verification round completed, root Sol ran the full cluster nextest
+selection once on5f0c723 plus the retained docs-only Opus review51b4012:
+`cargo nextest run -p arxd --locked --offline -E 'test(/^cluster::/)'`.
+Result:140passed,0failed,468skipped by selection/quarantine,9.064s test execution.
+Log: D:/Temp/arx-close-full-cluster.log. The four close controls, issuance tests
+and required read tests passed. This is separate from Opus's focused runs.
+
+Opus source review6fcc369, retained51b4012, passes Standards, Spec and Security.
+Its log-store-only shutdown-wait test gap remains a follow-up before a production
+restart caller; SQLite/OS close-success and historical-flake claims are not made.
+Exact-head independent publication review, all five hosted gates and a fresh
+green-main check remain required. M2 open, M3 unchecked, eight quarantines kept.
