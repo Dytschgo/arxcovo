@@ -171,3 +171,23 @@ publication. Platform checks for this source are unrun. Activation requires sepa
 acceptance of the KICKOFF wall-clock deviation and a concrete bounded bootstrap route;
 preparation grants neither. ADR0022's historical exception is exhausted. No claim is
 made that the current main health, PR162 deadlock or R5 is fixed.
+
+
+## Root completed-attempt validation reproduction
+
+Root Sol static review flags measure() passing a forced completed status into
+existing duration(). A synthetic VM probe uses the unchanged incomplete-main
+scenario at800s rather than1200s. It executes the actual proposed entrypoint,
+with gh and record writes stubbed; no live policy or external write occurs.
+Result: error=null, pending then success, description wall800s/charged n/a
+(run-invalid)/budget satisfied. Thus the slow1200s test alone hides a weakened
+existing completed-baseline requirement. The source remains pinned874dc9e for
+independent Opus review, with this open question already in its assignment.
+
+The temporary harness first failed because its relocated history-fixture URL
+still resolved relative to D:/Temp; no policy result was produced. Correcting
+both module and history URLs enabled the synthetic reproduction. Repository
+source, fixtures and history remain unchanged by the probe. Temporary files:
+D:/Temp/arx-ci-fast-incomplete-probe.mjs and its JSON output. Output SHA-256:
+9cd32bb4edcf48037c280f836eb9bd9b5ba6b6c2acded3fe9a3f377738531033.
+No queue metric or gate activation is accepted from this reproduction.
