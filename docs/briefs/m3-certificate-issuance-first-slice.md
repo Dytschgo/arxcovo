@@ -124,8 +124,8 @@ Full issuance plus the TLS verifier is about 1.5k lines with tests, and Windows 
 
 ## PR A0 files and tests
 
-`consensus.rs` (`fresh_read`, `id`, `read_permits`, `Busy`), `consensus/adapter.rs` (`#[cfg(test)]` async `APPLY_PAUSE` keyed by the `SmAdapter` Arc pointer,
-awaited **before** `run`, so it holds no lock) and `three_node.rs`. No new dependencies. Actual OpenRaft, `mem_net`, `timeout(45 s)`. The **store gate** is a
+`consensus.rs` (`fresh_read`, `id`, `read_permits`, `Busy`), `consensus/adapter.rs` (main PR150's `#[cfg(test)]` `APPLY_PAUSE`, keyed by the `SmAdapter` Arc pointer,
+inside the blocking worker **before** acquiring the store mutex) and `three_node.rs`. No new dependencies. Actual OpenRaft, `mem_net`, `timeout(45 s)`. Every fixture using the shared pause slot (R1, R6 and any future issuance guard test) holds the test-only async APPLY_PAUSE_OWNER mutex for its complete hook lifetime. The **store gate** is a
 `std::thread` holding the leader's `SmAdapter` mutex until an mpsc release (never a Tokio worker). R1 and R3 hang past the old 4 s test timeout before the fix:
 - **R1 apply wait.** Pause the leader's apply, then commit a write on the followers. The leader's `linearizable_state()` gives `Unavailable` in ≤ 2.5 s. Release,
   and the write and a read succeed and `converge` holds. **R2:** an isolated leader gives `NotLeader`/`NoQuorum`, or `Unavailable` only at or after READ_BUDGET. Both caller return and all read permits returning must occur within2.5s measured from the original call start.

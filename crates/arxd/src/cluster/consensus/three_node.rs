@@ -4,6 +4,9 @@ use crate::cluster::enrollment::{CODE_TTL_MS, JoinCode, KeyDigest, Reject};
 use crate::service::application::tests::private_temp;
 use std::sync::atomic::Ordering;
 use tokio::time::timeout;
+
+// Own the single adapter pause slot across each complete async fixture.
+static APPLY_PAUSE_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Cluster {
     dirs: Vec<tempfile::TempDir>,
     nodes: Vec<Option<Arc<ConsensusNode>>>,
@@ -759,6 +762,7 @@ async fn t4_registry_revocation_snapshot_and_prune() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r1_apply_wait_deadline() {
     timeout(Duration::from_secs(45), async {
+        let _pause_owner = APPLY_PAUSE_OWNER.lock().await;
         let mut c = Cluster::new(Params::default()).await;
         c.converge().await;
         let l = c.leader().await;
@@ -1080,6 +1084,7 @@ fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r6_shutdown_report_cancelled_proposal() {
     timeout(Duration::from_secs(45), async {
+        let _pause_owner = APPLY_PAUSE_OWNER.lock().await;
         let mut c = Cluster::new(Params::default()).await;
         c.converge().await;
         let l = c.leader().await;
