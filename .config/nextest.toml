@@ -1,0 +1,5 @@
+# R5 post-release observation only: show this one test's passing output.
+# Contract: docs/briefs/m3-r5-postrelease-observation.md
+[[profile.default.overrides]]
+filter = "package(=arxd) & kind(lib) & test(=cluster::consensus::three_node::r5_shutdown_read_owners)"
+success-output = "immediate"
