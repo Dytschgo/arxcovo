@@ -2,10 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
+**Current merge blocker:** main01a42d5 CI [43788629298](https://github.com/Dytschgo/arxcovo/actions/runs/43788629298) failed Windows T2/U6 leader-deadline and T3/T4 write-deadline checks. Main remains red; no further merge under the standing rule.
+
 Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
 
 - Main38750cf (after PR144), CI [43757400254](https://github.com/Dytschgo/arxcovo/actions/runs/43757400254): Ubuntu `unix_shim::rights::linux::tests::s9c_bound_object_survives_file_and_directory_swap` failed at unix_shim_rights_linux_tests.rs237, actual `unknown` versus expected `exit_zero`.
 - Main765df2b (after PR145), CI [43767515928](https://github.com/Dytschgo/arxcovo/actions/runs/43767515928): Ubuntu `cluster::consensus::tests::append_spawned_cancellation_panic_and_poison_complete_once` failed at consensus/tests.rs550, unwrap of `StoreError::Io`.
+
+- Main01a42d5 (after PR150), CI [43788629298](https://github.com/Dytschgo/arxcovo/actions/runs/43788629298), Windows: T2 leader deadline at three_node.rs100 (14.281s), U6 same leader deadline (7.996s), T3/T4 write helper deadline at117 (13.582s/12.773s). Summary82pass/4fail/5skip/479unrun. PR149 read bounds do not address these election/write waits.
 
 PR145 was merged after the first red main run without accounting for it; the coordinator corrects that merge-readiness omission. Coordinator live verification on2026-11-16 confirms latest main CI [43768671593](https://github.com/Dytschgo/arxcovo/actions/runs/43768671593) completed successfully on exact main0ab5038d89e86e5f726fbed7e5ef6d76e64fa306; green main does not erase either intermittent failure. Active bounded diagnosis/fix work is required, with the new consensus test prioritized now and the Linux shim failure separately tracked. No test is silently retried, marked accepted or attributed to unrelated changes.
 
@@ -14,8 +18,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #147, `a318ae167e940948898affcb99da33bf17bd9dbc` at23:36:01Z; independent Opus exact-head PASS6903122978/status58983006547 and all five gates green. Reviewed9390742/squash full trees equal. Before merge, exact main0ab5038 CI43768671593 was confirmed completed green and main was re-read without drift.
-- Current work: main-based shutdown phase diagnostics passed independent Opus source review and exact-store-count recheck; publication exact-head review and fresh hosted gates next. PR149 bounded reads remains blocked until this diagnostic parent merges and its read-owner report integration is reviewed. Natural hosted U6 cause remains unknown; no fix or hardware acceptance is claimed. M2 remains open.
+- Last merged: PR #150, `01a42d5adfedbdbd3d6e6d35648b8adb0d76cad9` at01:50:48Z; independent Opus PASS6904986238/status58988237107 and all five gates green. Reviewed3bb81e9/squash trees equal; pre-merge exactmain6e9edd5 CI43777637580 green. Its subsequent main CI is red as recorded above.
+- Current work: separate main-based nextest resource-group repair for recurring three-node storage contention, suite-level fix attempt3. Opus reproduced exact leader deadline under shared-flush latency; Sol reviewed the scheduling contract before implementation. PR149 push remains held; no further merge while main red. Hardware/M2 gaps remain open.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -37,6 +41,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Opusde6a8f1 retainedd00a94f diagnoses exact-main01a42d5 leader-deadline failures under shared-flush contention; serialized three-node group removes leader signature under the controlled model. T3/T4 link remains inferred and hostedcauseunproven. Sol1ee25f0 independently approves narrow scheduling repair (ADR0024), no Rust/assertion/deadline/retry/skip change. Two new Python resource-contract tests and196 existing guards pass; actual nextest mapping/run validation active. Suitefixattempt3; another hosted cluster failure escalates, no fourth tweak.
 
 - 2026-11-16: Opus05a3a2f retained815f6c4 closes diagnostic B1: counts-before-own-handle-drop mutant compiles then fails exactlyone external-reference assertion, restoredR6 tests/fmt/lockedofflinearxdClippy pass. Coordinator separatelyR6/fmt pass. Productionreport unchanged; fresh exact-head review/five gates/latestexactmainCI remain publication/merge prerequisites. No manual CI rerun; first finite changed-diagnostic hosted attempt next.
 

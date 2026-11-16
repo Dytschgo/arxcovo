@@ -1,0 +1,7 @@
+# Bound shared-flush contention without changing tests or deadlines (ADR 0024).
+[test-groups]
+arxd-three-node-cluster = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/)'
+test-group = 'arxd-three-node-cluster'
