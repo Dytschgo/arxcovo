@@ -955,3 +955,184 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod controls {
+    //! Positive controls: each induces one seam and checks its own attribution.
+    //! Opt-in (`--run-ignored`), so CI time and the Windows quarantine are unchanged.
+    use super::super::three_node::{Cluster, report_cleanup, report_take_node, unknown};
+    use super::super::*;
+    use super::*;
+    use std::time::Instant;
+    use tokio::time::timeout;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "D1 diagnostic positive control; run explicitly with --run-ignored"]
+    async fn d1_control_s4_queued_apply_exceeds_shutdown_budget() {
+        const DELAY_MS: u32 = 250;
+        const QUEUED: u8 = 40;
+        timeout(Duration::from_secs(45), async {
+            let mut c = Cluster::new(Params {
+                election_min: 3000,
+                election_max: 6000,
+                ..Params::default()
+            })
+            .await;
+            c.converge().await;
+            let l = c.leader().await;
+            let stats = c.diag.nodes[l].clone();
+            let high0 = stats.op(Op::Apply).high();
+            let raft = c.node(l).raft.as_ref().unwrap().clone();
+            let base = raft.metrics().borrow_watched().last_log_index.unwrap();
+            stats.apply_delay_ms.store(DELAY_MS, Relaxed);
+            let mut callers = JoinSet::new();
+            for r in 0..QUEUED {
+                let node = c.node(l).clone();
+                callers.spawn(async move { node.propose(unknown(r)).await });
+            }
+            let m = raft
+                .wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |m| m.local_committed.is_some_and(|p| p.index >= base + QUEUED as u64),
+                    "control proposals committed",
+                )
+                .await
+                .unwrap();
+            let backlog = base + QUEUED as u64 - m.last_applied.map_or(0, |p| p.index);
+            callers.abort_all();
+            while callers.join_next().await.is_some() {}
+            drop(raft);
+            // The control must really exceed the unchanged 5 s budget, with margin.
+            assert!(backlog * DELAY_MS as u64 >= 6000, "backlog={backlog}");
+            let mut n = report_take_node(&mut c, l);
+            let start = Instant::now();
+            let result = timeout(Duration::from_millis(5500), n.shutdown())
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+            // Let the real worker drain before any assertion can panic.
+            stats.apply_delay_ms.store(0, Relaxed);
+            report_cleanup(&n).await;
+            let Err(Orphaned(r)) = result else {
+                panic!("queued apply backlog must fail shutdown: {result:?}")
+            };
+            c.attribute_stop(l, r);
+            let a = c.diag.recorded().unwrap();
+            let high = stats.op(Op::Apply).high() - high0;
+            let lag = c.diag.lag.max_since(0);
+            let cand = classify(lag, 0, if high > 0 { HIGH_MS } else { 0 });
+            eprintln!(
+                "D1 S4 control: delay_ms={DELAY_MS} queued={QUEUED} backlog={backlog} apply_high={high} lag={lag} cand={cand:?} elapsed={elapsed:?} report={r:?}"
+            );
+            assert_eq!((a.helper, a.fail), (Helper::Stop, Fail::Orphaned));
+            assert_eq!(r.first, Phase::Owners);
+            assert!(r.owners_left >= 1, "{r:?}");
+            assert!(high >= 1);
+            assert!(matches!(cand, Candidate::Store | Candidate::Both));
+            assert!(c.diag.render().contains("first: Owners"));
+            c.finish().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "D1 diagnostic positive control; run explicitly with --run-ignored"]
+    async fn d1_control_s3_isolated_leader_read_attributes_churn() {
+        timeout(Duration::from_secs(45), async {
+            let mut c = Cluster::new(Params::default()).await;
+            c.converge().await;
+            let old = c.leader().await;
+            let term = c.diag.sample(c.node(old).raft.as_ref().unwrap()).term;
+            c.router.isolated.lock().unwrap().insert(old as u64 + 1);
+            let new = timeout(Duration::from_secs(5), async {
+                loop {
+                    for i in (0..3).filter(|i| *i != old) {
+                        let m = c.diag.sample(c.node(i).raft.as_ref().unwrap());
+                        if m.state == b'L' && m.term > term {
+                            return i;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("replacement leader");
+            c.router.isolated.lock().unwrap().remove(&(old as u64 + 1));
+            let result = c.attributed_read(old).await;
+            let a = c.diag.recorded();
+            eprintln!(
+                "D1 S3 control: old={} new={} term={term} result={result:?} attr={a:?}",
+                old + 1,
+                new + 1
+            );
+            assert!(result.is_err(), "stale leader read must fail: {result:?}");
+            let a = a.unwrap();
+            assert_eq!((a.helper, a.node), (Helper::Converge, old as u8 + 1));
+            assert_eq!(a.read.unwrap().2, S3::Churn);
+            assert!(c.diag.render().contains("class=Churn"));
+            // The deposed node may still publish Leader metrics; converge only after
+            // it steps down so cleanup does not re-enter the seam under test.
+            c.node(old)
+                .raft
+                .as_ref()
+                .unwrap()
+                .wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |m| m.current_term > term,
+                    "deposed leader observes new term",
+                )
+                .await
+                .unwrap();
+            c.converge().await;
+            c.finish().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "D1 diagnostic positive control; run explicitly with --run-ignored"]
+    async fn d1_control_timer_lag_is_distinct_from_store_latency() {
+        timeout(Duration::from_secs(45), async {
+            let mut c = Cluster::new(Params {
+                election_min: 3000,
+                election_max: 6000,
+                ..Params::default()
+            })
+            .await;
+            c.converge().await;
+            let t = c.diag.t_ms();
+            let high0: u32 = c.diag.nodes.iter().map(|n| n.high_total()).sum();
+            // Occupy all four runtime workers at once; bounded rendezvous, no deadlock.
+            let arrived = Arc::new(AtomicU32::new(0));
+            let mut burn = JoinSet::new();
+            for _ in 0..4 {
+                let arrived = arrived.clone();
+                burn.spawn(async move {
+                    arrived.fetch_add(1, Relaxed);
+                    let gate = Instant::now();
+                    while arrived.load(Relaxed) < 4 && gate.elapsed() < Duration::from_secs(2) {
+                        std::hint::spin_loop();
+                    }
+                    let s = Instant::now();
+                    while s.elapsed() < Duration::from_millis(400) {
+                        std::hint::spin_loop();
+                    }
+                });
+            }
+            while burn.join_next().await.is_some() {}
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let lag = c.diag.lag.max_since(t);
+            let high: u32 = c.diag.nodes.iter().map(|n| n.high_total()).sum::<u32>() - high0;
+            let cand = classify(lag, 0, if high > 0 { HIGH_MS } else { 0 });
+            eprintln!("D1 lag control: burn_ms=400 workers=4 lag={lag} store_high_delta={high} cand={cand:?}");
+            assert!(lag >= 250, "lag={lag}");
+            assert_eq!(high, 0);
+            assert_eq!(cand, Candidate::Cpu);
+            c.finish().await;
+        })
+        .await
+        .unwrap();
+    }
+}
