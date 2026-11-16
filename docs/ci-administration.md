@@ -35,7 +35,7 @@ The command checks the allowlist, same-repository source, OWNER/MEMBER/COLLABORA
 
 Policy runs trusted default-branch code on workflow_run for CI and label signals, with a periodic retry. It never executes candidate code. API calls are bounded; discovery at 100 open PRs fails closed and needs pagination before scaling. Head and labels are read live; statuses are per SHA. Attempt 1 supplies the wall-clock measurement so a partial rerun cannot appear faster. The latest completed main push run is authoritative. Missing baseline fails. The currently active wall policy permits only a successful faster same-head/repository ci-speed candidate when main exceeds 900 seconds.
 
-**Prepared amendment, conditional and not active:** [ADR0025](adr/0025-ci-queue-outage-budget.md) retains wall seconds and adds charged-v1. A validated sweep credits only intervals with a created pending required job and no executing job. Execution, overlapping waits, prefix/tail and no-pending idle remain charged. The exact three completed platform jobs must match attempt 1, run/head, names, labels and strict timestamp ranges. One bounded jobs page is read; invalid metadata withholds credit with run-invalid/jobs-invalid, using the original wall gate. Transport/8 MiB overflow still fails closed. Failed runs or jobs retain computed measurements as not-green but receive no credit. A green valid baseline may use charged time at the unchanged 900s threshold. Above it, ci-speed requires BOTH baseline and candidate green/creditable and strictly reduced charged time AND longest execution. These metrics alone do not prove a source speedup or exclude runtime noise.
+**Owner-accepted amendment, conditional and not active:** [ADR0025](adr/0025-ci-queue-outage-budget.md) retains wall seconds and adds charged-v1. A validated sweep credits only intervals with a created pending required job and no executing job. Execution, overlapping waits, prefix/tail and no-pending idle remain charged. The exact three completed platform jobs must match attempt 1, run/head, names, labels and strict timestamp ranges. One bounded jobs page is read; invalid metadata withholds credit with run-invalid/jobs-invalid, using the original wall gate. Transport/8 MiB overflow still fails closed. Failed runs or jobs retain computed measurements as not-green but receive no credit. A green valid baseline may use charged time at the unchanged 900s threshold. Above it, ci-speed requires BOTH baseline and candidate green/creditable and strictly reduced charged time AND longest execution. These metrics alone do not prove a source speedup or exclude runtime noise.
 
 Main43880904887 remains RED: wall1475s/charged738s/Q737s/longest372s, credit withheld. PR162 run43889323450 is green: wall1311s/charged877s/Q434s/longest585s. It cannot qualify for ci-speed against this failed main. The separate exact-main health prerequisite still blocks feature merges.
 
@@ -52,7 +52,7 @@ After the reviewed installation merge: measure main CI, commit the first baselin
 
 ## Proposed ADR0025 bootstrap (not authorized)
 
-The owner authorized preparation of the reviewed amendment, not activation.
+The owner accepted ADR0025's budget-definition change on 2026-11-16. Activation and the one-use bootstrap route remain unauthorized. The earlier preparation-only wording is historical.
 On2026-11-16 the live mainc612152 snapshot requires all three verify jobs
 (App15368), agent-review (no app pin), and ci-time-budget (App15368), with
 strict=true and enforce_admins=true. The amendment cannot satisfy its own old
@@ -86,3 +86,16 @@ executor, before/after settings and result in PROGRESS and ADR0025. Any further
 exception requires a new decision; the route is not reusable.
 
 Source for explicit app binding: [GitHub protected-branch status-check API](https://docs.github.com/en/rest/branches/branch-protection#update-status-check-protection).
+
+
+## Owner acceptance checkpoint - 2026-11-16
+
+The owner explicitly accepted ADR0025's budget definition: exclude verified idle queue gaps
+only for fully green runs, retain the 900-second threshold and report total wall time.
+This supersedes statements above that definition acceptance is still pending. It grants no
+protection change or merge permission. The named-executor bootstrap decision remains separate.
+
+The owner also authorized one infrastructure-only retry of cancelled macOS job133431908247
+on old head a26de1b. Readback confirms runner_id=0 and zero steps. That job is superseded:
+current PR163 head78c72b6 already has successful CI43914905394 on attempt1, all platforms green.
+No obsolete-head retry was performed and no attempt2 result is claimed.

@@ -1,12 +1,21 @@
 # 0025: Charge the CI time budget for execution, not idle job queue
 
-Status: **Proposed 2026-11-16 — implemented locally for review, not accepted, not active.** Opus design sub-agent, exact main `c612152`.
+Status: **Accepted by the owner 2026-11-16; implementation reviewed, not active.** Opus design sub-agent, exact main `c612152`.
 
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
 No label makes this amendment, or its implementation, a `ci-speed` change. KICKOFF requires "15 minutes
 wall-clock", so this ADR is a deliberate deviation. It takes effect only after the user accepts it and separately
 approves a concrete bootstrap route (see Activation).
+
+## Owner decision and activation status
+
+On 2026-11-16 the owner explicitly answered "Yes, accept the budget-definition change":
+exclude verified idle queue gaps only for fully green runs while retaining total wall-time reporting.
+This accepts the deliberate deviation from KICKOFF's queue-inclusive wall-clock definition.
+The earlier preparation-only decision above is historical. Acceptance does not authorize the
+separate one-use protection/bootstrap route, name its executor, merge this PR, or waive red main.
+The trusted main implementation remains the old wall policy until authorized activation.
 
 ## Context (attempt 1, read-only API)
 
