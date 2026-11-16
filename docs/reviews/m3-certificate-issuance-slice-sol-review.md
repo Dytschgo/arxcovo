@@ -35,3 +35,13 @@ also reject Unix shorthand/target_family selectors, rather than only the listed 
 work; owned64proposal/8read bounds remain. Synchronous crypto is not preempted by the5s budget. No source or dependency approval follows automatically: builder
 must stop on real API conflict, and fresh Opus source review/five gates are required. Source start still waits for exact-main CI on PR149 squash f1c399d.
 No build/test was run for this prose check. M2 open/M3 unchecked and hardware paths unverified.
+
+## PR B readiness contract check (2026-11-16)
+
+Sol accepts Opus06ff3d4 (retained4c9cb65) V1-V9 with two precise clarifications recorded in the brief: registry Unavailable uses a PKI-owned VerifyRefusal rather
+than an absent enrollment PeerRefusal variant; authenticated identities are extracted only from completed TLS13 connections, not from arbitrary raw certificate
+slices. The extraction remains a trusted reviewed adapter, not unforgeable proof against arbitrary crate code/configuration. Actual sm_weak is Weak<Mutex<StateStore>>;
+weak callback ownership therefore preserves store shutdown, and its synchronous mutex wait is honestly unbounded. Intended-target node binding closes the original
+servername-omission gap while retaining cluster URI identity. New test placement/guard scope preserves exact8 quarantine/sample selection. Standalone PKI pure work
+remains bounded by DER/chain limits; blocking handshakes run off runtime workers. No build/test/resolve ran for this prose check. Source work remains held until
+A merges and its exact-main CI is green; independent Opus source review and five hosted gates remain required for B. No M2/M3 or hardware acceptance follows.
