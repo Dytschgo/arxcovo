@@ -805,7 +805,7 @@ class Clock:
 
 @dataclass
 class Phase:
-    status: str          # exit | killed | cancelled
+    status: str          # exit | killed (after go) | expired (before go) | cancelled
     rc: object = None
     ms: int = 0
     cleanup_ms: int = 0
