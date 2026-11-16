@@ -23,7 +23,9 @@ def assert_issuance_modules(issue, pki):
     assert_issuance_required(pki)
     for source, declaration in [
         (issue, '#[cfg(test)]\n#[path = "issue_tests.rs"]\nmod issue_tests;'),
+        (issue, '#[cfg(test)]\n#[path = "tls_engine_tests.rs"]\nmod tls_engine_tests;'),
         (pki, '#[cfg(test)]\nmod tests;'),
+        (pki, '#[cfg(test)]\nmod tls_tests;'),
     ]:
         if source.count(declaration) != 1:
             raise AssertionError("issuance test module must retain its binding")
@@ -43,7 +45,7 @@ class QuarantineTests(unittest.TestCase):
             '#[cfg(any())]', '#[cfg(target_env = "msvc")]',
             '#[cfg(target_vendor = "pc")]', '#[cfg(feature = "hidden")]',
         ]
-        for relative in ["consensus/issue_tests.rs", "pki/tests.rs"]:
+        for relative in ["consensus/issue_tests.rs", "pki/tests.rs", "consensus/tls_engine_tests.rs", "pki/tls_tests.rs"]:
             source = (base / relative).read_text(encoding="utf-8")
             assert_issuance_required(source)
             for mutation in mutations:
@@ -62,6 +64,11 @@ class QuarantineTests(unittest.TestCase):
             assert_issuance_modules(issue.replace('mod issue_tests;', 'mod absent;'), pki)
         with self.assertRaises(AssertionError):
             assert_issuance_modules(issue, pki.replace('mod tests;', 'mod absent;'))
+
+        with self.assertRaises(AssertionError):
+            assert_issuance_modules(issue.replace('mod tls_engine_tests;', 'mod absent;'), pki)
+        with self.assertRaises(AssertionError):
+            assert_issuance_modules(issue, pki.replace('mod tls_tests;', 'mod absent;'))
 
     def test_exact_windows_only_quarantine(self):
         source = (ROOT / "crates/arxd/src/cluster/consensus/three_node.rs").read_text(encoding="utf-8")

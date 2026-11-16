@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(super) struct MemRouter {
     pub nodes: Mutex<BTreeMap<u64, Engine>>,
     pub isolated: Mutex<BTreeSet<u64>>,
+    pub authenticated: Mutex<BTreeMap<u64, crate::cluster::pki::verify::AuthenticatedPeer>>,
     pub mismatch: AtomicUsize,
     pub append_max: AtomicUsize,
     pub snapshot_max: AtomicUsize,
@@ -32,7 +33,18 @@ fn unreachable() -> Unreachable<Arx> {
 }
 impl MemNetwork {
     fn remote(&self, sender: u64) -> Result<Engine, Unreachable<Arx>> {
-        if sender != self.source {
+        let identity = self
+            .router
+            .authenticated
+            .lock()
+            .unwrap()
+            .get(&self.source)
+            .copied();
+        let mismatch = match identity {
+            Some(peer) => crate::cluster::pki::verify::check_sender(peer.node(), sender).is_err(),
+            None => sender != self.source,
+        };
+        if mismatch {
             self.router.mismatch.fetch_add(1, Ordering::Relaxed);
             return Err(unreachable());
         }

@@ -289,3 +289,30 @@ pub(in crate::cluster) fn test_ticket(key: KeyDigest) -> IssueTicket {
         index: 1,
     }
 }
+
+impl ConsensusNode {
+    /// Local applied registry only; stale acceptance and lock waiting are unbounded.
+    pub fn peer_registry(&self) -> crate::cluster::pki::verify::Registry {
+        use crate::cluster::pki::verify::VerifyRefusal;
+        let weak = self.sm_weak.clone();
+        Arc::new(move |cluster, node, key| {
+            let store = weak.upgrade().ok_or(VerifyRefusal::Unavailable)?;
+            let result = {
+                let guard = store.lock().map_err(|_| VerifyRefusal::Unavailable)?;
+                guard
+                    .state()
+                    .authorize_peer(cluster, node, key)
+                    .map_err(|e| match e {
+                        PeerRefusal::WrongCluster => VerifyRefusal::WrongCluster,
+                        PeerRefusal::NotMember => VerifyRefusal::NotMember,
+                        PeerRefusal::KeyMismatch => VerifyRefusal::KeyMismatch,
+                    })
+            };
+            drop(store);
+            result
+        })
+    }
+}
+#[cfg(test)]
+#[path = "tls_engine_tests.rs"]
+mod tls_engine_tests;
