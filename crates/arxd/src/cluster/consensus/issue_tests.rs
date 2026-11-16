@@ -411,13 +411,21 @@ async fn i7_adapter_rejects_forged_shapes_and_mismatches() {
             ))
             .await
             .unwrap();
-        let mut forged = response.clone();
+        let mut forged = openraft::raft::ClientWriteResponse::<Arx> {
+            log_id: response.log_id,
+            data: response.data.clone(),
+            membership: response.membership.clone(),
+        };
         forged.log_id.leader_id.node_id = (l as u64 + 1) % 3 + 1;
         assert!(matches!(
             c.node(l).committed(forged),
             Err(IssueError::WrongNode)
         ));
-        let mut forged = response.clone();
+        let mut forged = openraft::raft::ClientWriteResponse::<Arx> {
+            log_id: response.log_id,
+            data: response.data.clone(),
+            membership: response.membership.clone(),
+        };
         forged.data = Applied(None);
         assert!(matches!(
             c.node(l).committed(forged),
