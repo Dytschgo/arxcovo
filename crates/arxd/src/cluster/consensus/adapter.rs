@@ -94,6 +94,29 @@ fn pause_append_completion(store: usize) {
         let _ = pause.release.recv();
     }
 }
+#[cfg(test)]
+pub(super) struct ApplyPause {
+    pub store: usize,
+    pub entered: oneshot::Sender<()>,
+    pub release: oneshot::Receiver<()>,
+}
+#[cfg(test)]
+pub(super) static APPLY_PAUSE: Mutex<Option<ApplyPause>> = Mutex::new(None);
+#[cfg(test)]
+async fn pause_apply(store: usize) {
+    let pause = {
+        let mut hook = APPLY_PAUSE.lock().unwrap();
+        if hook.as_ref().is_some_and(|p| p.store == store) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(p) = pause {
+        let _ = p.entered.send(());
+        let _ = p.release.await;
+    }
+}
 struct Completion(Option<IOFlushed<Arx>>);
 impl Completion {
     fn new(c: IOFlushed<Arx>) -> Self {
@@ -262,6 +285,8 @@ impl RaftStateMachine<Arx> for SmAdapter {
         while let Some(e) = entries.next().await {
             let (e, responder) = e?;
             let (p, e) = to_stored(e).map_err(err)?;
+            #[cfg(test)]
+            pause_apply(Arc::as_ptr(&self.0) as usize).await;
             let outcome = self.run(move |s| s.apply(p, &e)).await?;
             if let Some(r) = responder {
                 r.send(Applied(outcome));

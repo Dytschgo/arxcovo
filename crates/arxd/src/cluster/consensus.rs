@@ -226,6 +226,9 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 type Engine = Raft<Arx, SmAdapter>;
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
+const READ_BUDGET: Duration = Duration::from_millis(1500);
+const READ_PERMITS: usize = 8;
 #[derive(Clone, Copy)]
 pub(super) struct Params {
     pub snapshot_logs: u64,
@@ -244,6 +247,7 @@ pub(super) enum ProposeError {
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ReadError {
+    Busy,
     NotLeader,
     NoQuorum,
     Unavailable,
@@ -256,6 +260,10 @@ struct Owners {
     set: JoinSet<()>,
 }
 pub(super) struct ConsensusNode {
+    id: u64,
+    read_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    read_blocking: Arc<std::sync::atomic::AtomicUsize>,
     raft: Option<Engine>,
     sm: Option<SmAdapter>,
     log_weak: Weak<Mutex<VoteLogStore>>,
@@ -293,6 +301,10 @@ impl ConsensusNode {
             .await
             .map_err(|_| StartError::Fatal)?;
         Ok(Self {
+            id: node,
+            read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
+            #[cfg(test)]
+            read_blocking: Arc::default(),
             raft: Some(raft),
             sm: Some(sm),
             log_weak,
@@ -333,33 +345,107 @@ impl ConsensusNode {
         }
         rx.await.unwrap_or(Err(ProposeError::Unknown))
     }
-    pub async fn linearizable_state(&self) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
-        let raft = self.raft.as_ref().ok_or(ReadError::Unavailable)?;
-        let read = raft
-            .ensure_linearizable(
-                LinearizerOption::new(Some(Duration::ZERO), true)
-                    .with_wait_timeout(Duration::from_millis(1500)),
-            )
-            .await
-            .map_err(|e| match e {
-                RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
-                    ReadError::NotLeader
-                }
-                RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
-                    ReadError::NoQuorum
-                }
-                _ => ReadError::Unavailable,
-            })?;
-        let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
-        blocking(move || {
-            let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
-            if s.applied().is_none_or(|p| p.index < read.index()) {
-                return Err(StoreError::Corrupt);
+    /// `f` is a pure store read: no await and no calls back into Raft.
+    /// The caller deadline does not terminate queued engine or blocking work.
+    async fn fresh_read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&StateStore) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<(LeaderId, T), ReadError> {
+        let deadline = Instant::now() + READ_BUDGET;
+        let permit = self
+            .read_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ReadError::Busy)?;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut owners = self.owners.lock().map_err(|_| ReadError::Unavailable)?;
+            if owners.closed {
+                return Err(ReadError::Unavailable);
             }
-            Ok((s.applied(), s.snapshot()))
-        })
-        .await
-        .map_err(|_| ReadError::Unavailable)
+            while owners.set.try_join_next().is_some() {}
+            let raft = self.raft.as_ref().ok_or(ReadError::Unavailable)?.clone();
+            let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
+            #[cfg(test)]
+            let read_blocking = self.read_blocking.clone();
+            owners.set.spawn(async move {
+                let result = async {
+                    if Instant::now() >= deadline || tx.is_closed() {
+                        return Err(ReadError::Unavailable);
+                    }
+                    // Never cancel this wait: only its reply proves that an
+                    // unwithdrawable engine request no longer owns this unit.
+                    let linearizer = raft
+                        .get_read_linearizer(
+                            LinearizerOption::new(Some(Duration::ZERO), true).with_wait_timeout(
+                                deadline.saturating_duration_since(Instant::now()),
+                            ),
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
+                                ReadError::NotLeader
+                            }
+                            RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+                                ReadError::NoQuorum
+                            }
+                            _ => ReadError::Unavailable,
+                        })?;
+                    if Instant::now() >= deadline || tx.is_closed() {
+                        return Err(ReadError::Unavailable);
+                    }
+                    let ready = match linearizer
+                        .try_await_ready(
+                            &raft,
+                            Some(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .await
+                    {
+                        Ok(Ok(ready)) => ready,
+                        _ => return Err(ReadError::Unavailable),
+                    };
+                    if Instant::now() >= deadline || tx.is_closed() {
+                        return Err(ReadError::Unavailable);
+                    }
+                    let read = ready.read_log_id();
+                    let leader = *read.committed_leader_id();
+                    let index = read.index();
+                    // Cancellation of the async owner cannot release either
+                    // resource while this non-abortable closure still runs.
+                    blocking(move || {
+                        #[cfg(test)]
+                        read_blocking.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let result = (|| {
+                            let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
+                            if s.applied().is_none_or(|p| p.index < index) {
+                                Err(StoreError::Corrupt)
+                            } else {
+                                f(&s).map(|value| (leader, value))
+                            }
+                        })();
+                        // Guard, store Arc, permit, then completion (#147).
+                        drop(sm);
+                        drop(permit);
+                        result
+                    })
+                    .await
+                    .map_err(|_| ReadError::Unavailable)
+                }
+                .await;
+                if Instant::now() < deadline && !tx.is_closed() {
+                    let _ = tx.send(result);
+                }
+            });
+        }
+        match timeout_at(deadline, rx).await {
+            Ok(Ok(result)) if Instant::now() < deadline => result,
+            _ => Err(ReadError::Unavailable),
+        }
+    }
+    pub async fn linearizable_state(&self) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
+        self.fresh_read(|s| Ok((s.applied(), s.snapshot())))
+            .await
+            .map(|(_, state)| state)
     }
     pub async fn shutdown(&mut self) -> Result<(), Orphaned> {
         let deadline = Instant::now() + Duration::from_secs(5);
