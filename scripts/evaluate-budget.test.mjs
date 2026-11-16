@@ -14,7 +14,7 @@ test('fast main passes without history or a candidate measurement', async () => 
   io.getCandidateRun = () => assert.fail('fast baseline needs no candidate');
   await evaluatePullRequests(io);
   assert.equal(posts.at(-1).state, 'success');
-  assert.match(posts.at(-1).description, /42: 40s/);
+  assert.match(posts.at(-1).description, /42: wall 40s/);
 });
 test('measurement failure invalidates old success for every discovered PR', async () => {
   const { io, posts, pr } = fixture();
@@ -91,7 +91,19 @@ test('per-PR API errors and discovery bounds publish failure', async () => {
   assert.equal(posts.at(-1).state, 'failure');
 });
 test('speed labels require a successful reduction; absent baseline fails', () => {
-  assert.equal(decideBudget({ seconds: 901 }, { seconds: 800, conclusion: 'success' }, [{ name: 'ci-speed' }]).state, 'success');
+  assert.equal(decideBudget({ seconds: 901 }, { seconds: 800, conclusion: 'success' }, [{ name: 'ci-speed' }]).state, 'failure');
   assert.equal(decideBudget({ seconds: 901 }, { seconds: 902, conclusion: 'success' }, [{ name: 'ci-speed' }]).state, 'failure');
   assert.equal(decideBudget(null, null, []).state, 'failure');
+});
+
+test('status descriptions retain main marker and fit 140 characters without publisher truncation', () => {
+  for (const credit of ['applied', 'withheld:not-green', 'unavailable:run-invalid', 'unavailable:jobs-invalid']) {
+    const latest = { runId: 43880904887, seconds: 604800, chargedSeconds: credit.startsWith('unavailable') ? null : 604800, longestJobSeconds: 604800, credit, conclusion: credit === 'applied' ? 'success' : 'failure' };
+    for (const candidate of [null, { ...latest, chargedSeconds: 604799, longestJobSeconds: 604799 }]) {
+      const result = decideBudget(latest, candidate, [{name: 'ci-speed'}]);
+      assert.ok(result.description.startsWith('Main run 43880904887:'));
+      assert.ok(result.description.length <= 140, result.description);
+      if (credit === 'withheld:not-green') assert.match(result.description, /uncredited \(not-green\)/);
+    }
+  }
 });

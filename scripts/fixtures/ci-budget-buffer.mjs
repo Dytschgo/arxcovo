@@ -15,10 +15,11 @@ const transportErrors = [];
 let prReads = 0;
 const pr = { number: 1, state: 'open', head: { sha: head, repo: { id: 7 } }, labels: [{ name: 'ci-speed' }] };
 const run = (id, seconds, extra = {}) => ({
+  run_attempt: 1, path: '.github/workflows/ci.yml', event: id === 20 || id === 19 ? 'push' : 'pull_request', head_branch: 'main',
   id, run_number: id, head_sha: head, head_repository: { id: 7 },
   status: 'completed', conclusion: 'success',
   run_started_at: '2026-01-01T00:00:00Z',
-  updated_at: new Date(Date.parse('2026-01-01T00:00:00Z') + seconds * 1000).toISOString(),
+  updated_at: new Date(Date.parse('2026-01-01T00:00:00Z') + seconds * 1000).toISOString().replace('.000Z', 'Z'),
   ...extra,
 });
 
@@ -36,16 +37,25 @@ function response(path, args) {
     return {};
   }
   if (path === 'actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&per_page=100') {
-    return { workflow_runs: [run(19, 1), run(20, 1)], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
+    return { workflow_runs: [run(19, 1), run(20, 1, {run_attempt: 2})], ...(scenario === 'oversized-main' ? { padding: 'x'.repeat(9 * 1024 * 1024) } : {}) };
   }
-  if (path === 'actions/runs/20/attempts/1') return run(20, scenario === 'fast-main' ? 800 : 1200);
+  if (path === 'actions/runs/20/attempts/1') return run(20, scenario === 'fast-main' ? 800 : 1200, scenario === 'attempt2-main' ? {run_attempt: 2} : {});
+  const jobsPath = path.match(/^actions\/runs\/(20|11)\/attempts\/1\/jobs\?per_page=100$/);
+  if (jobsPath) {
+    if (scenario === 'missing-jobs') throw Error('Synthetic unavailable jobs transport');
+    const id = Number(jobsPath[1]);
+    const seconds = id === 20 ? (scenario === 'fast-main' ? 800 : 1200) : (scenario === 'slow-first-attempt' ? 1300 : 600);
+    const r = run(id, seconds);
+    const jobs = ['ubuntu', 'windows', 'macos'].map((os, i) => ({id: i+1, run_id: id, run_attempt: scenario === 'attempt2-jobs' ? 2 : 1, head_sha: head, name: `verify (${os}-latest)`, labels: [`${os}-latest`], status: 'completed', conclusion: 'success', created_at: r.run_started_at, started_at: r.run_started_at, completed_at: r.updated_at}));
+    return {total_count: scenario === 'partial-jobs' ? 101 : 3, jobs, ...(scenario === 'oversized-jobs' ? {padding:'x'.repeat(9*1024*1024)} : {})};
+  }
   if (path === 'actions/workflows/ci.yml/runs?event=pull_request&status=completed&per_page=100') {
     return {
-      workflow_runs: [run(10, 50), run(13, 50, { head_sha: 'b'.repeat(40) }), run(12, 50, { head_repository: { id: 8 } }), run(11, 50)],
+      workflow_runs: [run(10, 50), run(13, 50, { head_sha: 'b'.repeat(40) }), run(12, 50, { head_repository: { id: 8 } }), run(11, 50, {run_attempt: 2})],
       padding: 'x'.repeat((scenario === 'oversized-candidate' ? 9 : 1.25) * 1024 * 1024),
     };
   }
-  if (path === 'actions/runs/11/attempts/1') return run(11, scenario === 'slow-first-attempt' ? 1300 : 600);
+  if (path === 'actions/runs/11/attempts/1') return run(11, scenario === 'slow-first-attempt' ? 1300 : 600, scenario === 'attempt2-candidate' ? {run_attempt:2} : {});
   throw Error(`Unexpected synthetic API path: ${path}`);
 }
 
@@ -68,15 +78,19 @@ function fakeExec(command, args, options) {
   }
 }
 
-const context = createContext({ process: { env: { GITHUB_REPOSITORY: repository, GITHUB_EVENT_PATH: 'synthetic-event' }, argv: [] } });
+const history = readFileSync(new URL('../../docs/ci-duration-history.json', import.meta.url), 'utf8');
+const initialHistory = scenario === 'record-duplicate' ? JSON.stringify([{runId:20, marker:'unchanged'}], null, 2) + '\n' : history;
+let written = null;
+const context = createContext({ process: { env: { GITHUB_REPOSITORY: repository, GITHUB_EVENT_PATH: 'synthetic-event' }, argv: scenario.startsWith('record') ? ['--record'] : [] } });
 const modules = new Map();
 modules.set('node:child_process', new SyntheticModule(['execFileSync'], function () { this.setExport('execFileSync', fakeExec); }, { context }));
 modules.set('node:fs', new SyntheticModule(['readFileSync', 'writeFileSync'], function () {
   this.setExport('readFileSync', path => {
+    if (path === 'docs/ci-duration-history.json') return initialHistory;
     assert.equal(path, 'synthetic-event');
     return JSON.stringify({ workflow_run: { event: 'pull_request', head_sha: head } });
   });
-  this.setExport('writeFileSync', () => assert.fail('No record writes allowed'));
+  this.setExport('writeFileSync', (path, value) => { assert.ok(scenario.startsWith('record')); assert.equal(path, 'docs/ci-duration-history.json'); written = value; });
 }, { context }));
 for (const file of ['ci-budget.mjs', 'evaluate-budget.mjs', 'policy.mjs']) {
   modules.set(`./${file}`, new SourceTextModule(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), { context, identifier: file }));
@@ -88,4 +102,4 @@ await entry.link(specifier => {
 });
 let error = null;
 try { await entry.evaluate(); } catch (caught) { error = caught.message; }
-process.stdout.write(JSON.stringify({ calls, posts, payloadBytes, transportErrors, error }));
+process.stdout.write(JSON.stringify({ calls, posts, payloadBytes, transportErrors, error, written, initialHistory }));
