@@ -260,3 +260,37 @@ unchecked, eight Windows quarantines unchanged, hardware unverified.
 Final changed source pins (supersede earlier pins only for these paths):
 - `crates/arxd/src/cluster/pki/verify.rs`: `c8c198f4ee784c093c339930f83c91214b617f22`.
 - `crates/arxd/src/cluster/pki/tls_tests.rs`: `dd5ef2b3ade262ddc8fa35eca660c73122b35d49`.
+
+
+## R3 independent per-side resumption regression
+
+Opus recheck0dea866 retained56e6f07 closes B1/R1/R2 and approves production
+4c16354. R3 requests independent tests: either safe side masked a regression
+on the other when both production configs were paired. Sol coordinator adds
+three test-only cases; no production code changes.
+
+The protected production client is paired with a server that issues tickets and
+stores sessions; the protected production server faces a client with resumption
+enabled. Only the protected side's registry observes removal, while its peer
+retains the valid binding. Each test completes two full handshakes, then expects
+NotMember after removal. A both-resuming control produces Full then Resumed,
+proving the test peer can exercise the bypass. These are ordinary required tests
+on all platforms, with no ignore, scheduling, helper or timeout change.
+
+An initial compile found ServerSessionMemoryCache::new already returns Arc;
+removing the redundant wrapper fixed the test-only construction before runtime.
+No runtime test ran on that compile failure. All10pureTLS tests then passed.
+Each isolated per-side production revert compiles and fails only the matching
+focused test with Resumed versus Full (D:/Temp/arx-tls-r3-client-mutant.log and
+D:/Temp/arx-tls-r3-server-mutant.log). After each run, original verify.rs bytes
+were restored in finally and compared exactly. Restored pureTLS suite passes
+10/10 in0.02s (D:/Temp/arx-tls-r3-restored.log); arxd all-target locked/offline
+Clippy passes6.65s (D:/Temp/arx-tls-r3-clippy.log), fmt/diff pass. The prior152
+nextest/in-process and auxiliary runs are reused; no new full-suite pass is
+claimed for three added pure tests. Test blob now supersedes prior pin:
+`tls_tests.rs`: `1626658eb4277f7c7f1ad4c930bdb08af533c01f`.
+
+Main e601caa CI43862021319 completed green: Ubuntu221s, Windows477s,
+macOS269s active job duration. This confirms main after PR158; it grants no
+TLS PR B hosted timing or Windows stability credit. Opus R3 recheck remains
+pending. M2 open, M3 unchecked, eight quarantines unchanged.

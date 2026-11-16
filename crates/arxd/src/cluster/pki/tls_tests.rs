@@ -492,3 +492,103 @@ fn reused_configs_recheck_expiry() {
     let (client, server) = reused_connections(&c, &s);
     assert_time_error(pump(client, server).err().unwrap(), false);
 }
+
+#[derive(Clone, Copy)]
+enum ResumptionProtection {
+    Client,
+    Server,
+    Neither,
+}
+fn resumption_adversary_pair(
+    protection: ResumptionProtection,
+) -> (
+    Arc<rustls::ClientConfig>,
+    Arc<rustls::ServerConfig>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ca = ClusterCa::ephemeral([1; 16], NOW);
+    let key = KeyPair::generate().unwrap();
+    let der = leaf(&ca, &key);
+    let member = Arc::new(AtomicBool::new(true));
+    let current: Registry = {
+        let member = member.clone();
+        let binding = registry(&key);
+        Arc::new(move |cluster, node, digest| {
+            binding(cluster, node, digest)?;
+            if member.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(VerifyRefusal::NotMember)
+            }
+        })
+    };
+    // Only the protected side observes removal. Its peer deliberately retains
+    // the old binding and enables resumption, as an adversarial peer can do.
+    let (client_registry, server_registry) = match protection {
+        ResumptionProtection::Client => (current, registry(&key)),
+        ResumptionProtection::Server => (registry(&key), current),
+        ResumptionProtection::Neither => (registry(&key), registry(&key)),
+    };
+    let mut client = client_config(
+        verifier(&ca, client_registry).client(node(4)),
+        der.clone().into(),
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        Arc::new(FixedTime(1001)),
+    )
+    .unwrap();
+    let mut server = server_config(
+        verifier(&ca, server_registry).server(),
+        der.into(),
+        PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        Arc::new(FixedTime(1001)),
+    )
+    .unwrap();
+    if !matches!(protection, ResumptionProtection::Client) {
+        client.resumption = rustls::client::Resumption::in_memory_sessions(256);
+    }
+    if !matches!(protection, ResumptionProtection::Server) {
+        server.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+        server.send_tls13_tickets = 2;
+    }
+    (Arc::new(client), Arc::new(server), member)
+}
+fn assert_protected_side_reverifies(protection: ResumptionProtection) {
+    let (client, server, member) = resumption_adversary_pair(protection);
+    for _ in 0..2 {
+        let (c, s) = reused_connections(&client, &server);
+        let (c, s) = complete(c, s).unwrap();
+        assert_eq!(c.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        assert_eq!(s.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    }
+    member.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (c, s) = reused_connections(&client, &server);
+    assert_eq!(
+        refusal(
+            pump(c, s)
+                .err()
+                .expect("protected side accepted a removed peer")
+        ),
+        VerifyRefusal::NotMember
+    );
+}
+#[test]
+fn production_client_refuses_resumption_from_ticket_issuing_server() {
+    assert_protected_side_reverifies(ResumptionProtection::Client);
+}
+#[test]
+fn production_server_refuses_resumption_from_resuming_client() {
+    assert_protected_side_reverifies(ResumptionProtection::Server);
+}
+#[test]
+fn adversarial_pair_control_can_resume() {
+    let (client, server, _) = resumption_adversary_pair(ResumptionProtection::Neither);
+    let (c, s) = reused_connections(&client, &server);
+    let (c, s) = complete(c, s).unwrap();
+    assert_eq!(c.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    assert_eq!(s.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    let (c, s) = reused_connections(&client, &server);
+    let (c, s) = complete(c, s).unwrap();
+    assert_eq!(c.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+    assert_eq!(s.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+}
