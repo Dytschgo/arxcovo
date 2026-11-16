@@ -71,7 +71,7 @@ pub(super) fn release_pair() -> (ReleaseAck, Released);
   owner/abort ordering and read/proposal ownership (#147 guard → Arc → permit → completion) are untouched.
 - Test hooks compile out (`#[cfg(test)]`). No production behavior other than the wait condition changes. No restart caller is added.
 
-## Deterministic regressions (each must be red on the old wait, recorded before the fix)
+## Deterministic regressions (runtime controls, never compile-failure credit)
 
 1. **Store level** (`state_store/tests.rs`, `log_store/tests.rs`, one per store). Open, then take `released()` and `hold_drop(gate)`. Drop the store on a `std::thread`.
    Wait for `entered` (bounded recv). Assert `!is_set()` and that a reopen of the same dir returns `Err(Io)`, which proves the gate sits before the lock release. Release the gate
@@ -106,7 +106,7 @@ runs on the old wait and the mutation are recorded as evidence. They are not cla
 On the then-current main SHA (recorded in the PR), the implementer must reconfirm: the store field lists and `open_db` sharing above; that `start` is the sole
 `ConsensusNode` constructor; the StoreRelease loop text; rusqlite `=0.37.0` drop behavior and toolchain `1.95.0`, with the `sync.rs` drop sequence cited at that tag;
 and that no production restart caller exists. Pins at writing: `state_store.rs` blob `90474881230e`, `log_store.rs` `02db51fc2409`, `adapter.rs` `181e9dce6765`, and `consensus.rs` `b7d1f350afb6` (main) /
-`c93c58f624e9` (`c1cdecd`, which adds only the `issue` module). On any drift, stop and re-settle.
+`c93c58f624e9` (`c1cdecd`, whose issuance module/admission/propose-response additions leave the closing wait unchanged). On any drift, stop and re-settle.
 
 ## Review route
 
@@ -115,3 +115,18 @@ gates green and green main. It contains no PR157 or PR B content.
 
 Sources: Rust Reference, Destructors (doc.rust-lang.org/reference/destructors.html). Rustonomicon, Drop Check. rust-lang/rust `library/alloc/src/sync.rs`. Microsoft
 LockFileEx (learn.microsoft.com/…/nf-fileapi-lockfileex). rusqlite 0.37.0 `src/inner_connection.rs:140-165,402-408` and `src/lib.rs:353-358` (local registry copy).
+
+## Root Sol contract check (2026-11-16)
+
+PASS with these test-proof clarifications. Current main6231da9 store blobs match the recorded pins; consensus blobc93c58f624e9 matches the reviewed issuance head.
+Root re-read [Rust1.95.0 Arc source](https://raw.githubusercontent.com/rust-lang/rust/1.95.0/library/alloc/src/sync.rs): strong fetch_sub precedes drop_slow/drop_in_place
+(lines2689-2692 and2024-2034), confirming the weak-expiry window. [Field declaration drop order](https://doc.rust-lang.org/reference/destructors.html#destructors.operation)
+supports a last-field acknowledgement. No build or runtime test was run for this contract check.
+
+Store-level tests validate the new acknowledgement seam and must kill misplaced-ack and gate-after-lock mutants. They cannot be red solely from the old shutdown
+wait, which they never call. First add the signal/hooks with the old wait retained, so both shutdown regression controls compile and fail on runtime assertions;
+then change the wait and show those same tests pass. No compile-failure baseline credit. Moving the gate below _lock must be caught by the existing held-gate
+reopen==Io assertion, rather than accepted as an untested placement convention. New resource fields must remain before the final ack.
+
+The signal means all preceding field destructors have completed, not successful SQLite/OS close. Immediate reopen remains a required real check with no new retry.
+Implementation remains a separate main-based change after pending mainCI43854991316 is green; no TLS/PR157/source edits are authorized by this docs-only review.
