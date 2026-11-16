@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }
+x509-parser = { version = "=0.18.1", default-features = false }
+time = { version = "=0.3.55", default-features = false }
 anyhow = "=1.0.100"
 axum = "=0.8.6"
 getrandom = "=0.3.4"
