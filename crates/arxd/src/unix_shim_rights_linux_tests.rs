@@ -95,6 +95,131 @@ fn e4_helper() {
         _ => (),
     }
 }
+// Closed inputs only: this formatter cannot inspect Observation or fixture paths.
+#[derive(Clone, Copy)]
+enum AttributionCase {
+    S8,
+    S9cFile,
+    S9cDirectory,
+}
+impl AttributionCase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::S8 => "s8",
+            Self::S9cFile => "s9c_file",
+            Self::S9cDirectory => "s9c_directory",
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum AttributionMode {
+    A,
+    Three,
+    S,
+    K,
+}
+impl AttributionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::Three => "3",
+            Self::S => "S",
+            Self::K => "K",
+        }
+    }
+    fn from_fixture(mode: u8) -> Self {
+        match mode {
+            b'A' => Self::A,
+            b'3' => Self::Three,
+            b'S' => Self::S,
+            b'K' => Self::K,
+            _ => unreachable!(),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum AttributionOutcome {
+    ExitZero,
+    ExitNonzero,
+    Unknown,
+    Absent,
+    Untrusted,
+}
+impl AttributionOutcome {
+    fn capture(outcome: &str) -> Self {
+        match outcome {
+            "exit_zero" => Self::ExitZero,
+            "exit_nonzero" => Self::ExitNonzero,
+            "absent" => Self::Absent,
+            "untrusted" => Self::Untrusted,
+            _ => Self::Unknown,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExitZero => "exit_zero",
+            Self::ExitNonzero => "exit_nonzero",
+            Self::Unknown => "unknown",
+            Self::Absent => "absent",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+struct AttributionLine {
+    case: AttributionCase,
+    mode: AttributionMode,
+    outcome: AttributionOutcome,
+    record: Attribution,
+    marker: bool,
+    pidfile: bool,
+    fixture_ms: u32,
+    elf_mib: u32,
+}
+fn format_attribution(line: AttributionLine) -> String {
+    let a = line.record;
+    format!(
+        "ARX_S8_ATTR v1 case={} mode={} outcome={} site={} pre_ms={} wait_ms={} polls={} deadline_ms={} read={} status={} wait={} marker={} pidfile={} fixture_ms={} elf_mib={}",
+        line.case.label(),
+        line.mode.label(),
+        line.outcome.label(),
+        a.site.label(),
+        a.pre_ms.min(60_000),
+        a.wait_ms.min(60_000),
+        a.polls,
+        a.deadline_ms.min(60_000),
+        a.read.label(),
+        a.status.label(),
+        a.wait.label(),
+        u8::from(line.marker),
+        u8::from(line.pidfile),
+        line.fixture_ms.min(60_000),
+        line.elf_mib,
+    )
+}
+fn emit_attribution(
+    case: AttributionCase,
+    mode: AttributionMode,
+    outcome: &str,
+    root: &Path,
+    fixture_elapsed: Duration,
+) {
+    let record = ATTRIBUTION.with(|slot| slot.get());
+    let elf_mib = std::fs::metadata(root.join("base-elf"))
+        .map(|m| (m.len() / (1024 * 1024)).min(u32::MAX as u64) as u32)
+        .unwrap_or(0);
+    let line = format_attribution(AttributionLine {
+        case,
+        mode,
+        outcome: AttributionOutcome::capture(outcome),
+        record,
+        marker: root.join(mode.label()).exists(),
+        pidfile: root.join("pid").exists(),
+        fixture_ms: attribution::ms(fixture_elapsed),
+        elf_mib,
+    });
+    eprintln!("{line}");
+}
+
 #[test]
 fn s8_outcomes_and_reap() {
     if !ordinary() {
@@ -106,10 +231,20 @@ fn s8_outcomes_and_reap() {
         (b'S', "unknown"),
         (b'K', "unknown"),
     ] {
+        let fixture_started = Instant::now();
         let (root, settings) = fixture();
         fake(root.path(), "usr/bin/sudo", mode);
+        let fixture_elapsed = fixture_started.elapsed();
         let started = Instant::now();
-        assert_eq!(call(&settings), expected, "fixed outcome");
+        let outcome = call(&settings);
+        emit_attribution(
+            AttributionCase::S8,
+            AttributionMode::from_fixture(mode),
+            outcome,
+            root.path(),
+            fixture_elapsed,
+        );
+        assert_eq!(outcome, expected, "fixed outcome");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "bounded fixture completion"
@@ -230,26 +365,37 @@ fn s9c_bound_object_survives_file_and_directory_swap() {
         return;
     }
     for directory_swap in [false, true] {
+        let fixture_started = Instant::now();
         let (root, settings) = fixture();
         fake(root.path(), "usr/bin/sudo", b'A');
         std::fs::create_dir(root.path().join("replacement")).unwrap();
         fake(root.path(), "replacement/sudo", b'B');
-        assert_eq!(
-            run(&settings, || {
-                if directory_swap {
-                    std::fs::rename(root.path().join("usr/bin"), root.path().join("old")).unwrap();
-                    std::fs::rename(root.path().join("replacement"), root.path().join("usr/bin"))
-                        .unwrap();
-                } else {
-                    std::fs::rename(
-                        root.path().join("replacement/sudo"),
-                        root.path().join("usr/bin/sudo"),
-                    )
+        let fixture_elapsed = fixture_started.elapsed();
+        let outcome = run(&settings, || {
+            if directory_swap {
+                std::fs::rename(root.path().join("usr/bin"), root.path().join("old")).unwrap();
+                std::fs::rename(root.path().join("replacement"), root.path().join("usr/bin"))
                     .unwrap();
-                }
-            }),
-            "exit_zero"
+            } else {
+                std::fs::rename(
+                    root.path().join("replacement/sudo"),
+                    root.path().join("usr/bin/sudo"),
+                )
+                .unwrap();
+            }
+        });
+        emit_attribution(
+            if directory_swap {
+                AttributionCase::S9cDirectory
+            } else {
+                AttributionCase::S9cFile
+            },
+            AttributionMode::A,
+            outcome,
+            root.path(),
+            fixture_elapsed,
         );
+        assert_eq!(outcome, "exit_zero");
         assert_eq!(std::fs::read(root.path().join("A")).unwrap(), b"1");
         assert!(!root.path().join("B").exists());
     }
@@ -452,6 +598,162 @@ fn s14_sudo_nnp_scalar_discriminators() {
         assert!(
             !observation_accepts(bad, 2000, 2001),
             "assertion scalar discriminator {index}"
+        );
+    }
+}
+
+#[test]
+fn s8_attribution_controls() {
+    if !ordinary() {
+        return;
+    }
+    let (root, mut settings) = fixture();
+    fake(root.path(), "usr/bin/sudo", b'S');
+    let outcome = call(&settings);
+    let populated = ATTRIBUTION.with(|slot| slot.get());
+    assert_eq!(outcome, "unknown");
+    assert_eq!(populated.site, Site::Deadline);
+    assert!(populated.wait_ms >= populated.deadline_ms);
+    // Preemption before the first poll is valid; no minimum poll count.
+    // Populate every field so the early anchor return must clear all stale data.
+    attribute(|a| {
+        a.pre_ms = 17;
+        a.polls = 23;
+        a.deadline_ms = 31;
+        a.read = attribution::Read::Byte;
+        a.status = attribution::Status::Exited;
+        a.wait = attribution::Wait::Reaped;
+    });
+    settings.anchor = CString::new(root.path().join("missing").as_os_str().as_bytes()).unwrap();
+    assert_eq!(call(&settings), "unknown");
+    let reset = ATTRIBUTION.with(|slot| slot.get());
+    assert_eq!(
+        reset,
+        Attribution {
+            site: Site::Anchor,
+            deadline_ms: 200,
+            ..Attribution::default()
+        }
+    );
+    assert_eq!(reset.polls, 0);
+}
+
+#[test]
+fn s8_attribution_formatter() {
+    use attribution::{Read, Status, Wait};
+    let keys = [
+        "case",
+        "mode",
+        "outcome",
+        "site",
+        "pre_ms",
+        "wait_ms",
+        "polls",
+        "deadline_ms",
+        "read",
+        "status",
+        "wait",
+        "marker",
+        "pidfile",
+        "fixture_ms",
+        "elf_mib",
+    ];
+    for case in [
+        AttributionCase::S8,
+        AttributionCase::S9cFile,
+        AttributionCase::S9cDirectory,
+    ] {
+        for mode in [
+            AttributionMode::A,
+            AttributionMode::Three,
+            AttributionMode::S,
+            AttributionMode::K,
+        ] {
+            for outcome in [
+                AttributionOutcome::ExitZero,
+                AttributionOutcome::ExitNonzero,
+                AttributionOutcome::Unknown,
+                AttributionOutcome::Absent,
+                AttributionOutcome::Untrusted,
+            ] {
+                for site in [
+                    Site::None,
+                    Site::Anchor,
+                    Site::Classify,
+                    Site::Null,
+                    Site::Cwd,
+                    Site::Pipe,
+                    Site::Fdwrap,
+                    Site::Fork,
+                    Site::Deadline,
+                    Site::ReapedBad,
+                    Site::WaitErr,
+                ] {
+                    let line = format_attribution(AttributionLine {
+                        case,
+                        mode,
+                        outcome,
+                        record: Attribution {
+                            site,
+                            pre_ms: u32::MAX,
+                            wait_ms: u32::MAX,
+                            polls: u32::MAX,
+                            deadline_ms: u32::MAX,
+                            read: Read::Eof,
+                            status: Status::SignaledOther,
+                            wait: Wait::Interrupted,
+                        },
+                        marker: true,
+                        pidfile: false,
+                        fixture_ms: u32::MAX,
+                        elf_mib: u32::MAX,
+                    });
+                    assert!(line.is_ascii() && line.len() <= 512);
+                    assert!(!line.contains(['/', '\\', '\n', '\r']));
+                    let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                    assert_eq!(&fields[..2], &["ARX_S8_ATTR", "v1"]);
+                    assert_eq!(
+                        fields[2..]
+                            .iter()
+                            .map(|f| f.split_once('=').unwrap().0)
+                            .collect::<Vec<_>>(),
+                        keys
+                    );
+                    assert!(
+                        line.contains(
+                            "pre_ms=60000 wait_ms=60000 polls=4294967295 deadline_ms=60000"
+                        )
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(attribution::ms(Duration::MAX), 60_000);
+    assert_eq!(attribution::ms(Duration::ZERO), 0);
+    for read in [Read::Na, Read::Byte, Read::Eof, Read::Eagain, Read::Other] {
+        assert!(["na", "byte", "eof", "eagain", "other"].contains(&read.label()));
+    }
+    for status in [
+        Status::Na,
+        Status::Exited,
+        Status::SignaledKill,
+        Status::SignaledOther,
+        Status::Other,
+    ] {
+        assert!(
+            ["na", "exited", "signaled_kill", "signaled_other", "other"].contains(&status.label())
+        );
+    }
+    for wait in [
+        Wait::Na,
+        Wait::Pending,
+        Wait::Reaped,
+        Wait::Interrupted,
+        Wait::Echild,
+        Wait::Other,
+    ] {
+        assert!(
+            ["na", "pending", "reaped", "interrupted", "echild", "other"].contains(&wait.label())
         );
     }
 }
