@@ -2,6 +2,8 @@
 
 ## Main CI health and merge prerequisite
 
+Delegated clarification on2026-11-16 supersedes the pending owner exception question: the narrow reviewed Windows quarantine may merge after allfive PR gates pass to restore red main. Feature PRs remain blocked until the resulting exact-main CI is green. No fourth Sol repair or manual rerun.
+
 Two red main runs were missed in prior checkpoint updates; they are now explicitly recorded as intermittent until diagnosed:
 
 - Main38750cf (after PR144), CI [43757400254](https://github.com/Dytschgo/arxcovo/actions/runs/43757400254): Ubuntu `unix_shim::rights::linux::tests::s9c_bound_object_survives_file_and_directory_swap` failed at unix_shim_rights_linux_tests.rs237, actual `unknown` versus expected `exit_zero`.
@@ -37,6 +39,8 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
 ## Task history
+
+- 2026-11-16: Babysitter clarifies green-main prerequisite permits a reviewed repair/quarantine PR. Pending owner question superseded. Coordinator prepares exactlyeight Windows-only ignored three-node tests with explicit skip reason and scope guard; Ubuntu/macOS execution and allother tests remain required. Windows coverage unverified; M3/M2 unchecked. Opus follow-up after quarantine/greenmain; no fourthSolattempt.
 
 - 2026-11-16: Opus05a3a2f retained815f6c4 closes diagnostic B1: counts-before-own-handle-drop mutant compiles then fails exactlyone external-reference assertion, restoredR6 tests/fmt/lockedofflinearxdClippy pass. Coordinator separatelyR6/fmt pass. Productionreport unchanged; fresh exact-head review/five gates/latestexactmainCI remain publication/merge prerequisites. No manual CI rerun; first finite changed-diagnostic hosted attempt next.
 

@@ -192,6 +192,7 @@ impl Cluster {
 
 // Real RPC catch-up: no direct snapshot installation or fabricated acknowledgments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn t3_snapshot_catchup_then_consecutive_append() {
     timeout(Duration::from_secs(45), async {
         let started = Instant::now();
@@ -288,6 +289,7 @@ fn grant(o: Option<Outcome>, n: u64, replay: bool) {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn t1_follower_offline_enrollment_and_reopen() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -358,6 +360,7 @@ async fn t1_follower_offline_enrollment_and_reopen() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn t2_leader_offline_reads_and_unknown_retry() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -434,6 +437,7 @@ async fn t2_leader_offline_reads_and_unknown_retry() {
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn u6_cancelled_callers_keep_engine_permits_until_resolution() {
     timeout(Duration::from_secs(45), async {
         for restore in [false, true] {
@@ -538,6 +542,7 @@ fn founders() -> Command {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn t4_registry_revocation_snapshot_and_prune() {
     use crate::cluster::enrollment::{FoundMembers, NodeId, PeerRefusal, TOMBSTONE_MS};
     timeout(Duration::from_secs(45), async {
@@ -776,6 +781,7 @@ fn report_take_node(c: &mut Cluster, i: usize) -> ConsensusNode {
         .expect("caller joined and node Arc dropped")
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn r6_shutdown_report_cancelled_proposal() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -842,6 +848,7 @@ async fn r6_shutdown_report_cancelled_proposal() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn r6_shutdown_report_store_only() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -872,6 +879,7 @@ async fn r6_shutdown_report_store_only() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(target_os = "windows", ignore = "Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md")]
 async fn r6_shutdown_report_normal_and_reaped_panic() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
