@@ -130,3 +130,60 @@ Static-validator bookkeeping: the first script incorrectly compared arxd's depen
 **Counterfactual gaps for Opus:** no staging copy or mutation execution occurred because compilation triggered STOP. Still required: focused exact-algorithm removal and original-SPKI defense (including the P-384/SHA256 case with the algorithm gate removed, then both defenses removed); CSR field-discard mutants; check_grant, fresh pre/post guards and clock sampling mutants; privacy scanner positive-control and persisted raw/hex marker counterfactuals. No expected mutant reds or surviving mutants are claimed. Existing static marker assertions do not substitute for these behavioral checks. Error privacy tests and fixture assertions remain unverified on this final source. Full-source independent Opus review remains next; this evidence is not a readiness approval.
 
 Only this evidence file was edited. Bookkeeping repaired its known first-line byte 0x97 at offset 31 to UTF-8 em dash; the remaining historical bytes were preserved and the resulting document decodes strictly as UTF-8. No PROGRESS update (per this task's evidence-only constraint), network dispatch, native M2 run, VM/admin action, push, PR/status/merge/watch action, or TLS/production CA work. M2 remains open, M3 unchecked, and the eight Windows ignores unchanged. Hosted Windows stability is unverified; hardware paths remain **unverified on real hardware**.
+
+## Prepared 4c55b0f verification: tests green, Clippy stop (2026-11-16)
+
+Verifier: GPT-6.1 Sol, high, test sub-agent, no subagents. Exact source pin `4c55b0f7a5783cb49866b5154289213374fdc7e7`. Read the issuance brief including E1–E7, KICKOFF, current evidence `9e07bcc7fe9924495e390630faf15c67c988fcfd`, and Opus I4 disposition `0f6d0fff1a60ba6e8c4586e851de55c24cc61af2`. This is the new source with explicit construction of the three public response fields in I7; it is not a rerun of the compile-stopped `f547459`. No implementation or test correction was authorized or made.
+
+**STOP: workspace all-target Clippy exited 101.** At `crates/arxd/src/cluster/consensus/issue.rs:166`, `drop(proof)` triggers `clippy::drop_non_drop` under `-D warnings`, because `RedeemProof` does not implement `Drop`. Clippy reports failure for both lib and lib test. No allowance, source edit, fix, rerun, or subsequent test execution occurred. This is an unmodified-source required-check/compilation stop, not an E3 natural engine red and not a deliberately expected mutant red. No natural engine red occurred in this session. The previous I4 pre-E7 red was not repeated.
+
+### Actual executions
+
+All Cargo builds/checks used the newly created task-owned root `D:/arxcovo-a-final-0007343146c34e4b9de3f3632cc48d99`, `CARGO_TARGET_DIR=<root>/target`, `TEMP=TMP=<root>/tmp`, and `CARGO_NET_OFFLINE=true`. Every Cargo test/Clippy command below used both `--locked --offline`. No installation, fetch, re-resolution or cache cleanup. The first command compiled successfully (73 s reported build time).
+
+| Command | Observed result |
+| --- | --- |
+| `cargo nextest run --locked --offline -p arxd -E 'test(/^cluster::/)'` | 134 passed, 468 skipped, 8.752 s test round. Includes all four PKI tests, retained-grant matrix/enrollment, I1–I9 plus hook identity/admission, old four-process crash probes, and ordinary R1–R5. |
+| `cargo test --locked --offline -p arxd --lib cluster::` | 134 passed, 0 failed, 13 ignored, 417 filtered out, 8.85 s test execution (9.234 s command). Shared hooks exercised in process once. |
+| `cargo nextest run --locked --offline -p arxd --run-ignored only -E 'test(/d1_control_/)'` | Exactly 3 controls passed, 599 skipped, 5.477 s test round (6.254 s command). Timer lag, S3 churn and S4 queued-apply controls all executed. |
+| `cargo nextest run --locked --offline -p arxd --run-ignored only -E 'test(/^cluster::consensus::three_node::/)'` | Exactly 8 quarantined tests passed, 594 skipped, 7.747 s test round (8.514 s command). T1–T4/U6/three R6 cases, one local sanity execution only. |
+| `cargo fmt --all --check` | Exit 0 (0.686 s). |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Exit 101 (32.385 s), diagnostic above; STOP. |
+
+The ordinary I4 execution passed in 4.996 s. Its actual test asserts replay=true, node 4 and the original key from the new leader's committed replay response, then node equality and exact original CSR/leaf raw SPKI equality. The deposed node's higher-term barrier completes before unchanged convergence. I7's adapter assertions executed successfully. I6's five clock cases and sign counters passed. The complete ordinary round's 8.752 s includes other tests in parallel; it is not a standalone incremental issuance-cost measurement, a hosted budget measurement, or a stability result.
+
+### Retained logs and integrity
+
+Full local logs are under `<root>/logs/`, with SHA256:
+
+| File | SHA256 |
+| --- | --- |
+| `01-cluster-nextest.log` | `d84a9dc7fb2a9b1ea7fec063a774c407259635d26fb840cac21dbdc533695d95` |
+| `02-in-process.log` | `243607e79dd2a67433e64efeacd3c3f17d87d689f2b51701431adb8b19644b3a` |
+| `03-d1-controls.log` | `9968a42dcde9baf0730974e77f349f7b5fd75166ced92da76ef399cc2525034c` |
+| `04-quarantined-eight.log` | `c9cdafeabe7346ba5ec3f93923af96a787bb68ce1282a658f55a59a80c560684` |
+| `05-fmt.log` (empty success) | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `06-clippy.log` | `21d3563b2b1bde3a44a495acaaf4ab852e87983e8506f2aa630f888e2addc433` |
+| `10-lock-fixtures.log` | `8ba9ddf2377710ad7ea79dbf479475a3f1099d249e562634377b174126fc0b97` |
+
+`final-checks.py` and `final-results.json` retain commands, timings and the automatic stop at the first nonzero exit. `verify-pins.py` was copied from the earlier verifier and executed once successfully, read-only: baseline `8961772:Cargo.lock` has 243 packages, final lock has 281; exactly +38 and no removed or changed name/version/source/checksum identities. All old metadata and edges match after only the windows-sys/synstructure dependency qualification exceptions, applied also to arxd. arxd adds exactly rcgen/time/x509-parser; nine old dependency records differ textually including arxd. Pins remain rcgen 0.14.10 (crypto/ring/x509-parser only), x509-parser 0.18.1 without defaults, time 0.3.55 without defaults, rustls-pki-types 1.15.1; no rustls package. Lock SHA256 remains `2fdb57ec3e214aea2e4716c1ff90ce5ba4f5ec0aa85ed1e41834e7a88a477c03`.
+
+Public fixtures independently matched again without printing any fixture bytes or raw private keys: P-384/SHA256 `46633e68786c8b01fd14f46b518242a548aaf0478814328cf26aec292b1f8e9f`; RSA2048/SHA256 `0ad090e754249a5434781a574e8f952dca00cc0b847da6236936dcf3453b11aa`. Private-marker tests passed without emitting keys. This establishes their existing assertions only, not the unrun privacy counterfactuals.
+
+After STOP, read-only comparison checked 251 tracked non-doc files against the exact source pin (normalizing checkout CRLF only where necessary). All matched. `<root>/source-sha256.json` records checkout-byte hashes, SHA256 `d62ae4933468c72b5990f9d5a289a2c8998c97d8fb4dfee94246037d695a680a`. `git diff 4c55b0f --exit-code -- crates Cargo.lock Cargo.toml tools scripts .github` and `git diff --check` returned 0 before the evidence append. No source was mutated, so no restoration was required. The evidence file already decodes strictly as UTF-8; no additional header repair was needed.
+
+### Unrun work and assertion gaps for fresh Opus review
+
+Not run following STOP: the two quarantine-guard tests, the 58 sampler unit tests, Node workflow tests, or any counterfactual. The external task script lists the planned commands (`python -I -B -m unittest discover -s tools/ci -p test_windows_cluster_quarantine.py`, corresponding `test_windows_diag_sample.py`, and `node --test scripts/*.test.mjs`) but did not launch them. No full workspace nextest, hosted CI, native M2, VM or hardware path was run.
+
+`<root>/counterfactuals.py` was prepared outside the repository but **never executed**: no staging copies, mutant builds, mutant test results, killed mutants or surviving mutants exist from this session. Expected mutant reds remain distinct from E3 natural failure handling. Still outstanding are algorithm-gate removal; focused P-384/SHA256 original-SPKI defense with the algorithm gate removed, followed by both defenses removed; each requested CSR-field leak; retained check_grant and fresh pre/post guard counterfactuals; leader binding and pre/post clock sampling counterfactuals; and scanner-positive plus raw/hex persisted-marker controls. These are not credited by the green baseline tests or the guard's historical result.
+
+Inspection against the brief identifies these limits without changing tests:
+
+- I1 checks same node and distinct whole DER, plus registry authorization on all three nodes. It does not separately decode both retries to assert same raw SPKI and distinct serial. The pure leaf test separately proves raw SPKI, serial width/top bits and distinct serials; I4 now proves exact replay leaf SPKI. That combination does not replace I1's requested explicit retry assertions.
+- The pure adversarial CSR test exercises CN, SAN, CA, KU and EKU requests and verifies fresh leaf fields. Exact-algorithm rejection passes on both public fixtures and generated P-384/SHA384 and altered P-256 signature OID. Counterfactual evidence that each defense is necessary remains absent. The EKU assertion excludes any/codeSigning/other but does not explicitly exclude every other known EKU flag.
+- The retained-grant matrix distinguishes current, wrong request/node/key/cluster and missing/unconsumed records. Removal intentionally leaves check_grant valid while authorize_peer rejects, as the code contract requires. Counterfactual sensitivity remains untested.
+- I6 passes actual clock/refusal and pre-wait sign-counter assertions; I5 proves removal between guards is refused. This does not independently demonstrate sensitivity to removal of the first fresh guard. No weakening or new assertion was introduced.
+- Error privacy assertions cover the four CSR errors and only four retryable IssueError variants using fixed marker strings. They do not drive every IssueError variant with adversarial input or prove the scanner detects persisted raw/hex CA material. I9's existing raw/hex positive controls passed; behavioral scanner/leak mutations remain required.
+
+Only this evidence file is changed/committed. An initial read-only `git status --short` was inadvertently included in the first inspection command despite the task's no-status instruction; it returned no entries. No further status command, push, PR, merge, watch, CI action, admin step, native M2 or delegation occurred. No shared helper, quarantine, deadline or test source was changed. Fresh full-source Opus review remains next after coordinator disposition of this required-check failure; this is not readiness approval. M2 remains open, M3 unchecked, eight ignores unchanged, Windows stability unclaimed, all hardware paths **unverified on real hardware**.
