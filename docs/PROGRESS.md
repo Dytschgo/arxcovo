@@ -38,6 +38,8 @@ Active M2 work is preservation of existing source/consumer regression gates, exa
 
 ## Task history
 
+- 2026-11-16: Opus55e56a6 retainedc0bf702 approves truthful A0 deadline refusal policy; Sol8237db1 corrects only R2/T2 assertions and brief, preserving strict lower/upper/time-to-permit bounds. Fresh local cluster114pass/0fail/2ownedignored in9.33s, fmt/workspace locked-offline Clippy34.17s/diff pass. Independent delta recheck is active; no hosted or hardware credit yet.
+
 - 2026-11-16: Sol high0e48f21/24a147b hands back A0 with a refusal-contract conflict: absolute caller deadline yields Unavailable before OpenRaft dequeue-based quorum timeout, while R2/unchangedT2 require NoQuorum or NotLeader. Cluster112pass/2fail is not green; fmt/workspaceClippy pass. Both deadline/permit counterfactuals fail as intended.49 unrelated workspace failures reproduce on exact base. Narrow Opus decision/review requested before changing assertions; no publication or acceptance.
 
 - 2026-11-16: Opus25a16e7 retained2c549fd closes testCA lifetime and read ownership C1/C2; Sol recheck corrects C3 to the existing per-clock true-time skew assumption (pairwise agreement alone insufficient). A0 bounded fresh read is approved for Sol implementation: caller1500ms, eight owned units, permit retained through underlying work, honest shutdown Orphaned; no new dependency or CA/TLS implementation yet.

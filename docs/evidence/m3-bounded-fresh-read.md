@@ -117,3 +117,9 @@ No corrective policy attempt was made against the refusal conflict: the handoff
 threshold of three genuinely different failed fixes was not exhausted. This is a
 source-backed contract blocker, retained explicitly rather than patched around.
 Hosted CI and fresh independent implementation review have not run.
+
+## Coordinator refusal-contract correction and fresh verification
+
+Opus review55e56a6 (retainedc0bf702) confirms the pinned engine's dequeue-based timeout cannot guarantee a NoQuorum reply before the absolute caller deadline. Sol independently accepts the narrow policy and records it in the brief review. Test-only correction8237db1 accepts deadline Unavailable in R2 only when elapsed >= READ_BUDGET, keeps caller <=2.5s, and bounds permit return by the same original call-start +2.5s deadline. T2 adds Unavailable only to its isolated-read non-success pattern. No production code, timeout duration or error mapping changed; no quorum sub-budget or relabelling was introduced. The earlier112-pass/2-fail result remains historical handback evidence, superseded by this corrected-contract run.
+
+Fresh coordinator Windows checks on8237db1 used unique D:/Temp/arxcovo-a0-correction-root-target, with TEMP/TMP on D:. `cargo test -p arxd --lib --locked --offline cluster:: -- --nocapture` passed114 tests,0 failed,2 ignored owned crash-child entrypoints,416 filtered out,9.33s. R2/T2 and all other cluster tests pass; R5 gated shutdown returned Orphaned in5.0027259s, as required rather than claiming hard termination. `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` passed in34.17s; fmt check and diff check passed. No unrelated workspace failures are counted green; the builder's exact-base49-failure comparison remains unchanged. Independent delta recheck and fresh hosted gates remain pending. Hardware paths remain **unverified on real hardware**.
