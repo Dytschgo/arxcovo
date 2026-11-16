@@ -118,7 +118,7 @@ R5's gate can be removed only when all of the following hold:
    the repaired source.
 4. **Re-enable PR scope.** It removes only the R5 gate, empties `WINDOWS_UNSAMPLED` and
    restores `FILTER`, with all five gates and a different-provider review. If the next
-   exact-main CI is red, the quarantine is reverted at once, the failure counts as an
+   exact-main CI is red, the quarantine is restored through a reviewed recovery PR, the failure counts as an
    attempt, and there is no rerun.
 
 Cause attribution alone neither re-enables R5 nor is required: proof of cause gates a
@@ -136,8 +136,8 @@ forbidden. ADR0025 queue credit is inactive, its bootstrap is unauthorized, and 
 PR163, blocked by the same gate. The #152 restore-green exception covered a red-main base,
 not the budget, and may not be extended. **This PR cannot satisfy all five gates as things
 stand.** No label, manual status, protection change or waiver is permitted. An explicit owner
-decision is required, recorded before use: (a) authorize the ADR0025 bootstrap (whether
-1475 s with queue credit falls to 900 s or below is unknown); (b) authorize a one-time budget
+decision is required, recorded before use: (a) authorize the ADR0025 bootstrap (main has 738 s charged, but credit is withheld
+because Windows failed, so activation alone does not clear this hold); (b) authorize a one-time budget
 exception for this PR; or (c) authorize the existing `ci-speed` measured-reduction path.
 
 ## Next action
@@ -148,3 +148,7 @@ the `ci-time-budget` choice (a), (b) or (c) to the owner. Nothing merges before 
 decision.
 
 M2 is open, M3 is unchecked, and Windows three-node is **unverified on real hardware**.
+
+Root Sol contract check: accepted for local implementation only. The known main
+measurement is 1475 s wall / 738 s charged, uncredited because red. ADR0025 alone
+cannot restore this gate. No merge exception is granted by this contract check.
