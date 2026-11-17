@@ -965,3 +965,57 @@ async fn store_close_completion_shutdown_deadline() {
 async fn store_close_completion_shutdown_waits_for_log() {
     store_close_completion_shutdown(CloseStore::Log, false).await;
 }
+
+#[test]
+fn shared_membership_codec_literal_vectors() {
+    for (literal, configs, addresses) in [
+        (
+            "0101010000000000000001020000000000000001016100000000000000020162",
+            vec![[1].into()],
+            vec![(1, "a"), (2, "b")],
+        ),
+        (
+            "0102010000000000000001020000000000000001000000000000000203000000000000000101610000000000000002016200000000000000030163",
+            vec![[1].into(), [1, 2].into()],
+            vec![(1, "a"), (2, "b"), (3, "c")],
+        ),
+        (
+            "01020100000000000000010100000000000000010100000000000000010161",
+            vec![[1].into(), [1].into()],
+            vec![(1, "a")],
+        ),
+    ] {
+        let bytes: Vec<u8> = literal
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        let m = members(configs, &addresses);
+        assert_eq!(encode(&m).unwrap().bytes(), bytes);
+        let decoded = decode(&MembershipBlob::new(bytes.clone()).unwrap()).unwrap();
+        assert_eq!(decoded, m);
+        assert_eq!(encode(&decoded).unwrap().bytes(), bytes);
+    }
+}
+#[test]
+fn shared_membership_codec_error_normalization() {
+    for bytes in [
+        vec![1],
+        vec![2, 1],
+        vec![1, 0],
+        vec![1, 1, 1, 0],
+        vec![1; 4096],
+    ] {
+        assert!(matches!(
+            decode(&MembershipBlob::new(bytes).unwrap()),
+            Err(StoreError::Membership)
+        ));
+    }
+    for m in [
+        members(vec![[0].into()], &[(0, "a")]),
+        members(vec![[1].into()], &[(1, "!")]),
+        members(vec![[1].into()], &[(1, "a"), (2, "")]),
+    ] {
+        assert!(matches!(encode(&m), Err(StoreError::Membership)));
+    }
+}
