@@ -36,7 +36,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed head `aa63bd5f`, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 attempt 1 is green: 609 s wall / Windows604s.
-- Current work: anchored pre-proof source9b6c7e06 plus test-driver correctionf0c13d23 has pass evidence for all26 selected pure cases across the stopped/corrected rounds. Remaining22 passed, all3 designated mutants compiled and failed actual received-proof32 versus0 assertions, exact baseline restored; final fmt/Clippy passed. Evidence240c913b retained. Independent full source review and hosted all-OS proof remain pending; no publication yet.
+- Current work: anchored pre-proof source9b6c7e06 plus test-driver correctionf0c13d23 has pass evidence for all26 selected pure cases across the stopped/corrected rounds. Remaining22 passed, all3 designated mutants compiled and failed actual received-proof32 versus0 assertions, exact baseline restored; final fmt/Clippy passed. Evidence240c913b retained. Independent Sol 6.1 high source review f3cf3861 PASS (retained320c6b48). Preparing publication and exact-head review; hosted all-OS proof remains pending.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3477,3 +3477,14 @@ logs/patches/restores. No source correction in continuation, no local engine
 case, no public action. Separate Sol source review is next; all hosted gates,
 first all-OS anchored proof and fresh-main/Windows660 requirements remain.
 M2 open / M3 unchecked; counters unchanged; hardware unverified on real hardware.
+
+### Pre-proof source review and publication checkpoint (2026-11-17)
+
+Separate Sol 6.1 high source review f3cf3861 PASS: no Standards/Spec/Security
+blockers; actual scope/frozen-byte/artifact-hash audit, execution reused with
+attribution. One advisory retained: assertion/API panic can bypass the founder
+probe cleanup tail, so no universal failure-cleanup promise. Source unchanged
+sincef0c13d23; final proof has not run locally. Root re-read live main59a665c9
+and its first-attempt CI44114182696 success before publication preparation.
+Exact-head review, five gates, hosted new proof on all OS and Windows660s remain.
+M2 open/M3 unchecked; hardware **unverified on real hardware**.

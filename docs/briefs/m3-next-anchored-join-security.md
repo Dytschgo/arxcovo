@@ -1,6 +1,7 @@
 # M3 next slice: anchored endpoint proof before redeem-secret release
 
-Design only; Sol 6.1 high, 2026-11-17. Required prepared base:
+Implemented locally; independent Sol high source review PASS f3cf3861. Hosted proof pending.
+Original design: Sol 6.1 high, 2026-11-17. Required prepared base:
 0375963b55277f27dbfcf9684c53b61d7294245f, containing actual main
 59a665c9cda602d0b2939613656f2c98399f51f1 (PR173 atomic-anchor kernel).
 Root subsequently confirmed main CI44114182696 attempt1 green:609s wall/Windows604s.
@@ -180,10 +181,12 @@ main green pending; no source/build/test/engine/network/hardware acceptance.
 
 ## Local source status (2026-11-17)
 
-Implementation child source WIP `9b6c7e0` stops at the first natural static
-failure: its scope classifier included the generated inventory JSON evidence
-file as source. No classifier correction or rerun, natural TLS execution or
-mutant followed. Clippy passed after one mechanical correction batch; guard7
-and sampler60 passed. See [local evidence](../evidence/m3-anchored-preproof.md).
-This is not acceptance; independent full source/exact-head review and hosted
-all-OS proof remain required. PROGRESS remains coordinator-owned.
+Source9b6c7e06 plus test-driver correctionf0c13d23 has passing evidence for all26
+selected pure cases across recorded rounds; M1/M2/M3 compiled and failed the
+actual received-proof32 versus0 assertion, with exact restoration. Final fmt
+and Clippy passed. Independent Sol source review f3cf3861 PASS (retained320c6b48).
+The original static and semantic stops remain in the chronological evidence.
+Advisory: assertion/API panic can bypass explicit founder-test cleanup; no
+cleanup-after-every-failure guarantee is claimed. See [local evidence](../evidence/m3-anchored-preproof.md).
+Exact-head review and hosted all-OS proof remain required, with normal gates,
+Windows<=660s and fresh exact main. No local engine or hardware credit.
