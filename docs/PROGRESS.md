@@ -39,8 +39,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`, five gates/PASS6953829566. Merge tree equals reviewed head. Main CI44126173935 recovered via one macOS-only infrastructure retry attempt2; active first-attempt budget remains905s and blocks merges.
-- Current work: root verified exact-main recovery and all108 tracked cases. Owned anchor-query contract passed separate Sol high recheckd56a4a2 (retained3b45bb07); bounded local implementation authorized under the query ADR0005 amendment. Separate Sol high builder refreshes accepted queue policy PR163 locally; activation and protection changes remain unauthorized.
-- Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
+- Current work: #163 is the next merge candidate at22a09eae; exact-head PASS6955327399/status59164049828, three platform checks pending, budget expected to fail905s. No activation or bootstrap authority yet. Owned-query sourcef9d0a41/evidence15610c33 remains local:26 selected tests, guard8/sampler60/inventory and two mutation kills passed; independent source review is next, with no publication before policy recovery.
+- Blockers:905s first-attempt budget holds merges; #163 must land before features through its separately authorized route. Production joining still needs public query dispatch, discovery, removal authorization, custody/control identity and clock contracts. Internal anchor fencing/pre-proof probes are implemented; owned query is local-only. Joint recovery is an engine API proof, not production recovery acceptance. Windows fixture28 unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3544,3 +3544,17 @@ One local round with at most2 mechanical pre-behavior corrections, stop at
 first semantic/static red, two once-only targeted compiled mutations and exact
 restoration. No local engine or source publishing while905s budget blocks.
 Queue-policy refresh remains preparation, not activation authority.
+
+### Owned-query local result and independent review preparation (2026-11-17)
+
+Sol 6.1 high sourcef9d0a41/evidence15610c33: one mechanical lint correction
+removed an unfulfilled dead-code expectation now that encode has a real caller.
+26 selected pure/durable/compatibility cases passed; guard8/sampler60/listing
+passed. M1 actual abort-complete read capacity8 versus7 and M2 actual consumed
+query TLS proof32 versus0 each compiled and failed once; source restored exactly.
+No Raft engine or hosted proof executed locally. Root inspected the five-source
+allowlist, recomputed all9 retained log hashes and both restored source hashes;
+final exact-source fmt passed1.282s after the earlier lint correction.
+D:/Temp/arx-owned-query-root/inspection.json records actual root checks.
+Independent full source review follows while #163 remains the next merge. No
+feature publication or policy activation; M2open/M3unchecked/hardwareunverified.

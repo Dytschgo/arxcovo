@@ -181,3 +181,16 @@ f9d0a41; fmt/Clippy(after1 mechanical lint correction)/26 selected tests/8 guard
 60 sampler/real inventory PASS; M1 and M2 designated compiled failures once each,
 exact source restored. Hosted ONE-start query pipeline UNRUN; independent exact-head
 review and five gates pending; source-main905s publishing hold remains.
+
+## Root inspection before independent source review
+
+Root Sol6.1 medium verified exactly five allowed source paths against prepared
+2bee2043, all9 listed retained log hashes, and actual restored source SHA256
+350b634354c1d12de617dadbce3c828bf215efb77f7ed9ddaed99ba6ecef234a /
+0f0f185d2f4b604f879738dcb84b046a0f282af6ad81ccfd7bf0d1ca3a65195b.
+No Rust behavior was repeated. Final fmt --check on exactf9d0a41 passed1.282s
+to cover the mechanical lint edit after initial formatting; empty log hash
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+Raw root record: D:/Temp/arx-owned-query-root/inspection.json.
+#163 is prioritized ahead of any feature merge; its exact-head review passed
+but platform checks and owner bootstrap remain. This feature stays unpublished.
