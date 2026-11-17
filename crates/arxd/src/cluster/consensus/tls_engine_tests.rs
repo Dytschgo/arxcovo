@@ -592,3 +592,351 @@ async fn founder_joiner_mutual_tls_real_identities() {
     .await
     .unwrap();
 }
+
+// Log replay uses the mem_net double's default sender == source check only.
+// Production TLS cannot bootstrap this empty registry; no transport trust claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn learner_catch_up_gives_joiner_own_registry() {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    timeout_at(deadline, async {
+        use super::super::mem_net::{Factory, MemRouter};
+        let fdir = crate::service::application::tests::private_temp();
+        let jdir = crate::service::application::tests::private_temp();
+        assert!(crate::security::private(fdir.path()).is_ok());
+        assert!(crate::security::private(jdir.path()).is_ok());
+        let router = Arc::new(MemRouter::default());
+        let mut n1 = ConsensusNode::start(
+            1,
+            fdir.path(),
+            founder_init([1; 16]),
+            Params::default(),
+            Factory {
+                source: 1,
+                router: router.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        router
+            .nodes
+            .lock()
+            .unwrap()
+            .insert(1, n1.raft.as_ref().unwrap().clone());
+        let ca = TestCa::ephemeral([1; 16], pki::NOW);
+        let fkey = KeyPair::generate().unwrap();
+        let fcsr = CertificateParams::default()
+            .serialize_request(&fkey)
+            .unwrap();
+        let founder = n1
+            .found(&ca, &Clock, BasicNode::new("mem:1"), fcsr.der())
+            .await
+            .unwrap();
+        assert_eq!(founder.node, FOUNDER);
+        let jkey = KeyPair::generate().unwrap();
+        let jcsr = CertificateParams::default()
+            .serialize_request(&jkey)
+            .unwrap();
+        assert_ne!(
+            fkey.subject_public_key_info(),
+            jkey.subject_public_key_info()
+        );
+        let code = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+            b.fill(15);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        n1.propose(Command::Mint {
+            cluster: [1; 16],
+            actor: [3; 16],
+            request: [4; 16],
+            code: code.code_id(),
+            verifier: code.verifier(),
+            proposed_at_ms: pki::NOW,
+        })
+        .await
+        .unwrap();
+        let joiner = n1
+            .enroll(
+                &ca,
+                &Clock,
+                RedeemInput {
+                    cluster: [1; 16],
+                    request: [5; 16],
+                    code: code.code_id(),
+                    proof: code.proof(),
+                },
+                jcsr.der(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(joiner.node, pki::node(2));
+        let mut n2 = ConsensusNode::start(
+            2,
+            jdir.path(),
+            founder_init([1; 16]),
+            Params::default(),
+            Factory {
+                source: 2,
+                router: router.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        router
+            .nodes
+            .lock()
+            .unwrap()
+            .insert(2, n2.raft.as_ref().unwrap().clone());
+        {
+            let m = n2.raft.as_ref().unwrap().metrics().borrow_watched().clone();
+            assert_eq!(m.last_log_index, None);
+            assert_eq!(m.current_term, 0);
+        }
+        let code2 = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+            b.fill(16);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        let freg = n1.peer_registry();
+        let jreg = n2.peer_registry();
+        let (fc, fs, jc, js, fd, jd) = tokio::task::spawn_blocking(move || {
+            let fd = KeyDigest::of_spki(&fkey.subject_public_key_info()).unwrap();
+            let jd = KeyDigest::of_spki(&jkey.subject_public_key_info()).unwrap();
+            assert_eq!(
+                jreg([1; 16], pki::node(1), fd),
+                Err(VerifyRefusal::NotMember)
+            );
+            assert_eq!(
+                jreg([1; 16], pki::node(2), jd),
+                Err(VerifyRefusal::NotMember)
+            );
+            let time = Arc::new(pki::FixedTime(pki::NOW / 1000));
+            let fs = Arc::new(
+                server_config(
+                    pki::verifier(&ca, freg.clone()).server(),
+                    founder.der.clone().into(),
+                    PrivatePkcs8KeyDer::from(fkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let fc = Arc::new(
+                client_config(
+                    pki::verifier(&ca, freg).client(pki::node(2)),
+                    founder.der.into(),
+                    PrivatePkcs8KeyDer::from(fkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let js = Arc::new(
+                server_config(
+                    pki::verifier(&ca, jreg.clone()).server(),
+                    joiner.der.clone().into(),
+                    PrivatePkcs8KeyDer::from(jkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let jc = Arc::new(
+                client_config(
+                    pki::verifier(&ca, jreg).client(pki::node(1)),
+                    joiner.der.into(),
+                    PrivatePkcs8KeyDer::from(jkey.serialize_der()).into(),
+                    time,
+                )
+                .unwrap(),
+            );
+            for (client, server) in [(fc.clone(), js.clone()), (jc.clone(), fs.clone())] {
+                assert_eq!(
+                    pki::refusal(
+                        pki::pump(
+                            ClientConnection::new(
+                                client,
+                                ServerName::try_from(SERVER_NAME).unwrap()
+                            )
+                            .unwrap(),
+                            ServerConnection::new(server).unwrap(),
+                        )
+                        .err()
+                        .unwrap()
+                    ),
+                    VerifyRefusal::NotMember
+                );
+            }
+            (fc, fs, jc, js, fd, jd)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            n1.fresh_read(move |s| Ok(s.state().authorize_peer([1; 16], pki::node(2), jd)))
+                .await
+                .unwrap()
+                .1,
+            Ok(())
+        );
+        let l = n1
+            .raft
+            .as_ref()
+            .unwrap()
+            .add_learner(2, BasicNode::new("mem:2"), false)
+            .await
+            .unwrap()
+            .log_id
+            .index;
+        {
+            let m = n1.raft.as_ref().unwrap().metrics().borrow_watched().clone();
+            assert_eq!(
+                m.membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([1])
+            );
+            assert_eq!(
+                m.membership_config
+                    .membership()
+                    .non_write_voter_ids()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([2])
+            );
+        }
+        n2.raft
+            .as_ref()
+            .unwrap()
+            .wait(Some(deadline.saturating_duration_since(Instant::now())))
+            .applied_index_at_least(Some(l), "learner replay")
+            .await
+            .unwrap();
+        let expected = n1.linearizable_state().await.unwrap();
+        {
+            let sm = n2.sm.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!((sm.applied(), sm.snapshot()), expected);
+        }
+        // Post-catch-up membership fence.
+        for n in [&n1, &n2] {
+            let m = n.raft.as_ref().unwrap().metrics().borrow_watched().clone();
+            assert_eq!(
+                m.membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([1])
+            );
+            assert_eq!(
+                m.membership_config
+                    .membership()
+                    .non_write_voter_ids()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([2])
+            );
+            if m.id == 2 {
+                assert_eq!(m.state, openraft::ServerState::Learner);
+                assert_eq!(m.current_leader, Some(1));
+            }
+        }
+        let retained = (fc.clone(), fs.clone(), jc.clone(), js.clone());
+        tokio::task::spawn_blocking(move || {
+            let (fc, fs, jc, js) = retained;
+            for (client, server, expected) in [(fc, js, (2, 1)), (jc, fs, (1, 2))] {
+                let (a, b) = pki::pump(
+                    ClientConnection::new(client, ServerName::try_from(SERVER_NAME).unwrap())
+                        .unwrap(),
+                    ServerConnection::new(server).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    (a.node(), b.node()),
+                    (pki::node(expected.0), pki::node(expected.1))
+                );
+            }
+        })
+        .await
+        .unwrap();
+        router.isolated.lock().unwrap().insert(2);
+        let (last, outcome) = n1
+            .propose(Command::Mint {
+                cluster: [1; 16],
+                actor: [3; 16],
+                request: [6; 16],
+                code: code2.code_id(),
+                verifier: code2.verifier(),
+                proposed_at_ms: pki::NOW,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_some());
+        assert_eq!(
+            n1.raft
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow_watched()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1])
+        );
+        router.isolated.lock().unwrap().remove(&2);
+        n2.raft
+            .as_ref()
+            .unwrap()
+            .wait(Some(deadline.saturating_duration_since(Instant::now())))
+            .applied_index_at_least(Some(last.index), "learner resumes")
+            .await
+            .unwrap();
+        assert_eq!(
+            router.snapshots.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let durable = {
+            let sm = n2.sm.as_ref().unwrap().0.lock().unwrap();
+            (sm.applied(), sm.snapshot())
+        };
+        let weak1 = (n1.log_weak.clone(), n1.sm_weak.clone());
+        let weak2 = (n2.log_weak.clone(), n2.sm_weak.clone());
+        router.isolated.lock().unwrap().insert(2);
+        router.nodes.lock().unwrap().clear();
+        n2.shutdown().await.unwrap();
+        assert!(weak2.0.upgrade().is_none());
+        assert!(weak2.1.upgrade().is_none());
+        let mut reopened = ConsensusNode::start(
+            2,
+            jdir.path(),
+            founder_init([1; 16]),
+            Params::default(),
+            Factory {
+                source: 2,
+                router: router.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let sm = reopened.sm.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!((sm.applied(), sm.snapshot()), durable);
+        }
+        let reg = reopened.peer_registry();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(reg([1; 16], pki::node(1), fd), Ok(()));
+            assert_eq!(reg([1; 16], pki::node(2), jd), Ok(()));
+            assert_eq!(
+                reg([1; 16], pki::node(3), jd),
+                Err(VerifyRefusal::NotMember)
+            );
+        })
+        .await
+        .unwrap();
+        let weak_reopened = (reopened.log_weak.clone(), reopened.sm_weak.clone());
+        reopened.shutdown().await.unwrap();
+        n1.shutdown().await.unwrap();
+        assert!(weak1.0.upgrade().is_none());
+        assert!(weak1.1.upgrade().is_none());
+        assert!(weak_reopened.0.upgrade().is_none());
+        assert!(weak_reopened.1.upgrade().is_none());
+        drop((fc, fs, jc, js));
+    })
+    .await
+    .unwrap();
+}
