@@ -39,7 +39,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 - Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
 - Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
-- Blockers: independent Opus delta/exact-head review and fresh hosted normal five gates before publication/merge; hosted Windows timing still unmeasured for founder integration. Supplied exact main CI44051366327 attempt1 is green608s, Windows603s; no new remote query. No natural failure repair/rerun authorized. Sol shared fixes3/3 and Opus0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked; Windows fixture and multi-host/custody/transport **unverified on real hardware**.
+- Blockers: integration delta review passed (Opus high, 13a12ee5); exact-head publication review, fresh hosted five gates and measured Windows job at or below 660 s remain required. PR165 is awaiting its remaining platform gate before a documentation refresh. Main39b3dd7 CI44051366327 is green in 608 s. Sol shared fixes3/3 and Opus0/2 unchanged; M2 open/M3 unchecked. Windows fixture and multi-host/custody/transport paths remain **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3189,6 +3189,8 @@ separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 
 ### Founder F1 local implementation — 2026-11-16
 
+Historical checkpoint for the original 2026-11-16 local build. Its eight-quarantine and pending-review statements apply only to that revision; the current integration and 24-test quarantine are recorded above.
+
 Provider Sol, effort high; prepared base ff4eece89ca0c76870cda6d971acec7e6cebf8ad,
 source main c6121523417089bc0afaf307470183dd4a7f47ba and accepted contract455d8ea.
 Implements sealed founder subjects, persisted allocation precheck, owned bounded
@@ -3224,3 +3226,5 @@ Opus delta/exact-head review, hosted Windows timing and normal gates remain.
 Current Last merged PR164 and supplied green main facts above apply; historical
 Last merged labels remain history. M2open/M3unchecked, Sol3/3/Opus0/2 unchanged,
 hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-integration.md).
+
+- 2026-11-17: Retained Opus high founder integration PASS13a12ee5. Root confirmed six feature blobs equal reviewedc45089f, strict UTF-8 and guard3pass. All main guard functions remain unchanged; only reviewed founder seal/binding checks added. Source remains b8aadf6, unpublished pending PR165 parent checkpoint and normal hosted gates.
