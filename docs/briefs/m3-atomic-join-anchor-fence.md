@@ -4,7 +4,8 @@ Design proposal only; Sol 6.1 high, 2026-11-17; no children. Inspected assigned 
 `380c0215d662f75c083015658a9f6f261808f2ea`; tree equality to reviewed `27b412b0` is coordinator-supplied.
 Root reports PR172 merged normally: eleven pure/wrapper/compat tests PASS all OS, Windows510s.
 Exact-main CI44097456394 is running per assignment, not queried here. No source/build starts before root confirms green.
-This brief needs root contract review and separate source authorization. No production security acceptance follows.
+Root clarification review is in [the contract review](../reviews/m3-atomic-join-anchor-root-review.md); its corrections are normative.
+Separate independent contract recheck and source authorization remain pending. No production security acceptance follows.
 M2 open, M3 unchecked; hardware **unverified on real hardware**; shared Sol3/3, Opus0/2 unchanged.
 
 ## Decision and local grounding
@@ -57,11 +58,13 @@ Evaluate replay eligibility against tombstone lifetime at effective time; never 
 Once fence passes, existing expiry/key uniqueness/member/node-counter checks remain. Persist consumption, registry binding,
 counter, original E and original effective applied_ms together; SQL failure remains unknown/poisoned, never a returned grant.
 
-Consumption adds anchor32, origin:LogPos24 and original_applied_ms:u64; Grant adds anchor/origin getters and uses original
-applied_ms on replay. check_grant must match request/key/node/anchor/origin/original time/expiry to retained record.
+Consumption adds anchor32, origin:LogPos24 and original_applied_ms:u64. Grant adds anchor/origin/original-time getters.
+EXISTING applied_ms remains the CURRENT operation effective time, including replay, and check_issuable continues using it.
+check_grant matches request/key/node/anchor/origin/ORIGINAL time/expiry to the record; original_time <= fresh applied_ms <= committed_ms.
 Exact live proof+request+key+anchor replay bypasses NEW-consumption voter fencing after voter drift, including joint state,
 only while original record is retained and node/key still bound. Wrong request => Consumed; wrong key retains KeyConflict;
-wrong anchor refuses without grant; Remove => Revoked. Never reinsert a removed node. Replay cannot extend expiry or time.
+wrong anchor refuses without grant; Remove => Revoked. Never reinsert a removed node. Replay preserves expiry/origin time;
+fresh applied_ms advances for signer rollback protection, never as renewal of the original grant lifetime.
 Before/at-fence rejection is unconsumed; after E, a lost response/guard failure can mean consumed. No unconditional unspent claim.
 Expired retained replay may return its old grant as today, but check_issuable still refuses signing; pruned replay is UnknownCode.
 
@@ -82,11 +85,12 @@ Minting callers obtain anchor from an explicit applied membership+registry obser
 that later refuses unconsumed. No new public mint endpoint or promise of a pre-proof authenticated observation in this slice.
 
 RedeemInput gains anchor; enroll passes it into Command::redeem. IssueTicket retains CURRENT response L leader/index,
-adds original full E via grant; committed validates origin.index<=L.index and exact equality when indices equal.
+adds original full E via grant; committed validates origin.index<=L.index, origin.term<=L.term and full equality at equal index.
+Malformed origin uses existing Rejected(UnknownCode); direct adapter tests must reach this check with otherwise valid own-response fields.
 Do not use E's former leader for fresh issuer leadership checks. Keep both current-L issue_guard checks, CSR possession,
-key match, signer expiry/rollback, CA-fit and sealed subject checks. IssuedLeaf gains `redemption: LogPos` from grant E.
-found() already returns IssuedLeaf: fill this field from committed FounderTicket's full position, explicitly documented as
-the founding position for that method; FounderTicket/LeafSubject signing authority and every old founder assertion stay intact.
+key match, signer expiry/rollback, CA-fit and sealed subject checks. IssuedLeaf gains `identity_commit: LogPos` from grant E.
+found() already returns IssuedLeaf: reconstruct this field from committed FounderTicket leader/index, as its founding position.
+FounderTicket/LeafSubject signing authority and every old founder assertion stay intact.
 E survives snapshot/restart and replay at L>E, without renewing original grant lifetime. No durable joiner receipt/key custody yet.
 
 ## Versioning and byte budget (proposed source/snapshot break, not a migration)
@@ -156,7 +160,8 @@ One new standalone ONE-voter issuance integration in issue_tests.rs uses existin
 and ProvenCsr types (not Cluster::new three voters): enroll -> original E; replay -> L>E; released leaf retains E and real CSR key.
 Reuse existing AfterCommit pause to Remove joining binding before release: Revoked, consumed remains, no leaf returned.
 Member-change-before-consume counterfactual belongs in deterministic store tests, not a new multi-voter engine fixture.
-Keep founder13/TLS14 and joint classification; new one-voter case is required all OS, outside founder inventory. No Windows engine
+Keep founder13/TLS14 and joint classification; new one-voter case is required all OS, outside founder inventory.
+The inventory guard is additionally allowlisted ONLY to add the required single-voter class described in the root review. No Windows engine
 run by builder; first engine evidence is ordinary hosted CI. Preserve quarantine28/sample8 and all old quarantined tests.
 
 After root authorization/exact-main green, ONE source round: fmt --check; locked/offline workspace all-target Clippy -D warnings;
@@ -168,6 +173,8 @@ Three designated new-source mutants, each compiled/run ONCE with exact baseline 
 (1) skip first-redemption anchor comparison -> actual store A/B test wrongly enrolls; (2) replay origin overwritten with L ->
 snapshot/reopen replay full-E equality fails; (3) remove Mint reservation fence -> 56th Mint StateFull assertion fails while pending
 image still fits. Target named tests only; compiler failure, survival or unrelated red stops, no kill credit/retry/natural-suite replay.
+Fourth pure mutant: replay replaces fresh applied_ms with original_applied_ms; the fresh signer-clock refusal regression must fail.
+Root review pins its exact 1000/60000/20000ms vector and guard changes; no extra engine fixture or old assertion weakening.
 Independent Sol source reviewer verifies allowlist, changed old assertions, vectors, arithmetic, restored hashes and exact head.
 Normal five gates: verify(ubuntu-latest), verify(macos-latest), verify(windows-latest), ci-time-budget, agent-review; green exact-head
 source review, feature Windows<=660s and fresh green exact main before coordinator publication/merge; no protection exceptions.
