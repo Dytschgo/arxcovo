@@ -1,11 +1,19 @@
 use super::super::three_node::{Cluster, code, mint};
+use super::found::{FOUNDER, founder_init};
 use super::*;
+use crate::cluster::enrollment::JoinCode;
+use crate::cluster::pki::ca::ClusterCa as TestCa;
 use crate::cluster::pki::{self, verify::*};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::pki_types::CertificateDer;
 use rustls::server::danger::ClientCertVerifier;
+use rustls::{
+    ClientConnection, ServerConnection,
+    pki_types::{PrivatePkcs8KeyDer, ServerName},
+};
 use tokio::time::timeout;
+use x509_parser::prelude::*;
 struct Clock;
 impl SignerClock for Clock {
     fn now_ms(&self) -> u64 {
@@ -343,4 +351,244 @@ fn tls_single_node_directory_precondition() {
         crate::security::private(dir.path()).is_ok(),
         "TLS store directory must pass the first open_db check"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn founder_joiner_mutual_tls_real_identities() {
+    timeout(Duration::from_secs(20), async {
+        use super::super::mem_net::{Factory, MemRouter};
+        let dir = crate::service::application::tests::private_temp();
+        assert!(crate::security::private(dir.path()).is_ok());
+        let mut n = ConsensusNode::start(
+            1,
+            dir.path(),
+            founder_init([1; 16]),
+            Params::default(),
+            Factory {
+                source: 1,
+                router: Arc::new(MemRouter::default()),
+            },
+        )
+        .await
+        .unwrap();
+        let ca = TestCa::ephemeral([1; 16], pki::NOW);
+        let fkey = KeyPair::generate().unwrap();
+        let fcsr = CertificateParams::default()
+            .serialize_request(&fkey)
+            .unwrap();
+        let founder = n
+            .found(&ca, &Clock, BasicNode::new("mem:1"), fcsr.der())
+            .await
+            .unwrap();
+        assert_eq!(founder.node, FOUNDER);
+        let jkey = KeyPair::generate().unwrap();
+        let jcsr = CertificateParams::default()
+            .serialize_request(&jkey)
+            .unwrap();
+        assert_ne!(
+            fkey.subject_public_key_info(),
+            jkey.subject_public_key_info()
+        );
+        let code = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+            b.fill(15);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        n.propose(Command::Mint {
+            cluster: [1; 16],
+            actor: [3; 16],
+            request: [4; 16],
+            code: code.code_id(),
+            verifier: code.verifier(),
+            proposed_at_ms: pki::NOW,
+        })
+        .await
+        .unwrap();
+        let joiner = n
+            .enroll(
+                &ca,
+                &Clock,
+                RedeemInput {
+                    cluster: [1; 16],
+                    request: [5; 16],
+                    code: code.code_id(),
+                    proof: code.proof(),
+                },
+                jcsr.der(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(joiner.node, pki::node(2));
+        // One committed founder view for both roles; no joiner replica or second host.
+        let reg = n.peer_registry();
+        let (fc, fs, jc, js, reg, fd) = tokio::task::spawn_blocking(move || {
+            let (_, root) = X509Certificate::from_der(ca.cert_der()).unwrap();
+            for (leaf, key, id) in [(&founder, &fkey, 1), (&joiner, &jkey, 2)] {
+                let (_, cert) = X509Certificate::from_der(&leaf.der).unwrap();
+                cert.verify_signature(Some(root.public_key())).unwrap();
+                assert_eq!(cert.public_key().raw, key.subject_public_key_info());
+                assert_eq!(
+                    cert.subject_alternative_name()
+                        .unwrap()
+                        .unwrap()
+                        .value
+                        .general_names,
+                    vec![GeneralName::URI(
+                        pki::node_uri([1; 16], pki::node(id)).as_str()
+                    )]
+                );
+            }
+            let (_, fcert) = X509Certificate::from_der(&founder.der).unwrap();
+            let (_, jcert) = X509Certificate::from_der(&joiner.der).unwrap();
+            assert_ne!(fcert.raw_serial(), jcert.raw_serial());
+            let fd = KeyDigest::of_spki(&fkey.subject_public_key_info()).unwrap();
+            let jd = KeyDigest::of_spki(&jkey.subject_public_key_info()).unwrap();
+            assert_eq!(reg([1; 16], pki::node(1), fd), Ok(()));
+            assert_eq!(reg([1; 16], pki::node(2), jd), Ok(()));
+            assert_eq!(
+                reg([1; 16], pki::node(1), jd),
+                Err(VerifyRefusal::KeyMismatch)
+            );
+            assert_eq!(
+                reg([1; 16], pki::node(2), fd),
+                Err(VerifyRefusal::KeyMismatch)
+            );
+            assert_eq!(
+                reg([1; 16], pki::node(3), jd),
+                Err(VerifyRefusal::NotMember)
+            );
+            let time = Arc::new(pki::FixedTime(pki::NOW / 1000));
+            let fs = Arc::new(
+                server_config(
+                    pki::verifier(&ca, reg.clone()).server(),
+                    founder.der.clone().into(),
+                    PrivatePkcs8KeyDer::from(fkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let jc = Arc::new(
+                client_config(
+                    pki::verifier(&ca, reg.clone()).client(pki::node(1)),
+                    joiner.der.clone().into(),
+                    PrivatePkcs8KeyDer::from(jkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let fc = Arc::new(
+                client_config(
+                    pki::verifier(&ca, reg.clone()).client(pki::node(2)),
+                    founder.der.into(),
+                    PrivatePkcs8KeyDer::from(fkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            let js = Arc::new(
+                server_config(
+                    pki::verifier(&ca, reg.clone()).server(),
+                    joiner.der.clone().into(),
+                    PrivatePkcs8KeyDer::from(jkey.serialize_der()).into(),
+                    time.clone(),
+                )
+                .unwrap(),
+            );
+            for (client, server, expected) in [
+                (jc.clone(), fs.clone(), (1, 2)),
+                (fc.clone(), js.clone(), (2, 1)),
+            ] {
+                let (a, b) = pki::pump(
+                    ClientConnection::new(client, ServerName::try_from(SERVER_NAME).unwrap())
+                        .unwrap(),
+                    ServerConnection::new(server).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    (a.node(), b.node()),
+                    (pki::node(expected.0), pki::node(expected.1))
+                );
+            }
+            let wrong = Arc::new(
+                client_config(
+                    pki::verifier(&ca, reg.clone()).client(pki::node(2)),
+                    joiner.der.into(),
+                    PrivatePkcs8KeyDer::from(jkey.serialize_der()).into(),
+                    time,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                pki::refusal(
+                    pki::pump(
+                        ClientConnection::new(wrong, ServerName::try_from(SERVER_NAME).unwrap())
+                            .unwrap(),
+                        ServerConnection::new(fs.clone()).unwrap()
+                    )
+                    .err()
+                    .unwrap()
+                ),
+                VerifyRefusal::TargetMismatch
+            );
+            (fc, fs, jc, js, reg, fd)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            n.propose(Command::Remove {
+                cluster: [1; 16],
+                node: pki::node(2),
+                proposed_at_ms: pki::NOW,
+            })
+            .await
+            .unwrap()
+            .1,
+            Some(Outcome::Removed { replay: false })
+        );
+        let retained = (fc.clone(), fs.clone(), jc.clone(), js.clone());
+        tokio::task::spawn_blocking(move || {
+            let (fc, fs, jc, js) = retained;
+            for (client, server) in [(jc, fs), (fc, js)] {
+                assert_eq!(
+                    pki::refusal(
+                        pki::pump(
+                            ClientConnection::new(
+                                client,
+                                ServerName::try_from(SERVER_NAME).unwrap()
+                            )
+                            .unwrap(),
+                            ServerConnection::new(server).unwrap()
+                        )
+                        .err()
+                        .unwrap()
+                    ),
+                    VerifyRefusal::NotMember
+                );
+            }
+            assert_eq!(reg([1; 16], pki::node(1), fd), Ok(()));
+        })
+        .await
+        .unwrap();
+        // Retained verifiers own only a weak store reference.
+        n.shutdown().await.unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                pki::refusal(
+                    pki::pump(
+                        ClientConnection::new(jc, ServerName::try_from(SERVER_NAME).unwrap())
+                            .unwrap(),
+                        ServerConnection::new(fs).unwrap()
+                    )
+                    .err()
+                    .unwrap()
+                ),
+                VerifyRefusal::Unavailable
+            );
+            drop((fc, js));
+        })
+        .await
+        .unwrap();
+    })
+    .await
+    .unwrap();
 }
