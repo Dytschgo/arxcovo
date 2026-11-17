@@ -115,3 +115,31 @@ sampler, listing/build output, recorded scope failure and full source patch.
 No mutation or restoration hashes are claimed. Logs/caches remain in the
 assigned worktree; generated evidence files are retained locally, uncommitted.
 The source stop was preserved without a classifier fix or natural-suite replay.
+
+## Root scope-classifier disposition (2026-11-17)
+
+Root Sol 6.1 medium inspected the retained scope-failure.log: the checker mixed
+generated .task-evidence/inventory.json with four new source files. Root limited
+the source comparison to the committed source diff and inspected evidence
+separately. All ten source paths exactly match the allowlist; strict UTF-8/LF
+passes for all ten. Existing TLS/pki/enrollment tests, issuance, adapter, Cargo
+lock, CI workflow and sampler match the prepared base byte-for-byte. verify.rs
+changes only pki-parent visibility of Identity/fields/peer_identity; bodies match.
+No repository source or classifier code was changed to close this artifact error.
+
+Root classified the existing successful nextest listing without rerunning Cargo:
+fixture28 ignored, founder13/TLS14/atomic issuance1 required, and the new
+anchored_preproof_single_voter required. Sample selection remains attributed to
+guard7/sampler60; this full listing is not an engine or sample execution.
+Artifact D:/Temp/arx-preproof-root-disposition/scope-inventory.json SHA256:
+9e15b5249775f42b0f08a93613037eca40d3b490df6608f86ccff2ea761fa8f3.
+
+Root authorizes resuming the previously UNRUN pure anchor/preproof/TLS tests,
+existing pure pki cases and literal anchor regression, then the three designated
+once-only mutants if natural checks pass. No passing guard/sampler/Clippy/fmt
+rerun is needed absent a source edit or concrete concern. Any natural behavior
+failure, mutant survival/compiler/unrelated failure or scope need stops again
+without correction/retry. Production source remains9b6c7e06. No local Windows
+engine execution, publication or acceptance; separate source review follows.
+The initial compile correction batch remains1; this is a static artifact-check
+disposition, not a behavior fix or counter reset.

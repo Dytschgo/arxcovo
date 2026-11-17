@@ -36,7 +36,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed head `aa63bd5f`, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 attempt 1 is green: 609 s wall / Windows604s.
-- Current work: pre-proof TLS contract e859ff16/retained79f5fa01 passed separate Sol 6.1 high recheck9f3908d1 (retained35a5a1e6), including root R1/R2. Root adopted the internal ADR0005 amendment and authorizes one bounded local implementation round. No new source or runtime acceptance yet.
+- Current work: pre-proof TLS WIP9b6c7e06 compiled with one mechanical correction; guard7/sampler60/fmt/Clippy/listing pass. Child stopped on a scope checker that counted its generated JSON as source. Root closed that artifact mismatch with exact ten-path scope/UTF-8/frozen-byte checks and classified saved inventories; no source change. Pure behavior tests and three mutants may now run once under the existing stop rules. No engine run or publication yet.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3445,3 +3445,12 @@ before first behavior check. Natural semantic/static red stops without rerun;
 three named mutants run once each with exact restoration. No local engine run.
 Independent source review, exact-head review, all five gates, hosted all-OS proof,
 Windows at most660s and fresh green main remain. M2 open / M3 unchecked.
+
+### Pre-proof static stop disposition (2026-11-17)
+
+Sol 6.1 high stopped correctly at scope classification (evidence0ba6cbdf). Root
+Sol medium checked the generated JSON separately from the ten committed source
+paths and completed strict UTF-8/frozen-byte/saved-inventory checks without Cargo
+rerun or source changes. Pure behavior and three mutants remain unrun; root
+authorizes only that remaining round, with stop on the first natural behavior
+red. No local engine run. Existing counters and hardware limits remain.
