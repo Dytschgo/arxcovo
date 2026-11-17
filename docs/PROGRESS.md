@@ -2,14 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `fa7e3c019484bf2335bd26fbbafd2d65b207f480`
-after PR171. First push CI44090513191 attempt1 passed all platforms in604s
-wall; Windows600s, Ubuntu230s, macOS353s. The seven-scenario joint proof
-passed on Ubuntu2.507s/macOS5.101s; Windows compiles but ignores it. Original8
-sample skipped_budget at e_s608 and ran no tests. Earlier diagnostic reds stay
-recorded; no rerun, stability or re-enable credit. Windows fixture28 remains
+**Current main GREEN:** exact `380c0215d662f75c083015658a9f6f261808f2ea`
+after PR172. First push CI44097456394 attempt 1 passed all platforms in 556 s
+wall; Windows 551 s, Ubuntu 238 s, macOS 330 s. All eleven shared-membership
+codec, wrapper and compatibility tests passed on every OS. The original eight
+non-gating Windows sample cases passed in 30.906 s with no orphans; this grants
+no stability or re-enable credit. Windows fixture coverage (28 cases) remains
 unverified on hosted Windows and **unverified on real hardware**.
-M2open/M3unchecked; this is an engine API proof, not production join/recovery.
+M2 open / M3 unchecked; the codec extraction is not production joining.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -33,9 +33,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #171 as `fa7e3c019484bf2335bd26fbbafd2d65b207f480`, reviewed head3792bd89, five gates/PASS6948802456. First-main CI44090513191 attempt1 green604s wall/Windows600s; new proof PASS on both Unix OSes.
-- Current work: L2-A source d4694d57 passes independent Sol6.1 high source review1da2f466 (retained byte-for-byte). Local focused11/Clippy/final-fmt/guard5/sampler60 and three compiled mutants passed as recorded. Root condensed evidence and fixed advisory whitespace; source unchanged. Prepare publication with new pure tests on allOS and normal feature gates.
-- Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
+- Last merged: PR #172 as `380c0215d662f75c083015658a9f6f261808f2ea`, reviewed head `27b412b0`, five gates and PASS comment 6949888622. First-main CI44097456394 attempt 1 green: 556 s wall / Windows 551 s; eleven codec/compatibility tests passed on every OS.
+- Current work: Sol 6.1 high proposed the atomic join-anchor apply fence in `2462bf33`. Root Sol medium reviewed it and corrected fresh signer-time preservation, one-voter test classification and origin-position checks. Independent Sol contract recheck remains required before source authorization; no implementation or runtime claim for this slice.
+- Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3355,3 +3355,13 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Separate-author Sol6.1 high review1da2f466 at1117ba64: Standards/Spec/Security PASS, no blockers. Actual source/blob/hash/inventory and mutant-patch inspection; compile/test results reused with attribution, no Rust/engine rerun. Report retained byte-for-byte.
 - Root Sol medium resolved advisory A1 by replacing verbose escaped log excerpts with a concise evidence summary and stripping trailing whitespace; original detailed commit/raw log hashes retained. Source remains d4694d57. Fresh mainfa7e3c01/CI44090513191 was rechecked green. Exact-head review, hosted pure tests on everyOS, all five gates and Windows<=660s remain open. No behavior, schema or production joining change; hardware **unverified on real hardware**.
+
+## PR172 exact-main checkpoint and next contract review (2026-11-17)
+
+Root Sol 6.1 medium verified PR172's reviewed tree, normal five gates and fresh
+green base before merge. No protection exception was used. Main CI44097456394
+on exact `380c0215` passed on attempt 1; all eleven focused cases passed on all
+three OSes. Retained logs and hashes: `D:/Temp/arx-pr172-hosted/main-success.json`.
+Windows's non-gating sample is observation only. The next atomic-anchor design
+requires an independent contract recheck of the root corrections; no source is
+authorized yet. M2 open, M3 unchecked; hardware **unverified on real hardware**.

@@ -3,7 +3,7 @@
 Design proposal only; Sol 6.1 high, 2026-11-17; no children. Inspected assigned isolated HEAD
 `380c0215d662f75c083015658a9f6f261808f2ea`; tree equality to reviewed `27b412b0` is coordinator-supplied.
 Root reports PR172 merged normally: eleven pure/wrapper/compat tests PASS all OS, Windows510s.
-Exact-main CI44097456394 is running per assignment, not queried here. No source/build starts before root confirms green.
+Root subsequently confirmed exact-main CI44097456394 attempt 1 green: 556 s wall, Windows 551 s; all eleven cases PASS on every OS. No source is authorized yet.
 Root clarification review is in [the contract review](../reviews/m3-atomic-join-anchor-root-review.md); its corrections are normative.
 Separate independent contract recheck and source authorization remain pending. No production security acceptance follows.
 M2 open, M3 unchecked; hardware **unverified on real hardware**; shared Sol3/3, Opus0/2 unchanged.
@@ -169,7 +169,7 @@ focused pure/codec/durable tests excluding crash-child helper and all engine fix
 only for protected inventories. Hosted unchanged ordinary CI supplies all OS required suites/one-voter integration and Unix engine.
 Recommend root allow <=2 mechanical compile/import/lint corrections BEFORE first natural behavior check; no algorithm/limit fixes.
 Natural semantic/static-suite red stops immediately: preserve evidence, no rerun/tuning. Existing exhausted counters stay exhausted.
-Three designated new-source mutants, each compiled/run ONCE with exact baseline hash restoration after EACH:
+Four designated new-source mutants, each compiled/run ONCE with exact baseline hash restoration after EACH:
 (1) skip first-redemption anchor comparison -> actual store A/B test wrongly enrolls; (2) replay origin overwritten with L ->
 snapshot/reopen replay full-E equality fails; (3) remove Mint reservation fence -> 56th Mint StateFull assertion fails while pending
 image still fits. Target named tests only; compiler failure, survival or unrelated red stops, no kill credit/retry/natural-suite replay.
@@ -185,7 +185,7 @@ Kernel is source-supported; technical formats/API/capacity refusal above remain 
 No full-flow blocker to this kernel. Public D1 remains blocked on same-connection pre-proof anchored-key possession/discovery/read
 ownership; real transport, CA custody, authenticated control identity and trusted production clock/expiry policy remain separate.
 Root-owned PROGRESS unchanged. Proposed entry: “Sol6.1 high atomic-anchor design: local API/schema/byte-budget inspection only;
-root contract/source authorization and exact-main44097456394 green pending. PR172 last merged per root; no runtime claim.
+independent contract recheck and source authorization pending; exact-main44097456394 green confirmed by root. PR172 last merged per root; no runtime claim.
 M2 open/M3 unchecked; unverified on real hardware; Sol3/3 Opus0/2 unchanged.”
 Actual task checks: local reads, synthetic SHA256 vector calculation, documentation line count/relative links/UTF-8/whitespace/diff scope; local commit only.
 No build/test/network/PR/watch/link/merge/admin/VM/install/cache deletion, and no source or PROGRESS modification authorized here.
