@@ -1,7 +1,9 @@
 # Brief: M3 F2, founder and enrolled joiner prove mutual TLS with real identities
 
-Status: **proposed** (Opus 5.5 high, 2026-11-17) on `a560c30c`, source = main `67cc62d5` (PR159 TLS merge). Docs only; nothing built, run or
-resolved. Root reviews this contract; Sol (high) implements only after main CI run 44064366449 is green. No ADR is amended and no deviation is added.
+Status: **implemented locally; independent Opus review pending** (Sol high, 2026-11-17).
+Source `1f315bcb0b83f550ee3564e3c667f9477df11d18`; required26 PASS across two selections,
+guard4 PASS, N1/N2 caught once and restored. [Evidence](../evidence/m3-founder-joiner-tls.md).
+Local only; exact-head publication review and normal hosted gates remain unrun.
 ADR 0005 (2026-11-15 amendment), ADR 0023, ADR 0024 and the [runtime boundary brief](m3-next-runtime-boundary.md) (F1, "After F1: F2") stay binding.
 M2 open, M3 unchecked, Windows recovery Sol 3/3 / Opus 0/2, no M4 work; everything here is **unverified on real hardware**.
 
