@@ -153,3 +153,40 @@ No code length, schema, apply/signing semantics, production read ownership,
 timeouts, transport, custody or permission policy changes. The new single-voter
 proof is required on all OS, hosted-only on the local Windows host. Existing
 quarantines and inventories remain. All normal publication/merge gates apply.
+
+### Technical amendment 2026-11-17: owned local anchor query
+
+Root accepts the [query brief](../briefs/m3-owned-anchor-query.md), normative
+[scope and local-test corrections](../reviews/m3-owned-anchor-query-root-review.md)
+and [independent contract recheck](../reviews/m3-owned-anchor-query-contract-sol-recheck.md)
+for local implementation only. Exact main3022d601 recovered through the permitted
+zero-step macOS infrastructure retry; its first-attempt905s budget still blocks
+merges. This authorization grants no publishing, policy activation or exception.
+
+The internal query accepts only cluster16/codeID16 and returns at most641 bytes
+of canonical voter bindings for a locally pending eligible code. It is a stale
+applied-state hint, not bearer proof, freshness, unspent-code or real-time expiry
+authority. Uniform static refusal and existing clock/skew checks apply. No public
+listener, dispatcher, arbitrary read closure, mint/signing or member permission.
+
+Existing issue4 and read8 admission units become owned by the submitted blocking
+closure together with the store Arc. Caller timeout/drop or async-owner abort
+cannot release them early. The only start exception is Arc<Semaphore> storage
+and Arc::new around the unchanged MAX_ISSUING initializer. Existing enroll/found
+borrows retain their semantics; all other start/read/shutdown code stays frozen.
+The existing READ_BUDGET governs caller waiting; no new pool, retry or timer.
+
+Pure eligibility tables and durable non-engine query/shutdown/TLS harnesses may
+run locally. The separate actual-founder pipeline remains hosted-only on this
+Windows host and required on all OS. Two designated compiled mutations exercise
+actual post-abort permit retention and consumed-query plaintext proof refusal.
+Use a cfg(test) probe to retain the actual AbortHandle returned by Owners.spawn;
+wait until is_finished before the post-abort permit assertion. A yield or sampled
+pre-abort report is insufficient. The probe must hold no store or permit.
+Saved failing assertions propagate only after releasing/joining blocked work.
+
+Root permits one verification round, at most two mechanical compile/import/lint
+corrections before first behavior execution. Stop at natural semantic/static red;
+mutants run once each, compiling and failing their designated assertion, then
+restore exact bytes. No engine run, broad repair or counter reset is authorized.
+Independent source/exact-head reviews and every normal gate remain required.

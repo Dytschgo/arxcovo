@@ -17,7 +17,8 @@ Hardware paths remain **unverified on real hardware**.
 
 Root R1/R2 clarifications in ../reviews/m3-owned-anchor-query-root-review.md are normative.
 The Arc initializer exception is accepted; mutation evidence uses the specified local durable non-engine harness.
-Independent contract recheck and exact-main green remain pending; no source authorized.
+Independent Sol recheckd56a4a2 PASS. Exact main recovered via zero-step infrastructure retry;
+root authorizes local source under ADR0005, while905s first-attempt budget holds publishing/merges.
 
 ## Scope and exact technical blocker (original proposal, clarified above)
 

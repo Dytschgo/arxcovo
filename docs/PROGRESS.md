@@ -39,7 +39,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`, five gates/PASS6953829566. Merge tree equals reviewed head. Main CI44126173935 recovered via one macOS-only infrastructure retry attempt2; active first-attempt budget remains905s and blocks merges.
-- Current work: root verified exact-main recovery and all108 tracked cases. Owned anchor-query contract passed separate Sol high recheckd56a4a2 (retained3b45bb07); preparing bounded local source authorization. Separate Sol high builder refreshes accepted queue policy PR163 locally; activation and protection changes remain unauthorized.
+- Current work: root verified exact-main recovery and all108 tracked cases. Owned anchor-query contract passed separate Sol high recheckd56a4a2 (retained3b45bb07); bounded local implementation authorized under the query ADR0005 amendment. Separate Sol high builder refreshes accepted queue policy PR163 locally; activation and protection changes remain unauthorized.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3533,3 +3533,14 @@ ci-budget/status/history write. Active900s policy still blocks merges despite
 functional recovery. ADR0025 remains inactive; refreshing its accepted proposal
 is preparation only, requiring review/hosted checks and owner activation route.
 No third retry, exception, ci-speed or admin authority follows.
+
+### Owned-query local source authorization (2026-11-17)
+
+Root accepts separate Sol high contract recheckd56a4a2/retained3b45bb07 after
+functional exact-main recovery. Narrow Arc ownership exception and runnable
+local non-engine mutation seam are recorded in ADR0005. Actual AbortHandle
+completion must precede post-abort permit assertions; probes own no resources.
+One local round with at most2 mechanical pre-behavior corrections, stop at
+first semantic/static red, two once-only targeted compiled mutations and exact
+restoration. No local engine or source publishing while905s budget blocks.
+Queue-policy refresh remains preparation, not activation authority.
