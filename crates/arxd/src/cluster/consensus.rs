@@ -1,12 +1,15 @@
 //! Real OpenRaft boundary over durable local stores; no production ingress.
 #![allow(dead_code)]
 use super::{
-    enrollment::{Command, Outcome, codec::Reader},
+    enrollment::{Command, Outcome},
     log_store::StoredVote,
+    membership::Membership as WireMembership,
     state_store::{Entry as StoredEntry, LogPos, MembershipBlob, Released, StoreError},
 };
 use openraft::{BasicNode, Entry, EntryPayload, LogId, Membership, Vote};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 #[cfg(test)]
 mod membership_contract_tests;
@@ -51,94 +54,31 @@ fn stored_vote(v: Vote<openraft::impls::leader_id_adv::LeaderId<u64, u64>>) -> S
 }
 fn encode(m: &Members) -> Result<MembershipBlob, StoreError> {
     let configs = m.get_joint_config();
-    let nodes: Vec<_> = m.nodes().collect();
-    if !(1..=2).contains(&configs.len()) || !(1..=16).contains(&nodes.len()) {
+    // Bound the native object before cloning any sets or address strings.
+    if !(1..=2).contains(&configs.len())
+        || configs.iter().any(|c| !(1..=16).contains(&c.len()))
+        || !(1..=16).contains(&m.nodes().count())
+        || m.nodes().any(|(_, n)| !(1..=200).contains(&n.addr.len()))
+    {
         return Err(StoreError::Membership);
     }
-    let mut b = vec![1, configs.len() as u8];
-    for c in configs {
-        if !(1..=16).contains(&c.len()) {
-            return Err(StoreError::Membership);
-        }
-        b.push(c.len() as u8);
-        for n in c {
-            if *n == 0 || !nodes.iter().any(|(i, _)| *i == n) {
-                return Err(StoreError::Membership);
-            }
-            b.extend(n.to_be_bytes());
-        }
-    }
-    b.push(nodes.len() as u8);
-    for (n, node) in nodes {
-        let a = node.addr.as_bytes();
-        if *n == 0
-            || !(1..=200).contains(&a.len())
-            || !a
-                .iter()
-                .all(|c| c.is_ascii_alphanumeric() || b"._:[]-".contains(c))
-        {
-            return Err(StoreError::Membership);
-        }
-        b.extend(n.to_be_bytes());
-        b.push(a.len() as u8);
-        b.extend(a);
-    }
-    MembershipBlob::new(b).map_err(|_| StoreError::Membership)
+    let nodes = m.nodes().map(|(id, n)| (*id, n.addr.clone())).collect();
+    let wire = WireMembership::new(configs.clone(), nodes).map_err(|_| StoreError::Membership)?;
+    let bytes = wire.encode().map_err(|_| StoreError::Membership)?;
+    MembershipBlob::new(bytes).map_err(|_| StoreError::Membership)
 }
 fn decode(b: &MembershipBlob) -> Result<Members, StoreError> {
-    fn inner(b: &MembershipBlob) -> Result<Members, StoreError> {
-        let mut r = Reader(b.bytes());
-        if r.bytes(1)?[0] != 1 {
-            return Err(StoreError::Membership);
-        }
-        let count = r.bytes(1)?[0];
-        if !(1..=2).contains(&count) {
-            return Err(StoreError::Membership);
-        }
-        let mut configs = Vec::new();
-        for _ in 0..count {
-            let n = r.bytes(1)?[0];
-            if !(1..=16).contains(&n) {
-                return Err(StoreError::Membership);
-            }
-            let mut c = BTreeSet::new();
-            let mut prev = 0;
-            for _ in 0..n {
-                let v = r.u64()?;
-                if v <= prev {
-                    return Err(StoreError::Membership);
-                }
-                prev = v;
-                c.insert(v);
-            }
-            configs.push(c);
-        }
-        let n = r.bytes(1)?[0];
-        if !(1..=16).contains(&n) {
-            return Err(StoreError::Membership);
-        }
-        let mut nodes = BTreeMap::new();
-        let mut prev = 0;
-        for _ in 0..n {
-            let v = r.u64()?;
-            if v <= prev {
-                return Err(StoreError::Membership);
-            }
-            prev = v;
-            let len = r.bytes(1)?[0] as usize;
-            let a = std::str::from_utf8(r.bytes(len)?).map_err(|_| StoreError::Membership)?;
-            nodes.insert(v, BasicNode::new(a));
-        }
-        if !r.0.is_empty() || configs.iter().flatten().any(|v| !nodes.contains_key(v)) {
-            return Err(StoreError::Membership);
-        }
-        let m = Membership::new(configs, nodes).map_err(|_| StoreError::Membership)?;
-        if encode(&m)?.bytes() != b.bytes() {
-            return Err(StoreError::Membership);
-        }
-        Ok(m)
+    let wire = WireMembership::decode(b.bytes()).map_err(|_| StoreError::Membership)?;
+    let (configs, nodes) = wire.into_parts();
+    let nodes: std::collections::BTreeMap<_, _> = nodes
+        .into_iter()
+        .map(|(id, a)| (id, BasicNode::new(a)))
+        .collect();
+    let m = Membership::new(configs, nodes).map_err(|_| StoreError::Membership)?;
+    if encode(&m)?.bytes() != b.bytes() {
+        return Err(StoreError::Membership);
     }
-    inner(b).map_err(|_| StoreError::Membership)
+    Ok(m)
 }
 fn to_stored(
     e: openraft::type_config::alias::EntryOf<Arx>,
