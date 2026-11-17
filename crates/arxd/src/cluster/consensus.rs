@@ -9,6 +9,8 @@ use openraft::{BasicNode, Entry, EntryPayload, LogId, Membership, Vote};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
+mod membership_contract_tests;
+#[cfg(test)]
 mod tests;
 openraft::declare_raft_types!(pub Arx: D = Command, R = Applied);
 #[derive(Clone, Debug)]

@@ -2,13 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `a7200aa255d306969364068c4d19805bc8afcf1a`
-after PR169. First push CI44081103783 attempt 1 passed all platforms in
-694 s wall time, within the 900 s budget. Windows took689 s, above the660 s
-feature target; this run earns no feature headroom credit. PR169 itself passed
-Windows in612 s. The original8 sample skipped_budget at e_s697 and ran no tests.
-The L1 proof passed on every OS. Quarantined Windows fixture27 coverage remains
-unverified on hosted Windows and **unverified on real hardware**. M2open/M3unchecked.
+**Current main GREEN:** exact `76460c9706a6a15af7ea9fa037aee52876da3591`
+after PR170. First push CI44085879290 attempt1 passed all required platforms
+in575 s wall; Windows570 s, Ubuntu245 s, macOS327 s. The L1 learner proof
+passed on everyOS. The NON-GATING original8 Windows sample recorded diag_fail:
+7pass/1fail, T4 Write/Elapsed(node1), no orphans. This is retained quarantine
+evidence, not a required-job failure or re-enable credit; no rerun or fix.
+Windows fixture27 remains unverified on hosted Windows and **unverified on real
+hardware**. The new local joint proof targets28/sample8 but has not run in CI.
+M2open/M3unchecked.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -32,8 +34,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #169 as `a7200aa255d306969364068c4d19805bc8afcf1a`, reviewed head64cea955, all five gates and independent Sol PASS6947490221. PR Windows612s; first-main CI44081103783 attempt1 green694s wall, Windows689s (no <=660s feature headroom credit).
-- Current work: PR170 membership decisions/planning await hosted gates. Sol6.1 high builder stopped before implementation (bd9db531): frozen startup cancellation exposes no release handle. Root corrected the hard75s/guaranteed-failure-cleanup claim to a cooperative deadline with failed/unresolved startup handling; independent review is required before resume. No source/build/test ran for the stopped task.
+- Last merged: PR #170 as `76460c9706a6a15af7ea9fa037aee52876da3591`, reviewed headbce90cff, all five gates/PASS6948230778 and PR Windows484s. First-main CI44085879290 attempt1 green575s wall/Windows570s. Non-gating sample T4 red retained separately.
+- Current work: joint-recovery test source passes independent Sol6.1 high review c459d80c at8e3df55. Root retained the report and prepares publication of unchanged8a91dcb source. Compile/static/listing passed; first Ubuntu/macOS runtime of all seven scenarios and hosted Windows<=660s are still required. No local engine test ran.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3298,3 +3300,32 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Sol6.1 high stopped before source/verification in bd9db531. Root Sol medium confirmed frozen start and adapter use internal spawn_blocking; a caller timeout cannot prove OS/store work has stopped. No reproduced stall or product defect is claimed.
 - Root revised only the test contract: cooperative75s across scenarios and cleanup; startup still pending at deadline fails with unresolved cleanup, no next scenario or control credit. Existing Tokio/runtime/CI teardown may outlive the body. No production API, new cleanup task, deadline increase, Windows runtime or repair attempt. Completed startups still require verified clean release for every passing scenario. Independent review before resume.
+
+### Joint-proof implementation resumed - 2026-11-17
+
+- Independent Sol6.1 high exact-head review6948230778 passed the cooperative startup disposition on bce90cff. Root rechecked exact live maina7200aa2 and greenCI44081103783, then assigned Sol6.1 high the same narrow implementation. Original stopbd9db531 remains historical; no verification had run, and no check was rerun.
+- First runtime proof remains ordinary Ubuntu/macOS CI after independent source review. Every passing scenario must have verified cleanup; pending startup fails/unresolved, not a pass. New Windows classification28/sample8 is a target, not implemented evidence. Existing current inventory27 and exhausted fix budgets unchanged. Hardware paths **unverified on real hardware**.
+
+### PR170 merge / main pending - 2026-11-17
+
+- Root Sol medium verified exactbce90cff five green gates/PASS6948230778, Windows484s, freshgreenbasea7200aa2 and normal five-check strict protection before squash merge76460c97. The merge tree263a2926 equals reviewed head. No exception/protection change/rerun.
+- Exact main CI44085879290 is actively tracked through completion. Premerge/merge inputs are retained under D:/Temp/arx-pr170-hosted. No new main success is claimed before it finishes. Source builder runs in its assigned isolated worktree; counters and coverage claims remain unchanged.
+
+### Joint-proof corrected compile/static/listing - 2026-11-17
+
+- Sol6.1 high source73533941 stopped on three missing-trait E0599 errors before static suites/runtime. Root Sol medium added only the watcher import (8a91dcb), then finished the round: fmt, locked/offline workspace all-target Clippy, guard5, sampler60 and real listing passed. No engine test or behavior rerun.
+- Exact sampler argv confirms28 ignored fixtures/sample8; founder13 and requiredTLS14 unignored. Root corrected its raw-list ignored-selection omission and raw CRLF-vs-Git comparison assumption; source unchanged. Evidence retains all logs/runners/results/list hashes and frozen blob identities. Independent source review precedes publication; Unix runtime/control fit and Windows<=660s remain unverified.
+
+### PR170 exact-main success / quarantined diagnostic red - 2026-11-17
+
+- Root Sol medium actively awaited CI44085879290 on76460c97: attempt1 SUCCESS,575s wall; Windows570s, Ubuntu245s, macOS327s. Learner own-registry test passed on all three OS. Frozen docs merge adds no joint-proof runtime acceptance.
+- Windows non-gating original8 sample: diag_fail/nextest100,31.485s total, no orphans, e_s544. T1/T2/T3/U6/R6c/R6s/R6p passed; T4 failed21.386s with helper Write/Elapsed atnode1. Retained typed dump shows Append peak2882ms onnode1, Vote2969ms onnode3, lag15ms/over0, ringtrunc1. These are observations, not a proven cause or new fix attempt. No rerun, per-test quarantine or timing change. Existing shared-suite stop and unverified Windows coverage remain.
+- Main ubuntu log SHA256 `dd7753e1d5505c51d2ab153f69c84d3621d2209096c6d8a7b66a06d591fdb3ef` under D:/Temp/arx-pr170-hosted.
+- Main windows log SHA256 `c7992a312a3209915021136058a4f90d3f7f2e54a87cf7a5abc62c956b302f56` under D:/Temp/arx-pr170-hosted.
+- Main macos log SHA256 `01838f1b965435f7845054e74d2e839c1e1c30b64d5484372d2e1dddb5ae6077` under D:/Temp/arx-pr170-hosted.
+- Required CI remains green under the reviewed non-gating sample contract. No Windows recovery/re-enable credit; Sol3/3, Opus0/2 unchanged; M2open/M3unchecked; hardware **unverified on real hardware**.
+
+### Joint-proof independent source PASS - 2026-11-17
+
+- Separate-author Sol6.1 high review c459d80c at8e3df55: Standards/Spec/Security PASS, no blockers. Actual source/cache inspection, hash recomputation and saved inventory parsing; root compile/static/listing evidence reused, no Rust/engine run. Report retained byte-for-byte; new source unchanged8a91dcb.
+- Root rechecked live main76460c97 and exact CI44085879290 SUCCESS before publication preparation. Runtime/control fit, exact-head review and all hosted feature gates remain open. Hardware **unverified on real hardware**, M2open/M3unchecked and exhausted budgets unchanged.
