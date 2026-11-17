@@ -91,3 +91,60 @@ Artifacts are retained under `D:/Temp/arx-l1-sol-bed2f82aa0`.
 | `mutants.py` | `ae038cb9bade98cc25898391471ad89c15ea71916e8bd9001287d9e028f570ca` |
 
 TLS source SHA-256: `605cb06641369c2601e61699a5fb1a02a8351be861ac8739ee749465830a2590`.
+
+
+## Root disposition and completed corrected-source round
+
+The builder stop above is historical and retained. OpenRaft0.10.0's cached
+membership.rs lines228-240 show learner_ids() is exactly a deprecated alias
+calling non_write_voter_ids(). Root replaced only the two test calls with the
+supported method, source commit fa7bc545294d99eed71df822f9226503b721628f.
+No warning suppression, timeout/retry change, engine repair or prior behavior-test
+rerun occurred: the builder had run no behavior test before Clippy stopped.
+
+Root used the existing task-owned Cargo target with CARGO_PROFILE_DEV_DEBUG=0,
+offline networking and a fresh process-local temp directory. Original builder
+logs were preserved. Logs/runners are under D:/Temp/arx-l1-root-u6lxwfst.
+
+Actual corrected-source checks, each once:
+- fmt: exit0, 0.969s; SHA256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- clippy: exit0, 47.172s; SHA256 `9006468255ebf18c439c19c4525314ec5715862b4f66552f126a0f3b4dd398f3`.
+- focused27: exit0, 63.937s; SHA256 `089249fd715effef21415ccb7cf2b11ea314d1ec4296c046310849b332c66ae4`.
+- guard: exit0, 0.282s; SHA256 `35bba77e8d6dc989ba88b32c417dcc4fce299665512770fa676a2da9bcbd02bd`.
+
+The focused selection executed all27 unique cases: new L1 plus13founder and13
+existing requiredTLS. All passed; test wall5.533s, new L1 case0.679s. Guard4 passed.
+No natural runtime red or further source correction. The supported-API correction
+changes no assertion semantics. Production files remain untouched.
+
+Once-only controls selected only the new L1 test:
+- M1: runtime exit100 at line763/771, the expected pre-catch-up refusal no longer
+  exists when the joiner server borrows the founder registry.
+- M2: runtime exit100 at line814, applied/snapshot equality differs with a fresh
+  joiner starting at first_free3.
+- M3: runtime exit100 at line820, post-catch-up voter set is {1,2} instead of {1}
+  after the injected valid promotion. This follows the root contract correction.
+None was a compiler failure. No other mutants ran. Each source restoration in
+finally was byte-exact; final source equals fa7bc54 without another behavior run.
+
+M1: 12.063s command wall; restored source SHA256 `852d2e4c40bada793115505a78bcc098aed833fe630dfd47f9ce93ac127da622`.
+M1.log: `9025ee4924592a3991209d52d334fa2b40c23615de4aa11119d01d401f1ed77f`.
+M1.patch: `80c6018f8136c5094acfae1164d0a796da67fdc896cdd3ca98c91dfb15e1195a`.
+M1-restore.json: `1a175ffc2f0989dfe4579571187b5b3125cba1b3caff89d8ea1fda3a4b7dce2a`.
+
+M2: 12.359s command wall; restored source SHA256 `852d2e4c40bada793115505a78bcc098aed833fe630dfd47f9ce93ac127da622`.
+M2.log: `9064b905dfaecc4e9480d14494a89564347a860953d49ba53f6399a1fed39913`.
+M2.patch: `43bac5fb704caa94ac33369dea87e44aca1671a19355aad605a0473d22c5eee4`.
+M2-restore.json: `1a175ffc2f0989dfe4579571187b5b3125cba1b3caff89d8ea1fda3a4b7dce2a`.
+
+M3: 11.391s command wall; restored source SHA256 `852d2e4c40bada793115505a78bcc098aed833fe630dfd47f9ce93ac127da622`.
+M3.log: `d2a4883cf4971a85f87ef356c3bfb07b041c934e446b7bfdfe8eb2d08ae6195f`.
+M3.patch: `3debe257354b6d4501980a27c57e52dd66e7327b7427653733cd46f8c0931c7f`.
+M3-restore.json: `1a175ffc2f0989dfe4579571187b5b3125cba1b3caff89d8ea1fda3a4b7dce2a`.
+
+Independent Opus source review, exact-head publication review and all hosted gates
+remain pending. Windows job <=660s and fresh green exact main remain required.
+No publication, hosted rerun, fixture quarantine, production admission/promotion
+or D1-D3 policy change. L1 catch-up is the unauthenticated mem_net test double,
+not production TLS replication. M2 open/M3 unchecked; Sol3/3, Opus0/2 unchanged;
+hardware paths remain **unverified on real hardware**.
