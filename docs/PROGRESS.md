@@ -2,17 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `021a89d5f92ace75eaae892513cb8b4efcdc12c5` after PR165.
-CI [44055365214](https://github.com/Dytschgo/arxcovo/actions/runs/44055365214)
-passed on attempt 1 across Ubuntu, Windows and macOS in 565 s wall time;
-Windows job 561 s. All five normal gates and original protection remain active.
-PR164's one-use budget exception is consumed. Windows fixture coverage remains
-unverified on hosted Windows and **unverified on real hardware**; the eight-test
-diagnostic sample earns no acceptance credit. Founder source is independently
-reviewed and ready for publication; its own hosted Windows cost remains unmeasured
-and must satisfy the 660 s rule. M2 open, M3 unchecked. ADR0025 is inactive.
+**Current main GREEN:** exact `c40c547721641974bcb407ce343c795e6c6609ec`
+after PR166. First push CI44058803351 attempt 1 passed all three platforms in
+632 s wall time; Windows 628 s. All 13 founder tests passed on each OS.
+PR166 merged through all five normal gates with Opus PASS6944302384; no exception.
+Windows fixture coverage remains unverified on hosted Windows and **unverified on
+real hardware**. M2 open/M3 unchecked. ADR0025 remains inactive.
 
-**PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
+**PR159 integration held for verification/review:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. Root applied the owner whole-fixture choice to all three TLS Cluster tests; Windows eligibility releases only after the 27-case guard. Stability/re-enable holds remain; no shared cause, rerun or behavior fix is claimed.
 
 **Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
@@ -34,9 +31,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #165 as `021a89d5f92ace75eaae892513cb8b4efcdc12c5` at 2026-11-17T09:24:56Z, exact head b75006d7, independent Opus PASS6943864969 and all five normal gates. Squash tree equals reviewed head. Pre-merge main39b3dd7 CI44051366327 green; new main CI44055365214 pending.
-- Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
-- Blockers: integration delta review passed (Opus high, 13a12ee5). Exact-head publication review, five hosted gates and Windows job <=660 s remain required for founder source. Parent main021a89d5 CI44055365214 attempt1 is green; PR165 merged normally. Sol shared fixes3/3 and Opus0/2 unchanged; M2 open/M3 unchecked. Windows fixture, multi-host, custody and transport remain **unverified on real hardware**.
+- Last merged: PR #166 as `c40c547721641974bcb407ce343c795e6c6609ec`, exact head823e7cf, all five normal gates and independent Opus PASS6944302384. Hosted founder13/13 on all three OSes; PR Windows539s. Final exact-main CI44058803351 attempt1 SUCCESS: 632s wall, Windows628s, founder13/13 per OS.
+- Current work: publish the reviewed PR159 TLS verifier integration onto founder main c40c547. Independent Opus delta PASS75632148 confirms reviewed TLS bytes, exact three fixture attributes, the full 27-case Windows guard and unchanged sample8. Local cluster151, guard3/sampler60, compile/fmt/Clippy and inventory checks passed. Exact-head publication review and fresh hosted gates follow.
+- Blockers: PR159 needs one updated-source Ubuntu S8 observation, all 27 fixture tests and every TLS test actually passing on Ubuntu/macOS, all five exact-head gates and Windows job <=660 s. Main c40c547 CI44058803351 is green in 632 s. Owner whole-fixture scope releases only the quarantined Windows-test eligibility hold; no stability, budget, timing or retry waiver. M2 open/M3 unchecked; Sol3/3 and Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -56,6 +53,23 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 | Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
 
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
+
+## TLS founder-main integration checkpoint (2026-11-17)
+
+Sol high / local integration outcome: merged reviewed PR159 into the assigned
+prepared branch, preserving TLS bytes and founder seal/bindings. Exactly three
+Windows TLS fixture attributes extend the whole-fixture guard to27. Guard3/3,
+sampler60/60, compile gate, identity/Cargo+2 pins, fmt and workspace locked/offline
+Clippy pass. Real Windows nextest inventory confirms27ignored/sample8 and
+TLS12/founder13/pure required; ordinary cluster151/151 pass, exact-three selection
+0run/expected exit4. One routine encoding correction, no engine fix or rerun.
+Cryptographic mutants reused with byte-identity evidence. Logs/pins/limits in
+[evidence](evidence/m3-certificate-verifier.md#founder-main-integration---2026-11-17-sol-high).
+Root independent Opus delta review before push; local only, no hosted action.
+Windows eligibility scope is released by the recorded root decision after guard;
+stability/re-enable hold remains. Ubuntu S8 one updated-source observation only,
+allfive gates and hosted Windows<=660s still required. Main GREENc40/632s preserved;
+M2 open/M3 unchecked, Sol3/3 Opus0/2 unchanged, hardware **unverified on real hardware**.
 
 ## Whole-fixture quarantine checkpoint (2026-11-17)
 
@@ -3229,3 +3243,9 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Merged main021a89d5 into founder branch; only PROGRESS conflicted. Kept main health/correction wording and founder status/history. All six feature blobs and guard remain unchanged from reviewed integration13a12ee5. Exact-main CI44055365214 pending before publication.
 
 - 2026-11-17: PR165 merged normally as021a89d5, reviewedheadb75006d7 tree-identical, all5gates and prior exactmain39b3dd7 green. Root actively awaited newmainCI44055365214 attempt1, all3platformsgreen, wall565s, Windows561s. Founder parent refresh changed only PROGRESS; sixfeaturefiles/guard remain identical to integration reviewed13a12ee5. Publish under normal gates, no new exception.
+
+- 2026-11-17: Root verified PR166 all5gates, actual13founderPASS perOS, Windows539<=660s and fresh exactmain021a89d5 CI44055365214green, then pinned normal squashmergec40c547. Tree equalsreviewedhead823e7cf. FirstmainCI44058803351 pending; no exception/rerun or Windowsfixturecredit.
+
+- 2026-11-17: Root actively awaited founder mainCI44058803351 attempt1; all3platforms green, wall632s, Windows628s, founder13PASS perOS confirmed from finishedlogs. No rerun or protection exception. Parentgreen prerequisite satisfied for TLS local integration.
+
+- 2026-11-17: Retained independent Opus TLS integration PASS75632148, reviewing a1fba89d. Reviewer verified pins, issue.rs composition, attribute-only TLS engine diff, Cargo+2 and27-case guard; own63Python tests and13extra static guard mutants pass. Root independently verified reviewed TLS bytes, enginebodyidentity, lock+2, strictUTF8 and63Python. Fast-forward PR159 under normal gates; Ubuntu S8 gets one new-source observation with no rerun.

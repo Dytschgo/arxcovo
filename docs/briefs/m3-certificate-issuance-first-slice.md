@@ -273,3 +273,24 @@ certificate. It does not accept a caller-supplied raw certificate list as eviden
 These functions are trusted reviewed adapters used with this module's configs, not a claim that arbitrary crate code or an insecure external rustls config cannot forge evidence.
 The target-node mismatch must fail even when both presented identities are enrolled under the same cluster root. Tests distinguish real handshake identity from
 synthetic matching-founder identities; no real-founder-certificate claim is inferred from assume.
+
+## PR B private fixture correction
+
+The first local B engine red stopped before verifier/shutdown assertions: new single-node fixture used plain tempfile::tempdir, whereas open_db's first operation
+requires security::private(dir). Root's focused privacy-precondition probe failed on that raw directory under the exact builder TEMP, without rerunning the engine.
+One changed fixture version now uses the existing application::tests::private_temp and retains explicit privacy assertions. No production privacy check, shared
+Cluster helper, timeout, retry or quarantine changes. This is an ordinary new-fixture precondition correction, separate from the store-close advisory and the
+quarantined Windows failures. Any subsequent natural engine red stops again; no automatic retry or scope expansion follows.
+
+
+### PR B every-connection verification correction
+
+Disable client session resumption, server session storage and TLS1.3 ticket
+issuance. A resumed handshake skips certificate verification, so reusable
+configs must perform full handshakes and check local registry/time each time.
+Regressions reuse configs before and after local removal and across leaf expiry
+with a still-valid ticket age. Direct client-certificate verification must
+independently reject foreign/self-signed roots, time and registry failures;
+time checks assert native NotValidYetContext and ExpiredContext variants.
+This enforces the settled every-connection contract; no transport or production
+CA is added, and local-applied revocation retains its documented staleness.

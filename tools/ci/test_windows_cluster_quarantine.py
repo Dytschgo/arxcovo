@@ -11,9 +11,12 @@ WINDOWS_UNSAMPLED = ['r1_apply_wait_deadline', 'r2_isolated_read_refusal', 'r3_s
 ISSUANCE = ['i1_happy_retry', 'i2_follower_no_append', 'i3_single_consumption_race', 'i4_leadership_loss', 'i5_remove_between_guards', 'i6_actual_post_wait_clock', 'i7_adapter_rejects_forged_shapes_and_mismatches', 'i8_removed_leaf_remains_chain_valid_stale_registry', 'i9_private_material_never_persisted', 'hook_store_identity_and_admission', 'retained_record_is_required_even_while_member_remains_authorized']
 REASON_FIXTURE = 'Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
 PURE = 'read_failure_attribution_covers_all_errors'
+TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', 'authenticated_sender_mismatch_and_assumed_founder_control', 'store_lock_wait_does_not_block_runtime']
+TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses']
+TLS_PURE = ['tls_single_node_directory_precondition']
 
 
-def assert_fixture_quarantine(source, groups, pure=()):
+def assert_fixture_quarantine(source, groups, pure=(), *, required=()):
     names = [name for group, _ in groups for name in group]
     assert len(names) == len(set(names))
     functions = re.findall(r'^async fn ([a-z0-9_]+)\(', source, re.M)
@@ -39,10 +42,13 @@ def assert_fixture_quarantine(source, groups, pure=()):
             actual_tests.append(name)
             if name in pure:
                 assert attrs.strip() == '#[test]'
+            elif name in required:
+                assert 'tokio::test' in attrs
+                assert not re.search(r'\bcfg(?:_attr)?\b|\bignore\b', attrs)
             else:
                 assert 'tokio::test' in attrs and name in names
-    assert sorted(actual_tests) == sorted(names + list(pure))
-    assert source.count('tokio::test') == len(names)
+    assert sorted(actual_tests) == sorted(names + list(pure) + list(required))
+    assert source.count('tokio::test') == len(names) + len(required)
 
 
 def assert_windows_quarantine(source):
@@ -51,6 +57,18 @@ def assert_windows_quarantine(source):
 
 def assert_issuance_quarantine(source):
     assert_fixture_quarantine(source, ((ISSUANCE, REASON_FIXTURE),))
+
+
+def assert_tls_engine_quarantine(source):
+    assert_fixture_quarantine(source, ((TLS_FIXTURE, REASON_FIXTURE),),
+                              TLS_PURE, required=TLS_REQUIRED)
+    segments = re.split(r'(?m)^((?:async )?fn [a-z0-9_]+\()', source)
+    constructors = []
+    for signature, body in zip(segments[1::2], segments[2::2]):
+        if re.search(r'Cluster::(?:new|unfounded)\(', body):
+            constructors.append(re.search(r'fn ([a-z0-9_]+)', signature)[1])
+    assert sorted(constructors) == sorted(TLS_FIXTURE)
+    assert source.count('use super::super::three_node::{Cluster, code, mint};') == 1
 
 
 def assert_issuance_required(source):
@@ -69,7 +87,9 @@ def assert_issuance_modules(issue, pki):
     assert_issuance_required(pki)
     for source, declaration in [
         (issue, '#[cfg(test)]\n#[path = "issue_tests.rs"]\nmod issue_tests;'),
+        (issue, '#[cfg(test)]\n#[path = "tls_engine_tests.rs"]\nmod tls_engine_tests;'),
         (pki, '#[cfg(test)]\nmod tests;'),
+        (pki, '#[cfg(test)]\nmod tls_tests;'),
     ]:
         if source.count(declaration) != 1:
             raise AssertionError("issuance test module must retain its binding")
@@ -110,13 +130,13 @@ class QuarantineTests(unittest.TestCase):
             '#[cfg(any())]', '#[cfg(target_env = "msvc")]',
             '#[cfg(target_vendor = "pc")]', '#[cfg(feature = "hidden")]',
         ]
-        for relative in ["consensus/issue_tests.rs", "pki/tests.rs"]:
+        for relative in ["consensus/issue_tests.rs", "pki/tests.rs", "consensus/tls_engine_tests.rs", "pki/tls_tests.rs"]:
             source = (base / relative).read_text(encoding="utf-8")
-            (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_issuance_required)(source)
+            (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_tls_engine_quarantine if relative == "consensus/tls_engine_tests.rs" else assert_issuance_required)(source)
             for mutation in mutations:
                 with self.subTest(relative=relative, mutation=mutation):
                     with self.assertRaises(AssertionError):
-                        (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_issuance_required)(mutation + source)
+                        (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_tls_engine_quarantine if relative == "consensus/tls_engine_tests.rs" else assert_issuance_required)(mutation + source)
         for mutation in mutations:
             for parent in ("issue", "pki"):
                 with self.subTest(parent=parent, mutation=mutation):
@@ -129,6 +149,11 @@ class QuarantineTests(unittest.TestCase):
             assert_issuance_modules(issue.replace('mod issue_tests;', 'mod absent;'), pki)
         with self.assertRaises(AssertionError):
             assert_issuance_modules(issue, pki.replace('mod tests;', 'mod absent;'))
+
+        with self.assertRaises(AssertionError):
+            assert_issuance_modules(issue.replace('mod tls_engine_tests;', 'mod absent;'), pki)
+        with self.assertRaises(AssertionError):
+            assert_issuance_modules(issue, pki.replace('mod tls_tests;', 'mod absent;'))
 
     def test_founder_binding_and_seal(self):
         base = ROOT / "crates/arxd/src/cluster"
@@ -171,6 +196,7 @@ class QuarantineTests(unittest.TestCase):
         for filename, check, names in (
             ("three_node.rs", assert_windows_quarantine, EXPECTED + WINDOWS_UNSAMPLED),
             ("issue_tests.rs", assert_issuance_quarantine, ISSUANCE),
+            ("tls_engine_tests.rs", assert_tls_engine_quarantine, TLS_FIXTURE),
         ):
             source = (base / filename).read_text(encoding="utf-8")
             check(source)
@@ -202,6 +228,20 @@ class QuarantineTests(unittest.TestCase):
                 with self.subTest(file=filename, mutant=mutant[-65:]):
                     with self.assertRaises(AssertionError):
                         check(mutant)
+        tls = (base / "tls_engine_tests.rs").read_text(encoding="utf-8")
+        gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + REASON_FIXTURE + '"\n)]\n'
+        for name in TLS_REQUIRED + TLS_PURE:
+            signature = ('async fn ' if name in TLS_REQUIRED else 'fn ') + name + '('
+            with self.subTest(required_tls=name):
+                with self.assertRaises(AssertionError):
+                    assert_tls_engine_quarantine(tls.replace(signature, gate + signature))
+        signature = 'async fn ' + TLS_REQUIRED[0] + '() {'
+        mutant = tls.replace(signature, signature + '\n    Cluster::new(Params::default()).await;')
+        self.assertNotEqual(mutant, tls)
+        with self.assertRaises(AssertionError):
+            assert_tls_engine_quarantine(mutant)
+        with self.assertRaises(AssertionError):
+            assert_tls_engine_quarantine(tls.replace('use super::super::three_node::{Cluster, code, mint};', ''))
         source = (base / "three_node.rs").read_text(encoding="utf-8")
         with patch(__name__ + '.EXPECTED', EXPECTED + WINDOWS_UNSAMPLED):
             with self.assertRaises(AssertionError):
@@ -209,6 +249,7 @@ class QuarantineTests(unittest.TestCase):
         for variable, value, check, filename in (
             ('WINDOWS_UNSAMPLED', WINDOWS_UNSAMPLED[:-1], assert_windows_quarantine, 'three_node.rs'),
             ('ISSUANCE', ISSUANCE[:-1], assert_issuance_quarantine, 'issue_tests.rs'),
+            ('TLS_FIXTURE', TLS_FIXTURE[:-1], assert_tls_engine_quarantine, 'tls_engine_tests.rs'),
         ):
             with self.subTest(inventory_drift=variable):
                 with patch(__name__ + '.' + variable, value):

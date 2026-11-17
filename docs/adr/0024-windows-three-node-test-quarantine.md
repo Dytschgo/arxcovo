@@ -77,3 +77,30 @@ CI44051366327 is pending; no feature merge until green. ADR0025 stays inactive.
 First exact-main CI44051366327 attempt1 on39b3dd7 passed608s wall. Ubuntu/mac
 passed24fixturecases; Windows sample skipped for budget. Normal merge prerequisites
 are restored; Windows fixture coverage remains unverified. No further exception.
+
+
+## TLS fixture integration addendum - 2026-11-17
+
+The owner's whole-fixture choice, applied by the recorded root decision in
+[the resumption contract](../briefs/m3-tls-verifier-resumption.md#root-contract-decision---2026-11-17),
+also covers the three PR159 TLS tests that construct `three_node::Cluster`:
+`enrolled_target_binding_revocation_and_stale_acceptance`,
+`authenticated_sender_mismatch_and_assumed_founder_control`, and
+`store_lock_wait_does_not_block_runtime`. Their bodies are unchanged; exactly
+three Windows-only ignore attributes extend the guarded boundary from 24 to 27.
+Ubuntu/macOS must execute all 27. The original sample remains eight with its
+FILTER unchanged; these three TLS cases are outside that namespace.
+
+All 10 pure TLS tests, the live single-node verifier test, its pure directory
+precondition, all 13 founder tests and pure read-attribution remain required on
+Windows. The guard checks exact inventories, test attributes, module bindings,
+and that Cluster constructors occur exactly in the three fixture segments.
+
+This releases only PR159's Windows merge-eligibility hold after the 27-case guard
+passes. The recorded Windows F1/F2 failures remain historical failures; neither
+stability nor recovery/re-enable is established. The fixture suite still needs
+separate reviewed recovery evidence. Ubuntu S8 receives one updated-source hosted
+observation, with no rerun after red. All five normal gates, independent review
+and hosted Windows <=660 s remain required. No budget exception or engine fix.
+M2 open, M3 unchecked; shared fixes Sol3/3 and Opus0/2 unchanged. TLS, transport
+and Windows fixture behavior are **unverified on real hardware**.
