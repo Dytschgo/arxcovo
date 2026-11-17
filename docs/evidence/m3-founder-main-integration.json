@@ -1,0 +1,340 @@
+{
+  "identity": {
+    "root_base": "957184f4591592d511101128a4f8f9dcc88d8ef7",
+    "source_main": "39b3dd73052abd64c1c3d3042e62f080469f1597",
+    "reviewed_source": "c45089ffd62d80f799d3a168773bf4f8e624e839",
+    "head": "b8aadf693e2c97cdad0f53434d776c267a21639d",
+    "common_base": "c6121523417089bc0afaf307470183dd4a7f47ba",
+    "features": [
+      {
+        "path": "crates/arxd/src/cluster/consensus/found.rs",
+        "blob": "b4de3dac384a3f1d7c004d81f4472a5bb4ded20c",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "bcb68665277f564e68ee00dbd6db1c7c55dc15897d056a6adb0835bf428efc59"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/found_tests.rs",
+        "blob": "60c41dc5a3d0f585ef945e6e28ea878af782577a",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "f8295a477bbe09deb8b06a96040ed5ec2ebb2cab00f6ba5d5ab5341b951bca04"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/issue.rs",
+        "blob": "101f0175f318902d118d08566ab3623fb0912b83",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "f82902e41d793f6afcadc8904b7f014df1774df42cb78455d746efee30801021"
+      },
+      {
+        "path": "crates/arxd/src/cluster/enrollment/registry.rs",
+        "blob": "ccf1535e79709c929ffd14c5bfc532253dbb2736",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "f50ac504314d05fe1d3536de8498bf4d0c9d44189abddca0ee2c13c3eb571d70"
+      },
+      {
+        "path": "crates/arxd/src/cluster/pki/ca.rs",
+        "blob": "288be77634295529df6e0fb8e85fff46b9e4cb12",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "4acf19fdc1736c1687d9be8a1e8ba014d57555786aebe7647d1fe9faf3c443e0"
+      },
+      {
+        "path": "crates/arxd/src/cluster/pki/tests.rs",
+        "blob": "e531935a995344e08172760e92cd5e8fec42922e",
+        "diff_of_diffs_equal": true,
+        "diff_sha256": "73aa78d35335954d3e663b4714b0d7be8b542197252645016f5f4a2f58f36712"
+      }
+    ],
+    "frozen": [
+      {
+        "path": "crates/arxd/src/cluster/consensus.rs",
+        "blob": "5b83422bf8d0cc56b7c76ad15609543c40c14e00"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/adapter.rs",
+        "blob": "181e9dce6765b1db9339c254ec2dcead9b88a0b9"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/three_node.rs",
+        "blob": "0fd3ad557ad94a1f76b489bfd9c44a0c3afe7947"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/issue_tests.rs",
+        "blob": "b5a006156b48244971a1aa6322610bbfc2a7b7f0"
+      },
+      {
+        "path": "crates/arxd/src/cluster/consensus/mem_net.rs",
+        "blob": "e799e2510ab12a23f5fbfa7a64bf1c2c8c108712"
+      },
+      {
+        "path": "crates/arxd/src/cluster/pki.rs",
+        "blob": "5fd6a00d44a8bd69ef591417baa0ec1e7de60af6"
+      },
+      {
+        "path": "Cargo.toml",
+        "blob": "343f7301c8744ba3ee1b8ebfb5422c70a04479f9"
+      },
+      {
+        "path": "Cargo.lock",
+        "blob": "5e0b3191cf2141f430743ed31b7f4582f202cfbb"
+      },
+      {
+        "path": "crates/arxd/Cargo.toml",
+        "blob": "a0f0adc2436b284693ce48d4d56a800cd6382347"
+      },
+      {
+        "path": "tools/ci/windows_diag_sample.py",
+        "blob": "8002788b934a06b474b0cc9db41c687ff7d0b071"
+      },
+      {
+        "path": "tools/ci/test_windows_diag_sample.py",
+        "blob": "4060b5b3dfefc7f2a461223e0a5d69ab469c7aad"
+      },
+      {
+        "path": "tools/ci/windows-diag-sample.nextest.toml",
+        "blob": "f5b9f589f04d4e89bdfb1e6d4e365c94bef72917"
+      }
+    ],
+    "held_verifier": "absent on base and integration; PR159 not imported",
+    "guard": "all main bytes retained; exact reviewed additions only",
+    "scope": [
+      "crates/arxd/src/cluster/consensus/found.rs",
+      "crates/arxd/src/cluster/consensus/found_tests.rs",
+      "crates/arxd/src/cluster/consensus/issue.rs",
+      "crates/arxd/src/cluster/enrollment/registry.rs",
+      "crates/arxd/src/cluster/pki/ca.rs",
+      "crates/arxd/src/cluster/pki/tests.rs",
+      "docs/PROGRESS.md",
+      "docs/briefs/m3-next-runtime-boundary.md",
+      "docs/evidence/m3-founder-bootstrap.md",
+      "docs/evidence/m3-founder-main-integration.md",
+      "docs/reviews/m3-founder-bootstrap-opus-recheck.md",
+      "docs/reviews/m3-founder-bootstrap-opus-review.md",
+      "docs/reviews/m3-founder-bootstrap-sol-contract.md",
+      "tools/ci/test_windows_cluster_quarantine.py"
+    ]
+  },
+  "actual_checks": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit": 0,
+      "seconds": 1.938,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--offline",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "seconds": 52.25,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\clippy.log",
+      "sha256": "65d042b9bdc8ec34cef4aa1d99f5f26931eef3ef74b97e39d6f2dd0a0e76baf9"
+    },
+    {
+      "name": "nextest",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "-p",
+        "arxd",
+        "--locked",
+        "--offline",
+        "-E",
+        "test(/^cluster::/)",
+        "--no-fail-fast"
+      ],
+      "exit": 0,
+      "seconds": 66.859,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\nextest.log",
+      "sha256": "c3361c57611511b5b5f69d8a2123d3c0931497544cbfbdfbcbcc3e5e5a28e915"
+    },
+    {
+      "name": "inprocess",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arxd",
+        "--locked",
+        "--offline",
+        "--lib",
+        "cluster::",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit": 0,
+      "seconds": 11.453,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\inprocess.log",
+      "sha256": "1d93fa1f266bca1176c49aa26d573a276bd002ee7e8b80eafcb1dc52596b0348"
+    },
+    {
+      "name": "guard",
+      "command": [
+        "python",
+        "-I",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/ci",
+        "-p",
+        "test_windows_cluster_quarantine.py"
+      ],
+      "exit": 0,
+      "seconds": 0.266,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\guard.log",
+      "sha256": "2e440008878d0b729395d52544e1f02b0e529ab51def87ee798c133b0753fbd8"
+    },
+    {
+      "name": "sampler",
+      "command": [
+        "python",
+        "-I",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tools/ci",
+        "-p",
+        "test_windows_diag_sample.py"
+      ],
+      "exit": 0,
+      "seconds": 0.391,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\sampler.log",
+      "sha256": "b325d6ce7a50daa5abf2be41c0d6d924da8602d3793d1fdd471e9d9b1c019a49"
+    },
+    {
+      "name": "workflow",
+      "command": [
+        "node",
+        "--test",
+        "scripts/ci-workflow.test.mjs"
+      ],
+      "exit": 0,
+      "seconds": 0.141,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\workflow.log",
+      "sha256": "1f250244f8ff945f4a69fcfe157390e6b7c4530e18c7b5939ddc28b190df4991"
+    },
+    {
+      "name": "inventory",
+      "command": [
+        "cargo",
+        "nextest",
+        "list",
+        "-p",
+        "arxd",
+        "--locked",
+        "--offline",
+        "--message-format",
+        "json"
+      ],
+      "exit": 0,
+      "seconds": 1.359,
+      "log": "D:\\Temp\\arx-founder-integrate-c042978f201a49d6b21a8dc864439901\\inventory.log",
+      "sha256": "5a5c288e28f9e935f17fc15254258015fd120531ec0cb514257182b4943dfb9a"
+    }
+  ],
+  "inventory": {
+    "quarantined24": [
+      "cluster::consensus::three_node::t3_snapshot_catchup_then_consecutive_append",
+      "cluster::consensus::three_node::t1_follower_offline_enrollment_and_reopen",
+      "cluster::consensus::three_node::t2_leader_offline_reads_and_unknown_retry",
+      "cluster::consensus::three_node::u6_cancelled_callers_keep_engine_permits_until_resolution",
+      "cluster::consensus::three_node::t4_registry_revocation_snapshot_and_prune",
+      "cluster::consensus::three_node::r6_shutdown_report_cancelled_proposal",
+      "cluster::consensus::three_node::r6_shutdown_report_store_only",
+      "cluster::consensus::three_node::r6_shutdown_report_normal_and_reaped_panic",
+      "cluster::consensus::three_node::r1_apply_wait_deadline",
+      "cluster::consensus::three_node::r2_isolated_read_refusal",
+      "cluster::consensus::three_node::r3_store_wait_deadline_and_heartbeat",
+      "cluster::consensus::three_node::r4_read_admission_and_caller_abort",
+      "cluster::consensus::three_node::r5_shutdown_read_owners",
+      "cluster::consensus::issue::issue_tests::i1_happy_retry",
+      "cluster::consensus::issue::issue_tests::i2_follower_no_append",
+      "cluster::consensus::issue::issue_tests::i3_single_consumption_race",
+      "cluster::consensus::issue::issue_tests::i4_leadership_loss",
+      "cluster::consensus::issue::issue_tests::i5_remove_between_guards",
+      "cluster::consensus::issue::issue_tests::i6_actual_post_wait_clock",
+      "cluster::consensus::issue::issue_tests::i7_adapter_rejects_forged_shapes_and_mismatches",
+      "cluster::consensus::issue::issue_tests::i8_removed_leaf_remains_chain_valid_stale_registry",
+      "cluster::consensus::issue::issue_tests::i9_private_material_never_persisted",
+      "cluster::consensus::issue::issue_tests::hook_store_identity_and_admission",
+      "cluster::consensus::issue::issue_tests::retained_record_is_required_even_while_member_remains_authorized"
+    ],
+    "founder_required13": [
+      "cluster::consensus::issue::found::found_tests::f10_drop_bounded",
+      "cluster::consensus::issue::found::found_tests::f10_outer_budget",
+      "cluster::consensus::issue::found::found_tests::f10_shutdown_owns_closure",
+      "cluster::consensus::issue::found::found_tests::f1_happy_registry",
+      "cluster::consensus::issue::found::found_tests::f2_once_and_concurrent",
+      "cluster::consensus::issue::found::found_tests::f3_preinitialize_refusals",
+      "cluster::consensus::issue::found::found_tests::f3b_persisted_allocation",
+      "cluster::consensus::issue::found::found_tests::f4_registry_restart",
+      "cluster::consensus::issue::found::found_tests::f5_joiner_two",
+      "cluster::consensus::issue::found::found_tests::f6_adapters",
+      "cluster::consensus::issue::found::found_tests::f7_clock_guard_order",
+      "cluster::consensus::issue::found::found_tests::f8_store_privacy",
+      "cluster::consensus::issue::found::found_tests::f9_post_deadline"
+    ],
+    "pure_and_store_close_required7": [
+      "cluster::consensus::tests::store_close_completion_shutdown_deadline",
+      "cluster::consensus::tests::store_close_completion_shutdown_waits",
+      "cluster::consensus::tests::store_close_completion_shutdown_waits_for_log",
+      "cluster::consensus::three_node::read_failure_attribution_covers_all_errors",
+      "cluster::log_store::tests::store_close_completion",
+      "cluster::pki::tests::founder_pure_identity_and_validity",
+      "cluster::state_store::tests::store_close_completion"
+    ],
+    "sample8": [
+      "cluster::consensus::three_node::r6_shutdown_report_cancelled_proposal",
+      "cluster::consensus::three_node::r6_shutdown_report_normal_and_reaped_panic",
+      "cluster::consensus::three_node::r6_shutdown_report_store_only",
+      "cluster::consensus::three_node::t1_follower_offline_enrollment_and_reopen",
+      "cluster::consensus::three_node::t2_leader_offline_reads_and_unknown_retry",
+      "cluster::consensus::three_node::t3_snapshot_catchup_then_consecutive_append",
+      "cluster::consensus::three_node::t4_registry_revocation_snapshot_and_prune",
+      "cluster::consensus::three_node::u6_cancelled_callers_keep_engine_permits_until_resolution"
+    ],
+    "sample_command": [
+      "cargo",
+      "nextest",
+      "list",
+      "-T",
+      "json",
+      "--workspace",
+      "--locked",
+      "--cargo-quiet",
+      "--user-config-file",
+      "none",
+      "--config-file",
+      "tools/ci/windows-diag-sample.nextest.toml",
+      "-P",
+      "diag-sample",
+      "--run-ignored",
+      "only",
+      "-E",
+      "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r1_apply_wait_deadline) & not test(=cluster::consensus::three_node::r2_isolated_read_refusal) & not test(=cluster::consensus::three_node::r3_store_wait_deadline_and_heartbeat) & not test(=cluster::consensus::three_node::r4_read_admission_and_caller_abort) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)",
+      "--offline"
+    ],
+    "sample_list_seconds": 1.234,
+    "sample_log_sha256": "7215b66bce10850a02b18051abd54f9879f7e851d63f3a0d239ed3e9860ba273"
+  },
+  "reused_not_rerun": "Retained Opus 30 focused and builder 155 cluster results; 15 meaningful builder mutants and R2 refusal mutants. No new Rust mutants or fixture execution."
+}

@@ -38,7 +38,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
-- Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. One final locked/offline local verification round pending; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
+- Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
 - Blockers: independent Opus delta/exact-head review and fresh hosted normal five gates before publication/merge; hosted Windows timing still unmeasured for founder integration. Supplied exact main CI44051366327 attempt1 is green608s, Windows603s; no new remote query. No natural failure repair/rerun authorized. Sol shared fixes3/3 and Opus0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked; Windows fixture and multi-host/custody/transport **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3207,3 +3207,20 @@ All15 expected Rust mutation probes fail meaningfully and restore exact bytes.
 No natural red, compiler/lint fix or implementation correction (0/2) occurred.
 Full hosted Windows verify timing/660s headroom remains unmeasured; the existing
 eight quarantines were not forced. All owned build/test processes exited.
+
+
+### Founder integration checkpoint — 2026-11-17
+
+Sol high, one builder/no children: merged retained reviewed founder77398e4 into
+assigned branch on957184f (source main39b3dd7). Source commitb8aadf6 preserves
+all six reviewed c45089f feature blobs and exact diff-of-diffs; complete current
+main fixture guard plus reviewed founder seal guard only. All24 Windows fixture
+quarantines/sample8 retained, no latency hooks/TLS or helper changes. Final local
+round: fmt, locked/offline workspace all-target Clippy, nextest139/139 (484skipped),
+inprocess139/139 (29ignored), guard3/3, sampler60/60, workflow4/4. Founder13 and
+pure/store-close7 required; no natural red, rerun, mutant repeat or source
+correction. Prior30/155/15mutant evidence reused, not re-executed. Independent
+Opus delta/exact-head review, hosted Windows timing and normal gates remain.
+Current Last merged PR164 and supplied green main facts above apply; historical
+Last merged labels remain history. M2open/M3unchecked, Sol3/3/Opus0/2 unchanged,
+hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-integration.md).
