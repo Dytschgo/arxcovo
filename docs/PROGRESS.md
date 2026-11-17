@@ -3562,3 +3562,7 @@ feature publication or policy activation; M2open/M3unchecked/hardwareunverified.
 ### Self-admission identity prerequisite design - 2026-11-17
 
 Sol6.1 high design529012e2 retained as83d99877: actual peer handles currently retain only node ID. Proposed prerequisite preserves the parsed cluster/node/key tuple while synthetic assumed-founder handles remain unusable for self-admission. Root inspected the representation and existing TLS helpers; an independent Sol6.1 high contract review is running. No source implementation or new runtime credit. Owned-query source remains local/reviewed; PR163 recovery stays the next merge. M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged; hardware **unverified on real hardware**.
+
+### Retained peer identity contract review - 2026-11-17
+
+Independent Sol6.1 high review29ec4fd5: no blockers; root accepted the dedicated synchronous inventory, second genuine cluster, static assertion messages and accurate shutdown-deadline wording. Contract refinements only; no implementation/runtime credit. Source remains held on PR163 recovery and fresh exact-main gates. M2 open/M3 unchecked; counters unchanged; hardware **unverified on real hardware**.

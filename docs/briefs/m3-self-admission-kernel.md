@@ -1,7 +1,8 @@
 # M3 self-admission prerequisite: retain authenticated leaf identity
 
 Sol 6.1 high, design only, 2026-11-17; no children. Implementation-ready proposal,
-subject to root contract review, independent Sol recheck and fresh exact-main gates.
+Root and independent Sol contract review complete; source authorization remains
+blocked on policy recovery and fresh exact-main gates.
 Assigned branch t3/self-admission-kernel-brief; HEAD and local base ref
 work/m3-after-anchored-preproof both verified as 0c9efc0a00e701d3c56ca309ffe723281a0197ce.
 Only this document is delivered; no source/build/test/engine/network/public action.
@@ -131,7 +132,7 @@ Same operation is (authenticated cluster,N,key,canonical addr); no request actor
 Canonical address parsing still needs its own accepted scope; no discovery changes.
 
 consensus.rs::{Owners,propose_response,shutdown}: proposal64 shared owned units,
-closed check+JoinSet spawn under mutex, caller oneshot detach, total5s shutdown,
+closed check+JoinSet spawn under mutex, caller oneshot detach, shared5s shutdown deadline (not a proven hard wall ceiling),
 abort/join and Orphaned store-release accounting exist. Membership needs ONE local
 intent reservation under Owners, surviving caller cancellation until engine API
 resolution (shutdown may abort). Do not hold std mutex across await or add a pool.
@@ -163,3 +164,15 @@ node-only peer handle prevents full self tuple revalidation. No implementation o
 runtime credit. Root contract review + independent recheck + fresh exact-main gates
 required before source. PR163 budget hold; M2 open/M3 unchecked, Sol3/3 and historical
 Opus0/2 unchanged; hardware unverified. Last merged PR unchanged by this task.
+
+## Root disposition of independent review
+
+Review29ec4fd5 has no blockers. For implementation, use a dedicated synchronous
+three-name guard inventory without widening the async fixture classifier; pin both
+parent bindings and reject duplicate/hidden/empty inventories. Test1 also includes
+a genuine second cluster using configs assembled in the new file, with no helper
+changes. Compare identity components with boolean predicates and static messages,
+never Debug-print bindings. The existing shutdown deadline is shared across timed
+phases; mutex acquisition and the post-abort join loop prevent a hard wall claim.
+These are contract refinements only. No source authorization before PR163 policy
+recovery, confirmed fresh exact-main green, and a bounded verification assignment.
