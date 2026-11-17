@@ -1,6 +1,6 @@
 # 0025: Charge the CI time budget for execution, not idle job queue
 
-Status: **Owner definition accepted 2026-11-16. Activation requires a separately authorized pinned merge of the reviewed implementation; until then, inactive.** Original Opus design on `c612152`; current-main refresh uses Sol6.1.
+Status: **Active on main10aa891f, 2026-11-17, following the owner-authorized pinned PR163 bootstrap. First new exact-main CI and charged-v1 evaluation verified.** Original Opus design on `c612152`; current-main refresh uses Sol6.1.
 
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
@@ -194,3 +194,11 @@ making macOS non-blocking, raising the 900s threshold, and crediting failed runs
 
 M2 stays open and M3 unchecked. The Windows quarantines are unchanged; the old R5 failure is historical. Native paths remain **unverified on
 real hardware**.
+
+## Activation checkpoint - 2026-11-17
+
+Owner-authorized root Sol coordinator merged reviewed head22a09eae as10aa891f.
+The budget-only exception is consumed. Original five required checks and all
+protection fences were restored and verified. Earlier preparation/approval text
+is historical; no further exception is granted. CI44177880021 attempt1 passed:632s wall,629s charged,3s queue credit.
+Automatic trusted policy44179754154 succeeded.

@@ -2,7 +2,8 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN, budget satisfied:** exact `10aa891f27906e0c73e48396c5c812cab7d4523a`
+**Current main CI pending:** exact `09134085dce93742d8812821dbe11834dcee7a9c`
+after docs checkpoint PR175; CI44198128467 running. Historical policy activation main:
 after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
 629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
 ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
@@ -43,7 +44,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR163 as10aa891f; reviewed head22a09eae, owner-approved budget-only bootstrap consumed, original protection restored. First exact-main CI44177880021 green632s wall/629s charged.
+- Last merged: PR175 as09134085, reviewed head4a9a592b; all five gates passed. New exact-main CI44198128467 pending; prior10aa891f green632s wall/629s charged.
 - Current work: owned anchor-query kernel is integrated onto active-policy main; source and integration reviews passed. Hosted first-run engine proof, exact-head review and all five gates remain required. PR175 publishes the separately reviewed activation checkpoint.
 - Blockers: no current CI budget deadlock. Production joining still needs public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Windows fixture28 remains unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
 
@@ -3567,3 +3568,7 @@ Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f
 ### Owned anchor query publication preparation - 2026-11-18
 
 Sol6.1/high sourcef9d0a413 and integration2c599ffd reviewed independently (89efaaf5,3ca94b38). Five feature files remain byte-identical; fmt/guard8/sampler60 and final diff/UTF8 checks passed. Earlier26selected Rust cases and two compiled mutation kills are reused with exact-restoration qualifications. The new single-voter engine test remains hosted-first on all OS; Windows verify<=660s, all five gates and fresh green main required. Identity-retention design remains separately local and is excluded from this PR. M2 open/M3 unchecked, counters unchanged, hardware **unverified on real hardware**.
+
+### Query publication parent refresh - 2026-11-18
+
+PR175 merged while PR176 review ran. Reviewer found no source blockers but withheld public writes on main drift. Refreshed locally onto09134085 with PROGRESS conflict retaining query checkpoint and current main-pending status. Source remains reviewedf9d0a413; new exact-main CI44198128467 must pass before push, then a fresh exact-head review is required.
