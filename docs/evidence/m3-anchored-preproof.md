@@ -270,3 +270,106 @@ not a hidden mechanical batch or exhausted Windows engine repair attempt.
 No production source or old verification semantics changed. Independent full
 source review and hosted engine/gates remain pending; M2open/M3unchecked,
 Sol3/3 historicalOpus0/2 unchanged; hardware unverified on real hardware.
+
+## Corrected-driver bounded continuation completed (2026-11-17)
+
+Sol 6.1 high test child, no children; assigned isolated worktree only, prepared
+base `18556a70e4c7b6bea2fbc65a60ba58c620c57fb9`. Read AGENTS/KICKOFF, full
+preproof brief, normative root R1/R2, independent contract recheck and full
+prior evidence including root TLS-driver disposition. Source is original
+`9b6c7e060e54d9ec8b44fc12e0715ab92412a3bb` plus ONLY test-helper correction
+`f0c13d23d975d2d2d6e539d3752f210a7f7d8422`. Production unchanged.
+No source correction was made in this continuation.
+
+### Actual natural evidence and reuse
+
+Ran ONLY the22 previously unrun exact names/filter from
+`D:/Temp/arx-preproof-driver-disposition/remaining22.json`:
+`cargo nextest run --locked --offline -p arxd --lib --test-threads 1 --retries 0 --fail-fast -E <remaining22 exact-name union>`.
+Literal argv/names are retained in natural-command.json below. PASS22/22,
+611 skipped, exit0; compile46.36s, nextest0.629s, subprocess48.000s; run ID
+`2dcd8f4c-a0f5-4dbf-a6e2-a040f956f98f`.
+
+Actual R1 whole-session admission/fatal/drain PASS0.027s; genuine release and
+terminal gate PASS0.025s; gate errors/wrong identity PASS0.034s. Intact wrong
+CertificateVerify PASS0.025s includes the assertion that actual possession
+verification was reached once. Its synthetic CA/anchored leaf/list are valid;
+the resolver actually signs using the other private key. No callback-only or
+packet-marker substitution. The exchange consumes and checks query32 first,
+then reads proof32 separately after release; successful exchange requires the
+server plaintext proof read to have length32. Adversary zero-proof assertions
+therefore distinguish query from delivered proof.
+
+Reused without replay: original anchor3 passes from saved red `ad331016`
+(3pass/1fail/22unrun), root's corrected exact partial-proof-write/fatal/no-drain
+PASS0.027s, root scope/UTF8/frozen-byte disposition, saved inventories,
+guard7/sampler60. Thus26 selected natural cases have pass evidence across these
+rounds, not a fresh26-case run. Original red remains preserved; root did not
+rerun unchanged. The test-driver correction is separate from the earlier one
+mechanical build-correction batch and grants no Windows repair credit. Cached
+rustls partial vectored writes explain possible remaining client chunks while
+server idle; no runtime chunk size or product defect is claimed.
+
+### Once-only counterfactuals and exact restores
+
+Each used `cargo nextest run --locked --offline -p arxd --lib --test-threads 1 --retries 0 --fail-fast -E test(=cluster::pki::preproof_tests::<case>)`.
+No engine case selected. Each compiled, ran exactly its designated1 case
+(632 skipped), exited100 at preproof_tests.rs:228, and failed ONLY the exact
+`server received proof bytes` assertion: left32/right0. M2's dead-code warning
+and M3's unused-import warning were mutation consequences, not compile failures.
+No fix/retry, surviving mutant or unrelated failure occurred.
+
+| Mutant / exact case suffix | Build / case / subprocess seconds | Patch |
+| --- | --- | --- |
+| M1 adversary_anchor_digest_zero_proof | 14.18 / 0.030 / 15.266 | Omit only anchor-digest comparison; attacker list contains attacker's endpoint key. |
+| M2 adversary_endpoint_key_zero_proof | 14.67 / 0.028 / 15.657 | Omit only voter-key membership; retain cluster check and genuine list/digest. |
+| M3 adversary_certificate_verify_zero_proof | 14.76 / 0.028 / 15.766 | Replace only new bootstrap TLS1.3 signature delegate with assertion; retain signature-call counter and existing peer verifier. |
+
+M3's delivered proof with the wrong real CV signer supplies the counterfactual
+to the intact possession refusal. Each mutant reached successful exchange and
+actual server proof receipt before its zero-proof assertion failed. Kill credit
+is limited to these three controls.
+
+Baseline preproof.rs SHA256 (also exact restore hash after EACH mutant):
+`cda6d9b06610794f15bf377b22dd726eec7b530acea55fff99f61ba8b944e67e`.
+Exact patch files, literal commands, changed-source hashes, log hashes, durations
+and per-mutant restores are retained in mutant-results.json and M1/M2/M3.patch.
+
+- M1 mutated SHA256 `dcf17dcc0f95a3d94ce6b46b533eb31a6da73f768ece9df83b08fd18a860ae89`; patch SHA256 `00175374fef81b688d2ff5f7c5a55ea4fdb1e3725cf224b4a5eb5e333fc99d3e`; exact restore PASS.
+
+- M2 mutated SHA256 `b4eaa15b30ca493e4405edf36f39fd5237fd4c818f3a1ec038a8a5233736ace3`; patch SHA256 `bdfe64bb6a77d446636b9e0a442feba187ae3e2bedae382549e236a72b185a56`; exact restore PASS.
+
+- M3 mutated SHA256 `8575558749dad29a59ca2ea4bbb8fa95b898cacde62699d64ea422af55943d0c`; patch SHA256 `c1b6eec2d4f01b6c4af1076b6fd83dee2533bfc0e6dc013b84061193081c6b2e`; exact restore PASS.
+
+All ten allowed source paths matched the prepared head before execution and
+after final restore/checks; baseline-hashes.json records their SHA256 values.
+No natural case was replayed after restores. Final helper-edit checks:
+`cargo fmt --all -- --check` exit0,0.937s;
+`cargo clippy --locked --offline --workspace --all-targets -- -D warnings`
+exit0,11.813s. No broad passing suite replay.
+
+### Retained artifacts, ownership and readiness
+
+All new artifacts: `D:/Temp/arx-preproof-remaining-cdb73694/`.
+Natural log SHA256 `0a1ee92f3c9064a3e7d81b60a282e77564f1a7b05b6bb141644484cf1c3ca5f1`.
+Manifest SHA256 `b7e8fd126f6639851cda4d2abfc129e9e0ea8e84d9e3f9eeb3d21046d28cde6b`; pins commands/results, all logs, baseline hashes,
+mutant runner, baseline backup and exact patches.
+
+Sequential exclusive reused CARGO_TARGET_DIR:
+`C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-04a56b7c-8088f9385f5b4a14/target/anchored-preproof`.
+The prior prepared mutant script was inspected, then copied/adapted externally
+with an exact assigned-cwd assertion and this round's successful natural-result
+precondition; no root-checkout import/execution. All Python text reads/writes
+explicit UTF-8, console summaries ASCII. All owned Python/Cargo/nextest processes
+completed. Logs/caches retained; no deletion/install/network/admin/native/VM,
+old Lab Manager/protected VM access, push/PR/status/comment/watch/link/merge or
+protection change. Only this evidence file is committed; PROGRESS unchanged.
+
+Bounded pure continuation is ready for coordinator integration and independent
+full source review. Independent exact-head review, normal five gates, hosted
+all-OS proof including first execution of anchored_preproof_single_voter,
+feature Windows<=660s and fresh exact-main green remain required. NO local
+Windows engine test ran. Fixture28/sample8/founder13/TLS14/atomic issuance1/
+newproof1 inventories remain unchanged; no hosted runtime acceptance inferred.
+M2 open / M3 unchecked; historical Sol3/3 and Opus0/2 unchanged;
+hardware **unverified on real hardware**.
