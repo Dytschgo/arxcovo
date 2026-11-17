@@ -127,3 +127,15 @@ No rerun after restoration. If compile/review requires changes, seek a new grant
 Proposed coordinator PROGRESS entry: Sol 6.1/high prepared exact unapplied F6
 observation patch/plan; static checks only; independent/root review pending;
 no new runtime evidence, counters/statuses unchanged. PROGRESS is unmodified.
+
+## Root hosted-candidate disposition - 2026-11-18
+
+Local one-run grant is consumed, with result retained separately. The same probe
+is now prepared as a formatted test-only diagnostic PR candidate. The earlier
+unapplied wording describes preparation history. No local behavior rerun is
+claimed. Independent review of actual final source must precede one normal PR
+push and its hosted first-attempt CI. No dispatch/rerun, injection, fix, assertion
+or timing change is granted. Passing hosted tests may hide success output under
+existing nextest defaults; no passing trace is promised. Failure output carries
+the bounded emission if F6 reaches it. This authorizes observation preparation,
+not merging diagnostics onto red main or clearing any milestone acceptance.

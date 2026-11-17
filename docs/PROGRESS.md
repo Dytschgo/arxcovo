@@ -3575,3 +3575,7 @@ Fresh independent Sol6.1 high disposition20870818: one sequential exact-source F
 ### Single F6 diagnostic grant - 2026-11-18
 
 Root accepted prepared patch206e4610 and independent Sol6.1 high safetyPASSb6a28f1a; authorized one compilation plus one exact natural F6 invocation under the preregistered plan. No repeats, injection, mechanical repair, budget/assertion/ownership change or hosted action. Execution task is active and completion tracked; temporary source must restore exactly after any outcome. This is diagnosis only, no exhausted fix attempt reset. Main09134085 remains RED; PR176 held; M2 open/M3 unchecked and hardware **unverified on real hardware**.
+
+### Hosted founder observation candidate - 2026-11-18
+
+Root Sol coordinator retained Sol6.1/high one-F6 result25aad48a: complete14-event trace, all phases Ok, final35.415ms, local source restored; hosted red unreproduced. Root prepared the same reviewed probe as a test-only hosted diagnostic candidate and ran cargo fmt only. Production macro expansions remain identity expressions. No test budget, assertion, retry, clock call, permit or owner behavior is changed. Independent actual-source review precedes one normal PR CI observation; no merge onto red main is authorized. This is no fix or stability credit. Main09134085 RED; PR176 held, counters unchanged; hardware **unverified on real hardware**.
