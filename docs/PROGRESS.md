@@ -34,7 +34,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #172 as `380c0215d662f75c083015658a9f6f261808f2ea`, reviewed head `27b412b0`, five gates and PASS comment 6949888622. First-main CI44097456394 attempt 1 green: 556 s wall / Windows 551 s; eleven codec/compatibility tests passed on every OS.
-- Current work: Sol 6.1 high proposed the atomic join-anchor apply fence in `2462bf33`. Root Sol medium reviewed it and corrected fresh signer-time preservation, one-voter test classification and origin-position checks. Independent Sol high contract recheck609fdd3f PASS. Root adopted the technical ADR0005 amendment and authorizes one bounded local source round; no implementation or runtime claim yet.
+- Current work: atomic-anchor kernel WIP8a7b9629 stopped at the first natural failure (17 pass / 1 fail / 40 unrun). Root identified and corrected a capacity-test voter-anchor mismatch in2e6b64e; the exact corrected case passed once. Production is unchanged by the correction. Remaining verification and independent source review are pending; no publication or engine acceptance.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3377,3 +3377,16 @@ the exact corrected contract locally; one verification round, at most two
 mechanical pre-behavior corrections, and four once-only targeted mutants. Stop
 on natural behavior failure. No local Windows engine run or publication yet.
 Existing repair counters/inventories and hardware limitations remain unchanged.
+
+### Atomic-anchor local stop and fixture disposition (2026-11-17)
+
+Sol 6.1 high implemented WIP8a7b9629, retained evidence92259a39, then stopped
+correctly on a capacity fixture whose code fingerprint did not match its voters.
+Root Sol medium correction2e6b64e derives the code from actual fixture state;
+the unchanged MembersFull/state/counter assertions pass in a single targeted
+run (0.023 s test, 47.719 s build/run). Full details and wrapper display error
+are in the root fixture disposition. Remaining40 cases, guard/sampler, inventory
+and four mutation probes may resume under the same stop rules, excluding the
+17 unchanged passes and the corrected target. No local Windows engine runs.
+Source review and hosted gates remain pending; no feature acceptance or repair
+credit. M2 open / M3 unchecked; hardware **unverified on real hardware**.
