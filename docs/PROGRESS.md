@@ -2,14 +2,16 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `380c0215d662f75c083015658a9f6f261808f2ea`
-after PR172. First push CI44097456394 attempt 1 passed all platforms in 556 s
-wall; Windows 551 s, Ubuntu 238 s, macOS 330 s. All eleven shared-membership
-codec, wrapper and compatibility tests passed on every OS. The original eight
-non-gating Windows sample cases passed in 30.906 s with no orphans; this grants
-no stability or re-enable credit. Windows fixture coverage (28 cases) remains
-unverified on hosted Windows and **unverified on real hardware**.
-M2 open / M3 unchecked; the codec extraction is not production joining.
+**Current main CI PENDING:** exact `59a665c9cda602d0b2939613656f2c98399f51f1`
+after PR173. First push CI44114182696 attempt 1 is running; no further feature
+merge or source build until it is green. Previous exact main380c0215 passed
+CI44097456394 in556s wall / Windows551s. PR173's five gates and independent
+exact-head review passed; Windows584s, tracked required92 tests passed on every
+OS, all28 fixtures passed on Ubuntu/macOS. New one-voter receipt/replay/revocation
+passed0.109s/0.282s/1.739s (Ubuntu/macOS/Windows), including exact-final restored
+malformed-code literal. PR sample8 passed with no orphans; no recovery credit.
+Windows fixture28 remains unverified on hosted Windows and **unverified on real hardware**.
+M2open/M3unchecked; internal atomic redemption does not close public join security.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -33,8 +35,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #172 as `380c0215d662f75c083015658a9f6f261808f2ea`, reviewed head `27b412b0`, five gates and PASS comment 6949888622. First-main CI44097456394 attempt 1 green: 556 s wall / Windows 551 s; eleven codec/compatibility tests passed on every OS.
-- Current work: atomic-anchor kernel source98b85305, evidenceedaf48fd, is locally verified with qualifications: original17 passes, corrected capacity1, remaining40 and new6; guard6/sampler60/final fmt/Clippy pass; four compiled targeted mutants killed and restored. Root closed the saved-inventory classifier mismatch without source changes: fixture28/founder13/TLS14/new one-voter1/sample8 retained. One restored malformed-code literal awaits exact-final-byte hosted execution. Independent Sol 6.1 high full source review c5ccb6c4 PASS, retained971d14bf. Preparing publication and exact-head review; hosted gates remain pending.
+- Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed headaa63bd5f, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 pending; feature work remains gated on its success.
+- Current work: root is actively waiting for PR173 exact-main CI. Atomic-anchor source and publication reviews passed; all92 tracked cases passed on every hosted OS and Unix fixtures28 passed. Next internal L2 contract may be prepared read-only while main runs; no production ingress or source build authorized.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3402,3 +3404,20 @@ qualified pending ordinary hosted CI. Root re-read live main380c0215 and its
 CI44097456394 attempt1 success before publication preparation. Next: exact-head
 review, five normal gates, all-OS one-voter proof and Windows job at most660s.
 No production ingress/custody/transport or hardware acceptance; M2open/M3unchecked.
+
+### PR173 merge checkpoint (2026-11-17)
+
+Root Sol 6.1 medium verified PR CI44110694916 attempt1 success, all five normal
+gates, independent exact-head PASS6952027124/status59150316915, fresh exact-main
+380c0215 green and unchanged strict/admin five-check protection. Windows584s
+meets660s feature rule. All92 tracked required cases PASS per OS; Ubuntu/macOS
+fixture28 PASS. Restored malformed-code literal's exact bytes now have hosted
+credit. Initial saved-log parser missed ANSI escapes; stripping them corrected
+the extraction without fetching logs again or rerunning tests. Raw log hashes
+and required-name evidence: D:/Temp/arx-pr173-hosted/pr-evidence.json.
+
+Pinned squash merged reviewedaa63bd5f as59a665c9; identical tree
+4aedac7dc9c66003da0b9cedc9e13854612feb47. No protection exception or rerun.
+PR watch removed; root is waiting directly on main CI44114182696. No green-main
+claim until that run finishes. M2open/M3unchecked, repair counters unchanged;
+hardware **unverified on real hardware**.
