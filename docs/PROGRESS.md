@@ -33,8 +33,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #167 as `fa8378889c05c6b87d191610e07e3bef68c2ebca`, reviewedheade649542, all5normalgates/OpusPASS6945935514. New proofPASSperOS, Windows541s. FirstmainCI44069931184 attempt1 passed in 472s wall, Windows467s.
-- Current work: L1 learner own-registry proof is implemented locally. Root corrected two deprecated API aliases after the builder Clippy stop; fmt/Clippy, all27 focused cases and guard4 now pass. M1-M3 runtime controls each failed once and source bytes were restored. Independent Opus review precedes publication; no production admission or promotion API is approved.
-- Blockers: L1 source/exact-head review and hosted normal gates, Windows <=660s, remain required. Main fa83788 is green. D1 bootstrap trust, D2 membership-operation handling and D3 promotion policy need a reviewed owner decision before production work. Windows fixture27 remains unverified; M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
+- Current work: L1 learner own-registry proof is implemented locally. Root corrected one deprecated API alias at two call sites after the builder Clippy stop; fmt/Clippy, all27 focused cases and guard4 now pass. M1-M3 runtime controls each failed once and source bytes were restored. Independent Opus source review passed (367db822); exact-head review and hosted checks precede merge. No production admission or promotion API is approved.
+- Blockers: L1 exact-head review and hosted normal gates, Windows <=660s, remain required. Main fa83788 is green. D1 bootstrap trust, D2 membership-operation handling and D3 promotion policy need a reviewed owner decision before production work. Windows fixture27 remains unverified; M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3265,3 +3265,7 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: L1 / Sol high / single builder / no children: local source prepared, one final verification round fmt0(0.766s), Clippy101(46.781s); stopped without fix/rerun. Deprecated learner_ids API is incompatible with warnings-as-errors. New runtime proof, focused27, guard and mutants remain unverified. No publication or hardware credit; last merged PR167 unchanged. See learner catch-up evidence for exact source and artifacts.
 
 - 2026-11-17: Root completed new-source L1 verification after mechanical learner_ids alias replacement: fmt/Clippy,27focusedPASS (newtest0.679s), guard4; M1/M2/M3 each runtime-failed as intended and restored identicalbytes. No natural engine red, rerun or policy/timing change. Independent review pending.
+
+### L1 source review and publication correction - 2026-11-17
+
+- Opus source PASS 367db822 at 16873ce1. Root corrected R1 stale headlines, R2 missing artifact hashes and R3 alias wording; code unchanged. Normal hosted gates and Windows <=660 s remain required. L2/promotion unapproved; hardware paths **unverified on real hardware**.

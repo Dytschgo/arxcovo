@@ -1,4 +1,8 @@
-# L1 learner catch-up: stopped local round
+# L1 learner catch-up: completed corrected-source verification
+
+Current status: local verification and independent Opus source review PASS. Hosted gates and exact-head review remain pending.
+
+## Historical builder stop
 
 2026-11-17. Sol high, single builder, no children. Prepared base
 `ac1465a5129a3c00215f91ebebfd1d024096b3d2`; source main
@@ -148,3 +152,14 @@ No publication, hosted rerun, fixture quarantine, production admission/promotion
 or D1-D3 policy change. L1 catch-up is the unauthenticated mem_net test double,
 not production TLS replication. M2 open/M3 unchecked; Sol3/3, Opus0/2 unchanged;
 hardware paths remain **unverified on real hardware**.
+
+## Source review and publication documentation correction
+
+Opus source PASS is retained in review commit 367db822. R1 status headlines
+are current; the original stop remains historical. R2 artifact hashes below
+were recomputed by root; R3 describes one deprecated alias at two call sites.
+No source changed after the reviewed and tested fa7bc545.
+
+- `mutants.py`: `6cd886bfc1d5375bf97420cabd00177a18eda2d00db36f5da50e30848b240058`.
+- `results.json`: `12ee3142d49bb79328e30faeb7139b95bf815c3faf0e88bb3ba4e5f99caa9adc`.
+- `mutants.json`: `28fbb5ccbb001e5dc6d2f3ae3e2ae61b2c233815c489d0875ba6dfc711eb91a0`.
