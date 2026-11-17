@@ -2,16 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
-`r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
-outside the eight quarantines. The cause is unknown. The owner-authorized local implementation quarantines all 24 Windows fixture tests
-(13 three_node and 11 issuance); independent Opus review remains required before push.
-This is an exception, not a fix. PR162 diagnostics remain
-held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
-under the active wall policy; 738 s charged remains uncredited because the run is red.
-ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
-cannot clear the budget gate. Main stays RED until a merged recovery's next exact-main CI
-is green. No hypothetical new-main green claim or budget exception is granted.
+**Current main GREEN:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164.
+CI [44051366327](https://github.com/Dytschgo/arxcovo/actions/runs/44051366327) passed
+on attempt 1 across Ubuntu, Windows and macOS in 608 s wall time, under 900 s.
+Ubuntu and macOS each passed all 24 fixture tests. The Windows job passed in
+603 s with those tests quarantined; its bounded eight-test diagnostic sample
+reported `skipped_budget` at `e_s=611`, so it earned no sample or Windows stability
+credit. The owner-authorized budget-only exception is consumed. The original five
+required checks, app bindings, strict mode and every other protection field were
+restored and reverified. The squash tree equals reviewed head `60f30c86`.
+Previous main `c612152` and its R5 failure / 1475 s budget remain historical.
+M3 work may resume under normal gates. Windows fixture coverage remains
+unverified on hosted Windows and **unverified on real hardware**; M2 is open and
+M3 unchecked. ADR0025 remains accepted but inactive; no bootstrap is authorized.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -33,11 +36,11 @@ PR145 was merged after the first red main run without accounting for it; the coo
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
 
 
-## Current state - 2026-11-16
+## Current state - 2026-11-17
 
-- Last merged: PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba`; its known exact-main CI43880904887 failed on Windows R5 and took 1475 s wall / 738 s charged (uncredited). This checkpoint uses the accepted contract's known evidence, with no new hosted query or credit.
-- Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
-- Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
+- Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
+- Current work: refresh the independently reviewed single-voter founder bootstrap onto green main `39b3dd7`, preserving the full Windows fixture quarantine. Sol high is integrating and verifying it locally; independent Opus delta review and normal hosted gates are required before publication and merge. PR165 records the restoration checkpoint.
+- Blockers: the prior red-main and budget deadlock are cleared by first-attempt main CI44051366327 (608 s). All five normal gates and exact-main health checks are restored; the owner-authorized exception is consumed. Windows coverage for all 24 three-node fixture tests remains unverified on hosted Windows and **unverified on real hardware**. PR159 remains held on its recorded failures; M2 remains open and M3 unchecked. Sol shared fixes remain 3/3 and Opus recovery fixes 0/2; the quarantine is not a fix. ADR0025 remains accepted but inactive, with no activation or further exception authorized.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3179,3 +3182,7 @@ separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 - 2026-11-17: Retained Opus bounded injected-latency follow-up4ac89a72. C1 Vote300/Append400/Apply600ms reproduced hosted I4 atissue_tests.rs237NotLeader(None) once; counterfactual0/0/600 passed once. Root verified raw-log hashes and exact failure/summary, inspected test-only hook patch, and confirmed crates unchanged from17a3fb2a. This demonstrates local latency-model sufficiency, not hosted cause, determinism or a fix. Hook removed; no source changes, hosted retry or fix attempt. Whole Windows three-node fixture quarantine scope clarification remains pending because I4 is outside the named three_node module. Main remainsRED, M2open/M3unchecked.
 
 - 2026-11-17: Independent Opus high review ca8ea420 passes full fixture quarantine source221077d0/head46df55b7, retained unchanged. Reviewer ran62Python tests and7extra guard probes; verified Rust bodies unchanged,24Windowsignored fixtures/pureunitunignored, original8sample matches and5expressionexclusions. Root also ran62Python tests and exactbodycomparison. Updating PR164 for fresh hosted checks and exact-head review; Ubuntu/mac must execute24. Main remainsRED, no budget exception authorized, no merge.
+
+- 2026-11-17: Owner-authorized one-use budget-only exception consumed by PR164 merge39b3dd7 at08:58:52Z, exactreviewedhead60f30c86. Original five requiredchecks/appbindingsstrict+allotherprotection restored andexactlyreadback. Review6933714689, platformCI43987282029 attempt1passed includingUbuntu/mac24each. MainCI44051366327 pending; no feature merge or rerun. Local action snapshots D:/Temp/arx-pr164-final-gates.
+
+- 2026-11-17: Root actively awaited mainCI44051366327 after t3_background_wait rejected this provider. All3platforms passed, wall608s. Verified Ubuntu/mac24fixturePASS each and full protection still identical. Windows sample skipped_budget e_s611; no sample/Windowsfixture acceptance. Main restored GREEN; resume M3 under normal gates. No rerun or further exception.
