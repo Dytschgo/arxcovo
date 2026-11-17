@@ -145,6 +145,7 @@ impl std::fmt::Display for StartError {
 }
 impl std::error::Error for StartError {}
 mod adapter;
+pub(in crate::cluster) mod anchor_query;
 pub(in crate::cluster) mod issue;
 
 use super::{
@@ -244,7 +245,7 @@ struct Owners {
 pub(super) struct ConsensusNode {
     id: u64,
     read_permits: Arc<Semaphore>,
-    issue_permits: Semaphore,
+    issue_permits: Arc<Semaphore>,
     #[cfg(test)]
     read_blocking: Arc<std::sync::atomic::AtomicUsize>,
     raft: Option<Engine>,
@@ -289,7 +290,7 @@ impl ConsensusNode {
             .map_err(|_| StartError::Fatal)?;
         Ok(Self {
             id: node,
-            issue_permits: Semaphore::new(issue::MAX_ISSUING),
+            issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
             read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
             #[cfg(test)]
             read_blocking: Arc::default(),

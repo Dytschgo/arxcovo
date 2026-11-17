@@ -1,6 +1,210 @@
 //! Canonical borrowed voter observation; not a pending-code authorization query.
 use super::*;
 
+/// Uniform refusal; eligibility details are deliberately not exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::cluster) struct AnchorQueryRefused;
+impl std::fmt::Display for AnchorQueryRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("anchor query refused")
+    }
+}
+impl EnrollmentState {
+    /// Pure local observation, without pruning or a freshness/unspent promise.
+    pub(in crate::cluster) fn pending_voters(
+        &self,
+        cluster: ClusterId,
+        code: CodeId,
+        now_ms: u64,
+        membership: Option<&Membership>,
+    ) -> Result<BoundVoters, AnchorQueryRefused> {
+        if !self.founded
+            || cluster != self.cluster
+            || now_ms > MAX_TIME_MS
+            || now_ms
+                .checked_add(SKEW_MS)
+                .is_none_or(|t| t < self.committed_ms)
+        {
+            return Err(AnchorQueryRefused);
+        }
+        let usable = now_ms
+            .max(self.committed_ms)
+            .checked_add(2 * SKEW_MS)
+            .ok_or(AnchorQueryRefused)?;
+        let record = self.records.get(&code).ok_or(AnchorQueryRefused)?;
+        if record.consumed.is_some() || usable >= record.expires_ms {
+            return Err(AnchorQueryRefused);
+        }
+        BoundVoters::observe(self, membership.ok_or(AnchorQueryRefused)?)
+            .map_err(|_| AnchorQueryRefused)
+    }
+}
+
+#[cfg(test)]
+mod pending_query_tables {
+    use super::*;
+    fn fixture() -> (EnrollmentState, Membership, JoinCode) {
+        let mut s = EnrollmentState::new([1; 16], NodeId::new(2).unwrap());
+        let m = Membership::new(vec![[1].into()], [(1, "a".into())].into()).unwrap();
+        s.founded = true;
+        s.members
+            .insert(NodeId::new(1).unwrap(), KeyDigest([1; 32]));
+        let code = JoinCode::generate(
+            [1; 16],
+            [2; 32],
+            BoundVoters::observe(&s, &m).unwrap().anchor([1; 16]),
+            |b| {
+                b.fill(9);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            s.apply(
+                &Command::Mint {
+                    cluster: [1; 16],
+                    actor: [3; 16],
+                    request: [4; 16],
+                    code: code.code_id(),
+                    verifier: code.verifier(),
+                    proposed_at_ms: 1_000_000,
+                },
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 0
+                },
+                Some(&m)
+            ),
+            Outcome::Minted { replay: false, .. }
+        ));
+        (s, m, code)
+    }
+    #[test]
+    fn pending_query_eligibility_and_immutability() {
+        let (s, m, code) = fixture();
+        let mut expected = vec![1];
+        expected.extend(1u64.to_be_bytes());
+        expected.extend([1; 32]);
+        for (cluster, id, now, ok) in [
+            ([1; 16], code.code_id(), 1_000_000, true),
+            ([2; 16], code.code_id(), 1_000_000, false),
+            ([1; 16], [0; 16], 1_000_000, false),
+            ([1; 16], code.code_id(), 970_000, true),
+            ([1; 16], code.code_id(), 969_999, false),
+            ([1; 16], code.code_id(), 1_839_999, true),
+            ([1; 16], code.code_id(), 1_840_000, false),
+            ([1; 16], code.code_id(), MAX_TIME_MS, false),
+            ([1; 16], code.code_id(), MAX_TIME_MS + 1, false),
+            ([1; 16], code.code_id(), u64::MAX, false),
+        ] {
+            let before = s.clone();
+            let result = s.pending_voters(cluster, id, now, Some(&m));
+            assert_eq!(result.is_ok(), ok);
+            if let Ok(v) = result {
+                assert_eq!(v.encode(), expected);
+            }
+            assert_eq!(s, before);
+        }
+        let mut consumed = s.clone();
+        assert!(matches!(
+            consumed.apply(
+                &Command::redeem(
+                    [1; 16],
+                    [5; 16],
+                    code.code_id(),
+                    &code.proof(),
+                    KeyDigest([2; 32]),
+                    code.anchor(),
+                    1_000_000
+                ),
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 1
+                },
+                Some(&m)
+            ),
+            Outcome::Enrolled(_)
+        ));
+        let before = consumed.clone();
+        assert!(
+            consumed
+                .pending_voters([1; 16], code.code_id(), 1_000_000, Some(&m))
+                .is_err()
+        );
+        assert_eq!(consumed, before);
+    }
+    #[test]
+    fn pending_query_membership_and_foundation() {
+        let (mut s, m, c) = fixture();
+        for membership in [
+            None,
+            Some(Membership::new(vec![[1].into(), [1].into()], [(1, "a".into())].into()).unwrap()),
+            Some(Membership::new(vec![[2].into()], [(2, "b".into())].into()).unwrap()),
+        ] {
+            let before = s.clone();
+            assert!(
+                s.pending_voters([1; 16], c.code_id(), 1_000_000, membership.as_ref())
+                    .is_err()
+            );
+            assert_eq!(s, before);
+        }
+        s.founded = false;
+        let before = s.clone();
+        assert!(
+            s.pending_voters([1; 16], c.code_id(), 1_000_000, Some(&m))
+                .is_err()
+        );
+        assert_eq!(s, before);
+    }
+    #[test]
+    fn pending_query_canonical_max_and_overflow() {
+        let (mut s, _, c) = fixture();
+        s.members = (1..=16)
+            .map(|i| (NodeId::new(i).unwrap(), KeyDigest([i as u8; 32])))
+            .collect();
+        let m = Membership::new(
+            vec![(1..=16).collect()],
+            (1..=16).map(|i| (i, format!("node{i}"))).collect(),
+        )
+        .unwrap();
+        let mut expected = vec![16];
+        for i in 1u64..=16 {
+            expected.extend(i.to_be_bytes());
+            expected.extend([i as u8; 32]);
+        }
+        assert_eq!(
+            s.pending_voters([1; 16], c.code_id(), 1_000_000, Some(&m))
+                .unwrap()
+                .encode(),
+            expected
+        );
+        let changed = Membership::new(
+            vec![[1].into()],
+            [(1, "changed".into()), (2, "learner".into())].into(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.pending_voters([1; 16], c.code_id(), 1_000_000, Some(&changed))
+                .unwrap()
+                .encode(),
+            expected[..41]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| if i == 0 { 1 } else { *b })
+                .collect::<Vec<_>>()
+        );
+        s.committed_ms = u64::MAX;
+        let before = s.clone();
+        assert!(
+            s.pending_voters([1; 16], c.code_id(), MAX_TIME_MS, Some(&m))
+                .is_err()
+        );
+        assert_eq!(s, before);
+    }
+}
+
 pub(in crate::cluster) struct BoundVoters(Vec<(NodeId, KeyDigest)>);
 impl BoundVoters {
     /// Both arguments must come from the same locked store image.
@@ -44,10 +248,6 @@ impl BoundVoters {
         }
         Ok(Self(pairs))
     }
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "internal probe has no production query caller")
-    )]
     pub(in crate::cluster) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(1 + 40 * self.0.len());
         bytes.push(self.0.len() as u8);
