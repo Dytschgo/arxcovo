@@ -2,13 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `a7200aa255d306969364068c4d19805bc8afcf1a`
-after PR169. First push CI44081103783 attempt 1 passed all platforms in
-694 s wall time, within the 900 s budget. Windows took689 s, above the660 s
-feature target; this run earns no feature headroom credit. PR169 itself passed
-Windows in612 s. The original8 sample skipped_budget at e_s697 and ran no tests.
-The L1 proof passed on every OS. Quarantined Windows fixture27 coverage remains
-unverified on hosted Windows and **unverified on real hardware**. M2open/M3unchecked.
+**Current main CI PENDING:** exact `76460c9706a6a15af7ea9fa037aee52876da3591`
+after PR170; first push CI44085879290 is running. No further merge until that
+exact run is green. Last verified green was a7200aa2, CI44081103783 attempt1,
+694 s wall / Windows689 s (no660 s feature headroom credit). PR170 itself
+passed all five normal gates and Windows484 s before merge. Root independently
+verified the reviewed head's tree equals the merge tree. No exception or rerun.
+Windows fixture27 remains unverified on hosted Windows and **unverified on real
+hardware**. M2open/M3unchecked.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -32,8 +33,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #169 as `a7200aa255d306969364068c4d19805bc8afcf1a`, reviewed head64cea955, all five gates and independent Sol PASS6947490221. PR Windows612s; first-main CI44081103783 attempt1 green694s wall, Windows689s (no <=660s feature headroom credit).
-- Current work: PR170 headbce90cff has independent Sol PASS6948230778; Ubuntu/macOS/budget/review green, Windows pending at last observation. Sol6.1 high resumed the test-only joint proof after the reviewed startup disposition. Local Windows work is compile/static/listing only; no production L2 source or engine runtime is authorized.
+- Last merged: PR #170 as `76460c9706a6a15af7ea9fa037aee52876da3591`, reviewed headbce90cff, all five normal gates/PASS6948230778, Windows484s. First-main CI44085879290 is pending; no further merge until exact main is green.
+- Current work: accepted membership choices and proof contracts are now on main via PR170. Sol6.1 high is implementing only the joint-recovery test/guard/classification under the reviewed cooperative startup deadline. Local Windows checks exclude engine execution; no production L2 implementation.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3303,3 +3304,8 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Independent Sol6.1 high exact-head review6948230778 passed the cooperative startup disposition on bce90cff. Root rechecked exact live maina7200aa2 and greenCI44081103783, then assigned Sol6.1 high the same narrow implementation. Original stopbd9db531 remains historical; no verification had run, and no check was rerun.
 - First runtime proof remains ordinary Ubuntu/macOS CI after independent source review. Every passing scenario must have verified cleanup; pending startup fails/unresolved, not a pass. New Windows classification28/sample8 is a target, not implemented evidence. Existing current inventory27 and exhausted fix budgets unchanged. Hardware paths **unverified on real hardware**.
+
+### PR170 merge / main pending - 2026-11-17
+
+- Root Sol medium verified exactbce90cff five green gates/PASS6948230778, Windows484s, freshgreenbasea7200aa2 and normal five-check strict protection before squash merge76460c97. The merge tree263a2926 equals reviewed head. No exception/protection change/rerun.
+- Exact main CI44085879290 is actively tracked through completion. Premerge/merge inputs are retained under D:/Temp/arx-pr170-hosted. No new main success is claimed before it finishes. Source builder runs in its assigned isolated worktree; counters and coverage claims remain unchanged.
