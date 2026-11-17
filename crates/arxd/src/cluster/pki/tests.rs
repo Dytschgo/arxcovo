@@ -233,3 +233,63 @@ fn signature_algorithm_parameters_are_refused() {
     let r = ProvenCsr::parse(&out);
     assert!(matches!(r, Err(CsrError::UnsupportedKey)));
 }
+
+#[test]
+fn founder_pure_identity_and_validity() {
+    use crate::cluster::consensus::issue::found::{FoundError, founder_init, generate_cluster_id};
+    assert_eq!(
+        generate_cluster_id(|b| {
+            b.fill(17);
+            Ok::<_, ()>(())
+        }),
+        Ok([17; 16])
+    );
+    assert_eq!(
+        generate_cluster_id(|_| Ok::<_, ()>(())),
+        Err(FoundError::Rng)
+    );
+    assert_eq!(generate_cluster_id(|_| Err(())), Err(FoundError::Rng));
+    assert_eq!(founder_init([17; 16]).first_free.get(), 2);
+    let now = 1_000_000;
+    let key = KeyPair::generate().unwrap();
+    let csr = ProvenCsr::parse(&request(&key)).unwrap();
+    let ticket = crate::cluster::consensus::issue::test_ticket(csr.digest());
+    for (seconds, fits) in [(30 * 86400 + 59, false), (30 * 86400 + 60, true)] {
+        let ca = ca::ClusterCa::ephemeral_with_validity([1; 16], now, seconds);
+        assert_eq!(ca.leaf_fits(now), fits);
+        let signed = ca.sign_leaf(&ticket, &csr, now);
+        if fits {
+            assert!(signed.is_ok());
+        } else {
+            assert_eq!(
+                signed,
+                Err(crate::cluster::consensus::issue::IssueError::CaExpiring)
+            );
+        }
+        assert_eq!(ca.fingerprint(), ca::fingerprint_of(ca.cert_der()));
+        assert_eq!(ca.fingerprint(), ca.fingerprint());
+        assert_ne!(
+            ca.fingerprint(),
+            ca::ClusterCa::ephemeral([1; 16], now).fingerprint()
+        );
+    }
+    for error in [
+        FoundError::Busy,
+        FoundError::Unavailable,
+        FoundError::NotFounder,
+        FoundError::AlreadyInitialized,
+        FoundError::FounderAllocation,
+        FoundError::Rng,
+        FoundError::BadCsr(CsrError::Malformed),
+        FoundError::Rejected(crate::cluster::enrollment::Reject::UnknownCode),
+        FoundError::WrongNode,
+        FoundError::StaleIssuer,
+        FoundError::Revoked,
+        FoundError::ClockRollback,
+        FoundError::CaExpiring,
+        FoundError::Sign,
+    ] {
+        assert!(!error.to_string().contains("private-marker"));
+        assert!(!error.to_string().is_empty());
+    }
+}
