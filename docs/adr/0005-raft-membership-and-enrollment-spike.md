@@ -41,3 +41,41 @@ Key rotation, certificate lifetime and retry limits remain open design decisions
 5. Inspect persisted state and bounded exported evidence for test secret markers. Test daemon/build-account key access separation independently from encryption-at-rest claims.
 
 Sources: [OpenRaft 0.10](https://docs.rs/openraft/0.10.0/openraft/), [membership source](https://docs.rs/crate/openraft/0.10.0/source/src/docs/cluster_control/dynamic-membership.md), [rustls verifier](https://docs.rs/rustls/0.23.46/rustls/server/struct.WebPkiClientVerifier.html), [rcgen CSR signing](https://docs.rs/rcgen/0.14.10/rcgen/struct.CertificateSigningRequestParams.html).
+
+### Owner decisions 2026-11-17: join trust, admission progress and initial voters
+
+The owner selected all three recommended options after the cross-provider
+membership decision review. These are adopted product/security requirements;
+production joining and promotion are not implemented or accepted by this record.
+The detailed proposal and remaining technical blockers are in
+[the membership decisions brief](../briefs/m3-membership-owner-decisions.md).
+
+- **Join trust.** The pasted join code fingerprints the current voting hosts and
+  their registered keys. The joiner checks that fingerprint and the endpoint's
+  possession of an anchored key before sending its redeem proof. A stolen CA
+  key alone must not impersonate the cluster. The proposed encoding adds 32
+  binary bytes, or 64 hexadecimal characters (206 to 270 text characters).
+  Voting-host changes can require a fresh code. Code consumption and refusal
+  during races must be reported honestly; no unconditional unspent guarantee.
+- **Admission and progress.** Self-admission uses a 5-second response budget,
+  then exposes catch-up progress separately. A timeout can mean Unknown and
+  must be resolved by checking/replaying the same operation, not declaring
+  failure or adding a second membership entry. No progress for 60 seconds
+  reports Stalled. Nothing is removed automatically.
+- **Initial voting policy.** Host 2 remains a non-voting learner until host 3
+  catches up; then the leader automatically promotes both into three voters
+  through a guarded membership change. With one or two hosts, writes depend
+  on host 1. Losing its disk can lose acknowledged writes not yet replicated.
+  This availability/durability tradeoff is accepted. There is no new owner
+  approval step during joining or promotion, and no voter cap is adopted here.
+
+The earlier paragraph leaving the host-2 policy unresolved is historical and
+superseded by this amendment. Production L2 remains blocked on address discovery,
+removal authorization, apply-time anchor fencing and interrupted joint-change
+recovery. The enrollment endpoint's pre-proof query/deny-by-default boundary,
+read ownership under cancellation, durable receipt and restart behavior also
+need a concrete reviewed implementation contract and negative controls.
+The suggested implementation details in the brief are not automatically adopted
+by these three selections. No timeout, retry, capacity, workflow, protection or
+quarantine changes are authorized by this record. M2 remains open, M3 unchecked;
+production transport and hardware paths are **unverified on real hardware**.
