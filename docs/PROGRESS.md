@@ -36,7 +36,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed head `aa63bd5f`, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 attempt 1 is green: 609 s wall / Windows604s.
-- Current work: pre-proof pure round stopped at query0 versus32 before proof-write assertions (3 pass / 1 fail / 22 unrun). Root test-helper correctionf0c13d23 requires both TLS directions idle; unchanged exact case passed once, production unchanged. Resume only22 unrun cases, final static checks and three mutants under the same stop rules; source review and hosted gates remain pending.
+- Current work: anchored pre-proof source9b6c7e06 plus test-driver correctionf0c13d23 has pass evidence for all26 selected pure cases across the stopped/corrected rounds. Remaining22 passed, all3 designated mutants compiled and failed actual received-proof32 versus0 assertions, exact baseline restored; final fmt/Clippy passed. Evidence240c913b retained. Independent full source review and hosted all-OS proof remain pending; no publication yet.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3463,3 +3463,17 @@ f0c13d23; exact failed case passed0.027s (build/run46.390s). No unchanged rerun,
 limit/retry change, product repair or partial-write assertion weakening. The
 22 unrun pure cases and three mutants may continue; final fmt/Clippy justified
 by helper edit. No local engine run/publication; repair counters unchanged.
+
+### Pre-proof local verification completed (2026-11-17)
+
+Sol 6.1 high continuation240c913b ran only22 previously unrun cases:22PASS.
+Original anchor3 and root corrected partial-write1 are reused, giving26 selected
+cases with pass evidence across rounds, not a fresh26-case run. M1/M2/M3 each
+compiled and failed the designated actual-server-proof assertion32 versus0;
+preproof.rs restored exactly after each (SHA256cda6d9b06610794f15bf377b22dd726eec7b530acea55fff99f61ba8b944e67e).
+Final fmt0.937s and locked/offline workspace all-target Clippy11.813s passed.
+Artifact manifest D:/Temp/arx-preproof-remaining-cdb73694/manifest.json pins raw
+logs/patches/restores. No source correction in continuation, no local engine
+case, no public action. Separate Sol source review is next; all hosted gates,
+first all-OS anchored proof and fresh-main/Windows660 requirements remain.
+M2 open / M3 unchecked; counters unchanged; hardware unverified on real hardware.
