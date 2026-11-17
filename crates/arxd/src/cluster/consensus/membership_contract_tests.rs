@@ -6,6 +6,7 @@ use crate::service::application::tests::private_temp;
 use openraft::ChangeMembers;
 use openraft::errors::{ChangeMembershipError, PreconditionFailed};
 use openraft::raft::{ClientWriteResponse, Precondition};
+use openraft::type_config::async_runtime::watch::WatchReceiver;
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 

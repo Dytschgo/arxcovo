@@ -208,3 +208,14 @@ All old test bodies, helpers, mem_net and adapters remain bytewise unchanged;
 PROGRESS is coordinator-owned and unchanged. Root disposition is required before
 any correction or additional verification. Preserve Sol3/3 and Opus0/2 unchanged,
 M2 open, M3 unchecked, and **unverified on real hardware**.
+
+## Root compiler disposition
+
+The builder stop above is retained. Root confirmed the compiler's three E0599
+sites call WatchReceiver::borrow_watched, and existing founder/issuance/TLS tests
+import the same trait from openraft::type_config::async_runtime::watch.
+Root added only that import in the new test file; no assertion, engine API,
+helper, timeout, scenario or production behavior changed. This is a mechanical
+compile correction, not a Windows engine repair or runtime rerun. The unfinished
+compile/static/listing verification may now proceed; no engine execution was
+or is permitted locally. Subsequent actual results will be appended separately.
