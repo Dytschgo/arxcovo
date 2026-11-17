@@ -91,16 +91,16 @@ parked future cannot produce J, report BLOCKED; do not replace step2 with append
 
 ## Deadline, platform classification and exact implementation allowlist
 
-Root accepted 75 s for this ONE test entry; retain that single absolute deadline across all seven sequential scenarios,
+Root sets a cooperative 75 s deadline for this ONE test entry; retain that absolute deadline across all seven sequential scenarios,
 pause-owner admission, startup, operations, observations and cleanup. This is NOT seven renewed 75 s allowances.
 Each operation retains its existing <=5 s cap, further limited by the shared deadline; no sleeps, retries or timing changes.
 Reserve the last5 s of remaining entry time for the active fixture's cleanup: end its body by deadline-minus5 s, collect
 failure as data, drop parked futures and all borrowed/store/engine clones, remove ALL router handles BEFORE shutdown.
 Join all three independent node shutdown futures concurrently within that remaining5 s; check each report/store release.
 Do cleanup before asserting the recorded result, including unexpected errors/timeouts; cleanup failure is a real test failure,
-never expected counterfactual credit. Admit no next fixture after failure or without cleanup reserve; no detached cleanup.
-Seven fixtures /21 engines maximum; never coexist across scenarios. Worst-case entry75 s, two hosted OS entries150 s
-aggregate; Windows zero engine execution. Serial operation caps sum beyond75 s: this shared budget deliberately fails
+never expected counterfactual credit. Admit no next fixture after failure or without cleanup reserve; no new detached cleanup task.
+Seven fixtures /21 engines maximum; never coexist across scenarios. Successful cases share75 s; Windows zero engine execution.
+This is a cooperative deadline, not a hard process-exit guarantee. Serial operation caps sum beyond75 s: the shared budget fails
 fast rather than promising all waits may saturate. Fit/headroom are UNMEASURED; cached whole-CI509 s is not Unix headroom.
 Root must accept this expanded work inside75 s before build; if it cannot fit, STOP, no added test/timeout or implicit budget.
 Existing CI<15 min, Windows<=660 s, Params/default timers, production5 s/1.5 s and shutdown bounds remain unchanged.
@@ -179,3 +179,17 @@ proof. Syntax alone cannot claim every broadcast is rejected. No new parser impl
 Actual work: cached source/docs inspection and brief whitespace/scope/line-count checks only; no build/tests/network/runtime.
 
 Root gate update: exact main a7200aa2 passed CI44081103783 attempt1,694s wall/Windows689s. The implementation allowlist and shared75s/equivalent-control plan are accepted; no Windows engine run or production change. Hosted feature head must independently meet660s Windows.
+
+## Startup/cancellation disposition (supersedes hard-ceiling failure-path claims)
+
+Builder evidence bd9db531 establishes a source-supported limitation, not a runtime red. Frozen start internally awaits
+spawn_blocking before returning release witnesses. Blocking work cannot be cancelled merely by timing out its caller.
+Keep startup pinned/owned through the cooperative cleanup reserve; if it returns a node, register and clean that node.
+If startup remains pending at the entry deadline, record StartupIncomplete and cleanup=unresolved, drop only the caller
+future and fail the test. Do not claim store release, successful cleanup or counterfactual credit, and start no next fixture.
+No new owner/reaper task or production startup change is permitted. Existing runtime-owned blocking work may outlive
+this failed test body; Tokio runtime teardown can exceed75 s. The unchanged CI job timeout/disposable runner teardown
+is the outer bound, not proof of graceful release. This limitation also applies to other uninterruptible blocking work.
+For every completed startup, router removal, concurrent shutdown and verified clean release remain mandatory for PASS.
+No successful scenario may use this exception. No deadline increase, retry, extra run or engine setting change is granted.
+Root explicitly revises its earlier hard-ceiling/guaranteed-all-failure-cleanup promise; independent review precedes resume.
