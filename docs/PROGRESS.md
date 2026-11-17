@@ -2,14 +2,13 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `3084f8e5ef87f9aaa11e12e780a5adfe62e87f6a`
-after PR168. First push CI44077792712 attempt 1 passed all platforms in
-509 s wall time; Windows 505 s <=660 s. Finished logs confirm the learner
-own-registry proof PASS on every OS. PR168 merged normally from reviewed
-head b851d14 with all five gates and independent PASS6947032865.
-Catch-up is still the unauthenticated in-memory test transport, not production
-replication. Windows fixture27 remains unverified on hosted Windows and
-**unverified on real hardware**. M2 open/M3 unchecked.
+**Current main GREEN:** exact `a7200aa255d306969364068c4d19805bc8afcf1a`
+after PR169. First push CI44081103783 attempt 1 passed all platforms in
+694 s wall time, within the 900 s budget. Windows took689 s, above the660 s
+feature target; this run earns no feature headroom credit. PR169 itself passed
+Windows in612 s. The original8 sample skipped_budget at e_s697 and ran no tests.
+The L1 proof passed on every OS. Quarantined Windows fixture27 coverage remains
+unverified on hosted Windows and **unverified on real hardware**. M2open/M3unchecked.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -33,8 +32,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #168 as `3084f8e5ef87f9aaa11e12e780a5adfe62e87f6a`, reviewed head b851d14, all five normal gates and PASS6947032865. PR Windows601s; first-main CI44077792712 attempt1 passed in 509s wall, Windows505s.
-- Current work: PR169 owner Sol6.1 routing has independent exact-head PASS6947490221 and awaits platform checks. Owner D1/D2/D3 decisions and the bounded L2 proposal are retained locally (25bef7a6), with separate-author Sol planning review. Sol6.1 high is preparing a narrower test-only joint-membership interruption/recovery contract; no production source has started.
+- Last merged: PR #169 as `a7200aa255d306969364068c4d19805bc8afcf1a`, reviewed head64cea955, all five gates and independent Sol PASS6947490221. PR Windows612s; first-main CI44081103783 attempt1 green694s wall, Windows689s (no <=660s feature headroom credit).
+- Current work: owner D1/D2/D3 decisions and reviewed L2 planning contracts are ready for documentation publication. Root accepted a new test-only joint-membership interruption/recovery proof with seven real-engine scenarios under one75s deadline; local Windows work is compile/static/listing only. No production admission has started.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3288,3 +3287,9 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Sol6.1 high proposal9b3cfeab specifies bounded discovery, pre-proof read ownership, deterministic apply fencing/original redemption receipt, self-admission and guarded joint flatten. Root Sol medium planning review retains custody, authenticated transport/control identity and clock policy as production blockers. No new material owner choice identified; exact encoding and APIs remain proposed.
 - Owner acceptance reviewed in77a7fa81 is retained. The next bounded brief must prove a real interrupted API future rather than crediting a manually constructed joint state as cancellation. Windows multi-voter classification and inventory guards precede any runtime action. No engine run/build/test occurred for this planning checkpoint, and exhausted counters are unchanged.
+
+### PR169 main and joint-proof contract checkpoint - 2026-11-17
+
+- Root Sol medium merged reviewed64cea955 normally as a7200aa2 after all five exact-head gates, PR Windows612s and fresh green base3084f8e5. No exception, protection change or rerun. Main44081103783 attempt1 passed694s wall; Windows689s, Ubuntu178s, macOS298s. Windows sample skipped_budget at e_s697, no child/test execution. Feature PR Windows<=660s remains a separate requirement.
+- Retained main log SHA256 under D:/Temp/arx-pr169-hosted: Windows `bdef1771cc15a50c0f001e22ef6beb336145e6160212302dd7b87b34d3103f5e`; Ubuntu `b5b0178ad9233abeee8d4b5e7514abdbd3fb8436af903b86cd27feb6c311e76a`; macOS `d9d9e05461e1a25230f93db174557d00d698093d936b6086a48f87a71c330871`. JSON preserves inputs; learner proof PASS eachOS.
+- Sol6.1 high joint-proof brief fb4ddb58 revised0e1febcd passes root Sol medium planning recheck3081ccb: source-supported parked-future seam, seven omission-equivalent real-engine controls, one75s ceiling including cleanup. These replace compiled source-mutation evidence and must be labelled accordingly. Root permits only the stated test/guard/binding/docs implementation; Windows runtime remains excluded and new classification is28/sample8. No production L2 authority or exhausted-budget reset.

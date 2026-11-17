@@ -1,6 +1,6 @@
 # M3 guarded joint-membership recovery proof
 
-Proposal only; Sol 6.1 high, 2026-11-17; no children. Root review required before implementation.
+Test-only implementation contract accepted by root Sol in3081ccb; Sol6.1 high design, 2026-11-17. Runtime proof remains pending.
 Dependent base / inspected HEAD `293791ad2aa8842d2931009574832ef187d0785b`; coordinator bookkeeping preserved.
 Read with [L2 proposal](m3-production-learner-admission.md), [root review](../reviews/m3-membership-decisions-root-review.md),
 [ADR 0005](../adr/0005-raft-membership-and-enrollment-spike.md) and [ADR 0024](../adr/0024-windows-three-node-test-quarantine.md).
@@ -177,3 +177,5 @@ that build. B1-B5, authenticated transport, owner removal role, M2 key custody a
 The L2 parser can recognize IPv4 limited broadcast; subnet-directed broadcast needs subnet context and is outside this
 proof. Syntax alone cannot claim every broadcast is rejected. No new parser implementation or owner decision here.
 Actual work: cached source/docs inspection and brief whitespace/scope/line-count checks only; no build/tests/network/runtime.
+
+Root gate update: exact main a7200aa2 passed CI44081103783 attempt1,694s wall/Windows689s. The implementation allowlist and shared75s/equivalent-control plan are accepted; no Windows engine run or production change. Hosted feature head must independently meet660s Windows.
