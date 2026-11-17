@@ -1,0 +1,261 @@
+# ADR0025 local preparation evidence
+
+2026-11-16, implementation sub-agent, gpt-6.1-sol high. Base
+`d6dc883f68c1605e1a52c83ac4201159dcad4a84`; source HEAD
+`874dc9ec79de6d10e5489ba7485832463fc2efd3` (implementation `51ccbb8` plus
+completion-metadata correction `874dc9e`). This evidence and administration/progress
+updates are a separate documentation commit. Root review then independent Opus high
+source/security review remain pending before publication. No independent review is
+claimed here. ADR remains Proposed, unaccepted and inactive.
+
+## Commands and results
+
+Node `v24.18.0`, Windows PowerShell host. All entrypoint executions used the synthetic
+Node VM harness; its child-process stub runs Node with JSON on stdin, never gh. FS
+record writes are intercepted in memory. No live policy entrypoint or live --record ran.
+
+```text
+node --test scripts/policy.test.mjs scripts/evaluate-budget.test.mjs scripts/ci-budget.test.mjs scripts/ci-workflow.test.mjs
+```
+
+Initial focused result: 39/39 pass, exit0 (5401.7895ms). One complete Node script-suite
+run followed test expansion:
+
+```text
+node --test scripts/*.test.mjs
+```
+
+44/44 pass, exit0 (5180.6018ms). This full run precedes the two final validation
+corrections; it is not claimed as a complete-suite run on final source. Correction1
+requires a positive safe repository id rather than letting missing ids compare equal.
+Its focused rerun passed39/39 (5034.482ms). Correction2 lets a calculable wall
+measurement reach run-invalid on a completion-status defect. Uncalculable/negative
+wall duration still fails through the existing duration validation. Its final focused
+rerun used the exact first command above:40/40 pass, exit0 (5580.1889ms). Two
+implementation corrections used; no further corrections attempted. The five unchanged
+auto-merge unit tests passed in the full run; no live merge was performed.
+
+```text
+git diff --check
+```
+
+Exit0. CRLF normalization warnings occurred for files rewritten through Python;
+Git diffs contain no unrelated line-ending changes. Python assertions compared
+base/current git blobs for workflows, protection, author allowlist and history;
+all equal. ADR comparison excludes only its Status line; all remaining lines equal.
+PROGRESS before/after its Current state section is equal. No other ADR text changed.
+
+## Contract coverage
+
+1. Geometry: serial/interleaved gaps, concurrent waits counted once, pending intervals
+   overlapping execution, prefix/tail/no-pending idle, coincident boundaries and zero
+   wall/execution. Sweep uses half-open segments; no longest-queue subtraction.
+2. Slow execution:600s idle queue plus1000s execution still fails;900s charged boundary passes.
+3. Defects: each run and job validation clause, unsafe/duplicate ids, exact platform
+   inventory including a duplicate with matching labels, counts2/4/101 and wrong lengths,
+   strict/invalid/missing timestamps, all ordering/range inequalities, head/repo/attempt,
+   event/path/status. Defects produce null metrics and wall gate, denying ci-speed.
+4. Failed runs/jobs: complete failures compute but withhold credit; failed800s passes
+   the old wall rule and failed1475s fails. Cancelled incomplete jobs are invalid.
+5. ci-speed: strict charged AND longest execution reductions; failed baseline denied
+   even with a faster green valid candidate. No queue-variance speedup claim. Existing
+   live-label reread, changed head, same-head/repo selection and actual first attempt
+   regressions retained. Synthetic latest listings show attempt2 while /attempts/1
+   supplies the measured data; actual returned attempt2 is rejected.
+6. Exact actual fixtures reproduce the table below and reject PR162's speed claim.
+7. Status marker,<=140 untruncated descriptions,1100 idle dedupe evaluations; real
+   execFileSync8MiB bounds exercised on synthetic workflow and jobs JSON. Main/candidate
+   workflow overflow and jobs overflow fail closed. Missing jobs transport fails closed.
+   VM asserts12 calls for a valid speed evaluation, exact attempt1 paths, one jobs page,
+   no page2,<=2 jobs calls, and refused partial inventories.
+8. Synthetic record appends one charged-v1 record after the30 old records, preserving
+   old record bytes and values; duplicate id causes no write. Actual repository history
+   is untouched. Trusted workflow structural pins require one unconditional verify job,
+   exact three-platform matrix, no needs/if/environment/services/job concurrency, one
+   top-level concurrency and12min timeout. Existing step ordering, smoke checks and
+   action pins remain pinned. Apple Silicon macos-latest is unchanged.
+
+## Intentional runtime mutants
+
+Executed this Python harness twice (the second on final policy blob). Every mutant
+compiled under node --check and failed with ERR_ASSERTION at runtime, exit1. No
+syntax/compiler-only failure is counted. The source bytes were restored in finally.
+
+```python
+from pathlib import Path
+import subprocess, hashlib
+p=Path('scripts/policy.mjs'); original=p.read_bytes(); source=original.decode()
+mutants=[
+ ('queue-overlap',' && !intervals.some(({ s, e }) => s <= t && t < e)','','geometry'),
+ ('credit-failed',"run.conclusion === 'success' && payload.jobs.every(job => job.conclusion === 'success') ?",'true ?','failed run or any'),
+ ('platform-inventory','!names.delete(job.name)','false','every metadata defect'),
+ ('attempt2','run.run_attempt !== 1','false','every metadata defect'),
+ ('ci-speed-fakequeue',' && candidate.longestJobSeconds < latest.longestJobSeconds','','ci-speed rejects queue-only')]
+try:
+ for name,old,new,pattern in mutants:
+  assert old in source
+  p.write_text(source.replace(old,new),encoding='utf8')
+  check=subprocess.run(['node','--check',str(p)],capture_output=True,text=True)
+  assert check.returncode==0,check.stderr
+  result=subprocess.run(['node','--test','--test-name-pattern='+pattern,'scripts/policy.test.mjs'],capture_output=True,text=True)
+  assert result.returncode!=0 and 'ERR_ASSERTION' in result.stdout,result.stdout+result.stderr
+  print(name+': compiled JS; runtime ERR_ASSERTION red (exit '+str(result.returncode)+')')
+finally: p.write_bytes(original)
+assert p.read_bytes()==original
+print('restored SHA256 '+hashlib.sha256(p.read_bytes()).hexdigest())
+```
+
+Final restored policy SHA256:
+`6e9911bfaf8c4076583168d896c85b999e0c15593b5cfab3ff98688d0e192480`.
+The later completion-status correction touches only the entrypoint and its VM test;
+the mutated policy blob remains identical.
+
+## Fixture provenance
+
+Read-only public GitHub API,2026-11-16. The following exact gh argument arrays
+were executed via Node execFileSync with encoding:utf8,maxBuffer:8388608, once to
+inspect allowlisted fields and once to write the sanitized fixture (8 GETs total):
+
+```text
+gh api repos/Dytschgo/arxcovo/actions/runs/43880904887/attempts/1
+gh api repos/Dytschgo/arxcovo/actions/runs/43880904887/attempts/1/jobs?per_page=100
+gh api repos/Dytschgo/arxcovo/actions/runs/43889323450/attempts/1
+gh api repos/Dytschgo/arxcovo/actions/runs/43889323450/attempts/1/jobs?per_page=100
+```
+
+Only run{id,head_sha,head_repository.id,run_attempt,path,event,head_branch,status,
+conclusion,run_started_at,updated_at} and jobs{total_count,jobs[{id,run_id,run_attempt,
+head_sha,name,labels,status,conclusion,created_at,started_at,completed_at}]} were retained
+or printed. No logs, annotations, steps, private fields, raw payloads, headers or
+credentials were stored in source/evidence. The fixture is public metadata, not
+independent hosted test execution of this amendment.
+
+| Attempt1 run | Wall | Q | Charged | Longest job | Credit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| main43880904887 |1475|737|738|372|withheld:not-green|
+| PR16243889323450 |1311|434|877|585|applied|
+
+Main remains RED and gates on1475s wall. PR162 has four green gates but budget failure;
+it cannot claim ci-speed against failed main. Neither record grants merge authority.
+
+## Pins
+
+Git blobs on source HEAD:
+
+| Path | Blob |
+| --- | --- |
+| scripts/policy.mjs |4b52a44df0b24cfa518d896d58ed18c1c2487a4d|
+| scripts/evaluate-budget.mjs |6d312a8050d9ace7269677ab86565a5f0c7e0f1d|
+| scripts/ci-budget.mjs |b315b25d51663ea13ce9f6191d129553012bcea1|
+| scripts/fixtures/ci-queue-credit-runs.mjs |70d60463057a9426e82801b4ca3167f9b1235e5c|
+| .github/workflows/ci.yml (unchanged) |0c7af38b33f6c127029d8312a0c9ecd92f6361da|
+| .github/workflows/policy.yml (unchanged) |4925b7f12bdebcd624024e64af5ce9e000743b67|
+| .github/workflows/policy-signal.yml (unchanged) |1898f78e1f4f529ab575af6d5a1db3961631b6ea|
+| .github/main-protection.json (unchanged) |575540057aee74d979b86ff6c086bf8ae465dd09|
+| .github/agent-authors.json (unchanged) |de7a8c79940b870926acec71eeeb7707e2f09886|
+| docs/ci-duration-history.json (unchanged) |23f63dfb74048551b12bf7df900f0bcccaa1d8cd|
+
+Fixture SHA256:`9ef25a64cb17f191ebc03a39adba1e1e2aaba1bb3412a25a7c4d9c907489622e`.
+History SHA256:`3b9d9d5494c8aea0ef715348f7e407b1b8cd50016a2c80d8e2776b90ade82e51`.
+
+## Unrun and remaining boundary
+
+No UI/Cargo/native/VM/hardware build or execution, installs, cache deletion, dispatch,
+rerun, live recording/policy/status/label/protection/admin/bootstrap, watch, push,
+PR, merge or child agent. M2 stays open, M3 unchecked; hardware paths remain
+**unverified on real hardware**. Required contexts, App pins, Actions permissions,
+source boundaries, architecture and900s threshold are unchanged.
+
+Root review then independent Opus high exact-source/security review must precede
+publication. Platform checks for this source are unrun. Activation requires separate
+acceptance of the KICKOFF wall-clock deviation and a concrete bounded bootstrap route;
+preparation grants neither. ADR0022's historical exception is exhausted. No claim is
+made that the current main health, PR162 deadlock or R5 is fixed.
+
+
+## Root completed-attempt validation reproduction
+
+Root Sol static review flags measure() passing a forced completed status into
+existing duration(). A synthetic VM probe uses the unchanged incomplete-main
+scenario at800s rather than1200s. It executes the actual proposed entrypoint,
+with gh and record writes stubbed; no live policy or external write occurs.
+Result: error=null, pending then success, description wall800s/charged n/a
+(run-invalid)/budget satisfied. Thus the slow1200s test alone hides a weakened
+existing completed-baseline requirement. The source remains pinned874dc9e for
+independent Opus review, with this open question already in its assignment.
+
+The temporary harness first failed because its relocated history-fixture URL
+still resolved relative to D:/Temp; no policy result was produced. Correcting
+both module and history URLs enabled the synthetic reproduction. Repository
+source, fixtures and history remain unchanged by the probe. Temporary files:
+D:/Temp/arx-ci-fast-incomplete-probe.mjs and its JSON output. Output SHA-256:
+9cd32bb4edcf48037c280f836eb9bd9b5ba6b6c2acded3fe9a3f377738531033.
+No queue metric or gate activation is accepted from this reproduction.
+
+
+## Root S1 correction and A2 test closure
+
+Independent Opus95ecbce confirms S1: forcing completed status weakens the old
+baseline validation. Root restores duration(run), updates the1200s unfinished
+scenario to require the original exception, and adds800s unfinished and record
+scenarios. All three unfinished-attempt tests fail with runtime assertions on
+the old forced-completion code before correction. The record case writes nothing.
+ADR fallback wording is clarified: optional credit metadata may fall back to
+wall time; original completion/time validation still runs first and can throw.
+
+Root also closes advisory A2 with a success run containing one failed job and
+400s charged versus1000s wall. It receives no credit and the budget rejects it.
+Deleting the credit-marker condition compiles under node --check then fails this
+runtime assertion; restored source passes the focused test. No unrelated source
+change, live policy call or status action occurred. Final full Node suite48/48
+passes in8165.94ms; diff check passes. No UI/Cargo/native or hosted run is credited.
+This is one narrow independent-review correction round, not a CI-speed change.
+
+Root log hashes:
+
+- arx-ci-completion-red.log: `24365ccff78bb2ebe479725e474724584116be57aa0dc6880a9cd14f0d9ebc62`.
+- arx-ci-completion-green.log: `aeeae4eedc8574e8aebf29c41361f785dc89fed034af8d8897fcc8c613ce06d3`.
+- arx-ci-credit-marker-mutant.log: `c565c725bc9703d75ffde87e530a8ccd1e7c312215dbae401c2b274da4d46eb6`.
+
+Fresh Opus recheck remains required. ADR0025 stays Proposed and inactive; no
+bootstrap, KICKOFF deviation, protection change or merge has been authorized.
+
+
+## Coordinator publication checkpoint
+
+Independent Opus recheckdfd6ceb closes S1/A2 at sourcef5b3361. It actually ran
+48/48Node tests in8058.70ms using synthetic API fixtures only. Root retains the
+full review and recheck. Publication bookkeeping adds no script, fixture, workflow,
+protection or history change. A read-only protection snapshot confirms the five
+required contexts and original app bindings; no settings were modified.
+The administration guide now states the concrete proposed one-use activation
+route. It remains unauthorized and requires separate acceptance of the KICKOFF
+wall-clock deviation after exact-head review and platform results exist.
+
+
+## PR163 first hosted run and lint correction
+
+PR163 d635d88 CI43903996401 Ubuntujob133427808041 passed567/567 Rust tests,
+22skipped, then npm lint failed at policy.test.mjs76/97: structuredClone was
+not declared in the configured ESLint globals. This is introduced by the new
+test file and is deterministic; no original S8 or cluster failure is attributed.
+Root qualifies both calls as globalThis.structuredClone, preserving behavior
+and leaving lint configuration unchanged. Actual root npm run lint (tsc+eslint)
+passes and full Node48/48 passes in7483.71ms on the corrected test source.
+No dependency install, workflow change, runtime-policy or history change occurs.
+The first raw-log extraction hit a local stdout encoding error; reading the
+saved UTF-8 log then isolated the actual hosted lint failure above.
+
+Independent publication PASS6921895097/status59044541434 on d635d88 remains
+historical. Its SA1/SA2 activation advisories are incorporated: check for zero
+armed auto-merges before removing a gate and again immediately before merge;
+write all app bindings explicitly, with-1 for the original null binding.
+The official GitHub API documents-1 semantics. Its exact readback representation
+remains unverified until a separately authorized operation. No auto-merge state,
+protection or status was modified by this documentation change. New-head source
+review and platform gates are required; old-head passes do not carry forward.
+
+Root log hashes:
+
+- arx-ci-queue-lint-fixed.log: `3806a30a0c4866a8d8cfc5bfc34cb421ece106e0efef98646b4d780ce0d1095f`.
+- arx-ci-queue-lint-node.log: `6a8ceaaee1e911795d0fa9f570173780cbec1b8647c918ff29a78d8032827405`.
