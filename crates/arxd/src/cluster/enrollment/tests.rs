@@ -668,9 +668,19 @@ fn registry_capacity_rejection_keeps_code_and_counter() {
         s.apply_test(&found((1..=16).map(|n| (node(n), key(n as u8))).collect())),
         Outcome::Founded { replay: false }
     );
-    s.apply_test(&mint(&code(80), 80, 0));
+    let c = JoinCode::generate(
+        CLUSTER,
+        [2; 32],
+        s.voter_anchor(&anchor_membership()).unwrap(),
+        |bytes: &mut [u8]| {
+            bytes.fill(80);
+            Ok::<_, ()>(())
+        },
+    )
+    .unwrap();
+    s.apply_test(&mint(&c, 80, 0));
     let before = s.clone();
-    reject(&mut s, redeem(&code(80), 80, 80, 0), Reject::MembersFull);
+    reject(&mut s, redeem(&c, 80, 80, 0), Reject::MembersFull);
     assert_eq!(s, before);
     s.apply_test(&Command::Remove {
         cluster: CLUSTER,
@@ -678,7 +688,7 @@ fn registry_capacity_rejection_keeps_code_and_counter() {
         proposed_at_ms: 0,
     });
     assert_eq!(
-        grant(s.apply_test(&redeem(&code(80), 80, 80, 0))).node(),
+        grant(s.apply_test(&redeem(&c, 80, 80, 0))).node(),
         node(17)
     );
 }
