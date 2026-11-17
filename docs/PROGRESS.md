@@ -2,18 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164,
-CI [44051366327](https://github.com/Dytschgo/arxcovo/actions/runs/44051366327) passed
-on attempt1 across Ubuntu, Windows and macOS in608s wall (under900s). Ubuntu/macOS
-actually passed all24fixturetests. Windows job603s passed with24fixturetests
-quarantined; the bounded8test diagnostic sample skipped_budget at e_s611, so no
-sample execution or Windows stability credit. The owner-authorized budget-only
-exception is consumed; original five requiredchecks/appbindings/strict and all
-other protection fields were restored and reverified. Exact squash tree equals
-reviewedhead60f30c86. Previousc612152R5red/1475s is historical, not fixed.
-M3 work may resume under normal gates. Windows fixture coverage remains
-unverified on hosted Windows and **unverified on real hardware**; M2 open/M3 unchecked.
-ADR0025 remains accepted but inactive; no bootstrap exception is authorized.
+**Latest verified main GREEN:** `39b3dd73052abd64c1c3d3042e62f080469f1597`,
+CI44051366327 attempt 1 passed in 608 s. PR165 subsequently merged as
+`021a89d5f92ace75eaae892513cb8b4efcdc12c5` through all five normal gates, with
+independent Opus PASS6943864969. Its first exact-main CI44055365214 is running;
+no feature publication or merge until that run is green. PR165 changes docs only.
+The consumed PR164 budget exception and full protection restoration remain recorded.
+Windows coverage of 24 fixture tests is unverified on hosted Windows and
+**unverified on real hardware**; Ubuntu/macOS run all 24. M2 open, M3 unchecked.
+ADR0025 remains accepted but inactive; no ADR0025 bootstrap is authorized.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -37,7 +34,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
+- Last merged: PR #165 as `021a89d5f92ace75eaae892513cb8b4efcdc12c5` at 2026-11-17T09:24:56Z, exact head b75006d7, independent Opus PASS6943864969 and all five normal gates. Squash tree equals reviewed head. Pre-merge main39b3dd7 CI44051366327 green; new main CI44055365214 pending.
 - Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
 - Blockers: integration delta review passed (Opus high, 13a12ee5); exact-head publication review, fresh hosted five gates and measured Windows job at or below 660 s remain required. PR165 is awaiting its remaining platform gate before a documentation refresh. Main39b3dd7 CI44051366327 is green in 608 s. Sol shared fixes3/3 and Opus0/2 unchanged; M2 open/M3 unchecked. Windows fixture and multi-host/custody/transport paths remain **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
@@ -3228,3 +3225,5 @@ Last merged labels remain history. M2open/M3unchecked, Sol3/3/Opus0/2 unchanged,
 hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-integration.md).
 
 - 2026-11-17: Retained Opus high founder integration PASS13a12ee5. Root confirmed six feature blobs equal reviewedc45089f, strict UTF-8 and guard3pass. All main guard functions remain unchanged; only reviewed founder seal/binding checks added. Source remains b8aadf6, unpublished pending PR165 parent checkpoint and normal hosted gates.
+
+- 2026-11-17: Merged main021a89d5 into founder branch; only PROGRESS conflicted. Kept main health/correction wording and founder status/history. All six feature blobs and guard remain unchanged from reviewed integration13a12ee5. Exact-main CI44055365214 pending before publication.
