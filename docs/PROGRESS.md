@@ -2,14 +2,13 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `67cc62d538905f3d2ed89a7676d1a71b9f4617ff`
-after PR159. First push CI44064366449 attempt 1 is running. Pre-merge mainc40c547
-CI44058803351 passed in 632 s. PR159 had five normal gates, independent Opus
-PASS6945132966, Windows465s <=660s, and all27fixture cases plus everyTLS test
-passing on Ubuntu/macOS. Ubuntu S8 passed one new-source observation, not a fix.
-Squash tree equals reviewedhead2c4f973a. No dependent merge until exact newmain
-is green. M2 open/M3 unchecked; Windows fixture coverage remains unverified
-on hosted Windows and **unverified on real hardware**.
+**Current main GREEN:** exact `67cc62d538905f3d2ed89a7676d1a71b9f4617ff`
+after PR159. First push CI44064366449 attempt 1 passed all platforms in
+610 s wall time; Windows606s <=660s. Ubuntu/macOS passed all27fixture
+cases and everyTLS test; Windows required12TLS passed. UbuntuS8 passed, one
+observation rather than a fix. All five normal gates and full protection remain
+active. Windows fixture coverage is unverified on hosted Windows and **unverified
+on real hardware**. M2 open/M3 unchecked; ADR0025 remains inactive.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI remains pending.
 
@@ -33,9 +32,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #159 as `67cc62d538905f3d2ed89a7676d1a71b9f4617ff`, exacthead2c4f973a, all five normal gates and Opus PASS6945132966. Windows465s; Ubuntu/mac all27fixtures and everyTLS test PASS, UbuntuS8 PASS. New main CI44064366449 pending.
-- Current work: publish the reviewed PR159 TLS verifier integration onto founder main c40c547. Independent Opus delta PASS75632148 confirms reviewed TLS bytes, exact three fixture attributes, the full 27-case Windows guard and unchanged sample8. Local cluster151, guard3/sampler60, compile/fmt/Clippy and inventory checks passed. Exact-head publication review and fresh hosted gates follow.
-- Blockers: PR159 needs one updated-source Ubuntu S8 observation, all 27 fixture tests and every TLS test actually passing on Ubuntu/macOS, all five exact-head gates and Windows job <=660 s. Main c40c547 CI44058803351 is green in 632 s. Owner whole-fixture scope releases only the quarantined Windows-test eligibility hold; no stability, budget, timing or retry waiver. M2 open/M3 unchecked; Sol3/3 and Opus0/2 unchanged.
+- Last merged: PR #159 as `67cc62d538905f3d2ed89a7676d1a71b9f4617ff`, exacthead2c4f973a, all five normal gates and Opus PASS6945132966. Windows465s; Ubuntu/mac all27fixtures and everyTLS test PASS, UbuntuS8 PASS. First main CI44064366449 attempt1 passed in 610s wall, Windows606s.
+- Current work: founder and TLS verifier are merged with exact main67cc62d green. Implement the accepted F2 founder/joiner real-identity TLS proof locally, using one single-voter founder and its committed registry view for both verifiers. No production transport, joiner replica or custody change; independent Opus review and normal gates required.
+- Blockers: F2 local verification and independent review precede publication; hosted gates and Windows <=660 s precede merge. Production custody, transport, learner catch-up and freshness policy are separate. Windows fixture27 remains quarantined, M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged. No further exception, rerun or timing waiver.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3253,3 +3252,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Retained independent Opus TLS integration PASS75632148, reviewing a1fba89d. Reviewer verified pins, issue.rs composition, attribute-only TLS engine diff, Cargo+2 and27-case guard; own63Python tests and13extra static guard mutants pass. Root independently verified reviewed TLS bytes, enginebodyidentity, lock+2, strictUTF8 and63Python. Fast-forward PR159 under normal gates; Ubuntu S8 gets one new-source observation with no rerun.
 
 - 2026-11-17: Root verified PR159 hostedrun44062696091 attempt1green, Windows465<=660, UbuntuS8 and all27fixtures/all15TLS cases on Ubuntu/mac (Windowsrequired12TLS) PASS, freshmainc40c547CI44058803351green, then pinned normalmerge67cc62d. Squash tree equalsreviewedhead2c4f973a; newmainCI44064366449 pending. No exception or rerun, no S8fix/Windowsstability credit.
+
+- 2026-11-17: Root actively awaited exact TLSmainCI44064366449 attempt1; all3platformsgreen, wall610s, Windows606s. Finishedlogs confirm Ubuntu/mac27fixtures+allTLS, Windowsrequired12TLS and UbuntuS8 PASS. No stability/fix credit or rerun. F2 acceptedcontract may proceed locally.

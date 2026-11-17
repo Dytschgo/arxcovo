@@ -108,3 +108,6 @@ claim only the observed catch; do not claim it is the only catching test without
 running the other tests. Restore both files byte-for-byte afterward. Existing
 resumption tests already pin full handshakes; the new pump path must use the
 unchanged production config builders and distinct real leaves. No helper change.
+
+Main prerequisite satisfied: root verified exact67cc62d CI44064366449 attempt1
+SUCCESS all3platforms, wall610s / Windows606s. Local implementation may start.
