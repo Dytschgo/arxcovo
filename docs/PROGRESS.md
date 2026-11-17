@@ -2,18 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164,
+**Current main GREEN:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164.
 CI [44051366327](https://github.com/Dytschgo/arxcovo/actions/runs/44051366327) passed
-on attempt1 across Ubuntu, Windows and macOS in608s wall (under900s). Ubuntu/macOS
-actually passed all24fixturetests. Windows job603s passed with24fixturetests
-quarantined; the bounded8test diagnostic sample skipped_budget at e_s611, so no
-sample execution or Windows stability credit. The owner-authorized budget-only
-exception is consumed; original five requiredchecks/appbindings/strict and all
-other protection fields were restored and reverified. Exact squash tree equals
-reviewedhead60f30c86. Previousc612152R5red/1475s is historical, not fixed.
+on attempt 1 across Ubuntu, Windows and macOS in 608 s wall time, under 900 s.
+Ubuntu and macOS each passed all 24 fixture tests. The Windows job passed in
+603 s with those tests quarantined; its bounded eight-test diagnostic sample
+reported `skipped_budget` at `e_s=611`, so it earned no sample or Windows stability
+credit. The owner-authorized budget-only exception is consumed. The original five
+required checks, app bindings, strict mode and every other protection field were
+restored and reverified. The squash tree equals reviewed head `60f30c86`.
+Previous main `c612152` and its R5 failure / 1475 s budget remain historical.
 M3 work may resume under normal gates. Windows fixture coverage remains
-unverified on hosted Windows and **unverified on real hardware**; M2 open/M3 unchecked.
-ADR0025 remains accepted but inactive; no bootstrap exception is authorized.
+unverified on hosted Windows and **unverified on real hardware**; M2 is open and
+M3 unchecked. ADR0025 remains accepted but inactive; no bootstrap is authorized.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -35,11 +36,11 @@ PR145 was merged after the first red main run without accounting for it; the coo
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
 
 
-## Current state - 2026-11-16
+## Current state - 2026-11-17
 
 - Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
-- Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
-- Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
+- Current work: refresh the independently reviewed single-voter founder bootstrap onto green main `39b3dd7`, preserving the full Windows fixture quarantine. Sol high is integrating and verifying it locally; independent Opus delta review and normal hosted gates are required before publication and merge. PR165 records the restoration checkpoint.
+- Blockers: the prior red-main and budget deadlock are cleared by first-attempt main CI44051366327 (608 s). All five normal gates and exact-main health checks are restored; the owner-authorized exception is consumed. Windows coverage for all 24 three-node fixture tests remains unverified on hosted Windows and **unverified on real hardware**. PR159 remains held on its recorded failures; M2 remains open and M3 unchecked. Sol shared fixes remain 3/3 and Opus recovery fixes 0/2; the quarantine is not a fix. ADR0025 remains accepted but inactive, with no activation or further exception authorized.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
