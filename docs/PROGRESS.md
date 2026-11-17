@@ -2,22 +2,18 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main functionally GREEN, budget BLOCKED:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
-after PR174. CI44126173935 attempt2 succeeded after only the zero-step cancelled
-macOS acquisition was retried. Ubuntu248s/Windows553s retain their first
-executions; macOS's first execution passed348s. All108 tracked required cases
-passed each OS, Unix fixture28 passed; new founder pre-proof0.182s/0.310s/1.020s
-(Ubuntu/macOS/Windows). First attempt remains failed infrastructure: final
-attempts/1 API and trusted duration() measure905s, above900s. Initial top-level
-completed read was904s; retained initial evidence is not the current baseline.
-Recovery wall from first run start to final job completion is1352s; job-execution
-union across both attempts is901s (overlapping Ubuntu/Windows553s plus macOS348s).
-These descriptive recovery metrics are not charged-v1 or eligible queue credit.
-No queue credit or bypass; ADR0025 is accepted but inactive. Refreshed policy
-preparation requires independent review, fresh platform checks and separate owner
-activation/bootstrap authorization. Windows sample8 passed with no orphans,
-no re-enable credit. Fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**. M2 open / M3 unchecked; merges remain held.
+**Current main CI pending:** PR163 merged as `10aa891f27906e0c73e48396c5c812cab7d4523a`
+from reviewed head `22a09eae15aee61dc3f489003f6fb8c81b88b882` at21:15:20 UTC.
+All three platform jobs and independent review passed; macOS first executed on
+attempt5 after four zero-step runner-acquisition cancellations. Owner's pinned
+budget-only bootstrap was used once. Original strict five checks, app bindings
+and all other protection fences were restored and read back; merge tree matched.
+ADR0025's implementation is now on trusted main. New exact-main CI44177880021
+is pending; feature publication/merges remain held until it passes and a first
+trusted charged-v1 evaluation is verified. Prior main3022d601 recovered on
+attempt2 but its failed905s first attempt stays uncredited; recovery1352s wall
+and901s execution union were descriptive only. M2 open/M3 unchecked; Windows
+fixture28 remains unverified and hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -3558,3 +3554,7 @@ retry), exit0 in8.750s, log SHA256
 2ad029d7311f75ed9147e4a477e11932b7e0113c83b2a6d5344f712e34eaa458.
 Root lint passed once; source remains identical7aefa2ca. Exact-head review
 and hosted checks still needed. Activation/protection/merge remain unauthorized.
+
+### ADR0025 pinned activation - 2026-11-17
+
+Root Sol coordinator executed independently reviewed executor SHA2562b2866045120e8ba4d8cde357640aef0fbdc2662e5eb21363f14d108c4aaa7b9 under recorded owner approval. PR163 merged10aa891f; restore/readback and tree equality passed. Shared retry plan is marked merged, later slots no-op. Only one of four additional infrastructure requests was used. Exact-main CI44177880021 is actively awaited; no feature publication or merge yet. Evidence retained in D:/Temp/arx-ci-queue-root-refresh.
