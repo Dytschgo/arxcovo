@@ -64,3 +64,12 @@ Independent Opus review is required before push. After four hosted gates pass,
 root must ask the owner for a one-use budget-only exception for the final exact
 head. ADR0025 is accepted but inactive; bootstrap remains unauthorized. No
 publishing or hosted action was performed by this implementation task.
+
+## Consumed owner-authorized restoration exception - 2026-11-17
+
+Owner explicitly authorized root to remove only ci-time-budget for exact PR164
+head60f30c8673e9c9653d1a177d79379a1975f3107f, merge, and immediately restore
+protection. Merge39b3dd7 completed; full protection snapshot matches readback
+exactly afterward. The exception is consumed and grants no further merge. See
+[checkpoint](../evidence/ci-windows-fixture-restoration-checkpoint.md). First-main
+CI44051366327 is pending; no feature merge until green. ADR0025 stays inactive.
