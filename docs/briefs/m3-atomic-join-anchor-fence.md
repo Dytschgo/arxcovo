@@ -5,7 +5,7 @@ Design proposal only; Sol 6.1 high, 2026-11-17; no children. Inspected assigned 
 Root reports PR172 merged normally: eleven pure/wrapper/compat tests PASS all OS, Windows510s.
 Root subsequently confirmed exact-main CI44097456394 attempt 1 green: 556 s wall, Windows 551 s; all eleven cases PASS on every OS. No source is authorized yet.
 Root clarification review is in [the contract review](../reviews/m3-atomic-join-anchor-root-review.md); its corrections are normative.
-Separate independent contract recheck and source authorization remain pending. No production security acceptance follows.
+Independent Sol contract recheck609fdd3f PASS; root authorizes the bounded local source round under ADR0005. No production security acceptance follows.
 M2 open, M3 unchecked; hardware **unverified on real hardware**; shared Sol3/3, Opus0/2 unchanged.
 
 ## Decision and local grounding
@@ -181,7 +181,7 @@ source review, feature Windows<=660s and fresh green exact main before coordinat
 
 ## Readiness, blockers and coordinator entry
 
-Kernel is source-supported; technical formats/API/capacity refusal above remain PROPOSED until root review, not build authorization.
+Kernel contract accepted for bounded local implementation under ADR0005 after independent recheck609fdd3f. Publication and runtime acceptance remain pending.
 No full-flow blocker to this kernel. Public D1 remains blocked on same-connection pre-proof anchored-key possession/discovery/read
 ownership; real transport, CA custody, authenticated control identity and trusted production clock/expiry policy remain separate.
 Root-owned PROGRESS unchanged. Proposed entry: “Sol6.1 high atomic-anchor design: local API/schema/byte-budget inspection only;
