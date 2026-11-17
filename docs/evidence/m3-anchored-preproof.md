@@ -143,3 +143,95 @@ without correction/retry. Production source remains9b6c7e06. No local Windows
 engine execution, publication or acceptance; separate source review follows.
 The initial compile correction batch remains1; this is a static artifact-check
 disposition, not a behavior fix or counter reset.
+
+## Bounded pure continuation: first semantic stop (2026-11-17)
+
+Sol 6.1 high test child, no children. Prepared local head
+`7bc58ddd99230c5215480231c84c5218119baddd`; source remains
+`9b6c7e060e54d9ec8b44fc12e0715ab92412a3bb`. Read AGENTS/KICKOFF, full
+anchored brief, normative root R1/R2, independent contract recheck and this
+record including root scope disposition. Only the assigned isolated worktree
+was used as cwd. No source correction was authorized or attempted.
+
+Reused, not rerun: root scope/UTF8/frozen-byte disposition and inventory counts;
+prior fmt/Clippy, guard7 and sampler60. Saved inventory SHA256
+`c6a6ceb4a377a4fd9e1340eb71203e5b8156197761ff61c6c4c4273d2e33b3c4`
+was read to enumerate exact names before selection. Inspected anchor/preproof
+fixtures and existing pure PKI/TLS source. No new nextest listing was needed.
+
+### Actual natural round and mandatory stop
+
+One command, locked/offline, serial, no retries, fail-fast:
+`cargo nextest run --locked --offline -p arxd --lib --test-threads 1 --retries 0 --fail-fast -E <exact-name union>`.
+The literal argv and all 26 selected names are retained in
+`D:/Temp/arx-preproof-continuation-98c62e96/natural-command.json`.
+Selection was exactly enrollment::anchor2, pki::preproof quota2,
+pki::preproof_tests5, pki::tests6, pki::tls_tests10 and existing enrollment
+literal_anchor_and_proof_binding1. No consensus/founder-engine/anchored_join
+case was selected. Existing founder_pure_identity_and_validity is a pure case
+in pki::tests, but remained unrun after fail-fast.
+
+Task-exclusive reused target:
+`C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-04a56b7c-8088f9385f5b4a14/target/anchored-preproof`.
+Cargo rebuilt this assigned worktree's arxd; compilation succeeded in48.88s.
+Overall subprocess50.110s, exit100; nextest runtime0.117s, run ID
+`7ac5f0bf-b1c9-47e0-a3e5-6214c5eff8e3`. Results:
+
+- PASS canonical_bounds_and_order (0.028s).
+- PASS observation_excludes_addresses_and_learners (0.024s).
+- PASS literal_anchor_and_proof_binding (0.021s).
+- FAIL partial_proof_write_is_fatal_and_cannot_drain (0.029s).
+- Remaining22 selected tests UNRUN;607 other tests skipped.
+
+The first failure is the existing new fixture setup assertion at
+`crates/arxd/src/cluster/pki/preproof_tests.rs:286`, in prepared():
+`assert_eq!(plaintext(&mut s).len(), 32)` observed left0/right32 after query
+pumping. It occurs before the partial-proof-write test reaches its intended
+buffer-limit/write-failure assertion. This is a natural semantic failure,
+not a compile/import failure or designated mutant kill. No cause, fix or
+partial-write behavior acceptance is claimed. No fix, rerun or subsequent
+verification suite followed. Root disposition is required.
+
+The runner saved its Cargo exit/duration before a console-export error:
+printing Unicode nextest separators to cp1252 raised UnicodeEncodeError.
+This affected only display after test completion. The retained UTF-8 log was
+then read with ASCII escaping; no behavior command was repeated. Future runner
+summaries must retain ASCII escaping. Its shell exited1; actual Cargo exit100
+is independently retained in natural-result.json and the completed log.
+
+### Evidence, source preservation and remaining work
+
+All continuation artifacts are retained outside the repository at
+`D:/Temp/arx-preproof-continuation-98c62e96/`:
+
+- natural.log SHA256 `48d0aa6a4eddaee46f6411bd8eb9d01d505dec94d49fdaecd47ec1d154714ff3`.
+- natural-command.json SHA256 `d0792361fc73d827aaafa05c8a776233f0438d4ceb8f409a3b9747b1554986c0`.
+- natural-result.json SHA256 `a3ac57a8d2fcd357b46e6916393ea04a48ae447b06e6abf044f6a0e8eccd8c1c`.
+- manifest.json SHA256 `3405260e771d0c11f7cfa0d24b99bdf5f61ab7a7fa26ec7316e9ccf351f6628a`.
+
+Read-only byte preservation compared all ten source paths to git objects at
+source9b6c7e06: all exact equality PASS. Manifest records each source SHA256
+and runner hashes. This is preservation evidence, not a repeat of the natural
+suite or root's classifier acceptance. Git tree was clean after the failure
+before this evidence-only edit.
+
+M1/M2/M3 all UNRUN: natural-pass precondition failed. An external mutants.py
+was prepared while compilation ran, but never executed. No mutant patch was
+applied, no source backup/restore operation was necessary, and there are no
+mutant patch/restore/kill hashes or credits. No natural replay after stop.
+The sole owned runner and Cargo/nextest process tree completed; no background
+process was started. Logs/caches remain intact.
+
+PROGRESS is root-owned and unchanged. Proposed entry: Sol6.1 high bounded
+verification source9b6c7e06; natural pure round stopped at first semantic
+failure in prepared() query plaintext length0 vs32;3 passed/1 failed/22 unrun;
+mutants unrun;source bytes unchanged;root disposition pending. Mechanical
+correction batch remains1, historical Sol3/3 and Opus0/2 unchanged.
+
+No local Windows engine/native/VM/hardware test, network/install/admin,
+old Lab Manager/protected VM access, push/PR/status/comment/watch/link/merge or
+protection action occurred. Hosted-first anchored_preproof_single_voter,
+independent source/exact-head review, five normal gates, feature Windows<=660s
+and fresh exact-main CI remain required. Main59a665c9 CI44114182696 green609s,
+Windows604s is historical root evidence only. M2 open / M3 unchecked;
+hardware **unverified on real hardware**.
