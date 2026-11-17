@@ -109,3 +109,12 @@ comparison failed on retained root appendix; stopped without rerun. Root final
 diff/encoding inspection and independent integration/exact-head reviews pending;
 no publication. Supplied main632wall/629charged/Windows628 green and policy success
 clear the old budget hold. M2/M3, counters and hardware gaps unchanged.
+
+## Root disposition - 2026-11-18
+
+The whole evidence document equals prepared e5fca6bf exactly, and the original
+builder15610c33 bytes are an exact prefix. The additional root appendix is retained
+provenance, not source drift. Root therefore closes the comparison objection.
+All final changed Git blobs decode strict UTF8 with LF and no BOM. Root diff
+whitespace check passed; no behavior, compilation, engine or mutation rerun.
+Independent integration and exact-head reviews and hosted gates remain required.
