@@ -28,3 +28,9 @@ pub fn parse_node_uri(uri: &str) -> Option<(ClusterId, NodeId)> {
     hex::decode_to_slice(cluster, &mut id).ok()?;
     Some((id, NodeId::new(node.parse().ok()?)?))
 }
+#[cfg(test)]
+mod tls_tests;
+pub(super) mod verify;
+
+#[cfg(test)]
+pub(super) use tls_tests::*;

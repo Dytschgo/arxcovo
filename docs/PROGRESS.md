@@ -9,7 +9,7 @@ PR166 merged through all five normal gates with Opus PASS6944302384; no exceptio
 Windows fixture coverage remains unverified on hosted Windows and **unverified on
 real hardware**. M2 open/M3 unchecked. ADR0025 remains inactive.
 
-**PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
+**PR159 integration held for verification/review:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. Root applied the owner whole-fixture choice to all three TLS Cluster tests; Windows eligibility releases only after the 27-case guard. Stability/re-enable holds remain; no shared cause, rerun or behavior fix is claimed.
 
 **Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
@@ -31,8 +31,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #166 as `c40c547721641974bcb407ce343c795e6c6609ec`, exact head823e7cf, all five normal gates and independent Opus PASS6944302384. Hosted founder13/13 on all three OSes; Windows539s. New main CI44058803351 pending.
-- Current work: founder bootstrap is merged as PR166 and exact-main CI44058803351 is green. Prepare the held PR159 TLS verifier integration onto founder main under the owner-approved whole-fixture quarantine: three TLS fixture cases become Windows-ignored, while pure/single-node TLS and all founder tests remain required. Root accepted the Opus contract; Sol local integration and independent Opus review follow.
+- Last merged: PR #166 as `c40c547721641974bcb407ce343c795e6c6609ec`, exact head823e7cf, all five normal gates and independent Opus PASS6944302384. Hosted founder13/13 on all three OSes; PR Windows539s. Final exact-main CI44058803351 attempt1 SUCCESS: 632s wall, Windows628s, founder13/13 per OS.
+- Current work: Sol high integrates reviewed PR159 head3d702d17 onto prepared8676a6f7 / founder mainc40c547. Exactly three TLS fixture gates and a dedicated 27-case guard preserve all pure/single-node TLS, founder and existing fixture boundaries. Local verification evidence is in docs/evidence/m3-certificate-verifier.md. Root independent Opus delta review is required before push; this task is local only.
 - Blockers: PR159 requires one new-source Ubuntu S8 observation, integrated local checks, independent delta/exact-head review, all five hosted gates and Windows <=660 s. No rerun, timing or budget waiver. Owner whole-fixture scope supersedes its quarantined Windows-test eligibility hold, not stability/re-enable conditions. M2 remains open, M3 unchecked; Sol shared fixes3/3, Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -53,6 +53,23 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 | Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
 
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
+
+## TLS founder-main integration checkpoint (2026-11-17)
+
+Sol high / local integration outcome: merged reviewed PR159 into the assigned
+prepared branch, preserving TLS bytes and founder seal/bindings. Exactly three
+Windows TLS fixture attributes extend the whole-fixture guard to27. Guard3/3,
+sampler60/60, compile gate, identity/Cargo+2 pins, fmt and workspace locked/offline
+Clippy pass. Real Windows nextest inventory confirms27ignored/sample8 and
+TLS12/founder13/pure required; ordinary cluster151/151 pass, exact-three selection
+0run/expected exit4. One routine encoding correction, no engine fix or rerun.
+Cryptographic mutants reused with byte-identity evidence. Logs/pins/limits in
+[evidence](evidence/m3-certificate-verifier.md#founder-main-integration---2026-11-17-sol-high).
+Root independent Opus delta review before push; local only, no hosted action.
+Windows eligibility scope is released by the recorded root decision after guard;
+stability/re-enable hold remains. Ubuntu S8 one updated-source observation only,
+allfive gates and hosted Windows<=660s still required. Main GREENc40/632s preserved;
+M2 open/M3 unchecked, Sol3/3 Opus0/2 unchanged, hardware **unverified on real hardware**.
 
 ## Whole-fixture quarantine checkpoint (2026-11-17)
 
