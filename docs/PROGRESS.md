@@ -3567,3 +3567,7 @@ Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f
 ### PR175 first-main founder red - 2026-11-18
 
 Root actively awaited CI44198128467, exit1. Required Windows F6/F7/F8 founder tests failed; no infrastructure retry applies. Raw failure log retained D:/Temp/arx-pr175-main/failed.log, SHA256 50706e4fd294eaf4552c0f8d4165b7a93895f1a9db5a2f52cecca2b2865319ff. Fresh independent Sol6.1 high diagnosis requested; no fix credit, quarantine or retry. PR176 publication/merge held.
+
+### Founder red local control disposition - 2026-11-18
+
+Fresh independent Sol6.1 high disposition20870818: one sequential exact-source F6/F7/F8 control passed in0.405s test time; hosted failure not reproduced and cause unproven. No source fix, probe, repeated test or quarantine. Logs/hashes/process cleanup retained. Root is preparing a reviewable bounded single-F6 observation patch before authorizing any probe execution. Main09134085 remains RED; PR176 held; Sol3/3 and historical Opus0/2 unchanged. M2 open/M3 unchecked, hardware **unverified on real hardware**.
