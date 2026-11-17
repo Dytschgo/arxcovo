@@ -1,4 +1,4 @@
-import { budget } from './policy.mjs';
+import { budget, creditable } from './policy.mjs';
 
 export class DiscoveryError extends Error {}
 
@@ -14,11 +14,14 @@ export async function evaluateEvent(io, triggeringHead) {
 }
 
 export function decideBudget(latest, candidate, labels) {
+  const charged = latest?.chargedSeconds == null ? `n/a (${latest?.credit?.split(':')[1] ?? 'run-invalid'})` : `${latest.chargedSeconds}s${creditable(latest) ? '' : ' uncredited (not-green)'}`;
+  const prefix = latest ? `Main run ${latest.runId}: wall ${latest.seconds}s, charged ${charged}; ` : '';
   try {
     budget(latest, candidate, labels.some(label => label.name === 'ci-speed'));
-    return { state: 'success', description: `Main run ${latest.runId}: ${latest.seconds}s; budget satisfied` };
+    const reduction = (creditable(latest) ? latest.chargedSeconds : latest.seconds) > 900;
+    return { state: 'success', description: prefix + (reduction ? `ci-speed reduction ${candidate.chargedSeconds}s/${candidate.longestJobSeconds}s` : 'budget satisfied') };
   } catch (error) {
-    return { state: 'failure', description: latest ? `Main run ${latest.runId}: ${latest.seconds}s; ${error.message}` : error.message };
+    return { state: 'failure', description: prefix + error.message };
   }
 }
 

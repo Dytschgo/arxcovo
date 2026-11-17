@@ -5,6 +5,22 @@ import { existsSync, readFileSync } from 'node:fs';
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const playwrightConfig = readFileSync(new URL('../playwright.config.ts', import.meta.url), 'utf8');
 
+test('trusted queue contract pins a single unconditional three-platform matrix job', () => {
+  const lines = workflow.split(/\r?\n/);
+  assert.deepEqual(lines.filter(l => /^\S/.test(l)), ['name: CI', 'on:', 'concurrency:', 'permissions:', 'jobs:']);
+  const jobs = workflow.slice(workflow.indexOf('\njobs:'));
+  assert.deepEqual(jobs.match(/^ {2}\S.*$/gm), ['  verify:']);
+  assert.deepEqual(jobs.match(/^ {4}\S[^\r\n]*$/gm), [
+    '    name: verify (${{ matrix.os }})', '    strategy:', '    runs-on: ${{ matrix.os }}',
+    '    timeout-minutes: 12', '    env:', '    steps:',
+  ]);
+  assert.doesNotMatch(jobs, /^ {4}(?:needs|if|environment|services|concurrency):/m);
+  assert.match(jobs, /^ {4}name: verify \(\$\{\{ matrix.os \}\}\)\r?$/m);
+  assert.match(jobs, /^ {4}runs-on: \$\{\{ matrix.os \}\}\r?$/m);
+  assert.match(jobs, /^ {4}strategy:\r?\n {6}fail-fast: false\r?\n {6}matrix:\r?\n {8}os: \[ubuntu-latest, windows-latest, macos-latest\]\r?\n {4}runs-on:/m);
+  assert.match(workflow, /^permissions:\r?\n {2}contents: read\r?\njobs:/m);
+});
+
 test('CI installs the headless shell used by its unchanged browser smoke tests', () => {
   assert.match(workflow, /^ {6}- name: Install Chromium shell with platform dependencies\r?\n {8}if: runner.os != 'Windows'\r?\n {8}run: npx playwright install --with-deps --only-shell chromium\r?$/m);
   assert.match(workflow, /^ {6}- name: Install Chromium shell on Windows\r?\n {8}if: runner.os == 'Windows'\r?\n {8}run: npx playwright install --only-shell chromium\r?$/m);

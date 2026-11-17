@@ -2,16 +2,27 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `59a665c9cda602d0b2939613656f2c98399f51f1`
-after PR173. First push CI44114182696 attempt 1 passed in 609 s wall;
-Windows 604 s, Ubuntu 241 s, macOS 292 s. All 92 tracked required cases passed
-on every OS; Ubuntu/macOS passed all 28 fixtures. The new one-voter proof passed
-in 0.092 s / 0.239 s / 2.451 s (Ubuntu/macOS/Windows). Exact-final restored
-malformed-code bytes now have hosted passing evidence. Windows's non-gating
-sample passed seven cases and failed U6 at Stop/Orphaned (owners_left=2),
-orphans=0; no rerun, fix or re-enable credit. Windows fixture28 remains
-unverified on hosted Windows and **unverified on real hardware**.
+**Current main functional health GREEN on infrastructure retry:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
+after PR174 (reviewed head e4f0d48). PR CI44123480876 passed all five gates,
+Windows541s, all108 tracked cases on all OSes, Unix28fixtures and new founder/preproof
+cases on all OSes. Main CI44126173935 attempt1 failed in904s wall: Ubuntu248s
+and Windows553s succeeded; macOS job134190447393 was cancelled before acquiring
+a runner (runner_id0, steps[]), with GitHub's no-hosted-runner annotation.
+Root used the standing zero-step infrastructure rule for one macOS-only retry.
+Attempt2 job134201720165 acquired a runner. The single final API read confirmed
+completed/success on exact3022d601 and attempt2; this is functional health only. Carried Ubuntu/Windows jobs134201723218/
+134201723989 retain original times and runner IDs; they were not re-executed.
+No further retry permission. Attempt1 remains the904s budget baseline, uncredited
+under inactive ADR0025 even if attempt2 restores functional health. No partial
+baseline measurement or first-attempt-green claim. R5 is historical, no current
+runtime R5 red. Windows fixture28 remains unverified on hosted Windows and
+**unverified on real hardware**; its non-gating sample gives no acceptance.
 M2 open / M3 unchecked; atomic redemption does not close public join security.
+
+**Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
+wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
+Unix28fixtures passed. The Windows sample failed U6 Stop/Orphaned (owners_left=2),
+orphans=0; no rerun, fix or re-enable credit.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -35,8 +46,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed head `aa63bd5f`, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 attempt 1 is green: 609 s wall / Windows604s.
-- Current work: anchored pre-proof source9b6c7e06 plus test-driver correctionf0c13d23 has pass evidence for all26 selected pure cases across the stopped/corrected rounds. Remaining22 passed, all3 designated mutants compiled and failed actual received-proof32 versus0 assertions, exact baseline restored; final fmt/Clippy passed. Evidence240c913b retained. Independent Sol 6.1 high source review f3cf3861 PASS (retained320c6b48). Preparing publication and exact-head review; hosted all-OS proof remains pending.
+- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head e4f0d48; PR CI44123480876 all five gates green. Main first-attempt infrastructure failure and single retry are recorded above; attempt2 completed/success verified once, functional health restored; attempt1 remains failed904s.
+- Current work: refresh existing PR163's reviewed queue-outage policy source7aefa2ca onto exact main3022d601 locally. Owner accepted the definition on2026-11-16; ADR0025 remains inactive/unmerged, named-executor activation/bootstrap/protection/merge unauthorized. Root plus independent Sol source/exact-head review and fresh three-platform gates remain required. No public action by this child.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -95,6 +106,31 @@ Final guard2/2 + sampler60/60 pass; fmt/workspace locked-offline Clippy pass.
 Real nextest lists24 ignored/pure unit required/sample8, R1–R5 mismatched; ordinary
 fixture selection0executed/expected exit4. Two routine corrections (sampler test
 expectations, documentation encoding); no runtime correction or attempt counter spent. Last merged PR remains PR161; current main RED facts above apply.
+
+## Queue-outage policy refresh checkpoint (2026-11-17)
+
+Sol6.1 high / local integration only / no children. Reviewed PR163 source
+7aefa2cae0abadda594f2a7f4bad02fd8241a92a integrated onto main3022d601;
+only PROGRESS conflicted, resolved from current main with its history preserved.
+All nine policy runtime/test/fixture files retain exact old-head bytes. No
+workflow, protection, app pin, timeout, quarantine, dependency or committed duration
+history changes. One full synthetic Node run passed48/48 in8105.1264ms; lint unrun (dependencies
+absent, no install). Static identity/scope/UTF8LF/history checks pass. Python
+console printing failed after successful Node exit0; saved UTF8 log read without
+rerun. Current checks, hashes, reused reviews/mutants and unrun paths:
+[evidence](evidence/ci-idle-queue-main-refresh.md).
+
+PR164's one-use budget-only exception was consumed at39b3dd7; ADR0022/#57 is
+also exhausted. Neither can be reused. Definition acceptance is settled;
+activation needs an explicit owner decision on a concrete reviewed exact head and
+named root executor after the other four gates are green. No grant is claimed.
+Prepared route removes ONLY ci-time-budget temporarily, restores original strict,
+admin enforcement and all five app bindings in finally, checks zero armed
+auto-merges before the window and again before merge, and aborts on pin/settings
+drift or restoration failure. New first-attempt green main after eventual
+activation is still needed; attempt2 cannot credit the failed904s attempt1.
+M2 open / M3 unchecked / Sol3/3 / historical Opus0/2 unchanged; hardware
+**unverified on real hardware**. No push or activation performed.
 
 ## Task history
 
@@ -3488,3 +3524,10 @@ sincef0c13d23; final proof has not run locally. Root re-read live main59a665c9
 and its first-attempt CI44114182696 success before publication preparation.
 Exact-head review, five gates, hosted new proof on all OS and Windows660s remain.
 M2 open/M3 unchecked; hardware **unverified on real hardware**.
+
+### Historical ADR0025 acceptance (2026-11-16; retained at refresh)
+
+Owner accepted fully-green-only idle queue credit with wall reporting. Prior
+PR163 source78c72b6 CI43914905394 passed platforms on attempt1; the obsolete-head
+macOS retry was unused. The earlier c612152/R5 red was the then-current state,
+not current main health. Definition acceptance granted no activation or exception.

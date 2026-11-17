@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { duration } from './policy.mjs';
+import { duration, queueMeasurement } from './policy.mjs';
 import { evaluateEvent, statusPublisher } from './evaluate-budget.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
@@ -8,9 +8,15 @@ if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw Error('I
 const api = (path, args = []) => JSON.parse(execFileSync('gh', ['api', `repos/${repository}/${path}`, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
 const runs = query => api(`actions/workflows/ci.yml/runs?${query}&per_page=100`).workflow_runs;
 const firstAttempt = run => api(`actions/runs/${run.id}/attempts/1`);
+const measure = (listed, kind, repositoryId) => {
+  const run = firstAttempt(listed);
+  const jobs = api(`actions/runs/${listed.id}/attempts/1/jobs?per_page=100`);
+  // Keep the existing completed-attempt baseline validation before optional credit.
+  return queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId);
+};
 const getMainRun = () => {
   const run = runs('branch=main&event=push&status=completed').sort((a, b) => b.run_number - a.run_number)[0];
-  return run ? duration(firstAttempt(run)) : null;
+  return run ? measure(run, 'main') : null;
 };
 const statuses = statusPublisher({
   readStatus: sha => api(`commits/${sha}/status?per_page=100`).statuses.find(status => status.context === 'ci-time-budget') ?? null,
@@ -23,8 +29,12 @@ if (process.argv.includes('--record')) {
   if (!latest) throw Error('No baseline to record');
   const path = 'docs/ci-duration-history.json';
   const records = JSON.parse(readFileSync(path, 'utf8'));
-  if (!records.some(record => record.runId === latest.runId)) records.push(latest);
-  writeFileSync(path, JSON.stringify(records, null, 2) + '\n');
+  if (!records.some(record => record.runId === latest.runId)) {
+    // Preserve every existing record's bytes, including its whitespace.
+    const original = readFileSync(path, 'utf8');
+    const end = original.lastIndexOf(']');
+    writeFileSync(path, original.slice(0, end).trimEnd() + (records.length ? ',' : '') + '\n' + JSON.stringify(latest, null, 2) + '\n' + original.slice(end));
+  }
 } else {
   const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
   const triggeringHead = event.workflow_run?.event === 'pull_request' ? event.workflow_run.head_sha : event.pull_request?.head.sha;
@@ -37,7 +47,7 @@ if (process.argv.includes('--record')) {
         const run = runs('event=pull_request&status=completed')
           .filter(run => run.head_sha === pr.head.sha && run.head_repository?.id === pr.head.repo?.id)
           .sort((a, b) => b.run_number - a.run_number)[0];
-        return run ? duration(firstAttempt(run)) : null;
+        return run ? measure(run, 'candidate', pr.head.repo?.id) : null;
       },
       postStatus,
   }, triggeringHead);
