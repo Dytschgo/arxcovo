@@ -2,15 +2,13 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `021a89d5f92ace75eaae892513cb8b4efcdc12c5` after PR165.
-CI [44055365214](https://github.com/Dytschgo/arxcovo/actions/runs/44055365214)
-passed on attempt 1 across Ubuntu, Windows and macOS in 565 s wall time;
-Windows job 561 s. All five normal gates and original protection remain active.
-PR164's one-use budget exception is consumed. Windows fixture coverage remains
-unverified on hosted Windows and **unverified on real hardware**; the eight-test
-diagnostic sample earns no acceptance credit. Founder source is independently
-reviewed and ready for publication; its own hosted Windows cost remains unmeasured
-and must satisfy the 660 s rule. M2 open, M3 unchecked. ADR0025 is inactive.
+**Current main CI pending:** exact `c40c547721641974bcb407ce343c795e6c6609ec`
+after PR166. First push CI44058803351 attempt 1 is running. Pre-merge exact main
+021a89d5 CI44055365214 passed in 565 s. PR166 had all five normal gates, Opus
+PASS6944302384 and all 13 founder tests passing on all three OSes; its Windows
+job took 539 s, below 660 s. Squash tree equals reviewed head823e7cf. No dependent
+merge until the new exact-main run is green. Windows fixture coverage remains
+unverified; M2 open/M3 unchecked, hardware **unverified on real hardware**.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -34,7 +32,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #165 as `021a89d5f92ace75eaae892513cb8b4efcdc12c5` at 2026-11-17T09:24:56Z, exact head b75006d7, independent Opus PASS6943864969 and all five normal gates. Squash tree equals reviewed head. Pre-merge main39b3dd7 CI44051366327 green; new main CI44055365214 pending.
+- Last merged: PR #166 as `c40c547721641974bcb407ce343c795e6c6609ec`, exact head823e7cf, all five normal gates and independent Opus PASS6944302384. Hosted founder13/13 on all three OSes; Windows539s. New main CI44058803351 pending.
 - Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
 - Blockers: integration delta review passed (Opus high, 13a12ee5). Exact-head publication review, five hosted gates and Windows job <=660 s remain required for founder source. Parent main021a89d5 CI44055365214 attempt1 is green; PR165 merged normally. Sol shared fixes3/3 and Opus0/2 unchanged; M2 open/M3 unchecked. Windows fixture, multi-host, custody and transport remain **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
@@ -3229,3 +3227,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Merged main021a89d5 into founder branch; only PROGRESS conflicted. Kept main health/correction wording and founder status/history. All six feature blobs and guard remain unchanged from reviewed integration13a12ee5. Exact-main CI44055365214 pending before publication.
 
 - 2026-11-17: PR165 merged normally as021a89d5, reviewedheadb75006d7 tree-identical, all5gates and prior exactmain39b3dd7 green. Root actively awaited newmainCI44055365214 attempt1, all3platformsgreen, wall565s, Windows561s. Founder parent refresh changed only PROGRESS; sixfeaturefiles/guard remain identical to integration reviewed13a12ee5. Publish under normal gates, no new exception.
+
+- 2026-11-17: Root verified PR166 all5gates, actual13founderPASS perOS, Windows539<=660s and fresh exactmain021a89d5 CI44055365214green, then pinned normal squashmergec40c547. Tree equalsreviewedhead823e7cf. FirstmainCI44058803351 pending; no exception/rerun or Windowsfixturecredit.
