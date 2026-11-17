@@ -496,3 +496,14 @@ restored. Independent source/exact-head review and all hosted feature gates,
 fresh main and Windows<=660 remain. No engine/join/recovery acceptance.
 M2open/M3unchecked; hardware unverified on real hardware; Sol3/3 Opus0/2 unchanged.
 Last merged PR171 per root; PROGRESS remains root-owned.
+
+## Root final-source format check and source-review gate
+
+Root Sol6.1 medium actually checked cargo fmt --all --check after the builder's
+import-only correction, on final source d4694d57: exit0 in0.875s. No source was
+changed. Log D:/Temp/arx-l2a-root-wr93ssym/fmt.log has empty SHA256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+This closes only final-source formatting; the11 pure tests and three mutation
+probes remain builder evidence, not rerun by root. Independent Sol6.1 high source
+review is running at1117ba64. Fresh exact mainfa7e3c01/CI44090513191 SUCCESS was
+rechecked before review assignment. No publication or hosted new-head credit yet.
