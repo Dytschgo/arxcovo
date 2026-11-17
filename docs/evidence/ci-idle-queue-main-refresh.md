@@ -115,3 +115,27 @@ Sol3/3 and historical Opus0/2 unchanged. Windowsfixture28 unverified on hosted
 Windows; non-gating sample is not acceptance. Native paths **unverified on real
 hardware**. Ready for root inspection and independent Sol source/exact-head reviews,
 not activation or merge. No public action taken.
+
+## Root current-baseline correction and inspection (2026-11-17)
+
+Root Sol6.1 medium independently read attempts/1 after recovery and called only
+trusted main's pure duration() on the saved payload:905s, conclusionfailure.
+The earlier904s top-level completed-run snapshot remains historical evidence;
+current policy/activation docs now use the905s authoritative baseline. No live
+policy/status/history write or new test attempt. Recovery metadata/log hashes:
+D:/Temp/arx-pr174-hosted/main-recovery-success.json. All108 tracked cases pass
+each OS; Unix fixture28 pass. MacOS's first execution348s passed on infrastructure
+retry; original Ubuntu248s/Windows553s were carried, not rerun.
+
+Root verified all9 policy/test/fixture working bytes equal7aefa2ca and six
+protected committed blobs equal3022d601, including duration history. Initial
+raw checkout check hit31 CRLFs versus LF in unchanged policy.yml. Its committed
+blob4925b7f12bdebcd624024e64af5ce9e000743b67 is identical; normalized working
+bytes match. No source fix. Lint ran once after that checker assertion (disclosed),
+exit0 in6.922s; no lint or Node retry. Log SHA256
+6cc523691fae5355c9180a5372974a6ae92b938911703530b5046d48c6704925.
+Root identity/lint records: D:/Temp/arx-ci-queue-root-refresh.
+
+Source remains unchanged. Activation route is still preparation only: exact
+head review,3 green platforms then owner's named-executor one-use decision.
+No activation, protection write, exception reuse or merge authority.

@@ -1,6 +1,6 @@
 # 0025: Charge the CI time budget for execution, not idle job queue
 
-Status: **Accepted by the owner 2026-11-16; implementation reviewed, not active.** Opus design sub-agent, exact main `c612152`.
+Status: **Owner definition accepted 2026-11-16. Activation requires a separately authorized pinned merge of the reviewed implementation; until then, inactive.** Original Opus design on `c612152`; current-main refresh uses Sol6.1.
 
 The user chose to *prepare* a reviewed queue-outage amendment for the PR #162 deadlock. That choice grants no
 bootstrap, protection, status, label or merge exception. The ADR 0022 exception is exhausted and cannot be reused.
@@ -164,7 +164,7 @@ test/smoke/desktop counts, or history contents.
    Root and an independent Sol6.1 reviewer must review the source and exact final head
    under current non-UI routing, then require three successful platform jobs and
    exact-head independent agent-review. Historical Opus reviews remain valid evidence.
-2. **Current old gate.** Main44126173935 attempt1 failed in904s wall after a zero-step
+2. **Current old gate.** Main44126173935 attempt1 failed in905s wall after a zero-step
    macOS infrastructure cancellation. This replaces the historical1475s/R5 baseline.
    The single final read verified macOS-only attempt2 completed/success on exact
    main3022d601, restoring functional health but giving attempt1 no credit. Trusted main still runs the old wall policy; no ci-speed label applies.
@@ -180,7 +180,7 @@ test/smoke/desktop counts, or history contents.
    finally with exact readback. Abort on drift or restoration failure. No manual
    success status, rerun, admin bypass or label workaround.
 5. **After eventual activation.** Verify merge SHA/tree and first trusted evaluation.
-   Failed904s attempt1 gets no credit, regardless of attempt2 functional success.
+   Failed905s attempt1 gets no credit, regardless of attempt2 functional success.
    A new first-attempt fully green exact-main push with a qualifying charged value
    is still needed to restore the normal budget flow. No feature merge is granted.
    This preparation never runs live ci-budget.mjs or --record; historical rows stay

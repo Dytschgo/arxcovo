@@ -37,7 +37,7 @@ Policy runs trusted default-branch code on workflow_run for CI and label signals
 
 **Owner-accepted amendment, conditional and not active:** [ADR0025](adr/0025-ci-queue-outage-budget.md) retains wall seconds and adds charged-v1. A validated sweep credits only intervals with a created pending required job and no executing job. Execution, overlapping waits, prefix/tail and no-pending idle remain charged. The exact three completed platform jobs must match attempt 1, run/head, names, labels and strict timestamp ranges. One bounded jobs page is read; invalid metadata withholds credit with run-invalid/jobs-invalid, using the original wall gate. Transport/8 MiB overflow still fails closed. Failed runs or jobs retain computed measurements as not-green but receive no credit. A green valid baseline may use charged time at the unchanged 900s threshold. Above it, ci-speed requires BOTH baseline and candidate green/creditable and strictly reduced charged time AND longest execution. These metrics alone do not prove a source speedup or exclude runtime noise.
 
-Historical main43880904887 was RED: wall1475s/charged738s/Q737s/longest372s, credit withheld. PR162 run43889323450 is green: wall1311s/charged877s/Q434s/longest585s. It cannot qualify for ci-speed against this failed main. Current main3022d601 run44126173935 attempt1 failed at904s due to zero-step macOS infrastructure cancellation; the single final read verified root's macOS-only attempt2 completed/success on exact3022d601. Functional health is restored; its outcome cannot credit attempt1. The separate exact-main health prerequisite remains binding.
+Historical main43880904887 was RED: wall1475s/charged738s/Q737s/longest372s, credit withheld. PR162 run43889323450 is green: wall1311s/charged877s/Q434s/longest585s. It cannot qualify for ci-speed against this failed main. Current main3022d601 run44126173935 attempt1 failed at905s due to zero-step macOS infrastructure cancellation; the single final read verified root's macOS-only attempt2 completed/success on exact3022d601. Functional health is restored; its outcome cannot credit attempt1. The separate exact-main health prerequisite remains binding.
 
 Status publication compares the current context's state and description and skips unchanged results. Unchanged heads are not cycled through pending on periodic checks. The `Main run {id}:` marker remains intact; descriptions report wall, charged or unavailability, and verdict within 140 characters. A changed main measurement invalidates old successes; errors for one head do not prevent evaluating the others. The evaluator reports aggregate failure if a head cannot be updated.
 
@@ -79,7 +79,7 @@ work for owner recovery. No command or protection update has run from this plan.
 
 Verify the actual merge SHA/tree, the first trusted policy evaluation, and CI on
 that exact new main. Failed main gets no idle credit; no other merge follows
-until a new first-attempt green exact main and normal required gates pass. The failed904s attempt1 remains uncredited even if attempt2 is functionally green. Record the approved scope,
+until a new first-attempt green exact main and normal required gates pass. The failed905s attempt1 remains uncredited even if attempt2 is functionally green. Record the approved scope,
 executor, before/after settings and result in PROGRESS and ADR0025. Any further
 exception requires a new decision; the route is not reusable.
 
@@ -101,7 +101,7 @@ No obsolete-head retry was performed and no attempt2 result is claimed.
 ## Current-main preparation refresh - 2026-11-17
 
 PR174 merged as3022d601; PR CI44123480876 all five green. Main44126173935
-attempt1 is the904s uncredited infrastructure baseline, not a runtime R5 failure.
+attempt1 is the905s uncredited infrastructure baseline, not a runtime R5 failure.
 Only root's single zero-step macOS retry is allowed; no further retry or partial
 baseline measurement. See [refresh evidence](evidence/ci-idle-queue-main-refresh.md)
 for the single final read (attempt2 completed/success on exact3022d601), source

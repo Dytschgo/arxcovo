@@ -2,22 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main functional health GREEN on infrastructure retry:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
-after PR174 (reviewed head e4f0d48). PR CI44123480876 passed all five gates,
-Windows541s, all108 tracked cases on all OSes, Unix28fixtures and new founder/preproof
-cases on all OSes. Main CI44126173935 attempt1 failed in904s wall: Ubuntu248s
-and Windows553s succeeded; macOS job134190447393 was cancelled before acquiring
-a runner (runner_id0, steps[]), with GitHub's no-hosted-runner annotation.
-Root used the standing zero-step infrastructure rule for one macOS-only retry.
-Attempt2 job134201720165 acquired a runner. The single final API read confirmed
-completed/success on exact3022d601 and attempt2; this is functional health only. Carried Ubuntu/Windows jobs134201723218/
-134201723989 retain original times and runner IDs; they were not re-executed.
-No further retry permission. Attempt1 remains the904s budget baseline, uncredited
-under inactive ADR0025 even if attempt2 restores functional health. No partial
-baseline measurement or first-attempt-green claim. R5 is historical, no current
-runtime R5 red. Windows fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**; its non-gating sample gives no acceptance.
-M2 open / M3 unchecked; atomic redemption does not close public join security.
+**Current main functionally GREEN, budget BLOCKED:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
+after PR174. CI44126173935 attempt2 succeeded after only the zero-step cancelled
+macOS acquisition was retried. Ubuntu248s/Windows553s retain their first
+executions; macOS's first execution passed348s. All108 tracked required cases
+passed each OS, Unix fixture28 passed; new founder pre-proof0.182s/0.310s/1.020s
+(Ubuntu/macOS/Windows). First attempt remains failed infrastructure: final
+attempts/1 API and trusted duration() measure905s, above900s. Initial top-level
+completed read was904s; retained initial evidence is not the current baseline.
+No queue credit or bypass; ADR0025 is accepted but inactive. Refreshed policy
+preparation requires independent review, fresh platform checks and separate owner
+activation/bootstrap authorization. Windows sample8 passed with no orphans,
+no re-enable credit. Fixture28 remains unverified on hosted Windows and
+**unverified on real hardware**. M2 open / M3 unchecked; merges remain held.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -46,9 +43,10 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head e4f0d48; PR CI44123480876 all five gates green. Main first-attempt infrastructure failure and single retry are recorded above; attempt2 completed/success verified once, functional health restored; attempt1 remains failed904s.
-- Current work: refresh existing PR163's reviewed queue-outage policy source7aefa2ca onto exact main3022d601 locally. Owner accepted the definition on2026-11-16; ADR0025 remains inactive/unmerged, named-executor activation/bootstrap/protection/merge unauthorized. Root plus independent Sol source/exact-head review and fresh three-platform gates remain required. No public action by this child.
-- Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
+- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`; all five PR gates green. Main recovered through macOS-only infrastructure retry; first-attempt905s still blocks budget.
+- Current work: policy source7aefa2ca is refreshed onto current main with identical nine source/test/fixture files; synthetic Node48 and root lint passed. Root is preparing independent integration review, then exact-head review and platform checks. Activation/bootstrap remains unauthorized; owner definition acceptance is already settled and will not be asked again.
+- Blockers: first-attempt905s budget holds merges. Production joining still needs owned query/public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Internal apply-time anchor fencing and pre-proof TLS probes are implemented, not public join acceptance. Joint recovery has only an engine API proof. Windows fixture28 unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
+
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
