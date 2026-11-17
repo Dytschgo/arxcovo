@@ -273,3 +273,14 @@ fresh green exact main, all five gates and feature Windows<=660s remain required
 No local runtime/control success, Windows recovery, production L2 or hardware
 credit. M2open/M3unchecked, Sol3/3 and Opus0/2 unchanged; hardware paths remain
 **unverified on real hardware**.
+
+## Exact base-main result after PR170
+
+Root actually verified exact76460c97 main CI44085879290 attempt1 SUCCESS in575s
+wall; Windows570s, Ubuntu245s, macOS327s. The new joint test is not on that
+commit and earns no runtime credit. Original8 non-gating Windows sample had
+7passes/1failure, T4 helper Write/Elapsed(node1), no orphans; logs are retained
+under D:/Temp/arx-pr170-hosted. This does not turn required CI red under the
+accepted sample contract and gives no recovery or re-enable credit. No rerun,
+quarantine expansion beyond the accepted new-test classification, or engine fix.
+Independent source review at8e3df55 is running; source remains unchanged.
