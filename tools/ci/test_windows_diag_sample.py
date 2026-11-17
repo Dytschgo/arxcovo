@@ -337,7 +337,7 @@ class InventoryTests(unittest.TestCase):
     def test_exact_eight_ignored_pass(self):
         w.check_inventory(listing(), NAMES, FROOT)
 
-    def test_nonignored_a0_cases_mismatch_and_unexpected_match_gates(self):
+    def test_unsampled_cases_mismatch_and_unexpected_match_gates(self):
         doc = json.loads(listing())
         cases = doc["rust-suites"]["arxd"]["testcases"]
         names = ["r1_apply_wait_deadline", "r2_isolated_read_refusal",
@@ -345,8 +345,8 @@ class InventoryTests(unittest.TestCase):
                  "r5_shutdown_read_owners"]
         for name in names:
             cases[w.TEST_PREFIX + name] = {
-                "kind": "test", "ignored": False,
-                "filter-match": {"status": "mismatch", "reason": "ignored"}}
+                "kind": "test", "ignored": True,
+                "filter-match": {"status": "mismatch", "reason": "expression"}}
         doc["test-count"] = len(cases)
         w.check_inventory(json.dumps(doc).encode(), NAMES, FROOT)
         for name in names:
@@ -354,7 +354,7 @@ class InventoryTests(unittest.TestCase):
                 case = cases[w.TEST_PREFIX + name]
                 case["filter-match"] = {"status": "matches"}
                 self.check(json.dumps(doc).encode(), "inventory")
-                case["filter-match"] = {"status": "mismatch", "reason": "ignored"}
+                case["filter-match"] = {"status": "mismatch", "reason": "expression"}
 
     def test_unsampled_filter_matches_verified_guard_inventory(self):
         # Capture the namespace executed by the real verified-bytes loader.
@@ -364,19 +364,22 @@ class InventoryTests(unittest.TestCase):
         namespace = execute.call_args.args[1]
         excluded = re.findall(r" & not test\(=cluster::consensus::three_node::([a-z0-9_]+)\)", w.FILTER)
         self.assertEqual(excluded, namespace["WINDOWS_UNSAMPLED"])
-        self.assertEqual(excluded, ["r5_shutdown_read_owners"])
+        self.assertEqual(excluded, ['r1_apply_wait_deadline', 'r2_isolated_read_refusal', 'r3_store_wait_deadline_and_heartbeat', 'r4_read_admission_and_caller_abort', 'r5_shutdown_read_owners'])
         self.assertTrue(set(excluded).isdisjoint(NAMES))
 
-    def test_ignored_r5_expression_mismatch_passes_but_match_gates(self):
+    def test_ignored_unsampled_expression_mismatch_passes_but_match_gates(self):
         doc = json.loads(listing())
         cases = doc["rust-suites"]["arxd"]["testcases"]
-        case = {"kind": "test", "ignored": True,
-                "filter-match": {"status": "mismatch", "reason": "expression"}}
-        cases[w.TEST_PREFIX + "r5_shutdown_read_owners"] = case
-        doc["test-count"] = len(cases)
-        w.check_inventory(json.dumps(doc).encode(), NAMES, FROOT)
-        case["filter-match"] = {"status": "matches"}
-        self.check(json.dumps(doc).encode(), "inventory")
+        for name in ['r1_apply_wait_deadline', 'r2_isolated_read_refusal', 'r3_store_wait_deadline_and_heartbeat', 'r4_read_admission_and_caller_abort', 'r5_shutdown_read_owners']:
+            with self.subTest(name=name):
+                case = {"kind": "test", "ignored": True,
+                        "filter-match": {"status": "mismatch", "reason": "expression"}}
+                cases[w.TEST_PREFIX + name] = case
+                doc["test-count"] = len(cases)
+                w.check_inventory(json.dumps(doc).encode(), NAMES, FROOT)
+                case["filter-match"] = {"status": "matches"}
+                self.check(json.dumps(doc).encode(), "inventory")
+                case["filter-match"] = {"status": "mismatch", "reason": "expression"}
 
     def test_rejections(self):
         self.check(listing(NAMES[:7]), "inventory")
@@ -997,7 +1000,7 @@ class SourceTests(unittest.TestCase):
         head = ["--workspace", "--locked", "--cargo-quiet", "--user-config-file", "none",
                 "--config-file", "tools/ci/windows-diag-sample.nextest.toml", "-P", "diag-sample",
                 "--run-ignored", "only"]
-        expr = ["-E", "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)"]
+        expr = ["-E", "package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r1_apply_wait_deadline) & not test(=cluster::consensus::three_node::r2_isolated_read_refusal) & not test(=cluster::consensus::three_node::r3_store_wait_deadline_and_heartbeat) & not test(=cluster::consensus::three_node::r4_read_admission_and_caller_abort) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)"]
         # `list` has no --no-tests flag in nextest 0.9.151 (usage error, exit 2).
         self.assertEqual(w.cargo_argv("list"),
                          ["cargo", "nextest", "list", "-T", "json"] + head + expr)

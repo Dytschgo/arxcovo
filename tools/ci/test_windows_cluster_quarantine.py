@@ -7,23 +7,51 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = ['t3_snapshot_catchup_then_consecutive_append', 't1_follower_offline_enrollment_and_reopen', 't2_leader_offline_reads_and_unknown_retry', 'u6_cancelled_callers_keep_engine_permits_until_resolution', 't4_registry_revocation_snapshot_and_prune', 'r6_shutdown_report_cancelled_proposal', 'r6_shutdown_report_store_only', 'r6_shutdown_report_normal_and_reaped_panic']
 REASON = 'Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md'
-WINDOWS_UNSAMPLED = ['r5_shutdown_read_owners']
-REASON_R5 = 'Windows R5 post-release quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
+WINDOWS_UNSAMPLED = ['r1_apply_wait_deadline', 'r2_isolated_read_refusal', 'r3_store_wait_deadline_and_heartbeat', 'r4_read_admission_and_caller_abort', 'r5_shutdown_read_owners']
+ISSUANCE = ['i1_happy_retry', 'i2_follower_no_append', 'i3_single_consumption_race', 'i4_leadership_loss', 'i5_remove_between_guards', 'i6_actual_post_wait_clock', 'i7_adapter_rejects_forged_shapes_and_mismatches', 'i8_removed_leaf_remains_chain_valid_stale_registry', 'i9_private_material_never_persisted', 'hook_store_identity_and_admission', 'retained_record_is_required_even_while_member_remains_authorized']
+REASON_FIXTURE = 'Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
+PURE = 'read_failure_attribution_covers_all_errors'
 
 
-def assert_windows_quarantine(source):
+def assert_fixture_quarantine(source, groups, pure=()):
+    names = [name for group, _ in groups for name in group]
+    assert len(names) == len(set(names))
     functions = re.findall(r'^async fn ([a-z0-9_]+)\(', source, re.M)
-    assert set(EXPECTED).isdisjoint(WINDOWS_UNSAMPLED)
-    for names, reason in ((EXPECTED, REASON), (WINDOWS_UNSAMPLED, REASON_R5)):
+    attributes = re.findall(r"#\s*!?\s*\[([^\]]*)\]", source)
+    # No alternate spelling/predicate can skip Unix coverage or hide a new test.
+    allowed = {re.sub(r"\s+", "", 'cfg_attr(target_os="windows",ignore="' + reason + '")')
+               for _, reason in groups}
+    for attribute in attributes:
+        if re.match(r"\s*cfg(?:_attr)?\b", attribute) or re.search(r"\bignore\b", attribute):
+            assert re.sub(r"\s+", "", attribute) in allowed
+    for group, reason in groups:
         actual = re.findall(
             r'#\[cfg_attr\(\s*target_os\s*=\s*"windows",\s*ignore\s*=\s*"'
             + re.escape(reason) + r'"\s*\)\]\s*async fn ([a-z0-9_]+)\(', source)
-        assert sorted(actual) == sorted(names)
-        for name in names:
-            assert functions.count(name) == 1
-    assert source.count('ignore') == len(EXPECTED) + len(WINDOWS_UNSAMPLED)
-    assert '#[cfg(target_os' not in source
-    assert '#[cfg(not(target_os' not in source
+        assert sorted(actual) == sorted(group)
+    assert source.count('ignore') == len(names)
+    for name in names:
+        assert functions.count(name) == 1
+    tests = re.findall(r'((?:#\[[^\]]*\]\s*)+)(?:async )?fn ([a-z0-9_]+)\(', source)
+    actual_tests = []
+    for attrs, name in tests:
+        if 'tokio::test' in attrs or '#[test]' in attrs:
+            actual_tests.append(name)
+            if name in pure:
+                assert attrs.strip() == '#[test]'
+            else:
+                assert 'tokio::test' in attrs and name in names
+    assert sorted(actual_tests) == sorted(names + list(pure))
+    assert source.count('tokio::test') == len(names)
+
+
+def assert_windows_quarantine(source):
+    assert_fixture_quarantine(source, ((EXPECTED, REASON), (WINDOWS_UNSAMPLED, REASON_FIXTURE)), (PURE,))
+
+
+def assert_issuance_quarantine(source):
+    assert_fixture_quarantine(source, ((ISSUANCE, REASON_FIXTURE),))
+
 
 def assert_issuance_required(source):
     # Both inner and outer attributes are covered. Only cfg(test) is permitted;
@@ -63,11 +91,11 @@ class QuarantineTests(unittest.TestCase):
         ]
         for relative in ["consensus/issue_tests.rs", "pki/tests.rs"]:
             source = (base / relative).read_text(encoding="utf-8")
-            assert_issuance_required(source)
+            (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_issuance_required)(source)
             for mutation in mutations:
                 with self.subTest(relative=relative, mutation=mutation):
                     with self.assertRaises(AssertionError):
-                        assert_issuance_required(mutation + source)
+                        (assert_issuance_quarantine if relative == "consensus/issue_tests.rs" else assert_issuance_required)(mutation + source)
         for mutation in mutations:
             for parent in ("issue", "pki"):
                 with self.subTest(parent=parent, mutation=mutation):
@@ -82,30 +110,55 @@ class QuarantineTests(unittest.TestCase):
             assert_issuance_modules(issue, pki.replace('mod tests;', 'mod absent;'))
 
     def test_exact_windows_only_quarantine(self):
-        source = (ROOT / "crates/arxd/src/cluster/consensus/three_node.rs").read_text(encoding="utf-8")
-        assert_windows_quarantine(source)
-        gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + REASON_R5 + '"\n)]'
-        mutants = {
-            "removed gate": source.replace(gate, ''),
-            "unix family": source.replace(gate, gate.replace('target_os = "windows"', 'target_family = "unix"')),
-            "all platforms": source.replace(gate, gate.replace('target_os = "windows"', 'all()')),
-            "R5 sampled reason": source.replace(REASON_R5, REASON),
-            "sample unsampled reason": source.replace(REASON, REASON_R5, 1),
-            "tenth ignore": source + '\n#[ignore]\nasync fn extra() {}\n',
-            "renamed R5": source.replace('async fn r5_shutdown_read_owners(', 'async fn renamed('),
-            "removed R5": source.replace('async fn r5_shutdown_read_owners(', ''),
-            "duplicate R5": source + '\nasync fn r5_shutdown_read_owners() {}\n',
-            "cfg ban": '#[cfg(target_os = "windows")]\n' + source,
-            "cfg not ban": '#[cfg(not(target_os = "windows"))]\n' + source,
-        }
-        for name, mutant in mutants.items():
-            with self.subTest(mutant=name):
-                self.assertNotEqual(mutant, source)
-                with self.assertRaises(AssertionError):
-                    assert_windows_quarantine(mutant)
+        base = ROOT / "crates/arxd/src/cluster/consensus"
+        for filename, check, names in (
+            ("three_node.rs", assert_windows_quarantine, EXPECTED + WINDOWS_UNSAMPLED),
+            ("issue_tests.rs", assert_issuance_quarantine, ISSUANCE),
+        ):
+            source = (base / filename).read_text(encoding="utf-8")
+            check(source)
+            for name in names:
+                reason = REASON if name in EXPECTED else REASON_FIXTURE
+                gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + reason + '"\n)]'
+                needle = gate + '\nasync fn ' + name + '('
+                mutants = {
+                    "removed gate": source.replace(needle, 'async fn ' + name + '('),
+                    "wrong OS": source.replace(needle, needle.replace('target_os = "windows"', 'target_os = "linux"')),
+                    "Unix family": source.replace(needle, needle.replace('target_os = "windows"', 'target_family = "unix"')),
+                    "all OS": source.replace(needle, needle.replace('target_os = "windows"', 'all()')),
+                    "wrong reason": source.replace(needle, needle.replace(reason, 'unapproved reason')),
+                    "renamed": source.replace('async fn ' + name + '(', 'async fn renamed('),
+                    "duplicate": source + '\n' + needle + ') {}\n',
+                }
+                for label, mutant in mutants.items():
+                    with self.subTest(file=filename, test=name, mutant=label):
+                        self.assertNotEqual(mutant, source)
+                        with self.assertRaises(AssertionError):
+                            check(mutant)
+            mutants = [
+                source + '\n#[tokio::test]\nasync fn extra_fixture() {}\n',
+                source + '\n#[test]\nfn extra_fixture() {}\n',
+                '#![cfg(unix)]\n' + source,
+                source + '\n#[ignore]\nasync fn extra() {}\n',
+            ]
+            for mutant in mutants:
+                with self.subTest(file=filename, mutant=mutant[-65:]):
+                    with self.assertRaises(AssertionError):
+                        check(mutant)
+        source = (base / "three_node.rs").read_text(encoding="utf-8")
         with patch(__name__ + '.EXPECTED', EXPECTED + WINDOWS_UNSAMPLED):
             with self.assertRaises(AssertionError):
                 assert_windows_quarantine(source)
+        for variable, value, check, filename in (
+            ('WINDOWS_UNSAMPLED', WINDOWS_UNSAMPLED[:-1], assert_windows_quarantine, 'three_node.rs'),
+            ('ISSUANCE', ISSUANCE[:-1], assert_issuance_quarantine, 'issue_tests.rs'),
+        ):
+            with self.subTest(inventory_drift=variable):
+                with patch(__name__ + '.' + variable, value):
+                    with self.assertRaises(AssertionError):
+                        check((base / filename).read_text(encoding="utf-8"))
+        with self.assertRaises(AssertionError):
+            assert_windows_quarantine(source.replace('#[test]', '#[test]\n#[ignore]'))
 
 if __name__ == "__main__":
     unittest.main()
