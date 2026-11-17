@@ -2,14 +2,13 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `fa8378889c05c6b87d191610e07e3bef68c2ebca`
-after PR167. First push CI44069931184 attempt 1 is running. PR167 passed all
-five normal gates with Opus PASS6945935514; the new real-identity proof passed
-on Ubuntu, Windows and macOS, Windows job541s <=660s. Squash tree equals reviewed
-heade649542. Pre-merge main67cc62d CI44064366449 was green in610s. No dependent
-merge until this exact newmain is green. Claims remain one process and one shared
-committed registry; Windows fixture27 remains unverified on hosted Windows and
-**unverified on real hardware**. M2 open/M3 unchecked; no new exception.
+**Current main GREEN:** exact `fa8378889c05c6b87d191610e07e3bef68c2ebca`
+after PR167. First push CI44069931184 attempt 1 passed all platforms in
+472 s wall time; Windows467s <=660s. Finishedlogs confirm the real founder/
+joiner identity proof PASS on everyOS. PR167 merged normally with OpusPASS6945935514;
+no exception or rerun. Claims remain one process and one shared committed registry,
+not a joiner replica or production transport. Windows fixture27 remains unverified
+on hosted Windows and **unverified on real hardware**. M2 open/M3 unchecked.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -33,9 +32,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #167 as `fa8378889c05c6b87d191610e07e3bef68c2ebca`, reviewedheade649542, all5normalgates/OpusPASS6945935514. New proofPASSperOS, Windows541s. FirstmainCI44069931184 pending.
-- Current work: F2 real founder/joiner TLS proof is merged. Actively verify its first main CI; prepare the next bounded learner admission/promotion contract from existing M3 design without assuming production transport, joiner replica bootstrap or custody policy.
-- Blockers: exact-main CI44069931184 must pass before the next dependent source work. Learner/replica admission needs an explicit reviewed technical contract; production custody, transport and freshness remain separate. Windows fixture27 unverified; M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
+- Last merged: PR #167 as `fa8378889c05c6b87d191610e07e3bef68c2ebca`, reviewedheade649542, all5normalgates/OpusPASS6945935514. New proofPASSperOS, Windows541s. FirstmainCI44069931184 attempt1 passed in 472s wall, Windows467s.
+- Current work: F2 real founder/joiner TLS proof is merged and exact main fa83788 is green. Opus is preparing the next bounded learner admission/promotion contract, explicitly checking bootstrap trust, registry-vs-Raft membership semantics and operation ownership/budgets. No next-stage source work has started.
+- Blockers: learner admission needs an explicit reviewed technical contract before source changes; any unsettled product/trust choice must be resolved first. Production custody, transport and freshness remain separate. Main CI is green under normal gates; Windows fixture27 unverified, M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3259,3 +3258,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Retained Opus high F2 implementation PASSa219c63c: reviewer verified all11artifacthashes, 26uniquePASS and once-onlyN1/N2catches/restoredbytes, realissuedleaf/key/SAN/serial/bothroleidentities/retainedconfigrevocation/shutdown assertions. Root guard4 and source-restoration hashes verified. Currentmain67cc62d CI44064366449green; publish with frozenproduction and unchanged27quarantine/sample8. No hosted F2 acceptance yet.
 
 - 2026-11-17: Root verified PR167run44068215957 attempt1SUCCESS, newproofactualPASSperOS, Windows541<=660s, all5gates and freshmain67cc62dCI44064366449green, then normalpinnedsquashmergefa83788. Treeequalsreviewedheade649542; firstmainCI44069931184 pending. No exception, rerun or expanded acceptance.
+
+- 2026-11-17: Root actively awaited mainCI44069931184 attempt1 onfa83788; all3platforms green, wall472s, Windows467s. Finishedlogs confirm F2newproofPASSperOS. No rerun, exception or broader acceptance. Nextlearnercontract is static preparation only.
