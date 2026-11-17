@@ -138,3 +138,23 @@ static codec/API/edge-case inspection; implementation/review/main-green pending;
 M2 open, M3 unchecked, hardware **unverified on real hardware**; Sol3/3 Opus0/2 unchanged; last merge PR171 per root.”
 Actual task verification: documentation line count, whitespace/diff/scope and relative links only; no compile/test run.
 Only this brief is committed locally; no PR/push/status/watch/link/merge/admin/VM/install/cache deletion authorized.
+
+## Root implementation clarifications
+
+Root Sol review accepts the extraction boundary, conditional on exact-main green.
+Add small synchronous consensus wrapper tests for literal U/J/D, including learner
+metadata, duplicate-config preservation and uniform StoreError::Membership errors.
+Run them locally with the two preserved old codec tests, in addition to the new
+pure tests; none starts an engine. Do not rewrite the old test bodies.
+For the duplicate-config mutant, target a direct constructor assertion that its
+configs remain [{1},{1}] BEFORE encode/decode. A later decode unwrap or encode-back
+refusal must not substitute for the designated semantic assertion. Address mutant
+likewise targets direct well-formed constructor refusal for "!"; learner-drop
+mutant targets literal-U encode equality. Preserve exact restored hashes.
+Root allows at most two mechanical compile/import/lint corrections before the
+first natural behavior run; log each, with no acceptance/algorithm/limit changes.
+Any semantic mismatch, natural behavior/static-suite red, mutant compiler failure,
+survival or unrelated mutant failure stops for disposition, with no rerun/tuning.
+The shared std-only module must not couple to enrollment Reader or StateStore.
+This grants only the stated extraction/tests after main green, not the later
+apply-time validation, arxj2, schema, state-machine or transport work.
