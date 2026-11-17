@@ -1,6 +1,6 @@
 # M3 L2-A: extract the canonical membership-v1 codec
 
-Design only; Sol 6.1 / high, 2026-11-17; no children. Coordinator review precedes implementation.
+L2-A implemented locally and independently reviewed; Sol6.1 high, 2026-11-17. Hosted gates remain pending. Original design and root clarifications follow.
 Inspected HEAD/base: `3792bd89398e312e4ec85dbab06c1ce99fc787a7` in the assigned isolated worktree.
 Coordinator supplies tree equivalence to PR171 merge `fa7e3c019484bf2335bd26fbbafd2d65b207f480`;
 this task did not independently compare that tree or query CI. Exact-main CI `44090513191` is pending per assignment.
