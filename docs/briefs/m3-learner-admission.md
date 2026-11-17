@@ -1,6 +1,6 @@
 # Brief: M3 learner admission, catch-up and promotion after F2
 
-Status: **proposed** (Opus 5.5 high, 2026-11-17), docs only, nothing built or run. Worktree `fa286109` (source main `fa837888`, PR167 F2 merge).
+Status: **L1 local source prepared; verification STOPPED** (Sol high, 2026-11-17): fmt PASS, Clippy natural red on deprecated learner_ids; tests/guard/mutants not run. See [local evidence](../evidence/m3-learner-catch-up.md). L2/promotion blocked. Original proposal: Opus 5.5 high, 2026-11-17. Worktree `fa286109` (source main `fa837888`, PR167 F2 merge).
 Exact-main CI 44069931184 is pending; no build or push starts until root records it green. ADR 0005 with its 2026-11-15 amendment, ADR 0023,
 ADR 0024 (all addenda), the [runtime boundary brief](m3-next-runtime-boundary.md) and the [F2 brief](m3-founder-joiner-tls-proof.md) stay binding.
 No ADR is amended here. M2 open, M3 unchecked, Windows recovery Sol 3/3 / Opus 0/2; everything here is **unverified on real hardware**.

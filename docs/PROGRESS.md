@@ -33,8 +33,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #167 as `fa8378889c05c6b87d191610e07e3bef68c2ebca`, reviewedheade649542, all5normalgates/OpusPASS6945935514. New proofPASSperOS, Windows541s. FirstmainCI44069931184 attempt1 passed in 472s wall, Windows467s.
-- Current work: F2 real founder/joiner TLS proof is merged and exact main fa83788 is green. Opus is preparing the next bounded learner admission/promotion contract, explicitly checking bootstrap trust, registry-vs-Raft membership semantics and operation ownership/budgets. No next-stage source work has started.
-- Blockers: learner admission needs an explicit reviewed technical contract before source changes; any unsettled product/trust choice must be resolved first. Production custody, transport and freshness remain separate. Main CI is green under normal gates; Windows fixture27 unverified, M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
+- Current work: Sol high L1 test-only learner proof source `aa0c771a7826fb8b8f2b32955114b7b2349f46db` prepared locally. Final round STOPPED on natural Clippy red: deprecated `Membership::learner_ids` at TLS test lines799/829 under `-D warnings`; fmt PASS. Focused27, guard and M1/M2/M3 NOT RUN. No fix/rerun after red. [Evidence](evidence/m3-learner-catch-up.md).
+- Blockers: coordinator disposition of L1 Clippy red required before further work; independent Opus review and publication gates pending. L2 and D1/D2/D3 remain unapproved; bootstrap trust cycle unresolved. Main CI green remains reused coordinator evidence; Windows fixture27 unverified, M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3260,3 +3260,6 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Root verified PR167run44068215957 attempt1SUCCESS, newproofactualPASSperOS, Windows541<=660s, all5gates and freshmain67cc62dCI44064366449green, then normalpinnedsquashmergefa83788. Treeequalsreviewedheade649542; firstmainCI44069931184 pending. No exception, rerun or expanded acceptance.
 
 - 2026-11-17: Root actively awaited mainCI44069931184 attempt1 onfa83788; all3platforms green, wall472s, Windows467s. Finishedlogs confirm F2newproofPASSperOS. No rerun, exception or broader acceptance. Nextlearnercontract is static preparation only.
+
+
+- 2026-11-17: L1 / Sol high / single builder / no children: local source prepared, one final verification round fmt0(0.766s), Clippy101(46.781s); stopped without fix/rerun. Deprecated learner_ids API is incompatible with warnings-as-errors. New runtime proof, focused27, guard and mutants remain unverified. No publication or hardware credit; last merged PR167 unchanged. See learner catch-up evidence for exact source and artifacts.
