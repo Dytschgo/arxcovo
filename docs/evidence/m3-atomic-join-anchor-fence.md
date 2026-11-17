@@ -353,3 +353,25 @@ guard6/sampler60/final fmt/Clippy passed; all4 designated mutants compiled/kille
 at exact assertions and restored. Actual nextest listing passed, custom TLS14
 classifier failed(13,7); stopped without correction/rerun. Independent source/
 exact-head review and hosted gates pending; no publication/hardware acceptance.
+
+## Root inventory disposition (2026-11-17)
+
+Root Sol 6.1 medium read the saved final-inventory.json; no Cargo or engine rerun.
+The child's classifier selected only tls_engine_tests (seven cases) instead of
+ten pki::tls_tests plus the four required engine-file cases. Root also caught an
+initial scratch namespace typo omitting issue::; that static assertion failed
+before artifact creation, then exact saved names supplied the corrected map.
+Neither classifier error changed repository code or test inventory.
+
+Actual saved listing classification: fixture28 ignored, founder13 required,
+pure TLS10 plus required engine-file4 = TLS14, new one-voter issuance1 required.
+Original sample eight names remain; sample filter semantics rely on guard6 and
+sampler60, not an engine execution from this full-list classification. Artifact:
+D:/Temp/arx-anchor-root-disposition/protected-inventories.json, SHA256
+b4dfce89df3e73c6206458b1be9db08419aff2caa64f152b45b87f4b1bbde9e8.
+
+Inventory blocker closed without source changes. The UTF-8-restored malformed
+code literal remains qualified: its old exact bytes were restored after the
+40-case run; no final-byte runtime pass is claimed for that individual case.
+Final compile/static checks cover restored source; hosted CI must execute it.
+Independent full source review remains pending; no publication authority yet.
