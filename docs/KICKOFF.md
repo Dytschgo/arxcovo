@@ -86,21 +86,19 @@ Arxcovo is your base to manage home-lab hosts, VMs and agent deployments, all ex
 
 After v1 (roadmap only, do NOT build in this run; write it as docs/ROADMAP.md): Linux hosts → overlay network → static VMs, backups and updates → board and warm migration → Mac/macOS VMs → GitHub runners → agent spawning and secrets vault → Cloudflare and public publishing → signing and public release.
 
-# Model routing and usage limits (Codex GPT-6.1 Sol + Claude Opus 5.5)
-- You (orchestrator): gpt-6.1-sol, medium. You coordinate and delegate; keep your own turns lean.
-- Opus 5.5 (high): architecture, ADRs, API/MCP contracts, threat model, Raft/join/mTLS protocol design, dashboard UX design and screenshot review, security reviews.
-- Sol (medium; high for MCP, QEMU/WHPX, Windows install, Raft implementation): all other implementation, CI, tests; docs at low.
-- Review rule: the PR reviewer must be the OTHER provider. Sol-built → Opus reviews; Opus-built → Sol reviews.
-- Stuck rule: after 3 failed fix attempts, hand the task to the other provider with the failure notes.
+# Model routing and usage limits (owner update 2026-11-17)
+- Owner instruction supersedes the original cross-provider routing: use GPT-6.1 Sol for engineering, architecture, security and reviews. Claude is reserved for UI work. Existing reviews remain valid; no repeated review is needed solely for this routing change.
+- You (orchestrator): gpt-6.1-sol, medium. Coordinate, inspect evidence and integrate.
+- Sol: medium by default; high for consequential design, security, implementation and review. Documentation corrections may use low effort.
+- Every PR needs an independent reviewer separate from the builder. A separate Sol review is valid for non-UI work. Keep all required checks and exact-head review evidence; the coordinator alone merges.
+- Stuck rule: after three failed fixes, stop and give the failure evidence to a fresh independent reviewer within this routing. Existing exhausted counters and stop rules remain; changing agents never grants another fix attempt.
 - Never use max/ultra effort or fast mode unless a task is blocked and a cheaper attempt already failed.
 
 # Keep working through limits
-- On a usage-limit/rate-limit error, immediately reassign the in-progress task to the other provider with the same brief; do not wait.
-- If the reviewer's provider is limited, the fallback reviewer is grok-4.7 (high). A PR never merges without a review from a model other than its builder.
-- If Opus has less than 15% of its weekly allowance left, defer Opus-only design tasks and continue Sol-able work; queue Opus reviews.
-- If BOTH providers are limited: commit WIP to its branch, write a resume note in docs/PROGRESS.md, schedule an automatic resume of this thread after the 5-hour window, and stop cleanly. Never lose work and never skip reviews to save quota.
-- Run at most 2 builder agents at once (plus 1 reviewer) to avoid draining both windows simultaneously.
-- Record per-task provider, effort and outcome in docs/PROGRESS.md so routing can be tuned.
+- On a usage-limit/rate-limit error, preserve WIP and failure evidence. Continue independent work that fits the owner routing; report a blocked required task rather than switching a non-UI task to Claude or an unapproved model.
+- Keep review pending when no authorized independent reviewer can run. Never skip review to save quota. Do not create a new automatic resume schedule unless the owner requests one.
+- Run at most 2 builder agents plus 1 reviewer. Record per-task provider, effort and outcome in docs/PROGRESS.md.
+- Leave the existing babysitter and its schedule intact. The original setup instructions are historical; this routing update does not authorize cancelling or rescheduling it.
 
 # Development environment rules
 - Real VM tests run on Dylan's Windows 11 Pro PC under the same rules Arxcovo enforces: a dedicated standard (non-admin) user account, a dedicated folder with a disk cap for test VMs, and a RAM/CPU reserve for Dylan.
@@ -133,7 +131,7 @@ Each check-in (scheduled every 3 hours; keep each one short and cheap):
 2. Check against the kickoff prompt:
    - Scope: is it working on v1 milestones 1–6 in order? Flag any post-v1 feature work, redesign of settled decisions, or reinvented council/score-gate/evidence ceremonies.
    - Progress: has something merged since the last check? If the same task or failure has persisted across 2 check-ins, or the 3-attempt stuck rule was ignored, call it out.
-   - Rules: every merged PR has CI green, ci-time-budget green, and an `agent-review` from a different provider than its builder. Outsider PRs did not auto-merge. CI stays under 15 minutes.
+   - Rules: every merged PR has CI green, ci-time-budget green, and an `agent-review` from an independent reviewer separate from its builder under the owner routing above. Outsider PRs did not auto-merge. CI stays under 15 minutes.
    - Honesty: anything not exercised on real hardware is labelled unverified; no claimed passes without runs; no secrets or private owner data in commits/logs.
    - Safety: nothing touched D:\Code\LabManager, its installed app/state, or the Hyper-V VM agent-windows-test. No admin steps performed on the owner's PC.
    - Limits: if the orchestrator stopped on a usage limit, check that WIP was committed and a resume was scheduled. If it stalled with no resume, send it the resume instruction.

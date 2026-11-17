@@ -3269,3 +3269,8 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 ### L1 source review and publication correction - 2026-11-17
 
 - Opus source PASS 367db822 at 16873ce1. Root corrected R1 stale headlines, R2 missing artifact hashes and R3 alias wording; code unchanged. Normal hosted gates and Windows <=660 s remain required. L2/promotion unapproved; hardware paths **unverified on real hardware**.
+
+### Owner model routing update - 2026-11-17
+
+- Owner corrected the model request to Sol 6.1, with Claude only for UI work. Root Sol medium updated AGENTS and KICKOFF: non-UI engineering, architecture/security and independent reviews use Sol 6.1. A separate reviewer remains mandatory; existing reviews and all required gates remain valid.
+- Existing Windows fix budgets and stop rules are unchanged (Sol3/3, Opus0/2); no extra repair is granted. Existing babysitter remains intact. This documentation change ran only UTF-8 and whitespace checks; independent Sol review remains required before publication.
