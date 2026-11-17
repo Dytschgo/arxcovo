@@ -4,8 +4,9 @@
 
 **Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
 `r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
-outside the eight quarantines. The cause is unknown. This independently reviewed change adds a Windows-only
-R5 quarantine: an exception, not a fix. PR162 diagnostics remain
+outside the eight quarantines. The cause is unknown. The owner-authorized local implementation quarantines all 24 Windows fixture tests
+(13 three_node and 11 issuance); independent Opus review remains required before push.
+This is an exception, not a fix. PR162 diagnostics remain
 held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
 under the active wall policy; 738 s charged remains uncredited because the run is red.
 ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
@@ -56,6 +57,27 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 | Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
 
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
+
+## Whole-fixture quarantine checkpoint (2026-11-17)
+
+Sol high implements the owner-authorized 24-case Windows boundary from prepared
+b0345f3d (main source c612152; PR164 prior 17a3fb2a). Original eight sampled gates
+and declarations are unchanged; five R1–R5 exclusions keep the sample at eight.
+All eleven issuance cases are outside the sample. Pure attribution stays required;
+D1 controls unchanged. Ubuntu/macOS must execute all 24; Windows fixture coverage
+is unverified on hosted Windows and **unverified on real hardware**. M2 remains
+open; M3 unchecked. Shared fix attempts Sol3/3, Opus0/2 unchanged.
+
+Prior PR164 I4 red is retained; Opus induced exact I4 once and counterfactual
+passed, hooks removed, hosted cause/rate unproven. No engine behavior, stability
+or green-main claim. Independent Opus review before push; four hosted gates before
+root's final-exact-head one-use budget-only owner exception question. ADR0025 is
+accepted but inactive, bootstrap unauthorized. No hosted rerun or publication.
+Local results and source/log pins: [fixture evidence](evidence/m3-windows-fixture-quarantine.md).
+Final guard2/2 + sampler60/60 pass; fmt/workspace locked-offline Clippy pass.
+Real nextest lists24 ignored/pure unit required/sample8, R1–R5 mismatched; ordinary
+fixture selection0executed/expected exit4. Two routine corrections (sampler test
+expectations, documentation encoding); no runtime correction or attempt counter spent. Last merged PR remains PR161; current main RED facts above apply.
 
 ## Task history
 

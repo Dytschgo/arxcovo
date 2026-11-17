@@ -36,3 +36,31 @@ uncredited because Windows failed. ADR0025 acceptance alone cannot clear the act
 budget gate. All five gates and a later explicit owner budget decision remain required;
 this addendum does not extend the prior restore-green exception to the budget.
 M2 remains open, M3 unchecked, Windows three-node **unverified on real hardware**.
+
+## Whole-fixture addendum: owner authorization, 2026-11-17
+
+The [full-fixture contract](../briefs/m3-windows-fixture-quarantine.md) supersedes
+R5-only scope and its independent re-enable criteria above. Quarantine all 13 async
+three_node fixture cases and all 11 issuance fixture cases on Windows; Ubuntu/macOS
+must execute all 24. The pure read-attribution unit remains required. The three D1
+controls retain their pre-existing global ignores. Original eight attributes and
+EXPECTED/REASON declarations remain byte-identical. R1–R5 and issuance share the
+whole-fixture reason; R5's earlier reason is normalized. Bodies remain unchanged.
+
+Coverage loss: all 24 are excluded from ordinary Windows execution. Only the
+original eight may execute through the bounded non-gating diagnostic sample;
+R1–R5 and issuance have no Windows execution coverage. Five fixed FILTER exclusions
+keep the sampler at eight; issuance is outside its namespace. A green sample is no
+Windows acceptance or re-enable evidence. Windows fixture coverage is unverified
+on hosted Windows and **unverified on real hardware**. Re-enable as one reviewed
+fixture suite after a separately bounded timing recovery plan with meaningful
+slow-storage evidence and hosted acceptance; no further per-test expansion.
+
+The prior PR164 I4 red is retained. Opus's injected-latency follow-up reproduced
+exact I4 once, counterfactual passed, hooks removed; hosted cause and reproduction
+rate remain unproven. Sol attempts 3/3, Opus 0/2 unchanged. M2 open, M3 unchecked.
+Current main c612152 remains RED (1475 s wall / 738 s charged, uncredited).
+Independent Opus review is required before push. After four hosted gates pass,
+root must ask the owner for a one-use budget-only exception for the final exact
+head. ADR0025 is accepted but inactive; bootstrap remains unauthorized. No
+publishing or hosted action was performed by this implementation task.

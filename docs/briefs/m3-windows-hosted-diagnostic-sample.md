@@ -2,7 +2,7 @@
 
 Status: **proposed, corrected** (Anthropic / Claude Opus 5.5 / high, design sub-agent, 2026-11-16) on `9f3ee35`, which sits on main `58d06c1` (PR #153 D1). This revision closes Sol review B1–B4 and the output-grammar requirement (`docs/reviews/m3-hosted-sample-sol-contract-review.md`).
 This brief is docs only. Nothing was built, run or dispatched. Sol must recheck it before any sample workflow change.
-It authorizes no fix and no re-enable. The eight sampled Windows ignores and their IDs stay unchanged. The accepted [R5 quarantine contract](m3-r5-quarantine-restoration.md) adds a separate unsampled inventory to the guard. **Coverage loss: Windows R5 does not run in either the gate or this sample; Linux/macOS R5 remains required.** M3 stays unchecked, and Windows three-node is unverified on hosted Windows and **unverified on real hardware**. M2 stays open: A7 is NO-GO, and A12 is consumed with no retry.
+It authorizes no fix and no re-enable. The eight sampled Windows ignores and their IDs stay unchanged. The accepted [whole-fixture contract](m3-windows-fixture-quarantine.md) pins 24 Windows ignores: 13 three_node fixture tests plus 11 issuance fixture tests. **Coverage loss: R1–R5 and all 11 issuance tests run in neither the Windows gate nor this sample; Ubuntu/macOS must execute all 24.** The bounded non-gating sample is an explicit exception for only the original eight, without Windows acceptance credit. The pure attribution unit remains required everywhere; three D1 controls stay globally ignored unchanged. M3 stays unchecked, and Windows three-node is unverified on hosted Windows and **unverified on real hardware**. M2 stays open: A7 is NO-GO, and A12 is consumed with no retry.
 
 ## Verified inputs
 
@@ -14,7 +14,7 @@ It authorizes no fix and no re-enable. The eight sampled Windows ignores and the
   - **JUnit write** (`aggregator/junit.rs`): written once, on `RunFinished`, with `File::create` (truncate, not atomic) then `serialize`. A write error becomes `TestRunnerExecuteErrors`, which exits **110**. So a normal exit 0 or 100 means a complete file was written. If nextest is killed before or during `RunFinished`, the file is missing or truncated. `quick-junit` strips ANSI escapes and XML-invalid control characters from all strings, so test output cannot make a complete file malformed.
   - **JUnit types** (`non_success_kind_and_type`): `test failure with exit code N` (N ≥ 1; negative Windows codes become aborts), `test abort`, `test timeout`, `execution failure`, `test exited with code 0, but leaked handles so was marked failed`, plus the `(leaked handles)` suffix on failure/abort. A pass that leaks with the default `on-timeout` is a success with no failure element.
   - Exit codes: 0 OK; 100 test run failed or cancelled; 4, 94, 96, 101, 102, 104, 110 for no tests, filterset, setup, build/panic, metadata, list and write-output failures.
-- **Workflow constraints.** `scripts/ci-workflow.test.mjs` pins one `timeout-minutes: 12`, one job-wide `env:` block, no other `CARGO_*` token and the exact playwright line. `tools/ci/test_windows_cluster_quarantine.py` pins eight sampled ignores plus the separate unsampled R5 ignore.
+- **Workflow constraints.** `scripts/ci-workflow.test.mjs` pins one `timeout-minutes: 12`, one job-wide `env:` block, no other `CARGO_*` token and the exact playwright line. `tools/ci/test_windows_cluster_quarantine.py` pins eight sampled ignores, five unsampled three_node ignores and eleven issuance ignores.
 - **D1 output.** `diagnostics.rs` at `58d06c1` prints one `[DIAG-3n] pass …` line on success and, from a drop guard, a dump of at most 8192 bytes on failure. Its line forms are the grammar below. Other test output (panics, `RPC counters`, `R6 …`) can contain paths and is never released.
 
 ## Budget and C1
@@ -42,10 +42,10 @@ A fixed +90 s step is **not robust**: 598 + 90 = 688 s, and 708 + 90 = 798 s exc
 ```
 cargo nextest {list -T json | run} --workspace --locked --cargo-quiet --user-config-file none \
   --config-file tools/ci/windows-diag-sample.nextest.toml -P diag-sample --run-ignored only --no-tests fail \
-  -E 'package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)'
+  -E 'package(arxd) & kind(lib) & test(/^cluster::consensus::three_node::/) & not test(=cluster::consensus::three_node::r1_apply_wait_deadline) & not test(=cluster::consensus::three_node::r2_isolated_read_refusal) & not test(=cluster::consensus::three_node::r3_store_wait_deadline_and_heartbeat) & not test(=cluster::consensus::three_node::r4_read_admission_and_caller_abort) & not test(=cluster::consensus::three_node::r5_shutdown_read_owners)'
 ```
 
-**Inventory (gates before `run`).** In the `list` JSON, exactly one suite (binary-id `arxd`, kind `lib`) has matches; its matched names equal `cluster::consensus::three_node::` + each `EXPECTED` name imported from `test_windows_cluster_quarantine.py`; all eight are `ignored: true`; nothing else matches. R5 is `ignored: true` with an `expression` mismatch, explicitly excluded by the fixed filter. The exclusion equals the guard's `WINDOWS_UNSAMPLED` inventory in tests only; runtime argv remains built from constants.
+**Inventory (gates before `run`).** In the `list` JSON, exactly one suite (binary-id `arxd`, kind `lib`) has matches; its matched names equal `cluster::consensus::three_node::` + each `EXPECTED` name imported from `test_windows_cluster_quarantine.py`; all eight are `ignored: true`; nothing else matches. Each of R1–R5 is `ignored: true` with an `expression` mismatch, excluded by five fixed exact-name terms. Issuance is outside the namespace. The exclusion equals the guard's `WINDOWS_UNSAMPLED` inventory in tests only; runtime argv remains built from constants.
 
 ## Ownership and cancellation (Windows Job Object, stdlib `ctypes` only)
 
@@ -112,7 +112,7 @@ trunc id=<ID> dropped_lines=<u16> dropped_bytes=<u32>    reject id=<ID> n=<u16> 
    - exit 0/1 per outcome; `internal` without traceback; a source scan finding no `taskkill`, `psutil` or `os.kill`.
 5. `scripts/ci-workflow.test.mjs`: one new test pinning anchor-first-before-checkout and sample-last (Windows-only, exact one-line text with `&&`), the ordered list of the 25 existing step identifiers, and no `continue-on-error`. Existing tests still pin one `timeout-minutes` and no other `CARGO_`.
 
-**Original sample implementation scope (superseded only by the accepted R5 contract):** `three_node.rs`, `diagnostics.rs`, `test_windows_cluster_quarantine.py`, Cargo files, other workflows were untouched. The R5 exception now adds its single ignore and the separate guard inventory; diagnostics, Cargo files and workflows remain untouched. The coordinator owns PROGRESS and any ADR 0024 note.
+**Original sample implementation scope (superseded by the accepted whole-fixture contract):** `three_node.rs`, `diagnostics.rs`, `test_windows_cluster_quarantine.py`, Cargo files, other workflows were untouched. The whole-fixture exception pins all 24 ignores and the separate inventories; diagnostics, Cargo files and workflows remain untouched. The coordinator owns PROGRESS and any ADR 0024 note.
 
 **Local evidence Opus must report** (dev host, current user, unique target under D:): the unittest file and `npm test`; one real wrapper run with `outcome`, phase times and `orphans=0`; one manual Job Object control where a Python grandchild sleeping 600 s is reaped with `ActiveProcesses=0`; one manual assign-failure control (assign to a closed job handle) showing the blocked child killed. Hosted ownership stays unverified until the PR's own run.
 

@@ -1,5 +1,7 @@
 # M3 R5 Windows quarantine restoration: implementation contract
 
+Historical R5-only contract: superseded by [the owner-authorized full-fixture contract](m3-windows-fixture-quarantine.md). Its independent R5 re-enable path no longer governs: restore the fixture suite together under a separately reviewed bounded timing recovery plan. Failure evidence below is retained.
+
 Opus 5.5 high architecture/security brief. Sol implements; Opus reviews (different provider).
 This is a narrow quarantine *exception* to restore green main. It is **not a fix**. Attempt
 counts are unchanged: Sol shared fixes 3/3 exhausted, Opus fixes 0/2 (none spent here).
