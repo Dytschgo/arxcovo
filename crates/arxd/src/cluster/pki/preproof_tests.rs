@@ -58,6 +58,7 @@ impl Driver {
         for _ in 0..32 {
             let mut bytes = [0; 4096];
             let n = c.drain(&mut bytes)?;
+            let client_sent = n;
             self.outgoing = self.outgoing.checked_add(n).ok_or(Refused)?;
             if self.outgoing > 128 * 1024 {
                 return Err(Refused);
@@ -83,7 +84,7 @@ impl Driver {
                 }
                 input = &input[n..];
             }
-            if n == 0 && !s.wants_write() {
+            if client_sent == 0 && n == 0 && !s.wants_write() {
                 return Ok(());
             }
         }
