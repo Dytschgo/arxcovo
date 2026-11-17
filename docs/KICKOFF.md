@@ -96,7 +96,7 @@ After v1 (roadmap only, do NOT build in this run; write it as docs/ROADMAP.md): 
 
 # Keep working through limits
 - On a usage-limit/rate-limit error, preserve WIP and failure evidence. Continue independent work that fits the owner routing; report a blocked required task rather than switching a non-UI task to Claude or an unapproved model.
-- Keep review pending when no authorized independent reviewer can run. Never skip review to save quota. Do not create a new automatic resume schedule unless the owner requests one.
+- Keep review pending when no authorized independent reviewer can run. Never skip review to save quota. If usage limits block all authorized work, commit WIP, record a resume note in docs/PROGRESS.md, schedule the existing five-hour automatic resume of this thread, and stop cleanly. Resume within the owner-approved model routing.
 - Run at most 2 builder agents plus 1 reviewer. Record per-task provider, effort and outcome in docs/PROGRESS.md.
 - Leave the existing babysitter and its schedule intact. The original setup instructions are historical; this routing update does not authorize cancelling or rescheduling it.
 
@@ -114,7 +114,7 @@ After v1 (roadmap only, do NOT build in this run; write it as docs/ROADMAP.md): 
 
 # Stop conditions (otherwise keep working)
 - A step needs the owner's admin action, payment, account or credential (e.g. GitHub App creation, Cloudflare account). Write exactly what is needed in docs/PROGRESS.md, continue with other unblocked work, and report it at the end.
-- The same failure persists after three genuinely different fix attempts by both providers. Document it and move on to unblocked work.
+- The same failure persists after its authorized fix attempts are exhausted. Preserve the counters, document the failure and move on to unblocked work.
 - v1 milestones 1–6 are complete.
 
 # Final report

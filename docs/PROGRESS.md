@@ -3274,3 +3274,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Owner corrected the model request to Sol 6.1, with Claude only for UI work. Root Sol medium updated AGENTS and KICKOFF: non-UI engineering, architecture/security and independent reviews use Sol 6.1. A separate reviewer remains mandatory; existing reviews and all required gates remain valid.
 - Existing Windows fix budgets and stop rules are unchanged (Sol3/3, Opus0/2); no extra repair is granted. Existing babysitter remains intact. This documentation change ran only UTF-8 and whitespace checks; independent Sol review remains required before publication.
+
+- Routing review 5b25560 found R1: root accidentally changed automatic resume policy. Root restored the existing five-hour usage-limit resume policy within the accepted model routing; no schedule was created, cancelled or changed. Existing attempt caps remain exhausted.
