@@ -10,7 +10,7 @@ observation rather than a fix. All five normal gates and full protection remain
 active. Windows fixture coverage is unverified on hosted Windows and **unverified
 on real hardware**. M2 open/M3 unchecked; ADR0025 remains inactive.
 
-**Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI remains pending.
+**Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
 **Historical restoration:** exact87c9940 CI43823823164 success after S2b repair. Windowsjob396s/install7s/bothsmokespass. OriginalfailedC1firstconfirmation43819925277 remains historical; this newsource-repair run is not a rerun. No feature merge without fresh exact-main green verification.
 
@@ -33,7 +33,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #159 as `67cc62d538905f3d2ed89a7676d1a71b9f4617ff`, exacthead2c4f973a, all five normal gates and Opus PASS6945132966. Windows465s; Ubuntu/mac all27fixtures and everyTLS test PASS, UbuntuS8 PASS. First main CI44064366449 attempt1 passed in 610s wall, Windows606s.
-- Current work: F2 test-only real-identity TLS source `1f315bcb0b83f550ee3564e3c667f9477df11d18` implemented locally (Sol high, single builder/no children): required26 PASS across TLS13 and missing founder13 selections, guard4/fmt/workspace all-target offline Clippy PASS. N1/N2 caught once; production hashes restored exactly. Independent Opus review pending. One single-voter founder/shared committed registry; no joiner replica or multi-host credit. [Evidence](evidence/m3-founder-joiner-tls.md).
+- Current work: publish the real founder/joiner TLS proof. Sol source1f315bcb passed local fmt/Clippy, 26 unique required tests and guard4; intentional N1/N2 mutants each failed once and production bytes were restored. Independent Opus implementation PASSa219c63c is retained. Exact-head review and normal hosted gates follow; claims stay one process and one shared committed founder registry.
 - Blockers: F2 independent Opus source review then exact-head publication review remain; hosted gates and Windows <=660 s precede merge. Production custody, transport, learner catch-up and freshness policy are separate. Windows fixture27 remains quarantined, M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged. No further exception, rerun or timing waiver.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3254,3 +3254,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: Root verified PR159 hostedrun44062696091 attempt1green, Windows465<=660, UbuntuS8 and all27fixtures/all15TLS cases on Ubuntu/mac (Windowsrequired12TLS) PASS, freshmainc40c547CI44058803351green, then pinned normalmerge67cc62d. Squash tree equalsreviewedhead2c4f973a; newmainCI44064366449 pending. No exception or rerun, no S8fix/Windowsstability credit.
 
 - 2026-11-17: Root actively awaited exact TLSmainCI44064366449 attempt1; all3platformsgreen, wall610s, Windows606s. Finishedlogs confirm Ubuntu/mac27fixtures+allTLS, Windowsrequired12TLS and UbuntuS8 PASS. No stability/fix credit or rerun. F2 acceptedcontract may proceed locally.
+
+- 2026-11-17: Retained Opus high F2 implementation PASSa219c63c: reviewer verified all11artifacthashes, 26uniquePASS and once-onlyN1/N2catches/restoredbytes, realissuedleaf/key/SAN/serial/bothroleidentities/retainedconfigrevocation/shutdown assertions. Root guard4 and source-restoration hashes verified. Currentmain67cc62d CI44064366449green; publish with frozenproduction and unchanged27quarantine/sample8. No hosted F2 acceptance yet.
