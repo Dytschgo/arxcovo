@@ -49,6 +49,9 @@ pub(crate) fn encode(s: &EnrollmentState, b: &mut Vec<u8>) {
             b.extend(c.request);
             b.extend(c.key.0);
             b.extend(c.node.get().to_be_bytes());
+            b.extend(c.anchor.0);
+            super::super::state_store::put_pos(b, c.origin);
+            b.extend(c.original_applied_ms.to_be_bytes());
         }
     }
     b.push(u8::from(s.founded));
@@ -66,7 +69,7 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> 
         return Err(StoreError::Corrupt);
     }
     let count = r.u16()? as usize;
-    if count > MAX_RECORDS {
+    if count > MAX_RECORDS || 4866 + count * 209 > 16384 {
         return Err(StoreError::Corrupt);
     }
     let mut records = BTreeMap::new();
@@ -99,7 +102,27 @@ pub(crate) fn decode(r: &mut Reader<'_>) -> Result<EnrollmentState, StoreError> 
             if node >= next_node_id || !nodes.insert(node) {
                 return Err(StoreError::Corrupt);
             }
-            Some(Consumption { request, key, node })
+            {
+                let anchor = JoinAnchor(r.array()?);
+                let origin = super::super::state_store::get_pos(r)?;
+                let original_applied_ms = r.u64()?;
+                if origin.index > i64::MAX as u64
+                    || original_applied_ms > committed_ms
+                    || original_applied_ms
+                        .checked_add(2 * SKEW_MS)
+                        .is_none_or(|t| t >= expires_ms)
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                Some(Consumption {
+                    request,
+                    key,
+                    node,
+                    anchor,
+                    origin,
+                    original_applied_ms,
+                })
+            }
         } else {
             if committed_ms + 2 * SKEW_MS < expires_ms {
                 pending += 1;
@@ -207,15 +230,17 @@ pub(crate) fn encode_command(c: &Command, b: &mut Vec<u8>) {
             code,
             presented,
             key,
+            anchor,
             proposed_at_ms,
         } => {
-            b.push(2);
+            b.push(6);
             b.extend(cluster);
             b.extend(request);
             b.extend(code);
             b.extend(presented.bytes());
             b.extend(key.0);
             b.extend(proposed_at_ms.to_be_bytes());
+            b.extend(anchor.0);
         }
     }
 }
@@ -254,14 +279,32 @@ pub(crate) fn decode_command(tag: u8, r: &mut Reader<'_>) -> Result<Command, Sto
             verifier: CodeVerifier::from_bytes(r.array()?),
             proposed_at_ms: r.u64()?,
         },
-        2 => Command::Redeem {
+        2 => return Err(StoreError::Unsupported),
+        6 => Command::Redeem {
             cluster: r.array()?,
             request: r.array()?,
             code: r.array()?,
             presented: CodeVerifier::from_bytes(r.array()?),
             key: KeyDigest(r.array()?),
             proposed_at_ms: r.u64()?,
+            anchor: JoinAnchor(r.array()?),
         },
         _ => return Err(StoreError::Corrupt),
     })
+}
+
+pub(crate) fn validate_origins(
+    s: &EnrollmentState,
+    applied: Option<LogPos>,
+) -> Result<(), StoreError> {
+    for c in s.records.values().filter_map(|r| r.consumed.as_ref()) {
+        let a = applied.ok_or(StoreError::Corrupt)?;
+        if c.origin.index > a.index
+            || c.origin.term > a.term
+            || (c.origin.index == a.index && c.origin != a)
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    Ok(())
 }

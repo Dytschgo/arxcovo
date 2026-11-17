@@ -48,6 +48,7 @@ async fn enroll(c: &mut Cluster, ca: &ClusterCa, key: &KeyPair, marker: u8) -> I
                 request: [marker; 16],
                 code: code.code_id(),
                 proof: code.proof(),
+                anchor: code.anchor(),
             },
             csr.der(),
         )
@@ -389,7 +390,7 @@ async fn founder_joiner_mutual_tls_real_identities() {
             fkey.subject_public_key_info(),
             jkey.subject_public_key_info()
         );
-        let code = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+        let code = JoinCode::generate([1; 16], ca.fingerprint(), observed_anchor(&n), |b| {
             b.fill(15);
             Ok::<_, ()>(())
         })
@@ -413,6 +414,7 @@ async fn founder_joiner_mutual_tls_real_identities() {
                     request: [5; 16],
                     code: code.code_id(),
                     proof: code.proof(),
+                    anchor: code.anchor(),
                 },
                 jcsr.der(),
             )
@@ -640,7 +642,7 @@ async fn learner_catch_up_gives_joiner_own_registry() {
             fkey.subject_public_key_info(),
             jkey.subject_public_key_info()
         );
-        let code = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+        let code = JoinCode::generate([1; 16], ca.fingerprint(), observed_anchor(&n1), |b| {
             b.fill(15);
             Ok::<_, ()>(())
         })
@@ -664,6 +666,7 @@ async fn learner_catch_up_gives_joiner_own_registry() {
                     request: [5; 16],
                     code: code.code_id(),
                     proof: code.proof(),
+                    anchor: code.anchor(),
                 },
                 jcsr.der(),
             )
@@ -692,7 +695,7 @@ async fn learner_catch_up_gives_joiner_own_registry() {
             assert_eq!(m.last_log_index, None);
             assert_eq!(m.current_term, 0);
         }
-        let code2 = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+        let code2 = JoinCode::generate([1; 16], ca.fingerprint(), observed_anchor(&n1), |b| {
             b.fill(16);
             Ok::<_, ()>(())
         })
@@ -939,4 +942,12 @@ async fn learner_catch_up_gives_joiner_own_registry() {
     })
     .await
     .unwrap();
+}
+
+fn observed_anchor(n: &ConsensusNode) -> crate::cluster::enrollment::JoinAnchor {
+    let store = n.sm.as_ref().unwrap().0.lock().unwrap();
+    let membership =
+        crate::cluster::membership::Membership::decode(store.membership().unwrap().1.bytes())
+            .unwrap();
+    store.state().voter_anchor(&membership).unwrap()
 }

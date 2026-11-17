@@ -256,7 +256,7 @@ bounded!(f5_joiner_two, async {
     let ca = ClusterCa::ephemeral([1; 16], NOW);
     let other = ClusterCa::ephemeral([1; 16], NOW);
     let founder = issue(&n, &ca, &a).await.unwrap();
-    let code = JoinCode::generate([1; 16], ca.fingerprint(), |b| {
+    let code = JoinCode::generate([1; 16], ca.fingerprint(), observed_anchor(&n), |b| {
         b.fill(15);
         Ok::<_, ()>(())
     })
@@ -285,6 +285,7 @@ bounded!(f5_joiner_two, async {
                 request: [5; 16],
                 code: code.code_id(),
                 proof: code.proof(),
+                anchor: code.anchor(),
             },
             &b,
         )
@@ -602,3 +603,11 @@ bounded!(f10_shutdown_owns_closure, async {
         Err(FoundError::Unavailable)
     ));
 });
+
+fn observed_anchor(n: &ConsensusNode) -> crate::cluster::enrollment::JoinAnchor {
+    let store = n.sm.as_ref().unwrap().0.lock().unwrap();
+    let membership =
+        crate::cluster::membership::Membership::decode(store.membership().unwrap().1.bytes())
+            .unwrap();
+    store.state().voter_anchor(&membership).unwrap()
+}

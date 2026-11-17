@@ -58,7 +58,7 @@ fn valid_pos(p: LogPos) -> Result<LogPos, StoreError> {
     }
 }
 fn encode_row(p: LogPos, e: &Entry) -> Vec<u8> {
-    let mut b = b"ARXLE1\0\0".to_vec();
+    let mut b = b"ARXLE2\0\0".to_vec();
     put_pos(&mut b, p);
     match e {
         Entry::Blank => b.push(0),
@@ -73,16 +73,22 @@ fn encode_row(p: LogPos, e: &Entry) -> Vec<u8> {
 }
 fn decode_row(b: &[u8]) -> Result<(LogPos, Entry), StoreError> {
     let mut r = reader(b, MAX_ROW)?;
-    if r.bytes(8)? != b"ARXLE1\0\0" {
+    let magic = r.bytes(8)?;
+    if magic == b"ARXLE1\0\0" {
+        return Err(StoreError::Unsupported);
+    }
+    if magic != b"ARXLE2\0\0" {
         return Err(StoreError::Corrupt);
     }
     let p = valid_pos(get_pos(&mut r)?)?;
     let e = match r.bytes(1)?[0] {
         0 => Entry::Blank,
-        t @ (1 | 2 | 4 | 5) => Entry::Enrollment(codec::decode_command(t, &mut r)?),
+        t @ (1 | 2 | 4 | 5 | 6) => Entry::Enrollment(codec::decode_command(t, &mut r)?),
         3 => {
             let n = r.u16()? as usize;
-            Entry::Membership(MembershipBlob::new(r.bytes(n)?.to_vec())?)
+            let m = MembershipBlob::new(r.bytes(n)?.to_vec())?;
+            super::membership::Membership::decode(m.bytes()).map_err(|_| StoreError::Membership)?;
+            Entry::Membership(m)
         }
         _ => return Err(StoreError::Corrupt),
     };
@@ -93,7 +99,7 @@ fn decode_row(b: &[u8]) -> Result<(LogPos, Entry), StoreError> {
 }
 fn encode_meta(m: &Meta) -> Vec<u8> {
     let mut b = b"ARXLM1\0\0".to_vec();
-    b.extend(1u16.to_be_bytes());
+    b.extend(2u16.to_be_bytes());
     b.extend(m.cluster);
     b.push(u8::from(m.vote.is_some()));
     if let Some(v) = m.vote {
@@ -114,8 +120,13 @@ fn encode_meta(m: &Meta) -> Vec<u8> {
 }
 fn decode_meta(b: &[u8]) -> Result<Meta, StoreError> {
     let mut r = reader(b, 256)?;
-    if r.bytes(8)? != b"ARXLM1\0\0" || r.u16()? != 1 {
+    if r.bytes(8)? != b"ARXLM1\0\0" {
         return Err(StoreError::Corrupt);
+    }
+    match r.u16()? {
+        2 => {}
+        1 => return Err(StoreError::Unsupported),
+        _ => return Err(StoreError::Corrupt),
     }
     let cluster = r.array()?;
     let vote = if r.flag()? {
@@ -189,7 +200,7 @@ impl VoteLogStore {
         let tx = db.transaction()?;
         let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
-            tx.execute_batch("CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), blob BLOB NOT NULL CHECK(length(blob)<=256)); CREATE TABLE log(idx INTEGER PRIMARY KEY CHECK(idx>=0), body BLOB NOT NULL CHECK(length(body)<=4163)); PRAGMA user_version=1;")?;
+            tx.execute_batch("CREATE TABLE meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), blob BLOB NOT NULL CHECK(length(blob)<=256)); CREATE TABLE log(idx INTEGER PRIMARY KEY CHECK(idx>=0), body BLOB NOT NULL CHECK(length(body)<=4163)); PRAGMA user_version=2;")?;
             tx.execute(
                 "INSERT INTO meta VALUES(1,?1)",
                 [encode_meta(&Meta {
@@ -199,7 +210,7 @@ impl VoteLogStore {
                     tail: None,
                 })],
             )?;
-        } else if version != 1 {
+        } else if version != 2 {
             return Err(StoreError::Unsupported);
         }
         let mut stmt = tx.prepare("SELECT singleton,blob FROM meta LIMIT 2")?;
@@ -433,6 +444,10 @@ impl VoteLogStore {
             }
             if prev.is_some_and(|q| q.index.checked_add(1) != Some(p.index) || *p <= q) {
                 return Err(StoreError::OutOfOrder);
+            }
+            if let Entry::Membership(m) = e {
+                super::membership::Membership::decode(m.bytes())
+                    .map_err(|_| StoreError::Membership)?;
             }
             let b = encode_row(*p, e);
             if b.len() > MAX_ROW {

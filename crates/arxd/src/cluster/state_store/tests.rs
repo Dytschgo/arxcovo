@@ -21,7 +21,7 @@ fn pos(index: u64) -> LogPos {
 }
 pub(in crate::cluster) fn code(n: u8) -> JoinCode {
     let mut call = 0;
-    JoinCode::generate([1; 16], [4; 32], |b: &mut [u8]| {
+    JoinCode::generate([1; 16], [4; 32], fixture_anchor(), |b: &mut [u8]| {
         call += 1;
         b.fill(if call == 1 { n } else { 0xa7 });
         Ok::<_, ()>(())
@@ -47,6 +47,7 @@ pub(in crate::cluster) fn redeem(n: u8, time: u64) -> Entry {
         c.code_id(),
         &c.proof(),
         KeyDigest::of_spki(&[n]).unwrap(),
+        c.anchor(),
         time,
     ))
 }
@@ -69,7 +70,7 @@ fn base(s: &mut StateStore) {
     s.apply(pos(0), &mint(5, 0)).unwrap();
     s.apply(
         pos(1),
-        &Entry::Membership(MembershipBlob::new(b"synthetic members".to_vec()).unwrap()),
+        &Entry::Membership(MembershipBlob::new(fixture_membership().encode().unwrap()).unwrap()),
     )
     .unwrap();
 }
@@ -107,7 +108,7 @@ fn membership_size_boundary_reaches_constructor_and_decoder() {
     rich(&mut s);
     let mut image = s.image.clone();
     image.membership = Some((pos(1), MembershipBlob(vec![0x42; 4096])));
-    assert_eq!(decode(&encode(&image)), Ok(image.clone()));
+    assert_eq!(decode(&encode(&image)), Err(StoreError::Membership));
     image.membership = Some((pos(1), MembershipBlob(vec![0x42; 4097])));
     let oversized = encode(&image);
     assert!(oversized.len() < LIMIT);
@@ -131,7 +132,7 @@ fn canonical_roundtrip_and_semantic_decoder_rejections() {
         assert_eq!(decode(&b[..n]), Err(StoreError::Corrupt));
     }
     corrupt(&b, |x| x[0] ^= 1);
-    corrupt(&b, |x| x[9] = 3);
+    corrupt(&b, |x| x[9] = 4);
     corrupt(&b, |x| x[10] = 2);
     corrupt(&b, |x| x[35] = 2);
     // Membership starts at 36; applied position starts at 11.
@@ -143,14 +144,14 @@ fn canonical_roundtrip_and_semantic_decoder_rejections() {
     });
     corrupt(&b, |x| x[60..62].copy_from_slice(&0u16.to_be_bytes()));
     corrupt(&b, |x| x[60..62].copy_from_slice(&4097u16.to_be_bytes()));
-    let start = 62 + b"synthetic members".len(); // state cluster, next, committed, count
+    let start = 62 + fixture_membership().encode().unwrap().len(); // state cluster, next, committed, count
     corrupt(&b, |x| set64(x, start + 16, 0));
     corrupt(&b, |x| set64(x, start + 24, enrollment::MAX_TIME_MS + 1));
     corrupt(&b, |x| {
         x[start + 32..start + 34].copy_from_slice(&65u16.to_be_bytes())
     });
     let first = start + 34;
-    let second = first + 145;
+    let second = first + 209;
     let third = second + 89;
     corrupt(&b, |x| {
         let id = x[first..first + 16].to_vec();
@@ -170,7 +171,7 @@ fn canonical_roundtrip_and_semantic_decoder_rejections() {
     // A second consumption with a duplicate node; recompute digest to reach node validation.
     corrupt(&b, |x| {
         x[second + 88] = 1;
-        let consumption = x[first + 89..first + 145].to_vec();
+        let consumption = x[first + 89..first + 209].to_vec();
         x.splice(second + 89..second + 89, consumption);
     });
     corrupt(&b, |x| {
@@ -228,14 +229,14 @@ fn open_and_order_fail_closed() {
         StoreError::WrongCluster
     );
     let db = Connection::open(d.path().join("cluster-state.sqlite3")).unwrap();
-    db.pragma_update(None, "user_version", 2).unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
     drop(db);
     assert_eq!(
         StateStore::open(d.path(), init()).unwrap_err(),
         StoreError::Unsupported
     );
     let db = Connection::open(d.path().join("cluster-state.sqlite3")).unwrap();
-    db.pragma_update(None, "user_version", 1).unwrap();
+    db.pragma_update(None, "user_version", 2).unwrap();
     let mut bad = b;
     bad[20] ^= 1;
     db.execute("UPDATE sm SET snapshot=?1", [bad]).unwrap();
@@ -315,6 +316,7 @@ fn install_and_replica_determinism() {
     assert_eq!(dest.install(b"bad"), Err(StoreError::Corrupt));
     let mut lower = source.image.clone();
     lower.applied = Some(LogPos { term: 1, ..pos(5) });
+    lower.state = EnrollmentState::new(init().cluster, init().first_free);
     lower.membership = None;
     assert_eq!(
         dest.install(&encode(&lower)),
@@ -354,10 +356,11 @@ pub(in crate::cluster) fn privacy_markers() -> Vec<Vec<u8>> {
     let raw = hex::decode(&text[6..]).unwrap();
     let secret = &raw[32..64];
     let proof = Sha256::new()
-        .chain_update(b"arxcovo/join/proof/v1")
+        .chain_update(b"arxcovo/join/proof/v2")
         .chain_update(c.cluster())
         .chain_update(c.code_id())
         .chain_update(secret)
+        .chain_update(c.anchor().as_bytes())
         .finalize();
     let mut markers = vec![secret.to_vec(), proof.to_vec(), text.as_bytes().to_vec()];
     let encoded: Vec<_> = markers
@@ -433,10 +436,14 @@ fn crash_child() {
     base(&mut s);
     let mut image = s.image.clone();
     image.applied = Some(pos(2));
-    image.state.apply(match &redeem(5, 1) {
-        Entry::Enrollment(c) => c,
-        _ => unreachable!(),
-    });
+    image.state.apply(
+        match &redeem(5, 1) {
+            Entry::Enrollment(c) => c,
+            _ => unreachable!(),
+        },
+        pos(2),
+        Some(&fixture_membership()),
+    );
     s.hook = Some((d.clone(), mode.ends_with("after")));
     if mode.starts_with("install") {
         s.install(&encode(&image)).unwrap();
@@ -545,8 +552,13 @@ fn maximal_state_is_bounded_and_unsafe_sidecars_are_refused() {
     let d = private_temp();
     let mut s = open(d.path());
     s.apply(LogPos { index: 0, ..pos(0) }, &found()).unwrap();
-    let mut index = 0;
-    for n in 1..=64 {
+    s.apply(
+        pos(0),
+        &Entry::Membership(MembershipBlob::new(fixture_membership().encode().unwrap()).unwrap()),
+    )
+    .unwrap();
+    let mut index = 1;
+    for n in 1..=55 {
         s.apply(pos(index), &mint(n, 0)).unwrap();
         index += 1;
         assert!(matches!(
@@ -554,7 +566,7 @@ fn maximal_state_is_bounded_and_unsafe_sidecars_are_refused() {
             Some(Outcome::Enrolled(_))
         ));
         index += 1;
-        if n <= 49 {
+        if n <= 40 {
             s.apply(
                 pos(index),
                 &Entry::Enrollment(Command::Remove {
@@ -569,7 +581,18 @@ fn maximal_state_is_bounded_and_unsafe_sidecars_are_refused() {
     }
     s.apply(
         pos(index),
-        &Entry::Membership(MembershipBlob::new(vec![0x42; 4096]).unwrap()),
+        &Entry::Membership(
+            MembershipBlob::new(
+                crate::cluster::membership::Membership::new(
+                    vec![(1..=16).collect(), (1..=16).collect()],
+                    (1..=16).map(|n| (n, "a".repeat(200))).collect(),
+                )
+                .unwrap()
+                .encode()
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
     )
     .unwrap();
     let b = s.snapshot();
@@ -632,8 +655,8 @@ fn v1_checksum_valid_refused_without_database_mutation() {
     assert_eq!(std::fs::read(file).unwrap(), bytes);
 }
 #[test]
-fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
-    // Build bytes independently: 64 consumed records, 16 current members and maximum
+fn maximum_v3_image_and_registry_semantics_with_recomputed_checksums() {
+    // Build bytes independently: 55 consumed records, 16 current members and maximum
     // actual membership codec payload (two 16-voter configs, 16 200-byte addresses).
     let mut membership = vec![1, 2];
     for _ in 0..2 {
@@ -650,7 +673,7 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
     }
     assert_eq!(membership.len(), 3605);
     let mut b = b"ARXSM1\0\0".to_vec();
-    b.extend(2u16.to_be_bytes());
+    b.extend(3u16.to_be_bytes());
     b.push(1);
     put_pos(&mut b, pos(1));
     b.push(1);
@@ -659,10 +682,10 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
     b.extend(membership);
     b.extend([1; 16]);
     let next = b.len();
-    b.extend(74u64.to_be_bytes());
+    b.extend(65u64.to_be_bytes());
     b.extend(0u64.to_be_bytes());
-    b.extend(64u16.to_be_bytes());
-    for n in 0..64u8 {
+    b.extend(55u16.to_be_bytes());
+    for n in 0..55u8 {
         b.extend([n; 16]);
         b.extend([2; 16]);
         b.extend([n; 16]);
@@ -672,16 +695,19 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
         b.extend([8; 16]);
         b.extend([n; 32]);
         b.extend((10 + u64::from(n)).to_be_bytes());
+        b.extend([9; 32]);
+        put_pos(&mut b, pos(0));
+        b.extend(0u64.to_be_bytes());
     }
     let flag = b.len();
     b.extend([1, 16]);
-    for n in 48..64u8 {
+    for n in 39..55u8 {
         b.extend((10 + u64::from(n)).to_be_bytes());
         b.extend([n; 32]);
     }
     let digest = Sha256::digest(&b);
     b.extend(digest);
-    assert_eq!(b.len(), 13655);
+    assert_eq!(b.len(), 15870);
     assert!(b.len() < 16384);
     let image = decode(&b).unwrap();
     assert_eq!(encode(&image), b);
@@ -708,18 +734,18 @@ fn maximum_v2_image_and_registry_semantics_with_recomputed_checksums() {
         x[flag + 2..flag + 42].copy_from_slice(&z);
         x[flag + 42..flag + 82].copy_from_slice(&a);
     });
-    corrupt(&b, |x| set64(x, flag + 2, 74));
+    corrupt(&b, |x| set64(x, flag + 2, 65));
     // Keep order and consumed-record consistency so only duplicate member keys reject.
     corrupt(&b, |x| {
         let duplicate = x[flag + 10..flag + 42].to_vec();
         x[flag + 50..flag + 82].copy_from_slice(&duplicate);
-        let consumed_key = next + 18 + 49 * 145 + 105;
+        let consumed_key = next + 18 + 40 * 209 + 105;
         x[consumed_key..consumed_key + 32].copy_from_slice(&duplicate);
     });
-    // The last member has no matching consumed record at74; ordering remains valid.
-    corrupt(&b, |x| set64(x, flag + 2 + 15 * 40, 74));
+    // The last member has no matching consumed record at65; ordering remains valid.
+    corrupt(&b, |x| set64(x, flag + 2 + 15 * 40, 65));
     corrupt(&b, |x| x[flag + 10] ^= 1); // Current consumed member has different key.
-    corrupt(&b, |x| set64(x, next, 58));
+    corrupt(&b, |x| set64(x, next, 49));
     corrupt(&b, |x| {
         x.insert(x.len() - 32, 0);
     });
@@ -761,4 +787,119 @@ fn store_close_completion() {
     dropping.join().unwrap();
     assert!(released.is_set());
     drop(StateStore::open(dir.path(), init()).unwrap());
+}
+
+pub(in crate::cluster) fn fixture_membership() -> crate::cluster::membership::Membership {
+    crate::cluster::membership::Membership::new(vec![[1].into()], [(1, "mem:1".to_owned())].into())
+        .unwrap()
+}
+pub(in crate::cluster) fn fixture_anchor() -> enrollment::JoinAnchor {
+    let mut s = EnrollmentState::new(init().cluster, init().first_free);
+    let Entry::Enrollment(c) = found() else {
+        unreachable!()
+    };
+    s.apply(
+        &c,
+        LogPos {
+            term: 2,
+            leader: 3,
+            index: 0,
+        },
+        None,
+    );
+    s.voter_anchor(&fixture_membership()).unwrap()
+}
+
+#[test]
+fn authoritative_anchor_change_is_inert_before_consume() {
+    let d = private_temp();
+    let mut s = open(d.path());
+    base(&mut s);
+    let original = s.snapshot();
+    let a = s.image.clone();
+    let b = crate::cluster::membership::Membership::new(
+        vec![[1].into(), [1].into()],
+        [(1, "mem:1".to_owned())].into(),
+    )
+    .unwrap();
+    s.apply(
+        pos(2),
+        &Entry::Membership(MembershipBlob::new(b.encode().unwrap()).unwrap()),
+    )
+    .unwrap();
+    let before = s.image.state.clone();
+    assert_eq!(
+        s.apply(pos(3), &redeem(5, 1000)).unwrap(),
+        Some(Outcome::Rejected(Reject::AnchorChanged))
+    );
+    assert_eq!(s.image.state, before);
+    assert_eq!(s.applied(), Some(pos(3)));
+    let control = private_temp();
+    let mut c = open(control.path());
+    c.install(&original).unwrap();
+    assert_eq!(c.image, a);
+    assert!(matches!(
+        c.apply(pos(2), &redeem(5, 1000)).unwrap(),
+        Some(Outcome::Enrolled(_))
+    ));
+    for m in [
+        None,
+        Some(
+            crate::cluster::membership::Membership::new(
+                vec![[2].into()],
+                [(2, "mem:2".to_owned())].into(),
+            )
+            .unwrap(),
+        ),
+    ] {
+        let mut state = before.clone();
+        let Entry::Enrollment(command) = redeem(5, 1000) else {
+            unreachable!()
+        };
+        assert_eq!(
+            state.apply(&command, pos(3), m.as_ref()),
+            Outcome::Rejected(Reject::AnchorChanged)
+        );
+        assert_eq!(state, before);
+    }
+}
+#[test]
+fn replay_origin_survives_drift_snapshot_and_reopen() {
+    let d = private_temp();
+    let mut s = open(d.path());
+    base(&mut s);
+    let Some(Outcome::Enrolled(first)) = s.apply(pos(2), &redeem(5, 1000)).unwrap() else {
+        panic!("first grant")
+    };
+    let joint = crate::cluster::membership::Membership::new(
+        vec![[1].into(), [1].into()],
+        [(1, "other-address".to_owned())].into(),
+    )
+    .unwrap();
+    s.apply(
+        pos(3),
+        &Entry::Membership(MembershipBlob::new(joint.encode().unwrap()).unwrap()),
+    )
+    .unwrap();
+    let snapshot = s.snapshot();
+    drop(s);
+    let mut s = open(d.path());
+    let other = private_temp();
+    let mut dest = open(other.path());
+    dest.install(&snapshot).unwrap();
+    for store in [&mut s, &mut dest] {
+        let Some(Outcome::Enrolled(replay)) = store.apply(pos(4), &redeem(5, 60000)).unwrap()
+        else {
+            panic!("replay grant")
+        };
+        assert_eq!(replay.origin(), pos(2));
+        assert_eq!(replay.origin(), first.origin());
+        assert_eq!(replay.original_applied_ms(), 1000);
+        assert_eq!(replay.code_expires_ms(), first.code_expires_ms());
+        assert_eq!(replay.applied_ms(), 60000);
+        assert_eq!(
+            store.state().check_grant(&replay, &code(5).code_id()),
+            Ok(())
+        );
+    }
 }

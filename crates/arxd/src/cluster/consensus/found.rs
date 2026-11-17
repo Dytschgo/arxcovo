@@ -237,7 +237,15 @@ impl ConsensusNode {
             if post_now < pre_now {
                 return Err(FoundError::ClockRollback);
             }
-            Ok(IssuedLeaf { der, node: FOUNDER })
+            Ok(IssuedLeaf {
+                der,
+                node: FOUNDER,
+                identity_commit: LogPos {
+                    term: ticket.leader.term,
+                    leader: ticket.leader.node_id,
+                    index: ticket.index,
+                },
+            })
         };
         match timeout_at(deadline, work).await {
             Ok(r) if Instant::now() < deadline => r,

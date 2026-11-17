@@ -9,6 +9,7 @@ EXPECTED = ['t3_snapshot_catchup_then_consecutive_append', 't1_follower_offline_
 REASON = 'Windows three-node quarantine: docs/reviews/m3-cluster-third-attempt-owner-disposition.md'
 WINDOWS_UNSAMPLED = ['r1_apply_wait_deadline', 'r2_isolated_read_refusal', 'r3_store_wait_deadline_and_heartbeat', 'r4_read_admission_and_caller_abort', 'r5_shutdown_read_owners']
 ISSUANCE = ['i1_happy_retry', 'i2_follower_no_append', 'i3_single_consumption_race', 'i4_leadership_loss', 'i5_remove_between_guards', 'i6_actual_post_wait_clock', 'i7_adapter_rejects_forged_shapes_and_mismatches', 'i8_removed_leaf_remains_chain_valid_stale_registry', 'i9_private_material_never_persisted', 'hook_store_identity_and_admission', 'retained_record_is_required_even_while_member_remains_authorized']
+ISSUANCE_REQUIRED = ['anchored_single_voter_receipt_replay_and_revocation']
 REASON_FIXTURE = 'Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
 PURE = 'read_failure_attribution_covers_all_errors'
 TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', 'authenticated_sender_mismatch_and_assumed_founder_control', 'store_lock_wait_does_not_block_runtime']
@@ -116,7 +117,7 @@ def assert_windows_quarantine(source):
 
 
 def assert_issuance_quarantine(source):
-    assert_fixture_quarantine(source, ((ISSUANCE, REASON_FIXTURE),))
+    assert_fixture_quarantine(source, ((ISSUANCE, REASON_FIXTURE),), required=ISSUANCE_REQUIRED)
 
 
 REAL_REQUIRED = ('founder_init(', '.found(', '.enroll(', 'peer_registry()', 'pki::pump(')
@@ -293,6 +294,26 @@ class QuarantineTests(unittest.TestCase):
                 with self.subTest(name=name, required=token):
                     with self.assertRaises(AssertionError):
                         assert_real_identity_body(prefix + signature + body.replace(token, 'removed_token') + separator + suffix)
+
+    def test_anchored_single_voter_required(self):
+        source = (ROOT / "crates/arxd/src/cluster/consensus/issue_tests.rs").read_text(encoding="utf-8")
+        name = ISSUANCE_REQUIRED[0]
+        assert ISSUANCE_REQUIRED == ['anchored_single_voter_receipt_replay_and_revocation']
+        signature = 'async fn ' + name + '() {'
+        body = source.split(signature, 1)[1]
+        assert body.count('ConsensusNode::start(') == 1
+        for token in ('founder_init(', '.found(', '.enroll('):
+            assert token in body
+        assert not re.search(r'\bCluster\b', body)
+        for mutant in (source.replace(signature, 'async fn renamed() {'),
+                       source[:source.rfind('#[tokio::test')],
+                       source.replace(signature, '#[ignore]\n' + signature),
+                       source.replace(signature, '#[cfg(unix)]\n' + signature)):
+            with self.assertRaises(AssertionError):
+                assert_issuance_quarantine(mutant)
+        with patch(__name__ + '.ISSUANCE_REQUIRED', []):
+            with self.assertRaises(AssertionError):
+                assert_issuance_quarantine(source)
 
     def test_exact_windows_only_quarantine(self):
         base = ROOT / "crates/arxd/src/cluster/consensus"

@@ -32,6 +32,7 @@ fn input(c: &crate::cluster::enrollment::JoinCode, r: u8) -> RedeemInput {
         request: [r; 16],
         code: c.code_id(),
         proof: c.proof(),
+        anchor: c.anchor(),
     }
 }
 fn arm(n: &ConsensusNode, point: PausePoint) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -247,6 +248,7 @@ async fn i4_leadership_loss() {
                 code.code_id(),
                 &code.proof(),
                 digest,
+                code.anchor(),
                 NOW,
             ))
             .await
@@ -446,6 +448,7 @@ async fn i7_adapter_rejects_forged_shapes_and_mismatches() {
                 code.code_id(),
                 &code.proof(),
                 proven.digest(),
+                code.anchor(),
                 NOW,
             ))
             .await
@@ -470,6 +473,33 @@ async fn i7_adapter_rejects_forged_shapes_and_mismatches() {
             c.node(l).committed(forged),
             Err(IssueError::Rejected(_))
         ));
+        for (term, index) in [
+            (response.log_id.leader_id.term, response.log_id.index - 1),
+            (
+                response.log_id.leader_id.term - 1,
+                response.log_id.index + 1,
+            ),
+            (response.log_id.leader_id.term + 1, response.log_id.index),
+        ] {
+            let mut forged = openraft::raft::ClientWriteResponse::<Arx> {
+                log_id: response.log_id,
+                data: response.data.clone(),
+                membership: response.membership.clone(),
+            };
+            forged.log_id.leader_id.term = term;
+            forged.log_id.index = index;
+            assert!(matches!(
+                c.node(l).committed(forged),
+                Err(IssueError::Rejected(Reject::UnknownCode))
+            ));
+        }
+        let mut later = openraft::raft::ClientWriteResponse::<Arx> {
+            log_id: response.log_id,
+            data: response.data.clone(),
+            membership: response.membership.clone(),
+        };
+        later.log_id.index += 1;
+        assert!(c.node(l).committed(later).is_ok());
         let mut ticket = c.node(l).committed(response).unwrap();
         c.node(l)
             .issue_guard(&ticket, code.code_id(), proven.digest())
@@ -669,6 +699,7 @@ async fn retained_record_is_required_even_while_member_remains_authorized() {
                 code.code_id(),
                 &code.proof(),
                 key,
+                code.anchor(),
                 NOW,
             ))
             .await
@@ -713,4 +744,68 @@ async fn retained_record_is_required_even_while_member_remains_authorized() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anchored_single_voter_receipt_replay_and_revocation() {
+    use super::found::founder_init;
+    use crate::cluster::consensus::mem_net::{Factory, MemRouter};
+    use crate::cluster::enrollment::JoinCode;
+    use crate::service::application::tests::private_temp;
+    let entry = Instant::now();
+    let work_deadline = entry + Duration::from_secs(35);
+    let cleanup_deadline = entry + Duration::from_secs(40);
+    let dir = private_temp();
+    let router = Arc::new(MemRouter::default());
+    let mut node = None;
+    let mut release_hook = None;
+    let result = timeout_at(work_deadline, async {
+        let n = ConsensusNode::start(1, dir.path(), founder_init([1;16]), Params::default(),
+            Factory { source:1, router:router.clone() }).await.unwrap();
+        router.nodes.lock().unwrap().insert(1, n.raft.as_ref().unwrap().clone());
+        node = Some(n);
+        let n = node.as_ref().unwrap();
+        let ca = ClusterCa::ephemeral([1;16],NOW); let clock = Clock::new();
+        let founder_csr = csr();
+        timeout(Duration::from_secs(5),n.found(&ca,&clock,BasicNode::new("mem:1"),&founder_csr)).await.unwrap().unwrap();
+        let anchor = {
+            let store=n.sm.as_ref().unwrap().0.lock().unwrap();
+            let membership=crate::cluster::membership::Membership::decode(store.membership().unwrap().1.bytes()).unwrap();
+            store.state().voter_anchor(&membership).unwrap()
+        };
+        let code=JoinCode::generate([1;16],ca.fingerprint(),anchor,|b| { b.fill(111);Ok::<_,()>(()) }).unwrap();
+        n.propose(mint(&code,1,NOW)).await.unwrap();
+        let der=csr(); let proven=ProvenCsr::parse(&der).unwrap();
+        let first=n.enroll(&ca,&clock,input(&code,2),&der).await.unwrap();
+        let replay=n.enroll(&ca,&clock,input(&code,2),&der).await.unwrap();
+        assert_eq!(first.node,replay.node);assert_eq!(first.identity_commit,replay.identity_commit);
+        assert!(n.sm.as_ref().unwrap().0.lock().unwrap().applied().unwrap().index>first.identity_commit.index);
+        use x509_parser::prelude::*;
+        let (_,cert)=X509Certificate::from_der(&replay.der).unwrap();
+        let (_,req)=X509CertificationRequest::from_der(&der).unwrap();
+        assert_eq!(cert.public_key().raw,req.certification_request_info.subject_pki.raw);
+        assert_eq!(proven.digest(),KeyDigest::of_spki(cert.public_key().raw).unwrap());
+        let (wait,release)=arm(n,PausePoint::AfterCommit); release_hook=Some(release);
+        let enrollment=n.enroll(&ca,&clock,input(&code,2),&der);tokio::pin!(enrollment);
+        tokio::select! { _=entered(wait)=>{}, r=&mut enrollment=>panic!("enrollment completed before revoke: {:?}",r.err()) }
+        n.propose(Command::Remove{cluster:[1;16],node:first.node,proposed_at_ms:NOW}).await.unwrap();
+        release_hook.take().unwrap().send(()).unwrap();
+        assert!(matches!(enrollment.await,Err(IssueError::Revoked)));
+        let store=n.sm.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(store.state().authorize_peer([1;16],first.node,proven.digest()),Err(PeerRefusal::NotMember));
+    }).await;
+    if let Some(release) = release_hook.take() {
+        let _ = release.send(());
+    }
+    router.nodes.lock().unwrap().clear();
+    let n = node
+        .as_mut()
+        .expect("startup unresolved; cooperative deadline cannot cancel blocking startup");
+    timeout_at(cleanup_deadline, n.shutdown())
+        .await
+        .expect("cleanup deadline exceeded")
+        .expect("clean shutdown required");
+    assert!(n.log_weak.upgrade().is_none());
+    assert!(n.sm_weak.upgrade().is_none());
+    result.expect("single-voter work exceeded entry budget");
 }

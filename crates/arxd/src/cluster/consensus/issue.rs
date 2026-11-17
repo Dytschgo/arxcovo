@@ -2,8 +2,8 @@
 use super::*;
 use crate::cluster::{
     enrollment::{
-        ClusterId, CodeId, EnrollmentGrant, IssueRefusal, JoinerReply, KeyDigest, NodeId,
-        PeerRefusal, RedeemProof, Reject, RequestId,
+        ClusterId, CodeId, EnrollmentGrant, IssueRefusal, JoinAnchor, JoinerReply, KeyDigest,
+        NodeId, PeerRefusal, RedeemProof, Reject, RequestId,
     },
     pki::{
         ca::ClusterCa,
@@ -20,10 +20,12 @@ pub struct RedeemInput {
     pub request: RequestId,
     pub code: CodeId,
     pub proof: RedeemProof,
+    pub anchor: JoinAnchor,
 }
 pub struct IssuedLeaf {
     pub der: Vec<u8>,
     pub node: NodeId,
+    pub identity_commit: LogPos,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueError {
@@ -94,11 +96,25 @@ impl ConsensusNode {
             return Err(IssueError::WrongNode);
         }
         match resp.data.0 {
-            Some(Outcome::Enrolled(grant)) => Ok(IssueTicket {
-                grant,
-                leader: resp.log_id.leader_id,
-                index: resp.log_id.index,
-            }),
+            Some(Outcome::Enrolled(grant)) => {
+                let origin = grant.origin();
+                let current = LogPos {
+                    term: resp.log_id.leader_id.term,
+                    leader: resp.log_id.leader_id.node_id,
+                    index: resp.log_id.index,
+                };
+                if origin.index > current.index
+                    || origin.term > current.term
+                    || (origin.index == current.index && origin != current)
+                {
+                    return Err(IssueError::Rejected(Reject::UnknownCode));
+                }
+                Ok(IssueTicket {
+                    grant,
+                    leader: resp.log_id.leader_id,
+                    index: resp.log_id.index,
+                })
+            }
             Some(Outcome::Rejected(r)) => Err(IssueError::Rejected(r)),
             _ => Err(IssueError::Rejected(Reject::UnknownCode)),
         }
@@ -161,9 +177,17 @@ impl ConsensusNode {
                 request,
                 code,
                 proof,
+                anchor,
             } = input;
-            let command =
-                Command::redeem(cluster, request, code, &proof, csr.digest(), clock.now_ms());
+            let command = Command::redeem(
+                cluster,
+                request,
+                code,
+                &proof,
+                csr.digest(),
+                anchor,
+                clock.now_ms(),
+            );
             // The proof's scope ends before any await; this is not erasure.
             (code, command)
         };
@@ -197,6 +221,7 @@ impl ConsensusNode {
             Ok(IssuedLeaf {
                 der,
                 node: ticket.node(),
+                identity_commit: ticket.grant.origin(),
             })
         };
         match timeout_at(deadline, work).await {
@@ -247,37 +272,72 @@ mod issue_tests;
 #[cfg(test)]
 pub(in crate::cluster) fn test_ticket(key: KeyDigest) -> IssueTicket {
     use crate::cluster::enrollment::{EnrollmentState, FoundMembers, JoinCode};
-    let mut s = EnrollmentState::new([1; 16], NodeId::new(4).unwrap());
-    s.apply(&Command::Found {
-        cluster: [1; 16],
-        members: FoundMembers::new([(
-            NodeId::new(1).unwrap(),
-            KeyDigest::of_spki(&[250]).unwrap(),
-        )])
-        .unwrap(),
-        proposed_at_ms: 0,
-    });
-    let c = JoinCode::generate([1; 16], [2; 32], |b| {
-        b.fill(19);
-        Ok::<_, ()>(())
-    })
+    let test_membership = crate::cluster::membership::Membership::new(
+        vec![[1].into()],
+        [(1, "mem:1".to_owned())].into(),
+    )
     .unwrap();
-    s.apply(&Command::Mint {
-        cluster: [1; 16],
-        actor: [3; 16],
-        request: [4; 16],
-        code: c.code_id(),
-        verifier: c.verifier(),
-        proposed_at_ms: 1000,
-    });
-    let Outcome::Enrolled(grant) = s.apply(&Command::redeem(
+    let mut s = EnrollmentState::new([1; 16], NodeId::new(4).unwrap());
+    s.apply(
+        &Command::Found {
+            cluster: [1; 16],
+            members: FoundMembers::new([(
+                NodeId::new(1).unwrap(),
+                KeyDigest::of_spki(&[250]).unwrap(),
+            )])
+            .unwrap(),
+            proposed_at_ms: 0,
+        },
+        LogPos {
+            term: 1,
+            leader: 1,
+            index: 1,
+        },
+        Some(&test_membership),
+    );
+    let c = JoinCode::generate(
         [1; 16],
-        [5; 16],
-        c.code_id(),
-        &c.proof(),
-        key,
-        1000,
-    )) else {
+        [2; 32],
+        s.voter_anchor(&test_membership).unwrap(),
+        |b| {
+            b.fill(19);
+            Ok::<_, ()>(())
+        },
+    )
+    .unwrap();
+    s.apply(
+        &Command::Mint {
+            cluster: [1; 16],
+            actor: [3; 16],
+            request: [4; 16],
+            code: c.code_id(),
+            verifier: c.verifier(),
+            proposed_at_ms: 1000,
+        },
+        LogPos {
+            term: 1,
+            leader: 1,
+            index: 1,
+        },
+        Some(&test_membership),
+    );
+    let Outcome::Enrolled(grant) = s.apply(
+        &Command::redeem(
+            [1; 16],
+            [5; 16],
+            c.code_id(),
+            &c.proof(),
+            key,
+            c.anchor(),
+            1000,
+        ),
+        LogPos {
+            term: 1,
+            leader: 1,
+            index: 1,
+        },
+        Some(&test_membership),
+    ) else {
         panic!("test enrollment");
     };
     IssueTicket {

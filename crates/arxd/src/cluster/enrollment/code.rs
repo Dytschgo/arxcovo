@@ -1,4 +1,4 @@
-use super::{CaFingerprint, ClusterId, CodeId, MAX_CODE_TEXT};
+use super::{CaFingerprint, ClusterId, CodeId, JoinAnchor, MAX_CODE_TEXT};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -28,6 +28,7 @@ pub struct JoinCode {
     code: CodeId,
     secret: JoinSecret,
     ca_fp: CaFingerprint,
+    anchor: JoinAnchor,
 }
 impl fmt::Debug for JoinSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,6 +67,7 @@ impl JoinCode {
     pub fn generate<E>(
         cluster: ClusterId,
         ca_fp: CaFingerprint,
+        anchor: JoinAnchor,
         mut fill: impl FnMut(&mut [u8]) -> Result<(), E>,
     ) -> Result<Self, CodeError> {
         let mut code = [0; 16];
@@ -77,6 +79,7 @@ impl JoinCode {
             code,
             secret: JoinSecret(secret),
             ca_fp,
+            anchor,
         })
     }
     pub fn cluster(&self) -> ClusterId {
@@ -88,13 +91,17 @@ impl JoinCode {
     pub fn ca_fingerprint(&self) -> CaFingerprint {
         self.ca_fp
     }
+    pub fn anchor(&self) -> JoinAnchor {
+        self.anchor
+    }
     pub fn proof(&self) -> RedeemProof {
         RedeemProof(
             Sha256::new()
-                .chain_update(b"arxcovo/join/proof/v1")
+                .chain_update(b"arxcovo/join/proof/v2")
                 .chain_update(self.cluster)
                 .chain_update(self.code)
                 .chain_update(self.secret.0)
+                .chain_update(self.anchor.0)
                 .finalize()
                 .into(),
         )
@@ -104,27 +111,28 @@ impl JoinCode {
     }
     /// Sensitive plaintext for owner transfer only. Never log or return through MCP.
     pub fn expose_for_owner_transfer(&self) -> String {
-        let mut raw = [0; 100];
+        let mut raw = [0; 132];
         raw[..16].copy_from_slice(&self.cluster);
         raw[16..32].copy_from_slice(&self.code);
         raw[32..64].copy_from_slice(&self.secret.0);
         raw[64..96].copy_from_slice(&self.ca_fp);
-        let check = checksum(&raw[..96]);
-        raw[96..].copy_from_slice(&check);
-        format!("arxj1-{}", hex::encode(raw))
+        raw[96..128].copy_from_slice(self.anchor.as_bytes());
+        let check = checksum(&raw[..128]);
+        raw[128..].copy_from_slice(&check);
+        format!("arxj2-{}", hex::encode(raw))
     }
     pub fn parse(text: &str) -> Result<Self, CodeError> {
         if text.len() > MAX_CODE_TEXT {
             return Err(CodeError::Malformed);
         }
         let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
-        let payload = text.strip_prefix("arxj1-").ok_or(CodeError::Malformed)?;
-        if payload.len() != 200 || !payload.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let payload = text.strip_prefix("arxj2-").ok_or(CodeError::Malformed)?;
+        if payload.len() != 264 || !payload.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(CodeError::Malformed);
         }
-        let mut raw = [0; 100];
+        let mut raw = [0; 132];
         hex::decode_to_slice(payload, &mut raw).map_err(|_| CodeError::Malformed)?;
-        if raw[96..] != checksum(&raw[..96]) {
+        if raw[128..] != checksum(&raw[..128]) {
             return Err(CodeError::Malformed);
         }
         let mut cluster = [0; 16];
@@ -135,17 +143,19 @@ impl JoinCode {
         code.copy_from_slice(&raw[16..32]);
         secret.copy_from_slice(&raw[32..64]);
         ca_fp.copy_from_slice(&raw[64..96]);
+        let anchor = JoinAnchor(raw[96..128].try_into().map_err(|_| CodeError::Malformed)?);
         Ok(Self {
             cluster,
             code,
             secret: JoinSecret(secret),
             ca_fp,
+            anchor,
         })
     }
 }
 fn checksum(bytes: &[u8]) -> [u8; 4] {
     let hash = Sha256::new()
-        .chain_update(b"arxcovo/join/check/v1")
+        .chain_update(b"arxcovo/join/check/v2")
         .chain_update(bytes)
         .finalize();
     [hash[0], hash[1], hash[2], hash[3]]

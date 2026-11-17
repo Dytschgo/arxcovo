@@ -29,7 +29,14 @@ fn payloads() -> Vec<(LogPos, Entry)> {
         (pos(0), crate::cluster::state_store::tests::found()),
         (
             pos(1),
-            Entry::Membership(MembershipBlob::new(b"synthetic-members-m3".to_vec()).unwrap()),
+            Entry::Membership(
+                MembershipBlob::new(
+                    crate::cluster::state_store::tests::fixture_membership()
+                        .encode()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
         ),
         (pos(2), mint(5, 0)),
         (pos(3), redeem(5, 1)),
@@ -59,11 +66,8 @@ fn bad_meta(b: &[u8], edit: impl FnOnce(&mut Vec<u8>)) {
 fn canonical_codecs_and_full_payload_semantic_rejections() {
     let mut entries = payloads();
     entries.push((pos(7), Entry::Blank));
-    for n in [1, 4096] {
-        entries.push((
-            pos(7),
-            Entry::Membership(MembershipBlob::new(vec![0x42; n]).unwrap()),
-        ));
+    for n in [1, 16] {
+        entries.push((pos(7), Entry::Membership(canonical_membership(n))));
     }
     entries.push((pos(8), mint(9, u64::MAX)));
     entries.push((pos(9), redeem(9, u64::MAX)));
@@ -79,7 +83,7 @@ fn canonical_codecs_and_full_payload_semantic_rejections() {
             let n = x.len() - 32;
             x.insert(n, 0);
         });
-        for tag in [6, 255] {
+        for tag in [7, 255] {
             bad_row(&b, |x| x[32] = tag);
         }
         bad_row(&b, |x| {
@@ -160,7 +164,10 @@ fn canonical_codecs_and_full_payload_semantic_rejections() {
         .unwrap()
         .1
     {
-        assert_eq!(core.apply(&c), Outcome::Rejected(Reject::TimeOutOfRange));
+        assert_eq!(
+            core.apply(&c, pos(0), None),
+            Outcome::Rejected(Reject::TimeOutOfRange)
+        );
     }
 }
 #[test]
@@ -208,8 +215,9 @@ fn append_preconditions_and_maximal_capacity_are_atomic() {
     assert_eq!(open(edge.path()).live(), Ok(1));
     let d = private_temp();
     let mut s = open(d.path());
-    let m = Entry::Membership(MembershipBlob::new(vec![0x42; 4096]).unwrap());
-    assert_eq!(encode_row(pos(0), &m).len(), MAX_ROW);
+    let m = Entry::Membership(canonical_membership(16));
+    assert_eq!(encode_row(pos(0), &m).len(), 3672);
+    assert_eq!(MAX_ROW, 4163);
     for start in (0..512).step_by(64) {
         let b: Vec<_> = (start..start + 64).map(|i| (pos(i), m.clone())).collect();
         s.append(&b).unwrap();
@@ -478,7 +486,7 @@ fn reopen_rejects_row_meta_inconsistency_versions_clusters_locks_sidecars() {
         StoreError::WrongCluster
     );
     let s = open(d.path());
-    s.db.pragma_update(None, "user_version", 2).unwrap();
+    s.db.pragma_update(None, "user_version", 1).unwrap();
     drop(s);
     assert_eq!(
         VoteLogStore::open(d.path(), [1; 16]).unwrap_err(),
@@ -541,7 +549,14 @@ fn two_store_ordering_replay_and_snapshot_install_ahead_of_tail() {
     for (p, e) in &entries[..5] {
         let out = sm.apply(*p, e).unwrap();
         if let Entry::Enrollment(c) = e {
-            assert_eq!(out, Some(reference.apply(c)));
+            assert_eq!(
+                out,
+                Some(reference.apply(
+                    c,
+                    *p,
+                    Some(&crate::cluster::state_store::tests::fixture_membership())
+                ))
+            );
         }
     }
     assert!(pos(4).index <= sm.applied().unwrap().index);
@@ -556,7 +571,14 @@ fn two_store_ordering_replay_and_snapshot_install_ahead_of_tail() {
     for (p, e) in log.entries(0, 10, 64).unwrap() {
         let out = sm.apply(p, &e).unwrap();
         if let Entry::Enrollment(c) = e {
-            assert_eq!(out, Some(reference.apply(&c)));
+            assert_eq!(
+                out,
+                Some(reference.apply(
+                    &c,
+                    p,
+                    Some(&crate::cluster::state_store::tests::fixture_membership())
+                ))
+            );
         }
     }
     let source = private_temp();
@@ -876,7 +898,7 @@ fn registry_rows_match_independent_raw_format_and_bounds() {
             members: FoundMembers::new(pairs.clone()).unwrap(),
         });
         let row = encode_row(pos(42), &c);
-        let mut raw = b"ARXLE1\0\0".to_vec();
+        let mut raw = b"ARXLE2\0\0".to_vec();
         for n in [2u64, 3, 42] {
             raw.extend(n.to_be_bytes());
         }
@@ -913,7 +935,7 @@ fn registry_rows_match_independent_raw_format_and_bounds() {
         proposed_at_ms: 123,
     });
     let row = encode_row(pos(42), &c);
-    let mut raw = b"ARXLE1\0\0".to_vec();
+    let mut raw = b"ARXLE2\0\0".to_vec();
     for n in [2u64, 3, 42] {
         raw.extend(n.to_be_bytes());
     }
@@ -953,4 +975,13 @@ fn store_close_completion() {
     dropping.join().unwrap();
     assert!(released.is_set());
     drop(VoteLogStore::open(dir.path(), [1; 16]).unwrap());
+}
+
+fn canonical_membership(n: u64) -> MembershipBlob {
+    let m = crate::cluster::membership::Membership::new(
+        vec![(1..=n).collect(), (1..=n).collect()],
+        (1..=n).map(|i| (i, "a".repeat(200))).collect(),
+    )
+    .unwrap();
+    MembershipBlob::new(m.encode().unwrap()).unwrap()
 }
