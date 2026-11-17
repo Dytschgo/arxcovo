@@ -2,18 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** PR163 merged as `10aa891f27906e0c73e48396c5c812cab7d4523a`
-from reviewed head `22a09eae15aee61dc3f489003f6fb8c81b88b882` at21:15:20 UTC.
-All three platform jobs and independent review passed; macOS first executed on
-attempt5 after four zero-step runner-acquisition cancellations. Owner's pinned
-budget-only bootstrap was used once. Original strict five checks, app bindings
-and all other protection fences were restored and read back; merge tree matched.
-ADR0025's implementation is now on trusted main. New exact-main CI44177880021
-is pending; feature publication/merges remain held until it passes and a first
-trusted charged-v1 evaluation is verified. Prior main3022d601 recovered on
-attempt2 but its failed905s first attempt stays uncredited; recovery1352s wall
-and901s execution union were descriptive only. M2 open/M3 unchecked; Windows
-fixture28 remains unverified and hardware **unverified on real hardware**.
+**Current main GREEN, budget satisfied:** exact `10aa891f27906e0c73e48396c5c812cab7d4523a`
+after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
+629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
+ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
+the root pure measurement of retained attempt1/job data confirms charged-v1.
+Owner's pinned budget-only bootstrap is consumed. Original strict five checks,
+app bindings and all other protection fences were restored and read back.
+Merge tree equals reviewed head22a09eae. Later hourly recovery slots are no-ops.
+Prior main3022d601's failed905s first attempt remains uncredited and historical.
+Normal feature preparation can resume; every PR still needs independent review,
+all five gates, fresh exact-main green and its applicable Windows timing limit.
+M2 open/M3 unchecked; Windows fixture28 remains unverified on hosted Windows and
+**unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -3558,3 +3559,7 @@ and hosted checks still needed. Activation/protection/merge remain unauthorized.
 ### ADR0025 pinned activation - 2026-11-17
 
 Root Sol coordinator executed independently reviewed executor SHA2562b2866045120e8ba4d8cde357640aef0fbdc2662e5eb21363f14d108c4aaa7b9 under recorded owner approval. PR163 merged10aa891f; restore/readback and tree equality passed. Shared retry plan is marked merged, later slots no-op. Only one of four additional infrastructure requests was used. Exact-main CI44177880021 is actively awaited; no feature publication or merge yet. Evidence retained in D:/Temp/arx-ci-queue-root-refresh.
+
+### First active queue-policy main verified - 2026-11-17
+
+Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f attempt1 passed; charged-v1 measurement632s wall/629s charged/3s credit applied. Automatic trusted policy44179754154 completed success. All original protection fences remain restored. No further retry, waiver or feature merge occurred. Owned-query refresh and retained-identity prerequisite can resume normal preparation.
