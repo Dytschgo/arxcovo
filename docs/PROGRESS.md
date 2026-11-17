@@ -2,16 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
-`r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
-outside the eight quarantines. The cause is unknown. The owner-authorized local implementation quarantines all 24 Windows fixture tests
-(13 three_node and 11 issuance); independent Opus review remains required before push.
-This is an exception, not a fix. PR162 diagnostics remain
-held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
-under the active wall policy; 738 s charged remains uncredited because the run is red.
-ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
-cannot clear the budget gate. Main stays RED until a merged recovery's next exact-main CI
-is green. No hypothetical new-main green claim or budget exception is granted.
+**Current main CI pending:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164,
+first push CI44051366327 attempt1 is running. Owner explicitly authorized the one-use
+budget-only protection exception for exacthead60f30c8673e9c9653d1a177d79379a1975f3107f.
+Root removed only ci-time-budget, performed the pinned squash merge, and restored
+all five original checks/app bindings/strict mode and every other fence in finally;
+exact readback passed. Squash tree equals reviewed head. Previous mainc612152 R5
+failure and1475s budget remain historical; this is quarantine, not a fix. Windows
+24fixture tests remain unverified; Ubuntu/mac passed24each on the PR. No feature
+merge until this exact first-attempt main run is green. ADR0025 remains inactive.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -3179,3 +3178,5 @@ separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 - 2026-11-17: Retained Opus bounded injected-latency follow-up4ac89a72. C1 Vote300/Append400/Apply600ms reproduced hosted I4 atissue_tests.rs237NotLeader(None) once; counterfactual0/0/600 passed once. Root verified raw-log hashes and exact failure/summary, inspected test-only hook patch, and confirmed crates unchanged from17a3fb2a. This demonstrates local latency-model sufficiency, not hosted cause, determinism or a fix. Hook removed; no source changes, hosted retry or fix attempt. Whole Windows three-node fixture quarantine scope clarification remains pending because I4 is outside the named three_node module. Main remainsRED, M2open/M3unchecked.
 
 - 2026-11-17: Independent Opus high review ca8ea420 passes full fixture quarantine source221077d0/head46df55b7, retained unchanged. Reviewer ran62Python tests and7extra guard probes; verified Rust bodies unchanged,24Windowsignored fixtures/pureunitunignored, original8sample matches and5expressionexclusions. Root also ran62Python tests and exactbodycomparison. Updating PR164 for fresh hosted checks and exact-head review; Ubuntu/mac must execute24. Main remainsRED, no budget exception authorized, no merge.
+
+- 2026-11-17: Owner-authorized one-use budget-only exception consumed by PR164 merge39b3dd7 at08:58:52Z, exactreviewedhead60f30c86. Original five requiredchecks/appbindingsstrict+allotherprotection restored andexactlyreadback. Review6933714689, platformCI43987282029 attempt1passed includingUbuntu/mac24each. MainCI44051366327 pending; no feature merge or rerun. Local action snapshots D:/Temp/arx-pr164-final-gates.
