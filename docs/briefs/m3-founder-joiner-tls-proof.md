@@ -96,3 +96,15 @@ One round on the isolated branch: `cargo fmt --check`, workspace clippy `-D warn
 (record each wall time; the new test is expected well under 20 s), `python -m unittest tools/ci/test_windows_cluster_quarantine.py`, then N1/N2. A natural
 red stops the round for disposition, with no rerun, filter, deadline or source tuning. Publication needs: fresh green exact main (run 44064366449 or later),
 independent Opus review of the diff against this brief, and the normal five required gates, with Windows `verify` ≤ 660 s. Root merges only after all pass.
+
+
+## Root contract check - 2026-11-17
+
+Accepted for test-only implementation after green exact main. For N1, preserve
+Weak upgrade, lock and poison refusals, replacing only the locked registry
+`authorize_peer` result with Ok. This isolates authorization bypass from existing
+Unavailable ownership tests. Run each mutant only against the new test and
+claim only the observed catch; do not claim it is the only catching test without
+running the other tests. Restore both files byte-for-byte afterward. Existing
+resumption tests already pin full handshakes; the new pump path must use the
+unchanged production config builders and distinct real leaves. No helper change.
