@@ -12,7 +12,7 @@ ISSUANCE = ['i1_happy_retry', 'i2_follower_no_append', 'i3_single_consumption_ra
 REASON_FIXTURE = 'Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md'
 PURE = 'read_failure_attribution_covers_all_errors'
 TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', 'authenticated_sender_mismatch_and_assumed_founder_control', 'store_lock_wait_does_not_block_runtime']
-TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses', 'founder_joiner_mutual_tls_real_identities']
+TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses', 'founder_joiner_mutual_tls_real_identities', 'learner_catch_up_gives_joiner_own_registry']
 TLS_PURE = ['tls_single_node_directory_precondition']
 
 
@@ -64,15 +64,25 @@ REAL_FORBIDDEN = ('assume(', 'test_ticket', 'pki::leaf(', 'pki::registry(',
                   'pki::connections(', 'handshake(', 'Cluster', '[250')
 
 
+PROOF_TOKENS = {
+    'founder_joiner_mutual_tls_real_identities': (REAL_REQUIRED, REAL_FORBIDDEN),
+    'learner_catch_up_gives_joiner_own_registry': (
+        REAL_REQUIRED + ('add_learner(', 'applied_index_at_least('),
+        REAL_FORBIDDEN + ('change_membership', 'initialize(', '.install(', 'AddVoter', 'authenticated'),
+    ),
+}
+
+
 def assert_real_identity_body(source):
     segments = re.split(r'(?m)^((?:async )?fn [a-z0-9_]+\()', source)
-    bodies = [body for signature, body in zip(segments[1::2], segments[2::2])
-              if signature == 'async fn founder_joiner_mutual_tls_real_identities(']
-    assert len(bodies) == 1
-    for token in REAL_REQUIRED:
-        assert token in bodies[0], token
-    for token in REAL_FORBIDDEN:
-        assert token not in bodies[0], token
+    for name, (required, forbidden) in PROOF_TOKENS.items():
+        bodies = [body for signature, body in zip(segments[1::2], segments[2::2])
+                  if signature == 'async fn ' + name + '(']
+        assert len(bodies) == 1
+        for token in required:
+            assert token in bodies[0], (name, token)
+        for token in forbidden:
+            assert token not in bodies[0], (name, token)
 
 
 def assert_tls_engine_quarantine(source):
@@ -210,17 +220,19 @@ class QuarantineTests(unittest.TestCase):
 
     def test_real_identity_proof_tokens(self):
         source = (ROOT / 'crates/arxd/src/cluster/consensus/tls_engine_tests.rs').read_text(encoding='utf-8')
-        signature = 'async fn founder_joiner_mutual_tls_real_identities() {'
-        prefix, body = source.split(signature)
         assert_real_identity_body(source)
-        for token in REAL_FORBIDDEN:
-            with self.subTest(forbidden=token):
-                with self.assertRaises(AssertionError):
-                    assert_real_identity_body(prefix + signature + '\n// ' + token + '\n' + body)
-        for token in REAL_REQUIRED:
-            with self.subTest(required=token):
-                with self.assertRaises(AssertionError):
-                    assert_real_identity_body(prefix + signature + body.replace(token, 'removed_token'))
+        for name, (required, forbidden) in PROOF_TOKENS.items():
+            signature = 'async fn ' + name + '() {'
+            prefix, rest = source.split(signature)
+            body, separator, suffix = rest.partition('\n#[tokio::test')
+            for token in forbidden:
+                with self.subTest(name=name, forbidden=token):
+                    with self.assertRaises(AssertionError):
+                        assert_real_identity_body(prefix + signature + '\n// ' + token + '\n' + rest)
+            for token in required:
+                with self.subTest(name=name, required=token):
+                    with self.assertRaises(AssertionError):
+                        assert_real_identity_body(prefix + signature + body.replace(token, 'removed_token') + separator + suffix)
 
     def test_exact_windows_only_quarantine(self):
         base = ROOT / "crates/arxd/src/cluster/consensus"
