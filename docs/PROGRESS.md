@@ -3571,3 +3571,7 @@ Root actively awaited CI44198128467, exit1. Required Windows F6/F7/F8 founder te
 ### Founder red local control disposition - 2026-11-18
 
 Fresh independent Sol6.1 high disposition20870818: one sequential exact-source F6/F7/F8 control passed in0.405s test time; hosted failure not reproduced and cause unproven. No source fix, probe, repeated test or quarantine. Logs/hashes/process cleanup retained. Root is preparing a reviewable bounded single-F6 observation patch before authorizing any probe execution. Main09134085 remains RED; PR176 held; Sol3/3 and historical Opus0/2 unchanged. M2 open/M3 unchecked, hardware **unverified on real hardware**.
+
+### Single F6 diagnostic grant - 2026-11-18
+
+Root accepted prepared patch206e4610 and independent Sol6.1 high safetyPASSb6a28f1a; authorized one compilation plus one exact natural F6 invocation under the preregistered plan. No repeats, injection, mechanical repair, budget/assertion/ownership change or hosted action. Execution task is active and completion tracked; temporary source must restore exactly after any outcome. This is diagnosis only, no exhausted fix attempt reset. Main09134085 remains RED; PR176 held; M2 open/M3 unchecked and hardware **unverified on real hardware**.
