@@ -3,6 +3,7 @@ mod code;
 mod registry;
 pub use registry::{FoundMembers, FoundTooLarge, MAX_FOUND_WIRE, MAX_MEMBERS, PeerRefusal};
 pub(super) mod codec;
+use super::{membership::Membership, state_store::LogPos};
 pub use code::{CodeError, CodeVerifier, JoinCode, JoinSecret, RedeemProof};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, num::NonZeroU64};
@@ -23,6 +24,13 @@ pub const MAX_CODE_TEXT: usize = 4096;
 pub const MAX_SPKI: usize = 2048;
 pub const MAX_TIME_MS: u64 = 253_402_300_799_999;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinAnchor([u8; 32]);
+impl JoinAnchor {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyDigest([u8; 32]);
 impl KeyDigest {
@@ -67,6 +75,7 @@ pub enum Command {
         code: CodeId,
         presented: CodeVerifier,
         key: KeyDigest,
+        anchor: JoinAnchor,
         proposed_at_ms: u64,
     },
 }
@@ -80,6 +89,7 @@ impl Command {
         code: CodeId,
         proof: &RedeemProof,
         key: KeyDigest,
+        anchor: JoinAnchor,
         proposed_at_ms: u64,
     ) -> Self {
         Self::Redeem {
@@ -88,12 +98,14 @@ impl Command {
             code,
             presented: CodeVerifier::of_proof(proof),
             key,
+            anchor,
             proposed_at_ms,
         }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
+    AnchorChanged,
     NotFounded,
     BadFounders,
     AlreadyFounded,
@@ -119,6 +131,7 @@ pub enum Reject {
 impl std::fmt::Display for Reject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::AnchorChanged => "join anchor changed",
             Self::NotFounded => "not founded",
             Self::BadFounders => "bad founders",
             Self::AlreadyFounded => "already founded",
@@ -166,6 +179,9 @@ pub struct EnrollmentGrant {
     key: KeyDigest,
     request: RequestId,
     code_expires_ms: u64,
+    anchor: JoinAnchor,
+    origin: LogPos,
+    original_applied_ms: u64,
     applied_ms: u64,
     replay: bool,
 }
@@ -184,6 +200,15 @@ impl EnrollmentGrant {
     }
     pub fn code_expires_ms(&self) -> u64 {
         self.code_expires_ms
+    }
+    pub fn anchor(&self) -> JoinAnchor {
+        self.anchor
+    }
+    pub fn origin(&self) -> LogPos {
+        self.origin
+    }
+    pub fn original_applied_ms(&self) -> u64 {
+        self.original_applied_ms
     }
     pub fn applied_ms(&self) -> u64 {
         self.applied_ms
@@ -235,6 +260,9 @@ struct Consumption {
     request: RequestId,
     key: KeyDigest,
     node: NodeId,
+    anchor: JoinAnchor,
+    origin: LogPos,
+    original_applied_ms: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeRecord {
@@ -277,9 +305,46 @@ impl EnrollmentState {
         if consumed.key != grant.key {
             return Err(Reject::KeyConflict);
         }
+        if consumed.anchor != grant.anchor
+            || consumed.origin != grant.origin
+            || consumed.original_applied_ms != grant.original_applied_ms
+            || record.expires_ms != grant.code_expires_ms
+            || grant.original_applied_ms > grant.applied_ms
+            || grant.applied_ms > self.committed_ms
+        {
+            return Err(Reject::UnknownCode);
+        }
         Ok(())
     }
-    pub fn apply(&mut self, command: &Command) -> Outcome {
+    pub(in crate::cluster) fn voter_anchor(
+        &self,
+        membership: &Membership,
+    ) -> Result<JoinAnchor, Reject> {
+        let [voters] = membership.configs() else {
+            return Err(Reject::AnchorChanged);
+        };
+        if !(1..=MAX_MEMBERS).contains(&voters.len()) {
+            return Err(Reject::AnchorChanged);
+        }
+        let mut hash = Sha256::new()
+            .chain_update(b"arxcovo/join/anchor/v1")
+            .chain_update(self.cluster)
+            .chain_update([voters.len() as u8]);
+        for voter in voters {
+            let node = NodeId::new(*voter).ok_or(Reject::AnchorChanged)?;
+            let key = self.members.get(&node).ok_or(Reject::AnchorChanged)?;
+            hash = hash
+                .chain_update(voter.to_be_bytes())
+                .chain_update(key.as_bytes());
+        }
+        Ok(JoinAnchor(hash.finalize().into()))
+    }
+    pub(in crate::cluster) fn apply(
+        &mut self,
+        command: &Command,
+        pos: LogPos,
+        membership: Option<&Membership>,
+    ) -> Outcome {
         let (cluster, proposed) = match command {
             Command::Mint {
                 cluster,
@@ -329,6 +394,22 @@ impl EnrollmentState {
         {
             return Outcome::Rejected(Reject::TimeOutOfRange);
         }
+        // Only authenticated, retained first redemption reaches the voter fence.
+        // Refusal here leaves enrollment time, pruning and allocation untouched.
+        if let Command::Redeem {
+            code,
+            presented,
+            anchor,
+            ..
+        } = command
+            && let Some(record) = self.records.get(code)
+            && record.expires_ms + TOMBSTONE_MS > eff
+            && record.consumed.is_none()
+            && bool::from(record.verifier.bytes().ct_eq(presented.bytes()))
+            && membership.and_then(|m| self.voter_anchor(m).ok()) != Some(*anchor)
+        {
+            return Outcome::Rejected(Reject::AnchorChanged);
+        }
         self.committed_ms = eff;
         self.records.retain(|_, r| {
             r.expires_ms
@@ -374,7 +455,9 @@ impl EnrollmentState {
                 {
                     return Outcome::Rejected(Reject::TooManyPending);
                 }
-                if self.records.len() >= MAX_RECORDS {
+                if self.records.len() >= MAX_RECORDS
+                    || 4866 + (self.records.len() + 1) * 209 > 16384
+                {
                     return Outcome::Rejected(Reject::StateFull);
                 }
                 self.records.insert(
@@ -397,6 +480,7 @@ impl EnrollmentState {
                 code,
                 presented,
                 key,
+                anchor,
                 ..
             } => {
                 let Some(record) = self.records.get_mut(code) else {
@@ -411,6 +495,9 @@ impl EnrollmentState {
                     }
                     if consumed.key != *key {
                         return Outcome::Rejected(Reject::KeyConflict);
+                    }
+                    if consumed.anchor != *anchor {
+                        return Outcome::Rejected(Reject::AnchorChanged);
                     }
                     if self.members.get(&consumed.node) != Some(key) {
                         return Outcome::Rejected(Reject::Revoked);
@@ -435,6 +522,9 @@ impl EnrollmentState {
                         request: *request,
                         key: *key,
                         node,
+                        anchor: *anchor,
+                        origin: pos,
+                        original_applied_ms: eff,
                     });
                     self.members.insert(node, *key);
                     self.next_node_id = next;
@@ -446,6 +536,9 @@ impl EnrollmentState {
                     key: *key,
                     request: *request,
                     code_expires_ms: record.expires_ms,
+                    anchor: *anchor,
+                    origin: record.consumed.as_ref().unwrap().origin,
+                    original_applied_ms: record.consumed.as_ref().unwrap().original_applied_ms,
                     applied_ms: eff,
                     replay,
                 })

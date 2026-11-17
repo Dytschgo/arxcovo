@@ -79,3 +79,50 @@ The suggested implementation details in the brief are not automatically adopted
 by these three selections. No timeout, retry, capacity, workflow, protection or
 quarantine changes are authorized by this record. M2 remains open, M3 unchecked;
 production transport and hardware paths are **unverified on real hardware**.
+
+### Technical amendment 2026-11-17: atomic join-anchor kernel
+
+Root accepts the internal implementation contract in
+[the atomic-anchor brief](../briefs/m3-atomic-join-anchor-fence.md), with
+[root corrections](../reviews/m3-atomic-join-anchor-root-review.md) and the
+[independent Sol recheck](../reviews/m3-atomic-join-anchor-contract-sol-recheck.md).
+This authorizes the bounded local source slice, not public enrollment or release.
+
+- First redemption compares the code-bound voter-key anchor against the
+  canonical membership and registry immediately before that committed entry.
+  Missing, joint or unbound voting state refuses. AnchorChanged leaves enrollment
+  state untouched, while the applied log position advances. Persistence precedes
+  any returned grant. Both existing fresh signing guards remain required.
+- Exact authorized replay preserves the original commit, expiry and original
+  effective time, even after voting-state changes. The grant's existing
+  applied_ms remains the fresh operation time for signer rollback protection.
+  Revocation never recreates a binding. IssuedLeaf.identity_commit reports the
+  original redemption position, or the founding position for a founder leaf.
+- Codes use fixed arxj2 (270 characters), including a 32-byte voter-key anchor
+  bound into proof-v2. Command tag6 replaces legacy Redeem tag2. Snapshot version3,
+  state SQLite version2, log SQLite/metadata version2 and ARXLE2 are explicit
+  format breaks. Legacy formats refuse Unsupported; no migration, reset,
+  deletion, mixed-version cluster or rolling upgrade is authorized. Preserve old
+  files. A requirement to operate retained deployed data stops this slice for
+  a separate migration design.
+- The 16 KiB snapshot limit stays. New Mint reserves for future consumption,
+  maximum registry and membership growth: 4866 + (retained records + 1)*209
+  must not exceed16384. Effective retained-code capacity becomes55; existing
+  MAX_RECORDS64/MAX_PENDING8/MAX_MEMBERS16 remain upper bounds. This is an
+  intentional earlier StateFull refusal, after pruning and exact Mint dedup.
+  Snapshot decode enforces the same invariant. SQL errors stay unknown/poisoned.
+- Pure and durable tests must preserve prior semantic assertions through stated
+  setup/format adaptations. Canonical membership max3605 is distinct from its
+  4096-byte envelope. The new one-voter issuance test is required on all OSes;
+  existing fixture28/sample8/founder13/TLS14 classifications remain unchanged.
+
+No discovery, pre-proof authenticated endpoint, durable joiner custody,
+membership controller, transport/control identity or production clock policy
+is accepted here. Root authorizes one local verification round, with at most two
+mechanical compile/import/lint corrections before the first behavior check.
+A natural semantic/static-suite failure stops for disposition without rerun.
+The four designated pure/durable mutants run once each and restore baseline
+bytes. No local Windows engine scenario is authorized. Publication and merge
+still require independent exact-head source review, all five normal gates,
+hosted Windows at most660s and fresh green exact main. M2 stays open and M3
+unchecked; hardware paths remain **unverified on real hardware**.

@@ -156,10 +156,15 @@ fn codec_rejects_noncanonical_and_out_of_bounds_memberships() {
 #[test]
 fn command_mapping_and_display_never_emit_command_contents() {
     use crate::cluster::enrollment::{JoinCode, KeyDigest};
-    let code = JoinCode::generate([1; 16], [2; 32], |b| {
-        b.fill(7);
-        Ok::<_, ()>(())
-    })
+    let code = JoinCode::generate(
+        [1; 16],
+        [2; 32],
+        crate::cluster::state_store::tests::fixture_anchor(),
+        |b| {
+            b.fill(7);
+            Ok::<_, ()>(())
+        },
+    )
     .unwrap();
     let mint = Command::Mint {
         cluster: [1; 16],
@@ -175,6 +180,7 @@ fn command_mapping_and_display_never_emit_command_contents() {
         code.code_id(),
         &code.proof(),
         KeyDigest::of_spki(b"test-public-key").unwrap(),
+        code.anchor(),
         2,
     );
     assert_eq!(mint.to_string(), "enrollment mint");

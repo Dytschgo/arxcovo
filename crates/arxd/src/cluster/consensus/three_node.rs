@@ -373,7 +373,7 @@ impl Drop for Cluster {
     }
 }
 pub(super) fn code(seed: u8) -> JoinCode {
-    JoinCode::generate([1; 16], [2; 32], |b| {
+    JoinCode::generate([1; 16], [2; 32], fixture_anchor(), |b| {
         b.fill(if b.len() == 32 {
             seed.wrapping_add(128)
         } else {
@@ -400,6 +400,7 @@ fn redeem(c: &JoinCode, r: u8, k: u8, t: u64) -> Command {
         c.code_id(),
         &c.proof(),
         KeyDigest::of_spki(&[k]).unwrap(),
+        c.anchor(),
         t,
     )
 }
@@ -472,6 +473,7 @@ async fn t1_follower_offline_enrollment_and_reopen() {
             z.code_id(),
             &code(4).proof(),
             KeyDigest::of_spki(b"wrong").unwrap(),
+            z.anchor(),
             1006,
         );
         assert_eq!(
@@ -1392,4 +1394,26 @@ async fn r6_shutdown_report_normal_and_reaped_panic() {
     })
     .await
     .unwrap();
+}
+
+fn fixture_anchor() -> crate::cluster::enrollment::JoinAnchor {
+    let mut s = crate::cluster::enrollment::EnrollmentState::new(
+        [1; 16],
+        std::num::NonZeroU64::new(4).unwrap(),
+    );
+    let m = crate::cluster::membership::Membership::new(
+        vec![[1, 2, 3].into()],
+        (1..=3).map(|n| (n, format!("mem:{n}"))).collect(),
+    )
+    .unwrap();
+    s.apply(
+        &founders(),
+        LogPos {
+            term: 1,
+            leader: 1,
+            index: 0,
+        },
+        Some(&m),
+    );
+    s.voter_anchor(&m).unwrap()
 }

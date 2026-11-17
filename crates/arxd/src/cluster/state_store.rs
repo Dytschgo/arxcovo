@@ -106,7 +106,7 @@ pub(super) fn get_pos(r: &mut Reader<'_>) -> Result<LogPos, StoreError> {
 }
 fn encode(i: &Image) -> Vec<u8> {
     let mut b = b"ARXSM1\0\0".to_vec();
-    b.extend(2u16.to_be_bytes());
+    b.extend(3u16.to_be_bytes());
     b.push(u8::from(i.applied.is_some()));
     if let Some(p) = i.applied {
         put_pos(&mut b, p);
@@ -135,8 +135,8 @@ fn decode(b: &[u8]) -> Result<Image, StoreError> {
         return Err(StoreError::Corrupt);
     }
     match r.u16()? {
-        2 => {}
-        1 => return Err(StoreError::Unsupported),
+        3 => {}
+        1 | 2 => return Err(StoreError::Unsupported),
         _ => return Err(StoreError::Corrupt),
     }
     let applied = if r.flag()? {
@@ -148,6 +148,7 @@ fn decode(b: &[u8]) -> Result<Image, StoreError> {
         let p = get_pos(&mut r)?;
         let len = r.u16()? as usize;
         let m = MembershipBlob::new(r.bytes(len)?.to_vec())?;
+        super::membership::Membership::decode(m.bytes()).map_err(|_| StoreError::Membership)?;
         let a = applied.ok_or(StoreError::Corrupt)?;
         if p.index > a.index || p.term > a.term || (p.index == a.index && p != a) {
             return Err(StoreError::Corrupt);
@@ -157,6 +158,7 @@ fn decode(b: &[u8]) -> Result<Image, StoreError> {
         None
     };
     let state = codec::decode(&mut r)?;
+    codec::validate_origins(&state, applied)?;
     if !r.0.is_empty() {
         return Err(StoreError::Corrupt);
     }
@@ -321,9 +323,9 @@ impl StateStore {
                 membership: None,
                 state: EnrollmentState::new(init.cluster, init.first_free),
             });
-            tx.execute_batch("CREATE TABLE sm(singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot BLOB NOT NULL CHECK(length(snapshot)<=16384)); PRAGMA user_version=1;")?;
+            tx.execute_batch("CREATE TABLE sm(singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot BLOB NOT NULL CHECK(length(snapshot)<=16384)); PRAGMA user_version=2;")?;
             tx.execute("INSERT INTO sm VALUES(1,?1)", [&blob])?;
-        } else if v != 1 {
+        } else if v != 2 {
             return Err(StoreError::Unsupported);
         }
         let blob:Vec<u8>=tx.query_row("SELECT snapshot FROM sm WHERE singleton=1 AND typeof(snapshot)='blob' AND length(snapshot)<=16384",[],|r|r.get(0))?;
@@ -413,8 +415,20 @@ impl StateStore {
         image.applied = Some(pos);
         let outcome = match entry {
             Entry::Blank => None,
-            Entry::Enrollment(c) => Some(image.state.apply(c)),
+            Entry::Enrollment(c) => {
+                let membership = image
+                    .membership
+                    .as_ref()
+                    .map(|(_, m)| {
+                        super::membership::Membership::decode(m.bytes())
+                            .map_err(|_| StoreError::Membership)
+                    })
+                    .transpose()?;
+                Some(image.state.apply(c, pos, membership.as_ref()))
+            }
             Entry::Membership(m) => {
+                super::membership::Membership::decode(m.bytes())
+                    .map_err(|_| StoreError::Membership)?;
                 image.membership = Some((pos, m.clone()));
                 None
             }
