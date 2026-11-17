@@ -901,6 +901,10 @@ async fn t4_registry_revocation_snapshot_and_prune() {
 
 // A0 uses the actual engine: apply is paused before acquiring the store mutex.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r1_apply_wait_deadline() {
     timeout(Duration::from_secs(45), async {
         let _pause_owner = APPLY_PAUSE_OWNER.lock().await;
@@ -1013,6 +1017,10 @@ async fn read_units_return(n: &ConsensusNode, budget: Duration) {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r2_isolated_read_refusal() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -1046,6 +1054,10 @@ async fn r2_isolated_read_refusal() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r3_store_wait_deadline_and_heartbeat() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -1081,6 +1093,10 @@ async fn r3_store_wait_deadline_and_heartbeat() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r4_read_admission_and_caller_abort() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -1128,6 +1144,10 @@ async fn r4_read_admission_and_caller_abort() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn r5_shutdown_read_owners() {
     timeout(Duration::from_secs(45), async {
         for gated in [false, true] {

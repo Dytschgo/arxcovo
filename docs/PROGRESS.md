@@ -2,7 +2,16 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main green:** exact688f1ad CI43875610482 success; Ubuntu179s/Windows590s/macOS317s active job duration. Prior e601caa was freshly green before PR160. Fresh exact-main verification remains required before each merge.
+**Current main RED:** exact `c612152` after PR161, CI43880904887 failed. Windows
+`r5_shutdown_read_owners` timed out at `three_node.rs:1195` in its 2 s post-release wait,
+outside the eight quarantines. The cause is unknown. The owner-authorized local implementation quarantines all 24 Windows fixture tests
+(13 three_node and 11 issuance); independent Opus review remains required before push.
+This is an exception, not a fix. PR162 diagnostics remain
+held unless the owner decides. The whole run took 1475 s, which also fails `ci-time-budget`
+under the active wall policy; 738 s charged remains uncredited because the run is red.
+ADR0025 is accepted but inactive, and its bootstrap is not authorized; acceptance alone
+cannot clear the budget gate. Main stays RED until a merged recovery's next exact-main CI
+is green. No hypothetical new-main green claim or budget exception is granted.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -26,8 +35,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #160 as `688f1ad555327d66216eef6f1be06cddf4275a2c` at13:25:25Z, independent Opus PASS6916751847/status59025034118 and all five gates. Reviewed/squash tree c638d054 equal; premerge exact-main e601caa CI43862021319 green. New main CI43875610482 green; Windows590s.
-- Current work: PR161 push2 all platform jobs succeeded on7f71652; independent Opus PASS6917477824/status59027550095. Parent integration9fb217d imports reviewed PR160 only, attribution/harness bytes unchanged. Preparing final integration push3/3 and fresh exact-head gates/review; other merges wait for this head to settle. Windows phase/history diagnostics reviewed with complementary cleanup PASS, publication after this integration. PR159 held; M2 open/M3 unchecked/eight quarantines unchanged.
+- Last merged: PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba`; its known exact-main CI43880904887 failed on Windows R5 and took 1475 s wall / 738 s charged (uncredited). This checkpoint uses the accepted contract's known evidence, with no new hosted query or credit.
+- Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
+- Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -48,7 +58,30 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
+## Whole-fixture quarantine checkpoint (2026-11-17)
+
+Sol high implements the owner-authorized 24-case Windows boundary from prepared
+b0345f3d (main source c612152; PR164 prior 17a3fb2a). Original eight sampled gates
+and declarations are unchanged; five R1–R5 exclusions keep the sample at eight.
+All eleven issuance cases are outside the sample. Pure attribution stays required;
+D1 controls unchanged. Ubuntu/macOS must execute all 24; Windows fixture coverage
+is unverified on hosted Windows and **unverified on real hardware**. M2 remains
+open; M3 unchecked. Shared fix attempts Sol3/3, Opus0/2 unchanged.
+
+Prior PR164 I4 red is retained; Opus induced exact I4 once and counterfactual
+passed, hooks removed, hosted cause/rate unproven. No engine behavior, stability
+or green-main claim. Independent Opus review before push; four hosted gates before
+root's final-exact-head one-use budget-only owner exception question. ADR0025 is
+accepted but inactive, bootstrap unauthorized. No hosted rerun or publication.
+Local results and source/log pins: [fixture evidence](evidence/m3-windows-fixture-quarantine.md).
+Final guard2/2 + sampler60/60 pass; fmt/workspace locked-offline Clippy pass.
+Real nextest lists24 ignored/pure unit required/sample8, R1–R5 mismatched; ordinary
+fixture selection0executed/expected exit4. Two routine corrections (sampler test
+expectations, documentation encoding); no runtime correction or attempt counter spent. Last merged PR remains PR161; current main RED facts above apply.
+
 ## Task history
+
+- 2026-11-16: Sol high bounded R5 quarantine implementation: source/guard/filter/tests plus ADR0024/sample brief/current health correction. Initial pure guard run: 2 tests, 3 failing subtests caused by no-op fixtures, not an R5 runtime execution. One routine fixture correction; natural-failure stop honored with no rerun or further tests. No hosted evidence, source repair credit, publication or merge. Root inspection then Opus high independent review remain pending.
 
 - 2026-11-16: Coordinator independently verifies main87c9940 CI43823823164success, Windowsjob133152799712396s(07:26:06–07:32:42)/install7s(07:32:22–29)/browser3s/Electron7ssuccess. Restores feature work; distinct S2b-repair measurement confirms C1component/headroom target<=500s without replacing originalfailedfirstC1run. Retained correctedOpusbrief26ac2d6/Solcontractrecheck permits samplerimplementation under90sbudget,ownedprocesscleanup,typedoutput and unchangedquarantine; no CIrerun or fixcredit.
 
@@ -3134,3 +3167,15 @@ claim or Linux execution. Sol high implementation next, independently reviewed
 before a normal main-based PR; no dispatch or blind rerun. PR159 remains held on
 both Ubuntu S8 and Windows engine failures. Windows recovery disposition active
 separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
+
+- 2026-11-16: Root verified corrected R5 quarantine source5350d22: guard2, sampler60, fmt and workspace Clippy pass. Real inventory exactly8 with ignoredR5/expression mismatch; ordinary R5 selection runs0tests/571skipped, expected no-tests exit4. No engine rerun. Opus source review pending, main remains RED and budget exception unauthorized.
+
+- 2026-11-16: Retained Opus high source PASS d14e98c for5350d22; its own guard2/sampler60 and7additionalguardmutants pass. Root final verification in30fa749 additionally proves real8-test inventory/R5expression exclusion, ordinaryR5 skip and workspaceClippy. Source unchanged since reviewedc7d1367. Publishing bounded recovery for hosted gates; no merge or budget exception authorized.
+
+- 2026-11-16: PR164 head17a3fb2a Windows job133587063992, run43949259583, failed required i4_leadership_loss atissue_tests.rs237: direct new-leader replay proposal returnedNotLeader(None), attrnone. 36pass/1fail/17skip,557unrun. R5 quarantine skips as intended; no new ignore or rerun authorized. Separate Opus disposition pending. Raw failed-joblog retained D:/Temp/arx-pr164-windows-failure.log SHA25638af212695516bfc9128b27e963c19f34bdea8cc651aad900560bbd94f3e7dc3. Main stillc612152RED; restorationPRblocked on this test plusbudget.
+
+- 2026-11-16: Owner authorized using this Windows PC for tests. Root ran unchanged PR164 I4 once locally (source identical17a3fb2a, current70c15365 docs-only): cargo nextest0.9.151 locked/offline exact i4_leadership_loss passed1/1 in4.340s,570filtered/skipped. DIAGmaxVote8ms/Append7ms/Apply8ms,candNone; hosted failure11.495s had much slower storage. No reproduction or causal/fix/hosted credit; no rerun/loop/source edit. Logs D:/Temp/arx-i4-local-1y__vt3f, stderrSHA2562a6033273ed149fe7b507e652da5451ad37cfb52b66da148a8bc8bfae563b67b.
+
+- 2026-11-17: Retained Opus bounded injected-latency follow-up4ac89a72. C1 Vote300/Append400/Apply600ms reproduced hosted I4 atissue_tests.rs237NotLeader(None) once; counterfactual0/0/600 passed once. Root verified raw-log hashes and exact failure/summary, inspected test-only hook patch, and confirmed crates unchanged from17a3fb2a. This demonstrates local latency-model sufficiency, not hosted cause, determinism or a fix. Hook removed; no source changes, hosted retry or fix attempt. Whole Windows three-node fixture quarantine scope clarification remains pending because I4 is outside the named three_node module. Main remainsRED, M2open/M3unchecked.
+
+- 2026-11-17: Independent Opus high review ca8ea420 passes full fixture quarantine source221077d0/head46df55b7, retained unchanged. Reviewer ran62Python tests and7extra guard probes; verified Rust bodies unchanged,24Windowsignored fixtures/pureunitunignored, original8sample matches and5expressionexclusions. Root also ran62Python tests and exactbodycomparison. Updating PR164 for fresh hosted checks and exact-head review; Ubuntu/mac must execute24. Main remainsRED, no budget exception authorized, no merge.

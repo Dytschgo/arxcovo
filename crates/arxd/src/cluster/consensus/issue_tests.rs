@@ -55,6 +55,10 @@ async fn entered(wait: oneshot::Receiver<()>) {
 }
 fn assert_send<T: Send>(_: T) {}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i1_happy_retry() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -108,6 +112,10 @@ async fn i1_happy_retry() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i2_follower_no_append() {
     timeout(Duration::from_secs(45),async {
     let mut c=Cluster::new(Params::default()).await; let l=c.leader().await; let f=(l+1)%3; let code=code(12); c.write(mint(&code,1,NOW)).await; c.converge().await;
@@ -119,6 +127,10 @@ async fn i2_follower_no_append() {
  }).await.unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i3_single_consumption_race() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -159,6 +171,10 @@ async fn i3_single_consumption_race() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i4_leadership_loss() {
     timeout(Duration::from_secs(45), async {
         let _owner = APPLY_PAUSE_OWNER.lock().await;
@@ -275,6 +291,10 @@ async fn i4_leadership_loss() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i5_remove_between_guards() {
     timeout(Duration::from_secs(45), async {
         let _owner = APPLY_PAUSE_OWNER.lock().await;
@@ -311,6 +331,10 @@ async fn i5_remove_between_guards() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i6_actual_post_wait_clock() {
     timeout(Duration::from_secs(45), async {
         let _owner = APPLY_PAUSE_OWNER.lock().await;
@@ -402,6 +426,10 @@ async fn i6_actual_post_wait_clock() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i7_adapter_rejects_forged_shapes_and_mismatches() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -482,6 +510,10 @@ async fn i7_adapter_rejects_forged_shapes_and_mismatches() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i8_removed_leaf_remains_chain_valid_stale_registry() {
     timeout(Duration::from_secs(45), async {
         use x509_parser::prelude::*;
@@ -553,6 +585,10 @@ async fn i8_removed_leaf_remains_chain_valid_stale_registry() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn i9_private_material_never_persisted() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
@@ -572,6 +608,10 @@ async fn i9_private_material_never_persisted() {
     .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn hook_store_identity_and_admission() {
     timeout(Duration::from_secs(45), async {
         let _owner = APPLY_PAUSE_OWNER.lock().await;
@@ -609,6 +649,10 @@ async fn hook_store_identity_and_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
+)]
 async fn retained_record_is_required_even_while_member_remains_authorized() {
     timeout(Duration::from_secs(45), async {
         let mut c = Cluster::new(Params::default()).await;
