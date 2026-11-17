@@ -36,3 +36,30 @@ Do not silently waive mutation evidence or treat static tokens as equivalent.
 Actual work: static source/brief review only, no build/test/probe/network.
 Production admission, custody, transport, owner authorization and expiry policy
 remain open. M2 open, M3 unchecked; hardware **unverified on real hardware**.
+
+## Recheck of 0e1febcd
+
+Root accepts the revised seven-scenario plan for this test-only API proof.
+The scenario-independent checker consumes real results and saved expectations;
+each counterfactual must both succeed in the intended engine operation and
+trigger exactly its designated checker violation. Setup, convergence and cleanup
+failures cannot count as successful negative controls. This closes the supported
+runtime evidence-route blocker through ordinary Ubuntu/macOS CI.
+
+These are omission-equivalent runtime controls, not compiled source mutations.
+The report and future PR must preserve that distinction. Each of the seven
+fixtures runs once, sequentially, under the one shared 75-second entry ceiling,
+including a reserved cleanup window. No Windows engine execution is granted.
+Root accepts this expanded work inside the existing ceiling, not seven renewed
+budgets. Actual runtime fit and headroom remain unknown until the first normal
+hosted run; a natural red stops work without rerun or tuning.
+
+Keep the parked Box owned until the scenario's decision point. Positive and the
+five request-substitution scenarios drop it before recovery; ResumeFuture alone
+resumes it. No constructed joint entry, fabricated result or expected panic.
+
+The bounded implementation allowlist is accepted, conditional on fresh green
+exact main and independent source review before publication. This authorizes
+only the new test, cfg(test) binding, guard and stated documentation changes.
+Production L2 remains unauthorized. Actual recheck: read revised brief only;
+no build, test, runtime probe or network action ran.
