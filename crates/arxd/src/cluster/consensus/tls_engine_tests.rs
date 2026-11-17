@@ -796,7 +796,7 @@ async fn learner_catch_up_gives_joiner_own_registry() {
             assert_eq!(
                 m.membership_config
                     .membership()
-                    .learner_ids()
+                    .non_write_voter_ids()
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([2])
             );
@@ -826,7 +826,7 @@ async fn learner_catch_up_gives_joiner_own_registry() {
             assert_eq!(
                 m.membership_config
                     .membership()
-                    .learner_ids()
+                    .non_write_voter_ids()
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([2])
             );

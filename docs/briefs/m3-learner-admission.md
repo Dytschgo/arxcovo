@@ -175,3 +175,9 @@ and its returned anchor. Also, discarding pins at Found alone can strand a learn
 when the current leader's registry binding appears later in replay. Consider a
 one-code-bound anchor and an applied fence without adding a second owner step.
 No D1, D2 or D3 production decision is selected by this L1 approval.
+
+Root lint disposition: OpenRaft0.10.0 learner_ids() is a deprecated alias that
+delegates directly to non_write_voter_ids(). Use the latter in the two test
+assertions; semantics are identical. No behavior test ran before the lint stop.
+Root authorizes the mechanical correction and the unfinished verification once,
+with no runtime tuning, warning suppression or retry of a failed engine test.
