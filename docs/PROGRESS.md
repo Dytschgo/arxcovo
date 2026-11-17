@@ -2,16 +2,16 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI PENDING:** exact `59a665c9cda602d0b2939613656f2c98399f51f1`
-after PR173. First push CI44114182696 attempt 1 is running; no further feature
-merge or source build until it is green. Previous exact main380c0215 passed
-CI44097456394 in556s wall / Windows551s. PR173's five gates and independent
-exact-head review passed; Windows584s, tracked required92 tests passed on every
-OS, all28 fixtures passed on Ubuntu/macOS. New one-voter receipt/replay/revocation
-passed0.109s/0.282s/1.739s (Ubuntu/macOS/Windows), including exact-final restored
-malformed-code literal. PR sample8 passed with no orphans; no recovery credit.
-Windows fixture28 remains unverified on hosted Windows and **unverified on real hardware**.
-M2open/M3unchecked; internal atomic redemption does not close public join security.
+**Current main GREEN:** exact `59a665c9cda602d0b2939613656f2c98399f51f1`
+after PR173. First push CI44114182696 attempt 1 passed in 609 s wall;
+Windows 604 s, Ubuntu 241 s, macOS 292 s. All 92 tracked required cases passed
+on every OS; Ubuntu/macOS passed all 28 fixtures. The new one-voter proof passed
+in 0.092 s / 0.239 s / 2.451 s (Ubuntu/macOS/Windows). Exact-final restored
+malformed-code bytes now have hosted passing evidence. Windows's non-gating
+sample passed seven cases and failed U6 at Stop/Orphaned (owners_left=2),
+orphans=0; no rerun, fix or re-enable credit. Windows fixture28 remains
+unverified on hosted Windows and **unverified on real hardware**.
+M2 open / M3 unchecked; atomic redemption does not close public join security.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -35,8 +35,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed headaa63bd5f, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 pending; feature work remains gated on its success.
-- Current work: root is actively waiting for PR173 exact-main CI. Atomic-anchor source and publication reviews passed; all92 tracked cases passed on every hosted OS and Unix fixtures28 passed. Next internal L2 contract may be prepared read-only while main runs; no production ingress or source build authorized.
+- Last merged: PR #173 as `59a665c9cda602d0b2939613656f2c98399f51f1`, reviewed head `aa63bd5f`, normal five gates/PASS6952027124. Merge tree equals reviewed head. First-main CI44114182696 attempt 1 is green: 609 s wall / Windows604s.
+- Current work: Sol 6.1 high prepared the next anchored pre-proof security brief e859ff16 (retained79f5fa01). Root is reviewing bounded voter observation and same-connection endpoint possession before proof release. No next-slice source authorized yet.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3421,3 +3421,14 @@ Pinned squash merged reviewedaa63bd5f as59a665c9; identical tree
 PR watch removed; root is waiting directly on main CI44114182696. No green-main
 claim until that run finishes. M2open/M3unchecked, repair counters unchanged;
 hardware **unverified on real hardware**.
+
+### PR173 first-main result (2026-11-17)
+
+Root Sol 6.1 medium directly awaited CI44114182696 to exit0. Exact59a665c9
+passed on attempt1 in609s; Windows604s, Ubuntu241s, macOS292s. All92 tracked
+cases passed on each OS; Unix fixture28 passed. No rerun/protection exception.
+Raw logs, run metadata and hashes: D:/Temp/arx-pr173-hosted/main-success.json.
+Non-gating Windows sample:7 pass, U6 fails Stop/Orphaned with owners_left2,
+propose_held2, read_held0, total5001ms; no orphans. This does not prove cause
+or stability; quarantine and exhausted repair counters remain unchanged.
+Next design is local/static only. M2 open / M3 unchecked; hardware unverified.
