@@ -2,16 +2,18 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI PENDING:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
-after PR174. First push CI44126173935 attempt1 is queued/running; no further
-feature build or merge until exact-main green. Previous main59a665c9 passed
-CI44114182696 in609s wall/Windows604s. PR174's five normal gates and exact-head
-PASS6953829566 passed; Windows541s, all108 tracked cases passed on every OS,
-all28 fixtures passed on Ubuntu/macOS. First anchored founder proof passed
-0.143s/0.296s/1.127s (Ubuntu/macOS/Windows). PR sample8 passed, no orphans;
-no Windows fixture stability or re-enable credit. Fixture28 remains unverified
-on hosted Windows and **unverified on real hardware**. M2open/M3unchecked;
-internal pre-proof TLS does not close public joining or key custody.
+**Current main recovery PENDING:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
+after PR174. Main CI44126173935 attempt1 ended failure in904s wall: Ubuntu and
+Windows passed (248s/553s), macOS was cancelled before runner acquisition
+(runner0, zero steps/tests). GitHub annotation says no hosted runner acquired;
+this is infrastructure, not a test or quarantine-gap failure. Under standing
+pre-start cancellation recovery, root retried ONLY macOS job134190447393 once
+as attempt2; Ubuntu/Windows are not rerun. No more retry authority is inferred.
+Exact-main health remains pending until the retry finishes. First-attempt904s
+is retained, exceeds900s and receives no idle-queue credit; ADR0025 is inactive.
+PR174 had all108 tracked tests/Unix fixture28/new proof pass, Windows541s.
+Fixture28 stays unverified on hosted Windows and **unverified on real hardware**.
+M2 open / M3 unchecked; no new feature build or merge before main health recovers.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -35,8 +37,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`, five gates/PASS6953829566. Merge tree equals reviewed head. First-main CI44126173935 pending.
-- Current work: root directly awaits PR174 exact-main CI. Read-only next-slice design may proceed; no new source build before exact-main success. New hosted proof passed all OS in the PR; no production listener or universal panic cleanup guarantee.
+- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`, five gates/PASS6953829566. Merge tree equals reviewed head. Main CI44126173935 attempt1 failed only pre-start macOS acquisition; one macOS-only infrastructure retry attempt2 is pending.
+- Current work: root awaits the single macOS-only infrastructure retry. Owned anchor-query design3502c69/root10309ef4 passed separate Sol high contract recheckd56a4a2 (retained3b45bb07). No source authorization yet; health/verification-budget prerequisites remain.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3500,3 +3502,16 @@ Evidence and log hashes: D:/Temp/arx-pr174-hosted/pr-evidence.json.
 Pinned squash3022d601 has reviewed tree5be6086939a0e47830fa0a1a34e3f660f3b78f70.
 No exception/rerun; PR watch removed. Root awaits main CI44126173935 directly.
 No exact-main acceptance until it finishes; M2open/M3unchecked/hardwareunverified.
+
+### Main macOS pre-start cancellation and one retry (2026-11-17)
+
+Root read job134190447393: conclusion cancelled, runner_id0, steps[]; annotation
+"The job was not acquired by Runner of type hosted even after multiple attempts".
+Run44126173935 attempt1 concluded failure in904s; Ubuntu/Windows passed.
+Standing babysitter rule permits one pre-start infrastructure retry without
+owner reconfirmation. Root verified unchanged main3022d601 immediately before
+POST jobs/134190447393/rerun. Only cancelled macOS retried, expected attempt2;
+no test-failure rerun or re-execution of passed platform jobs. Evidence:
+D:/Temp/arx-pr174-hosted/main-attempt1-infrastructure-cancel.json and
+infrastructure-retry.json. No first-attempt success or queue credit claimed.
+Root directly awaits recovery; policy/feature merges still require all gates.
