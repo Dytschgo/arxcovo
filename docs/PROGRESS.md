@@ -35,7 +35,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #170 as `76460c9706a6a15af7ea9fa037aee52876da3591`, reviewed headbce90cff, all five gates/PASS6948230778 and PR Windows484s. First-main CI44085879290 attempt1 green575s wall/Windows570s. Non-gating sample T4 red retained separately.
-- Current work: joint-recovery source is implemented locally; root fixed only the missing watcher-trait import. Fmt/Clippy, guard5, sampler60 and exact real listings passed; source review by independent Sol6.1 high is running at8e3df55. No engine scenario has executed locally; Unix runtime/control fit and feature-head Windows<=660s remain open.
+- Current work: joint-recovery test source passes independent Sol6.1 high review c459d80c at8e3df55. Root retained the report and prepares publication of unchanged8a91dcb source. Compile/static/listing passed; first Ubuntu/macOS runtime of all seven scenarios and hosted Windows<=660s are still required. No local engine test ran.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3324,3 +3324,8 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - Main windows log SHA256 `c7992a312a3209915021136058a4f90d3f7f2e54a87cf7a5abc62c956b302f56` under D:/Temp/arx-pr170-hosted.
 - Main macos log SHA256 `01838f1b965435f7845054e74d2e839c1e1c30b64d5484372d2e1dddb5ae6077` under D:/Temp/arx-pr170-hosted.
 - Required CI remains green under the reviewed non-gating sample contract. No Windows recovery/re-enable credit; Sol3/3, Opus0/2 unchanged; M2open/M3unchecked; hardware **unverified on real hardware**.
+
+### Joint-proof independent source PASS - 2026-11-17
+
+- Separate-author Sol6.1 high review c459d80c at8e3df55: Standards/Spec/Security PASS, no blockers. Actual source/cache inspection, hash recomputation and saved inventory parsing; root compile/static/listing evidence reused, no Rust/engine run. Report retained byte-for-byte; new source unchanged8a91dcb.
+- Root rechecked live main76460c97 and exact CI44085879290 SUCCESS before publication preparation. Runtime/control fit, exact-head review and all hosted feature gates remain open. Hardware **unverified on real hardware**, M2open/M3unchecked and exhausted budgets unchanged.

@@ -1,4 +1,8 @@
-# M3 joint-membership recovery: implementation ownership stop
+# M3 joint-membership recovery: compile and inventory evidence
+
+Current status: corrected source passes compile/static/listing verification and independent Sol source review c459d80c. First Ubuntu/macOS runtime and hosted head timing remain pending.
+
+## Historical startup ownership stop
 
 Sol 6.1 high implementation sub-agent, 2026-11-17; no children.
 Prepared isolated base/source HEAD:
@@ -284,3 +288,12 @@ under D:/Temp/arx-pr170-hosted. This does not turn required CI red under the
 accepted sample contract and gives no recovery or re-enable credit. No rerun,
 quarantine expansion beyond the accepted new-test classification, or engine fix.
 Independent source review at8e3df55 is running; source remains unchanged.
+
+## Publication preparation
+
+Independent separate-author Sol6.1 high source review c459d80c passed at8e3df55,
+with no blocking Standards/Spec/Security findings. Root retained it byte-for-byte;
+source remains exactly8a91dcb. Reviewer inspected source/cache, recomputed artifact
+hashes and parsed saved inventories; it ran no Rust or engine scenario. The new
+headline supersedes the historical stops above. Exact-head publication review,
+first required Unix runtime and all normal hosted gates remain open.
