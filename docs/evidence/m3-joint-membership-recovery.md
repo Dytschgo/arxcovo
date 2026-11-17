@@ -219,3 +219,57 @@ helper, timeout, scenario or production behavior changed. This is a mechanical
 compile correction, not a Windows engine repair or runtime rerun. The unfinished
 compile/static/listing verification may now proceed; no engine execution was
 or is permitted locally. Subsequent actual results will be appended separately.
+
+## Root completed corrected-source verification
+
+Corrected source: 8a91dcb; the only correction is the missing watcher trait import.
+No assertion, scenario, helper, timeout or engine behavior changed. Original
+builder stop is retained. Commands used locked/offline Cargo, dev/test debug=0,
+task-owned temp and the original task-owned build cache; no cache was deleted.
+No engine scenario or Rust runtime test ran locally.
+
+Logs/runners: D:/Temp/arx-joint-root-z2dl6rai. Actual command results:
+
+- `fmt`: exit0, 0.859s, SHA256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- `clippy`: exit0, 11.656s, SHA256 `ae465f71e6511e2019102acdbab6e43eefd27d1a7d3eddb77c3f8a1eb5997d5b`.
+- `guard`: exit0, 0.328s, SHA256 `8c2f5cc4dd9a1690a703c3fde4b07759356a4f1562c7aff59d5783ff5e671edc`.
+- `sampler`: exit0, 0.407s, SHA256 `91fe6bf6aa5222add4bd5ed3cf7dfb8d282aac32c642bff197a84b8a81203fb3`.
+- `list`: exit0, 60.875s, SHA256 `4e22a201be0fea29256c40d06a6e210b52ef888167ce57e34d33d28d15484621`.
+- `sample-list`: exit0, 1.109s, SHA256 `c30e1a794db024b55ecc0266ac1887cdecc6a5c038f672adfcc23c458c75cbe4`.
+
+Guard5 and sampler60 passed, including their static mutants. The all-tests
+listing contains643 cases. The first raw FILTER-only listing used default
+ignored handling and matched only the ordinary pure attribution test. Root's
+initial inventory assertion therefore failed from omitted --run-ignored only,
+not from a source/test failure. Both raw JSON files are retained. The corrected
+listing uses the unchanged sampler cargo_argv(list), including config/profile
+and ignored-only handling. Listing executes no engine tests.
+Exact sampler list: exit0, 1.062s, SHA256 `840f8ae6b8e440410bb1c56f9358ecc2c2a065b4cb85395ba06737e04e91a32e`.
+
+Parsed inventory:28 ignored Windows fixture cases; exactly the original8 sample
+IDs; new proof ignored/outside sample; founder13 and requiredTLS14 unignored.
+First Ubuntu/macOS execution and shared cooperative75s fit remain unproven.
+Controls are equivalent caller omissions, not compiled source-mutation kills.
+
+New test source SHA256: `451582242970a90eaf70c0e108d7d71a4559af26d5d64e5f245223e3be563aba`.
+Frozen Git blobs equal exact main76460c97, and normalized worktree blob hashes
+match them. The first raw filesystem-to-Git comparison failed on Cargo.toml's
+normal CRLF checkout; LF-normalized bytes were identical. Root corrected that
+verification assumption without changing source. frozen.json records exact blobs.
+
+Additional artifact hashes:
+- `verify.py`: `0a38f28569bdd964768d8e5247e6f01c585d7ce862e425abb9a2a13875a30403`.
+- `fixed-list.py`: `09bb461a87b4f9368d8e8a83b70237e3b369a499001cc026cbb62a2caa08030e`.
+- `results.json`: `e2c96fcd39d80de9cee1cabdcc8668ea4a229ee081a11f889d35030f5242090b`.
+- `list.json`: `8ff3dc1ad9371b2ea62ec71db8292ec26521dbde14d4e2e228ec88a3d87d79aa`.
+- `sample-list.json`: `6f39d9396eb67328920996f58632232b14c1fc3906555049aee3cbc39bda3f3b`.
+- `fixed-sample-list.json`: `840f8ae6b8e440410bb1c56f9358ecc2c2a065b4cb85395ba06737e04e91a32e`.
+- `fixed-sample-result.json`: `0660b2dd0286a248b18cca7a0cb6f32f67347dd555c9c3405b0792d85bc9d7ee`.
+- `inventory.json`: `1f0557e47e0813565e17a7f3377e2b5dbb4dbac8c98bf407c9030260e93e86c7`.
+- `frozen.json`: `ba3bfabb5f10aba3b98ae59e172e114a3a7bbfd4e8f22184c9c075f1d2a92d13`.
+
+Independent separate-author Sol source review, exact-head publication review,
+fresh green exact main, all five gates and feature Windows<=660s remain required.
+No local runtime/control success, Windows recovery, production L2 or hardware
+credit. M2open/M3unchecked, Sol3/3 and Opus0/2 unchanged; hardware paths remain
+**unverified on real hardware**.

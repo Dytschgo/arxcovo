@@ -3309,3 +3309,8 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 
 - Root Sol medium verified exactbce90cff five green gates/PASS6948230778, Windows484s, freshgreenbasea7200aa2 and normal five-check strict protection before squash merge76460c97. The merge tree263a2926 equals reviewed head. No exception/protection change/rerun.
 - Exact main CI44085879290 is actively tracked through completion. Premerge/merge inputs are retained under D:/Temp/arx-pr170-hosted. No new main success is claimed before it finishes. Source builder runs in its assigned isolated worktree; counters and coverage claims remain unchanged.
+
+### Joint-proof corrected compile/static/listing - 2026-11-17
+
+- Sol6.1 high source73533941 stopped on three missing-trait E0599 errors before static suites/runtime. Root Sol medium added only the watcher import (8a91dcb), then finished the round: fmt, locked/offline workspace all-target Clippy, guard5, sampler60 and real listing passed. No engine test or behavior rerun.
+- Exact sampler argv confirms28 ignored fixtures/sample8; founder13 and requiredTLS14 unignored. Root corrected its raw-list ignored-selection omission and raw CRLF-vs-Git comparison assumption; source unchanged. Evidence retains all logs/runners/results/list hashes and frozen blob identities. Independent source review precedes publication; Unix runtime/control fit and Windows<=660s remain unverified.
