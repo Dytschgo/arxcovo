@@ -34,7 +34,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #172 as `380c0215d662f75c083015658a9f6f261808f2ea`, reviewed head `27b412b0`, five gates and PASS comment 6949888622. First-main CI44097456394 attempt 1 green: 556 s wall / Windows 551 s; eleven codec/compatibility tests passed on every OS.
-- Current work: atomic-anchor kernel source98b85305, evidenceedaf48fd, is locally verified with qualifications: original17 passes, corrected capacity1, remaining40 and new6; guard6/sampler60/final fmt/Clippy pass; four compiled targeted mutants killed and restored. Root closed the saved-inventory classifier mismatch without source changes: fixture28/founder13/TLS14/new one-voter1/sample8 retained. One restored malformed-code literal awaits exact-final-byte hosted execution. Independent full source review and hosted gates remain pending; no publication yet.
+- Current work: atomic-anchor kernel source98b85305, evidenceedaf48fd, is locally verified with qualifications: original17 passes, corrected capacity1, remaining40 and new6; guard6/sampler60/final fmt/Clippy pass; four compiled targeted mutants killed and restored. Root closed the saved-inventory classifier mismatch without source changes: fixture28/founder13/TLS14/new one-voter1/sample8 retained. One restored malformed-code literal awaits exact-final-byte hosted execution. Independent Sol 6.1 high full source review c5ccb6c4 PASS, retained971d14bf. Preparing publication and exact-head review; hosted gates remain pending.
 - Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, custody, authenticated transport/control identity and clock contracts. Joint recovery has a bounded engine API proof, not production recovery acceptance. Windows fixture coverage (28 cases) remains unverified; M2 open / M3 unchecked; Sol 3/3 and historical Opus recovery 0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3390,3 +3390,15 @@ and four mutation probes may resume under the same stop rules, excluding the
 17 unchanged passes and the corrected target. No local Windows engine runs.
 Source review and hosted gates remain pending; no feature acceptance or repair
 credit. M2 open / M3 unchecked; hardware **unverified on real hardware**.
+
+### Atomic-anchor source review and publication preparation (2026-11-17)
+
+Separate Sol 6.1 high reviewer c5ccb6c4 found no Standards/Spec/Security blockers.
+Only advisory: duplicate named reservation arithmetic could later be centralized;
+no new source round needed. Review retained byte-for-byte as971d14bf. Reviewer
+recomputed artifact/mutant hashes and inspected all semantic adaptations; no
+Rust or engine run was repeated. The restored malformed-code literal remains
+qualified pending ordinary hosted CI. Root re-read live main380c0215 and its
+CI44097456394 attempt1 success before publication preparation. Next: exact-head
+review, five normal gates, all-OS one-voter proof and Windows job at most660s.
+No production ingress/custody/transport or hardware acceptance; M2open/M3unchecked.

@@ -1,9 +1,10 @@
 # M3 L2-B: atomic redemption anchor fence
 
-Design proposal only; Sol 6.1 high, 2026-11-17; no children. Inspected assigned isolated HEAD
+Implemented local kernel; independent Sol high source review PASS c5ccb6c4. Hosted gates remain pending.
+Original design inspection: Sol 6.1 high, 2026-11-17; no children; assigned isolated HEAD
 `380c0215d662f75c083015658a9f6f261808f2ea`; tree equality to reviewed `27b412b0` is coordinator-supplied.
 Root reports PR172 merged normally: eleven pure/wrapper/compat tests PASS all OS, Windows510s.
-Root subsequently confirmed exact-main CI44097456394 attempt 1 green: 556 s wall, Windows 551 s; all eleven cases PASS on every OS. No source is authorized yet.
+Root subsequently confirmed exact-main CI44097456394 attempt 1 green: 556 s wall, Windows 551 s; all eleven cases PASS on every OS. Source was subsequently authorized under ADR0005; no hosted behavior is claimed yet.
 Root clarification review is in [the contract review](../reviews/m3-atomic-join-anchor-root-review.md); its corrections are normative.
 Independent Sol contract recheck609fdd3f PASS; root authorizes the bounded local source round under ADR0005. No production security acceptance follows.
 M2 open, M3 unchecked; hardware **unverified on real hardware**; shared Sol3/3, Opus0/2 unchanged.
