@@ -81,7 +81,7 @@ Acquire the existing APPLY_PAUSE_OWNER across the test to avoid other tests' glo
    by exactly one F from this change. Decode persisted state through existing accessors, not a mocked response.
    Simulate lost reply only by discarding the already successful response value; status/readback must find F without
    another append or new future. This proves observation after reply loss, not durable operation-ID deduplication.
-8. Shut down every node, remove router-held engine clones, assert clean existing shutdown reports and store release;
+8. Remove every router-held engine clone BEFORE shutting down the nodes, then assert clean existing shutdown reports and store release;
    no ignored cleanup error, background task or surviving directory handle. Retain diagnostics on assertion failure.
 
 Direct constructed-joint control is deliberately excluded from this one-test slice. Public append of a caller-built
