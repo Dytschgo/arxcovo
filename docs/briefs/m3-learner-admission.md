@@ -151,3 +151,27 @@ L2 must derive it from the code and refuse any other persisted `first_free` on a
 
 Root: after CI 44069931184 is green on exact main, give L1 to Sol high on that head with this brief, and take D1 (recommend O2), D2 and D3
 to the owner in one message. Do not start L2 or promotion until D1 and D2 are recorded in an ADR 0005 amendment.
+
+
+## Root L1 contract check - 2026-11-17
+
+L1 accepted for test-only implementation on exact fa83788: CI44069931184 attempt1
+is green, wall472s / Windows467s, and the F2 test passed on every OS. L2 and
+promotion production APIs are not approved. Compute one deadline at entry and
+use timeout_at plus its remaining duration for every wait. Before shutdown,
+remove both engines from router.nodes so router-held Raft handles cannot retain
+stores. Retained TLS configs remain alive through the shutdown checks.
+
+For M3, first complete normal learner catch-up, then insert one valid AddVoters
+promotion in the temporary mutant before the existing post-catch-up metrics
+assertions. Assert node1 voters remain {1} in normal code after catch-up as well
+as at admission. This isolates an unintended promotion from NotLearner API
+preconditions. No new assertion is added only in the mutant; restore source
+byte-for-byte and report the actual observed catch.
+
+D1's reply-only O2 recommendation needs security refinement before an owner
+choice: a stolen CA key must not be able to forge both an enrollment endpoint
+and its returned anchor. Also, discarding pins at Found alone can strand a learner
+when the current leader's registry binding appears later in replay. Consider a
+one-code-bound anchor and an applied fence without adding a second owner step.
+No D1, D2 or D3 production decision is selected by this L1 approval.
