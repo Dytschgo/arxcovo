@@ -3,9 +3,9 @@
 Design only; Sol 6.1 high, 2026-11-17. Required prepared base:
 0375963b55277f27dbfcf9684c53b61d7294245f, containing actual main
 59a665c9cda602d0b2939613656f2c98399f51f1 (PR173 atomic-anchor kernel).
-Root reports main CI44114182696 running; no green result is asserted here.
-Implementation requires root confirmation of fresh green EXACT main plus root
-contract review of this brief. Independent Sol source review remains required.
+Root subsequently confirmed main CI44114182696 attempt1 green:609s wall/Windows604s.
+Root review clarifications R1/R2 are normative in ../reviews/m3-preproof-contract-root-review.md.
+Independent contract recheck and root source authorization remain pending.
 M2 open; M3 unchecked; hardware **unverified on real hardware**.
 Historical repair counters Sol3/3, Opus0/2 remain unchanged; no retry grant.
 
@@ -103,9 +103,10 @@ A future local query is a separate slice: both issue/read owned permits and stor
 Arc must live INSIDE its blocking closure through completion after caller loss;
 closed Owners must refuse. This brief does not implement or prove that query.
 TLS is driven in memory on a joined blocking thread, max32 handshake pump rounds,
-fixed <=641-byte list input and32-byte proof output; set rustls output buffer
-limit4096. Bound cumulative ciphertext per side/phase at128KiB in the test driver;
-no unbounded Vec pump or IO wait. No network sockets, queue or background retry.
+fixed <=641-byte list input and32-byte proof output; set rustls output buffer4096.
+The wrapper AND driver cap cumulative ciphertext at128KiB per direction over the WHOLE session,
+with checked pre-admission counters, bounded drain buffers and terminal quota errors (root R1).
+No unbounded Vec pump or IO wait, network sockets, queue or background retry.
 Single-founder proof uses cooperative40s entry budget:35s work,5s cleanup reserve;
 existing operation budgets unchanged. Drop connections/router handles and join
 blocking work before checking shutdown Ok and weak store/log expiry. Startup
