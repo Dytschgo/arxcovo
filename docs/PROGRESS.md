@@ -2,22 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main functionally GREEN, budget BLOCKED:** exact `3022d601f09f24b0e5f092a33f2e9343b500471d`
-after PR174. CI44126173935 attempt2 succeeded after only the zero-step cancelled
-macOS acquisition was retried. Ubuntu248s/Windows553s retain their first
-executions; macOS's first execution passed348s. All108 tracked required cases
-passed each OS, Unix fixture28 passed; new founder pre-proof0.182s/0.310s/1.020s
-(Ubuntu/macOS/Windows). First attempt remains failed infrastructure: final
-attempts/1 API and trusted duration() measure905s, above900s. Initial top-level
-completed read was904s; retained initial evidence is not the current baseline.
-Recovery wall from first run start to final job completion is1352s; job-execution
-union across both attempts is901s (overlapping Ubuntu/Windows553s plus macOS348s).
-These descriptive recovery metrics are not charged-v1 or eligible queue credit.
-No queue credit or bypass; ADR0025 is accepted but inactive. Refreshed policy
-preparation requires independent review, fresh platform checks and separate owner
-activation/bootstrap authorization. Windows sample8 passed with no orphans,
-no re-enable credit. Fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**. M2 open / M3 unchecked; merges remain held.
+**Current main GREEN, budget satisfied:** exact `10aa891f27906e0c73e48396c5c812cab7d4523a`
+after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
+629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
+ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
+the root pure measurement of retained attempt1/job data confirms charged-v1.
+Owner's pinned budget-only bootstrap is consumed. Original strict five checks,
+app bindings and all other protection fences were restored and read back.
+Merge tree equals reviewed head22a09eae. Later hourly recovery slots are no-ops.
+Prior main3022d601's failed905s first attempt remains uncredited and historical.
+Normal feature preparation can resume; every PR still needs independent review,
+all five gates, fresh exact-main green and its applicable Windows timing limit.
+M2 open/M3 unchecked; Windows fixture28 remains unverified on hosted Windows and
+**unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -46,9 +43,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #174 as `3022d601f09f24b0e5f092a33f2e9343b500471d`, reviewed head `e4f0d48c`; all five PR gates green. Main recovered through macOS-only infrastructure retry; first-attempt905s still blocks budget.
-- Current work: policy source7aefa2ca is refreshed onto current main with identical nine source/test/fixture files; synthetic Node48 and root lint passed. Root is preparing independent integration review, then exact-head review and platform checks. Activation/bootstrap remains unauthorized; owner definition acceptance is already settled and will not be asked again.
-- Blockers: first-attempt905s budget holds merges. Production joining still needs owned query/public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Internal apply-time anchor fencing and pre-proof TLS probes are implemented, not public join acceptance. Joint recovery has only an engine API proof. Windows fixture28 unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
+- Last merged: PR163 as10aa891f; reviewed head22a09eae, owner-approved budget-only bootstrap consumed, original protection restored. First exact-main CI44177880021 green632s wall/629s charged.
+- Current work: owned anchor-query kernel is integrated onto active-policy main; source and integration reviews passed. Hosted first-run engine proof, exact-head review and all five gates remain required. PR175 publishes the separately reviewed activation checkpoint.
+- Blockers: no current CI budget deadlock. Production joining still needs public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Windows fixture28 remains unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3558,3 +3555,15 @@ retry), exit0 in8.750s, log SHA256
 2ad029d7311f75ed9147e4a477e11932b7e0113c83b2a6d5344f712e34eaa458.
 Root lint passed once; source remains identical7aefa2ca. Exact-head review
 and hosted checks still needed. Activation/protection/merge remain unauthorized.
+
+### ADR0025 pinned activation - 2026-11-17
+
+Root Sol coordinator executed independently reviewed executor SHA2562b2866045120e8ba4d8cde357640aef0fbdc2662e5eb21363f14d108c4aaa7b9 under recorded owner approval. PR163 merged10aa891f; restore/readback and tree equality passed. Shared retry plan is marked merged, later slots no-op. Only one of four additional infrastructure requests was used. Exact-main CI44177880021 is actively awaited; no feature publication or merge yet. Evidence retained in D:/Temp/arx-ci-queue-root-refresh.
+
+### First active queue-policy main verified - 2026-11-17
+
+Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f attempt1 passed; charged-v1 measurement632s wall/629s charged/3s credit applied. Automatic trusted policy44179754154 completed success. All original protection fences remain restored. No further retry, waiver or feature merge occurred. Owned-query refresh and retained-identity prerequisite can resume normal preparation.
+
+### Owned anchor query publication preparation - 2026-11-18
+
+Sol6.1/high sourcef9d0a413 and integration2c599ffd reviewed independently (89efaaf5,3ca94b38). Five feature files remain byte-identical; fmt/guard8/sampler60 and final diff/UTF8 checks passed. Earlier26selected Rust cases and two compiled mutation kills are reused with exact-restoration qualifications. The new single-voter engine test remains hosted-first on all OS; Windows verify<=660s, all five gates and fresh green main required. Identity-retention design remains separately local and is excluded from this PR. M2 open/M3 unchecked, counters unchanged, hardware **unverified on real hardware**.
