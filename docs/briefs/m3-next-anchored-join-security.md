@@ -177,3 +177,13 @@ required for this slice; longer codes/new discovery or product choices stay out.
 Proposed PROGRESS (not applied): Sol6.1 high design; anchored-list/pre-proof TLS
 brief prepared, static local/cached API inspection only; root review/fresh exact
 main green pending; no source/build/test/engine/network/hardware acceptance.
+
+## Local source status (2026-11-17)
+
+Implementation child source WIP `9b6c7e0` stops at the first natural static
+failure: its scope classifier included the generated inventory JSON evidence
+file as source. No classifier correction or rerun, natural TLS execution or
+mutant followed. Clippy passed after one mechanical correction batch; guard7
+and sampler60 passed. See [local evidence](../evidence/m3-anchored-preproof.md).
+This is not acceptance; independent full source/exact-head review and hosted
+all-OS proof remain required. PROGRESS remains coordinator-owned.
