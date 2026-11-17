@@ -2,15 +2,18 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164,
-first push CI44051366327 attempt1 is running. Owner explicitly authorized the one-use
-budget-only protection exception for exacthead60f30c8673e9c9653d1a177d79379a1975f3107f.
-Root removed only ci-time-budget, performed the pinned squash merge, and restored
-all five original checks/app bindings/strict mode and every other fence in finally;
-exact readback passed. Squash tree equals reviewed head. Previous mainc612152 R5
-failure and1475s budget remain historical; this is quarantine, not a fix. Windows
-24fixture tests remain unverified; Ubuntu/mac passed24each on the PR. No feature
-merge until this exact first-attempt main run is green. ADR0025 remains inactive.
+**Current main GREEN:** exact `39b3dd73052abd64c1c3d3042e62f080469f1597` after PR164,
+CI [44051366327](https://github.com/Dytschgo/arxcovo/actions/runs/44051366327) passed
+on attempt1 across Ubuntu, Windows and macOS in608s wall (under900s). Ubuntu/macOS
+actually passed all24fixturetests. Windows job603s passed with24fixturetests
+quarantined; the bounded8test diagnostic sample skipped_budget at e_s611, so no
+sample execution or Windows stability credit. The owner-authorized budget-only
+exception is consumed; original five requiredchecks/appbindings/strict and all
+other protection fields were restored and reverified. Exact squash tree equals
+reviewedhead60f30c86. Previousc612152R5red/1475s is historical, not fixed.
+M3 work may resume under normal gates. Windows fixture coverage remains
+unverified on hosted Windows and **unverified on real hardware**; M2 open/M3 unchecked.
+ADR0025 remains accepted but inactive; no bootstrap exception is authorized.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -34,7 +37,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-16
 
-- Last merged: PR #161 as `c6121523417089bc0afaf307470183dd4a7f47ba`; its known exact-main CI43880904887 failed on Windows R5 and took 1475 s wall / 738 s charged (uncredited). This checkpoint uses the accepted contract's known evidence, with no new hosted query or credit.
+- Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
 - Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
 - Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
@@ -3180,3 +3183,5 @@ separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 - 2026-11-17: Independent Opus high review ca8ea420 passes full fixture quarantine source221077d0/head46df55b7, retained unchanged. Reviewer ran62Python tests and7extra guard probes; verified Rust bodies unchanged,24Windowsignored fixtures/pureunitunignored, original8sample matches and5expressionexclusions. Root also ran62Python tests and exactbodycomparison. Updating PR164 for fresh hosted checks and exact-head review; Ubuntu/mac must execute24. Main remainsRED, no budget exception authorized, no merge.
 
 - 2026-11-17: Owner-authorized one-use budget-only exception consumed by PR164 merge39b3dd7 at08:58:52Z, exactreviewedhead60f30c86. Original five requiredchecks/appbindingsstrict+allotherprotection restored andexactlyreadback. Review6933714689, platformCI43987282029 attempt1passed includingUbuntu/mac24each. MainCI44051366327 pending; no feature merge or rerun. Local action snapshots D:/Temp/arx-pr164-final-gates.
+
+- 2026-11-17: Root actively awaited mainCI44051366327 after t3_background_wait rejected this provider. All3platforms passed, wall608s. Verified Ubuntu/mac24fixturePASS each and full protection still identical. Windows sample skipped_budget e_s611; no sample/Windowsfixture acceptance. Main restored GREEN; resume M3 under normal gates. No rerun or further exception.

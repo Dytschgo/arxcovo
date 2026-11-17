@@ -27,3 +27,19 @@ First exact-main CI44051366327 attempt1 is running; feature merges remain held.
 Windows fixture coverage is unverified on hosted Windows and **unverified on real
 hardware**. The bounded eight-test diagnostic sample is not acceptance evidence.
 M2 open, M3 unchecked; Sol3/3, Opus0/2 unchanged. This exception is consumed.
+
+## First-main result
+
+CI44051366327 attempt1 succeeded on exact39b3dd7, wall608s. Ubuntu237s,
+macOS368s, Windows603s. Ubuntu/mac logs each show all24fixturetests PASS.
+Windows sample: skipped_budget, e_s611, wall_ms63, no child spawned. No Windows
+fixture acceptance credit. Root re-read live main and full protection after CI;
+main remains39b3dd7 and every protection field equals the original snapshot.
+
+Main log SHA256:
+- ubuntu: `7e198f9ef048bac1458f03032a5b15a98d59c8b3ffb4e69f8882cedeb33b23e7`
+- macos: `de55f012a990572dd8944f8048ee66d7b3116c3ca4910aea80b1a7d5c631cd6a`
+- windows: `12b09d71e1d899f0cf1497a9e1a5c2277e806e003ff0bf4afeb864f62dfc082f`
+
+Main GREEN restores normal prerequisite, not Windows stability. ADR0025 stays
+inactive. This consumed exception grants no other merge or settings action.

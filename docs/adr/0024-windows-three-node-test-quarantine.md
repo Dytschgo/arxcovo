@@ -73,3 +73,7 @@ protection. Merge39b3dd7 completed; full protection snapshot matches readback
 exactly afterward. The exception is consumed and grants no further merge. See
 [checkpoint](../evidence/ci-windows-fixture-restoration-checkpoint.md). First-main
 CI44051366327 is pending; no feature merge until green. ADR0025 stays inactive.
+
+First exact-main CI44051366327 attempt1 on39b3dd7 passed608s wall. Ubuntu/mac
+passed24fixturecases; Windows sample skipped for budget. Normal merge prerequisites
+are restored; Windows fixture coverage remains unverified. No further exception.
