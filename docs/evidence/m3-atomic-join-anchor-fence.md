@@ -181,3 +181,175 @@ nextest inventory pass. No guard/sampler/mutants/engine/hardware acceptance.
 Root disposition and independent review required before further source/testing;
 no publication. M2open/M3unchecked, hardware unverified on real hardware;
 historical Sol3/3 Opus0/2 unchanged.
+
+
+## Authorized continuation at a28b752 (2026-11-17)
+
+Sol6.1 high implementation child, assigned isolated worktree only, no children.
+Prepared `a28b752ba25051b5ad4251da7a76eaee99fe834b`; root fixture correction
+`2e6b64eb262a73a54fab18b32ebd50c34138b672`, original source/evidence pins above.
+Read full brief, normative root review, independent recheck and new fixture
+disposition. No production changes beyond prepared baseline. Added six tests
+in the approved enrollment/state_store/log_store test files, source commit
+`98b853058e022200cff9e9c71bfb32c791527702`. PROGRESS is root-owned and unchanged.
+
+**Stopped at a new custom inventory-classifier static failure; no retry/fix.**
+The final actual nextest listing succeeded (663 cases, exit0). A subsequent
+ad hoc Python inventory classifier incorrectly selected only `tls_engine_tests::`
+for a TLS14 assertion: founder13, selected TLS7, assertion `(13,7)` failed.
+This is not a Cargo failure or evidence of inventory deletion. The classifier
+never produced protected-inventories.json. Its earlier checks found all fixture28
+ignored and sample8 names intact. Complete TLS14 classification is NOT claimed;
+root disposition is needed before correcting/re-running this static check.
+The guard's own six tests passed. No repository guard/filter changed here.
+
+### Coverage audit before behavior execution
+
+- Actual StateStore A/B refusal and counterfactual: existing
+  authoritative_anchor_change_is_inert_before_consume compares entire enrollment
+  state and applied E, with joint identical configs; control installs pre-B
+  snapshot and enrolls. New anchor_boundary_variants_and_durable_inertness adds
+  absent membership, absent voter binding, changed voter key, durable reopen
+  equality and learner/address-only unchanged-anchor success. Whole-state equality
+  covers records, counter, registry, committed time and pruning state.
+- Existing maximum_v3_image_and_registry_semantics_with_recomputed_checksums
+  independently constructs 55 consumed records/max canonical membership/members:
+  actual15870, canonical3605. New new_mint_reservation_56th_pending_bytes_fit
+  independently pins16361/16570 reservation arithmetic; proves a 56th pending
+  record fits current bytes, asserts StateFull and exact unchanged state, exact
+  Mint replay and pruning. Existing retained-cap test's prior pass is reused,
+  not rerun. New replay_drift_authentication_and_pending_reservation_decode
+  rejects56 expired retained pending records even though serialized bytes fit.
+- New malformed_membership_refuses_all_state_boundaries_and_v2 tests malformed
+  canonical payloads at apply/peek/install/open, before persisted mutation;
+  explicit v2 snapshot refusal complements existing v1/DB-version refusals.
+  New anchor_legacy_rows_and_malformed_membership_refuse_replay covers tag2,
+  ARXLE1, metadata-v1 and malformed4096 membership at row replay/open/append,
+  preserving durable rows/meta on append refusal. Canonical maximum3605,
+  membership envelope4096 and row MAX_ROW4163 remain distinct; exact malformed
+  envelope row4163 refuses Membership, old4164 CHECK corruption remains.
+- New origin_time_corruption_refuses_peek_install_and_reopen reaches full origin
+  index/term/equal-index leader mismatch, index above i64::MAX, original time
+  after committed time and invalid original-time lifetime; repaired checksums
+  reach semantics. Good snapshot install/reopen control retained. Existing
+  replay_origin_survives_drift_snapshot_and_reopen verifies full E, original1000,
+  expiry and fresh60000 after joint drift, snapshot install and reopen.
+- Existing literal_anchor_and_proof_binding and replay_fresh_signer_clock_fence
+  are prior17-pass evidence only. New replay_drift_authentication_and_pending_reservation_decode
+  tests exact replay after joint drift, wrong proof/request/key/anchor and
+  removal refusal, comparing entire state and original E/time. Prior privacy,
+  proof/hash vectors, marker-positive controls and durable SQL/crash assertions
+  are preserved. No semantic assertion removed. Only old-test diff is rustfmt's
+  line wrap of root-corrected capacity assertion.
+- R3 source audit: i7_adapter_rejects_forged_shapes_and_mismatches uses genuine
+  grant data and own current response leader, then tests origin index>L,
+  origin term>L at lower origin index, equal-index full-position mismatch,
+  and valid older-origin control. Existing WrongNode path is separate.
+  This quarantined engine fixture is compiled/listed, NOT run locally.
+- Required anchored_single_voter_receipt_replay_and_revocation inspected with
+  helpers: one actual start, founder_init/found/enroll, MemRouter, real CSR,
+  no three-node Cluster helper, original E receipt and replay L>E, AfterCommit
+  removal causing Revoked rather than another allocation/leaf, router clear and
+  shutdown before pass. 35s work/40s entry including5s cleanup; startup blocking
+  caveat remains. Required all-OS class is compiled/listed, NOT executed here.
+  Founder13 was counted from real listing; full protected TLS14 classification
+  stopped as explained above. No local engine test or engine mutant ran.
+
+### Actual checks, reused evidence and source qualifications
+
+Before additions, actual nextest list with root resume-selection filter selected
+exactly40 original unrun names; compared original focused.log's17 PASS names
+with original_passes and excluded those plus root corrected target. Retained
+remaining-names.json is that exact list. After additions, executed an exact-name
+union of those40 once (not an expanded filter that silently added new cases),
+then a separate union of six new tests once. **40/40 and6/6 PASS.** No broad
+passing-suite replay. Root corrected capacity PASS and original17 PASS are reused
+only, never rerun naturally. Mutant4 intentionally executes its designated
+previously-passing signer regression once under mutation, as authorized.
+
+One mechanical pre-behavior correction for new tests: cargo fmt parser caught
+one misplaced assert_eq closing parenthesis; fixed once, fmt and nextest listing
+compiled. No compile/import/lint correction followed. Later diff inspection found
+Python's default Windows read encoding had mangled the unchanged non-ASCII
+malformed-code literal. Restored all three old test prefixes directly from git
+UTF-8 bytes, retaining only additive tests, then formatted. This restoration
+preserves old assertions, not a semantic repair. The40-case result therefore
+used a malformed non-ASCII variant in text_is_bounded_checked_and_round_trips;
+its original literal is restored on final source without a forbidden rerun.
+Do not describe that individual test as an exact-final-bytes behavior pass.
+Final fmt/Clippy and real listing ran after restoration. New six test bodies
+were unchanged between their natural passes and final source.
+
+All Cargo uses task target D:/Temp/arxcovo-anchor-c9616b-target, locked/offline;
+no concurrent user of that target. No installs/network/cache deletion. Commands
+and full argument vectors (including exact40 and6 filters), exit/time/log hashes
+are in corresponding result JSON under D:/Temp/arxcovo-anchor-resume-a28b752.
+Initial inventory/list compile also passed; no test executable ran during listing.
+Final static checks were justified by new tests and UTF-8 prefix restoration.
+
+| Result stem | Exit | Seconds including build |
+| --- | --- | --- |
+| `remaining40` | 0 | 3.453 |
+| `new6` | 0 | 1.375 |
+| `guard` | 0 | 0.329 |
+| `sampler` | 0 | 0.407 |
+| `fmt` | 0 | 0.812 |
+| `clippy` | 0 | 11.640 |
+| `mutant1` | 100 | 20.859 |
+| `mutant2` | 100 | 19.531 |
+| `mutant3` | 100 | 17.469 |
+| `mutant4` | 100 | 17.297 |
+| `final-fmt` | 0 | 0.796 |
+| `final-clippy` | 0 | 5.172 |
+| `final-inventory-result` | 0 | 16.672 |
+
+`guard`: python -I -B -m unittest discover -s tools/ci -p test_windows_cluster_quarantine.py
+(6 PASS, including omission/rename/ignore/Unix gating and old inventory controls).
+`sampler`: same unittest command with test_windows_diag_sample.py (60 PASS).
+`final-fmt`: cargo fmt --all -- --check.
+`final-clippy`: cargo clippy --workspace --all-targets --locked --offline -- -D warnings.
+`final-inventory-result`: cargo nextest list --workspace --all-targets --locked --offline --message-format json.
+Natural runs use cargo nextest run --workspace --all-targets --locked --offline -E
+with exact filters in remaining40.json/new6.json. Pre-behavior compile used the
+same inventory command (compile.json/log). No unchanged suite replay for final checks.
+
+### Four designated mutants (once each, restored after each)
+
+All four compiled successfully, exit100 at their designated assertion; none
+survived, failed compilation, or failed at an unrelated assertion. No retries.
+Each touched enrollment.rs only temporarily; baseline and every restored SHA256:
+`955b728624272640dcad8483e7fcdf728c8dfc527f9be6236ecc23ce5066f4f2`.
+Each mutant patch hash and restored hash is retained in mutantN-restore.json;
+logs/results include the exact filter and build/passbuild evidence.
+
+1. Replace first-consumption voter-anchor comparison with false: actual A/B
+   StateStore assertion line831 returned Enrolled instead of AnchorChanged.
+2. Replace retained consumption origin with current pos on replay: snapshot/
+   reopened replay assertion line895 returned full origin(2,3,5), expected(2,3,3).
+3. Remove only NEW Mint reservation clause: new test line938 returned
+   Minted{replay:false,expires_ms:900000} instead of StateFull. Its earlier pending
+   byte-fit assertion passed, so this is the required reachable capacity mutant.
+4. Set fresh grant applied_ms to retained original time: regression line869
+   returned Ok instead of SignerClockBehind at signer20000, first1000/replay60000,
+   before any fresh-field equality assertion.
+
+Retained source hashes and continuation.patch pin final additions. All artifacts
+are listed with SHA256 in artifact-hashes.json, itself SHA256 `2909772dddf6a0b24c82785ff138cae5888fef9ede06c67cc073661f501a9474`.
+Logs/caches retained; owned Cargo/Python processes finished. No push, PR, remote
+status/comment/watch/link/merge, admin/native/VM or old Lab Manager operations.
+
+### Remaining coordinator work and proposed PROGRESS entry (not applied)
+
+Root disposition of custom classifier static failure; independent full Sol high
+source and exact-head reviews; hosted five gates/all-OS new tests and required
+one-voter engine; feature Windows<=660s and fresh exact-main evidence remain.
+Main380c0215/CI44097456394 green is historical root evidence, not feature proof.
+Existing exhausted repairs and Sol3/3 historical Opus0/2 remain unchanged.
+M2open/M3unchecked; hardware **unverified on real hardware**.
+
+Proposed entry: Sol6.1 high atomic-anchor continuation 98b853058e022200cff9e9c71bfb32c791527702: six additive
+boundary tests; remaining40 and new6 passed once, original17/root target reused;
+guard6/sampler60/final fmt/Clippy passed; all4 designated mutants compiled/killed
+at exact assertions and restored. Actual nextest listing passed, custom TLS14
+classifier failed(13,7); stopped without correction/rerun. Independent source/
+exact-head review and hosted gates pending; no publication/hardware acceptance.
