@@ -10,6 +10,9 @@ passed each OS, Unix fixture28 passed; new founder pre-proof0.182s/0.310s/1.020s
 (Ubuntu/macOS/Windows). First attempt remains failed infrastructure: final
 attempts/1 API and trusted duration() measure905s, above900s. Initial top-level
 completed read was904s; retained initial evidence is not the current baseline.
+Recovery wall from first run start to final job completion is1352s; job-execution
+union across both attempts is901s (overlapping Ubuntu/Windows553s plus macOS348s).
+These descriptive recovery metrics are not charged-v1 or eligible queue credit.
 No queue credit or bypass; ADR0025 is accepted but inactive. Refreshed policy
 preparation requires independent review, fresh platform checks and separate owner
 activation/bootstrap authorization. Windows sample8 passed with no orphans,
@@ -126,7 +129,7 @@ Prepared route removes ONLY ci-time-budget temporarily, restores original strict
 admin enforcement and all five app bindings in finally, checks zero armed
 auto-merges before the window and again before merge, and aborts on pin/settings
 drift or restoration failure. New first-attempt green main after eventual
-activation is still needed; attempt2 cannot credit the failed904s attempt1.
+activation is still needed; final trusted attempt1 baseline is905s (initial read904s), uncredited despite attempt2 success.
 M2 open / M3 unchecked / Sol3/3 / historical Opus0/2 unchanged; hardware
 **unverified on real hardware**. No push or activation performed.
 
@@ -3529,3 +3532,29 @@ Owner accepted fully-green-only idle queue credit with wall reporting. Prior
 PR163 source78c72b6 CI43914905394 passed platforms on attempt1; the obsolete-head
 macOS retry was unused. The earlier c612152/R5 red was the then-current state,
 not current main health. Definition acceptance granted no activation or exception.
+
+### Babysitter priority: activate reviewed queue policy before features (2026-11-17)
+
+Root accepts valid priority steering: #163 is the NEXT merge candidate; all
+feature merges remain held. Existing definition acceptance is settled. Root
+will present the exact publication head for one named-executor bootstrap only
+after independent review and three green platform checks make it concrete.
+No feature PR is used to discover this already confirmed budget deadlock.
+
+Recorded wall versus execution: first run start16:28:31 to final macOS completion
+16:51:03 =1352s. Actual executing-job union =901s: Ubuntu overlaps Windows's
+553s, then macOS348s. This cross-attempt descriptive union exceeds900 itself
+and is not ADR0025's charged metric. Reviewed ADR0025 withholds credit for the
+failed first attempt (trusted evaluator905s), so this recovered run will not
+be retroactively green-budgeted. A new qualifying first-attempt main after
+authorized activation is required. Source/threshold/definition stay unchanged.
+Static metric script had one parenthesis typo before execution; corrected
+scratch calculation is pinned in D:/Temp/arx-ci-queue-root-refresh/recovery-time-comparison.json.
+
+Separate Sol high integration reviewe11196b7 PASS (retainede94e921b); advisory
+stale904 checkpoint corrected. Builder raw Node log was unavailable; root
+resolved that evidence concern with one fresh synthetic48/48 run (no failed-test
+retry), exit0 in8.750s, log SHA256
+2ad029d7311f75ed9147e4a477e11932b7e0113c83b2a6d5344f712e34eaa458.
+Root lint passed once; source remains identical7aefa2ca. Exact-head review
+and hosted checks still needed. Activation/protection/merge remain unauthorized.

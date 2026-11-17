@@ -139,3 +139,23 @@ Root identity/lint records: D:/Temp/arx-ci-queue-root-refresh.
 Source remains unchanged. Activation route is still preparation only: exact
 head review,3 green platforms then owner's named-executor one-use decision.
 No activation, protection write, exception reuse or merge authority.
+
+## Root fresh-log verification and cross-attempt timing (2026-11-17)
+
+Independent integration reviewe11196b7 (retainede94e921b) found no blockers;
+its unavailable builder raw-log qualification is preserved. Root then ran the
+synthetic full Node suite once to close that provenance concern:48/48 PASS,
+exit0,8.750s; raw log SHA256
+2ad029d7311f75ed9147e4a477e11932b7e0113c83b2a6d5344f712e34eaa458.
+No source edit or failed-test retry; exact args/result/log are retained at
+D:/Temp/arx-ci-queue-root-refresh/node-tests.{json,log}. Root lint prior pass
+is unchanged and was not repeated.
+
+Root calculation from saved job timestamps:1352s start-to-final-job recovery,
+901s executing-job union (Windows553 includes Ubuntu, then macOS348). This is
+descriptive across attempts, not charged-v1; the failed905s first attempt still
+gets no credit. A scratch script syntax typo ran no calculation or tests, then
+was corrected; recovery-time-comparison.json records the actual interval union.
+Babysitter priority adopted: #163 is next merge, feature merges held. Exact-head
+review/three platform successes precede the concrete one-use owner bootstrap
+request. No activation, protection or merge action is authorized yet.

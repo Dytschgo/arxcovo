@@ -107,3 +107,13 @@ baseline measurement. See [refresh evidence](evidence/ci-idle-queue-main-refresh
 for the single final read (attempt2 completed/success on exact3022d601), source
 identity, checks and unchanged activation limits.
 A new first-attempt fully green main after eventual activation is still required.
+
+### Recovery measurement clarification and next-merge priority
+
+Run44126173935 recovered over1352s from first start to final job completion.
+Its two-attempt executing-job union is901s (Ubuntu overlaps Windows553s, then
+macOS348s), not a charged-v1 measurement or a claim that all idle time qualifies.
+Trusted current policy reads failed attempt1 at905s; ADR0025 would withhold
+credit for that failed attempt. No retroactive pass is promised. #163 is the
+next merge candidate, ahead of all features, subject to the reviewed pinned
+owner-authorized route above and fresh qualifying main after activation.
