@@ -235,3 +235,38 @@ independent source/exact-head review, five normal gates, feature Windows<=660s
 and fresh exact-main CI remain required. Main59a665c9 CI44114182696 green609s,
 Windows604s is historical root evidence only. M2 open / M3 unchecked;
 hardware **unverified on real hardware**.
+
+## Root TLS-driver disposition and targeted correction (2026-11-17)
+
+Root Sol 6.1 medium applied dytschgo-debug. The saved natural red is the failing
+loop; no unchanged rerun was performed under the standing stop rule. The exact
+case fails at prepared query plaintext0 versus32 before proof-write checks.
+Static diagnosis ranked: premature one-direction quiescence; dropped partial
+drain suffix; query accepted without queueing. Cached rustls0.23.46 vecbuf
+write_to consumes only the successful vectored-write count. The bounded writer
+may emit a first chunk while later chunks remain, which the driver must drain.
+
+The driver returned when server output was zero, ignoring client progress. Root
+changed ONLY that test helper to require both observed directional writes zero.
+Its32-round bound, byte counters, fixed buffers and all assertions remain.
+Source correction f0c13d23d975d2d2d6e539d3752f210a7f7d8422; production unchanged.
+No temporary logging/instrumentation or additional retry was introduced. The
+existing failing setup assertion remains the regression at the actual TLS seam.
+
+One corrected exact-case run passed: test0.027s; build/run46.390s; Cargo exit0,
+632 other cases skipped. This supports the premature-driver-return explanation;
+no specific runtime TLS chunk size or product defect is claimed. The partial
+proof-write/fatal/no-drain assertions were reached and passed unchanged.
+Retained plan and target command/results/log: D:/Temp/arx-preproof-driver-disposition.
+Targeted log SHA256 a55511ec4b7afc9261ff791ffa209afcda122097a77708eb5773568b5fa2c701.
+
+Root authorizes ONLY the22 previously unrun pure cases next, followed by the
+three designated once-only mutants if natural checks pass. Reuse unchanged
+anchor3 and corrected target1 without natural replay. Final fmt/Clippy are
+justified by the helper edit; no broad engine or repeated passing suite. Any
+new natural failure/mutant survival/compiler/unrelated failure stops again.
+This is one separate local test-driver correction after the behavior stop,
+not a hidden mechanical batch or exhausted Windows engine repair attempt.
+No production source or old verification semantics changed. Independent full
+source review and hosted engine/gates remain pending; M2open/M3unchecked,
+Sol3/3 historicalOpus0/2 unchanged; hardware unverified on real hardware.
