@@ -2,13 +2,12 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `c40c547721641974bcb407ce343c795e6c6609ec`
-after PR166. First push CI44058803351 attempt 1 is running. Pre-merge exact main
-021a89d5 CI44055365214 passed in 565 s. PR166 had all five normal gates, Opus
-PASS6944302384 and all 13 founder tests passing on all three OSes; its Windows
-job took 539 s, below 660 s. Squash tree equals reviewed head823e7cf. No dependent
-merge until the new exact-main run is green. Windows fixture coverage remains
-unverified; M2 open/M3 unchecked, hardware **unverified on real hardware**.
+**Current main GREEN:** exact `c40c547721641974bcb407ce343c795e6c6609ec`
+after PR166. First push CI44058803351 attempt 1 passed all three platforms in
+632 s wall time; Windows 628 s. All 13 founder tests passed on each OS.
+PR166 merged through all five normal gates with Opus PASS6944302384; no exception.
+Windows fixture coverage remains unverified on hosted Windows and **unverified on
+real hardware**. M2 open/M3 unchecked. ADR0025 remains inactive.
 
 **PR159 held:** original Ubuntu S8 and Windows engine failures remain recorded separately. No shared cause, rerun, behavior fix or quarantine change is claimed.
 
@@ -33,8 +32,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-17
 
 - Last merged: PR #166 as `c40c547721641974bcb407ce343c795e6c6609ec`, exact head823e7cf, all five normal gates and independent Opus PASS6944302384. Hosted founder13/13 on all three OSes; Windows539s. New main CI44058803351 pending.
-- Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. Final locked/offline local round passed: fmt/workspace all-target Clippy, cluster nextest139 (484 skipped), in-process139 (29 ignored), guard3/sampler60/workflow4. Actual inventory24quarantined/sample8; founder13 and pure/store-close7 required. No natural red/rerun; one documentation serialization correction (1/2), no runtime correction; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
-- Blockers: integration delta review passed (Opus high, 13a12ee5). Exact-head publication review, five hosted gates and Windows job <=660 s remain required for founder source. Parent main021a89d5 CI44055365214 attempt1 is green; PR165 merged normally. Sol shared fixes3/3 and Opus0/2 unchanged; M2 open/M3 unchecked. Windows fixture, multi-host, custody and transport remain **unverified on real hardware**.
+- Current work: founder bootstrap is merged as PR166 and exact-main CI44058803351 is green. Prepare the held PR159 TLS verifier integration onto founder main under the owner-approved whole-fixture quarantine: three TLS fixture cases become Windows-ignored, while pure/single-node TLS and all founder tests remain required. Root accepted the Opus contract; Sol local integration and independent Opus review follow.
+- Blockers: PR159 requires one new-source Ubuntu S8 observation, integrated local checks, independent delta/exact-head review, all five hosted gates and Windows <=660 s. No rerun, timing or budget waiver. Owner whole-fixture scope supersedes its quarantined Windows-test eligibility hold, not stability/re-enable conditions. M2 remains open, M3 unchecked; Sol shared fixes3/3, Opus0/2 unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3229,3 +3228,5 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 - 2026-11-17: PR165 merged normally as021a89d5, reviewedheadb75006d7 tree-identical, all5gates and prior exactmain39b3dd7 green. Root actively awaited newmainCI44055365214 attempt1, all3platformsgreen, wall565s, Windows561s. Founder parent refresh changed only PROGRESS; sixfeaturefiles/guard remain identical to integration reviewed13a12ee5. Publish under normal gates, no new exception.
 
 - 2026-11-17: Root verified PR166 all5gates, actual13founderPASS perOS, Windows539<=660s and fresh exactmain021a89d5 CI44055365214green, then pinned normal squashmergec40c547. Tree equalsreviewedhead823e7cf. FirstmainCI44058803351 pending; no exception/rerun or Windowsfixturecredit.
+
+- 2026-11-17: Root actively awaited founder mainCI44058803351 attempt1; all3platforms green, wall632s, Windows628s, founder13PASS perOS confirmed from finishedlogs. No rerun or protection exception. Parentgreen prerequisite satisfied for TLS local integration.

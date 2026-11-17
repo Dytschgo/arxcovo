@@ -132,3 +132,7 @@ founder tests remain required on Windows. Ubuntu S8 gets one new-source observat
 any red stops work, with no rerun. No budget/review/timeout/retry waiver is granted.
 Earlier owner-clarification wording above is superseded only by this recorded
 application of the existing owner decision; no further permission is inferred.
+
+Main prerequisite satisfied: root verified exactc40c547 CI44058803351 attempt1
+SUCCESS on all3platforms, wall632s / Windows628s; all13founder tests pass perOS.
+Local integration may start. Publication still needs independent delta review.
