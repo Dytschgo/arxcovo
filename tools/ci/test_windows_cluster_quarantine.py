@@ -14,6 +14,66 @@ PURE = 'read_failure_attribution_covers_all_errors'
 TLS_FIXTURE = ['enrolled_target_binding_revocation_and_stale_acceptance', 'authenticated_sender_mismatch_and_assumed_founder_control', 'store_lock_wait_does_not_block_runtime']
 TLS_REQUIRED = ['live_verifier_does_not_retain_store_and_poison_refuses', 'founder_joiner_mutual_tls_real_identities', 'learner_catch_up_gives_joiner_own_registry']
 TLS_PURE = ['tls_single_node_directory_precondition']
+MEMBERSHIP_UNSAMPLED = ['interrupted_joint_exact_guarded_flatten']
+
+
+def assert_membership_contract(source, parent):
+    assert_fixture_quarantine(source, ((MEMBERSHIP_UNSAMPLED, REASON_FIXTURE),))
+    binding = '#[cfg(test)]\nmod membership_contract_tests;'
+    assert parent.count(binding) == 1
+    assert parent.count('mod membership_contract_tests;') == 1
+    # No parent predicate may silently hide the new module on Unix.
+    prefix = parent.split('mod membership_contract_tests;')[0]
+    attrs = re.search(r'((?:#\[[^\]]*\]\s*)+)$', prefix)
+    assert attrs and attrs[1].strip() == '#[cfg(test)]'
+    assert len(EXPECTED) == 8
+    assert set(MEMBERSHIP_UNSAMPLED).isdisjoint(EXPECTED + WINDOWS_UNSAMPLED)
+    assert len(EXPECTED + WINDOWS_UNSAMPLED + ISSUANCE + TLS_FIXTURE + MEMBERSHIP_UNSAMPLED) == 28
+
+
+class MembershipQuarantineTests(unittest.TestCase):
+    def test_unsampled_membership_contract(self):
+        base = ROOT / 'crates/arxd/src/cluster'
+        source = (base / 'consensus/membership_contract_tests.rs').read_text(encoding='utf-8')
+        parent = (base / 'consensus.rs').read_text(encoding='utf-8')
+        assert_membership_contract(source, parent)
+        gate = '#[cfg_attr(\n    target_os = "windows",\n    ignore = "' + REASON_FIXTURE + '"\n)]'
+        name = MEMBERSHIP_UNSAMPLED[0]
+        signature = 'async fn ' + name + '('
+        test = '#[tokio::test(flavor = "current_thread")]\n' + gate + '\n' + signature
+        mutants = [
+            source.replace(gate, ''),
+            source.replace(gate, gate.replace('windows', 'linux')),
+            source.replace(gate, gate.replace('target_os = "windows"', 'target_family = "unix"')),
+            source.replace(gate, gate.replace('target_os = "windows"', 'all()')),
+            source.replace(REASON_FIXTURE, 'wrong reason'),
+            source.replace(signature, 'async fn renamed('),
+            source.replace(test, 'async fn removed('),
+            source + '\n' + test + ') {}\n',
+            source + '\n#[test]\nfn hidden() {}\n',
+            '#![cfg(unix)]\n' + source,
+            '#![ignore]\n' + source,
+        ]
+        for mutant in mutants:
+            self.assertNotEqual(source, mutant)
+            with self.assertRaises(AssertionError):
+                assert_membership_contract(mutant, parent)
+        binding = '#[cfg(test)]\nmod membership_contract_tests;'
+        for replacement in ['', 'mod membership_contract_tests;', '#[cfg(unix)]\nmod membership_contract_tests;',
+                            binding + '\n' + binding, '#[cfg(unix)]\n' + binding]:
+            mutant = parent.replace(binding, replacement)
+            self.assertNotEqual(parent, mutant)
+            with self.assertRaises(AssertionError):
+                assert_membership_contract(source, mutant)
+        for variable, value in [('MEMBERSHIP_UNSAMPLED', []), ('EXPECTED', EXPECTED + MEMBERSHIP_UNSAMPLED)]:
+            with patch(__name__ + '.' + variable, value):
+                with self.assertRaises(AssertionError):
+                    assert_membership_contract(source, parent)
+        # Pin the unchanged sampler selection independently of the Rust guard.
+        import windows_diag_sample as sample
+        self.assertEqual(set(sample.IDS), set(EXPECTED))
+        self.assertEqual(len(sample.IDS), 8)
+        self.assertNotIn('membership_contract_tests', sample.FILTER)
 
 
 def assert_fixture_quarantine(source, groups, pure=(), *, required=()):

@@ -104,3 +104,18 @@ observation, with no rerun after red. All five normal gates, independent review
 and hosted Windows <=660 s remain required. No budget exception or engine fix.
 M2 open, M3 unchecked; shared fixes Sol3/3 and Opus0/2 unchanged. TLS, transport
 and Windows fixture behavior are **unverified on real hardware**.
+
+## Joint membership contract addendum - 2026-11-17
+
+The new `membership_contract_tests::interrupted_joint_exact_guarded_flatten`
+contains seven sequential fresh three-engine scenarios. The owner's whole-fixture
+classification applies even without the shared Cluster constructor. Its exact
+Windows-only REASON_FIXTURE gate extends the inventory from 27 to 28; the original
+sample stays eight. The separate MEMBERSHIP_UNSAMPLED inventory guards the test
+and cfg(test) module binding. Ubuntu/macOS execution remains required.
+
+Coverage loss: Windows runs none of this new recovery proof, including its six
+equivalent controls, in either the required suite or diagnostic sample. Compile,
+Clippy and listing are not recovery or re-enable evidence. Required Unix runtime,
+independent source review and hosted Windows <=660 s remain pending. M2 open,
+M3 unchecked; Sol3/3 and Opus0/2 unchanged; **unverified on real hardware**.
