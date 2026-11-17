@@ -985,3 +985,53 @@ fn canonical_membership(n: u64) -> MembershipBlob {
     .unwrap();
     MembershipBlob::new(m.encode().unwrap()).unwrap()
 }
+
+#[test]
+fn anchor_legacy_rows_and_malformed_membership_refuse_replay() {
+    let mut cases = Vec::new();
+    let mut row = encode_row(pos(0), &redeem(5, 1000));
+    row[32] = 2;
+    resign(&mut row);
+    cases.push((row, StoreError::Unsupported));
+    let mut row = encode_row(pos(0), &Entry::Blank);
+    row[..8].copy_from_slice(b"ARXLE1\0\0");
+    resign(&mut row);
+    cases.push((row, StoreError::Unsupported));
+    let row = encode_row(
+        pos(0),
+        &Entry::Membership(MembershipBlob::new(vec![0x42; 4096]).unwrap()),
+    );
+    assert_eq!(row.len(), 4163);
+    cases.push((row, StoreError::Membership));
+    for (row, error) in cases {
+        assert_eq!(decode_row(&row), Err(error));
+        let d = private_temp();
+        let mut s = open(d.path());
+        s.append(&[(pos(0), Entry::Blank)]).unwrap();
+        s.db.execute("UPDATE log SET body=?1 WHERE idx=0", [row])
+            .unwrap();
+        drop(s);
+        assert_eq!(VoteLogStore::open(d.path(), [1; 16]).unwrap_err(), error);
+    }
+    let d = private_temp();
+    let mut s = open(d.path());
+    let before = durable_bytes(&s);
+    assert_eq!(
+        s.append(&[(
+            pos(0),
+            Entry::Membership(MembershipBlob::new(vec![0x42; 4096]).unwrap())
+        )]),
+        Err(StoreError::Membership)
+    );
+    assert_eq!(durable_bytes(&s), before);
+    let mut old = encode_meta(&s.meta);
+    old[8..10].copy_from_slice(&1u16.to_be_bytes());
+    resign(&mut old);
+    assert_eq!(decode_meta(&old), Err(StoreError::Unsupported));
+    s.db.execute("UPDATE meta SET blob=?1", [old]).unwrap();
+    drop(s);
+    assert_eq!(
+        VoteLogStore::open(d.path(), [1; 16]).unwrap_err(),
+        StoreError::Unsupported
+    );
+}

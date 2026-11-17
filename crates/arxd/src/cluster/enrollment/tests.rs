@@ -687,10 +687,7 @@ fn registry_capacity_rejection_keeps_code_and_counter() {
         node: node(16),
         proposed_at_ms: 0,
     });
-    assert_eq!(
-        grant(s.apply_test(&redeem(&c, 80, 80, 0))).node(),
-        node(17)
-    );
+    assert_eq!(grant(s.apply_test(&redeem(&c, 80, 80, 0))).node(), node(17));
 }
 #[test]
 fn founding_iterator_is_bounded_before_command_construction() {
@@ -912,4 +909,134 @@ fn literal_anchor_and_proof_binding() {
     assert_ne!(altered.proof(), c.proof());
     assert_ne!(altered.verifier(), c.verifier());
     assert!(JoinCode::parse(&c.expose_for_owner_transfer().replace("arxj2-", "arxj1-")).is_err());
+}
+
+#[test]
+fn new_mint_reservation_56th_pending_bytes_fit() {
+    let mut s = state();
+    for n in 1..=55u8 {
+        assert!(matches!(
+            s.apply_test(&mint(&code(n), n, 0)),
+            Outcome::Minted { replay: false, .. }
+        ));
+        grant(s.apply_test(&redeem(&code(n), n, n, 0)));
+        s.apply_test(&Command::Remove {
+            cluster: CLUSTER,
+            node: node(9 + u64::from(n)),
+            proposed_at_ms: 0,
+        });
+    }
+    let mut bytes = Vec::new();
+    codec::encode(&s, &mut bytes);
+    assert!(
+        94 + 4096 + bytes.len() + 89 < 16384,
+        "56th pending record fits actual bytes"
+    );
+    assert_eq!(4866 + 55 * 209, 16361);
+    assert_eq!(4866 + 56 * 209, 16570);
+    let before = s.clone();
+    assert_eq!(
+        s.apply_test(&mint(&code(56), 56, 0)),
+        Outcome::Rejected(Reject::StateFull),
+        "NEW Mint must reserve its future consumption"
+    );
+    assert_eq!(s, before);
+    assert!(matches!(
+        s.apply_test(&mint(&code(1), 1, 0)),
+        Outcome::Minted { replay: true, .. }
+    ));
+    assert!(matches!(
+        s.apply_test(&mint(&code(56), 56, CODE_TTL_MS + TOMBSTONE_MS)),
+        Outcome::Minted { replay: false, .. }
+    ));
+}
+
+#[test]
+fn replay_drift_authentication_and_pending_reservation_decode() {
+    let mut s = state();
+    let c = code(90);
+    s.apply_test(&mint(&c, 1, 1000));
+    let first = grant(s.apply_test(&redeem(&c, 2, 90, 1000)));
+    let joint = crate::cluster::membership::Membership::new(
+        vec![[1].into(), [1].into()],
+        [(1, "drift".into())].into(),
+    )
+    .unwrap();
+    let later = LogPos {
+        term: 2,
+        leader: 2,
+        index: 9,
+    };
+    let replay = grant(s.apply(&redeem(&c, 2, 90, 60000), later, Some(&joint)));
+    assert_eq!(replay.origin(), first.origin());
+    assert_eq!(replay.original_applied_ms(), 1000);
+    for (command, reason) in [
+        (redeem(&c, 3, 90, 60000), Reject::Consumed),
+        (redeem(&c, 2, 91, 60000), Reject::KeyConflict),
+        (
+            Command::redeem(
+                CLUSTER,
+                [2; 16],
+                c.code_id(),
+                &code(91).proof(),
+                key(90),
+                c.anchor(),
+                60000,
+            ),
+            Reject::BadProof,
+        ),
+        (
+            Command::redeem(
+                CLUSTER,
+                [2; 16],
+                c.code_id(),
+                &c.proof(),
+                key(90),
+                JoinAnchor([0; 32]),
+                60000,
+            ),
+            Reject::AnchorChanged,
+        ),
+    ] {
+        let before = s.clone();
+        assert_eq!(
+            s.apply(&command, later, Some(&joint)),
+            Outcome::Rejected(reason)
+        );
+        assert_eq!(s, before);
+    }
+    s.apply_test(&Command::Remove {
+        cluster: CLUSTER,
+        node: first.node(),
+        proposed_at_ms: 60000,
+    });
+    let before = s.clone();
+    assert_eq!(
+        s.apply(&redeem(&c, 2, 90, 60000), later, Some(&joint)),
+        Outcome::Rejected(Reject::Revoked)
+    );
+    assert_eq!(s, before);
+    let mut pending = state();
+    for n in 1..=56u8 {
+        let c = code(n);
+        pending.records.insert(
+            c.code_id(),
+            CodeRecord {
+                actor: [2; 16],
+                request: [n; 16],
+                verifier: c.verifier(),
+                expires_ms: CODE_TTL_MS,
+                consumed: None,
+            },
+        );
+    }
+    // Expired but retained records avoid the independent live pending limit.
+    pending.committed_ms = CODE_TTL_MS;
+    let mut bytes = Vec::new();
+    codec::encode(&pending, &mut bytes);
+    assert!(bytes.len() + 4190 < 16384);
+    assert_eq!(
+        codec::decode(&mut codec::Reader(&bytes)),
+        Err(crate::cluster::state_store::StoreError::Corrupt)
+    );
 }

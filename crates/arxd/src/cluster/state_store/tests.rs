@@ -903,3 +903,169 @@ fn replay_origin_survives_drift_snapshot_and_reopen() {
         );
     }
 }
+
+#[test]
+fn anchor_boundary_variants_and_durable_inertness() {
+    use crate::cluster::membership::Membership;
+    let d = private_temp();
+    let mut store = open(d.path());
+    base(&mut store);
+    let initial = store.snapshot();
+    let a = store.state().voter_anchor(&fixture_membership()).unwrap();
+    let cosmetic = Membership::new(
+        vec![[1].into()],
+        [(1, "changed".into()), (9, "learner".into())].into(),
+    )
+    .unwrap();
+    assert_eq!(store.state().voter_anchor(&cosmetic), Ok(a));
+    for mode in 0..4 {
+        let d = private_temp();
+        let mut s = open(d.path());
+        s.install(&initial).unwrap();
+        match mode {
+            0 => s.image.membership = None,
+            1 | 2 => {
+                let mut state = EnrollmentState::new(init().cluster, init().first_free);
+                let founders = enrollment::FoundMembers::new([(
+                    NodeId::new(if mode == 1 { 2 } else { 1 }).unwrap(),
+                    KeyDigest::of_spki(b"changed").unwrap(),
+                )])
+                .unwrap();
+                assert!(matches!(
+                    state.apply(
+                        &Command::Found {
+                            cluster: init().cluster,
+                            members: founders,
+                            proposed_at_ms: 0
+                        },
+                        pos(0),
+                        None
+                    ),
+                    Outcome::Founded { .. }
+                ));
+                let Entry::Enrollment(command) = mint(5, 0) else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    state.apply(&command, pos(1), None),
+                    Outcome::Minted { .. }
+                ));
+                s.image.state = state;
+            }
+            _ => {
+                s.image.membership = Some((
+                    pos(1),
+                    MembershipBlob::new(
+                        Membership::new(vec![[1].into(), [1].into()], [(1, "mem:1".into())].into())
+                            .unwrap()
+                            .encode()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            }
+        }
+        let before = s.image.state.clone();
+        assert_eq!(
+            s.apply(pos(2), &redeem(5, 1000)).unwrap(),
+            Some(Outcome::Rejected(Reject::AnchorChanged))
+        );
+        assert_eq!(s.image.state, before);
+        assert_eq!(s.applied(), Some(pos(2)));
+        let bytes = s.snapshot();
+        drop(s);
+        assert_eq!(open(d.path()).snapshot(), bytes);
+    }
+    store
+        .apply(
+            pos(2),
+            &Entry::Membership(MembershipBlob::new(cosmetic.encode().unwrap()).unwrap()),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.apply(pos(3), &redeem(5, 1000)).unwrap(),
+        Some(Outcome::Enrolled(_))
+    ));
+}
+
+#[test]
+fn origin_time_corruption_refuses_peek_install_and_reopen() {
+    let d = private_temp();
+    let mut s = open(d.path());
+    base(&mut s);
+    s.apply(pos(2), &redeem(5, 1000)).unwrap();
+    let good = s.snapshot();
+    let record = 62 + fixture_membership().encode().unwrap().len() + 34;
+    // consumed origin starts at record+177, original time at +201.
+    for (offset, value) in [
+        (177, 3),
+        (193, 4),
+        (193, i64::MAX as u64 + 1),
+        (185, 4),
+        (201, 1001),
+        (201, CODE_TTL_MS - 2 * SKEW_MS),
+    ] {
+        let mut bad = good.clone();
+        set64(&mut bad, record + offset, value);
+        resign(&mut bad);
+        assert_eq!(StateStore::peek(&bad), Err(StoreError::Corrupt));
+        assert_eq!(s.install(&bad), Err(StoreError::Corrupt));
+        assert_eq!(s.snapshot(), good);
+        let target = private_temp();
+        let db = open(target.path());
+        db.db.execute("UPDATE sm SET snapshot=?1", [&bad]).unwrap();
+        drop(db);
+        assert_eq!(
+            StateStore::open(target.path(), init()).unwrap_err(),
+            StoreError::Corrupt
+        );
+    }
+    let target = private_temp();
+    let mut copy = open(target.path());
+    copy.install(&good).unwrap();
+    drop(copy);
+    assert_eq!(open(target.path()).snapshot(), good);
+}
+
+#[test]
+fn malformed_membership_refuses_all_state_boundaries_and_v2() {
+    for raw in [vec![0x42; 4096], vec![1], vec![1, 0, 0]] {
+        let d = private_temp();
+        let mut s = open(d.path());
+        base(&mut s);
+        let before = s.snapshot();
+        let blob = MembershipBlob::new(raw).unwrap();
+        assert_eq!(
+            s.apply(pos(2), &Entry::Membership(blob.clone())),
+            Err(StoreError::Membership)
+        );
+        assert_eq!(s.snapshot(), before);
+        let mut image = s.image.clone();
+        image.membership = Some((pos(1), blob));
+        let bad = encode(&image);
+        assert_eq!(StateStore::peek(&bad), Err(StoreError::Membership));
+        assert_eq!(s.install(&bad), Err(StoreError::Membership));
+        s.db.execute("UPDATE sm SET snapshot=?1", [&bad]).unwrap();
+        drop(s);
+        assert_eq!(
+            StateStore::open(d.path(), init()).unwrap_err(),
+            StoreError::Membership
+        );
+    }
+    let d = private_temp();
+    let mut s = open(d.path());
+    base(&mut s);
+    let before = s.snapshot();
+    let mut old = before.clone();
+    old[8..10].copy_from_slice(&2u16.to_be_bytes());
+    resign(&mut old);
+    assert_eq!(StateStore::peek(&old), Err(StoreError::Unsupported));
+    assert_eq!(s.install(&old), Err(StoreError::Unsupported));
+    assert_eq!(s.snapshot(), before);
+    s.db.execute("UPDATE sm SET snapshot=?1", [&old]).unwrap();
+    drop(s);
+    assert_eq!(
+        StateStore::open(d.path(), init()).unwrap_err(),
+        StoreError::Unsupported
+    );
+}
