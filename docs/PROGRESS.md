@@ -2,19 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN, budget satisfied:** exact `10aa891f27906e0c73e48396c5c812cab7d4523a`
-after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
-629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
-ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
-the root pure measurement of retained attempt1/job data confirms charged-v1.
-Owner's pinned budget-only bootstrap is consumed. Original strict five checks,
-app bindings and all other protection fences were restored and read back.
-Merge tree equals reviewed head22a09eae. Later hourly recovery slots are no-ops.
-Prior main3022d601's failed905s first attempt remains uncredited and historical.
-Normal feature preparation can resume; every PR still needs independent review,
-all five gates, fresh exact-main green and its applicable Windows timing limit.
-M2 open/M3 unchecked; Windows fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**.
+**Current main RED:** exact `09134085dce93742d8812821dbe11834dcee7a9c`
+after docs-only PR175. First-attempt CI44198128467 failed Windows nextest:
+found_tests::f6_adapters at319 and f8_store_privacy at449 unwrapped Unavailable;
+f7_clock_guard_order at434 did not return expected ClockRollback. These required
+single-node founder tests are outside the existing three-node fixture quarantine.
+Ubuntu/macOS passed. No cause, rerun, fix, waiver or new quarantine claimed.
+Feature publication and merges are held. Fresh independent Sol diagnosis is
+assigned; exhausted Sol3/3 and historical Opus0/2 counters remain unchanged.
+PR176's previous source review passed but public status was withheld on main
+drift; its docs-only parent refresh remains local and unpushed.
+Historical policy activation main10aa891f passed632s wall/629s charged,
+ADR0025 active, original five protection checks restored; the exception is consumed.
+M2 open/M3 unchecked; hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -3563,3 +3563,7 @@ Root Sol coordinator executed independently reviewed executor SHA2562b2866045120
 ### First active queue-policy main verified - 2026-11-17
 
 Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f attempt1 passed; charged-v1 measurement632s wall/629s charged/3s credit applied. Automatic trusted policy44179754154 completed success. All original protection fences remain restored. No further retry, waiver or feature merge occurred. Owned-query refresh and retained-identity prerequisite can resume normal preparation.
+
+### PR175 first-main founder red - 2026-11-18
+
+Root actively awaited CI44198128467, exit1. Required Windows F6/F7/F8 founder tests failed; no infrastructure retry applies. Raw failure log retained D:/Temp/arx-pr175-main/failed.log, SHA256 50706e4fd294eaf4552c0f8d4165b7a93895f1a9db5a2f52cecca2b2865319ff. Fresh independent Sol6.1 high diagnosis requested; no fix credit, quarantine or retry. PR176 publication/merge held.
