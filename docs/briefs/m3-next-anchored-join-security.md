@@ -5,7 +5,7 @@ Design only; Sol 6.1 high, 2026-11-17. Required prepared base:
 59a665c9cda602d0b2939613656f2c98399f51f1 (PR173 atomic-anchor kernel).
 Root subsequently confirmed main CI44114182696 attempt1 green:609s wall/Windows604s.
 Root review clarifications R1/R2 are normative in ../reviews/m3-preproof-contract-root-review.md.
-Independent contract recheck and root source authorization remain pending.
+Independent Sol recheck9f3908d1 PASS; root authorizes local source under ADR0005.
 M2 open; M3 unchecked; hardware **unverified on real hardware**.
 Historical repair counters Sol3/3, Opus0/2 remain unchanged; no retry grant.
 
@@ -84,9 +84,10 @@ verify_server_cert success alone does not prove CertificateVerify possession.
 Keep list/session binding private. Invalid/incomplete/mismatched input fails
 closed; fatal TLS/gate errors make session unusable. Never reconnect inside gate.
 release_proof(&JoinCode) rechecks code metadata and completion, queues exactly
-32 proof bytes through this connection's writer ONCE, then consumes the gate.
+32 proof bytes through this connection's writer ONCE, then consumes proof authorization; Released may only drain bounded ciphertext.
 Proof bytes are this internal probe's payload, not an enrollment wire protocol.
 No CSR/redeem dispatch is exposed; the trusted test bridge below calls enroll.
+Fatal state rejects all later calls, including drain; partial proof-write failure is fatal.
 Gate returns static errors without code/list/cert contents. Do not log proof,
 secret, code text, private key, list or receipt; no Debug containing those values.
 Existing JoinCode::proof remains trusted internal API, not a crate-wide capability

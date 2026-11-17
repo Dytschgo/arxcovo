@@ -126,3 +126,30 @@ bytes. No local Windows engine scenario is authorized. Publication and merge
 still require independent exact-head source review, all five normal gates,
 hosted Windows at most660s and fresh green exact main. M2 stays open and M3
 unchecked; hardware paths remain **unverified on real hardware**.
+
+### Technical amendment 2026-11-17: internal pre-proof endpoint gate
+
+Root accepts the [pre-proof brief](../briefs/m3-next-anchored-join-security.md),
+[root byte-admission and signature clarifications](../reviews/m3-preproof-contract-root-review.md)
+and [independent contract recheck](../reviews/m3-preproof-contract-sol-recheck.md)
+for a bounded local implementation. A canonical voter list and a private TLS1.3
+client demonstrate code-bound endpoint-key possession before proof release.
+The initial chain-only bootstrap check grants no member or owner authority.
+It is separate from the existing peer verifier and exposes no public listener,
+generic application writer or raw connection. This is not authorization to
+deploy a no-client-certificate endpoint or production joining.
+
+The wrapper enforces separate cumulative128KiB input/output quotas over the
+whole session, bounded feed/drain and terminal failures. Released state permits
+bounded ciphertext drain but no second query/anchor/proof operation. Fatal state
+permits no later operation, including draining queued proof. Distinguish the
+fixed32-byte query from the32-byte proof when counting received plaintext.
+Application buffer4096 is not a handshake limit. Partial proof-write failure
+is fatal; it cannot retry or expose its queued bytes through a later drain.
+Tests must prove same-CA wrong-key and wrong-CertificateVerify refusals with
+zero proof received, plus their designated mutation counterfactuals.
+
+No code length, schema, apply/signing semantics, production read ownership,
+timeouts, transport, custody or permission policy changes. The new single-voter
+proof is required on all OS, hosted-only on the local Windows host. Existing
+quarantines and inventories remain. All normal publication/merge gates apply.
