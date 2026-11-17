@@ -383,5 +383,50 @@ class QuarantineTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_windows_quarantine(source.replace('#[test]', '#[test]\n#[ignore]'))
 
+
+ANCHORED_JOIN_REQUIRED = ['anchored_preproof_single_voter']
+
+
+def assert_anchored_preproof(source, parent):
+    assert ANCHORED_JOIN_REQUIRED == ['anchored_preproof_single_voter']
+    assert_fixture_quarantine(source, (), required=ANCHORED_JOIN_REQUIRED)
+    binding = '#[cfg(test)]\nmod anchored_join_tests;'
+    assert parent.count(binding) == 1
+    assert parent.count('mod anchored_join_tests;') == 1
+    prefix = parent.split('mod anchored_join_tests;')[0]
+    attrs = re.search(r'((?:#\[[^\]]*\]\s*)+)$', prefix)
+    assert attrs and attrs[1].strip() == '#[cfg(test)]'
+    assert source.count('ConsensusNode::start(') == 1
+    for token in ('founder_init(', '.found(', '.enroll(', 'BoundVoters::observe(',
+                  'spawn_blocking(', 'drop(store)', 'exchange(', 'identity_commit',
+                  'shutdown()', 'sm_weak.upgrade()', 'log_weak.upgrade()'):
+        assert token in source, token
+    for token in ('Cluster::', 'test_ticket', 'assume(', 'pki::leaf(', 'seedregistry'):
+        assert token not in source, token
+
+
+class AnchoredPreproofTests(unittest.TestCase):
+    def test_required_binding_and_single_start(self):
+        base = ROOT / 'crates/arxd/src/cluster'
+        source = (base / 'consensus/anchored_join_tests.rs').read_text(encoding='utf-8')
+        parent = (base / 'consensus.rs').read_text(encoding='utf-8')
+        assert_anchored_preproof(source, parent)
+        name = ANCHORED_JOIN_REQUIRED[0]
+        for mutant in (source.replace(name, 'renamed'), '', '#![cfg(unix)]\n' + source,
+                       source.replace('async fn ' + name, '#[ignore]\nasync fn ' + name),
+                       source + '\nfn hidden_helper(){ ConsensusNode::start(); }',
+                       source + '\nfn hidden_helper(){ Cluster::new(); }'):
+            with self.assertRaises(AssertionError):
+                assert_anchored_preproof(mutant, parent)
+        binding = '#[cfg(test)]\nmod anchored_join_tests;'
+        for replacement in ('', '#[cfg(unix)]\nmod anchored_join_tests;',
+                            '#[cfg(unix)]\n' + binding, binding + '\n' + binding):
+            with self.assertRaises(AssertionError):
+                assert_anchored_preproof(source, parent.replace(binding, replacement))
+        with patch(__name__ + '.ANCHORED_JOIN_REQUIRED', []):
+            with self.assertRaises(AssertionError):
+                assert_anchored_preproof(source, parent)
+
+
 if __name__ == "__main__":
     unittest.main()
