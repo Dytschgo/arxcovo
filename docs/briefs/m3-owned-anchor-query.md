@@ -15,7 +15,11 @@ Read with AGENTS, KICKOFF, ADR0005 (D1/D2/D3 and both kernel amendments),
 M2 open, M3 unchecked; Sol3/3, historical Opus0/2 unchanged; no new fix attempts.
 Hardware paths remain **unverified on real hardware**.
 
-## Scope and exact technical blocker
+Root R1/R2 clarifications in ../reviews/m3-owned-anchor-query-root-review.md are normative.
+The Arc initializer exception is accepted; mutation evidence uses the specified local durable non-engine harness.
+Independent contract recheck and exact-main green remain pending; no source authorized.
+
+## Scope and exact technical blocker (original proposal, clarified above)
 
 Add one internal local applied-state query, feeding the existing private
 PreproofClient query (cluster16 || code_id16). No listener, socket, dispatch,
