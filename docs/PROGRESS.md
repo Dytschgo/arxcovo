@@ -35,11 +35,11 @@ PR145 was merged after the first red main run without accounting for it; the coo
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
 
 
-## Current state - 2026-11-16
+## Current state - 2026-11-17
 
 - Last merged: PR #164 as `39b3dd73052abd64c1c3d3042e62f080469f1597` at2026-11-17T08:58:52Z, exacthead60f30c86, independent Opus PASS6933714689 and three platform jobs green. Owner-authorized one-use budget-only exception consumed; exact full protection restored. First main CI44051366327 attempt1 green608s.
-- Current work: bounded R5 quarantine local implementation on prepared `8e662ecf625e8e7fb26a9dde5d5896ff694aacf7`, source base `c612152`. Sol high implemented nine distinct guarded ignores with only eight sampled; Windows R5 coverage is removed, Linux/macOS remains required. Initial guard unittest failed on three no-op mutation fixtures; one routine multiline-fixture correction, no rerun. Verification stopped; sampler, fmt, Clippy and real nextest checks remain unrun. Root inspection and independent Opus review are required before publication. [Evidence](evidence/m3-r5-quarantine-restoration.md).
-- Blockers: natural-failure stop; incomplete local verification; independent Opus source review; five required hosted gates. The active budget gate cannot pass known 1475 s main. No publication, label/status/protection change, rerun, merge or owner exception is authorized. Sol shared fixes 3/3 and Opus 0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked, Windows three-node **unverified on real hardware**.
+- Current work: Sol high integrates reviewed founder head `77398e4d6799a74aee9a073d7491d6ef34487858` onto prepared `957184f4` (source main `39b3dd73`, PR164). Production and founder tests retain reviewed `c45089f` bytes. Current main full 24-case Windows fixture guard is retained, plus reviewed founder binding/seal guard; diagnostic sample remains eight. One final locked/offline local verification round pending; local commits only. [Integration evidence](evidence/m3-founder-main-integration.md).
+- Blockers: independent Opus delta/exact-head review and fresh hosted normal five gates before publication/merge; hosted Windows timing still unmeasured for founder integration. Supplied exact main CI44051366327 attempt1 is green608s, Windows603s; no new remote query. No natural failure repair/rerun authorized. Sol shared fixes3/3 and Opus0/2 unchanged; quarantine is not a fix. M2 open, M3 unchecked; Windows fixture and multi-host/custody/transport **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3185,3 +3185,25 @@ separately. Observability0/3, Linux fixes0/3; M2/M3 acceptance unchanged.
 - 2026-11-17: Owner-authorized one-use budget-only exception consumed by PR164 merge39b3dd7 at08:58:52Z, exactreviewedhead60f30c86. Original five requiredchecks/appbindingsstrict+allotherprotection restored andexactlyreadback. Review6933714689, platformCI43987282029 attempt1passed includingUbuntu/mac24each. MainCI44051366327 pending; no feature merge or rerun. Local action snapshots D:/Temp/arx-pr164-final-gates.
 
 - 2026-11-17: Root actively awaited mainCI44051366327 after t3_background_wait rejected this provider. All3platforms passed, wall608s. Verified Ubuntu/mac24fixturePASS each and full protection still identical. Windows sample skipped_budget e_s611; no sample/Windowsfixture acceptance. Main restored GREEN; resume M3 under normal gates. No rerun or further exception.
+
+
+### Founder F1 local implementation — 2026-11-16
+
+Provider Sol, effort high; prepared base ff4eece89ca0c76870cda6d971acec7e6cebf8ad,
+source main c6121523417089bc0afaf307470183dd4a7f47ba and accepted contract455d8ea.
+Implements sealed founder subjects, persisted allocation precheck, owned bounded
+bootstrap snapshot, single-voter initialization and two fresh guards. F1–F10,
+pure identity/CA tests and seal/binding mutation guards are local only. See
+[evidence](evidence/m3-founder-bootstrap.md) for exact commands, hashes and limits.
+No shared-suite correction, production CA, custody, transport, native or owner-admin
+work. Sol Windows recovery remains3/3 exhausted; Opus recovery0/2 unused.
+M2 open, M3 unchecked; hardware paths **unverified on real hardware**.
+Root independent review then Opus source review and green exact main remain
+publication prerequisites; no push, PR, merge or hosted action was performed.
+
+Local founder source committed as `ec3e5d2228fe1d06564d3e7e4bfad40b5b1f53aa`. Natural nextest and in-process
+cluster runs each pass155 tests; Clippy/fmt pass; guard3/sampler58/workflow4 pass.
+All15 expected Rust mutation probes fail meaningfully and restore exact bytes.
+No natural red, compiler/lint fix or implementation correction (0/2) occurred.
+Full hosted Windows verify timing/660s headroom remains unmeasured; the existing
+eight quarantines were not forced. All owned build/test processes exited.

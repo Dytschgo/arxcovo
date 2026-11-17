@@ -75,6 +75,27 @@ def assert_issuance_modules(issue, pki):
             raise AssertionError("issuance test module must retain its binding")
 
 
+def assert_founder_binding(found):
+    assert_issuance_required(found)
+    if found.count('#[cfg(test)]\n#[path = "found_tests.rs"]\nmod found_tests;') != 1:
+        raise AssertionError("founder test binding required")
+
+
+def assert_subject_seal(sources):
+    issue = sources["consensus/issue.rs"]
+    if len(re.findall(r"(?m)^mod sealed\s*\{", issue)) != 1:
+        raise AssertionError("private seal required")
+    if re.search(r"pub(?:\([^)]*\))?\s+mod sealed", issue):
+        raise AssertionError("seal must be private")
+    traits = [(p, len(re.findall(r"trait LeafSubject\b", text))) for p, text in sources.items()]
+    if [(p,n) for p,n in traits if n] != [("consensus/issue.rs",1)]:
+        raise AssertionError("trait must live beside seal")
+    impls = sorted((p, subject) for p, text in sources.items()
+                   for subject in re.findall(r"impl\s+(?:\w+::)*Sealed\s+for\s+(\w+)", text))
+    if impls != [("consensus/found.rs", "FounderTicket"), ("consensus/issue.rs", "IssueTicket")]:
+        raise AssertionError("unexpected seal implementation")
+
+
 class QuarantineTests(unittest.TestCase):
     def test_issuance_required_on_every_os(self):
         base = ROOT / "crates/arxd/src/cluster"
@@ -108,6 +129,42 @@ class QuarantineTests(unittest.TestCase):
             assert_issuance_modules(issue.replace('mod issue_tests;', 'mod absent;'), pki)
         with self.assertRaises(AssertionError):
             assert_issuance_modules(issue, pki.replace('mod tests;', 'mod absent;'))
+
+    def test_founder_binding_and_seal(self):
+        base = ROOT / "crates/arxd/src/cluster"
+        found = (base / "consensus/found.rs").read_text(encoding="utf-8")
+        tests = (base / "consensus/found_tests.rs").read_text(encoding="utf-8")
+        assert_founder_binding(found)
+        assert_issuance_required(tests)
+        for mutation in ['#[ignore]', '#![cfg(unix)]', '#![cfg(not(windows))]',
+                         '#[cfg(windows)]', '#[cfg(unix)]', '#[cfg(target_os = "linux")]',
+                         '#[cfg_attr(target_family = "unix", ignore)]', '#[cfg_attr(all(), ignore)]',
+                         '#[cfg_attr(debug_assertions, ignore)]', '#[cfg(any())]',
+                         '#[cfg(target_env = "msvc")]', '#[cfg(target_vendor = "pc")]',
+                         '#[cfg(feature = "hidden")]']:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(AssertionError):
+                    assert_issuance_required(mutation + tests)
+                with self.assertRaises(AssertionError):
+                    assert_founder_binding(mutation + found)
+        with self.assertRaises(AssertionError):
+            assert_founder_binding(found.replace('mod found_tests;', 'mod absent;'))
+        src = ROOT / "crates/arxd/src"
+        sources = {p.relative_to(base).as_posix() if p.is_relative_to(base) else p.relative_to(src).as_posix(): p.read_text(encoding="utf-8") for p in src.rglob("*.rs")}
+        assert_subject_seal(sources)
+        for visibility in ['pub', 'pub(crate)']:
+            mutated = dict(sources)
+            mutated['consensus/issue.rs'] = mutated['consensus/issue.rs'].replace('mod sealed', visibility + ' mod sealed')
+            with self.assertRaises(AssertionError):
+                assert_subject_seal(mutated)
+        moved = dict(sources)
+        moved['consensus/issue.rs'] = moved['consensus/issue.rs'].replace('trait LeafSubject', 'trait MovedSubject')
+        moved['other.rs'] = 'trait LeafSubject {}'
+        with self.assertRaises(AssertionError):
+            assert_subject_seal(moved)
+        extra = dict(sources, **{'other.rs': 'impl issue::sealed::Sealed for Outsider {}'})
+        with self.assertRaises(AssertionError):
+            assert_subject_seal(extra)
 
     def test_exact_windows_only_quarantine(self):
         base = ROOT / "crates/arxd/src/cluster/consensus"

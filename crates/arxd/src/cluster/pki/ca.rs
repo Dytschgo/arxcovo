@@ -1,5 +1,5 @@
 use super::{csr::ProvenCsr, node_uri};
-use crate::cluster::consensus::issue::{IssueError, IssueTicket};
+use crate::cluster::consensus::issue::{IssueError, LeafSubject};
 use rcgen::{
     CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType, SerialNumber,
@@ -42,6 +42,20 @@ impl ClusterCa {
             signs: std::sync::atomic::AtomicUsize::new(0),
         }
     }
+    fn leaf_validity(now_ms: u64) -> Result<(i64, i64), IssueError> {
+        let nb = i64::try_from(now_ms / 1000)
+            .map_err(|_| IssueError::Sign)?
+            .checked_sub(60)
+            .ok_or(IssueError::Sign)?;
+        let na = nb.checked_add(30 * 86400).ok_or(IssueError::Sign)?;
+        Ok((nb, na))
+    }
+    pub fn leaf_fits(&self, now_ms: u64) -> bool {
+        Self::leaf_validity(now_ms).is_ok_and(|(_, na)| na <= self.not_after_s)
+    }
+    pub fn fingerprint(&self) -> crate::cluster::enrollment::CaFingerprint {
+        fingerprint_of(&self.cert_der)
+    }
     pub fn cert_der(&self) -> &[u8] {
         &self.cert_der
     }
@@ -49,21 +63,17 @@ impl ClusterCa {
     pub fn private_marker(&self) -> Vec<u8> {
         self.issuer.key().serialize_der()
     }
-    pub fn sign_leaf(
+    pub fn sign_leaf<S: LeafSubject>(
         &self,
-        ticket: &IssueTicket,
+        ticket: &S,
         csr: &ProvenCsr,
         now_ms: u64,
     ) -> Result<Vec<u8>, IssueError> {
         if ticket.key() != csr.digest() {
             return Err(IssueError::Revoked);
         }
-        let nb = i64::try_from(now_ms / 1000)
-            .map_err(|_| IssueError::Sign)?
-            .checked_sub(60)
-            .ok_or(IssueError::Sign)?;
-        let na = nb.checked_add(30 * 86400).ok_or(IssueError::Sign)?;
-        if na > self.not_after_s {
+        let (nb, na) = Self::leaf_validity(now_ms)?;
+        if !self.leaf_fits(now_ms) {
             return Err(IssueError::CaExpiring);
         }
         let mut serial = [0; 16];
@@ -98,4 +108,9 @@ impl ClusterCa {
         }
         Ok(der)
     }
+}
+
+pub fn fingerprint_of(der: &[u8]) -> crate::cluster::enrollment::CaFingerprint {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(der).into()
 }
