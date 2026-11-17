@@ -3579,3 +3579,7 @@ Root accepted prepared patch206e4610 and independent Sol6.1 high safetyPASSb6a28
 ### Hosted founder observation candidate - 2026-11-18
 
 Root Sol coordinator retained Sol6.1/high one-F6 result25aad48a: complete14-event trace, all phases Ok, final35.415ms, local source restored; hosted red unreproduced. Root prepared the same reviewed probe as a test-only hosted diagnostic candidate and ran cargo fmt only. Production macro expansions remain identity expressions. No test budget, assertion, retry, clock call, permit or owner behavior is changed. Independent actual-source review precedes one normal PR CI observation; no merge onto red main is authorized. This is no fix or stability credit. Main09134085 RED; PR176 held, counters unchanged; hardware **unverified on real hardware**.
+
+### Diagnostic CI static guard rejection - 2026-11-18
+
+PR177 head3c2d04c3 CI44203071298 failed the same issuance-scope guard on all OS before Rust checks or F6. No hosted phase observation occurred. Guard correctly rejects cfg(not(test)); root replaced split macro definitions with one definition per macro, using cfg(test) only on observation statements. Guard remains unchanged and passes7/7; fmt/diff checks passed. Non-test expansion now uses a single-evaluation let/result block rather than literal expression tokens; independent review of lifetime/drop equivalence is required before any push. No tests rerun, no fix/stability credit; main09134085 RED and PR176 held. Raw failurelog SHA256 afc8c19955785b9457f04c2fc3096e8f24127ef5a6efefc5b63e3d14657644f9.

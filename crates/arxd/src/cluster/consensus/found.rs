@@ -92,33 +92,23 @@ fn init_refusal(e: RaftError<Arx, InitializeError<Arx>>) -> FoundError {
         _ => FoundError::Unavailable,
     }
 }
-// Temporary F6 observation: production expansions are expression identities.
-#[cfg(not(test))]
-macro_rules! found_phase {
-    ($deadline:expr, $phase:literal, $work:expr) => {
-        $work
-    };
-}
-#[cfg(test)]
+// Temporary F6 observation; cfg(test) statements add only bounded scalar events.
 macro_rules! found_phase {
     ($deadline:expr, $phase:literal, $work:expr) => {{
+        #[cfg(test)]
         observation::enter($deadline, $phase);
         let result = $work;
+        #[cfg(test)]
         observation::exit($deadline, $phase, &result);
         result
     }};
 }
-#[cfg(not(test))]
-macro_rules! found_final {
-    ($deadline:expr, $work:expr) => {
-        $work
-    };
-}
-#[cfg(test)]
 macro_rules! found_final {
     ($deadline:expr, $work:expr) => {{
+        #[cfg(test)]
         observation::deadline_entry($deadline);
         let result = $work;
+        #[cfg(test)]
         observation::deadline_exit($deadline, &result);
         result
     }};
