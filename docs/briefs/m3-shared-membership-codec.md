@@ -158,3 +158,5 @@ survival or unrelated mutant failure stops for disposition, with no rerun/tuning
 The shared std-only module must not couple to enrollment Reader or StateStore.
 This grants only the stated extraction/tests after main green, not the later
 apply-time validation, arxj2, schema, state-machine or transport work.
+
+Root gate update: exact mainfa7e3c01 passed CI44090513191 attempt1 in604s wall/Windows600s. Contract e22dc93 is accepted; the narrow implementation and specified pure tests/probes may proceed. Source review and all hosted feature gates remain required.
