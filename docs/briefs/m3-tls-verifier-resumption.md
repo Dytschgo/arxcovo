@@ -118,3 +118,17 @@ Windows-quarantined fixture cases (13 three_node + 11 issuance + 3 TLS). Ubuntu/
   coverage. No other waiver is implied: not for budget, S8, the gates or the review.
 - Counters unchanged: Sol shared fixes 3/3, Opus 0/2 (exception, not fix). M2 open, M3 unchecked.
   TLS, Windows fixture behavior and transport are **unverified on real hardware**.
+
+
+## Root contract decision - 2026-11-17
+
+Accepted for integration after green exact main. The owner's explicit "Cover all
+three-node fixture tests" decision applies to the three identified TLS fixture
+cases as well as issuance. Root records that delegated scope decision as releasing
+PR159's Windows merge-eligibility hold once the full 27-case guard is in place.
+This is one fixture-class boundary, not another per-test expansion or proof of
+recovery. Windows stability/re-enable holds remain. All pure/single-node TLS and
+founder tests remain required on Windows. Ubuntu S8 gets one new-source observation;
+any red stops work, with no rerun. No budget/review/timeout/retry waiver is granted.
+Earlier owner-clarification wording above is superseded only by this recorded
+application of the existing owner decision; no further permission is inferred.
