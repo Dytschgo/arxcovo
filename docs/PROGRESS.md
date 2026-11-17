@@ -2,13 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `fa8378889c05c6b87d191610e07e3bef68c2ebca`
-after PR167. First push CI44069931184 attempt 1 passed all platforms in
-472 s wall time; Windows467s <=660s. Finishedlogs confirm the real founder/
-joiner identity proof PASS on everyOS. PR167 merged normally with OpusPASS6945935514;
-no exception or rerun. Claims remain one process and one shared committed registry,
-not a joiner replica or production transport. Windows fixture27 remains unverified
-on hosted Windows and **unverified on real hardware**. M2 open/M3 unchecked.
+**Current main GREEN:** exact `3084f8e5ef87f9aaa11e12e780a5adfe62e87f6a`
+after PR168. First push CI44077792712 attempt 1 passed all platforms in
+509 s wall time; Windows 505 s <=660 s. Finished logs confirm the learner
+own-registry proof PASS on every OS. PR168 merged normally from reviewed
+head b851d14 with all five gates and independent PASS6947032865.
+Catch-up is still the unauthenticated in-memory test transport, not production
+replication. Windows fixture27 remains unverified on hosted Windows and
+**unverified on real hardware**. M2 open/M3 unchecked.
 
 **Historical PR159 failures:** original Ubuntu S8 and Windows F1/F2 engine failures remain recorded separately. The resumed PR merged as67cc62d under the owner-approved fixture quarantine and all normal gates. No shared cause, flake fix or Windows stability is claimed; first-main CI44064366449 passed on attempt 1 in 610 s.
 
@@ -32,9 +33,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-17
 
-- Last merged: PR #167 as `fa8378889c05c6b87d191610e07e3bef68c2ebca`, reviewedheade649542, all5normalgates/OpusPASS6945935514. New proofPASSperOS, Windows541s. FirstmainCI44069931184 attempt1 passed in 472s wall, Windows467s.
-- Current work: L1 learner own-registry proof is implemented locally. Root corrected one deprecated API alias at two call sites after the builder Clippy stop; fmt/Clippy, all27 focused cases and guard4 now pass. M1-M3 runtime controls each failed once and source bytes were restored. Independent Opus source review passed (367db822); exact-head review and hosted checks precede merge. No production admission or promotion API is approved.
-- Blockers: L1 exact-head review and hosted normal gates, Windows <=660s, remain required. Main fa83788 is green. D1 bootstrap trust, D2 membership-operation handling and D3 promotion policy need a reviewed owner decision before production work. Windows fixture27 remains unverified; M2 open/M3 unchecked, Sol3/3 and Opus0/2 unchanged.
+- Last merged: PR #168 as `3084f8e5ef87f9aaa11e12e780a5adfe62e87f6a`, reviewed head b851d14, all five normal gates and PASS6947032865. PR Windows601s; first-main CI44077792712 attempt1 passed in 509s wall, Windows505s.
+- Current work: record the owner Sol6.1 engineering/review and Claude-only-UI routing. The owner also selected voter fingerprints, bounded5s admission/progress and host2 non-voting until host3; their ADR amendment and the next L2 contract are prepared locally, not production implementation.
+- Blockers: production L2 still needs reviewed discovery, removal authorization, apply-time anchor fencing, joint recovery, custody/transport and clock contracts. No new owner choice identified by the latest contract proposal, but technical review remains. Windows fixture27 unverified; M2open/M3unchecked; exhausted fix counters unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3269,3 +3270,16 @@ hardware **unverified on real hardware**. [Evidence](evidence/m3-founder-main-in
 ### L1 source review and publication correction - 2026-11-17
 
 - Opus source PASS 367db822 at 16873ce1. Root corrected R1 stale headlines, R2 missing artifact hashes and R3 alias wording; code unchanged. Normal hosted gates and Windows <=660 s remain required. L2/promotion unapproved; hardware paths **unverified on real hardware**.
+
+### Owner model routing update - 2026-11-17
+
+- Owner corrected the model request to Sol 6.1, with Claude only for UI work. Root Sol medium updated AGENTS and KICKOFF: non-UI engineering, architecture/security and independent reviews use Sol 6.1. A separate reviewer remains mandatory; existing reviews and all required gates remain valid.
+- Existing Windows fix budgets and stop rules are unchanged (Sol3/3, Opus0/2); no extra repair is granted. Existing babysitter remains intact. This documentation change ran only UTF-8 and whitespace checks; independent Sol review remains required before publication.
+
+- Routing review 5b25560 found R1: root accidentally changed automatic resume policy. Root restored the existing five-hour usage-limit resume policy within the accepted model routing; no schedule was created, cancelled or changed. Existing attempt caps remain exhausted.
+
+### PR168 first-main checkpoint - 2026-11-17
+
+- Root Sol medium verified reviewed-head/tree identity, all five exact-head gates, learner PASS on all OS, PR Windows601s and fresh green base before normal squash merge3084f8e5. No exception or rerun. Main run44077792712 on that exact commit passed attempt1 in509s; Ubuntu219s, macOS367s, Windows505s. Learner times: Ubuntu0.323s, macOS0.526s, Windows2.974s.
+- Logs under D:/Temp/arx-pr168-hosted: main Windows SHA256 `0ed8cfaf34eed9053bcaf3cb7c5367c5a517a2f951c366a577673500ffdb482a`; Ubuntu `9a047af9ce028d44034318f54d959ed0c76769eae023a92a886b1202c7aaa002`; macOS `3a9abf7df863ed6cd18f613e39fb4c29eca2d1b78fa6e4c2ab6f48338ab447d5`. Main-success JSON preserves exact inputs. Windows original8 sample all_pass30.578s, no orphans, e_s484; no stability or acceptance credit.
+- Normal protection and budgets unchanged. M2open/M3unchecked; production transport and hardware paths **unverified on real hardware**.
