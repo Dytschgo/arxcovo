@@ -131,3 +131,15 @@ five gates are still unrun here. A later docs-only PR165 refresh may be required
 no source rework follows from text-only changes. No publication authorized here.
 Owned Cargo/test processes were observed at zero after completion. All test gate
 threads exited with their processes. Build artifacts are retained without deletion.
+
+## Root parent refresh and publication checkpoint
+
+PR165 merged normally as021a89d5. Its tree equals reviewedheadb75006d7;
+exact-main CI44055365214 attempt1 passed all3platforms in565s wall, Windows561s.
+Root merged021a89d5 into the founder branch; only PROGRESS conflicted. Main health
+wording and founder history/status were retained. No crates/tools/workflow/Cargo
+diff exists against13a12ee5 after this merge. All6featurefiles remain reviewed
+c45089f bytes and full main guard plus reviewed founder additions unchanged.
+The Opus13a12ee5 integration verdict therefore still applies to source; the
+final publication head needs its own live review/status and5gates. Hosted founder
+cost under660s remains unmeasured. No Windows stability or hardware credit.
