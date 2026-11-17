@@ -45,6 +45,11 @@ impl fmt::Debug for JoinCode {
         f.write_str("<redacted>")
     }
 }
+impl RedeemProof {
+    pub(in crate::cluster) fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 impl CodeVerifier {
     pub(super) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)

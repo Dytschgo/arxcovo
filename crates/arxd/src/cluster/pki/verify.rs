@@ -49,12 +49,12 @@ impl From<VerifyRefusal> for Error {
 pub type Registry =
     Arc<dyn Fn(ClusterId, NodeId, KeyDigest) -> Result<(), VerifyRefusal> + Send + Sync>;
 #[derive(Clone, Copy)]
-struct Identity {
-    cluster: ClusterId,
-    node: NodeId,
-    key: KeyDigest,
+pub(super) struct Identity {
+    pub(super) cluster: ClusterId,
+    pub(super) node: NodeId,
+    pub(super) key: KeyDigest,
 }
-fn peer_identity(der: &[u8]) -> Result<Identity, VerifyRefusal> {
+pub(super) fn peer_identity(der: &[u8]) -> Result<Identity, VerifyRefusal> {
     if der.len() > MAX_CSR {
         return Err(VerifyRefusal::Oversized);
     }

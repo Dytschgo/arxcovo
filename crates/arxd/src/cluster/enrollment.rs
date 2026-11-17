@@ -1,4 +1,6 @@
 //! Pure proposal-time enrollment. This module performs no I/O and proves no consensus commit.
+mod anchor;
+pub(in crate::cluster) use anchor::BoundVoters;
 mod code;
 mod registry;
 pub use registry::{FoundMembers, FoundTooLarge, MAX_FOUND_WIRE, MAX_MEMBERS, PeerRefusal};
@@ -320,24 +322,7 @@ impl EnrollmentState {
         &self,
         membership: &Membership,
     ) -> Result<JoinAnchor, Reject> {
-        let [voters] = membership.configs() else {
-            return Err(Reject::AnchorChanged);
-        };
-        if !(1..=MAX_MEMBERS).contains(&voters.len()) {
-            return Err(Reject::AnchorChanged);
-        }
-        let mut hash = Sha256::new()
-            .chain_update(b"arxcovo/join/anchor/v1")
-            .chain_update(self.cluster)
-            .chain_update([voters.len() as u8]);
-        for voter in voters {
-            let node = NodeId::new(*voter).ok_or(Reject::AnchorChanged)?;
-            let key = self.members.get(&node).ok_or(Reject::AnchorChanged)?;
-            hash = hash
-                .chain_update(voter.to_be_bytes())
-                .chain_update(key.as_bytes());
-        }
-        Ok(JoinAnchor(hash.finalize().into()))
+        Ok(BoundVoters::observe(self, membership)?.anchor(self.cluster))
     }
     pub(in crate::cluster) fn apply(
         &mut self,

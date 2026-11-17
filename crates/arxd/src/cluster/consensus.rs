@@ -583,3 +583,6 @@ impl ConsensusNode {
         .unwrap()
     }
 }
+
+#[cfg(test)]
+mod anchored_join_tests;

@@ -34,3 +34,7 @@ pub(super) mod verify;
 
 #[cfg(test)]
 pub(super) use tls_tests::*;
+
+pub(super) mod preproof;
+#[cfg(test)]
+pub(super) mod preproof_tests;
