@@ -4653,3 +4653,78 @@ to4; native child/recovery remains UNRUN locally and requires hosted execution.
 All journal, integrity, rollback and privacy oracles remain. The separate damaged
 v3 migration rollback expectation stays3 intentionally. No additional runtime or
 native attempt follows from this test expectation correction.
+
+Published the three test-only integration corrections as `dd9d602b` then
+`f5cee7b6ef9dde1345435be7046346fc06115387` on existing PR183. Final Windows
+Clippy PASS4.742s; focused4PASS and fmt/diff evidence retained. Full feature now
+has16pinned source/test files; production bodies remain identical to the approved
+runtime source. Fresh independent Sol6.1/medium delta review is active, with
+exact-head attestation/status only if its source assessment passes. Normal
+new-source [CI44340307270](https://github.com/Dytschgo/arxcovo/actions/runs/44340307270)
+is attempt1 atf5cee7b6, pending; no manual rerun/dispatch. The first bfd failure,
+macOS runner-capacity annotations and unrun cases remain preserved. Existing
+watch persists across the update. This new checkpoint stays local; no diagnostic
+push or engine/timeout/quarantine/runner-policy change. M2OPEN/M3UNCHECKED.
+
+## PR183 f5 review GO; Ubuntu reveals another stale schema oracle
+
+Fresh independent Sol6.1/medium delta review gives SOURCE GO atf5cee7b6,
+Standards/Spec PASS,16pins/4localartifacts verified. Attestation
+[comment6983758439](https://github.com/Dytschgo/arxcovo/pull/183#issuecomment-6983758439)
+and exact-head agent-review success are published. Hosted checks remain mandatory.
+Report: `D:/Temp/arx-pr183-ci-delta-review/review.md`.
+
+On that review completion, a single required-jobs read found Ubuntu failed in
+new-source CI44340307270 attempt1, Windows running, macOS queued. The retained
+Ubuntu job134928130147 log is175,547bytes, SHA256
+`4b89453ad4cbb35f10274530f8ae9cc4c8c306c96227ce6a07c9cf83e49e8018`;
+8MiB/45s bounds, no truncation. Clippy now passes. Nextest434PASS/1FAIL/22skip/
+243unrun in29.720s: service::executor::tests::late_dispatch_after_drain_finishes_without_worker_or_poll
+fails only its schema assertion atline660 (expected3,actual4). Full evidence is
+`D:/Temp/arx-pr183-f5-first-ci`. No whole-run conclusion is inferred while the
+other jobs remain unfinished, and no workflow rerun/dispatch/cancellation occurred.
+
+Coordinator's earlier three-line-context search missed this closure-formatted
+assertion. Following the owner's conditional Opus request, assigned Opus5.5/high
+(fast off) a bounded complete activity-schema assertion audit and test-only
+correction. It must classify every occurrence, retain intentional old-version
+seed/rollback cases, preserve all assertions and change no production/schema/
+permission/timer/engine code. Only safe fake/probe cases may run locally; no
+native hot-journal/Job/founder/S4U/engine experiment. Result/audit table/manifests
+go to `D:/Temp/arx-opus-activity-schema-ci-audit`. Coordinator will inspect and
+obtain fresh independent review before delivery. The already completed Opus F1
+core correction stays separate; this does not reset historicalengineSol3/3 or
+Opus0/2 and does not grant another PR182/native fix. M2OPEN/M3UNCHECKED.
+
+The returned M3 learner fixture remains a design draft undergoing coordinator
+review. Its sender/prebound-listener seams and truthful pre-return startup-failure
+limit need explicit contract treatment. No M3 source/build/runtime authority or
+container/hardware credit follows. Current priority remains PR183's CI repair.
+
+## Opus schema-family audit returned; f5 hosted observation terminal
+
+All3 jobs of normal CI44340307270 attempt1 atf5cee7b6 are terminal FAILURE,
+each on the same stale service-executor schema assertion (expected3/actual4).
+Ubuntu434PASS/1FAIL/22skip/243unrun,182s job; macOS412/1/8/233,250s job;
+Windows424/1/36/267,431s job. Workflowwall555s. macOS acquired a runner this time;
+the first bfd capacity cancellation remains preserved without stability credit.
+All3 boundedlogs/metadata/case lists retained onD; no rerun/dispatch/cancellation.
+[Checkpoint](evidence/windows-execution-choice-pr183-schema-followup.md).
+
+Owner-requested Opus5.5/high (fast off) completed the bounded test-family audit:
+all33 source hits classified (22activity-test/4production/7cluster); root repeated
+the search and confirmed33. Two test lines corrected: successful service-fixture
+schema expects4, and unsupported-future-version corruption uses5 because4 is now
+valid. All worker/privacy/integrity/byte-preservation oracles remain, intentional
+legacy/rollback values retained. Root read the full audit and failing-before/
+passing-after logs and verified2source/7artifact identities. Seven safe casesPASS,
+WindowsClippy/fmt/diffPASS. The inventory corruption case remains locallyUNRUN
+behind the unchanged ACL fixture; source proof is distinguished from execution.
+No normal binary rebuild/runtime/native probe or production-code change.
+
+[Audit table](evidence/windows-execution-choice-schema-audit.md) preserves the
+per-row classifications; the checkpoint notes a prose subtotal mismatch in the
+returned summary, without altering original artifacts. Fresh independent Sol
+review and all corrected-head gates remain required before merge. Currentsource
+is not yet published beyondf5, so the completed failed matrix is not interrupted.
+M2OPEN/M3UNCHECKED, fullv1 remains active; no historical engine-counter reset.
