@@ -4196,6 +4196,40 @@ Corrections covered explicit original-deadline/close/caller fences before side
 effects and after reauthorization; store/resource destruction outside admission
 mutex; close deadline resampling. This is NOT final source PASS: tests remain
 mutable and baseline runtime is unrun. Initial no-run test compilation PASS15.057s.
-Legal maximum fixture measured232640 bytes (larger than64KiB send buffer), separate
+Initial legal-frame source calculation232640 bytes (not a runtime measurement), separate
 from conservative264112-byte cap. Root read actual dependency feature logs:
 tokio-rustls0.26.6 ring, rustls0.23.46 ring/std, Tokio1.48 single version.
+
+Final prebaseline review also required panic JoinError payloads to be disposed
+outside the short ownership gate with keeper retained; builder applied bounded
+persistent handling, and tests add a nonblocking Drop/try_lock proof. Test review
+required removing an implicit auto-success dispatcher default, tightening clock-observer
+cleanup, and isolating expired/wrong-root certificate fixtures from key mismatch
+so named security checks cannot pass for the wrong reason. These are new-slice
+construction/review corrections before any runtime baseline, not engine fixes;
+Sol3/3 exhausted remains unchanged. Additional no-run compile PASS7.64s predates
+last core correction and is not final proof. Runtime/controls still UNRUN.
+
+Tests builder Sol6.1/high declared file freeze after explicit spy results,
+isolated registered-SPKI expiry/root/cluster fixtures, clock observer pre-setup
+cleanup and panic-payload Drop proof. Final maximum-frame source calculation is
+232688 bytes after including both optional LogIds; prior232640 was an earlier
+source calculation, never runtime evidence. First focused runtime baseline now
+pending after format/Clippy; all runtime/controls remain unclaimed until logs.
+
+Owner's repeated PR180 handoff reconciled against actual state: re-read current
+PROGRESS/status, reverified CI44286225997 attempt1 SUCCESS on exact8b36405.
+Retained D: job logs still match all three recorded SHA256 values, original689s
+wall/686charged/3queue history exists once. Checkpoints82bf2f57 and71024c82 remain
+ancestors of preserved work/m3-container-prerequisites (now0bd9654d); no duplicate
+Rust or CI trigger. Registry prerequisite already merged asPR181/cd890750 with
+its own first-main green. Continue accepted ADR0028, not a second registry build.
+
+Verification correction: transport-baseline used --bin arxd and executed ZERO
+transport tests (0passed,1filtered;9.618s). It grants no runtime credit. Earlier
+--bin --no-run checks likewise did not compile the library's transport tests;
+workspace all-targets Clippy did compile them. All wrong-target logs retained.
+Corrected --lib target is required for the first actual focused transport run;
+no test is being repeated by correcting a zero-execution target. Same-term/higher-
+node HigherVote advisory can be added before that run. EngineSol3/3 exhausted and
+Opus0/2 unchanged; no founder diagnostic/fix/rerun, settings or quarantine change.
