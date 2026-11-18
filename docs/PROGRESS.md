@@ -3638,3 +3638,7 @@ Sol6.1/high source84522a3b and evidencea5f7d37e retainedlocally (ea4542d2/30547a
 ### Founder observer review corrections - 2026-11-18
 
 Root correctionc3d45d6d addresses Astra9da4bf2b five blockers: leafdrop, singlelookups/inactivecapture, distinctguardfinalbranches/emptyunperformedrows, typedpremapleaderwait, livewiringevidence. RootClippyinitial5lazyclosurelintfailures corrected with singlelookupmatches; recheckpassed. Pure4passedonce (641filtered), livewiringauditpassed and6source-mutantsrejected; finalguard8/fmt/diffpassed. Optionalsuccessrows acceptedasUnknown, no synthetictiming. ExactsourceAstra6.2high recheckactiveatba493dfc; no engine/CI/push/newfixcredit. Earlier scriptseam errors recordedinevidence, not hidden. PR176held/countersunchanged/M2openM3unchecked/hardware **unverified on real hardware**.
+
+### Ubuntu observer publication decision - 2026-11-18
+
+Astra6.2/high recheck10d324e6 closes all five9da4bf2b blockers atba493dfc, no new blocker. Root confirmed currentmain05b9c829/CI44212212325 stillgreen and finalsourceunchanged from reviewedtree. Optionalmissing worker rows stayUnknown. Root authorizes one new-source normalfullCI observation via PR176 update; no manualdispatch/rerun/settings change. Existingqueryengineproof/allfivegates/Windows<=660s and freshmainhealth remain required; thisdiagnostic is notfix/stabilitycredit. Authorization D:/Temp/arx-pr176-ubuntu-diagnostic-publication/authorization.json. Cinvalid/Tunrun, counters unchanged; M2open/M3unchecked/hardware **unverified on real hardware**.
