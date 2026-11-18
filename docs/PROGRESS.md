@@ -3634,3 +3634,7 @@ Root applied all four Astra2be92556 contract corrections asbbe9a443: immutablegu
 ### Ubuntu observer local candidate and gaps - 2026-11-18
 
 Sol6.1/high source84522a3b and evidencea5f7d37e retainedlocally (ea4542d2/30547a71). FinalClippy and pure4passed after1/1mechanicalbatch; fmt/guard8/sampler60 passed beforebatch, no finalsource rerun claimed. Knownbranchattributiongaps remain; source is notpublication-ready. Root requested Astra6.2/high exactdiffreview, including non-test semantics, success/failurecleanup, missingbranchdistinctions and1121linecomplexity. No furtherbuilderedits orCIuntilrootdisposition. Noengine/runtimefailingcase rerun, nofixcredit; PR176held/M2openM3unchecked/hardware **unverified on real hardware**.
+
+### Founder observer review corrections - 2026-11-18
+
+Root correctionc3d45d6d addresses Astra9da4bf2b five blockers: leafdrop, singlelookups/inactivecapture, distinctguardfinalbranches/emptyunperformedrows, typedpremapleaderwait, livewiringevidence. RootClippyinitial5lazyclosurelintfailures corrected with singlelookupmatches; recheckpassed. Pure4passedonce (641filtered), livewiringauditpassed and6source-mutantsrejected; finalguard8/fmt/diffpassed. Optionalsuccessrows acceptedasUnknown, no synthetictiming. ExactsourceAstra6.2high recheckactiveatba493dfc; no engine/CI/push/newfixcredit. Earlier scriptseam errors recordedinevidence, not hidden. PR176held/countersunchanged/M2openM3unchecked/hardware **unverified on real hardware**.
