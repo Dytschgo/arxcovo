@@ -4174,3 +4174,28 @@ or stability/fix credit. Bounded D: logs/hashes in PR181 merge evidence; existin
 recorder appended duration history without policy changes. One-time main followup
 complete, no polling/rerun/dispatch. M2 OPEN/M3 UNCHECKED; source implementation
 continues under accepted ADR0028 and independent source review still required.
+
+Transport execution split: Sol6.1/high core builder owns peer_transport.rs plus
+dependency/module wiring; second Sol6.1/high builder owns only its tests.rs after
+API handoff. No concurrent Cargo runs or duplicate source ownership. Coordinator
+keeps docs/CI evidence. Independent source review follows source/test freeze.
+Bounded child Python environment probe confirms tempfile root D:/Temp/arx-tls-
+integrate/tmp, TMP/TEMP and Cargo paths D:, TMPDIR unset; no app runtime check.
+
+Sol6.1/high core initial offline compile PASS17.771s (before subsequent WIP
+close-deadline/TTL-overflow refinements); runtime still UNRUN. Builder reports
+locked offline feature-tree inspection: one tokio-rustls0.26.6 ring adapter,
+rustls0.23.46 ring/std and Tokio1.48; lock diff adds adapter package/direct edge
+only. Independent Sol6.1/high preliminary actual-core review active while second
+builder finishes real-socket tests. Final frozen source baseline/review and two
+once-only controls remain; no early compile treated as final-source proof.
+
+Core prebaseline independent Sol6.1/high static review has no remaining findings
+at mutable core SHA2569db6fbe2debc29a47f89422a03dea76140450338c96b76d2245481b9ce7e9997.
+Corrections covered explicit original-deadline/close/caller fences before side
+effects and after reauthorization; store/resource destruction outside admission
+mutex; close deadline resampling. This is NOT final source PASS: tests remain
+mutable and baseline runtime is unrun. Initial no-run test compilation PASS15.057s.
+Legal maximum fixture measured232640 bytes (larger than64KiB send buffer), separate
+from conservative264112-byte cap. Root read actual dependency feature logs:
+tokio-rustls0.26.6 ring, rustls0.23.46 ring/std, Tokio1.48 single version.
