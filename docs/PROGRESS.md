@@ -48,7 +48,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
-- Active CI work: owner oversight authorized a separate reviewed ci-speed split of Rust/platform and Node/UI/browser/Electron validation, followed only after green exact-main by a normal PR182 refresh. Existing required verify names, all validations, 12-minute limits and 900-second budget remain. ADR0031 records the fail-closed gates and conservative wall fallback; no engine fix authority or cause claim follows. The secure Claude Code OAuth request is unchanged.
+- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185), ci-speed head59800c7632b0d91a09c6643ffe455a0898328571, splits Rust/platform and Node/UI/browser/Electron validation. Independent Sol6.1/high Standards/Spec GO, exact-head agent-review success; normal first CI44389444133 attempt1 remains incomplete. Existing required verify names, all validations, 12-minute limits and 900-second budget remain. ADR0031 records fail-closed gates and conservative wall fallback. Only after reviewed merge and green exact-main may PR182 receive a normal refresh; no engine fix authority or cause claim follows. The secure Claude Code OAuth request is unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -5244,3 +5244,28 @@ PASS6.032s, diff check PASS. Application/tools/nextest/trusted policy and
 auto-merge source unchanged. [Preflight evidence](evidence/parallel-ci-preflight.md).
 Independent exact-head review and normal first hosted attempt remain pending;
 no speed claim, CI retry, engine repair or acceptance follows from local guards.
+
+## PR185 published and independently reviewed; first CI pending
+
+Coordinator published59800c7632b0d91a09c6643ffe455a0898328571 as
+[PR185](https://github.com/Dytschgo/arxcovo/pull/185), linked it immediately and
+added ci-speed. Independent separate native Sol6.1/high reviewer inspected all12
+changed files, actual28-block mapping, downstream dependencies and policy/history
+proofs: Standards GO / Spec GO, zero findings. Report and pin proof retained at
+D:/Temp/arx-ci-split-review. Published [attestation](https://github.com/Dytschgo/arxcovo/pull/185#issuecomment-6990519364)
+and exact-head agent-review success59297092788 after separate live source checks.
+No tests were rerun by the reviewer; hosted gates remain mandatory.
+
+Normal first CI44389444133 attempt1 was discovered once; no rerun/dispatch or
+polling loop. Reviewer's final20:22:33UTC snapshot recorded Rust Ubuntu and UI
+Ubuntu/Windows SUCCESS, Rust Windows/UI macOS running, Rust macOS queued, verify
+gates not yet emitted; ci-time-budget and agent-review SUCCESS. This is an
+incomplete run, not merge acceptance or a speed measurement. Coordinator must
+retain bounded D logs/counts/durations from every worker and gate, require total
+wall<=900s and Windows worker<=660s, then freshly verify all exact-head/main gates
+before merge. The resulting exact-main first CI must pass before PR182 refresh.
+
+This follow-up checkpoint stays local above the published source head; it is not
+pushed to manufacture another CI attempt. Main remains verifiedff599a24. PR182
+HOLD, code-fix counters and OAuth input remain unchanged. M2 OPEN/M3 UNCHECKED;
+relevant paths remain **unverified on real hardware**.
