@@ -138,3 +138,36 @@ Babysitter unchanged.
 | clippy.log | 31543fb98af2a1a188b61008f7b6fb0d6f3127f272bab2b4edb15d0f962dad48 |
 | clippy-recheck.log | 0487c871ddf4674261b5fa3ba86cc94895dc277a87deaf1508180e6331a3ac78 |
 | pure-tests.log | 24b5994eb38b0f0a28addd4437def34b66aa1daa1a4ade050159a6138afdb0bf |
+
+## Root exact-review correction - 2026-11-18
+
+Root addressed Astra9da4bf2b findings locally: explicitF10leafdrop, singlelookup
+matches with error-path diagnostics, inactivecapture gating, distinct guard late
+reply/elapsed edges and empty unperformed edges, borrowed leaderwait timeout/
+shutdown reasons beforecollapse. Optional successreply/helper edges remain
+Unknown; no synthetic timestamps. Old F6formatting unchanged.
+
+The wiring audit docs/evidence/m3-founder-observer-wiring.py checks actuallive
+founder/guard arm tags and returns, premapleaderclassification, originalleafdrop
+and eachreturnedrefusalcleanup path. Six in-memory source mutants were rejected;
+no Rustsource mutant or engine ran. Purelane test now writes a retained first
+handle during secondcapture and checksF6Nonewithrealpendingphase.
+
+Root Clippy initially failed5 unnecessary-lazy-evaluation lints after cfg erasure;
+changed errorclosures to singlelookup matches, no lintallowance. Recheckpassed.
+Pure4 passedonce aftercompile46.01s,641filtered; no engine cases. Guard8, sampler60,
+fmt/diff checks passed, with guard8/fmt repeated on final correctedsource.
+A first source-edit script expected Stopped as Unavailable and stopped before
+writing consensus.rs; corrected its match. A first wiring mutant selector also
+matched a puretest token; tightened to the qualifiedlive call before rerunning
+static audit. These are harness/edit errors, not founder behavior executions.
+Task-private completed builder cache/target reused serially with offline
+CARGO_BUILD_JOBS=2; owned command sessions completed. No global-name process
+ownership inference, unrelated kill, install/network/CI/push occurred.
+Non-test lookup match/error/drop equivalence needs Astra exactsource recheck;
+prior compiler evidence is not a substitute. PR176remainsheld, countersunchanged.
+
+Retained root log SHA256:
+- clippy.log: 944c7413de4365c63bbaabe5c8a4f2249fe31e7728e91f6d5dd38a5fe99a7763
+- clippy-recheck.log: b150431240854c29c628fad690b5708a9e7391532b4b85e2b03d49bdbf55865b
+- pure-tests.log: 55b39270db2e0b6aad756b5aacf0e241e10d31621f5ea03de1100b5f27f1b579

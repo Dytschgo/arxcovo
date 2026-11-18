@@ -552,7 +552,7 @@ bounded!(f10_drop_bounded, async {
     let (found, snapshot) =
         observation::capture_call(observation::Call::F10Final, issue(&n, &ca, &csr)).await;
     match found {
-        Ok(_) => (),
+        Ok(leaf) => drop(leaf),
         Err(error) => {
             let shutdown = n.shutdown().await;
             let mut cleanup = observation::Cleanup::unknown();

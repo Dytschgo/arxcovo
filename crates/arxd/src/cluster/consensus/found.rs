@@ -88,16 +88,18 @@ struct Pre {
 }
 fn init_refusal(e: RaftError<Arx, InitializeError<Arx>>) -> FoundError {
     #[cfg(test)]
-    observation::phase_reply(
-        10,
-        match &e {
-            RaftError::APIError(InitializeError::NotAllowed(_)) => {
-                observation::Reason::InitNotAllowed
-            }
-            RaftError::APIError(_) => observation::Reason::ApiOther,
-            RaftError::Fatal(_) => observation::Reason::Fatal,
-        },
-    );
+    if observation::active() {
+        observation::phase_reply(
+            10,
+            match &e {
+                RaftError::APIError(InitializeError::NotAllowed(_)) => {
+                    observation::Reason::InitNotAllowed
+                }
+                RaftError::APIError(_) => observation::Reason::ApiOther,
+                RaftError::Fatal(_) => observation::Reason::Fatal,
+            },
+        );
+    }
     match e {
         RaftError::APIError(InitializeError::NotAllowed(_)) => FoundError::AlreadyInitialized,
         _ => FoundError::Unavailable,
@@ -204,18 +206,11 @@ pub(in crate::cluster::consensus) mod observation {
     }
     pub(super) fn exit<T>(d: Instant, p: &'static str, r: &Result<T, FoundError>) {
         record(d, p, "exit", variant(r));
-        if p == "initialize" && r.is_ok() {
+        if active() && p == "initialize" && r.is_ok() {
             phase_reply(10, Reason::Ok);
         }
-        if p == "leaderwait" {
-            phase_reply(
-                11,
-                if r.is_ok() {
-                    Reason::Ok
-                } else {
-                    Reason::ReplyError
-                },
-            );
+        if active() && p == "leaderwait" && r.is_ok() {
+            phase_reply(11, Reason::Ok);
         }
     }
     pub(super) fn deadline_entry(d: Instant) {
@@ -300,6 +295,8 @@ pub(in crate::cluster::consensus) mod observation {
         ReadyOuterError,
         SubmitError,
         ReplyError,
+        WaitTimeout,
+        ShuttingDown,
         Unknown,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,15 +436,26 @@ pub(in crate::cluster::consensus) mod observation {
     }
     pub(in crate::cluster::consensus) fn caller(reason: Reason) {
         let _ = CAPTURE.try_with(|cell| {
-            cell.borrow_mut().reason = reason;
+            let mut buffer = cell.borrow_mut();
+            if buffer.slots.is_some() {
+                buffer.reason = reason;
+            }
         });
     }
     pub(in crate::cluster::consensus) fn decision(tag: Decision) {
         let _ = CAPTURE.try_with(|cell| {
-            cell.borrow_mut().decision = tag;
+            let mut buffer = cell.borrow_mut();
+            if buffer.slots.is_some() {
+                buffer.decision = tag;
+            }
         });
     }
-    pub(in crate::cluster::consensus) fn phase_reply(index: usize, reason: Reason) {
+    pub(super) fn active() -> bool {
+        CAPTURE
+            .try_with(|cell| cell.borrow().slots.is_some())
+            .unwrap_or(false)
+    }
+    pub(super) fn phase_reply(index: usize, reason: Reason) {
         let _ = CAPTURE.try_with(|cell| {
             if let Some(slots) = &cell.borrow().slots {
                 slots.words[index].store(
@@ -456,6 +464,12 @@ pub(in crate::cluster::consensus) mod observation {
                 );
             }
         });
+    }
+    pub(super) fn leader_wait_reason(error: &openraft::metrics::WaitError) -> Reason {
+        match error {
+            openraft::metrics::WaitError::Timeout(_, _) => Reason::WaitTimeout,
+            openraft::metrics::WaitError::ShuttingDown => Reason::ShuttingDown,
+        }
     }
     pub(in crate::cluster::consensus) fn store_reason<T>(
         r: &Result<T, super::StoreError>,
@@ -678,13 +692,26 @@ pub(in crate::cluster::consensus) mod observation {
             assert_eq!(second.lane, Lane::Guard2);
             assert_ne!(snapshot.words[27], 0);
             assert_ne!(snapshot.words[41], 0);
-            let (_, isolated) =
-                capture_call(Call::ProofInitial, async { Ok::<_, FoundError>(()) }).await;
+            let (next, isolated) = capture_call(Call::ProofInitial, async {
+                enter(Instant::now() + ISSUE_BUDGET, "guard1");
+                let next = worker().unwrap();
+                mark(&Some(first.clone()), Edge::ClosureStart, Reason::Pending);
+                Ok::<_, FoundError>(next)
+            })
+            .await;
             assert_eq!(isolated.words, [0; 48]);
-            assert!(!Arc::ptr_eq(&first.slots, &Arc::new(Slots::new())));
+            assert!(!Arc::ptr_eq(&first.slots, &next.unwrap().slots));
             assert!(worker().is_none());
             capture(async {
+                enter(Instant::now() + ISSUE_BUDGET, "guard1");
                 assert!(worker().is_none());
+                caller(Reason::MissingRaft);
+                decision(Decision::ReadyLate);
+                CAPTURE.with(|cell| {
+                    let buffer = cell.borrow();
+                    assert_eq!(buffer.reason, Reason::Unknown);
+                    assert_eq!(buffer.decision, Decision::Unknown);
+                });
             })
             .await;
         }
@@ -820,16 +847,19 @@ impl ConsensusNode {
                 return Err(FoundError::Unavailable);
             }
             while owners.set.try_join_next().is_some() {}
-            #[cfg(test)]
-            if self.sm.is_none() {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::OwnersGate,
-                    observation::Reason::MissingStore,
-                );
+            let sm = match self.sm.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingStore,
+                    );
+                    return Err(FoundError::Unavailable);
+                }
             }
-            let sm = self.sm.as_ref().ok_or(FoundError::Unavailable)?.clone();
+            .clone();
             #[cfg(test)]
             let owner_obs = obs.clone();
             owners.set.spawn(async move {
@@ -871,11 +901,13 @@ impl ConsensusNode {
                         })
                     })();
                     #[cfg(test)]
-                    observation::mark(
-                        &blocking_obs,
-                        observation::Edge::StoreReply,
-                        observation::store_reason(&result),
-                    );
+                    if blocking_obs.is_some() {
+                        observation::mark(
+                            &blocking_obs,
+                            observation::Edge::StoreReply,
+                            observation::store_reason(&result),
+                        );
+                    }
                     drop(sm);
                     drop(permit);
                     result
@@ -980,11 +1012,14 @@ impl ConsensusNode {
             if !ca.leaf_fits(clock.now_ms()) {
                 return Err(FoundError::CaExpiring);
             }
-            #[cfg(test)]
-            if self.raft.is_none() {
-                observation::caller(observation::Reason::MissingRaft);
-            }
-            let raft = self.raft.as_ref().ok_or(FoundError::Unavailable)?;
+            let raft = match self.raft.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::caller(observation::Reason::MissingRaft);
+                    return Err(FoundError::Unavailable);
+                }
+            };
             found_phase!(
                 deadline,
                 "initialize",
@@ -1001,7 +1036,13 @@ impl ConsensusNode {
                         "founder leader",
                     )
                     .await
-                    .map_err(|_| FoundError::Unavailable)
+                    .map_err(|_error| {
+                        #[cfg(test)]
+                        if observation::active() {
+                            observation::phase_reply(11, observation::leader_wait_reason(&_error));
+                        }
+                        FoundError::Unavailable
+                    })
             )?;
             let t0 = clock.now_ms();
             let resp = found_phase!(

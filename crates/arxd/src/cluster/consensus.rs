@@ -348,16 +348,19 @@ impl ConsensusNode {
                 return Err(ProposeError::Stopped);
             }
             while owners.set.try_join_next().is_some() {}
-            #[cfg(test)]
-            if self.raft.is_none() {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::OwnersGate,
-                    observation::Reason::MissingRaft,
-                );
+            let raft = match self.raft.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingRaft,
+                    );
+                    return Err(ProposeError::Stopped);
+                }
             }
-            let raft = self.raft.as_ref().ok_or(ProposeError::Stopped)?.clone();
+            .clone();
             #[cfg(test)]
             let owner_obs = obs.clone();
             owners.set.spawn(async move {
@@ -500,26 +503,32 @@ impl ConsensusNode {
                 return Err(ReadError::Unavailable);
             }
             while owners.set.try_join_next().is_some() {}
-            #[cfg(test)]
-            if self.raft.is_none() {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::OwnersGate,
-                    observation::Reason::MissingRaft,
-                );
+            let raft = match self.raft.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingRaft,
+                    );
+                    return Err(ReadError::Unavailable);
+                }
             }
-            let raft = self.raft.as_ref().ok_or(ReadError::Unavailable)?.clone();
-            #[cfg(test)]
-            if self.sm.is_none() {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::OwnersGate,
-                    observation::Reason::MissingStore,
-                );
+            .clone();
+            let sm = match self.sm.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingStore,
+                    );
+                    return Err(ReadError::Unavailable);
+                }
             }
-            let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
+            .clone();
             #[cfg(test)]
             let read_blocking = self.read_blocking.clone();
             #[cfg(test)]
@@ -534,12 +543,6 @@ impl ConsensusNode {
 
                 let result = async {
                     if Instant::now() >= deadline || tx.is_closed() {
-                        #[cfg(test)]
-                        observation::mark(
-                            &owner_obs,
-                            observation::Edge::LinearizerReply,
-                            observation::Reason::Unknown,
-                        );
                         return Err(ReadError::Unavailable);
                     }
                     // Never cancel this wait: only its reply proves that an
@@ -559,19 +562,21 @@ impl ConsensusNode {
                         .await
                         .map_err(|e| {
                             #[cfg(test)]
-                            observation::mark(
-                                &owner_obs,
-                                observation::Edge::LinearizerReply,
-                                match &e {
-                                    RaftError::APIError(
-                                        LinearizableReadError::ForwardToLeader(_),
-                                    ) => observation::Reason::Forward,
-                                    RaftError::APIError(
-                                        LinearizableReadError::QuorumNotEnough(_),
-                                    ) => observation::Reason::NoQuorum,
-                                    RaftError::Fatal(_) => observation::Reason::Fatal,
-                                },
-                            );
+                            if owner_obs.is_some() {
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::LinearizerReply,
+                                    match &e {
+                                        RaftError::APIError(
+                                            LinearizableReadError::ForwardToLeader(_),
+                                        ) => observation::Reason::Forward,
+                                        RaftError::APIError(
+                                            LinearizableReadError::QuorumNotEnough(_),
+                                        ) => observation::Reason::NoQuorum,
+                                        RaftError::Fatal(_) => observation::Reason::Fatal,
+                                    },
+                                );
+                            }
                             match e {
                                 RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
                                     ReadError::NotLeader
@@ -589,12 +594,6 @@ impl ConsensusNode {
                         observation::Reason::Ok,
                     );
                     if Instant::now() >= deadline || tx.is_closed() {
-                        #[cfg(test)]
-                        observation::mark(
-                            &owner_obs,
-                            observation::Edge::AppliedReady,
-                            observation::Reason::Unknown,
-                        );
                         return Err(ReadError::Unavailable);
                     }
                     let ready = match linearizer
@@ -632,12 +631,6 @@ impl ConsensusNode {
                         observation::Reason::Ok,
                     );
                     if Instant::now() >= deadline || tx.is_closed() {
-                        #[cfg(test)]
-                        observation::mark(
-                            &owner_obs,
-                            observation::Edge::BlockingJoin,
-                            observation::Reason::Unknown,
-                        );
                         return Err(ReadError::Unavailable);
                     }
                     let read = ready.read_log_id();
@@ -677,11 +670,13 @@ impl ConsensusNode {
                             }
                         })();
                         #[cfg(test)]
-                        observation::mark(
-                            &blocking_obs,
-                            observation::Edge::StoreReply,
-                            observation::store_reason(&result),
-                        );
+                        if blocking_obs.is_some() {
+                            observation::mark(
+                                &blocking_obs,
+                                observation::Edge::StoreReply,
+                                observation::store_reason(&result),
+                            );
+                        }
                         // Guard, store Arc, permit, then completion (#147).
                         drop(sm);
                         drop(permit);
@@ -725,7 +720,7 @@ impl ConsensusNode {
                 #[cfg(test)]
                 observation::mark(
                     &obs,
-                    observation::Edge::CallerExpiry,
+                    observation::Edge::CallerReply,
                     observation::Reason::Expired,
                 );
                 Err(ReadError::Unavailable)
