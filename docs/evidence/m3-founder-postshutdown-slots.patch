@@ -1,0 +1,175 @@
+diff --git a/crates/arxd/src/cluster/consensus/found.rs b/crates/arxd/src/cluster/consensus/found.rs
+--- a/crates/arxd/src/cluster/consensus/found.rs
++++ b/crates/arxd/src/cluster/consensus/found.rs
+@@ -506,6 +506,8 @@
+         result: &'static str,
+         start: Marker,
+         end: Marker,
++        // Only ProofInitial Err retains this scalar recorder; never an engine/store handle.
++        postshutdown: Option<Arc<Slots>>,
+     }
+     // Sequential Acquire loads at capture return, before cleanup; no atomic worker snapshot.
+     pub(in crate::cluster::consensus) async fn capture_call<T>(
+@@ -539,6 +541,8 @@
+                         result: variant(&result),
+                         start,
+                         end: marker(slots.start),
++                        postshutdown: (call == Call::ProofInitial && result.is_err())
++                            .then(|| slots.clone()),
+                     }
+                 });
+                 (result, snapshot)
+@@ -655,6 +659,48 @@
+         format_snapshot(s, c, &mut out);
+         eprint!("{}", out.finish());
+     }
++    #[derive(Clone, Copy)]
++    struct Postshutdown {
++        words: [u64; 2],
++    }
++    // One sequential pair of Acquire loads, no clock sample or full freeze.
++    fn postshutdown_cut(slots: &Slots) -> Postshutdown {
++        Postshutdown {
++            words: [
++                slots.words[17].load(Ordering::Acquire),
++                slots.words[18].load(Ordering::Acquire),
++            ],
++        }
++    }
++    fn format_postshutdown(cut: Option<Postshutdown>, c: Cleanup, out: &mut Sink<8192>) {
++        let eligible = c.router == Status::Ok
++            && c.shutdown == Status::Ok
++            && c.store == Status::Ok
++            && c.log == Status::Ok;
++        let _ = write!(
++            out,
++            "\n[FOUNDER-POSTSHUTDOWN] cutoff=aftershutdown sequential=1 cleanup_eligible={} interpretation=Unknown present={}",
++            eligible, cut.is_some()
++        );
++        if let Some(cut) = cut {
++            for (i, w) in cut.words.iter().enumerate() {
++                let _ = write!(
++                    out,
++                    "\nslot={} packed={} absent={} saturated={}",
++                    17 + i, w, *w == 0, w >> 56 != 0
++                );
++            }
++        }
++    }
++    // Sole live caller: ProofInitial refusal AFTER existing shutdown/weak checks.
++    // Keep the original cut and primary error even when cleanup is not Ok.
++    pub(in crate::cluster::consensus) fn emit_proof_refusal(s: &Snapshot, c: Cleanup) {
++        let cut = s.postshutdown.as_ref().map(|slots| postshutdown_cut(slots));
++        let mut out = Sink::<8192>::new();
++        format_snapshot(s, c, &mut out);
++        format_postshutdown(cut, c, &mut out);
++        eprint!("{}", out.finish());
++    }
+     pub(in crate::cluster::consensus) fn fourth_start() -> (Instant, Marker) {
+         let start = Instant::now();
+         (start, marker(start))
+@@ -673,6 +719,92 @@
+     #[cfg(test)]
+     mod observer_tests {
+         use super::*;
++        #[test]
++        fn postshutdown_pair_preserves_return_cut_and_scalar_shape() {
++            // Exhaustive destructuring fails compilation if hidden fields are added.
++            let Slots { words, start }: Slots = Slots::new();
++            let _: [AtomicU64; 48] = words;
++            let _: Instant = start;
++            let slots = Slots::new();
++            slots.words[16].store(pack(1, Reason::Ok), Ordering::Release);
++            let returned = slots.freeze();
++            slots.words[17].store(pack(2, Reason::Ok), Ordering::Release);
++            slots.words[18].store(pack(3, Reason::Pending), Ordering::Release);
++            slots.words[19].store(u64::MAX, Ordering::Release);
++            let after = postshutdown_cut(&slots);
++            assert_eq!(returned[17..19], [0, 0]);
++            assert_eq!(after.words, [pack(2, Reason::Ok), pack(3, Reason::Pending)]);
++            assert_eq!(returned[16], pack(1, Reason::Ok));
++        }
++        #[tokio::test]
++        async fn postshutdown_retention_only_proof_refusal() {
++            for call in [Call::QueryInitial, Call::ProofInitial, Call::F10Final] {
++                for refused in [false, true] {
++                    let mut weak = None;
++                    let (_, snapshot) = capture_call(call, async {
++                        CAPTURE.with(|cell| {
++                            weak = Some(Arc::downgrade(cell.borrow().slots.as_ref().unwrap()));
++                        });
++                        if refused {
++                            Err(FoundError::Unavailable)
++                        } else {
++                            Ok(())
++                        }
++                    })
++                    .await;
++                    let retained = call == Call::ProofInitial && refused;
++                    assert_eq!(snapshot.postshutdown.is_some(), retained);
++                    let weak = weak.unwrap();
++                    assert_eq!(weak.upgrade().is_some(), retained);
++                    drop(snapshot);
++                    assert!(weak.upgrade().is_none());
++                }
++            }
++        }
++        #[tokio::test]
++        async fn postshutdown_formatter_two_cuts_cleanup_unknown_and_total_cap() {
++            let (_, snapshot) = capture_call(Call::ProofInitial, async {
++                decision(Decision::WaitElapsed);
++                Err::<(), _>(FoundError::Unavailable)
++            })
++            .await;
++            let before = snapshot.words;
++            let slots = snapshot.postshutdown.as_ref().unwrap();
++            slots.words[17].store(pack(2, Reason::Ok), Ordering::Release);
++            slots.words[18].store(pack(3, Reason::Pending), Ordering::Release);
++            for state in [Status::Ok, Status::Failed, Status::Timeout, Status::Unknown] {
++                let cleanup = Cleanup {
++                    router: Status::Ok,
++                    shutdown: state,
++                    store: Status::Ok,
++                    log: Status::Ok,
++                };
++                let mut out = Sink::<8192>::new();
++                format_snapshot(&snapshot, cleanup, &mut out);
++                format_postshutdown(Some(postshutdown_cut(slots)), cleanup, &mut out);
++                let text = out.finish();
++                assert!(text.starts_with("[FOUNDER-OBS] primary=WaitElapsed result=Unavailable"));
++                let (original, after) = text.split_once("[FOUNDER-POSTSHUTDOWN]").unwrap();
++                assert!(original.contains("slot=17 packed=0 absent=true"));
++                assert!(original.contains("slot=18 packed=0 absent=true"));
++                assert!(after.contains("cutoff=aftershutdown sequential=1"));
++                assert!(after.contains("slot=17 packed=769 absent=false saturated=false"));
++                assert!(after.contains("slot=18 packed=1024 absent=false saturated=false"));
++                assert!(!after.contains("slot=16") && !after.contains("slot=19"));
++                assert!(after.contains("interpretation=Unknown"));
++                assert_eq!(after.contains("cleanup_eligible=true"), state == Status::Ok);
++                assert!(text.len() <= 8192 && text.is_ascii() && text.ends_with('\n'));
++            }
++            assert_eq!(snapshot.words, before);
++            let mut out = Sink::<8192>::new();
++            // Same sink must reject an appended cut if the original consumes capacity.
++            for _ in 0..8179 {
++                out.write_str("x").unwrap();
++            }
++            format_postshutdown(Some(postshutdown_cut(slots)), Cleanup::unknown(), &mut out);
++            let text = out.finish();
++            assert!(text.len() <= 8192 && text.ends_with(" truncated=1\n"));
++        }
+         #[tokio::test]
+         async fn immutable_lane_isolation_and_optin() {
+             assert!(worker().is_none());
+diff --git a/crates/arxd/src/cluster/consensus/anchored_join_tests.rs b/crates/arxd/src/cluster/consensus/anchored_join_tests.rs
+--- a/crates/arxd/src/cluster/consensus/anchored_join_tests.rs
++++ b/crates/arxd/src/cluster/consensus/anchored_join_tests.rs
+@@ -190,7 +190,7 @@
+         cleanup.shutdown = observation::shutdown_status(&shutdown);
+         cleanup.store = observation::status(n.sm_weak.upgrade().is_none());
+         cleanup.log = observation::status(n.log_weak.upgrade().is_none());
+-        observation::emit(captured.as_ref().unwrap(), cleanup);
++        observation::emit_proof_refusal(captured.as_ref().unwrap(), cleanup);
+         panic!("original founder refusal: {error}");
+     }
+     timeout_at(cleanup_deadline, n.shutdown())
