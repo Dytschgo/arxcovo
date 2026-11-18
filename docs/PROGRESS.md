@@ -4057,3 +4057,12 @@ pendingpin/inventory. [Evidence](evidence/m3-peer-registry.md). Next2purecontrol
 onceeachwithrestore, no engine/RPC/TLS/network/container/nativeacceptance.
 M2OPEN/M3UNCHECKED; countersandownerfencesunchanged. Progress toward firstowner-testable
 version continues viaactualtransport and joinpath aftercallback prerequisite.
+
+Sol6.1/high parallel realTLSdesign investigation retained separately at
+D:/Temp/arx-owned-tls-design.md: pinnedasyncadapter proposal, explicitnewtransport
+caps/deadlines/owner, NotReady startupattachcycle, and shutdownjoin/releasetransport
+Sm before unchangednode.shutdown. No code/dependency/install/networktest. Root
+requested preciseEOF/halfclose rule to avoid extrabyte-detection deadlock; notyet
+acceptedlivecontract. Nextslice must be realTLS/TCPAppend transport, notanother
+unrelatedhelper, then completeVote/PreVote/fullsnapshot+networkedengineproof and
+actualjoin. Allnormalreviews/fences remain; no enginefix or CIbudgetchange.
