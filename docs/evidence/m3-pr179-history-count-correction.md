@@ -51,3 +51,11 @@ Rust622/622PASS/8skipped64.770s. Local boundedlog221413bytes SHA256
 Windows stillinprogress at09:13:44Z; no inferred result. Correction committed
 bfb1fc98 locally after independent review, not yetpushed so original evidence
 completes without cancellation. ExistingPRwatch remains active for nextchange.
+
+Original CI44272864519 attempt1 is now completedFAIL. Windowsjob134693561560
+completed09:16:42Z (590s job), failed the same31!=30 assertion during npm tests,
+after Rust nextest passed. Windows boundedlog231916bytes SHA256
+b04efe5a787e7c10fe5261fa1abc44769b0891458c7f7b66b4b3b5211091e8a4.
+Allthreeplatforms failed this history test; no run cancelled/retried. Later
+UI/build/smoke/sample steps were not reached. Coordinator retained all3logs before
+publishing reviewed test correction. Membership source remains unchanged.

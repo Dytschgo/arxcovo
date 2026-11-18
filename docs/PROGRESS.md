@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,9 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR178 as6f4618c76256c2ead9dfb501c2c3946fde14a81b from reviewed11a34312. Allfive gates passed; CI44267088243 attempt1SUCCESS633s, Windows629s. Identity3/observer3 passed eachOS. Premerge exactmain e3e79089/CI44229539357 GREEN verified.
-- Current work: exact-main CI44269052508 first-attemptGREEN603s confirmed. PR179 published reviewed d4bd38b4 fresh membership observation prerequisite; CI44272864519 firstattempt Ubuntu/macOS failed only stale historycount assertion31!=30 after Rust suites passed. Windows pending. Independent reviewed one-line correction bfb1fc98 ready locally, fullNode48/48PASS; waiting oldrun completion before publication, no same-head rerun. Normal allfive/freshgreenmain/Windows<=660s pending. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
-- Blockers: M2 owner/hardware acceptance incomplete; M3 admission/transport/discovery/removal authority/custody/clock and production integration remain. Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
+- Last merged: PR179 as6bf8f46bc87a05bed01e342c1a37f68427e4c16b from reviewed2f888992. Allfive gatesSUCCESS; CI44274746575 attempt1GREEN537s, Windows533s. New7tests and Node48 eachOS PASS. Premerge exactmain6f4618c/CI44269052508 GREEN checked immediately.
+- Current work: exact-main CI44276313116 attempt1GREEN565s verified. PR180 headb1cf9d50 held: CI44279691035 Windows executed12minute jobtimeout after662RustPASS, laterNode/UIchecks unrun. Astra disposition retained; no rerun/settings change. Separatelyauthorized Sol6.1 purecodec implementation running locally underADR0026, no liveTLS/dispatch authority. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
+- Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -52,13 +52,13 @@ Owner steering on2026-11-15 14:06 permits parallel work on features with few dep
 | Remaining M2 item | Evidence and blocker | Work status / closure prerequisite |
 | --- | --- | --- |
 | A6 quarantine and A8 Ready/discovery join | Accepted injected-port/SDK/persisted-state coverage; no native failure/startup credit | Source coverage remains actively maintained by ordinary CI. Any claimed native extension needs dedicated-host evidence. |
-| A4 crash provenance; crash/A9/U9 populated-stop and production Drain | D9a present-residue accepted; PR141 only proves removal after natural exit with empty directories | Native gap **unverified on real hardware**; dedicated qualifying host needed, no new hosted diagnostic authorized. |
+| A4 crash provenance; crash/A9/U9 populated-stop and production Drain | D9a present-residue accepted; PR141 only proves removal after natural exit with empty directories | Native gap **unverified on real hardware**. This Windows PC is authorized, pending owner-created Standard account and verified caps/reserves; no new hosted diagnostic is authorized. |
 | A7 sudo/NNP and A11 descriptor/alias | D7k final hosted NO-GO; no case proof | Deferred pending dedicated Linux host; **unverified on real hardware**. No more hosted bind/fix/grant/retry. |
 | A10 capability sufficiency for actual Runner | PR140 covers setup/janitor/fixture migration, not Runner self-migration/lifecycle | Source regression checks actively maintained; unmatched native operations need dedicated-host proof, **unverified on real hardware**. |
 | A12 normal/cancel residue producer | D7l sole run43741300777 failed; cleanup unconfirmed; consumer SDK joins are nonnative | Attempt consumed, host excluded, no further hosted execution authorized. Deferred dedicated-host producer evidence; **unverified on real hardware**. |
 | Full Stage F | Partial bounded credits A1-A5 and source joins do not cover every item above | Acceptance ledger/source regressions actively maintained; full credit blocked on missing native items, **unverified on real hardware**. |
 | Full Stage G | Pure/source refusal checks do not replace the real execution path | Source checks remain workable in CI; native execution/panic/security acceptance blocked on qualifying host and F, **unverified on real hardware**. |
-| Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner-provided dedicated standard-account host prerequisites and separate scoped authorization required; **unverified on real hardware**. No agent admin setup. |
+| Real-Runner PA6 and complete M2 MCP acceptance | Dedicated production execution remains inactive; mock result/activity joins are insufficient | Owner authorized this Windows PC; dedicated Standard account, enforced caps/reserves and verified execution setup remain pending. **Unverified on real hardware**. Agents perform no admin setup. |
 
 Active M2 work is preservation of existing source/consumer regression gates, exact acceptance accounting and fixing concrete regressions when found. There is no authorized native M2 run queued. Hardware closure is explicitly blocked, not silently treated as complete. Coordinator continues independent M3 work under its own reviews/gates; no M2 checkbox changes until the acceptance decision explicitly accounts for every unresolved item and its hardware limitation.
 
@@ -3844,3 +3844,172 @@ Independent Sol6.1/high correctionPASS, Standards0/Spec0/Security0; exacttestblo
 allbyte/oldrecord/duplicateguards preserved; productionbudget/runtimeunchanged.
 [Review](reviews/m3-pr179-history-count-sol61-review.md). OldrunWindows stillrunning;
 retain its firstattempt evidence before publishing correction. No PRrerun/dispatch.
+
+## Babysitter-relayed owner steering: M2 PC and M3 containers (2026-11-18)
+
+Acknowledged Dylan's delegated steering and recorded it in ADR0023. This Windows
+PC is authorized as the M2 host for applicable native gaps, subject to owner-created
+Standard account, enforced disk cap and owner CPU/RAM reserves. Sent one short
+checklist from docs/dev-host-setup.md before any native execution. Owner setup is
+pending/unverified; agents perform no admin steps and never use the owner's login
+as fallback. All data, VM disks, builds and TMP/TEMP go to D:. Lab Manager/state/
+agent-windows-test remain untouched. Linux A7/A11 sudo/NNP and A12 cannot close
+on Windows and remain qualifying-Linux-host pending; M2 stays OPEN.
+
+M3 acceptance target is three containers on hosted Ubuntu with real network
+transport, kill-one/write-preservation and expired/reused-code refusals. No local
+hypervisor install is needed for this preferred path. Assigned Sol6.1/high a
+read-only implementation plan grounded in actual source; no container/CI/native
+run yet. VM/container credit only; real multi-host hardware remains **unverified
+on real hardware**. Transport/custody/clock gaps remain explicit prerequisites,
+not permission to replace real paths with mem_net or mocks. M3 stays UNCHECKED.
+Sol3/3 exhausted/Opus0/2 unchanged; no founder diagnostic/fix or Linux hosted retry.
+Existing babysitter schedule untouched. PR179's independently reviewed history
+assertion correction remains local, awaiting original Windows result before push.
+
+Sol6.1/high source-grounded container plan complete; coordinator reviewed and
+retained [three-container plan](briefs/m3-three-container-acceptance.md). Current
+binary lacks cluster startup/config and real network adapter; mem_net/three_node
+are in-process/direct-initialize fixtures and cannot earn requested credit.
+Build order: peer protocol -> real socket adapter -> actual code/certificate join
+and custody/admission/promotion -> process config/lifecycle -> fenced hosted
+three-container leader-loss/write-ledger harness -> expired/distinct-reuse tests.
+No container run yet. Trusted expiry remains a security/evidence prerequisite:
+controlled-clock transport tests may prove policy but not real15-minute expiry;
+no TTL or CI-budget change. Real multi-host hardware unverified. M2OPEN/M3UNCHECKED.
+Owner checklist already sent; PC native runs await account/fence setup. Existing
+babysitter left intact; no LabManager/VM/admin actions. PR179 prepared correction
+and its independent review remain unchanged while old Windows job completes.
+
+OriginalPR179 run44272864519 completedFAIL: allthreeplatforms samehistory31!=30,
+Rust suites passed; Windowsjob590s. Fullboundedlogs retained. Publish only
+reviewed correction ancestor2f888992 (testblob0d735fd4), preserving oneconcernPR;
+ownersteering/containerplan commits remain local on this branch for next delivery.
+No runcancel/rerun/dispatch; membershipAPI and founder untouched, countersunchanged.
+
+PR179 correction published as2f888992f82683f54cb9c8170b8d061d6773ea03 after original
+allOS firstattempt completed. NewnormalCI44274746575 firstattempt running;
+independent correction review6974277201/agent-reviewSUCCESS. Remaining production
+source unchanged. Originalfailurelogs retained, no rerun/cancel/dispatch. Local
+ownersteering/devsetup/containerplan commits intentionally excluded from this
+one-concern correction push and preserved on rootbranch. Existing PRwatch active;
+no duplicate watch. Follow results, require allfive/new7eachOS/Windows<=660s/
+freshgreenmain, then verify resultingmain CI before more featuremerges. PC native
+work still waits verified owner account/fences; no admin/container run occurred.
+
+## PR179 merged; verify resulting main (2026-11-18)
+
+Coordinator Sol6.1/high verified correctedhead2f888992 allfiveSUCCESS,new7eachOS,
+Node48eachOS, Windows533s<=660s, freshpremergemain6f4618c/CI44269052508 GREEN.
+Normal guarded squash merged as6bf8f46 at09:28:55Z. Resultingmain CI pending.
+[Fullgate/sample/merge evidence](evidence/m3-pr179-corrected-gates-merge.md).
+OptionalWindows sample3pass/5fail retained inclU6StopOrphaned owners_left55,
+orphans0; truncated rows unresolved. No fix/stability/re-enable credit/retry.
+M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged. Owner PC checklist/ADR0023/
+containerplan commits remain preserved locally for separate delivery. No owner
+account/admin/native/container actions. Next verify exact-main firstattempt, then
+continue containerplan prerequisites with independent review and normalgates.
+
+## Green main and peer-transport prerequisite (2026-11-18)
+
+Coordinator Sol6.1/high verified exactmain6bf8f46/CI44276313116 attempt1GREEN565wall,
+563charged/2validatedqueuecredit. New7andNode48eachOSPASS, optionalWindowssample
+all_pass but no stability/re-enable/fixcredit. [Evidence](evidence/m3-pr179-corrected-gates-merge.md).
+Existing historyrecorder ran; automaticpolicy44277813800SUCCESS. No rerun/dispatch.
+Sol6.1/high assigned read-only source-grounded first peerprotocol contract for
+containerprerequisites, no implementation/test/engine/container run. Next docs
+delivery carries ownerPCchecklist/ADR0023/containerplan and preserved evidence
+onto greenmain without duplicating mergedRust/testsource. M2OPEN/M3UNCHECKED,
+Sol3/3exhausted/Opus0/2unchanged; hardware unverified. Owner native setup stillpending.
+
+Sol6.1/high peertransport source audit complete. Proposed firstslice is pure
+bounded ARXP/v1 AppendEntries request/exactreply codec, not liveTLS/cluster proof.
+[Brief](briefs/m3-peer-wire-v1.md),[proposed ADR0026](adr/0026-bounded-peer-wire-codec.md).
+Root reviewed bounds/header/replyidentity and changed proposed ackcontrol to a
+compilable forceNone mutation (codec has no originalrequest from which to invent
+an ack). LiveTLS handshake registrycallback blockingownership is an explicit
+separate prerequisite. Independent Sol doc/technical review running; no code/build/
+engine/network/container action. Allsource still exactgreenmain6bf8f46.
+
+Independent Sol6.1/high docs/architecture review PASS at eec2cad6: Standards0/
+Spec0/Security0. Non-doc source exactlymain6bf8f46; all6retainedloghashes verified,
+history565/563/2/561 correct; relative links/diffcheckPASS. Three protocolclarifications
+were applied and rechecked. ADR0026 accepted for purecodec prerequisite only;
+review explicitly permits status+reviewretention with unchangedprotocol/source.
+[Review](reviews/m3-container-prerequisites-sol61-review.md). Future dispatch must
+also validate sequenceinvariants; no liveTLS/engine authority from purecodec.
+Ready scoped docsPR for ownersteering/containerroute/firstcodec contract. No new
+runtime tests appropriate to docs-only change; normalhostedgates stillrequired.
+
+## PR180 published: acceptance route and peer codec contract
+
+Coordinator Sol6.1/high published exactb1cf9d50abc87b7ac3858dad3a1daba3e9a9613b,
+[PR180](https://github.com/Dytschgo/arxcovo/pull/180), basedexactgreenmain6bf8f46.
+Independent Sol review6974982923/agent-reviewSUCCESS; final3docretentiondelta
+verified, no protocolsemantics or non-doc source changes. Allpreserved ownerPC/
+ADR0023/devsetup/containerplan/evidence delivered without duplicating mergedRust.
+[CI44279691035](https://github.com/Dytschgo/arxcovo/actions/runs/44279691035)
+firstattempt running. Normalgates/freshgreenmain before coordinator merge.
+No new runtime tests/build/engine/network/container action for docs-only work.
+ADR0026 accepted purecodec only; nextimplementation will need ownsource review/
+puretests/semanticcontrols/normalgates. LiveTLS handshake blockingownership,
+connectionlimits, actualtransport/join/custody/clock/containeracceptance remain.
+M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged; realhardware unverified.
+Owner PC native runs still await verified Standardaccount/caps/reserves; Linux
+sudoNNP/A12pending. Existing babysitter untouched. Pending-run checkpoint local
+only, not pushed to create redundantCI. Priorbranches/commits preserved.
+
+## PR180 executed Windows job timeout (2026-11-18)
+
+CI44279691035 attempt1Windowsjob134716782048 cancelled at12m joblimit after
+fmt/Clippy and662RustPASS; npmci cancelled, laterchecks unrun. Ubuntu/macOSPASS,
+main6bf8f46stillGREEN, but requiredWindowsgateBLOCKED. Independent Astra6.2/high
+retained-evidence disposition confirms executedtimeout/underlyingcauseunknown,
+not prestartinfra. [Evidence](evidence/m3-pr180-windows-job-timeout.md),
+[disposition](reviews/m3-pr180-job-timeout-astra62-disposition.md).
+No rerun/dispatch/timeout/quarantine/settings change or sourcefix. Sol3/3exhausted/
+Opus0/2unchanged. Continue separatelyauthorized genuine purecodec implementation
+locally underADR0026, not as timeoutrepair; Sol6.1/high builder assigned only
+consensus modulebinding/newpeer_wire.rs+synchronous tests. Independentactualsource
+review/normalnewsourcefirstattempt required before publication. No docs-onlypush
+solely to triggerCI. OwnerPCfences/babysitter intact; no native/admin/container run.
+
+Sol6.1/high read-only TLSownership follow-up proposes futureWeakstore+try_lock
+registrycallback to remove mutexwaiting withouttasks/snapshots/newcapacity. Actual
+localappliedauthorize stillrequired; contentionfailsclosed, no hardwallpromise.
+Candidate retained D:/Temp/arx-peer-registry-design.md for separatebrief/ADR/review,
+notadded to currentcodecsource scope. Future livehandshakecap/taskownership/
+inbounddeadlinepolicy remainsneeded. No callback/transport implementation or test.
+Current purecodec source draft validating; initialClippy hadtypeAPI compileerrors,
+mechanicallycorrected withinnewmodule beforesemanticexecution. Independent Sol
+actualsourcereview started; no runtimefix/counterreset.
+
+Sol6.1/high builder completedpurecodec exact2sourcepaths. Finalfmt/ClippyPASS,
+focused8/8PASS32.420s inclcompile; initial6derivedOpenRaftgenerics compileerrors
+mechanicallycorrected beforetests, no semanticred. Sourcefrozenblobs8fc25217/
+b0a2b564, independentSol6.1 actualreviewrunning; no mutantsyet. [Evidence](evidence/m3-peer-wire-v1.md).
+No engine/runtime/socket/TLS/transport/container acceptance; no timeoutrepairclaim,
+Sol3/3exhausted/Opus0/2unchanged. PR180oldheadWindowscancelledgate stillretained;
+no sourcepublication until independentreview and plannedsemanticcontrols.
+
+Independent actualsource audit foundnoblocker; rootclosed innertrailingrequest
+coverage advisory with3testlines, productionunchanged. Reviewer rechecked module
+blob9322c5c6. RootDfmt/Clippy7.95s/focused8PASS refreshed for newtestdelta. Planned
+controls refined to decoder-count/request-inner-trailing/acceptedackNone so each
+proves an intendedguard without unrelatedencoder/outerguard changes. No mutantyet.
+
+Independent Sol6.1/high actualcodec sourcePASS, all3axes0remainingfindings;
+innerrequesttrailingadvisoryclosed. Finalblob9322c5c6/SHAffb505d4,21originalartifact
+hashes verified, strengthened8/8 outputs inspected. [Source review](reviews/m3-peer-wire-v1-sol61-review.md).
+Threeguardcontrols assignedonce with exactrestore; reviewerreads committedbaseline
+whiletemporaryworktreemutants run. Futureoutcomes separatelyattributed. No retry/
+merge/timeout authority or stabilitycredit; PR180oldcancelledgate remainsretained.
+
+Builder Sol6.1/high all3pure codeccontrols compiled andfailed intendedassertions
+once each; rootread allpatches/logs/time/restoration. M2checkertextmismatch was
+bookkeeping only, retained; no M1/M2repeat, unrunM3 onceafterexplicitsteering.
+Exactrestoration aftereach and finalnon-docidentity toreviewed6a27902c verified.
+No postrestore runtime rerun; retainedbinaryM3mutant. Independent sourcePASS
+applicable under exactrestore/docsretentionconditions. Genuinecodecfeature ready
+for publication asPR180 finalscope; olddocsjobtimeout retained, no performance/
+stabilityfixclaim, no timeout/quarantine/settings/counterchange.
