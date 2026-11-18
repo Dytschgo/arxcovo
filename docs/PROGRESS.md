@@ -3921,3 +3921,12 @@ containerprerequisites, no implementation/test/engine/container run. Next docs
 delivery carries ownerPCchecklist/ADR0023/containerplan and preserved evidence
 onto greenmain without duplicating mergedRust/testsource. M2OPEN/M3UNCHECKED,
 Sol3/3exhausted/Opus0/2unchanged; hardware unverified. Owner native setup stillpending.
+
+Sol6.1/high peertransport source audit complete. Proposed firstslice is pure
+bounded ARXP/v1 AppendEntries request/exactreply codec, not liveTLS/cluster proof.
+[Brief](briefs/m3-peer-wire-v1.md),[proposed ADR0026](adr/0026-bounded-peer-wire-codec.md).
+Root reviewed bounds/header/replyidentity and changed proposed ackcontrol to a
+compilable forceNone mutation (codec has no originalrequest from which to invent
+an ack). LiveTLS handshake registrycallback blockingownership is an explicit
+separate prerequisite. Independent Sol doc/technical review running; no code/build/
+engine/network/container action. Allsource still exactgreenmain6bf8f46.
