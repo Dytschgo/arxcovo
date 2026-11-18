@@ -137,6 +137,15 @@ impl Listener {
     ) -> Result<()> {
         run_listener(self.0, config, activity).await
     }
+    /// Stop admission and join aborted connection handlers before worker drain.
+    pub async fn run_until(
+        self,
+        config: Arc<crate::config::Config>,
+        activity: Arc<crate::store::Activity>,
+        stop: crate::service::Shutdown,
+    ) -> Result<()> {
+        run_listener_until(self.0, config, activity, stop).await
+    }
 }
 async fn run_listener(
     listener: impl Acceptor,

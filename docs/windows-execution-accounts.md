@@ -50,10 +50,18 @@ remain private and are never command-line tokens or committed examples.
 
 Verify the account choice through `list_hosts`, then `run_command` with
 `{"tool":"cargo","args":["--version"]}`, and `list_activity` using the returned
-activity ID. Normal runs identify as `current_user`, dedicated false, isolation
+activity row's `id` (find the fresh `run_command` row in `list_activity`; the
+command response itself does not return an activity ID). Normal runs identify as `current_user`, dedicated false, isolation
 false, and report actual current-user match and cleanup. Historical development
 and dedicated activity retain their provenance. Restart persistence is a separate
 check; a successful compile alone is not a completed owner journey.
+
+Opening existing activity state upgrades it to schema version 4. Earlier binaries
+refuse that version. Before upgrading an existing deployment, stop its daemon and
+preserve a private backup of its state directory. To roll back, stop the new daemon
+and restore that backup with the earlier binary; activity written after the backup
+will not be present. Do not copy an active SQLite database as the backup. Initial
+current-user verification uses fresh task-owned state rather than owner history.
 
 For the owner's test PC, all workspace, state, scratch and build output stay on
 D:. Owner-admin, Lab Manager, VM/static-data and privileged native-test fences

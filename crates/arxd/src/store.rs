@@ -3,6 +3,8 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
+#[cfg(test)]
+mod account_choice_tests;
 #[cfg(all(test, windows))]
 mod crash_tests;
 

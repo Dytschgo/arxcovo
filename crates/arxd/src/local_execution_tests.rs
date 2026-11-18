@@ -15,6 +15,54 @@ use sha2::{Digest, Sha256};
 
 type Peer = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
+#[tokio::test]
+async fn foreground_listener_stop_joins_connections_and_rejects_later_calls() {
+    let state = private_dir();
+    let token = "c".repeat(64);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let config = Arc::new(crate::config::Config {
+        execution: None,
+        execution_settings: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![crate::config::Agent {
+            principal: "fixture-agent".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+    });
+    let activity = Arc::new(crate::store::Activity::open(state.path()).unwrap());
+    let listener = Listener::bind(&endpoint).unwrap();
+    let stop = crate::service::Shutdown::default();
+    let server = tokio::spawn(listener.run_until(config, activity, stop.clone()));
+    let peer = connect(&address, &token).await;
+    call(&peer, "list_hosts", json!({})).await.unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), call(&peer, "list_hosts", json!({})))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        db(state.path())
+            .query_row::<i64, _, _>("SELECT count(*) FROM activity", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    let _ = peer.cancel().await;
+}
+
 fn private_dir() -> tempfile::TempDir {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{

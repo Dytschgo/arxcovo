@@ -4358,3 +4358,43 @@ carriedfrom48c6022e; no heldPR182Rust/TLS source duplicated. Priorbranch/checkpo
 preserved. Rootowns docs; builderowns source/tests; independent source review next.
 No runtime current-user smoke yet; explicit ownerdefault request is authorization
 for this mode, not owneradmin or relaxation of elevated/SYSTEM guards.
+
+## Current-user execution: independent findings and corrections
+
+Sol 6.1/high builder delivered the setting at `96592cf4`; independent Sol
+6.1/high reviewed that exact source and found no SYSTEM/service-token bypass or
+dedicated-account fallback. Its [first review](reviews/windows-execution-choice-first-review.md)
+held acceptance for two findings: worker completion accounting and complete
+legacy-history preservation coverage. The bounded production current-user smoke
+was permitted, but has not run yet.
+
+Coordinator (Sol 6.1/high) corrected completion accounting: dispatch registers
+work before scheduling and retains it through the durable terminal activity
+commit. Failed commits, panics or dropped queued workers leave drain unconfirmed.
+Foreground stops its local listener and joins connection tasks before worker
+drain. Existing polling/HTTP budgets and engine quarantine are unchanged.
+The exit-code mapping for an unconfirmed drain is tested as nonzero; no real
+foreground signal/exit observation has been claimed.
+
+Focused passing evidence: 13 account-choice/store cases, one real local-listener
+stop case, nine legacy pure cases, and two foreground unit cases. Populated
+migration fixtures compare all 24 columns and the canonical visibility index;
+deleted-row sequences include an empty v1 database, and failure compares full
+rows/schema/sequence after rollback. All fixtures are task-owned. A paused-clock
+variant stalled with its blocking helper held and was stopped after about 60 s;
+its log is retained as unsuccessful. The corrected real-clock queue case passed.
+One Clippy style finding was corrected; final Clippy passed. Details and exact
+artifact identities are in [the evidence checkpoint](evidence/windows-execution-choice-local.md).
+
+The ten activity_v2 integration cases remain RED at ACL setup (Access Denied),
+with behavior unexecuted locally. They were not rerun, weakened or called
+pre-existing. Hosted required gates, fresh independent review of corrections,
+and the production MCP journey remain pending. C: free was 54,953,795,584 bytes
+before this continuation and remained above 53 GB during the focused checks.
+All scratch/build output stayed on D:. No owner history or credentials used.
+
+PR182 remains HOLD/NOFIX; engine Sol 3/3 exhausted and Opus 0/2 unchanged.
+M2 OPEN / M3 UNCHECKED. Dedicated/service/elevated/VM/Linux paths remain
+**unverified on real hardware**. The optional dedicated setting is unavailable;
+it never falls back. No admin, Lab Manager, VM, cache deletion, user-data or
+babysitter action occurred. The full v1 goal remains active.

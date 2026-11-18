@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 #[cfg(all(test, windows))]
@@ -221,6 +221,8 @@ pub struct Execution {
     tamper_identity: AtomicBool,
     settings: Settings,
     busy: AtomicBool,
+    pending: AtomicUsize,
+    completion_unconfirmed: AtomicBool,
     quarantined: AtomicBool,
     shutdown: Cancellation,
 }
@@ -234,6 +236,22 @@ struct Busy<'a>(&'a AtomicBool);
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+/// Registered before scheduling; retained through the terminal activity commit.
+/// A panic, cancelled queued task, or failed commit cannot acknowledge a drain.
+struct Pending {
+    execution: Arc<Execution>,
+    committed: bool,
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.execution
+                .completion_unconfirmed
+                .store(true, Ordering::Release);
+        }
+        self.execution.pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 type Work = (serde_json::Value, Outcome, Metadata);
@@ -300,6 +318,8 @@ impl Execution {
             tamper_identity: AtomicBool::new(false),
             settings,
             busy: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
+            completion_unconfirmed: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
             shutdown: Cancellation::default(),
         }
@@ -321,12 +341,13 @@ impl Execution {
     }
     pub async fn drain(&self) -> bool {
         for _ in 0..500 {
-            if !self.busy.load(Ordering::Acquire) {
+            if self.pending.load(Ordering::Acquire) == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        !self.busy.load(Ordering::Acquire)
+        self.pending.load(Ordering::Acquire) == 0
+            && !self.completion_unconfirmed.load(Ordering::Acquire)
     }
     pub fn shutdown(&self) {
         self.shutdown.cancel();
@@ -363,13 +384,20 @@ impl Execution {
         let cancellation = Cancellation::default();
         let guard = CancelOnDrop(cancellation.clone());
         let this = self.clone();
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let pending = Pending {
+            execution: self.clone(),
+            committed: false,
+        };
         let worker = tokio::task::spawn_blocking(move || {
+            let mut pending = pending;
             let result = this.work(request.as_ref(), &cancellation);
             match result {
                 Ok((value, outcome, meta)) => {
                     activity
                         .finish_typed(id, outcome, &meta)
                         .map_err(|_| Reason::StorageFailed)?;
+                    pending.committed = true;
                     Ok(value)
                 }
                 Err(reason) => {
@@ -380,6 +408,7 @@ impl Execution {
                             &this.metadata(request.as_ref(), None, Some(reason)),
                         )
                         .map_err(|_| Reason::StorageFailed)?;
+                    pending.committed = true;
                     Err(reason)
                 }
             }

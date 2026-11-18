@@ -288,14 +288,63 @@ async fn dedicated_selection_is_setup_required_and_never_invokes_current_user_ba
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test(start_paused = true)]
-async fn drain_budget_reports_unfinished_worker_without_claiming_cleanup() {
-    let execution = Execution::probe_fixture(|_, _| panic!("no worker"));
-    assert!(execution.drain().await);
-    execution.busy.store(true, Ordering::Release);
-    assert!(!execution.drain().await);
-    execution.busy.store(false, Ordering::Release);
-    assert!(execution.drain().await);
+#[test]
+fn drain_waits_for_a_queued_worker_even_before_it_acquires_busy() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = crate::service::application::tests::private_temp();
+        let activity = Arc::new(Activity::open(dir.path()).unwrap());
+        let id = activity
+            .start_development("fixture-agent", "run_command")
+            .unwrap();
+        let execution = Execution::probe_fixture(|_, _| panic!("shutdown refuses before probe"));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        // Dropping release also unblocks this helper on any assertion failure.
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = wait.recv();
+        });
+        execution.shutdown();
+        let work = execution.dispatch(None, activity.clone(), id);
+        assert!(!execution.busy.load(Ordering::Acquire));
+        let started = tokio::time::Instant::now();
+        assert!(!execution.drain().await);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        drop(release);
+        blocker.await.unwrap();
+        assert!(matches!(work.await, Err(Reason::Shutdown)));
+        assert!(execution.drain().await);
+        let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
+        assert_eq!(
+            db.query_row::<String, _, _>("SELECT outcome FROM activity WHERE id=?1", [id], |r| r
+                .get(0))
+                .unwrap(),
+            "refused"
+        );
+    });
+}
+
+#[tokio::test]
+async fn drain_refuses_uncommitted_audit_and_panicked_worker() {
+    for panic in [false, true] {
+        let dir = crate::service::application::tests::private_temp();
+        let activity = Arc::new(Activity::open(dir.path()).unwrap());
+        let execution = Execution::probe_fixture(move |_, _| {
+            assert!(!panic, "intentional worker panic");
+            Err(Reason::Unavailable)
+        });
+        let request = serde_json::from_value(json!({"tool":"cargo"})).unwrap();
+        // No such row: refusal cannot durably complete its audit.
+        let result = execution.dispatch(Some(request), activity, 987).await;
+        assert!(
+            matches!(result, Err(Reason::StorageFailed)) && !panic
+                || matches!(result, Err(Reason::ExecutionFailed)) && panic
+        );
+        assert!(!execution.drain().await);
+    }
 }
 
 #[test]
@@ -461,7 +510,43 @@ fn failed_v3_migration_rolls_back_schema_and_rows() {
     let db = rusqlite::Connection::open(dir.path().join("activity.sqlite3")).unwrap();
     // A damaged v3 row must not be repaired or silently relabeled by migration.
     db.execute_batch("PRAGMA user_version=3; PRAGMA ignore_check_constraints=ON; UPDATE activity SET rights='standard'; PRAGMA ignore_check_constraints=OFF;").unwrap();
+    let snapshot = || {
+        let mut statement = db.prepare("SELECT * FROM activity ORDER BY id").unwrap();
+        let count = statement.column_count();
+        let rows = statement
+            .query_map([], |r| {
+                (0..count)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let schema = db
+            .prepare("SELECT type,name,sql FROM sqlite_schema ORDER BY type,name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let sequence = db
+            .query_row::<i64, _, _>(
+                "SELECT seq FROM sqlite_sequence WHERE name='activity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (rows, schema, sequence)
+    };
+    let before = snapshot();
     assert!(Activity::open(dir.path()).is_err());
+    assert_eq!(snapshot(), before);
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
