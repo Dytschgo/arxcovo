@@ -431,6 +431,7 @@ class AnchoredPreproofTests(unittest.TestCase):
 
 QUERY_REQUIRED = ['owned_anchor_query_single_voter']
 QUERY_LOCAL_REQUIRED = [
+    'checked_clock_refusal_has_no_submission_and_malformed_has_no_sample',
     'owned_query_dropped_callers_and_read_admission',
     'owned_query_timeout_shutdown_retains_submitted_resources',
     'owned_query_bounds_poison_and_no_submission',
@@ -440,7 +441,7 @@ QUERY_LOCAL_REQUIRED = [
 
 def assert_owned_query(source, module, parent):
     assert QUERY_REQUIRED == ['owned_anchor_query_single_voter']
-    assert len(QUERY_LOCAL_REQUIRED) == 4
+    assert len(QUERY_LOCAL_REQUIRED) == 5
     assert_fixture_quarantine(source, (), required=QUERY_REQUIRED + QUERY_LOCAL_REQUIRED)
     assert_issuance_required(source)
     assert_issuance_required(parent)

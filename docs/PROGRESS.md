@@ -41,6 +41,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
+- Current feature PR184: checked enrollment clock; head1cd91ef6 first CI44368904104 attempt1 failed Ubuntu22s/Windows52s at the mandatory test inventory guard, before Rust validation; macOS queued at the recorded read. Independent Sol6.1/high Standards PASS / Spec P1 missing new anchor inventory, no success attestation. Mechanical inventory correction locally9/9PASS, Rust unchanged; corrected-head independent recheck and normal required CI pending. No merge or acceptance yet.
 - Last merged: PR183 as08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 from reviewed29a3317f. All5gates SUCCESS; first PR CI44349045277 GREEN594s wall, Windows589s<=660, Ubuntu291s/macOS464s. Fresh exactmaincd890750/CI44304025778 SUCCESS checked immediately before guarded merge. Resulting exact-main firstCI44351538977 GREEN641s wall/639charged/2queuecredit.
 - Previous merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
 - Current owner-preview delivery: PR183 MERGED and exact-main first CI GREEN. Private D: backend package is prepared/syntax-audited with the reviewed binary; launcher and actual Claude Code acceptance remain UNRUN. This is a backend preview, not completed M2 or fullv1.
@@ -5040,3 +5041,51 @@ Test compilation replaced the shared target arxd.exe with an unobserved build
 df79751b; do not reuse the old f889 runtime claim for that path. The separate
 owner-preview bin/arxd.exe was rehashed and remains f8893673...6224b48; no packet
 launch occurred. No runtime/fix authority or exhausted counter changed.
+
+## Checked-clock PR184 published; first normal gates pending
+
+Coordinator published1cd91ef62cf74945b18f4c56efbfc7c613474760 as
+[PR184](https://github.com/Dytschgo/arxcovo/pull/184), linked to this thread.
+Before publication, live main08c4b999 and first CI44351538977 attempt1 SUCCESS
+were reverified at18:21:25UTC; no rerun/dispatch. The actual new-source PR's
+first normal CI is44368904104 attempt1, QUEUED at one metadata observation.
+No per-job execution, duration or passing credit yet. Retained metadata:
+D:/Temp/arx-v1-continuation/pr184-first-runs.json.
+
+Fresh independent Sol6.1/high source review/attestation task is active with
+the exact base/head, all17 PR files, original contracts, pre/post-correction
+evidence and unchanged holds. Returned selection: codex/gpt-6.1-sol,
+reasoningEffort high, serviceTier default. Review output will be
+D:/Temp/arx-pr184-independent-review/review.md. Only that independent reviewer
+may attest source PASS; required CI remains mandatory. This local checkpoint
+is unpublished to preserve the reviewed PR head and avoid an extra CI trigger.
+
+No new founder diagnostic/fix, engine attempt, timeout/quarantine/policy/capacity
+change or PR182 integration. Existing babysitter untouched. M2 OPEN /
+M3 UNCHECKED; full v1 and actual Claude Code acceptance remain incomplete.
+
+## PR184 first-CI inventory failure preserved; narrow registration correction
+
+Independent Sol6.1/high review returned Standards PASS / Spec one P1: the new
+anchor test was not in QUERY_LOCAL_REQUIRED. Ubuntu22s and Windows52s failed
+the exact-inventory guard, nine tests/one failure; Rust validation skipped.
+macOS remained queued at the single follow-up metadata read. Bounded D: logs,
+hashes, job metadata and honest UNRUN limits are retained in
+[first failure evidence](evidence/checked-enrollment-clock-ci-first-failure.md).
+No clock/engine/founder runtime failure or hosted passing credit is inferred.
+
+Coordinator Sol6.1/high reproduced the pure guard failure once, then added the
+single test name to the mandatory list and updated its exact count4to5. All
+nine guard tests PASS0.133s harness/0.324s command, including existing negative
+checks for every required test. Rust source is unchanged. This is required-test
+registration, not a quarantine/filter/workflow/timeout/capacity relaxation. Prior
+failed head/evidence and all engine/founder holds remain. New source will receive
+a fresh independent delta recheck and normal CI, with no rerun/dispatch.
+
+While review/CI ran, coordinator inspected the installed Claude Code help and
+official settings documentation for the real-client path. No cancelled delegation
+was restarted; no client/model/daemon/auth or owner credential/config/keychain
+action occurred. The native CLI is available; its documented restricted/tools/
+strict-MCP controls and managed-policy precedence require an explicit runner
+boundary. Existing Python MCP observer is not actual Claude Code acceptance.
+No new runnable runner or credential request has been claimed.
