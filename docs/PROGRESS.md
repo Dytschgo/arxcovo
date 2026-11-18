@@ -3614,3 +3614,7 @@ Independent Sol6.1 high safety review3320f566 has no blockers; root accepts coop
 ### F10 control invalidated at process audit - 2026-11-18
 
 Sol6.1/high result7a5302c9: Cnextestexit0/14eventtrace/capacity4+8/shutdownOk, but immediate snapshot contained2cargo/1rustc names withoutPIDs/ownership, so overallCinvalid andTunrun. One later agent snapshot absent; root current snapshot found a newcargo chain created after C, which does not attribute the earlier names. No kills/retries/reinterpretation. All132cratebytes restored exactly. Root requests independent harness disposition before furtherexecution; naturalUbuntu cause unproven, PR176held, counters unchanged. The evidence wrapper cp1252print error occurred after saved outcome and is separate from testexit0.
+
+### Owner Astra6.2 stuck-review routing - 2026-11-18
+
+Owner instruction: use Astra6.2 as code reviewer if stuck. Root confirmed Codexgpt-6.2-astra availability and selected high effort for the stuck founder/query code plus harness review. Replaced the Sol6.1 process audit: task_cancel requested, backingrun wait confirmed interrupted before Astra launch. One reviewer active, no duplicate writers. Sol6.1 remains implementation/default technical routing; Claude remains UI-only. Astra review is static only, no new tests/fixes/attemptreset/ownerexception. Existing Cinvalid/Tunrun andPR176held remain.
