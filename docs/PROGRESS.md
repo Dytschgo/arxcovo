@@ -4891,3 +4891,42 @@ source and propose a bounded draft only; no source/runtime/CI action or altered
 15minuteTTL/CI budget/controlled-vs-real-time evidence credit. Existing accepted
 complete RPC design stays frozen; PR182 HOLD/NOFIX and all exhausted counters
 remain. M2OPEN/M3UNCHECKED. No admin/VM/LabManager/cache/userdata/babysitter action.
+
+## Actual Claude Code acceptance preparation (unrun)
+
+Coordinator Sol6.1/high pinned a concrete draft at
+D:/Temp/arx-claude-acceptance-plan/brief.md: actual Claude Code uses only Arxcovo
+MCP list_hosts, one exact cargo--version, list_activity and correlated id lookup,
+with real trace plus durable-row verification. Requires exact-main green,
+independently reviewed bounded runner/cleanup and actual isolated client auth.
+No model/client/daemon/auth/native run occurred. Current inherited OAuth/API-key
+presence checks both false; existing owner credential/config/keychain untouched.
+Installed help distinguishes bare API-key-only from normal OAuth; no auth or
+provider/billing assumption. Product-client acceptance is separate from Claude
+engineering routing; full M2/v1 is not replaced by this one Windows journey.
+
+Attempted Sol6.1/high runner-preparation delegation was cancelled by the tool
+before launch, with no child task handle. It was not retried or replaced with a
+native/background agent. Only the local brief was prepared. Exact CLI settings,
+wrapper ownership and cleanup remain explicitly unresolved before execution;
+no request_secret is opened until a concrete eligible runner is ready.
+Existing source/backend entrypoint remains prepared/UNRUN, mainCI pending.
+
+Clock-design Sol6.1/high task returned source-only DRAFT at
+D:/Temp/arx-m3-clock-expiry-design/{contract.md,evidence-path.md,pin-manifest.json}.
+It distinguishes missing production time-health integration, logical deterministic
+timestamps, fresh signer refusal and possible late state consumption for an
+earlier queued request. That is not proof of successful late certificate/join.
+No production expiry vulnerability or stricter no-late-allocation mandate is
+inferred. Fresh independent Sol6.1/high review active; explicitly challenge
+whether a qualified-health-API requirement is necessary under existing spec or
+whether a simpler honest trusted-host UTC model suffices. No unrequested time
+infrastructure, stronger acceptance condition or source/fix grant is adopted.
+Controlled-clock vs real15minute evidence distinction and existing budgets remain.
+
+At that task completion, one exact-mainCI read found UbuntuSUCCESS348s and
+macOSSUCCESS368s, Windows still running. Rust680/648PASS, all10activity_v2 and
+inventory corruption casesPASS,48Node/UI/browser/ElectronPASS each. Full bounded
+logs and per-case proof retained onD. Main remains PENDING, no duration-history
+green entry and no owner runtime/client launch. See
+[main first-CI checkpoint](evidence/windows-execution-choice-main-first-ci.md).
