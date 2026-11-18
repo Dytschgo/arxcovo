@@ -62,3 +62,43 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  clippy.stdout.
 346e5c94ee26f9256068a6f2e1f2d31acf96ebd4c4701791d6328e35c06dbc1d  pure.json
 028166772a3ac65212df86aa6d866c923f2a64df60fbe2c3066549dd56d742bd  pure.stderr.txt
 33222685b25f1f3f2b4d4ad0a500b8bb6ead909babbef3e08842dd840b9f674b  pure.stdout.txt
+
+## Three pure semantic controls and exact restoration
+
+After independent Sol sourcePASS, coordinator assigned builder Sol6.1/high exactly
+three brief-designated pure mutants, each once with240s ownedprocess cap. All
+compiled and ran exactly1specifiedtest, exiting101 on intended assertion:
+M1 omit both full-content comparisons, retain IDs -> full_effective_and_committed_identity_and_contents
+assertion269 failed;25.985s. M2 omit authorize_peer -> real_registry_binding_and_removal_refuse
+expectedPeerRefused assertion339 failed;26.885s. M3 omit establishedleader equality,
+retain second-sample comparison -> leader_epoch_and_bracket_changes_refuse
+assertion315 failed;26.643s. These are meaningful guard-omission kills, not engine fixes.
+All owned PIDs exited. Coordinator personally read all3patches/stdout/stderr/
+exit+timing and restoration manifests. No compile/unrelated failure counted.
+
+Exact source bytes restored in finally after EACH. Each restoration manifest
+records baselineSHA256617d60d7aa7d8156404180f4820992973e43bbf410539fe406174703eae9bcc8,
+Gitblobe925a7e23db98f6502e5d8554c5f051f1e6b9851. Final coordinator hash and empty
+non-doc diff vs reviewed1d068d5f confirm exact final restoration. No postrestore
+runtime rerun; retained binary is mutant3, not restored-source proof. Earlier
+baseline7/7 and final Clippy evidence apply by source identity; normal hosted
+checks compile restored source. Independent sourcePASS applies under its explicit
+exactrestoration/docs-only condition, not an independent audit of future mutantlogs.
+
+Additional artifacts SHA256 (local logs root unchanged):
+06f9bbad30426d47f53b1f36330d70e38318d44275946caf5aed93e834bb0ffb  m1.json
+44814203dbb385c78baff3e5108f8214e6ca93e2cc5bee5ead80bf0552955fa0  m1.patch
+44fbc30cb515c2cfa98e61fe6f231d74f3594e2667a344063c7501aff4ed1c71  m1.restoration.json
+403121b10e2a3cbe250d9203e094afd8f5630fec0d99742d5fdec395d97fb808  m1.stderr.txt
+acaa6f1d198277e257fc2d06c56de9b0fbc75c1a5b85d665ad9b45bccc6f5a58  m1.stdout.txt
+f464c03db1c3e2222072e757eaa902909286ac304211f894f9b2b92a950fe766  m2.json
+5d2e1520434bd119da113e5bbf9f1554c971b82882afe91bddf95f5814629e89  m2.patch
+bcd9569241183c7be444e768f336609d3676bc5b85803a3e2977c650394d64a7  m2.restoration.json
+cc6ed684b8294c22774916cfeac69c48bb7243c26ba9cc906ff7d62b09a9046c  m2.stderr.txt
+aaa940fcef188b7ffd34be9a3baedee38aef5439f3e3e4681cff03dab26adefc  m2.stdout.txt
+ae393b27a9f730c22fdb4f055dc443eb303db817aaf71f572d6c6c86abd407c9  m3.json
+b018233ddf9ed9b18c6768f0c76f70630ffec9b95ca4f066e06226423ba67965  m3.patch
+e8457ec96d672c59f91121b7baeede5d9d9f7431b30b247ac1d59fa32e4a93ae  m3.restoration.json
+fa92079cc65bf113ea813d9eca4aef6db4c0634050d53eebb10eaae530e41878  m3.stderr.txt
+d67f0e69340e2c4869ca3d119a81c7ccca88619700c83598fa5cd476b75a3553  m3.stdout.txt
+4a478239e5e442ad670eb4b735e44d5bcf5b925a9cb4676f04723639e8f96741  semantic-baseline.json

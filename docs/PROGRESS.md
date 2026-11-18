@@ -3802,3 +3802,11 @@ sync tests no platformhiding. [Review](reviews/m3-fresh-membership-observation-s
 Three planned pure semanticcontrols executing once each with exactsource restore;
 review applicability conditional on non-doc equality after restoration. No
 production admission/quorum/cancellation/race proof or enginefix credit.
+
+Builder Sol6.1/high completed3designated pure semanticcontrols once each: content,
+authorization and establishedleader omission each compiled and failed intended
+assertion. Coordinator read all logs/diffs/manifests; exactsource restored aftereach,
+Gitblobe925a7e2/SHA256617d60d7... verified; non-doc tree identical to reviewed1d068d5f.
+No postrestore runtime rerun, retained binary is mutant3; hosted will compile restored
+source. Independent review applicability condition satisfied by exactrestore and
+accurate docs-only retention. Ready for normal featurePR, no founder rerun/repair.
