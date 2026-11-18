@@ -3991,3 +3991,9 @@ b0a2b564, independentSol6.1 actualreviewrunning; no mutantsyet. [Evidence](evide
 No engine/runtime/socket/TLS/transport/container acceptance; no timeoutrepairclaim,
 Sol3/3exhausted/Opus0/2unchanged. PR180oldheadWindowscancelledgate stillretained;
 no sourcepublication until independentreview and plannedsemanticcontrols.
+
+Independent actualsource audit foundnoblocker; rootclosed innertrailingrequest
+coverage advisory with3testlines, productionunchanged. Reviewer rechecked module
+blob9322c5c6. RootDfmt/Clippy7.95s/focused8PASS refreshed for newtestdelta. Planned
+controls refined to decoder-count/request-inner-trailing/acceptedackNone so each
+proves an intendedguard without unrelatedencoder/outerguard changes. No mutantyet.

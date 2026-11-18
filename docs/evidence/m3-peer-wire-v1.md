@@ -64,3 +64,29 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  format.stdout.
 6adf13534dc8e9921906592a8fff4281b74773307c765958c56b667f6c61e605  pure.json
 50d5c6663de0f9d70f55a3e10b6253db525da3f1569492c36ba1f29ffb8f8b3a  pure.stderr.txt
 12fffb17f8af0f818237f9cbcc55ea72fcb60905e6abaf78fc51fb3e2160f14f  pure.stdout.txt
+
+## Independent review advisory and final baseline refresh
+
+Independent Sol6.1 actualsource audit found no blocking issue, with one test
+coverage advisory: correctlyadvertised request payload with count0 plus an extra
+byte lacked a direct assertion for requestinner fullconsumption. Coordinator added
+three testlines only, no productionfunction change. Reviewer rechecked actualdelta
+and closed advisory at moduleblob9322c5c6694da224ed7687e21a31e9ea5ede8b19.
+Root ran D-only fmtcheckPASS, workspacealltargetlockedofflineClippyPASS7.95s, then
+same focused8/8PASS (testcompile28.30s). Allrootcommands/session exited normally;
+no fixed240s enforcement claim for this rootrefresh. Source stayed withinallowlist.
+Original testbaseline remains separatelyrecorded; newtest delta justifiesrefresh.
+
+Refined3planned controls per independentreview: omit decoder countguard only,
+omit requestinner fullconsumption only (outerguard retained), forceacceptedSome
+ack toNone. Each once afterpassingbaseline, compiled intendedassertion only;
+exactrestore aftereach; no postrestore runtime rerun. No controls executed yet.
+
+Additional rootrefresh artifacts SHA256:
+f5de70c16b9360707d16ff2015cbe07e06eae66a721c565ef0944eebed4d9a54  root-clippy.stderr.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  root-clippy.stdout.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  root-fmt.stderr.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  root-fmt.stdout.txt
+acdd6a264869ef5ea95e7a20db197cc16dd390210200b345c48944a4a38a5d5e  root-pure.json
+5c1df12c2406a3cad7130b623d7e4383c57b82f5fa0d2f8c536d973ee8b78d15  root-pure.stderr.txt
+7d908ea486f6772e7a8b9976a103057273acbc5e4c1f8461ae399a664f3cd6ba  root-pure.stdout.txt

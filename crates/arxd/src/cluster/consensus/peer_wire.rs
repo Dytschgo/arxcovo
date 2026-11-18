@@ -576,6 +576,9 @@ mod tests {
         }
         let mut payload = prefix();
         payload.push(0);
+        let mut inner_trailing = payload.clone();
+        inner_trailing.push(0);
+        assert!(decode_request(&expected_frame(1, &inner_trailing)).is_err());
         for offset in [16, 17, 18] {
             let mut altered = payload.clone();
             altered[offset] = 2;
