@@ -4096,3 +4096,13 @@ no enginefix/timeout/quarantine change. OwnerPCnativeaccount/caps/reserves pendi
 LinuxA7/A11sudoNNP/A12pending; no native/admin/LabManager/VM/container action.
 Existingbabysitter untouched; priorbranches/docs preserved. Pendingcheckpoint local
 only, notpushed to manufactureanotherCI. Goalnotmarkedcomplete.
+
+Next-turn TLS decision details retained in D:/Temp/arx-owned-tls-design.md include
+verified write-half-close protocol and primary tagged source links: client sends
+oneboundedframe/flush/TLSshutdown(writeonly) BEFOREwaitingreply; server requires
+cleanEOF withonebyte read beforedispatch, thenreply/flush/TLSshutdown; client
+requirescleanEOFafterreply. SameabsoluteRPCdeadline, no perprobe timer. ExtraTLS
+applicationbytes, missing/unclean termination refuse; no claimabout rawTCPbytes
+sentafterauthenticatedclose. RealTLSpositive/negative tests stillUNRUN.
+Currentgoal mustcontinue to actualTLS/TCPimplementation, fullRPCwire, genuinejoin
+and containeracceptance; no finalviableclaim fromthiscallback alone.
