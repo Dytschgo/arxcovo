@@ -3606,3 +3606,7 @@ Fresh Sol6.1/high disposition30185388 confirms initial found failures before new
 ### PR176 platform disposition and patch safety review - 2026-11-18
 
 CI44213815251 is terminal: Ubuntu failure, macOS and Windows success. No rerun. Root retained exact F10C/T patchese470dc3c; only gate-drop position differs, no active source change. Independent Sol6.1 high static safety review is running before any localWindowsmodel execution grant. PR176 held; no inference that hostedUbuntufailure is caused by mutexbackpressure.
+
+### F10 local-model execution grant - 2026-11-18
+
+Independent Sol6.1 high safety review3320f566 has no blockers; root accepts cooperative-budget and late-marker qualifications. Root authorizes one compilation/invocation of C, then only if every preregistered C result/trace/capacity/shutdown oracle passes one compilation/invocation of T. No repeats, source repairs, tuning or extra cells. LocalWindows model only under priorPCgrant, notUbuntu/naturalhostcausality. Any mismatch stops and consumes that cell; exactcrate restoration and no process survivors required. Diagnostic treatment expected red validates only its controlled refusal/observer path; fix counters unchanged, PR176held.
