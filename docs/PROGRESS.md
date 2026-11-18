@@ -3886,3 +3886,13 @@ Rust suites passed; Windowsjob590s. Fullboundedlogs retained. Publish only
 reviewed correction ancestor2f888992 (testblob0d735fd4), preserving oneconcernPR;
 ownersteering/containerplan commits remain local on this branch for next delivery.
 No runcancel/rerun/dispatch; membershipAPI and founder untouched, countersunchanged.
+
+PR179 correction published as2f888992f82683f54cb9c8170b8d061d6773ea03 after original
+allOS firstattempt completed. NewnormalCI44274746575 firstattempt running;
+independent correction review6974277201/agent-reviewSUCCESS. Remaining production
+source unchanged. Originalfailurelogs retained, no rerun/cancel/dispatch. Local
+ownersteering/devsetup/containerplan commits intentionally excluded from this
+one-concern correction push and preserved on rootbranch. Existing PRwatch active;
+no duplicate watch. Follow results, require allfive/new7eachOS/Windows<=660s/
+freshgreenmain, then verify resultingmain CI before more featuremerges. PC native
+work still waits verified owner account/fences; no admin/container run occurred.
