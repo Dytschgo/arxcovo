@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
-- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append contract independently reviewed and accepted; Sol6.1/high source implementation underway. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
+- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; final review requires one additional aborted-but-unjoined cancellation proof before PASS/controls/publication. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4242,3 +4242,13 @@ Wrong-target zero-execution log retained without credit. Final source review now
 pending, including builder-flagged aborted-but-unjoined cancellation qualification
 (no nonempty JoinSet assertion atCloseAborted). No controls/hosted check/merge yet.
 M2 OPEN/M3 UNCHECKED; source frozen, engine counters and all owner fences intact.
+
+Final independent Sol6.1/high source review verifies all29artifact hashes/sizes,
+all5source hashes and allowlist,31PASS/Clippy/zero-target classification. No source
+standards/security finding, but one SPEC blocker: prior CloseAborted test need not
+retain a nonempty JoinSet. Coordinator authorizes one new exact test
+cancelled_close_retains_aborted_outbound_task_until_join using a real outbound
+TLS exchange with TTL beyond close grace. Assert records/keeper/originaldeadline
+across another cancelled close, then actual joins/reclamation. Production source
+unchanged. Execute ONLY new test once plus relevant compile/lint; original31
+baseline retained, no blanket rerun. Controls remain unrun; final PASS pending.
