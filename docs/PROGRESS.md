@@ -4338,3 +4338,23 @@ INACTIVE Windowsdedicatedbackend contract, D:/Temp/arx-owner-test-path/windows-d
 No activationflag, fake success, nativeprobe/admin or S4Udiagnosis resumption.
 This is independentM2sourcepreparation towardactualinstalledMCPcargo/feedjourney,
 notanotherPR182fix. M2 OPEN/M3 UNCHECKED; fullv1 milestonesremainobjective.
+
+## Owner change: current Windows account is the default execution choice
+
+Owner explicitly asks signed-in Windows account bydefault for simplicity, with
+optional dedicatedaccount selection. [ADR0029](adr/0029-owner-selectable-windows-execution-account.md)
+and KICKOFF record this superseding Windows product decision. Current mode runs
+as user-levelapp/daemon, neverSYSTEM/elevated service; localprincipal and Job/
+identity/cleanup/privacy fences remain. DedicatedNative unavailable mode stays
+honest and neverfallsback. Legacydevelopmentconfig/activity preserved. M2OPEN/
+M3UNCHECKED, otherOS/VM/nativequalification and PR182HOLDNOFIX remain intact.
+
+Stopped/deferred olddedicated-contract revision; Astra desktop/pin design task
+cancelrequested because ownerchangedpriority, artifacts preserved. No native/
+S4U experiment or implementation was authorized from NO-GO. NewSol6.1/high builder
+implements realcurrent-user setting/config/activity/localMCP route on independent
+work/windows-execution-choice from exactgreenmaincd890750. RecoveryDOCS only
+carriedfrom48c6022e; no heldPR182Rust/TLS source duplicated. Priorbranch/checkpoints
+preserved. Rootowns docs; builderowns source/tests; independent source review next.
+No runtime current-user smoke yet; explicit ownerdefault request is authorization
+for this mode, not owneradmin or relaxation of elevated/SYSTEM guards.

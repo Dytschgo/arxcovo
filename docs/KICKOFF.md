@@ -19,7 +19,7 @@ Arxcovo is your base to manage home-lab hosts, VMs and agent deployments, all ex
 - Join: on an existing host "Add host" → one-time join code (15-minute expiry) → pasted on the new host → hosts trust each other via mutual TLS certificates issued by a cluster CA. No LAN auto-join.
 - Cluster state is replicated with Raft across all hosts. Any host can go down for updates while the others keep working.
 - Host modes: always-on (dedicated) or opportunistic (daily-use). Opportunistic hosts have a user RAM/CPU reserve, slow down or move test VMs away while the user is active, and only run static VMs if pinned.
-- Host settings dropdown "Agent rights on this host": standard account (default) | admin. Host builds run in a dedicated Arxcovo OS account.
+- Host settings dropdown "Agent rights on this host": standard privileges (default) | admin. Owner update 2026-11-18: Windows execution defaults to the account running the user-level Arxcovo app/daemon; a dedicated account is an explicit advanced choice. Current-user execution shares that account's access and refuses service/elevated identities. Dedicated execution retains its setup and qualification gates, and other OS account policies remain unchanged. See docs/adr/0029-owner-selectable-windows-execution-account.md.
 - Machine architecture (x86_64 / arm64 Apple) is shown on every host and VM. Incompatible targets are greyed out with a reason.
 
 **VMs**
@@ -68,7 +68,7 @@ Arxcovo is your base to manage home-lab hosts, VMs and agent deployments, all ex
    - MCP server exposes host inventory and capabilities (OS, arch, CPU/RAM/disk, tools found).
    - Agents run build commands on the host inside the dedicated Arxcovo account, according to the rights dropdown.
    - Activity feed is stored.
-   - Acceptance: from Claude Code via MCP, list the host and run `cargo --version` as the Arxcovo account; the action appears in the feed.
+   - Acceptance: from Claude Code via MCP, list the host and run `cargo --version` under the selected execution identity; the action appears in the feed with truthful identity and cleanup evidence. Windows defaults to current-user execution under the owner update above; optional dedicated execution still needs its own qualified evidence. Other OS dedicated-account requirements remain unchanged.
 3. **Multiple hosts**
    - Join codes, cluster CA and mutual TLS, Raft state, reachability over LAN or Tailscale IPs.
    - An agent connected to host A runs a build on host B.
