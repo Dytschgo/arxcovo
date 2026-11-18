@@ -2,16 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `05b9c82930cd3812614fc20f5d03d0a5fa05952a`
-after owner-approved diagnostic PR177. CI44212212325 attempt1 succeeded:
-608s wall,605s charged,3s verified idle queue credit; Windows604s,
-Ubuntu343s/macOS425s. Founder13 passed on all OS. Automatic trusted policy
-44213556680 succeeded. The previous main09134085 F6/F7/F8 red remains
-unreproduced and unfixed; passing output hides the diagnostic trace.
-The diagnostic red-main exception is consumed; protection is unchanged.
-Normal M3 preparation may resume with fresh review, five gates and feature
-Windows<=660s still required. M2 open/M3 unchecked; Windows fixture28 and
-hardware paths remain **unverified on real hardware**.
+**Current main CI pending:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+after PR176, reviewed head14d94c61, normal all-five-gate merge without exception.
+First main CI44229539357 running; no integration-on-main credit yet.
+PR CI44227925667 passed all OS; query proof0.089s Ubuntu/0.215s macOS/2.574s
+Windows. Founder13 passed each OS, Windowsverify595s<=660. Passing output hides
+diagnostic records, so historical founder cause and overlap remain unknown.
+Protection unchanged and reviewed-tree equality verified. Prior main05b9c829
+CI44212212325 green608wall/605charged; prior founder red remains unfixed.
+M2 open/M3 unchecked; fixture28 and hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -3642,3 +3641,7 @@ Root correctionc3d45d6d addresses Astra9da4bf2b five blockers: leafdrop, singlel
 ### Ubuntu observer publication decision - 2026-11-18
 
 Astra6.2/high recheck10d324e6 closes all five9da4bf2b blockers atba493dfc, no new blocker. Root confirmed currentmain05b9c829/CI44212212325 stillgreen and finalsourceunchanged from reviewedtree. Optionalmissing worker rows stayUnknown. Root authorizes one new-source normalfullCI observation via PR176 update; no manualdispatch/rerun/settings change. Existingqueryengineproof/allfivegates/Windows<=660s and freshmainhealth remain required; thisdiagnostic is notfix/stabilitycredit. Authorization D:/Temp/arx-pr176-ubuntu-diagnostic-publication/authorization.json. Cinvalid/Tunrun, counters unchanged; M2open/M3unchecked/hardware **unverified on real hardware**.
+
+### PR176 normal merge checkpoint - 2026-11-18
+
+Root verified exacthead14d94c61/currentmain05b9c829/greenmainrun44212212325, independentAstraPASS6967815508, allfivegreenPRgates, actualqueryproofPASSallOS and Windows595s. Normal squashmergee3e79089 readbacktree/protection equality passed. Evidence D:/Temp/arx-pr176-14d94c61-hosted; firstmainCI44229539357 actively awaited. No rerun/fix/stability/re-enable credit; newquery realengine proof on PR only untilmainpasses. Retainedidentity pureTLS builder continues independently.
