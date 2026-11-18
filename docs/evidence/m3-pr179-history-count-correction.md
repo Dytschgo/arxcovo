@@ -44,3 +44,10 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  history-after.
 8fbd0ef5501bdb2d36322f1f38a764aff7c71d7871926aacbf5d4396fc20b880  history-after.stdout.txt
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  history-before.stderr.txt
 be542aceb1648a63a2cfd89ea88d64ef2899a4a83584fbaf2c68f0c35d6ab87c  history-before.stdout.txt
+
+macOS job134693561979 now completedFAIL on the same history assertion31!=30,
+Rust622/622PASS/8skipped64.770s. Local boundedlog221413bytes SHA256
+8300f820161db1756d4d52458ee3953e9ea03aa01791a7606cd28cf41ae8cd52.
+Windows stillinprogress at09:13:44Z; no inferred result. Correction committed
+bfb1fc98 locally after independent review, not yetpushed so original evidence
+completes without cancellation. ExistingPRwatch remains active for nextchange.
