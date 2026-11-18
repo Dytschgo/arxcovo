@@ -252,5 +252,42 @@
       "completed": "2026-11-18T09:38:21Z"
     }
   ]
+},
+{
+  "runId": 44286225997,
+  "sha": "8b36405e932ef2921a3c8d71dbaf7ed001314de7",
+  "seconds": 689,
+  "conclusion": "success",
+  "metric": "charged-v1",
+  "chargedSeconds": 686,
+  "queueCreditSeconds": 3,
+  "longestJobSeconds": 685,
+  "credit": "applied",
+  "jobs": [
+    {
+      "id": 134739483840,
+      "name": "verify (macos-latest)",
+      "conclusion": "success",
+      "created": "2026-11-18T10:31:32Z",
+      "started": "2026-11-18T10:31:36Z",
+      "completed": "2026-11-18T10:39:24Z"
+    },
+    {
+      "id": 134739483366,
+      "name": "verify (ubuntu-latest)",
+      "conclusion": "success",
+      "created": "2026-11-18T10:31:32Z",
+      "started": "2026-11-18T10:31:35Z",
+      "completed": "2026-11-18T10:36:49Z"
+    },
+    {
+      "id": 134739483835,
+      "name": "verify (windows-latest)",
+      "conclusion": "success",
+      "created": "2026-11-18T10:31:32Z",
+      "started": "2026-11-18T10:31:35Z",
+      "completed": "2026-11-18T10:43:00Z"
+    }
+  ]
 }
 ]

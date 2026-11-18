@@ -148,6 +148,7 @@ mod adapter;
 pub(in crate::cluster) mod anchor_query;
 pub(in crate::cluster) mod issue;
 pub(in crate::cluster) mod membership_observation;
+mod peer_registry;
 mod peer_wire;
 
 use super::{

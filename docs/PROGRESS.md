@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,9 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR179 as6bf8f46bc87a05bed01e342c1a37f68427e4c16b from reviewed2f888992. Allfive gatesSUCCESS; CI44274746575 attempt1GREEN537s, Windows533s. New7tests and Node48 eachOS PASS. Premerge exactmain6f4618c/CI44269052508 GREEN checked immediately.
-- Current work: exact-main CI44276313116 attempt1GREEN565s verified. PR180 headb1cf9d50 held: CI44279691035 Windows executed12minute jobtimeout after662RustPASS, laterNode/UIchecks unrun. Astra disposition retained; no rerun/settings change. Separatelyauthorized Sol6.1 purecodec implementation running locally underADR0026, no liveTLS/dispatch authority. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
-- Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.
+- Last merged: PR180 as8b36405e932ef2921a3c8d71dbaf7ed001314de7 from reviewed548a22ff. Allfive gatesSUCCESS; CI44284448547 attempt1GREEN528s, Windows512s. Codec8andNode48eachOSPASS; optionalWindows8allpass with no stabilitycredit. Premerge main6bf8f46/CI44276313116GREEN checked immediately.
+- Current work: exact-main CI44286225997 attempt1GREEN689s verified. Continue toward owner-testablev1: nonblocking registry callback, then realtransport/genuinejoin/containeracceptance. Callback needs boundedbrief/ADR/independentreview before source.
+- Blockers: M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -4013,3 +4013,64 @@ No postrestore runtime rerun; retainedbinaryM3mutant. Independent sourcePASS
 applicable under exactrestore/docsretentionconditions. Genuinecodecfeature ready
 for publication asPR180 finalscope; olddocsjobtimeout retained, no performance/
 stabilityfixclaim, no timeout/quarantine/settings/counterchange.
+
+## PR180 substantive codec head published (2026-11-18)
+
+Coordinator Sol6.1/high published exact548a22ff326f2f27427e1b793de9f7a8a530db3e
+and rewrote PR180 title/body around completed purecodec. Independent Sol source
+review6975675806/agent-reviewSUCCESS after verifying finalnon-doc identity to
+reviewed6a27902c and exactrestore. Originaldocs cancellation remainshistorical;
+no claimtofix timeouts or infer rootcause. No sameheadrerun/manualdispatch.
+[CI44284448547](https://github.com/Dytschgo/arxcovo/actions/runs/44284448547)
+normalallOS firstattempt running on genuine newsource. Existingwatch retained,
+no duplicatewatch. Allfive/new8eachOS/Windows<=660s/freshgreenmain required before
+coordinator merge; ifeligible verify resultingmain ownfirstCI before nextfeature.
+Baseline8PASS +3intendedsemantic kills/exactrestore recorded; no postrestore
+runtime rerun, hostedcompiles baseline. RetainedbinaryM3mutant. No liveTLS/network/
+engine/container/hardware acceptance. Sol3/3exhausted/Opus0/2 unchanged; M2OPEN/
+M3UNCHECKED. Owner PC setup/babysitter/fences intact. Future nonblockingregistry
+candidate stays separatelyprepared atD:/Temp/arx-peer-registry-design.md, unbuilt.
+Localpendingcheckpoint notpushed solely totrigger anotherCI.
+
+## PR180 codec merged; verify resulting main
+
+Coordinator Sol6.1/high checked correctedfeature548a22ff allfiveSUCCESS, codec8/
+Node48eachOS, Windows512s<=660s and freshmain6bf8f46/CI44276313116GREEN. Normal
+expectedSHA squash merged8b36405 at10:31:29Z. Newmain ownfirstCI pending; gate
+futuremerges untilGREEN. [Evidence](evidence/m3-pr180-codec-gates-merge.md).
+Old12m cancellation/unknowncause retained, no timeoutfix/retry/stabilitycredit.
+Purecodec only, no liveTLS/network/container/hardware acceptance. OwnerPCdocs and
+containerplan nowmerged; nativeaccount/caps/reserves stillpending. Nextcandidate
+nonblockingregistry needs separateboundedbrief/ADR/review; no sourcebuilt yet.
+M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged. Existingbabysitter untouched.
+
+Owner renewed objective: continue hillclimbing until first viable version for
+owner testing; existinggoal remains active, no newgoalcreated. Verifiedmain8b36405
+firstCI44286225997GREEN689/686/3, codec8/Node48eachOSPASS; optionalsample skipped
+budget. Next bounded callback prerequisite advances actualTLSreadiness; no native
+PC acceptance until ownerStandardaccount/caps/reservesverified. M2OPEN/M3UNCHECKED.
+
+Sol6.1/high callbackbuilder finalfmt/ClippyPASS, actualStateStore4/4PASS27.482s,
+no compiler/semanticred. Exact2sourcepaths, blobs8f08c333/1d4a4082. IndependentSol
+frozenauditPASS inclheldlockcleanup and destructor/SQLhealthlimits; finalreport
+pendingpin/inventory. [Evidence](evidence/m3-peer-registry.md). Next2purecontrols
+onceeachwithrestore, no engine/RPC/TLS/network/container/nativeacceptance.
+M2OPEN/M3UNCHECKED; countersandownerfencesunchanged. Progress toward firstowner-testable
+version continues viaactualtransport and joinpath aftercallback prerequisite.
+
+Sol6.1/high parallel realTLSdesign investigation retained separately at
+D:/Temp/arx-owned-tls-design.md: pinnedasyncadapter proposal, explicitnewtransport
+caps/deadlines/owner, NotReady startupattachcycle, and shutdownjoin/releasetransport
+Sm before unchangednode.shutdown. No code/dependency/install/networktest. Root
+requested preciseEOF/halfclose rule to avoid extrabyte-detection deadlock; notyet
+acceptedlivecontract. Nextslice must be realTLS/TCPAppend transport, notanother
+unrelatedhelper, then completeVote/PreVote/fullsnapshot+networkedengineproof and
+actualjoin. Allnormalreviews/fences remain; no enginefix or CIbudgetchange.
+
+IndependentSol6.1 sourcePASS4cases/12artifacthashes verified, allaxes0findings;
+[review](reviews/m3-peer-registry-source-sol61-review.md). Bothdesignatedcontrols
+compiled/intendedassertionfailed onceeach, exactrestoreaftereach verifiedbyroot.
+Zeroexecution harnesssetupmetadata issue retained, no semanticrun repeated.
+No postrestore runtime rerun; retainedM2binary, hostedcompiles reviewedbaseline.
+Ready sourcePR for try-lockcallback, no fullTLS/network/container/SQLhealthclaim.
+M2OPEN/M3UNCHECKED,countersunchanged, no ownerPCnative/admin operation.
