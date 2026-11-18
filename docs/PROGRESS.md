@@ -4151,3 +4151,10 @@ archive sizes, path inventories and free-space observations verified. Review
 limits explicitly exclude witnessing completed deletions/original hash-copy loop.
 Eight archived founder logs total20,005 bytes separately from88entry total.
 Documentation diff check passed; no build/test needed for these instructions.
+
+Next-slice Sol6.1/high contract draft now at briefs/m3-owned-tls-append.md and
+ADR0028, independent Sol review active before source. Review requested explicit
+committed Append votes to protect pinned Engine preconditions, and cancellation-
+safe close ownership retaining JoinSet/store keeper until observed joins. Neither
+is an engine fix or diagnostic attempt; no source/build yet. C: followup12:35:40Z
+67,827,617,792 bytes free; same two preserved cache entries, no new arx* entry.
