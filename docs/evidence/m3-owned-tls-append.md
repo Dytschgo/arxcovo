@@ -5,7 +5,8 @@ under [ADR0028](../adr/0028-owned-tls-append-transport.md). Coordinator inspecte
 the actual logs, verified all 29 indexed artifact hashes/sizes (12,799 bytes total)
 and all five frozen source hashes. Final independent source
 [review passed](../reviews/m3-owned-tls-append-source-sol61-review.md) at b936dd20;
-the two designated controls and hosted checks remain pending.
+both designated controls produced their intended failures and source was restored
+exactly. Hosted checks remain pending.
 
 The new private transport implements actual TLS 1.3/TCP Append exchanges with
 explicit frame termination, current registry checks, owned tasks and resumable
@@ -82,8 +83,8 @@ All under `D:/Temp/arx-tls-append-build/logs`, each bounded below 8 MiB:
 | clippy-vote-final.log | 7fc982b8487ccf720e41cceab40241fac24e5c21b48a46510bfdda5d3c0e479f |
 | clippy-vote-final-result.json | 2ed1be8d3dbb7887726584c273af683121910334ae9c8e540a621a9517b1e7b3 |
 
-Two designated controls, all-OS hosted checks, merge and an owner-testable release
-remain pending. M2 OPEN / M3 UNCHECKED. No engine fixes or
+All-OS hosted checks, merge and an owner-testable release remain pending.
+M2 OPEN / M3 UNCHECKED. No engine fixes or
 counter reset: Sol3/3 exhausted, historical Opus0/2 unchanged. Full RPCs, actual
 startup/join/custody/clock and container acceptance remain; real multi-host paths
 are **unverified on real hardware**. All scratch/build paths are D:; no owner
@@ -119,3 +120,42 @@ Separate records under the same D: log root preserve the original 29 artifacts:
 `95c903dc5ad7d6b112aea6659ae654f748876f6d7b9c2db4b73600fd7fd7d849`;
 result JSON: `fa43fbf34ca3ac5b85389731d3b6013e54abfb4db363b346f6cd63bbd61266b7`.
 No failed runtime, engine test, control or policy change occurred for this addition.
+
+## Two designated controls and exact restoration
+
+Sol6.1/high builder ran each control once, sequentially, only after independent
+source PASS. Coordinator read both exact patches, stdout/stderr, command/timing/
+exit records and restoration manifests, and independently verified all 18 indexed
+control artifacts (46,483 bytes) and final five source hashes/Git blobs.
+
+| Control | Compilation | Exact semantic outcome | Total |
+| --- | ---: | --- | ---: |
+| M1 omit only inbound final registry callback | 18.67 s | Remove test, dispatch-count assertion at tests.rs:744, left 1 / right 0; exit 101 | 19.214 s |
+| M2 omit only inbound clean EOF before request decoding | 18.57 s | Extra-byte test, dispatch-count assertion at tests.rs:700, left 1 / right 0; exit 101 | 19.058 s |
+
+Both tests completed gate/helper/transport cleanup before the intended assertion.
+Neither failure was a compile error, timeout, setup error or unrelated red. Real
+handshake verification remained in M1; outbound reply termination remained in M2.
+Each exact reviewed source file was restored after **each** control. Root verified
+the final non-document tree equals reviewed b936dd20; independent review's
+restoration conditions are satisfied. The two controls were never repeated.
+
+An earlier shell wrapper had a nested here-string parse failure before script
+creation, source mutation or Cargo. `setup-command-failure.json` records zero
+control execution. It was replaced with a standalone driver; each semantic control
+then executed once. No founder/engine diagnostic or fix attempt was made.
+
+Evidence under `D:/Temp/arx-tls-append-build/controls`:
+
+| File | SHA256 |
+| --- | --- |
+| artifact-index.json | 0df9f470aa9ae7d26dedae2d91f019dd92c6dea054e14fc3d8b8002bfb2bfcae |
+| m1-result.json | 5b628f9c8f5a8862cd6b6bad56ecfeb6889c8088f4cb430881fd348ca0a0e748 |
+| m2-result.json | 702c034a2e4b3d380186caef1fa0a5a52cc386a3a221796d1c01903022e29014 |
+| m1-restored-source.json | 3ceee8542a450184cde72539980d9f7ae78f837c1a0f8c3d3404b85b1364b9d8 |
+| m2-restored-source.json | 3ceee8542a450184cde72539980d9f7ae78f837c1a0f8c3d3404b85b1364b9d8 |
+
+No runtime/fmt check was repeated after restoration. The local library test
+executable remains the M2 mutant; hosted CI must compile the restored baseline.
+Prior passing evidence applies by exact source identity. Engine Sol3/3 exhausted,
+Opus0/2 and all owner fences remain unchanged.

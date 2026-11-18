@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
-- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; two designated controls in progress before publication. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
+- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; ready for normal source PR gates. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4270,3 +4270,15 @@ runs exactly2predeclared controls onceeach via Sol6.1builder: receiver finalauth
 omission/actualRemove test, receiverEOF omission/extrabyte test; compile+intended
 assertion+cleanup required, restoreall5blobs afterEACH. Survivor/unrelatedred
 stops for disposition, no retry/newcontrol/enginefix grant. Hosted gates pending.
+
+Two designated controls COMPLETE onceeach: M1 finalauth omission compiled18.67s,
+Remove spy assertion744 left1/right0 aftercleanup,exit101,total19.214s; M2 inbound
+EOF omission compiled18.57s, extrabyte spy assertion700 left1/right0 aftercleanup,
+exit101,total19.058s. Root read actualpatches/logs/exit/timing and verified18control
+artifact hashes/sizes plusall5finalsourceSHA/Gitblobs. Exactrestore afterEACH;
+finalnon-doc tree identical toreviewedb936dd20. Review applicability satisfied.
+Initial shellquote setup failed beforemutation/Cargo, zeroexecution recorded;
+standalone driver then eachsemanticcontrol ranonce. No postrestore runtime/fmt
+rerun; localtestexeM2mutant, hostedmustcompilebaseline. Ready genuine source PR,
+allfive/new32eachOS/Windows<=660s/freshgreenmain beforemerge. M2 OPEN/M3 UNCHECKED,
+engineSol3/3 exhausted/Opus0/2 unchanged; no diagnostic/fix/settings bypass.
