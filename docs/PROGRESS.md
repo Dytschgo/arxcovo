@@ -3592,3 +3592,5 @@ Root actively awaited CI44212212325 to exit0, retained full three-platform logs 
 ### PR176 refresh after approved diagnostic merge - 2026-11-18
 
 Root integrated main05b9c829 after exact CI44212212325 success. Five query feature files remain byte-identical reviewedf9d0a413. Parent changes add reviewed diagnostic test instrumentation only outside the feature diff. Fresh guard8 and fmt/diff checks required before push; previous26selected cases/Clippy/mutants retained with restoration qualifications. Hosted query engine case remains first-run evidence, not locally exercised. Exact-head review, all five gates and featureWindows<=660s required.
+
+Root final refresh checks: all five feature files equal reviewedf9d0a413 bytes; cargo fmt and static guard8 passed once, diff checks clean. No Rust behavior, engine or mutation rerun on the refreshed parent; hosted checks provide new integration evidence.
