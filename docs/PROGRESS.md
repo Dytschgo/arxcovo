@@ -5016,3 +5016,27 @@ implementation. No compiler/runtime claim follows. Authorized next source slice
 is the reviewed checked-clock module and issuer/anchor plumbing with exact
 fixture adaptations, local pure tests/test compilation only, then independent
 source review and normal gates. No live transport/startup or held repair work.
+
+Sol6.1/high source builder is active on work/m3-checked-enrollment-clock from
+805408cb, using the reviewed scope. Coordinator added
+[ADR0030](adr/0030-checked-enrollment-clock.md) with the trust premise, arithmetic,
+availability limits and unwired startup boundary. Local validation permits pure
+checked-clock execution and compilation only; issuer engine coverage remains
+locally UNRUN and must preserve the existing quarantine inventory. No CI run,
+source acceptance or live time/transport credit has been claimed.
+
+Checked-clock source delivery: Sol6.1/high implemented the ten-file allowlist;
+14/14 isolated pure tests PASS (0.01s harness), Clippy PASS16.196s and all-target
+test compilation PASS38.456s, no engine/runtime tests. Coordinator self-review
+caught the 15-case matrix's potential MAX_MEMBERS exhaustion before execution;
+test-only per-case Remove plus an explicit removal assertion now preserves the
+unchanged capacity. Post-correction fmt/Clippy/no-run PASS0.748/4.741/18.186s.
+Pure module/tests are hash-identical to the earlier 14-pass source, not rerun.
+Original six issuer cases, founder fixture body, guards and quarantine inventory
+remain. [Local evidence](evidence/checked-enrollment-clock-local.md) records exact
+pre/post-correction scope; independent source review and hosted gates pending.
+
+Test compilation replaced the shared target arxd.exe with an unobserved build
+df79751b; do not reuse the old f889 runtime claim for that path. The separate
+owner-preview bin/arxd.exe was rehashed and remains f8893673...6224b48; no packet
+launch occurred. No runtime/fix authority or exhausted counter changed.

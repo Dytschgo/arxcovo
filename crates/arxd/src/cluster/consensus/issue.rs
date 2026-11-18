@@ -1,4 +1,5 @@
 //! Trusted adapter: only this module constructs issuance tickets.
+use super::checked_clock::{CheckedClock, ClockError};
 use super::*;
 use crate::cluster::{
     enrollment::{
@@ -161,7 +162,7 @@ impl ConsensusNode {
     pub async fn enroll(
         &self,
         ca: &ClusterCa,
-        clock: &dyn SignerClock,
+        clock: &dyn CheckedClock,
         input: RedeemInput,
         csr: &[u8],
     ) -> Result<IssuedLeaf, IssueError> {
@@ -186,7 +187,7 @@ impl ConsensusNode {
                 &proof,
                 csr.digest(),
                 anchor,
-                clock.now_ms(),
+                clock.sample_ms().map_err(issue_clock_error)?,
             );
             // The proof's scope ends before any await; this is not erasure.
             (code, command)
@@ -201,7 +202,7 @@ impl ConsensusNode {
             #[cfg(test)]
             self.issue_pause(PausePoint::AfterCommit).await;
             self.issue_guard(&ticket, code, csr.digest()).await?;
-            let pre_now = clock.now_ms();
+            let pre_now = clock.sample_ms().map_err(issue_clock_error)?;
             ticket
                 .grant
                 .check_issuable(pre_now)
@@ -210,7 +211,7 @@ impl ConsensusNode {
             #[cfg(test)]
             self.issue_pause(PausePoint::AfterSign).await;
             self.issue_guard(&ticket, code, csr.digest()).await?;
-            let post_now = clock.now_ms();
+            let post_now = clock.sample_ms().map_err(issue_clock_error)?;
             ticket
                 .grant
                 .check_issuable(post_now)
@@ -228,6 +229,12 @@ impl ConsensusNode {
             Ok(r) if Instant::now() < deadline => r,
             _ => Err(IssueError::Unavailable),
         }
+    }
+}
+fn issue_clock_error(error: ClockError) -> IssueError {
+    match error {
+        ClockError::Rollback => IssueError::ClockRollback,
+        _ => IssueError::Unavailable,
     }
 }
 #[cfg(test)]
