@@ -3602,3 +3602,7 @@ CI44213815251 onf1bf99bc failed Ubuntu nextest: owned_anchor_query_single_voter 
 ### Ubuntu founder refusal disposition - 2026-11-18
 
 Fresh Sol6.1/high disposition30185388 confirms initial found failures before newquery/proof in two cases and final first-initialization found in F10. Phase unknown; cancellation/timing causality unproven. Proposed real mutex-backpressure C/T loop is diagnostic, notfix; exactpatch preparation only is next. No qualifying dedicated Ubuntu runtime has been established in this session, so root may later authorize only a clearly labelled localWindowsmodel under existing PC grant, after exactdiffreview. No runtime now; macOSgreen, Windowspending, Ubuntured; PR176held and main05b9c829 separatelygreen.
+
+### PR176 platform disposition and patch safety review - 2026-11-18
+
+CI44213815251 is terminal: Ubuntu failure, macOS and Windows success. No rerun. Root retained exact F10C/T patchese470dc3c; only gate-drop position differs, no active source change. Independent Sol6.1 high static safety review is running before any localWindowsmodel execution grant. PR176 held; no inference that hostedUbuntufailure is caused by mutexbackpressure.
