@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Previous main GREEN; new main6f4618c CI44269052508 pending after PR178:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,10 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
-- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Published reviewed diagnostic head11a34312; fmt/Clippy/observer7/guard9 pass, independent Astra applied-source PASS. First-attempt normal all-OS CI44267088243 running; agent-review/ci-time-budget green, OS checks pending. No rerun or runtime correction authorized.
-- Blockers: PR178 is held after Windows founder refusal; first-attempt all-OS CI44267088243 evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
-
+- Last merged: PR178 as6f4618c76256c2ead9dfb501c2c3946fde14a81b from reviewed11a34312. Allfive gates passed; CI44267088243 attempt1SUCCESS633s, Windows629s. Identity3/observer3 passed eachOS. Premerge exactmain e3e79089/CI44229539357 GREEN verified.
+- Current work: resulting exact-main CI44269052508 running. Feature merges held until this exact run is GREEN. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
+- Blockers: M2 owner/hardware acceptance incomplete; M3 admission/transport/discovery/removal authority/custody/clock and production integration remain. Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
