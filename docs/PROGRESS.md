@@ -4106,3 +4106,41 @@ applicationbytes, missing/unclean termination refuse; no claimabout rawTCPbytes
 sentafterauthenticatedclose. RealTLSpositive/negative tests stillUNRUN.
 Currentgoal mustcontinue to actualTLS/TCPimplementation, fullRPCwire, genuinejoin
 and containeracceptance; no finalviableclaim fromthiscallback alone.
+
+## Owner disk correction, 2026-11-18
+
+Coordinator cleanup: C: free 4,711,038,976 bytes before; 18,877,157,376 after
+three attributed build targets; 69,358,583,808 at final observation. Removed
+12,733,421,465 logical target bytes plus 88 archived/hash-verified task entries
+(26,320,108 bytes) and eight archived founder logs. Two entries were already
+absent and receive no deletion credit. Concurrent volume activity means the
+whole free-space increase is not attributed to cleanup. Only the founder Cargo
+cache and cache metadata remain among C: Temp arx* entries; caches/user files/
+LabManager/VM data untouched. Large builds paused below 20 GB; final measurement
+clears that threshold. [Evidence](evidence/2026-11-18-agent-temp-cleanup.md).
+
+AGENTS now requires explicit D: TMP/TEMP/CARGO_TARGET_DIR and scratch roots in
+every command and delegate brief, with tool caches on D: when used; the linked
+scratch guide provides an effective-path/free-space check. Independent Sol6.1
+review pending. No runtime test/build for this documentation/cleanup task.
+PR181 first CI reports all three OS jobs successful; exact logs/durations and
+all remaining merge gates still to verify. M2 OPEN/M3 UNCHECKED, Sol3/3 exhausted,
+Opus0/2 unchanged; no founder fix, diagnostic rerun or owner admin action.
+
+## PR181 merged; exact-main observation pending
+
+Coordinator verified exact8e5091b9 first CI44290836331 attempt1 GREEN, all five
+checks and independent Sol6.1/high source review. Registry4/4 and Node48/48 on
+each OS; Windows594s <=660s, Ubuntu304s, macOS429s, wall598s. Bounded D: logs
+retained with hashes. Optional Windows diagnostic skipped_budget e_s604, no case
+execution or stability credit. Fresh exact-main8b36405 CI44286225997 GREEN before
+normal expected-head squash merge cd8907500dcd89fddc0c659590f962cbf03c7ed5.
+[Merge evidence](evidence/m3-pr181-registry-gates-merge.md). PR181 unwatched.
+
+Resulting main first CI44304025778 queued; verify once complete, no rerun/dispatch
+or next feature merge before green. Independent Sol6.1/high now prepares a
+concrete owned TLS/TCP Append contract, not source yet, while separate Sol reviews
+D: scratch prevention/evidence. Owner disk correction is applied; all command and
+delegate environments explicit on D:. M2 OPEN/M3 UNCHECKED, owner Standard-account/
+caps/reserves still pending, Linux-specific native items pending. Sol3/3 exhausted,
+Opus0/2 unchanged; no founder fix/diagnostic, owner admin or LabManager/VM action.
