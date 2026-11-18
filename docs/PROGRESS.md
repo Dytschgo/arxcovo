@@ -3866,3 +3866,17 @@ not permission to replace real paths with mem_net or mocks. M3 stays UNCHECKED.
 Sol3/3 exhausted/Opus0/2 unchanged; no founder diagnostic/fix or Linux hosted retry.
 Existing babysitter schedule untouched. PR179's independently reviewed history
 assertion correction remains local, awaiting original Windows result before push.
+
+Sol6.1/high source-grounded container plan complete; coordinator reviewed and
+retained [three-container plan](briefs/m3-three-container-acceptance.md). Current
+binary lacks cluster startup/config and real network adapter; mem_net/three_node
+are in-process/direct-initialize fixtures and cannot earn requested credit.
+Build order: peer protocol -> real socket adapter -> actual code/certificate join
+and custody/admission/promotion -> process config/lifecycle -> fenced hosted
+three-container leader-loss/write-ledger harness -> expired/distinct-reuse tests.
+No container run yet. Trusted expiry remains a security/evidence prerequisite:
+controlled-clock transport tests may prove policy but not real15-minute expiry;
+no TTL or CI-budget change. Real multi-host hardware unverified. M2OPEN/M3UNCHECKED.
+Owner checklist already sent; PC native runs await account/fence setup. Existing
+babysitter left intact; no LabManager/VM/admin actions. PR179 prepared correction
+and its independent review remain unchanged while old Windows job completes.
