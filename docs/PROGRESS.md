@@ -4049,3 +4049,11 @@ owner testing; existinggoal remains active, no newgoalcreated. Verifiedmain8b364
 firstCI44286225997GREEN689/686/3, codec8/Node48eachOSPASS; optionalsample skipped
 budget. Next bounded callback prerequisite advances actualTLSreadiness; no native
 PC acceptance until ownerStandardaccount/caps/reservesverified. M2OPEN/M3UNCHECKED.
+
+Sol6.1/high callbackbuilder finalfmt/ClippyPASS, actualStateStore4/4PASS27.482s,
+no compiler/semanticred. Exact2sourcepaths, blobs8f08c333/1d4a4082. IndependentSol
+frozenauditPASS inclheldlockcleanup and destructor/SQLhealthlimits; finalreport
+pendingpin/inventory. [Evidence](evidence/m3-peer-registry.md). Next2purecontrols
+onceeachwithrestore, no engine/RPC/TLS/network/container/nativeacceptance.
+M2OPEN/M3UNCHECKED; countersandownerfencesunchanged. Progress toward firstowner-testable
+version continues viaactualtransport and joinpath aftercallback prerequisite.
