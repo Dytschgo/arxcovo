@@ -4144,3 +4144,10 @@ D: scratch prevention/evidence. Owner disk correction is applied; all command an
 delegate environments explicit on D:. M2 OPEN/M3 UNCHECKED, owner Standard-account/
 caps/reserves still pending, Linux-specific native items pending. Sol3/3 exhausted,
 Opus0/2 unchanged; no founder fix/diagnostic, owner admin or LabManager/VM action.
+
+Independent Sol6.1/high scratch-rule/evidence review PASS, standards0/spec0;
+[report](reviews/agent-scratch-fence-sol61-review.md). Four manifest hashes,
+archive sizes, path inventories and free-space observations verified. Review
+limits explicitly exclude witnessing completed deletions/original hash-copy loop.
+Eight archived founder logs total20,005 bytes separately from88entry total.
+Documentation diff check passed; no build/test needed for these instructions.
