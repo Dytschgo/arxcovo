@@ -3787,3 +3787,11 @@ or founder edits, no engine run. [Bounded brief](briefs/m3-fresh-membership-obse
 D-only fmt/Clippy/focused pure tests and independent actual-source review before
 publication. Future live adapter/quorum/race/cancel proof remains separate; no
 production admission authority. Source builder running, no checks claimed yet.
+
+Sol6.1/high builder implemented bounded fresh observation module; final fmt and
+workspaceofflinealltargetClippyPASS, pure7/7PASS incl direct noengine synthetic API
+refusal. Initial2typeinferencecompileerrors fixed before tests; no semanticred.
+[Local evidence](evidence/m3-fresh-membership-observation.md). Independent separate
+Sol6.1/high actualsource review running. No engine/transport/admission credit;
+future live proof remains. Source frozen pendingreview; no publication yet.
+M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged, hardware unverified.
