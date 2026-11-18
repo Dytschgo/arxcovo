@@ -4510,3 +4510,44 @@ verification was 44,117,966,848 bytes, above the floor; all our output stayed on
 Next gate is fresh independent Sol review of this exact correction and v2 plan,
 then a bounded new-source production observation if cleared. M2 OPEN/M3 UNCHECKED,
 PR182 HOLD/NOFIX and historical engine counters unchanged. Full v1 remains active.
+
+Correction frozen as `7a42ffedac495c9b7aeaa0e10c7323dd2a074404`, with a clean
+source tree and 14 final feature source pins in the frozen manifest. Fresh
+independent Sol 6.1/high review is active. Coordinator prepared the separate v2
+private fixtures and verified ownership/DACL, credential hash/local identity
+pins, omitted default mode, no HTTP, D: child scratch, valid account length,
+empty state and exact new binary hash. Sanitized proof is
+`D:/Temp/arx-current-user-smoke-20261118-v2/preparation-proof.json`; C: free was
+42,610,434,048 bytes. No v2 daemon/command has started. Source stays frozen while
+review runs; runtime evidence collection remains gated on that review.
+
+## Current-user source GO and v2 production observation PASS
+
+Fresh independent Sol 6.1/high [final review](reviews/windows-execution-choice-final-review.md)
+at exact `7a42ffed` gives source GO: Standards PASS, Spec PASS, S1 closed, F1
+closed, no confirmed security bypass. It verifies 14 frozen pins, seven returned
+pins, nine logs and binary/SDK/diff/script identities. The synchronized admission
+boundary covers detached handlers before activity access through terminal commit.
+Read-write failure truthfully making shutdown unconfirmed is accepted. This is
+source approval, not a waiver of hosted checks or the ten ACL setup failures.
+
+Coordinator then ran exactly one approved new-source v2 production observation
+with the exact reviewed binary and a 90-second outer deadline. **PASS**, exit 0:
+all 12 checks passed in 1.203 s driver / 1.319 s outer wall. Actual default-account
+inventory, `cargo --version`, Job identity/cleanup, correlated durable activity,
+privacy fields and restart persistence passed. Optional dedicated capability
+truthfully reports setup required, refuses the command, preserves dedicated
+provenance in its refused row and does not fall back. Forced daemon restart
+followed observed terminal commit and child cleanup. No graceful signal/process
+exit, Claude Code, dedicated native or cross-platform acceptance is implied.
+[Sanitized result](evidence/windows-execution-choice-smoke-v2.json); originals and
+hash manifest at `D:/Temp/arx-current-user-smoke-20261118-v2`. V1 FAIL is preserved.
+
+Fresh live-main prepublish check confirms exact `cd890750` still has first-attempt
+CI44304025778 SUCCESS (626 s wall; existing duration history retained), no rerun or
+dispatch. Source stays identical across the evidence/docs delivery commit; all
+14 source pins must still match before push. Next action is the genuine feature
+PR and independent exact-head review attestation, then required hosted gates.
+No docs-only diagnostic run is manufactured. M2 OPEN / M3 UNCHECKED, full v1
+incomplete; native/VM/other OS paths remain **unverified on real hardware**.
+Engine Sol 3/3 exhausted, historical Opus 0/2 and PR182 HOLD/NOFIX unchanged.

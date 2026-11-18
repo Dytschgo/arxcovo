@@ -63,9 +63,25 @@ focused cases in one run. Foreground 2/2, fmt, Clippy and production build passe
 The returned seven source pins, nine command logs, source diff and binary hash
 were independently checked by the coordinator. Full evidence stays at
 `D:/Temp/arx-opus-admission-attempt1`; fresh source review is still required.
-No v2 production observation has run yet. The new binary is
+The new binary is
 `f889367307c8561cd813b115b6a6fb908631bf736f233f2d2ca8f7f7d6224b48`, replacing
 the earlier binary path while preserving the v1 hash as historical evidence.
+
+Independent [final source review](../reviews/windows-execution-choice-final-review.md)
+at exact `7a42ffed` gives source GO: standards/spec pass, S1 and F1 closed, no
+confirmed security bypass. It verifies all 14 frozen source pins, seven returned
+pins, nine command logs, SDK/diff/binary/script identities and separately permits
+one v2 production observation. Required hosted gates remain mandatory.
+
+That [v2 observation](windows-execution-choice-smoke-v2.json) now PASSES all 12
+checks on the exact reviewed normal binary, with no policy fixture. Driver wall
+time 1.203 s; outer wall 1.319 s, exit 0 under a 90-second deadline. It verifies
+omitted-mode current-user inventory, real `cargo --version`, actual Job identity
+and cleanup, durable correlated terminal activity without raw owner identity or
+rights, persistence across forced daemon restart, and durable dedicated-mode
+refusal without fallback. Only task-owned hidden processes were launched/stopped.
+No graceful signal shutdown or Claude Code acceptance is claimed. Original v1
+FAIL evidence is retained. Hosted checks and M2 acceptance are still pending.
 
 Schema v4 is an operational one-way door for an older binary: preserve a private
 backup while the old daemon is stopped before upgrading existing state. Restoring

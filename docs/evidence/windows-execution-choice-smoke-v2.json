@@ -1,0 +1,33 @@
+{
+  "source": "7a42ffedac495c9b7aeaa0e10c7323dd2a074404",
+  "report": {
+    "production_binary": true,
+    "fixture_bypass": false,
+    "steps": [
+      "omitted-mode-defaults-to-available-current-user",
+      "actual-cargo-current-user-job-cleanup",
+      "one-correlated-command-row",
+      "durable-current-user-provenance",
+      "durable-job-identity-and-cleanup",
+      "no-raw-owner-identity-or-rights",
+      "activity-id-filter-correlates-terminal-command",
+      "terminal-command-persists-across-daemon-restart",
+      "optional-dedicated-mode-truthfully-unavailable",
+      "dedicated-command-refused",
+      "dedicated-refusal-has-no-current-user-fallback",
+      "dedicated-refusal-is-durable"
+    ],
+    "binary_sha256": "f889367307c8561cd813b115b6a6fb908631bf736f233f2d2ca8f7f7d6224b48",
+    "restart_method": "forced-daemon-stop-after-observed-terminal-commit-and-child-cleanup",
+    "graceful_shutdown_proved": false,
+    "outcome": "PASS",
+    "elapsed_seconds": 1.203
+  },
+  "outer": {
+    "exit": 0,
+    "elapsedSeconds": 1.3187201,
+    "outerDeadlineSeconds": 90,
+    "binarySha256": "f889367307c8561cd813b115b6a6fb908631bf736f233f2d2ca8f7f7d6224b48",
+    "source": "7a42ffedac495c9b7aeaa0e10c7323dd2a074404"
+  }
+}

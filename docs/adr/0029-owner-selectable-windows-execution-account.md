@@ -1,7 +1,8 @@
 # 0029: Owner-selectable Windows execution account
 
-Status: owner product decision accepted, 2026-11-18; implementation and independent
-source review remain pending.
+Status: owner product decision accepted, 2026-11-18. Implementation has independent
+source GO and a passing bounded Windows production observation; hosted delivery
+and milestone acceptance remain pending.
 
 The owner explicitly requested that Windows execution default to the user's own
 Windows account for simplicity, with a dedicated account available as a choice.
