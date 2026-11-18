@@ -4158,3 +4158,11 @@ committed Append votes to protect pinned Engine preconditions, and cancellation-
 safe close ownership retaining JoinSet/store keeper until observed joins. Neither
 is an engine fix or diagnostic attempt; no source/build yet. C: followup12:35:40Z
 67,827,617,792 bytes free; same two preserved cache entries, no new arx* entry.
+
+Independent Sol6.1/high owned-TLS contract review GO, final standards0/spec0/
+security0 after committed-vote and close-lifetime clarifications. Exact reviewed
+hashes and pinned API rationale retained in reviews/m3-owned-tls-append-contract-
+sol61-review.md. Coordinator accepts ADR0028 and authorizes its narrow source
+slice, genuine realTLS/socket tests only, no engine/startup/factory edits. Builder
+Sol6.1/high next; independent actual-source review and all normal gates remain.
+New transport policies do not reset engineSol3/3 exhausted or historicalOpus0/2.

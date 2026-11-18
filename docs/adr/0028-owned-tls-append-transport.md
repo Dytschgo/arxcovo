@@ -1,7 +1,8 @@
 # 0028: Owned one-exchange TLS/TCP Append transport
 
-Status: proposed, 2026-11-18; independent Sol 6.1/high contract review required
-before source implementation. No live transport or acceptance result exists.
+Status: accepted for bounded implementation, 2026-11-18, after independent
+[Sol 6.1/high contract review](../reviews/m3-owned-tls-append-contract-sol61-review.md).
+No live transport or acceptance result exists.
 
 ADR 0026 supplied a bounded Append codec. ADR 0027 supplied the specific
 fail-closed try-lock applied-registry callback, without complete TLS ownership.
@@ -83,6 +84,6 @@ positive/refusal tests and two once-only semantic controls. No source changes,
 builds, tests, controls or acceptance runs were made for this decision. Existing
 Sol 3/3 exhausted and historical Opus 0/2 counters and stop rules remain intact.
 M2 remains OPEN, M3 UNCHECKED, and real multi-host paths are **unverified on real
-hardware**. Independent review is the next step, not an implementation grant.
+hardware**. Independent source review and implementation evidence remain required.
 
 

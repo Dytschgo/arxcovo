@@ -1,7 +1,8 @@
 # M3 owned TLS/TCP Append transport
 
-Status: proposed implementation contract, 2026-11-18. Independent Sol 6.1/high
-contract review is required before source work. This document records source
+Status: accepted bounded implementation contract, 2026-11-18, after independent
+[Sol 6.1/high review](../reviews/m3-owned-tls-append-contract-sol61-review.md).
+Coordinator authorized the specified source slice. This document records source
 inspection, not a build, dependency-resolution result, network test or acceptance
 pass. [ADR 0028](../adr/0028-owned-tls-append-transport.md) proposes the new policies.
 
