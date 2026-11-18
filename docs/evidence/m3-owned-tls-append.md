@@ -3,8 +3,9 @@
 2026-11-18. Sol6.1/high core builder and separate Sol6.1/high test builder,
 under [ADR0028](../adr/0028-owned-tls-append-transport.md). Coordinator inspected
 the actual logs, verified all 29 indexed artifact hashes/sizes (12,799 bytes total)
-and all five frozen source hashes. Final independent source review is pending;
-no controls or hosted checks have run for this source yet.
+and all five frozen source hashes. Final independent source
+[review passed](../reviews/m3-owned-tls-append-source-sol61-review.md) at b936dd20;
+the two designated controls and hosted checks remain pending.
 
 The new private transport implements actual TLS 1.3/TCP Append exchanges with
 explicit frame termination, current registry checks, owned tasks and resumable
@@ -62,11 +63,12 @@ policy time is controlled. A bounded blocking observer suppresses automatic
 clock advance, performs no transport/crypto I/O, and is released/joined before
 assertions. This supplies no wall-time performance or multi-host evidence.
 
-One test qualification is explicitly pending review: the cancelled-close test
+Final review identified this qualification in the original cancelled-close test:
 at `CloseAborted` does not assert a nonempty JoinSet. An inbound deadline may
 have completed work before the close grace expires. It proves keeper/original-
 deadline persistence; aborted-but-unjoined cancellation requires independent
-disposition rather than inference from the stage name.
+disposition rather than inference from the stage name. The added proof below
+resolves this finding; it was not accepted on the original 31-case evidence alone.
 
 ## Retained artifacts
 
@@ -80,8 +82,8 @@ All under `D:/Temp/arx-tls-append-build/logs`, each bounded below 8 MiB:
 | clippy-vote-final.log | 7fc982b8487ccf720e41cceab40241fac24e5c21b48a46510bfdda5d3c0e479f |
 | clippy-vote-final-result.json | 2ed1be8d3dbb7887726584c273af683121910334ae9c8e540a621a9517b1e7b3 |
 
-No final source review, two designated controls, all-OS hosted checks, merge or
-owner-testable release is claimed. M2 OPEN / M3 UNCHECKED. No engine fixes or
+Two designated controls, all-OS hosted checks, merge and an owner-testable release
+remain pending. M2 OPEN / M3 UNCHECKED. No engine fixes or
 counter reset: Sol3/3 exhausted, historical Opus0/2 unchanged. Full RPCs, actual
 startup/join/custody/clock and container acceptance remain; real multi-host paths
 are **unverified on real hardware**. All scratch/build paths are D:; no owner
@@ -96,8 +98,8 @@ exchange at ClientAuthenticated with an RPC deadline beyond close grace. It
 observes `aborting`, a nonempty JoinSet, retained keeper and unchanged original
 close deadline before and after another cancelled close. It then releases gates
 and explicitly joins transport, caller, remote helper and clock observer before
-asserting Unclean/reclamation. The independent reviewer found the missing static
-oracle supplied; final source disposition follows this commit.
+asserting Unclean/reclamation. Final independent source PASS at b936dd20 resolved
+the finding after reviewing this oracle and its first actual execution.
 
 First exact execution, without repeating the original 31:
 `cargo test -p arxd --lib --locked --offline cluster::consensus::peer_transport::tests::cancelled_close_retains_aborted_outbound_task_until_join -- --exact --test-threads=1`
