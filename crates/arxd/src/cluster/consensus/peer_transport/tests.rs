@@ -2912,3 +2912,62 @@ async fn rpc_snapshot_does_not_hold_heartbeat_client_and_stream_is_sequential() 
     assert!(matches!(output[0], Ok(Err(AppendError::Conflict { .. }))));
     assert_eq!(spy.count(), 1);
 }
+#[tokio::test]
+async fn rpc_all_new_methods_fail_closed_on_final_registry_remove_contention_and_poison() {
+    for method in 0..3 {
+        for failure in 0..3 {
+            let f = Fixture::new();
+            let spy = rpc_spy(false);
+            let mut receiver = f.owner(2, spy.clone());
+            let hold = gate(&receiver, Stage::BeforeDispatch);
+            let mut events = events(&receiver);
+            let address = listening(&mut receiver).await;
+            let bytes = if method == 2 {
+                peer_wire::encode_snapshot(route(), heartbeat().vote, &full_snapshot(&f)).unwrap()
+            } else {
+                peer_wire::encode_vote(
+                    route(),
+                    if method == 0 {
+                        peer_wire::Kind::VoteRequest
+                    } else {
+                        peer_wire::Kind::PreVoteRequest
+                    },
+                    &ballot_request(),
+                )
+                .unwrap()
+            };
+            let config = f.client_config(&f.client, 2);
+            let work = tokio::spawn(async move {
+                let mut stream = connect(config, address).await?;
+                send_frame(&mut stream, &bytes, false).await?;
+                read_frame(&mut stream).await
+            });
+            let observed = observe(&mut events, Event::Stage(Stage::BeforeDispatch)).await;
+            let mut guard = None;
+            let fenced = match failure {
+                0 => f.remove(1),
+                1 => {
+                    guard = f.sm.0.lock().ok();
+                    guard.is_some()
+                }
+                _ => {
+                    let sm = f.sm.clone();
+                    std::thread::spawn(move || {
+                        let _guard = sm.0.lock().unwrap();
+                        panic!("synthetic registry poison")
+                    })
+                    .join()
+                    .is_err()
+                }
+            };
+            release(&receiver, Stage::BeforeDispatch, &hold);
+            // Contention is held through the actual refusal, then released before close.
+            let result = work.await;
+            drop(guard);
+            let closed = receiver.close().await;
+            assert!(observed && fenced && closed.is_ok() && reclaimed(&receiver));
+            assert!(matches!(result, Ok(Err(_))));
+            assert!(spy.calls.lock().unwrap().is_empty());
+        }
+    }
+}
