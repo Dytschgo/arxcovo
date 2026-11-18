@@ -4,7 +4,7 @@ Status: accepted within owner-delegated scope,2026-11-15; no acceptance waiver.
 
 KICKOFF normally orders milestones1-6. The owner's2026-11-15 14:06 steering permits parallel work on other features with few dependencies; subsequent delegated babysitter steering explicitly directs remaining independent M2 work, then independent M3 while blocked hardware acceptance stays visible. This narrowly supersedes sequential implementation for independent M3 source only. PR142/143/144 therefore do not imply M2 completion.
 
-M3's enrollment core and storage probes are independent of enabling the production dedicated executor. Their own independent different-provider reviews and all normal gates remain mandatory. CA keys, production endpoints, real enrollment, transport and cluster acceptance retain their own contracts. No M4 work or post-v1 scope follows.
+M3's enrollment core and storage probes are independent of enabling the production dedicated executor. An independent reviewer separate from the builder under the current owner routing, and all normal gates, remain mandatory. CA keys, production endpoints, real enrollment, transport and cluster acceptance retain their own contracts. No M4 work or post-v1 scope follows.
 
 The [live M2 closure plan](../PROGRESS.md#ordering-and-m2-closure-plan) lists every open item, evidence, blocker and active work. A7/A11 hosted is finalNO-GO, A12's sole authorized attempt is consumed with cleanup unconfirmed; no hosted correction, diagnostic or retry is authorized. Dedicated-host work requires an owner-provided qualifying environment and a separate explicit scoped authorization; agents perform no owner-admin setup and never reuse the uncertain-cleanup host.
 
@@ -45,6 +45,6 @@ fences, independent review and normal merge gates remain mandatory.
 
 Current routing follows AGENTS/KICKOFF's owner update: Sol 6.1 engineering and
 independent reviews, Astra 6.2 when stuck as explicitly allowed, Claude UI only.
-The older different-provider phrase above is historical. Sol 3/3 exhausted and
+No earlier cross-provider rule overrides that owner update. Sol 3/3 exhausted and
 historical Opus 0/2 remain unchanged; no founder diagnostic/fix authority follows.
 The existing babysitter and its schedule remain untouched.
