@@ -2,7 +2,9 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exactcd8907500dcd89fddc0c659590f962cbf03c7ed5, CI44304025778 attempt1 SUCCESS626wall/624charged/2queuecredit; Windows622s, Ubuntu236s, macOS439s. Registry4/Node48 eachOS PASS; optional Windows sample budget-skipped, no cases. **Previous verified main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main PENDING:** exact08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 after PR183. First push CI44351538977 attempt1 RUNNING; no subsequent feature merge or owner-release qualification until this exact-main observation completes green. Prior green history below remains historical.
+
+**Previous verified main GREEN:** exactcd8907500dcd89fddc0c659590f962cbf03c7ed5, CI44304025778 attempt1 SUCCESS626wall/624charged/2queuecredit; Windows622s, Ubuntu236s, macOS439s. Registry4/Node48 eachOS PASS; optional Windows sample budget-skipped, no cases. **Previous verified main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,9 +41,10 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
-- Current owner-preview delivery: PR183 exact29a3317f, current-user default/optional dedicated setup-required. Independent source review GO/agent-review success; first CI44349045277 Ubuntu/macOS SUCCESS, Windows running at last review-completion read. No merge or release credit yet. Prepared private D: backend launcher remains UNRUN; full v1/M2 acceptance incomplete.
-- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
+- Last merged: PR183 as08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 from reviewed29a3317f. All5gates SUCCESS; first PR CI44349045277 GREEN594s wall, Windows589s<=660, Ubuntu291s/macOS464s. Fresh exactmaincd890750/CI44304025778 SUCCESS checked immediately before guarded merge. Resulting exact-main firstCI44351538977 pending.
+- Previous merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
+- Current owner-preview delivery: PR183 MERGED; current-user default/optional dedicated setup-required source reviewed and hosted gates green. Prepared private D: backend launcher still UNRUN; current exact-main health must clear before its first actual client acceptance. Full v1/M2 remains incomplete.
+- Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4859,3 +4862,32 @@ corrected inventory corruption case executed and passed on Ubuntu/macOS, plus
 unchanged; hosted evidence is platform-specific, not a local setup/backend fix.
 [Reviewed-source checkpoint](evidence/windows-execution-choice-pr183-reviewed-ci.md)
 and D:/Temp/arx-pr183-29a-first-ci/partial-execution-proof.json retain the scope.
+
+## PR183 merged after full green gates; first exact-main CI pending
+
+Coordinator Sol6.1/high retained the final Windows log:694RustPASS/36skip,
+184.200s body;48Node/UI/browser/ElectronPASS. Complete PR matrix GREEN594s wall:
+Windows589s<=660, Ubuntu291s,macOS464s. All10activity_v2 and corrected inventory
+case passed eachOS. Optional sample4PASS/4FAIL, U6owners_left49/owners_waited55,
+truncated1row2362bytes; no stability/re-enable/fix credit. Bounded all3logs,
+hashes/cases/durations retained. Prior failures remain, no rerun/dispatch.
+
+Immediately before merge at16:48:36UTC, live maincd890750 and its own
+CI44304025778 attempt1 SUCCESS reverified, alongside exact29a head/base/CLEAN
+and5green gates. Guarded squash merge succeeded as08c4b999; remote main/merged
+PR verified, crate diff versus reviewed29a empty. PR183 unwatched after merge.
+Local checkpoint0ffafc39/source branch preserved; no unpushed docs discarded.
+[Terminal/merge evidence](evidence/windows-execution-choice-pr183-reviewed-ci.md).
+
+First resulting-main pushCI44351538977 attempt1 running with all runners:
+Windows134968209866,Ubuntu134968210365,macOS134968210476. Metadata onD at
+arx-pr183-merge-main. Main health remains PENDING; previous626s history unchanged,
+no fabricated pending-green duration entry. Owner preview remains prepared/UNRUN;
+actual Claude Code acceptance and full M2/v1 acceptance still missing.
+
+While main gates run, a separate Sol6.1/high READ-ONLY architecture task prepares
+the remaining trusted-clock/expiry-security/evidence contract onD. It may inspect
+source and propose a bounded draft only; no source/runtime/CI action or altered
+15minuteTTL/CI budget/controlled-vs-real-time evidence credit. Existing accepted
+complete RPC design stays frozen; PR182 HOLD/NOFIX and all exhausted counters
+remain. M2OPEN/M3UNCHECKED. No admin/VM/LabManager/cache/userdata/babysitter action.
