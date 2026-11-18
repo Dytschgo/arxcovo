@@ -33,6 +33,9 @@ async fn anchored_preproof_single_voter() {
     let cleanup_deadline = entry + Duration::from_secs(40);
     let dir = private_temp();
     let router = Arc::new(MemRouter::default());
+    use issue::found::observation::{self, Call, Cleanup};
+    let mut captured = None;
+    let mut refusal = None;
     let mut node = None;
     let mut blocking = None;
     let mut tls_work = None;
@@ -61,10 +64,19 @@ async fn anchored_preproof_single_voter() {
         let csr = CertificateParams::default()
             .serialize_request(&key)
             .unwrap();
-        let founder = n
-            .found(&ca, &Clock, BasicNode::new("mem:1"), csr.der())
-            .await
-            .unwrap();
+        let (found, snapshot) = observation::capture_call(
+            Call::ProofInitial,
+            n.found(&ca, &Clock, BasicNode::new("mem:1"), csr.der()),
+        )
+        .await;
+        captured = Some(snapshot);
+        let founder = match found {
+            Ok(leaf) => leaf,
+            Err(error) => {
+                refusal = Some(error);
+                return;
+            }
+        };
         let store = n.sm.as_ref().unwrap().0.clone();
         blocking = Some(tokio::task::spawn_blocking(move || {
             let list = {
@@ -157,16 +169,46 @@ async fn anchored_preproof_single_voter() {
             .expect("TLS cleanup unresolved")
             .unwrap();
     }
-    router.nodes.lock().unwrap().clear();
+    let mut cleanup = Cleanup::unknown();
+    if refusal.is_some() {
+        cleanup.router = match router.nodes.lock() {
+            Ok(mut nodes) => {
+                nodes.clear();
+                observation::Status::Ok
+            }
+            Err(_) => observation::Status::Failed,
+        };
+    } else {
+        router.nodes.lock().unwrap().clear();
+    }
     drop(router);
     let n = node
         .as_mut()
         .expect("startup unresolved; cleanup unknown: blocking startup cannot be aborted");
+    if let Some(error) = refusal {
+        let shutdown = timeout_at(cleanup_deadline, n.shutdown()).await;
+        cleanup.shutdown = observation::shutdown_status(&shutdown);
+        cleanup.store = observation::status(n.sm_weak.upgrade().is_none());
+        cleanup.log = observation::status(n.log_weak.upgrade().is_none());
+        observation::emit(captured.as_ref().unwrap(), cleanup);
+        panic!("original founder refusal: {error}");
+    }
     timeout_at(cleanup_deadline, n.shutdown())
         .await
         .expect("cleanup deadline exceeded")
         .expect("clean shutdown required");
     assert!(n.sm_weak.upgrade().is_none());
     assert!(n.log_weak.upgrade().is_none());
+    if let Some(snapshot) = captured.as_ref() {
+        observation::emit(
+            snapshot,
+            Cleanup {
+                router: observation::Status::Ok,
+                shutdown: observation::Status::Ok,
+                store: observation::Status::Ok,
+                log: observation::Status::Ok,
+            },
+        );
+    }
     result.expect("work exceeded cooperative deadline");
 }

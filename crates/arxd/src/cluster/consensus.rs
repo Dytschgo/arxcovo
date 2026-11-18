@@ -145,6 +145,7 @@ impl std::fmt::Display for StartError {
 }
 impl std::error::Error for StartError {}
 mod adapter;
+pub(in crate::cluster) mod anchor_query;
 pub(in crate::cluster) mod issue;
 
 use super::{
@@ -244,7 +245,7 @@ struct Owners {
 pub(super) struct ConsensusNode {
     id: u64,
     read_permits: Arc<Semaphore>,
-    issue_permits: Semaphore,
+    issue_permits: Arc<Semaphore>,
     #[cfg(test)]
     read_blocking: Arc<std::sync::atomic::AtomicUsize>,
     raft: Option<Engine>,
@@ -289,7 +290,7 @@ impl ConsensusNode {
             .map_err(|_| StartError::Fatal)?;
         Ok(Self {
             id: node,
-            issue_permits: Semaphore::new(issue::MAX_ISSUING),
+            issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
             read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
             #[cfg(test)]
             read_blocking: Arc::default(),
@@ -311,36 +312,153 @@ impl ConsensusNode {
         &self,
         cmd: Command,
     ) -> Result<openraft::raft::ClientWriteResponse<Arx>, ProposeError> {
-        let permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ProposeError::Busy)?;
+        #[cfg(test)]
+        use issue::found::observation;
+        #[cfg(test)]
+        let obs = observation::worker();
+        let permit = self.permits.clone().try_acquire_owned().map_err(|_| {
+            #[cfg(test)]
+            observation::mark(
+                &obs,
+                observation::Edge::Admission,
+                observation::Reason::Busy,
+            );
+            ProposeError::Busy
+        })?;
+        #[cfg(test)]
+        observation::mark(&obs, observation::Edge::Admission, observation::Reason::Ok);
         let (tx, rx) = oneshot::channel();
         {
-            let mut owners = self.owners.lock().map_err(|_| ProposeError::Stopped)?;
+            let mut owners = self.owners.lock().map_err(|_| {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersPoison,
+                );
+                ProposeError::Stopped
+            })?;
             if owners.closed {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersClosed,
+                );
                 return Err(ProposeError::Stopped);
             }
             while owners.set.try_join_next().is_some() {}
-            let raft = self.raft.as_ref().ok_or(ProposeError::Stopped)?.clone();
+            let raft = match self.raft.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingRaft,
+                    );
+                    return Err(ProposeError::Stopped);
+                }
+            }
+            .clone();
+            #[cfg(test)]
+            let owner_obs = obs.clone();
             owners.set.spawn(async move {
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::OwnerEnter,
+                    observation::Reason::Ok,
+                );
+
                 let (responder, reply) = ProgressResponder::<Arx, _>::complete_only();
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::Submission,
+                    observation::Reason::Pending,
+                );
                 let result = match raft.client_write_ff(cmd, Some(responder)).await {
-                    Err(_) => Err(ProposeError::Unknown),
-                    Ok(()) => match reply.await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(ClientWriteError::ForwardToLeader(f))) => {
-                            Err(ProposeError::NotLeader(f.leader_id))
+                    Err(_) => {
+                        #[cfg(test)]
+                        observation::mark(
+                            &owner_obs,
+                            observation::Edge::SubmissionReply,
+                            observation::Reason::SubmitError,
+                        );
+                        Err(ProposeError::Unknown)
+                    }
+                    Ok(()) => {
+                        #[cfg(test)]
+                        observation::mark(
+                            &owner_obs,
+                            observation::Edge::SubmissionReply,
+                            observation::Reason::Ok,
+                        );
+                        match reply.await {
+                            Ok(Ok(r)) => {
+                                #[cfg(test)]
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::EngineReply,
+                                    observation::Reason::Ok,
+                                );
+                                Ok(r)
+                            }
+                            Ok(Err(ClientWriteError::ForwardToLeader(f))) => {
+                                #[cfg(test)]
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::EngineReply,
+                                    observation::Reason::Forward,
+                                );
+                                Err(ProposeError::NotLeader(f.leader_id))
+                            }
+                            #[cfg(test)]
+                            Ok(Err(_)) => {
+                                #[cfg(test)]
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::EngineReply,
+                                    observation::Reason::ReplyError,
+                                );
+                                Err(ProposeError::Unknown)
+                            }
+                            _ => {
+                                #[cfg(test)]
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::EngineReply,
+                                    observation::Reason::ReceiverClosed,
+                                );
+                                Err(ProposeError::Unknown)
+                            }
                         }
-                        _ => Err(ProposeError::Unknown),
-                    },
+                    }
                 };
                 drop(permit);
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::OwnerSend,
+                    observation::Reason::Pending,
+                );
                 let _ = tx.send(result);
             });
         }
-        rx.await.unwrap_or(Err(ProposeError::Unknown))
+        {
+            #[cfg(test)]
+            let rx = async {
+                rx.await.inspect_err(|_| {
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerReply,
+                        observation::Reason::ReceiverClosed,
+                    );
+                })
+            };
+            rx.await.unwrap_or(Err(ProposeError::Unknown))
+        }
     }
     /// `f` is a pure store read: no await and no calls back into Raft.
     /// The caller deadline does not terminate queued engine or blocking work.
@@ -348,30 +466,93 @@ impl ConsensusNode {
         &self,
         f: impl FnOnce(&StateStore) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<(LeaderId, T), ReadError> {
+        #[cfg(test)]
+        use issue::found::observation;
+        #[cfg(test)]
+        let obs = observation::worker();
         let deadline = Instant::now() + READ_BUDGET;
-        let permit = self
-            .read_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ReadError::Busy)?;
+        let permit = self.read_permits.clone().try_acquire_owned().map_err(|_| {
+            #[cfg(test)]
+            observation::mark(
+                &obs,
+                observation::Edge::Admission,
+                observation::Reason::Busy,
+            );
+            ReadError::Busy
+        })?;
+        #[cfg(test)]
+        observation::mark(&obs, observation::Edge::Admission, observation::Reason::Ok);
         let (tx, rx) = oneshot::channel();
         {
-            let mut owners = self.owners.lock().map_err(|_| ReadError::Unavailable)?;
+            let mut owners = self.owners.lock().map_err(|_| {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersPoison,
+                );
+                ReadError::Unavailable
+            })?;
             if owners.closed {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersClosed,
+                );
                 return Err(ReadError::Unavailable);
             }
             while owners.set.try_join_next().is_some() {}
-            let raft = self.raft.as_ref().ok_or(ReadError::Unavailable)?.clone();
-            let sm = self.sm.as_ref().ok_or(ReadError::Unavailable)?.clone();
+            let raft = match self.raft.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingRaft,
+                    );
+                    return Err(ReadError::Unavailable);
+                }
+            }
+            .clone();
+            let sm = match self.sm.as_ref() {
+                Some(value) => value,
+                None => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::OwnersGate,
+                        observation::Reason::MissingStore,
+                    );
+                    return Err(ReadError::Unavailable);
+                }
+            }
+            .clone();
             #[cfg(test)]
             let read_blocking = self.read_blocking.clone();
+            #[cfg(test)]
+            let owner_obs = obs.clone();
             owners.set.spawn(async move {
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::OwnerEnter,
+                    observation::Reason::Ok,
+                );
+
                 let result = async {
                     if Instant::now() >= deadline || tx.is_closed() {
                         return Err(ReadError::Unavailable);
                     }
                     // Never cancel this wait: only its reply proves that an
                     // unwithdrawable engine request no longer owns this unit.
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::LinearizerEnter,
+                        observation::Reason::Pending,
+                    );
                     let linearizer = raft
                         .get_read_linearizer(
                             LinearizerOption::new(Some(Duration::ZERO), true).with_wait_timeout(
@@ -379,15 +560,39 @@ impl ConsensusNode {
                             ),
                         )
                         .await
-                        .map_err(|e| match e {
-                            RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
-                                ReadError::NotLeader
+                        .map_err(|e| {
+                            #[cfg(test)]
+                            if owner_obs.is_some() {
+                                observation::mark(
+                                    &owner_obs,
+                                    observation::Edge::LinearizerReply,
+                                    match &e {
+                                        RaftError::APIError(
+                                            LinearizableReadError::ForwardToLeader(_),
+                                        ) => observation::Reason::Forward,
+                                        RaftError::APIError(
+                                            LinearizableReadError::QuorumNotEnough(_),
+                                        ) => observation::Reason::NoQuorum,
+                                        RaftError::Fatal(_) => observation::Reason::Fatal,
+                                    },
+                                );
                             }
-                            RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
-                                ReadError::NoQuorum
+                            match e {
+                                RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
+                                    ReadError::NotLeader
+                                }
+                                RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+                                    ReadError::NoQuorum
+                                }
+                                _ => ReadError::Unavailable,
                             }
-                            _ => ReadError::Unavailable,
                         })?;
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::LinearizerReply,
+                        observation::Reason::Ok,
+                    );
                     if Instant::now() >= deadline || tx.is_closed() {
                         return Err(ReadError::Unavailable);
                     }
@@ -399,8 +604,32 @@ impl ConsensusNode {
                         .await
                     {
                         Ok(Ok(ready)) => ready,
-                        _ => return Err(ReadError::Unavailable),
+                        #[cfg(test)]
+                        Ok(Err(_)) => {
+                            #[cfg(test)]
+                            observation::mark(
+                                &owner_obs,
+                                observation::Edge::AppliedReady,
+                                observation::Reason::ReadyInnerError,
+                            );
+                            return Err(ReadError::Unavailable);
+                        }
+                        _ => {
+                            #[cfg(test)]
+                            observation::mark(
+                                &owner_obs,
+                                observation::Edge::AppliedReady,
+                                observation::Reason::ReadyOuterError,
+                            );
+                            return Err(ReadError::Unavailable);
+                        }
                     };
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::AppliedReady,
+                        observation::Reason::Ok,
+                    );
                     if Instant::now() >= deadline || tx.is_closed() {
                         return Err(ReadError::Unavailable);
                     }
@@ -409,34 +638,112 @@ impl ConsensusNode {
                     let index = read.index();
                     // Cancellation of the async owner cannot release either
                     // resource while this non-abortable closure still runs.
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::BlockingSubmit,
+                        observation::Reason::Pending,
+                    );
+                    #[cfg(test)]
+                    let blocking_obs = owner_obs.clone();
                     blocking(move || {
+                        #[cfg(test)]
+                        observation::mark(
+                            &blocking_obs,
+                            observation::Edge::ClosureStart,
+                            observation::Reason::Ok,
+                        );
                         #[cfg(test)]
                         read_blocking.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let result = (|| {
                             let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
+                            #[cfg(test)]
+                            observation::mark(
+                                &blocking_obs,
+                                observation::Edge::MutexAcquired,
+                                observation::Reason::Ok,
+                            );
                             if s.applied().is_none_or(|p| p.index < index) {
                                 Err(StoreError::Corrupt)
                             } else {
                                 f(&s).map(|value| (leader, value))
                             }
                         })();
+                        #[cfg(test)]
+                        if blocking_obs.is_some() {
+                            observation::mark(
+                                &blocking_obs,
+                                observation::Edge::StoreReply,
+                                observation::store_reason(&result),
+                            );
+                        }
                         // Guard, store Arc, permit, then completion (#147).
                         drop(sm);
                         drop(permit);
                         result
                     })
                     .await
-                    .map_err(|_| ReadError::Unavailable)
+                    .map_err(|_| {
+                        #[cfg(test)]
+                        observation::mark(
+                            &owner_obs,
+                            observation::Edge::BlockingJoin,
+                            observation::Reason::BlockingError,
+                        );
+                        ReadError::Unavailable
+                    })
                 }
                 .await;
                 if Instant::now() < deadline && !tx.is_closed() {
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::OwnerSend,
+                        observation::Reason::Pending,
+                    );
                     let _ = tx.send(result);
                 }
             });
         }
         match timeout_at(deadline, rx).await {
-            Ok(Ok(result)) if Instant::now() < deadline => result,
-            _ => Err(ReadError::Unavailable),
+            Ok(Ok(result)) if Instant::now() < deadline => {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::CallerReply,
+                    observation::Reason::Ok,
+                );
+                result
+            }
+            #[cfg(test)]
+            Ok(Ok(_)) => {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::CallerReply,
+                    observation::Reason::Expired,
+                );
+                Err(ReadError::Unavailable)
+            }
+            #[cfg(test)]
+            Ok(Err(_)) => {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::CallerExpiry,
+                    observation::Reason::ReceiverClosed,
+                );
+                Err(ReadError::Unavailable)
+            }
+            _ => {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::CallerExpiry,
+                    observation::Reason::Expired,
+                );
+                Err(ReadError::Unavailable)
+            }
         }
     }
     pub async fn linearizable_state(&self) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {

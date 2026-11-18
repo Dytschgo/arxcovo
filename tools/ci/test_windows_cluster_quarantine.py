@@ -428,5 +428,79 @@ class AnchoredPreproofTests(unittest.TestCase):
                 assert_anchored_preproof(source, parent)
 
 
+
+QUERY_REQUIRED = ['owned_anchor_query_single_voter']
+QUERY_LOCAL_REQUIRED = [
+    'owned_query_dropped_callers_and_read_admission',
+    'owned_query_timeout_shutdown_retains_submitted_resources',
+    'owned_query_bounds_poison_and_no_submission',
+    'owned_query_consumed_tls_zero_proof',
+]
+
+
+def assert_owned_query(source, module, parent):
+    assert QUERY_REQUIRED == ['owned_anchor_query_single_voter']
+    assert len(QUERY_LOCAL_REQUIRED) == 4
+    assert_fixture_quarantine(source, (), required=QUERY_REQUIRED + QUERY_LOCAL_REQUIRED)
+    assert_issuance_required(source)
+    assert_issuance_required(parent)
+    # All helpers and ancestors participate: no hidden platform predicates.
+    assert_issuance_required(module.replace('#[cfg(not(test))]\n            drop(handle);', ''))
+    for text, binding in (
+        (parent, 'pub(in crate::cluster) mod anchor_query;'),
+        (module, '#[cfg(test)]\n#[path = "anchor_query_tests.rs"]\nmod anchor_query_tests;'),
+    ):
+        assert text.count(binding) == 1
+        prefix = text.split(binding)[0]
+        assert not re.search(r'#\[[^\]]*\]\s*$', prefix)
+    assert module.count('mod anchor_query_tests;') == 1
+    assert parent.count('mod anchor_query;') == 1
+    assert source.count('ConsensusNode::start(') == 1
+    for token in ('Cluster::', 'test_ticket', 'assume(', 'pki::leaf('):
+        assert token not in source
+    for token in ('.anchor_query(', '.shutdown()', 'EngineEnd::Absent',
+                  'M1 post-abort read retention', 'M2 consumed query server plaintext',
+                  'is_finished()', 'tls_query(', '.found(', '.enroll('):
+        assert token in source
+
+
+class OwnedQueryTests(unittest.TestCase):
+    def test_query_required_inventory_and_helpers(self):
+        base = ROOT / 'crates/arxd/src/cluster'
+        source = (base / 'consensus/anchor_query_tests.rs').read_text(encoding='utf-8')
+        module = (base / 'consensus/anchor_query.rs').read_text(encoding='utf-8')
+        parent = (base / 'consensus.rs').read_text(encoding='utf-8')
+        assert_owned_query(source, module, parent)
+        for name in QUERY_REQUIRED + QUERY_LOCAL_REQUIRED:
+            signature = 'async fn ' + name + '('
+            for mutation in (
+                source.replace(signature, 'async fn renamed('),
+                source.replace(signature, '#[ignore]\n' + signature),
+                source.replace(signature, '#[cfg(unix)]\n' + signature),
+            ):
+                with self.assertRaises(AssertionError):
+                    assert_owned_query(mutation, module, parent)
+        for mutation in ('', '#![cfg(unix)]\n' + source,
+                         source + '\nfn hidden(){ ConsensusNode::start(); }',
+                         source + '\n#[cfg(unix)]\nfn hidden(){}',
+                         source + '\n#[ignore]\nfn hidden(){}'):
+            with self.assertRaises(AssertionError):
+                assert_owned_query(mutation, module, parent)
+        with self.assertRaises(AssertionError):
+            assert_owned_query(source, module, '#![cfg(unix)]\n' + parent)
+        for text, token, which in (
+            (parent, 'pub(in crate::cluster) mod anchor_query;', 'parent'),
+            (module, 'mod anchor_query_tests;', 'module'),
+        ):
+            for replacement in ('', '#[cfg(unix)]\n' + token, token + token):
+                changed = text.replace(token, replacement)
+                with self.assertRaises(AssertionError):
+                    assert_owned_query(source, changed if which == 'module' else module,
+                                       changed if which == 'parent' else parent)
+        with patch(__name__ + '.QUERY_REQUIRED', []):
+            with self.assertRaises(AssertionError):
+                assert_owned_query(source, module, parent)
+
+
 if __name__ == "__main__":
     unittest.main()

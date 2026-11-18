@@ -2,19 +2,16 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main RED:** exact `09134085dce93742d8812821dbe11834dcee7a9c`
-after docs-only PR175. First-attempt CI44198128467 failed Windows nextest:
-found_tests::f6_adapters at319 and f8_store_privacy at449 unwrapped Unavailable;
-f7_clock_guard_order at434 did not return expected ClockRollback. These required
-single-node founder tests are outside the existing three-node fixture quarantine.
-Ubuntu/macOS passed. No cause, rerun, fix, waiver or new quarantine claimed.
-Feature publication and merges are held. Fresh independent Sol diagnosis is
-assigned; exhausted Sol3/3 and historical Opus0/2 counters remain unchanged.
-PR176's previous source review passed but public status was withheld on main
-drift; its docs-only parent refresh remains local and unpushed.
-Historical policy activation main10aa891f passed632s wall/629s charged,
-ADR0025 active, original five protection checks restored; the exception is consumed.
-M2 open/M3 unchecked; hardware **unverified on real hardware**.
+**Current main GREEN:** exact `05b9c82930cd3812614fc20f5d03d0a5fa05952a`
+after owner-approved diagnostic PR177. CI44212212325 attempt1 succeeded:
+608s wall,605s charged,3s verified idle queue credit; Windows604s,
+Ubuntu343s/macOS425s. Founder13 passed on all OS. Automatic trusted policy
+44213556680 succeeded. The previous main09134085 F6/F7/F8 red remains
+unreproduced and unfixed; passing output hides the diagnostic trace.
+The diagnostic red-main exception is consumed; protection is unchanged.
+Normal M3 preparation may resume with fresh review, five gates and feature
+Windows<=660s still required. M2 open/M3 unchecked; Windows fixture28 and
+hardware paths remain **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -41,11 +38,11 @@ PR145 was merged after the first red main run without accounting for it; the coo
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
 
 
-## Current state - 2026-11-17
+## Current state - 2026-11-18
 
-- Last merged: PR163 as10aa891f; reviewed head22a09eae, owner-approved budget-only bootstrap consumed, original protection restored. First exact-main CI44177880021 green632s wall/629s charged.
-- Current work: queue-policy activation checkpoint is local. Owned anchor-query refresh and reviewed authenticated identity-retention prerequisite are next; normal independent reviews and all five gates apply.
-- Blockers: no current CI budget deadlock. Production joining still needs public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Windows fixture28 remains unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
+- Last merged: PR177 as05b9c829 from reviewed1c7c9f52 under the explicit owner diagnostic exception; protection unchanged. First-main CI44212212325 green608wall/605charged; founder13 allOS.
+- Current work: PR176 owned anchor query refreshed onto green diagnostic main. Reviewed five feature files remain unchanged; fresh exact-head review and all hosted gates, including new query engine proof and Windows<=660s, remain required. Identity and membership-observation contracts are independently reviewed and local.
+- Blockers: no current red-main hold; prior founder failures remain unexplained, not fixed. Production join still needs admission, authenticated transport/discovery, owner/removal authority, custody and clock contracts. M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged; hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3583,3 +3580,65 @@ Root Sol coordinator retained Sol6.1/high one-F6 result25aad48a: complete14-even
 ### Diagnostic CI static guard rejection - 2026-11-18
 
 PR177 head3c2d04c3 CI44203071298 failed the same issuance-scope guard on all OS before Rust checks or F6. No hosted phase observation occurred. Guard correctly rejects cfg(not(test)); root replaced split macro definitions with one definition per macro, using cfg(test) only on observation statements. Guard remains unchanged and passes7/7; fmt/diff checks passed. Non-test expansion now uses a single-evaluation let/result block rather than literal expression tokens; independent review of lifetime/drop equivalence is required before any push. No tests rerun, no fix/stability credit; main09134085 RED and PR176 held. Raw failurelog SHA256 afc8c19955785b9457f04c2fc3096e8f24127ef5a6efefc5b63e3d14657644f9.
+
+### Owner-approved PR177 diagnostic merge - 2026-11-18
+
+Owner statement: Approve PR177 diagnostic merge. Root pinned head1c7c9f52/main09134085 and all five green gates, then merged05b9c829 through normal protection. No protection API writes; full before/after protection equality and reviewed tree equality passed. Authorization and raw readback retained D:/Temp/arx-pr177-approved-merge. Active main wait CI44212212325; no source fix, retry or feature merge authorized. Earlier approval-pending text is historical; this exception is consumed and not reusable.
+
+### First diagnostic-main CI verified - 2026-11-18
+
+Root actively awaited CI44212212325 to exit0, retained full three-platform logs and parsed founder13PASS eachOS. Pure charged-v1 calculation608wall/605charged/3credit; automaticpolicy44213556680success. Protection remained unchanged; no sourcefix/stabilitycredit or further exception. Main-red hold cleared for normal PR176 refresh. Evidence D:/Temp/arx-pr177-approved-merge/main-success.json and measurement.json.
+
+### PR176 refresh after approved diagnostic merge - 2026-11-18
+
+Root integrated main05b9c829 after exact CI44212212325 success. Five query feature files remain byte-identical reviewedf9d0a413. Parent changes add reviewed diagnostic test instrumentation only outside the feature diff. Fresh guard8 and fmt/diff checks required before push; previous26selected cases/Clippy/mutants retained with restoration qualifications. Hosted query engine case remains first-run evidence, not locally exercised. Exact-head review, all five gates and featureWindows<=660s required.
+
+Root final refresh checks: all five feature files equal reviewedf9d0a413 bytes; cargo fmt and static guard8 passed once, diff checks clean. No Rust behavior, engine or mutation rerun on the refreshed parent; hosted checks provide new integration evidence.
+
+### PR176 refreshed Ubuntu red - 2026-11-18
+
+CI44213815251 onf1bf99bc failed Ubuntu nextest: owned_anchor_query_single_voter atanchor_query_tests521, existinganchored_preproof_single_voter atanchored_join_tests67 and founderf10_drop_bounded atfound_tests552 each unwrapped found()->Unavailable. New query case failed before anchor-query execution; no query engine proof or cause claimed. Main05b9c829 remains separately green at last observed CI44212212325. Other platforms pending. One gh job-log wrapper was unavailable while overallrunpending; directcompleted-job log API succeeded; no test repeated. Rawlog D:/Temp/arx-pr176-f1bf-hosted/ubuntu.log SHA256 040328dacf0d441ac1229c380ee091d0b456f9f4ff9d25c1ebddfa7650786f5e. NewindependentSol disposition is required; no fix/timeout/retry/quarantine change, Sol3/3/historicalOpus0/2 unchanged. PR176 merge held; M2open/M3unchecked hardware **unverified on real hardware**.
+
+### Ubuntu founder refusal disposition - 2026-11-18
+
+Fresh Sol6.1/high disposition30185388 confirms initial found failures before newquery/proof in two cases and final first-initialization found in F10. Phase unknown; cancellation/timing causality unproven. Proposed real mutex-backpressure C/T loop is diagnostic, notfix; exactpatch preparation only is next. No qualifying dedicated Ubuntu runtime has been established in this session, so root may later authorize only a clearly labelled localWindowsmodel under existing PC grant, after exactdiffreview. No runtime now; macOSgreen, Windowspending, Ubuntured; PR176held and main05b9c829 separatelygreen.
+
+### PR176 platform disposition and patch safety review - 2026-11-18
+
+CI44213815251 is terminal: Ubuntu failure, macOS and Windows success. No rerun. Root retained exact F10C/T patchese470dc3c; only gate-drop position differs, no active source change. Independent Sol6.1 high static safety review is running before any localWindowsmodel execution grant. PR176 held; no inference that hostedUbuntufailure is caused by mutexbackpressure.
+
+### F10 local-model execution grant - 2026-11-18
+
+Independent Sol6.1 high safety review3320f566 has no blockers; root accepts cooperative-budget and late-marker qualifications. Root authorizes one compilation/invocation of C, then only if every preregistered C result/trace/capacity/shutdown oracle passes one compilation/invocation of T. No repeats, source repairs, tuning or extra cells. LocalWindows model only under priorPCgrant, notUbuntu/naturalhostcausality. Any mismatch stops and consumes that cell; exactcrate restoration and no process survivors required. Diagnostic treatment expected red validates only its controlled refusal/observer path; fix counters unchanged, PR176held.
+
+### F10 control invalidated at process audit - 2026-11-18
+
+Sol6.1/high result7a5302c9: Cnextestexit0/14eventtrace/capacity4+8/shutdownOk, but immediate snapshot contained2cargo/1rustc names withoutPIDs/ownership, so overallCinvalid andTunrun. One later agent snapshot absent; root current snapshot found a newcargo chain created after C, which does not attribute the earlier names. No kills/retries/reinterpretation. All132cratebytes restored exactly. Root requests independent harness disposition before furtherexecution; naturalUbuntu cause unproven, PR176held, counters unchanged. The evidence wrapper cp1252print error occurred after saved outcome and is separate from testexit0.
+
+### Owner Astra6.2 stuck-review routing - 2026-11-18
+
+Owner instruction: use Astra6.2 as code reviewer if stuck. Root confirmed Codexgpt-6.2-astra availability and selected high effort for the stuck founder/query code plus harness review. Replaced the Sol6.1 process audit: task_cancel requested, backingrun wait confirmed interrupted before Astra launch. One reviewer active, no duplicate writers. Sol6.1 remains implementation/default technical routing; Claude remains UI-only. Astra review is static only, no new tests/fixes/attemptreset/ownerexception. Existing Cinvalid/Tunrun andPR176held remain.
+
+### Astra stuck-path disposition adopted - 2026-11-18
+
+Astra6.2/high review76fab91b: required founder refusal branches remain unknown; new query test stopped before query. Existing panic paths bypass explicit shutdown, so teardown evidence is absent, not a proven leak or cause. Cinvalid/Tunrun retained; artificial mutex treatment duplicates coveredtimeout behavior and is not admitted. Root adopts a higher-information Ubuntu diagnostic: scope three failing calls plus observed fourthco-runner, capture actualrefusal branch/workeredges and cleanup separately. Prepare contract only before newsource; proposed carrier is one new instrumentedrevision through existing normal Ubuntuverify/fullCI, not a rerun or workflow/settings change. Record actual overlap; green/missingoverlap proves no reproduction. Independent Astra review precedes runtime/publication. Sol6.1 remains builder, no exhausted fix reset; PR176held.
+
+### Ubuntu diagnostic contract review - 2026-11-18
+
+Sol6.1/high brief f26c0825 retainedb10ac552 specifies actualrefusal tags, fixedworkeredges and primary-error cleanup before originalassertions. Root flaggedprocfs trust/overlap feasibility before sourceauthorization. Independent Astra6.2/high contractreview is running, tasked to keep the diagnostic minimal and resolve scope/trust gaps. No source/build/runtime/network changes; PR176held, Cinvalid/Tunrun, counters unchanged, hardware **unverified on real hardware**.
+
+### Corrected Ubuntu diagnostic implementation grant - 2026-11-18
+
+Root applied all four Astra2be92556 contract corrections asbbe9a443: immutableguardlane, missingRaftcallerreason, returned-Err-onlycleanup, no procfs/host/processreader. Sol6.1/high localimplementation active under explicitcompilebudget: oneClippy+oneoptionalmechanicalbatch/recheck, onefocusedpure-recorder invocation, no localengine/failingcase/mutation/runrepeat. ExactdiffAstrareview beforepublication, no push/CIgrantyet. Caps/clock/drop/primaryerror requirements retained. PR176held; countersunchanged,M2openM3unchecked,hardware **unverified on real hardware**.
+
+### Ubuntu observer local candidate and gaps - 2026-11-18
+
+Sol6.1/high source84522a3b and evidencea5f7d37e retainedlocally (ea4542d2/30547a71). FinalClippy and pure4passed after1/1mechanicalbatch; fmt/guard8/sampler60 passed beforebatch, no finalsource rerun claimed. Knownbranchattributiongaps remain; source is notpublication-ready. Root requested Astra6.2/high exactdiffreview, including non-test semantics, success/failurecleanup, missingbranchdistinctions and1121linecomplexity. No furtherbuilderedits orCIuntilrootdisposition. Noengine/runtimefailingcase rerun, nofixcredit; PR176held/M2openM3unchecked/hardware **unverified on real hardware**.
+
+### Founder observer review corrections - 2026-11-18
+
+Root correctionc3d45d6d addresses Astra9da4bf2b five blockers: leafdrop, singlelookups/inactivecapture, distinctguardfinalbranches/emptyunperformedrows, typedpremapleaderwait, livewiringevidence. RootClippyinitial5lazyclosurelintfailures corrected with singlelookupmatches; recheckpassed. Pure4passedonce (641filtered), livewiringauditpassed and6source-mutantsrejected; finalguard8/fmt/diffpassed. Optionalsuccessrows acceptedasUnknown, no synthetictiming. ExactsourceAstra6.2high recheckactiveatba493dfc; no engine/CI/push/newfixcredit. Earlier scriptseam errors recordedinevidence, not hidden. PR176held/countersunchanged/M2openM3unchecked/hardware **unverified on real hardware**.
+
+### Ubuntu observer publication decision - 2026-11-18
+
+Astra6.2/high recheck10d324e6 closes all five9da4bf2b blockers atba493dfc, no new blocker. Root confirmed currentmain05b9c829/CI44212212325 stillgreen and finalsourceunchanged from reviewedtree. Optionalmissing worker rows stayUnknown. Root authorizes one new-source normalfullCI observation via PR176 update; no manualdispatch/rerun/settings change. Existingqueryengineproof/allfivegates/Windows<=660s and freshmainhealth remain required; thisdiagnostic is notfix/stabilitycredit. Authorization D:/Temp/arx-pr176-ubuntu-diagnostic-publication/authorization.json. Cinvalid/Tunrun, counters unchanged; M2open/M3unchecked/hardware **unverified on real hardware**.

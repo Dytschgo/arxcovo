@@ -1,0 +1,34 @@
+--- a/crates/arxd/src/cluster/consensus/found_tests.rs
++++ b/crates/arxd/src/cluster/consensus/found_tests.rs
+@@ -549,8 +549,29 @@
+     drop(gate);
+     released(&n).await;
+     uninitialized(&n);
+-    issue(&n, &ca, &csr).await.unwrap();
+-    n.shutdown().await.unwrap();
++    let gate = Gate::new(&n);
++    eprintln!("[DEBUG-F10-BP] gate_acquired=1");
++    drop(gate);
++    let found_result = observation::capture(issue(&n, &ca, &csr)).await;
++    eprintln!("[DEBUG-F10-BP] gate_released_joined=1");
++    released(&n).await;
++    let issue_free = n.issue_permits.available_permits();
++    let read_free = n.read_permits.available_permits();
++    eprintln!("[DEBUG-F10-BP] drain_completed=1 issue_free={issue_free} read_free={read_free}");
++    let shutdown_result = n.shutdown().await;
++    eprintln!(
++        "[DEBUG-F10-BP] primary_ok={} primary_unavailable={}",
++        found_result.is_ok(),
++        matches!(&found_result, Err(FoundError::Unavailable))
++    );
++    eprintln!(
++        "[DEBUG-F10-BP] shutdown_completed=1 shutdown_ok={}",
++        shutdown_result.is_ok()
++    );
++    assert_eq!(issue_free, 4);
++    assert_eq!(read_free, 8);
++    found_result.unwrap();
++    shutdown_result.unwrap();
+ });
+ bounded!(f10_outer_budget, async {
+     let d = private_temp();
