@@ -3973,3 +3973,13 @@ locally underADR0026, not as timeoutrepair; Sol6.1/high builder assigned only
 consensus modulebinding/newpeer_wire.rs+synchronous tests. Independentactualsource
 review/normalnewsourcefirstattempt required before publication. No docs-onlypush
 solely to triggerCI. OwnerPCfences/babysitter intact; no native/admin/container run.
+
+Sol6.1/high read-only TLSownership follow-up proposes futureWeakstore+try_lock
+registrycallback to remove mutexwaiting withouttasks/snapshots/newcapacity. Actual
+localappliedauthorize stillrequired; contentionfailsclosed, no hardwallpromise.
+Candidate retained D:/Temp/arx-peer-registry-design.md for separatebrief/ADR/review,
+notadded to currentcodecsource scope. Future livehandshakecap/taskownership/
+inbounddeadlinepolicy remainsneeded. No callback/transport implementation or test.
+Current purecodec source draft validating; initialClippy hadtypeAPI compileerrors,
+mechanicallycorrected withinnewmodule beforesemanticexecution. Independent Sol
+actualsourcereview started; no runtimefix/counterreset.
