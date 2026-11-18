@@ -38,3 +38,10 @@ exact-main health. No rerun/dispatch/forcepush or additional fix follows.
 Production startup/factory/join/full RPC/container/hardware acceptance is not
 established; M2 OPEN/M3 UNCHECKED, hardware **unverified on real hardware**.
 EngineSol3/3/historicalOpus0/2 unchanged. OAuth/owner setup/babysitter untouched.
+
+Published834ca7d9 normal firstCI44404523355 is incomplete. Fresh independent
+Sol6.1/high integrated review returned Standards0/Spec0/Security0 GO after direct
+identities/compatibility checks and supplied32 expected names for hosted matching.
+[Exact-head attestation](https://github.com/Dytschgo/arxcovo/pull/182#issuecomment-6992641865)
+and agent-review success59305598516 are published. Hosted acceptance remains
+pending; source review adds no runtime, control, fix or exhausted-attempt authority.

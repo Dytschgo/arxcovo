@@ -62,6 +62,15 @@ stability, re-enable, repair or exhausted-attempt credit.
 
 ## Verification and delivery
 
+The standing owner rule, reiterated2026-11-19, recovers a proved zero-step,
+unassigned-runner acquisition cancellation on the unchanged head without owner
+approval. It is not a test rerun/fix attempt. Recover only the affected worker
+and dependent gates; retain successful workers and original failed-attempt
+metrics. Hourly recovery is bounded to four requests if acquisition fails again.
+This first-actual-execution exception does not change the budget evaluator,
+history, required checks, source review, timeouts or quarantine. Real test/step
+failures remain outside it. See PROGRESS Main CI health for the durable rule.
+
 Pin every validation step to its owning phase and test gate dependencies and
 failure behavior. Assert exact-layout/time validation and conservative fallback
 for any defect. Before merge, require independent exact-head review, all existing
