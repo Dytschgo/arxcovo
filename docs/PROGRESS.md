@@ -3610,3 +3610,7 @@ CI44213815251 is terminal: Ubuntu failure, macOS and Windows success. No rerun. 
 ### F10 local-model execution grant - 2026-11-18
 
 Independent Sol6.1 high safety review3320f566 has no blockers; root accepts cooperative-budget and late-marker qualifications. Root authorizes one compilation/invocation of C, then only if every preregistered C result/trace/capacity/shutdown oracle passes one compilation/invocation of T. No repeats, source repairs, tuning or extra cells. LocalWindows model only under priorPCgrant, notUbuntu/naturalhostcausality. Any mismatch stops and consumes that cell; exactcrate restoration and no process survivors required. Diagnostic treatment expected red validates only its controlled refusal/observer path; fix counters unchanged, PR176held.
+
+### F10 control invalidated at process audit - 2026-11-18
+
+Sol6.1/high result7a5302c9: Cnextestexit0/14eventtrace/capacity4+8/shutdownOk, but immediate snapshot contained2cargo/1rustc names withoutPIDs/ownership, so overallCinvalid andTunrun. One later agent snapshot absent; root current snapshot found a newcargo chain created after C, which does not attribute the earlier names. No kills/retries/reinterpretation. All132cratebytes restored exactly. Root requests independent harness disposition before furtherexecution; naturalUbuntu cause unproven, PR176held, counters unchanged. The evidence wrapper cp1252print error occurred after saved outcome and is separate from testexit0.
