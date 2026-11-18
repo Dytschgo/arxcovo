@@ -3880,3 +3880,9 @@ no TTL or CI-budget change. Real multi-host hardware unverified. M2OPEN/M3UNCHEC
 Owner checklist already sent; PC native runs await account/fence setup. Existing
 babysitter left intact; no LabManager/VM/admin actions. PR179 prepared correction
 and its independent review remain unchanged while old Windows job completes.
+
+OriginalPR179 run44272864519 completedFAIL: allthreeplatforms samehistory31!=30,
+Rust suites passed; Windowsjob590s. Fullboundedlogs retained. Publish only
+reviewed correction ancestor2f888992 (testblob0d735fd4), preserving oneconcernPR;
+ownersteering/containerplan commits remain local on this branch for next delivery.
+No runcancel/rerun/dispatch; membershipAPI and founder untouched, countersunchanged.
