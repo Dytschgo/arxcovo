@@ -22,13 +22,13 @@ One complete frame has a fixed44-byte header; all integers big-endian:
 magic ARXP(4), version1(u8), kind(u8:1AppendRequest/2AppendReply), reserved flags0(u16),
 payload length(u32), cluster16bytes, nonzero source(u64), nonzero target(u64).
 Separate header inspection from full decode so a later socket reader checks its
-allocation bound before reading a body. Neither function authenticates anything.
+kind-specific allocation bound before reading a body: request <=264068bytes, reply <=26bytes. Neither function authenticates anything.
 Reject unknown magic/version/kind, nonzero reserved, zero routes, truncation,
 length disagreement and trailing bytes. Vote/pre-vote/snapshot/leadershiptransfer/
 enrollment/forwarding/control/MCP kinds are unsupported and refused.
 
 Vote is term:u64,node:u64,committed:u8 restricted to0/1. A log position is
-term:u64,leader:u64,index:u64, respecting existing durable index range. Optional
+term:u64,leader:u64,index:u64. Every optional, entry and reply position requires index <=i64::MAX, matching durable storage. Term and vote/log node fields preserve the full u64 range, including zero syntactically; only header route IDs must be nonzero. Later TLS sender binding is a separate gate. Optional
 positions use0absent/1present then position; other option tags refuse.
 AppendRequest is vote, optionalprev, optionalleadercommit, count:u8(0..64), entries.
 Each entry is length:u16 then position24bytes and canonical payload. Payload tags
@@ -53,7 +53,7 @@ Do not use AppendEntriesResponse conversion helpers: conversion to Success disca
 exact acknowledgedposition, and Conflict->AppendResult can unwrap absent prev.
 No request is needed to reconstruct reply acknowledgement; do not invent its value.
 A later client must additionally validate returned positions against its sent request.
-No bytes/missing reply implies success. Static WireError variants only; no payload
+Missing, invalid or truncated replies are errors, never successful acknowledgements. Static WireError variants only; no payload
 Debug or commands/keydigests/verifiers/certificates in errors.
 
 ## Authentication boundary for later transport
