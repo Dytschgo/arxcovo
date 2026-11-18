@@ -75,4 +75,3 @@ Keep the runner under a finite outer task deadline as well: synchronous pipe wri
 M2 OPEN / M3 UNCHECKED. PR182 HOLD/NOFIX, engine Sol 3/3 exhausted and historical Opus 0/2 unchanged. No founder diagnostic/fix, S4U/dedicated/native VM dispatch, Lab Manager/state/Hyper-V access, owner-admin action, cache/user-data modification or babysitter change occurred.
 
 Standards: 0 outstanding material findings (S1 closed); Spec: 1 outstanding P2 finding (F1 admission/audit shutdown race). Bounded-smoke evidence collection GO; exact-source acceptance/merge NO-GO.
-

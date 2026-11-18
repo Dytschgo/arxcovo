@@ -4453,3 +4453,60 @@ prepared separately, preserving v1 evidence; no runtime replay before review.
 This is current-user work under the explicit routing exception. PR182 HOLD/NOFIX,
 engine Sol 3/3 exhausted, historical Opus 0/2 and all native/admin/data fences
 remain unchanged. M2 OPEN / M3 UNCHECKED; the full v1 objective remains active.
+
+Opus 5.5/high (fast mode off) is now assigned the single bounded current-user
+attempt, with source ownership limited to admission/MCP/lifecycle code and its
+tests. It must first establish a deterministic actual SDK regression, then
+validate the correction and return source/evidence for independent Sol review.
+It may draft a separate valid-input v2 fixture, but cannot run a native smoke,
+repeat v1, change store migration/engine policy or publish. Coordinator owns
+docs/integration. No other builder or reviewer remains active for this change.
+
+Independent acceptance preparation: the installed Claude Code CLI exposes
+`--mcp-config`, `--strict-mcp-config`, tool allowlisting and
+`--no-session-persistence`. A read-only auth-status check using a separate
+`CLAUDE_CONFIG_DIR` on D: reports unauthenticated (exit 1); no model call or
+Arxcovo runtime test ran. Sanitized proof is
+`D:/Temp/arx-current-user-default/claude-client-preflight.json`. Existing owner
+credential files/settings were not copied or modified. Actual Claude Code MCP
+acceptance still needs authenticated client access after source/hosted gates;
+the earlier Python journey does not substitute for it. No login request is made
+while the build remains held. Opus retains sole source ownership for its bounded
+attempt; coordinator has changed documentation only during that work.
+
+## Opus current-user correction returned; exact-source review next
+
+Owner-exception Opus 5.5/high completed its one bounded attempt, without publishing
+or production smoke. It reproduced F1 with three real named-pipe/stdio/SDK cases
+on seam-only baseline source: two drains acknowledged while a committed row
+remained started, and a late handler wrote a refusal after acknowledged drain.
+All three failed at the intended assertions (run 03, exit 101). Earlier run 02
+had a malformed pipe fixture and is not reproduction evidence.
+
+The correction uses a shared atomic closed-admission bit/live-ticket count.
+Foreground MCP handlers acquire a ticket before any activity access; drain closes
+admission on the same atomic before observing zero. A command/discovery transfers
+its ticket through the worker's terminal commit. An open-row ticket dropped on
+failure latches unconfirmed completion. Read-tool terminal write failure also
+requires an unconfirmed/nonzero shutdown when that foreground executor is present.
+Shutdown itself retains cached inventory behavior until drain closes admission.
+Token/Job engine, schema, SDK, legacy labels and budgets were not changed.
+
+Actual final-source run 05: 31 focused cases PASS in one run (7.96 s test body,
+8.422 s command wall), including the three negative-before/positive-after SDK
+regressions. Foreground 2/2 PASS, fmt PASS, workspace/all-target Clippy PASS,
+normal production build PASS. Coordinator inspected raw failing/passing logs and
+verified all seven source pins, nine command logs, source diff and binary against
+the returned manifest. New binary SHA-256:
+`f889367307c8561cd813b115b6a6fb908631bf736f233f2d2ca8f7f7d6224b48`.
+It replaces the earlier binary path; v1 observation identity remains historical.
+
+Evidence: `D:/Temp/arx-opus-admission-attempt1/{result.md,manifest.json,source.diff}`
+and `logs/`, `failing-before/`. A v2 fixture draft uses a valid 17-character
+synthetic account and a separate D: root; it is unrun. Existing first observation
+and scripts are preserved. Ten ACL-setup integration failures and excluded real
+Job/engine paths remain unrun; no Linux/macOS or hosted claim. C: free at root
+verification was 44,117,966,848 bytes, above the floor; all our output stayed on D:.
+Next gate is fresh independent Sol review of this exact correction and v2 plan,
+then a bounded new-source production observation if cleared. M2 OPEN/M3 UNCHECKED,
+PR182 HOLD/NOFIX and historical engine counters unchanged. Full v1 remains active.

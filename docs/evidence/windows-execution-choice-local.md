@@ -36,12 +36,36 @@ Ten `activity_v2` integration cases failed at ACL fixture setup before behavior:
 exists, so these failures are not classified as pre-existing. Required hosted
 checks remain necessary; the fixture was not changed or bypassed.
 
-Production MCP smoke and restart persistence are pending. The planned smoke uses
-fresh private D: state, an ephemeral synthetic agent credential, actual permitted
+The first production MCP observation ran at source `ba959133`, using fresh
+private D: state, an ephemeral synthetic agent credential, actual permitted
 foreground token, the normal daemon binary and stdio bridge, and `cargo --version`.
-It retains sanitized booleans only. Forced daemon restart after an observed
-terminal row/child cleanup will be labeled separately from graceful shutdown.
-Current-user smoke is not Claude Code acceptance or completion of M2.
+Current-user capability, command, Job identity/cleanup, correlated terminal
+activity/privacy and forced-restart persistence passed. The combined observation
+FAILED at the subsequent dedicated fixture startup: its synthetic account name
+was 21 characters, exceeding the existing maximum 20. This is invalid input;
+validation was not changed and no retry occurred. Driver wall time was 0.828 s,
+outer wall 0.990 s, exit 1 under a 90-second outer deadline.
+
+The [sanitized first observation](windows-execution-choice-smoke-first.json)
+retains only fixed categories/booleans and binary identity. Original private
+configs stay outside the repository in the task-owned D: tree. Forced restart
+followed an observed terminal commit/child cleanup; graceful shutdown remains
+unproved. This Python MCP client is not Claude Code acceptance or M2 completion.
+Independent second review keeps source NO-GO for the detached SDK admission race.
+The owner-authorized Opus 5.5 attempt must address that lifecycle defect, preserve
+this failed observation and prepare valid fresh input before another reviewed
+new-source observation.
+
+The owner-exception Opus 5.5/high attempt returned a synchronized admission/ticket
+implementation and three actual SDK lifecycle regressions. Run 03 on seam-only
+baseline fails all three at F1 assertions; run 05 on corrected source passes 31
+focused cases in one run. Foreground 2/2, fmt, Clippy and production build passed.
+The returned seven source pins, nine command logs, source diff and binary hash
+were independently checked by the coordinator. Full evidence stays at
+`D:/Temp/arx-opus-admission-attempt1`; fresh source review is still required.
+No v2 production observation has run yet. The new binary is
+`f889367307c8561cd813b115b6a6fb908631bf736f233f2d2ca8f7f7d6224b48`, replacing
+the earlier binary path while preserving the v1 hash as historical evidence.
 
 Schema v4 is an operational one-way door for an older binary: preserve a private
 backup while the old daemon is stopped before upgrading existing state. Restoring

@@ -137,7 +137,8 @@ impl Listener {
     ) -> Result<()> {
         run_listener(self.0, config, activity).await
     }
-    /// Stop admission and join aborted connection handlers before worker drain.
+    /// Stop accepting connections and join aborted connection tasks. Detached
+    /// SDK request handlers are fenced by execution admission, not this join.
     pub async fn run_until(
         self,
         config: Arc<crate::config::Config>,

@@ -134,7 +134,9 @@ async fn run() -> anyhow::Result<()> {
     }
     local_shutdown.cancel();
     let _ = shutdown_tx.send(true);
-    // Stop the listener and join its connection tasks before testing worker count.
+    // Stop the listener and join its connection tasks. SDK request handlers are
+    // detached from those tasks; drain closes execution admission and waits for
+    // every admitted handler's terminal audit.
     if has_local && !local_done {
         result = result.and(local_run.await);
     }

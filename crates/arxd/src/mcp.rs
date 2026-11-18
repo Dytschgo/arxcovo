@@ -17,6 +17,12 @@ pub struct Principal(pub String);
 fn unavailable() -> ErrorData {
     ErrorData::internal_error("activity unavailable", None)
 }
+/// Records that this handler's terminal activity row committed.
+fn completed(admission: &mut Option<crate::development::Admission>) {
+    if let Some(admission) = admission {
+        admission.completed();
+    }
+}
 impl ServerHandler for Inventory {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
@@ -71,6 +77,11 @@ impl ServerHandler for Inventory {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        #[cfg(test)]
+        let _entry = match &self.execution {
+            Some(e) => e.checkpoint(crate::development::Checkpoint::Entry).await,
+            None => None,
+        };
         let principal = self
             .principal
             .as_ref()
@@ -89,6 +100,19 @@ impl ServerHandler for Inventory {
             "list_activity" => "list_activity",
             _ => "unknown_tool",
         };
+        // A foreground executor admits each handler before any activity access
+        // and holds the admission through its terminal commit. The SDK detaches
+        // handlers, so this, not connection shutdown, is what drain observes; a
+        // handler first polled after drain closed admission writes nothing.
+        let mut admission = match &self.execution {
+            Some(execution) => Some(execution.admit().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "execution unavailable",
+                    Some(json!({"execution_reason":"shutdown"})),
+                )
+            })?),
+            None => None,
+        };
         let observation = if label == "discover_tools"
             && (self.activity.dedicated.is_some() || self.execution.is_some())
         {
@@ -100,9 +124,9 @@ impl ServerHandler for Inventory {
         } else {
             None
         };
-        let id = if self.activity.dedicated.is_some()
-            && matches!(label, "run_command" | "discover_tools")
-        {
+        let dedicated_row =
+            self.activity.dedicated.is_some() && matches!(label, "run_command" | "discover_tools");
+        let id = if dedicated_row {
             self.activity.start_dedicated(&principal.0, label)
         } else if let Some(execution) = &self.execution {
             self.activity
@@ -111,6 +135,14 @@ impl ServerHandler for Inventory {
             self.activity.start(&principal.0, label)
         }
         .map_err(|_| unavailable())?;
+        if !dedicated_row && let Some(admission) = &mut admission {
+            admission.started();
+        }
+        #[cfg(test)]
+        let _started = match &self.execution {
+            Some(e) => e.checkpoint(crate::development::Checkpoint::Started).await,
+            None => None,
+        };
         let args = request.arguments.unwrap_or_default();
         if let Some(executor) = &self.activity.dedicated
             && (label == "run_command" || label == "discover_tools")
@@ -183,12 +215,13 @@ impl ServerHandler for Inventory {
                 self.activity
                     .finish_typed(id, Outcome::Rejected, &m)
                     .map_err(|_| unavailable())?;
+                completed(&mut admission);
                 return Err(ErrorData::invalid_params(
                     "invalid execution arguments",
                     None,
                 ));
             }
-            let Some(executor) = &self.execution else {
+            let (Some(executor), Some(admission)) = (&self.execution, admission.take()) else {
                 self.activity
                     .finish_typed(
                         id,
@@ -215,7 +248,7 @@ impl ServerHandler for Inventory {
             };
             // Spawned here, before any await: the worker completes the audit row
             // even if cancellation wins the race below or the future is dropped.
-            let work = executor.dispatch(parsed, self.activity.clone(), id);
+            let work = executor.dispatch_admitted(admission, parsed, self.activity.clone(), id);
             let result = tokio::select! {
                 result = work => result,
                 _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
@@ -248,6 +281,7 @@ impl ServerHandler for Inventory {
                 self.activity
                     .finish(id, "rejected")
                     .map_err(|_| unavailable())?;
+                completed(&mut admission);
                 return Err(ErrorData::invalid_params(
                     "invalid activity arguments",
                     None,
@@ -260,6 +294,7 @@ impl ServerHandler for Inventory {
             self.activity
                 .finish(id, "succeeded")
                 .map_err(|_| unavailable())?;
+            completed(&mut admission);
             let value = serde_json::to_string(&page).map_err(|_| unavailable())?;
             return Ok(CallToolResult::success(vec![ContentBlock::text(value)]).into());
         }
@@ -267,6 +302,7 @@ impl ServerHandler for Inventory {
             self.activity
                 .finish(id, "rejected")
                 .map_err(|_| unavailable())?;
+            completed(&mut admission);
             return Err(ErrorData::invalid_params("unknown tool or arguments", None));
         }
         let host_id = self.activity.host_id().map_err(|_| unavailable())?;
@@ -312,6 +348,7 @@ impl ServerHandler for Inventory {
         self.activity
             .finish(id, "succeeded")
             .map_err(|_| unavailable())?;
+        completed(&mut admission);
         Ok(CallToolResult::success(vec![ContentBlock::text(value.to_string())]).into())
     }
 }

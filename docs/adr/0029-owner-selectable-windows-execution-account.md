@@ -56,6 +56,13 @@ truthful activity/capability and historical database preservation. Reuse the
 existing execution mechanism and budgets; a drain timeout must not be presented
 as observed cleanup or a clean foreground exit.
 
+Foreground admission must close atomically with the count observed by drain,
+before any new handler can write activity. Tickets cover handlers through their
+terminal audit commit and transfer to command/discovery workers. This includes
+read tools when a foreground executor is configured: a lost terminal write makes
+shutdown unconfirmed rather than claiming clean completion. SDK connection joins
+alone do not establish handler quiescence because its request tasks are detached.
+
 After independent source review, a bounded real user-level MCP journey can verify
 inventory, `cargo --version`, correlated durable activity and observed cleanup in
 a task-owned D: workspace under a permitted non-elevated token. Test fixtures do

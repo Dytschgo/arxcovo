@@ -384,6 +384,3 @@ prerequisites. Synthetic fixture credentials and dispatcher results cannot close
 them. Only then can real networked engines, and subsequently real joined
 three-container node-loss/write/expired-reuse acceptance, earn their own evidence.
 Real multi-host paths remain **unverified on real hardware**; M2 OPEN/M3 UNCHECKED.
-
-
-

@@ -1,5 +1,9 @@
 //! Foreground Windows current-user execution, including legacy development mode.
+mod admission;
 mod types;
+pub use admission::Admission;
+#[cfg(test)]
+pub(crate) use admission::{Checkpoint, Hold};
 pub use types::{Cancellation, CapturedOutput, RunSpec};
 #[cfg(windows)]
 mod windows;
@@ -213,6 +217,8 @@ pub struct Execution {
     identity_mode: IdentityMode,
     #[cfg(test)]
     probe: Option<Arc<Probe>>,
+    #[cfg(test)]
+    hold: Option<Arc<Hold>>,
     #[cfg(all(test, windows))]
     policy_fixture: bool,
     /// Test-only fault: perturbs the in-memory daemon TokenUser copy so the
@@ -221,6 +227,7 @@ pub struct Execution {
     tamper_identity: AtomicBool,
     settings: Settings,
     busy: AtomicBool,
+    /// Admission closure bit and live admitted handlers; see `admission`.
     pending: AtomicUsize,
     completion_unconfirmed: AtomicBool,
     quarantined: AtomicBool,
@@ -236,22 +243,6 @@ struct Busy<'a>(&'a AtomicBool);
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
-    }
-}
-/// Registered before scheduling; retained through the terminal activity commit.
-/// A panic, cancelled queued task, or failed commit cannot acknowledge a drain.
-struct Pending {
-    execution: Arc<Execution>,
-    committed: bool,
-}
-impl Drop for Pending {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.execution
-                .completion_unconfirmed
-                .store(true, Ordering::Release);
-        }
-        self.execution.pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 type Work = (serde_json::Value, Outcome, Metadata);
@@ -312,6 +303,8 @@ impl Execution {
             identity_mode: IdentityMode::DevelopmentCurrentUser,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            hold: None,
             #[cfg(all(test, windows))]
             policy_fixture: _fixture,
             #[cfg(all(test, windows))]
@@ -339,16 +332,6 @@ impl Execution {
     pub(crate) fn tamper_identity(&self, on: bool) {
         self.tamper_identity.store(on, Ordering::Release);
     }
-    pub async fn drain(&self) -> bool {
-        for _ in 0..500 {
-            if self.pending.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        self.pending.load(Ordering::Acquire) == 0
-            && !self.completion_unconfirmed.load(Ordering::Acquire)
-    }
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -371,11 +354,24 @@ impl Execution {
         serde_json::json!({"available":reason.is_none(),"reason":reason,"mode":self.identity_mode.as_str(),"claim":self.claim(),"dedicated":false,"isolation":isolation,"rights":null,"matches_current_user":true,"integrity":"medium","elevated":false})
     }
 
-    /// The blocking worker is spawned before this returns and owns audit
-    /// completion, so dropping the returned future (SDK cancellation, even before
-    /// its first poll) cancels the child but still completes the row exactly once.
-    pub fn dispatch(
+    /// Unit-test-only direct dispatch of an already started row.
+    #[cfg(test)]
+    pub(crate) fn dispatch(
         self: &Arc<Self>,
+        request: Option<Request>,
+        activity: Arc<crate::store::Activity>,
+        id: i64,
+    ) -> impl std::future::Future<Output = std::result::Result<serde_json::Value, Reason>> + Send + 'static
+    {
+        self.dispatch_admitted(self.register(), request, activity, id)
+    }
+    /// The blocking worker is spawned before this returns and takes over the
+    /// handler's admission through the terminal commit of started row `id`, so
+    /// dropping the returned future (SDK cancellation, even before its first
+    /// poll) cancels the child but still completes the row exactly once.
+    pub fn dispatch_admitted(
+        self: &Arc<Self>,
+        mut admission: Admission,
         request: Option<Request>,
         activity: Arc<crate::store::Activity>,
         id: i64,
@@ -384,20 +380,16 @@ impl Execution {
         let cancellation = Cancellation::default();
         let guard = CancelOnDrop(cancellation.clone());
         let this = self.clone();
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        let pending = Pending {
-            execution: self.clone(),
-            committed: false,
-        };
+        admission.started();
         let worker = tokio::task::spawn_blocking(move || {
-            let mut pending = pending;
+            let mut admission = admission;
             let result = this.work(request.as_ref(), &cancellation);
             match result {
                 Ok((value, outcome, meta)) => {
                     activity
                         .finish_typed(id, outcome, &meta)
                         .map_err(|_| Reason::StorageFailed)?;
-                    pending.committed = true;
+                    admission.completed();
                     Ok(value)
                 }
                 Err(reason) => {
@@ -408,7 +400,7 @@ impl Execution {
                             &this.metadata(request.as_ref(), None, Some(reason)),
                         )
                         .map_err(|_| Reason::StorageFailed)?;
-                    pending.committed = true;
+                    admission.completed();
                     Err(reason)
                 }
             }
