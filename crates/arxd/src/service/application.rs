@@ -319,6 +319,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         let transport = Arc::new(crate::config::Config {
             execution: None,
             development_execution: None,
+            execution_settings: None,
             listen: None,
             state_dir: self.layout.as_ref().ok_or(ExitCode::Layout)?.state().into(),
             local: None,

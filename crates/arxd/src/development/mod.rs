@@ -1,5 +1,9 @@
-//! Explicit owner-authorized development execution. This is not owner isolation.
+//! Foreground Windows current-user execution, including legacy development mode.
+mod admission;
 mod types;
+pub use admission::Admission;
+#[cfg(test)]
+pub(crate) use admission::{Checkpoint, Hold};
 pub use types::{Cancellation, CapturedOutput, RunSpec};
 #[cfg(windows)]
 mod windows;
@@ -10,13 +14,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 #[cfg(all(test, windows))]
 pub(crate) use windows::tests::{CHILD, fixture_settings};
 pub const MODE: &str = "development_current_user";
 pub const CLAIM: &str = "development_only_not_dedicated_account";
+pub const CURRENT_USER_CLAIM: &str = "shares_signed_in_user_files_and_credentials";
 pub const TOOLS: &[&str] = &[
     "cargo",
     "rustc",
@@ -34,6 +39,7 @@ const ENVIRONMENT: &[&str] = &[
     "TEMP",
     "TMP",
     "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "RUSTUP_HOME",
 ];
 #[derive(Clone, Deserialize)]
@@ -60,6 +66,59 @@ pub struct Settings {
     pub workspace: PathBuf,
     pub environment: BTreeMap<String, String>,
     pub limits: Limits,
+}
+/// Normal foreground execution choice. The installed service has separate,
+/// protected configuration and never obtains authority from these settings.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsMode {
+    #[default]
+    CurrentUser,
+    DedicatedAccount,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsSettings {
+    #[serde(default)]
+    pub mode: WindowsMode,
+    pub account: Option<String>,
+    pub workspace: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub limits: Limits,
+}
+impl WindowsSettings {
+    fn backend_settings(&self) -> Settings {
+        Settings {
+            mode: Mode::CurrentUser,
+            acknowledge: Acknowledge::Shared,
+            workspace: self.workspace.clone(),
+            environment: self.environment.clone(),
+            limits: self.limits.clone(),
+        }
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match (self.mode, self.account.as_deref()) {
+            (WindowsMode::CurrentUser, None) => {}
+            (WindowsMode::DedicatedAccount, Some(account))
+                if !account.is_empty()
+                    && account.len() <= 20
+                    && !["system", "localsystem", "localservice", "networkservice"]
+                        .iter()
+                        .any(|name| account.eq_ignore_ascii_case(name))
+                    && account
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) => {}
+            _ => anyhow::bail!("invalid execution account selection"),
+        }
+        self.backend_settings().validate()
+    }
+    pub fn disjoint(&self, path: &Path) -> anyhow::Result<()> {
+        crate::config::checked_path(&self.workspace)?;
+        crate::config::checked_path(path)?;
+        let mut settings = self.backend_settings();
+        settings.workspace = self.workspace.canonicalize()?;
+        settings.disjoint(&path.canonicalize()?)
+    }
 }
 impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -155,8 +214,11 @@ pub struct ResultData {
     pub stderr_dropped_bytes: u64,
 }
 pub struct Execution {
+    identity_mode: IdentityMode,
     #[cfg(test)]
     probe: Option<Arc<Probe>>,
+    #[cfg(test)]
+    hold: Option<Arc<Hold>>,
     #[cfg(all(test, windows))]
     policy_fixture: bool,
     /// Test-only fault: perturbs the in-memory daemon TokenUser copy so the
@@ -165,6 +227,9 @@ pub struct Execution {
     tamper_identity: AtomicBool,
     settings: Settings,
     busy: AtomicBool,
+    /// Admission closure bit and live admitted handlers; see `admission`.
+    pending: AtomicUsize,
+    completion_unconfirmed: AtomicBool,
     quarantined: AtomicBool,
     shutdown: Cancellation,
 }
@@ -184,6 +249,44 @@ type Work = (serde_json::Value, Outcome, Metadata);
 #[cfg(test)]
 type Probe = dyn Fn(&Request, &Cancellation) -> Result<ResultData, Reason> + Send + Sync;
 impl Execution {
+    pub fn from_windows(settings: WindowsSettings) -> anyhow::Result<Arc<Self>> {
+        settings.validate()?;
+        if !cfg!(windows) {
+            anyhow::bail!("execution requires Windows");
+        }
+        if settings.mode == WindowsMode::DedicatedAccount {
+            // Choosing an account grants no service authority. There is no
+            // foreground dedicated-account backend; never fall back to self.
+            let mut execution = Self::build(settings.backend_settings(), false);
+            execution.identity_mode = IdentityMode::DedicatedAccount;
+            return Ok(Arc::new(execution));
+        }
+        let mut execution = Self::new(settings.backend_settings())?;
+        Arc::get_mut(&mut execution)
+            .expect("new execution")
+            .identity_mode = IdentityMode::CurrentUser;
+        Ok(execution)
+    }
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.identity_mode
+    }
+    fn claim(&self) -> &'static str {
+        match self.identity_mode {
+            IdentityMode::CurrentUser => CURRENT_USER_CLAIM,
+            IdentityMode::DevelopmentCurrentUser => CLAIM,
+            IdentityMode::DedicatedAccount => "dedicated_account_setup_required",
+        }
+    }
+    pub fn metadata(
+        &self,
+        request: Option<&Request>,
+        result: Option<&ResultData>,
+        reason: Option<Reason>,
+    ) -> Metadata {
+        let mut m = metadata(request, result, reason);
+        m.identity_mode = Some(self.identity_mode);
+        m
+    }
     pub fn new(settings: Settings) -> anyhow::Result<Arc<Self>> {
         settings.validate()?;
         #[cfg(windows)]
@@ -195,17 +298,21 @@ impl Execution {
             Ok(Arc::new(Self::build(settings, false)))
         }
     }
-    #[cfg(any(windows, test))]
     fn build(settings: Settings, _fixture: bool) -> Self {
         Self {
+            identity_mode: IdentityMode::DevelopmentCurrentUser,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            hold: None,
             #[cfg(all(test, windows))]
             policy_fixture: _fixture,
             #[cfg(all(test, windows))]
             tamper_identity: AtomicBool::new(false),
             settings,
             busy: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
+            completion_unconfirmed: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
             shutdown: Cancellation::default(),
         }
@@ -225,18 +332,13 @@ impl Execution {
     pub(crate) fn tamper_identity(&self, on: bool) {
         self.tamper_identity.store(on, Ordering::Release);
     }
-    pub async fn drain(&self) {
-        for _ in 0..500 {
-            if !self.busy.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
     pub fn capability(&self) -> serde_json::Value {
+        if self.identity_mode == IdentityMode::DedicatedAccount {
+            return serde_json::json!({"available":false,"reason":"dedicated_account_setup_required","mode":"dedicated_account","claim":self.claim(),"dedicated":false,"isolation":false,"rights":null,"matches_current_user":null,"integrity":null,"elevated":null});
+        }
         let reason = if self.quarantined.load(Ordering::Acquire) {
             Some("quarantined")
         } else if self.shutdown.is_cancelled() {
@@ -244,14 +346,32 @@ impl Execution {
         } else {
             None
         };
-        serde_json::json!({"available":reason.is_none(),"reason":reason,"mode":MODE,"claim":CLAIM,"dedicated":false,"isolation":"none_shares_owner_user","rights":null,"matches_current_user":true,"integrity":"medium","elevated":false})
+        let isolation = if self.identity_mode == IdentityMode::CurrentUser {
+            serde_json::json!(false)
+        } else {
+            serde_json::json!("none_shares_owner_user")
+        };
+        serde_json::json!({"available":reason.is_none(),"reason":reason,"mode":self.identity_mode.as_str(),"claim":self.claim(),"dedicated":false,"isolation":isolation,"rights":null,"matches_current_user":true,"integrity":"medium","elevated":false})
     }
 
-    /// The blocking worker is spawned before this returns and owns audit
-    /// completion, so dropping the returned future (SDK cancellation, even before
-    /// its first poll) cancels the child but still completes the row exactly once.
-    pub fn dispatch(
+    /// Unit-test-only direct dispatch of an already started row.
+    #[cfg(test)]
+    pub(crate) fn dispatch(
         self: &Arc<Self>,
+        request: Option<Request>,
+        activity: Arc<crate::store::Activity>,
+        id: i64,
+    ) -> impl std::future::Future<Output = std::result::Result<serde_json::Value, Reason>> + Send + 'static
+    {
+        self.dispatch_admitted(self.register(), request, activity, id)
+    }
+    /// The blocking worker is spawned before this returns and takes over the
+    /// handler's admission through the terminal commit of started row `id`, so
+    /// dropping the returned future (SDK cancellation, even before its first
+    /// poll) cancels the child but still completes the row exactly once.
+    pub fn dispatch_admitted(
+        self: &Arc<Self>,
+        mut admission: Admission,
         request: Option<Request>,
         activity: Arc<crate::store::Activity>,
         id: i64,
@@ -260,13 +380,16 @@ impl Execution {
         let cancellation = Cancellation::default();
         let guard = CancelOnDrop(cancellation.clone());
         let this = self.clone();
+        admission.started();
         let worker = tokio::task::spawn_blocking(move || {
+            let mut admission = admission;
             let result = this.work(request.as_ref(), &cancellation);
             match result {
                 Ok((value, outcome, meta)) => {
                     activity
                         .finish_typed(id, outcome, &meta)
                         .map_err(|_| Reason::StorageFailed)?;
+                    admission.completed();
                     Ok(value)
                 }
                 Err(reason) => {
@@ -274,9 +397,10 @@ impl Execution {
                         .finish_typed(
                             id,
                             Outcome::Refused,
-                            &metadata(request.as_ref(), None, Some(reason)),
+                            &this.metadata(request.as_ref(), None, Some(reason)),
                         )
                         .map_err(|_| Reason::StorageFailed)?;
+                    admission.completed();
                     Err(reason)
                 }
             }
@@ -291,6 +415,9 @@ impl Execution {
         request: Option<&Request>,
         cancellation: &Cancellation,
     ) -> std::result::Result<Work, Reason> {
+        if self.identity_mode == IdentityMode::DedicatedAccount {
+            return Err(Reason::Unavailable);
+        }
         if self.quarantined.load(Ordering::Acquire) {
             return Err(Reason::Quarantined);
         }
@@ -302,7 +429,7 @@ impl Execution {
         }
         let _busy = Busy(&self.busy);
         let cancelled = || {
-            let mut m = metadata(request, None, None);
+            let mut m = self.metadata(request, None, None);
             m.stop_reason = Some(StopReason::Cancelled);
             Ok((serde_json::Value::Null, Outcome::Failed, m))
         };
@@ -316,12 +443,12 @@ impl Execution {
             return Ok((
                 value,
                 outcome(&output),
-                metadata(Some(r), Some(&output), None),
+                self.metadata(Some(r), Some(&output), None),
             ));
         }
         let mut tools = Vec::new();
         let mut complete = true;
-        let mut discovery_metadata = metadata(None, None, None);
+        let mut discovery_metadata = self.metadata(None, None, None);
         for name in TOOLS {
             if cancellation.is_cancelled() {
                 return cancelled();
@@ -341,13 +468,13 @@ impl Execution {
                 {
                     if r.exit_code != Some(0) {
                         complete = false;
-                        discovery_metadata = metadata(None, Some(&r), None);
+                        discovery_metadata = self.metadata(None, Some(&r), None);
                     }
                     serde_json::json!({"name":name,"found":true,"version":r.stdout.chars().take(256).collect::<String>()})
                 }
                 Ok(r) => {
                     complete = false;
-                    discovery_metadata = metadata(None, Some(&r), None);
+                    discovery_metadata = self.metadata(None, Some(&r), None);
                     serde_json::json!({"name":name,"found":null,"version":null})
                 }
                 Err(Reason::Unavailable) => {
@@ -369,7 +496,7 @@ impl Execution {
         Ok((
             // This signal is produced from terminal probe facts. dispatch only
             // releases it after the matching audit completion commits.
-            serde_json::json!({"execution_mode":MODE,"claim":CLAIM,"tools":tools,"outcome":outcome.as_str()}),
+            serde_json::json!({"execution_mode":self.identity_mode.as_str(),"claim":self.claim(),"tools":tools,"outcome":outcome.as_str()}),
             outcome,
             discovery_metadata,
         ))
@@ -382,7 +509,10 @@ impl Execution {
     ) -> std::result::Result<ResultData, Reason> {
         #[cfg(test)]
         if let Some(probe) = &self.probe {
-            return probe(r, cancellation);
+            let mut output = probe(r, cancellation)?;
+            output.execution_mode = self.identity_mode.as_str();
+            output.claim = self.claim();
+            return Ok(output);
         }
         #[cfg(windows)]
         {
@@ -468,6 +598,7 @@ fn redact(text: String, settings: &Settings) -> String {
     )];
     for (k, label) in [
         ("CARGO_HOME", "<cargo_home>"),
+        ("CARGO_TARGET_DIR", "<cargo_target>"),
         ("RUSTUP_HOME", "<rustup_home>"),
         ("TEMP", "<temp>"),
         ("TMP", "<temp>"),
@@ -540,6 +671,8 @@ fn redact_sids(text: &str) -> String {
     out.push_str(&text[last..]);
     out
 }
+#[cfg(test)]
+mod account_choice_tests;
 #[cfg(test)]
 mod tests;
 

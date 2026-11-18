@@ -16,7 +16,11 @@
         }
         value["hosts"][0]["tool_discovery"] = json!(if self.activity.dedicated.is_some() {
             "unavailable"
-        } else if self.execution.is_some() {
+        } else if self
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.capability()["available"] == true)
+        {
             "discover_tools"
         } else {
             "not_configured"
