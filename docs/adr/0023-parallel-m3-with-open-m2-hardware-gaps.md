@@ -16,7 +16,7 @@ Relayed by the existing babysitter on Dylan's behalf. This is additional scoped
 authorization, not a waiver of acceptance or exhausted-attempt rules.
 
 Dylan authorizes this Windows PC, a future cluster member, as the M2 test host for
-the applicable open A4 crash, A9/U9, A10, Stage F/G and PA6/Claude Code acceptance
+the applicable open A4 crash, A9/U9, Windows-applicable A7/A11, A10, Stage F/G and PA6/Claude Code acceptance
 paths. Native tests remain blocked until the owner creates the dedicated Standard
 account, configures a disk cap and CPU/RAM reserves, and completes any required
 admin installation. Agents perform no account creation, admin setup or silent
