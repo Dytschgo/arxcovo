@@ -122,7 +122,11 @@ owner-authorized route above and fresh qualifying main after activation.
 
 [ADR0031](adr/0031-parallel-ci-validation.md) keeps the three protected `verify`
 contexts as fail-closed completion gates over parallel Rust and UI matrices.
-No branch-protection edit is needed. The existing charged-v1 implementation is
-unchanged and rejects this nine-job layout for credit, using the original
-900-second wall limit. First-attempt hosted validation and independent review
-are required before activation; no speedup or PR182 release is established yet.
+No branch-protection edit is needed. The first source head passed every job but
+was held at 949 seconds wall with no credit from the unchanged legacy validator.
+A prospective exact-nine-job validator adaptation retains charged-v1's existing
+900-second threshold and interval arithmetic, strict identities/times, full wall
+reporting and conservative fallback; gates cannot be created before all workers
+finish. Fresh exact-source review and a normal new-head first attempt are needed.
+The held result is not retroactively credited; no speedup or PR182 release is
+established yet.

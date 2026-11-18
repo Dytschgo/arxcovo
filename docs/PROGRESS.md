@@ -48,7 +48,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
-- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185), ci-speed head59800c7632b0d91a09c6643ffe455a0898328571, splits Rust/platform and Node/UI/browser/Electron validation. Independent Sol6.1/high Standards/Spec GO, exact-head agent-review success; normal first CI44389444133 attempt1 remains incomplete. Existing required verify names, all validations, 12-minute limits and 900-second budget remain. ADR0031 records fail-closed gates and conservative wall fallback. Only after reviewed merge and green exact-main may PR182 receive a normal refresh; no engine fix authority or cause claim follows. The secure Claude Code OAuth request is unchanged.
+- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185) first CI44389444133 attempt1 at59800c76 passed all9jobs but took949s wall: HOLD under its initial900wall rule despite all5requiredgreen. Logs/counts/times retained. Fresh independent Sol6.1/high disposition recommends a prospective exact-nine-job adaptation of existing charged-v1, keeping900 threshold/math and strict gate timestamps; implementation/new review/new-head first attempt pending. Old source GO does not cover the amendment, and the949 result is not retroactively credited. PR182 remains held, no engine fix grant/counter reset. OAuth unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -5269,3 +5269,44 @@ This follow-up checkpoint stays local above the published source head; it is not
 pushed to manufacture another CI attempt. Main remains verifiedff599a24. PR182
 HOLD, code-fix counters and OAuth input remain unchanged. M2 OPEN/M3 UNCHECKED;
 relevant paths remain **unverified on real hardware**.
+
+## PR185 original first CI: all jobs pass, 949-second wall HOLD
+
+Exact59800c76 normal CI44389444133 attempt1 SUCCESS949wall. Rust Windows441s,
+Ubuntu192s/macOS327s; Rust709/695/663PASS with existing36/22/8skip. Node50 and
+UI/browser/Electron PASS eachOS; all3verify gates SUCCESS. AutomaticWindows8PASS,
+orphans0,31.688s, no stability/repair/re-enable credit. All9 bounded D logs fetched
+once (8MiB/45s each, zero truncation), counts/case/timing and policy proof retained.
+[Original observation](evidence/parallel-ci-first-attempt-held.md).
+
+Coordinator Sol6.1/high enforced the current ADR0031 wall900 requirement and held
+merge despite green required contexts. The actually executed old validator gives
+unavailable:jobs-invalid/nullcharged, not784. Fresh independent Sol6.1/high
+disposition confirms HOLD and proposes only prospective exact9topology support
+under the already accepted ADR0025 charged-v1 principle. Its165idle/784charged
+geometry is counterfactual fixture evidence, above base603charged, not a speed
+improvement, live credit or retrospective pass. Underlying queue capacity and
+PR182 slowdown cause remain unproven.
+
+Within the existing authorized CI-only scope, a separate Sol6.1/high builder now
+owns only the pure policy validator and focused tests/public metadata fixture.
+ADRs0025/0031 explicitly record the prospective contract: only legacy3/exact9,
+unchanged sweep/900 threshold/green eligibility, each gate created after all6
+workers finish, original wall fallback for defects. Workflow/checks/tool pins,
+12-minute limits, runtime/nextest/quarantine remain unchanged. Need fresh exact-
+source review and normal NEW-head first CI; no rerun/dispatch or source-free push.
+No CI mitigation qualifies PR182 until reviewed merge and own exact-main green.
+Engine Sol3/3/historicalOpus0/2 unchanged; M2 OPEN/M3 UNCHECKED; relevant hardware
+**unverified on real hardware**. Existing OAuth owner input/babysitter untouched.
+
+Prospective validator implementation frozen: builder Sol6.1/high changed only
+policy layout/labels and the gate-creation fence, tests and a public historical
+metadata fixture. Original nine-job negative body retained as early-gate
+regression. Positive prospective fixture failed against old policy first (1/1,
+57.680ms); after implementation policy21/21 PASS129.876ms, full Node scripts60/60
+PASS6.148s, diff check PASS. No failed source correction; one evidence-only hash
+filter error corrected without changing source/tests. Evidence at
+D:/Temp/arx-ci-split-credit-builder. Original949null-policy HOLD, history,
+workflow/callers/evaluator/source guards unchanged. Coordinator inspected the
+actual diff/tests/fixture and report. Fresh independent exact-head review and
+normal new-head hosted measurement still mandatory; no retroactive adoption.

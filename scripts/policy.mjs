@@ -25,18 +25,27 @@ export function queueMeasurement(wall, run, payload, listed, kind, repositoryId)
       !/^[a-f0-9]{40}$/.test(run.head_sha ?? '') || run.head_sha !== listed.head_sha ||
       (kind !== 'main' && (!Number.isSafeInteger(repositoryId) || repositoryId < 1 || run.head_repository?.id !== repositoryId)) ||
       !Number.isFinite(S) || !Number.isFinite(U) || U - S !== wall.seconds || U - S < 0 || U - S > 604800) return unavailable('run-invalid');
-  if (!payload || payload.total_count !== 3 || !Array.isArray(payload.jobs) || payload.jobs.length !== 3) return unavailable('jobs-invalid');
-  const names = new Set(['verify (ubuntu-latest)', 'verify (windows-latest)', 'verify (macos-latest)']);
+  if (!payload || ![3, 9].includes(payload.total_count) || !Array.isArray(payload.jobs) || payload.jobs.length !== payload.total_count) return unavailable('jobs-invalid');
+  const split = payload.total_count === 9;
+  const names = new Map((split ? ['rust', 'ui', 'verify'] : ['verify']).flatMap(phase =>
+    ['ubuntu-latest', 'windows-latest', 'macos-latest'].map(os => [`${phase} (${os})`, { label: split && phase === 'verify' ? 'ubuntu-latest' : os, gate: split && phase === 'verify' }])));
   const ids = new Set(), intervals = [];
   for (const job of payload.jobs) {
-    if (!job || !Number.isSafeInteger(job.id) || job.id < 1 || ids.has(job.id) || !names.delete(job.name) ||
+    const expected = names.get(job?.name);
+    if (!job || !Number.isSafeInteger(job.id) || job.id < 1 || ids.has(job.id) || !expected || !names.delete(job.name) ||
         job.run_id !== run.id || job.run_attempt !== 1 || job.head_sha !== run.head_sha ||
-        !Array.isArray(job.labels) || job.labels.length !== 1 || job.labels[0] !== job.name.slice(8, -1) ||
+        !Array.isArray(job.labels) || job.labels.length !== 1 || job.labels[0] !== expected.label ||
         job.status !== 'completed' || typeof job.conclusion !== 'string' || !job.conclusion || job.conclusion === 'skipped') return unavailable('jobs-invalid');
     ids.add(job.id);
     const c = timestamp(job.created_at), s = timestamp(job.started_at), e = timestamp(job.completed_at);
     if (![c, s, e].every(Number.isFinite) || !(S <= c && c <= s && s <= e && e <= U)) return unavailable('jobs-invalid');
-    intervals.push({ c, s, e });
+    intervals.push({ c, s, e, gate: expected.gate });
+  }
+  // The trusted split gates depend on both complete matrices. Early creation is
+  // ineligible even when execution starts later; dependency waits earn no credit.
+  if (split) {
+    const workersCompleted = Math.max(...intervals.filter(({ gate }) => !gate).map(({ e }) => e));
+    if (intervals.some(({ c, gate }) => gate && c < workersCompleted)) return unavailable('jobs-invalid');
   }
   const points = [...new Set([S, U, ...intervals.flatMap(({ c, s, e }) => [c, s, e])])].sort((a, b) => a - b);
   let queueCreditSeconds = 0;
