@@ -6,6 +6,8 @@ use crate::cluster::{
     state_store::{Entry as StoredEntry, Init, LogPos, StateStore},
 };
 use crate::service::application::tests::private_temp;
+use openraft::network::NetAppend;
+use openraft::type_config::async_runtime::watch::WatchReceiver;
 use openraft::{
     Entry, EntryPayload,
     network::RPCOption,
@@ -444,7 +446,7 @@ fn independent_heartbeat() -> Vec<u8> {
     payload.extend(7u64.to_be_bytes());
     payload.extend(1u64.to_be_bytes());
     payload.extend([1, 0, 0, 0]);
-    let mut bytes = b"ARXP\x01\x01\0\0".to_vec();
+    let mut bytes = b"ARXP\x02\x01\0\0".to_vec();
     bytes.extend((payload.len() as u32).to_be_bytes());
     bytes.extend(CLUSTER);
     bytes.extend(1u64.to_be_bytes());
@@ -660,7 +662,7 @@ async fn authenticated_request_shape_and_route_refusals_never_dispatch() {
 async fn independently_corrupted_headers_bodies_and_clean_truncation_refuse() {
     let baseline = independent_heartbeat();
     let mut cases = Vec::new();
-    for (offset, value) in [(4, 2), (5, 3), (5, 2), (6, 1), (60, 2)] {
+    for (offset, value) in [(4, 1), (5, 3), (5, 2), (6, 1), (60, 2)] {
         let mut bytes = baseline.clone();
         bytes[offset] = value;
         cases.push(bytes);
@@ -1913,4 +1915,1000 @@ async fn cancelled_close_retains_aborted_outbound_task_until_join() {
     );
     assert_eq!(closed, Err(Refusal::Unclean));
     assert!(recovered);
+}
+// Full-RPC recording fixtures use actual TLS identities and applied Registry.
+struct RpcSpy {
+    calls: Mutex<Vec<Vec<u8>>>,
+    deny: bool,
+    snapshot_gate: Option<Arc<Semaphore>>,
+    snapshot_entered: Mutex<Option<oneshot::Sender<()>>>,
+}
+impl AppendDispatch for RpcSpy {
+    fn append(&self, r: AppendEntriesRequest<Arx>) -> DispatchFuture {
+        let last = r.entries.last().map(|e| e.log_id).or(r.prev_log_id);
+        self.calls
+            .lock()
+            .unwrap()
+            .push(peer_wire::encode_request(route(), &r).unwrap_or_default());
+        Box::pin(async move { Ok(Ok(last)) })
+    }
+    fn ballot(&self, r: Ballot, pre: bool) -> BallotFuture {
+        let bytes = peer_wire::encode_vote(
+            route(),
+            if pre {
+                peer_wire::Kind::PreVoteRequest
+            } else {
+                peer_wire::Kind::VoteRequest
+            },
+            &r,
+        );
+        if let Ok(b) = bytes {
+            self.calls.lock().unwrap().push(b)
+        }
+        let reply = BallotReply {
+            vote: if pre {
+                vote(StoredVote {
+                    term: 2,
+                    node: 1,
+                    committed: false,
+                })
+            } else {
+                r.vote
+            },
+            last_log_id: r.last_log_id,
+            vote_granted: !self.deny,
+        };
+        Box::pin(async move { Ok(reply) })
+    }
+    fn snapshot(&self, v: BallotVote, s: Snapshot) -> SnapshotFuture {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(peer_wire::encode_snapshot(route(), v, &s).unwrap_or_default());
+        if let Some(entered) = self.snapshot_entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let gate = self.snapshot_gate.clone();
+        Box::pin(async move {
+            if let Some(g) = gate {
+                let _ = g.acquire().await;
+            }
+            Ok(openraft::raft::SnapshotResponse { vote: v })
+        })
+    }
+}
+fn rpc_spy(deny: bool) -> Arc<RpcSpy> {
+    Arc::new(RpcSpy {
+        calls: Mutex::new(Vec::new()),
+        deny,
+        snapshot_gate: None,
+        snapshot_entered: Mutex::new(None),
+    })
+}
+fn ballot_request() -> Ballot {
+    Ballot {
+        vote: vote(StoredVote {
+            term: 7,
+            node: 1,
+            committed: false,
+        }),
+        last_log_id: Some(log_id(1, 1, 0)),
+        leadership_transfer_from: Some(vote(StoredVote {
+            term: 3,
+            node: 8,
+            committed: true,
+        })),
+    }
+}
+fn full_snapshot(f: &Fixture) -> Snapshot {
+    Snapshot {
+        meta: openraft::SnapshotMeta {
+            last_log_id: Some(log_id(1, 1, 0)),
+            last_membership: openraft::StoredMembership::default(),
+        },
+        snapshot: f.sm.0.lock().unwrap().snapshot(),
+    }
+}
+#[tokio::test]
+async fn rpc_ballot_exact_semantics_over_tls() {
+    use openraft::network::NetVote;
+    for pre in [false, true] {
+        for deny in [false, true] {
+            let f = Fixture::new();
+            let spy = rpc_spy(deny);
+            let mut receiver = f.owner(2, spy.clone());
+            let address = listening(&mut receiver).await;
+            let mut sender = f.owner(1, Spy::exact(None));
+            let mut client = sender.loopback_client(2, address);
+            let r = ballot_request();
+            let expected = peer_wire::encode_vote(
+                route(),
+                if pre {
+                    peer_wire::Kind::PreVoteRequest
+                } else {
+                    peer_wire::Kind::VoteRequest
+                },
+                &r,
+            )
+            .unwrap();
+            let result = if pre {
+                client
+                    .pre_vote(r, RPCOption::new(Duration::from_secs(4)))
+                    .await
+            } else {
+                client.vote(r, RPCOption::new(Duration::from_secs(4))).await
+            };
+            let a = sender.close().await;
+            let b = receiver.close().await;
+            assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+            let reply = result.unwrap();
+            assert_eq!(reply.vote_granted, !deny);
+            assert_eq!(
+                reply.vote,
+                if pre {
+                    vote(StoredVote {
+                        term: 2,
+                        node: 1,
+                        committed: false,
+                    })
+                } else {
+                    ballot_request().vote
+                }
+            );
+            assert_eq!(reply.last_log_id, Some(log_id(1, 1, 0)));
+            assert_eq!(*spy.calls.lock().unwrap(), vec![expected]);
+        }
+    }
+}
+#[tokio::test]
+async fn rpc_snapshot_exact_blob_and_metadata_over_tls() {
+    use openraft::network::NetSnapshot;
+    let f = Fixture::new();
+    let spy = rpc_spy(false);
+    let mut receiver = f.owner(2, spy.clone());
+    let address = listening(&mut receiver).await;
+    let mut sender = f.owner(1, Spy::exact(None));
+    let mut client = sender.loopback_client(2, address);
+    let v = heartbeat().vote;
+    let s = full_snapshot(&f);
+    let expected = peer_wire::encode_snapshot(route(), v, &s).unwrap();
+    let result = client
+        .full_snapshot(
+            v,
+            s,
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await;
+    let a = sender.close().await;
+    let b = receiver.close().await;
+    assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+    assert_eq!(result.unwrap().vote, v);
+    assert_eq!(*spy.calls.lock().unwrap(), vec![expected]);
+}
+#[tokio::test]
+async fn rpc_snapshot_independent_mismatches_zero_dispatch() {
+    let f = Fixture::new();
+    let valid = peer_wire::encode_snapshot(route(), heartbeat().vote, &full_snapshot(&f)).unwrap();
+    let mut cases = Vec::new();
+    for offset in [52, 60, 61, 69, 77, 85, 86, valid.len() - 1] {
+        let mut b = valid.clone();
+        b[offset] ^= 1;
+        cases.push(b)
+    }
+    let mut old = valid.clone();
+    old[4] = 1;
+    cases.push(old);
+    for b in cases {
+        let spy = rpc_spy(false);
+        let mut receiver = f.owner(2, spy.clone());
+        let result = raw_request(&f, &mut receiver, &b, false).await;
+        let closed = receiver.close().await;
+        assert!(closed.is_ok() && reclaimed(&receiver));
+        assert!(result.is_err());
+        assert!(spy.calls.lock().unwrap().is_empty())
+    }
+    let mut huge = full_snapshot(&f);
+    huge.snapshot = vec![0; 16385];
+    assert!(peer_wire::encode_snapshot(route(), heartbeat().vote, &huge).is_err());
+}
+#[tokio::test]
+async fn rpc_ballot_sender_route_and_final_registry_refusals() {
+    for pre in [false, true] {
+        for substitution in 0..5 {
+            let f = Fixture::new();
+            let spy = rpc_spy(false);
+            let mut receiver = f.owner(2, spy.clone());
+            let kind = if pre {
+                peer_wire::Kind::PreVoteRequest
+            } else {
+                peer_wire::Kind::VoteRequest
+            };
+            let mut r = ballot_request();
+            let mut rt = route();
+            match substitution {
+                0 => r.vote.leader_id.node_id = 2,
+                1 => rt.source = 2,
+                2 => rt.target = 1,
+                3 => rt.cluster = [2; 16],
+                _ => {}
+            }
+            let bytes = peer_wire::encode_vote(rt, kind, &r).unwrap();
+            let result = if substitution == 4 {
+                let gate = gate(&receiver, Stage::BeforeDispatch);
+                let mut events = events(&receiver);
+                let addr = listening(&mut receiver).await;
+                let config = f.client_config(&f.client, 2);
+                let work = tokio::spawn(async move {
+                    let mut stream = connect(config, addr).await?;
+                    send_frame(&mut stream, &bytes, false).await?;
+                    read_frame(&mut stream).await
+                });
+                let observed = observe(&mut events, Event::Stage(Stage::BeforeDispatch)).await;
+                let removed = f.remove(1);
+                gate.add_permits(1);
+                let out = work.await;
+                match out {
+                    Ok(out) if observed && removed => out,
+                    _ => Err(io::Error::other("observation")),
+                }
+            } else {
+                raw_request(&f, &mut receiver, &bytes, false).await
+            };
+            let closed = receiver.close().await;
+            assert!(closed.is_ok() && reclaimed(&receiver));
+            assert!(result.is_err());
+            assert!(spy.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+#[tokio::test]
+async fn rpc_snapshot_cancellation_and_pending_weak_factory() {
+    use openraft::network::{NetSnapshot, NetVote, RaftNetworkFactory};
+    let f = Fixture::new();
+    let credentials = Credentials {
+        root: f.root.clone(),
+        leaf: f.client.cert.clone(),
+        key: f.client.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let (mut owner, mut factory) = TransportOwner::pending(CLUSTER, node(1), credentials);
+    factory.loopback = true;
+    let n = openraft::BasicNode::new("127.0.0.1:43182");
+    let mut c = factory.new_client(2, &n).await;
+    let h = factory.new_heartbeat_client(2, &n).await;
+    let s = factory.new_snapshot_client(2, &n).await;
+    let pending = c
+        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+        .await;
+    let cancel = openraft::errors::ReplicationClosed::new("test cancellation");
+    let result = c
+        .full_snapshot(
+            heartbeat().vote,
+            full_snapshot(&f),
+            std::future::ready(cancel),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await;
+    let untouched = owner.shared.connections.available_permits() == 32
+        && owner.shared.handshakes.available_permits() == 4
+        && owner.shared.state.lock().unwrap().tasks.is_empty();
+    let closed = owner.close().await;
+    drop(owner);
+    assert!(closed.is_ok() && untouched && pending.is_err());
+    assert!(matches!(
+        result,
+        Err(openraft::errors::StreamingError::Closed(_))
+    ));
+    assert_eq!(factory.shared.strong_count(), 0);
+    drop((h, s));
+    assert!(
+        c.pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+            .await
+            .is_err()
+    );
+}
+// These FOUR tests compile in this assignment and MUST NOT execute before
+// independent exact-source review. No founder, initialize, election or retry.
+fn seed_learner(
+    dir: &std::path::Path,
+    f: &Fixture,
+    m: &super::super::MembershipBlob,
+    tail: Option<LogPos>,
+) -> Result<Vec<u8>, &'static str> {
+    use super::super::VoteLogStore;
+    let init = Init {
+        cluster: CLUSTER,
+        first_free: node(3),
+    };
+    let e = StoredEntry::Enrollment(Command::Found {
+        cluster: CLUSTER,
+        members: FoundMembers::new([(node(1), f.client.digest()), (node(2), f.server.digest())])
+            .map_err(|_| "found members")?,
+        proposed_at_ms: 100,
+    });
+    let l0 = LogPos {
+        term: 1,
+        leader: 1,
+        index: 0,
+    };
+    let l1 = LogPos { index: 1, ..l0 };
+    let mut sm = StateStore::open(dir, init).map_err(|_| "seed sm open")?;
+    if !matches!(
+        sm.apply(l0, &e),
+        Ok(Some(Outcome::Founded { replay: false }))
+    ) {
+        return Err("seed Found");
+    }
+    sm.apply(l1, &StoredEntry::Membership(m.clone()))
+        .map_err(|_| "seed membership")?;
+    let mut rows = vec![(l0, e), (l1, StoredEntry::Membership(m.clone()))];
+    if let Some(p) = tail {
+        sm.apply(p, &StoredEntry::Blank).map_err(|_| "seed tail")?;
+        rows.push((p, StoredEntry::Blank))
+    }
+    let snapshot = sm.snapshot();
+    let sr = sm.released();
+    let mut log = VoteLogStore::open(dir, CLUSTER).map_err(|_| "seed log open")?;
+    let lr = log.released();
+    log.append(&rows).map_err(|_| "seed log append")?;
+    let v = StoredVote {
+        term: if tail.is_some() { 3 } else { 2 },
+        node: 1,
+        committed: tail.is_some(),
+    };
+    log.save_vote(v).map_err(|_| "seed vote")?;
+    if log.entries(0, 3, 3).map_err(|_| "seed read")? != rows
+        || log.vote().map_err(|_| "seed read vote")? != Some(v)
+    {
+        return Err("seed readback");
+    }
+    drop(log);
+    drop(sm);
+    if !sr.is_set() || !lr.is_set() {
+        return Err("seed release");
+    }
+    Ok(snapshot)
+}
+async fn learner_once(case: u8) -> Result<(), &'static str> {
+    use super::super::{ConsensusNode, MembershipBlob, Params, VoteLogStore, WireMembership};
+    use futures_util::FutureExt;
+    use openraft::network::{NetSnapshot, NetVote, RaftNetworkFactory};
+    let mut f = Fixture::new();
+    let port = 43181 + u16::from(case) * 2;
+    let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|_| "address")?;
+    let ra: SocketAddr = format!("127.0.0.1:{}", port + 1)
+        .parse()
+        .map_err(|_| "address")?;
+    let sl = TcpListener::bind(sa)
+        .await
+        .map_err(|_| "sender reservation")?;
+    let rl = TcpListener::bind(ra)
+        .await
+        .map_err(|_| "receiver reservation")?;
+    if sl.local_addr().map_err(|_| "sender address")? != sa
+        || rl.local_addr().map_err(|_| "receiver address")? != ra
+    {
+        return Err("reservation identity");
+    }
+    let m = MembershipBlob::new(
+        WireMembership::new(
+            vec![std::collections::BTreeSet::from([1])],
+            BTreeMap::from([(1, sa.to_string()), (2, ra.to_string())]),
+        )
+        .map_err(|_| "membership")?
+        .encode()
+        .map_err(|_| "membership encoding")?,
+    )
+    .map_err(|_| "membership bounds")?;
+    let sd = private_temp().keep();
+    let rd = private_temp().keep();
+    let original = seed_learner(&rd, &f, &m, None)?;
+    seed_learner(&sd, &f, &m, None)?;
+    let donor_snapshot = if case == 3 {
+        let donor = private_temp().keep();
+        Some(seed_learner(
+            &donor,
+            &f,
+            &m,
+            Some(LogPos {
+                term: 1,
+                leader: 1,
+                index: 2,
+            }),
+        )?)
+    } else {
+        None
+    };
+    let init = Init {
+        cluster: CLUSTER,
+        first_free: node(3),
+    };
+    f.sm = SmAdapter(Arc::new(Mutex::new(
+        StateStore::open(&sd, init).map_err(|_| "sender reopen")?,
+    )));
+    let sender_release = f.sm.0.lock().map_err(|_| "sender lock")?.released();
+    let sender_weak = Arc::downgrade(&f.sm.0);
+    let credentials = |identity: &Identity| Credentials {
+        root: f.root.clone(),
+        leaf: identity.cert.clone(),
+        key: identity.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let (mut sender, mut sf) = TransportOwner::pending(CLUSTER, node(1), credentials(&f.client));
+    sf.loopback = true;
+    let (mut receiver, mut rf) = TransportOwner::pending(CLUSTER, node(2), credentials(&f.server));
+    rf.loopback = true;
+    let mut pending = sf
+        .new_client(2, &openraft::BasicNode::new(ra.to_string()))
+        .await;
+    let pending_refused = pending
+        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+        .await
+        .is_err();
+    let rdir = rd.clone();
+    let mut startup =
+        tokio::spawn(
+            async move { ConsensusNode::start(2, &rdir, init, Params::default(), rf).await },
+        );
+    // Preserve sole startup handle on observation expiry. Never abort/drop/retry it.
+    let (startup_observed, started) = match timeout(OBSERVE, &mut startup).await {
+        Ok(r) => (true, r),
+        Err(_) => (false, startup.await),
+    };
+    let mut receiver_node = match started {
+        Ok(Ok(n)) => n,
+        _ => {
+            let _ = sender.close().await;
+            let _ = receiver.close().await;
+            return Err("startup failed; Engine cleanup unconfirmed");
+        }
+    };
+    let log_release = receiver_node.log_released.clone();
+    let sm_release = receiver_node.sm_released.clone();
+    let log_weak = receiver_node.log_weak.clone();
+    let sm_weak = receiver_node.sm_weak.clone();
+    let mut expected_snapshot = if case < 2 {
+        Some(original.clone())
+    } else {
+        None
+    };
+    let outcome = std::panic::AssertUnwindSafe(async {
+        if !startup_observed || !pending_refused {
+            return Err("startup/Pending observation");
+        }
+        let sm = receiver_node.sm.as_ref().ok_or("receiver sm")?;
+        let raft = receiver_node.raft.as_ref().ok_or("receiver raft")?;
+        receiver
+            .attach_reserved(
+                sm,
+                Arc::new(super::super::peer_network::EngineDispatch { raft: raft.clone() }),
+                rl,
+                ra,
+            )
+            .map_err(|_| "receiver attach")?;
+        sender
+            .attach_reserved(&f.sm, Spy::exact(None), sl, sa)
+            .map_err(|_| "sender attach")?;
+        let metrics = raft.metrics();
+        let initial = metrics.borrow_watched().clone();
+        drop(metrics);
+        if initial.state != openraft::ServerState::Learner
+            || initial.last_applied != Some(log_id(1, 1, 1))
+            || initial.local_committed != Some(log_id(1, 1, 1))
+            || initial.vote
+                != vote(StoredVote {
+                    term: 2,
+                    node: 1,
+                    committed: false,
+                })
+        {
+            return Err("initial learner state");
+        }
+        let mut c = sf
+            .new_client(2, &openraft::BasicNode::new(ra.to_string()))
+            .await;
+        let v3 = vote(StoredVote {
+            term: 3,
+            node: 1,
+            committed: case >= 2,
+        });
+        let l1 = log_id(1, 1, 1);
+        match case {
+            0 | 1 => {
+                let r = Ballot {
+                    vote: v3,
+                    last_log_id: Some(l1),
+                    leadership_transfer_from: None,
+                };
+                let reply = if case == 0 {
+                    c.pre_vote(r, RPCOption::new(Duration::from_secs(4))).await
+                } else {
+                    c.vote(r, RPCOption::new(Duration::from_secs(4))).await
+                }
+                .map_err(|_| "learner ballot RPC")?;
+                if reply
+                    != (BallotReply {
+                        vote: if case == 0 {
+                            vote(StoredVote {
+                                term: 2,
+                                node: 1,
+                                committed: false,
+                            })
+                        } else {
+                            v3
+                        },
+                        vote_granted: true,
+                        last_log_id: Some(l1),
+                    })
+                {
+                    return Err("learner exact ballot reply");
+                }
+            }
+            2 => {
+                let a2 = log_id(3, 1, 2);
+                let r = AppendEntriesRequest {
+                    vote: v3,
+                    prev_log_id: Some(l1),
+                    entries: vec![Entry {
+                        log_id: a2,
+                        payload: EntryPayload::Blank,
+                    }],
+                    leader_commit: Some(a2),
+                };
+                if c.append_entries(r, RPCOption::new(Duration::from_secs(4)))
+                    .await
+                    .map_err(|_| "learner append RPC")?
+                    != Ok(Some(a2))
+                {
+                    return Err("learner exact append");
+                }
+                raft.wait(Some(OBSERVE))
+                    .applied_index(Some(2), "learner append applied")
+                    .await
+                    .map_err(|_| "append application observation")?;
+            }
+            3 => {
+                let bs = donor_snapshot.clone().ok_or("snapshot donor")?;
+                let meta = openraft::SnapshotMeta {
+                    last_log_id: Some(log_id(1, 1, 2)),
+                    last_membership: openraft::StoredMembership::new(
+                        Some(l1),
+                        super::super::decode(&m).map_err(|_| "snapshot membership")?,
+                    ),
+                };
+                let mut c = sf
+                    .new_snapshot_client(2, &openraft::BasicNode::new(ra.to_string()))
+                    .await;
+                let reply = c
+                    .full_snapshot(
+                        v3,
+                        Snapshot {
+                            meta,
+                            snapshot: bs.clone(),
+                        },
+                        std::future::pending(),
+                        RPCOption::new(Duration::from_secs(4)),
+                    )
+                    .await
+                    .map_err(|_| "learner snapshot RPC")?;
+                expected_snapshot = Some(bs.clone());
+                if reply.vote != v3 {
+                    return Err("snapshot exact reply");
+                }
+                raft.wait(Some(OBSERVE))
+                    .applied_index(Some(2), "learner snapshot applied")
+                    .await
+                    .map_err(|_| "snapshot applied observation")?;
+                raft.wait(Some(OBSERVE))
+                    .purged(Some(log_id(1, 1, 2)), "learner snapshot purge")
+                    .await
+                    .map_err(|_| "snapshot purge observation")?;
+                if sm
+                    .0
+                    .try_lock()
+                    .map_err(|_| "snapshot read lock")?
+                    .snapshot()
+                    != bs
+                {
+                    return Err("snapshot installed bytes");
+                }
+            }
+            _ => return Err("case"),
+        }
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    // No test assertions/panic before explicit joins and unchanged node shutdown.
+    let sc = sender.close().await;
+    let rc = receiver.close().await;
+    if !sender.joined() || !receiver.joined() {
+        return Err("transport cleanup unconfirmed; node shutdown withheld");
+    }
+    let shutdown = receiver_node.shutdown().await;
+    let owners_released = log_release.is_set()
+        && sm_release.is_set()
+        && log_weak.strong_count() == 0
+        && sm_weak.strong_count() == 0;
+    drop(receiver_node);
+    drop(f.sm);
+    let sender_released = sender_release.is_set() && sender_weak.strong_count() == 0;
+    // Weak factory/client handles remain live during exact same-directory readback.
+    let expected_rows = {
+        let e = StoredEntry::Enrollment(Command::Found {
+            cluster: CLUSTER,
+            members: FoundMembers::new([
+                (node(1), f.client.digest()),
+                (node(2), f.server.digest()),
+            ])
+            .map_err(|_| "readback key members")?,
+            proposed_at_ms: 100,
+        });
+        let mut rows = vec![
+            (
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 0,
+                },
+                e,
+            ),
+            (
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 1,
+                },
+                StoredEntry::Membership(m.clone()),
+            ),
+        ];
+        if case == 2 {
+            rows.push((
+                LogPos {
+                    term: 3,
+                    leader: 1,
+                    index: 2,
+                },
+                StoredEntry::Blank,
+            ))
+        }
+        if case == 3 {
+            rows.clear()
+        }
+        rows
+    };
+    let k1 = f.client.digest();
+    let k2 = f.server.digest();
+    let mut readback = tokio::task::spawn_blocking(move || -> Result<(), &'static str> {
+        let mut log = VoteLogStore::open(&rd, CLUSTER).map_err(|_| "receiver log reopen")?;
+        let sm = StateStore::open(&rd, init).map_err(|_| "receiver state reopen")?;
+        let expected = LogPos {
+            term: if case == 2 { 3 } else { 1 },
+            leader: 1,
+            index: if case >= 2 { 2 } else { 1 },
+        };
+        if sm.applied() != Some(expected)
+            || sm.membership()
+                != Some(&(
+                    LogPos {
+                        term: 1,
+                        leader: 1,
+                        index: 1,
+                    },
+                    m,
+                ))
+        {
+            return Err("reopened position/membership");
+        }
+        if log.vote().map_err(|_| "reopen vote")?
+            != Some(StoredVote {
+                term: if case == 0 { 2 } else { 3 },
+                node: 1,
+                committed: case >= 2,
+            })
+        {
+            return Err("persisted vote");
+        }
+        if expected_snapshot.is_some_and(|b| sm.snapshot() != b) {
+            return Err("reopened snapshot bytes");
+        }
+        if log.entries(0, 3, 3).map_err(|_| "reopened rows")? != expected_rows {
+            return Err("reopened exact rows");
+        }
+        if sm.state().authorize_peer(CLUSTER, node(1), k1).is_err()
+            || sm.state().authorize_peer(CLUSTER, node(2), k2).is_err()
+        {
+            return Err("reopened applied registry");
+        }
+
+        let state = log.log_state().map_err(|_| "reopened log state")?;
+        if state.last != Some(expected)
+            || state.purged != if case == 3 { Some(expected) } else { None }
+        {
+            return Err("reopened log bounds");
+        }
+        if log.live().map_err(|_| "reopen live")?
+            != if case == 3 {
+                0
+            } else if case == 2 {
+                3
+            } else {
+                2
+            }
+        {
+            return Err("reopened row count");
+        }
+        super::super::preflight(&mut log, &sm).map_err(|_| "reopened preflight")?;
+        let lr = log.released();
+        let sr = sm.released();
+        drop(log);
+        drop(sm);
+        let sender = StateStore::open(&sd, init).map_err(|_| "sender state reopen")?;
+        let ss = sender.released();
+        drop(sender);
+        if !lr.is_set() || !sr.is_set() || !ss.is_set() {
+            return Err("reopen release");
+        };
+        Ok(())
+    });
+    let (readback_observed, reopened) = match timeout(OBSERVE, &mut readback).await {
+        Ok(r) => (true, r),
+        Err(_) => (false, readback.await),
+    };
+    let reopened = reopened.map_err(|_| "readback worker join")?;
+    if !readback_observed {
+        return Err("readback observation expired; worker joined");
+    }
+
+    let weak_refused = pending
+        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+        .await
+        .is_err();
+    drop((sf, pending));
+    if sc.is_err()
+        || rc.is_err()
+        || shutdown.is_err()
+        || !owners_released
+        || !sender_released
+        || !weak_refused
+    {
+        return Err("joined teardown/release");
+    }
+    reopened?;
+    outcome.map_err(|_| "fixture body panic after cleanup")??;
+    Ok(())
+}
+#[tokio::test]
+async fn rpc_learner_p_once() {
+    assert!(learner_once(0).await.is_ok())
+}
+#[tokio::test]
+async fn rpc_learner_v_once() {
+    assert!(learner_once(1).await.is_ok())
+}
+#[tokio::test]
+async fn rpc_learner_a_once() {
+    assert!(learner_once(2).await.is_ok())
+}
+#[tokio::test]
+async fn rpc_learner_s_once() {
+    assert!(learner_once(3).await.is_ok())
+}
+#[tokio::test]
+async fn rpc_snapshot_cancel_owned_future_at_tls_and_reply_phases() {
+    use openraft::network::NetSnapshot;
+    for phase in [
+        Stage::ClientHandshake,
+        Stage::ClientAuthenticated,
+        Stage::ReplyRead,
+    ] {
+        let f = Fixture::new();
+        let spy = rpc_spy(false);
+        let mut receiver = f.owner(2, spy.clone());
+        let address = listening(&mut receiver).await;
+        let mut sender = f.owner(1, Spy::exact(None));
+        let hold = gate(&sender, phase);
+        let mut events = events(&sender);
+        let mut client = sender.loopback_client(2, address);
+        let snapshot = full_snapshot(&f);
+        let (cancel, rx) = oneshot::channel();
+        let reason = openraft::errors::ReplicationClosed::new("exact owned cancel");
+        let expected = reason.clone();
+        let call = tokio::spawn(async move {
+            client
+                .full_snapshot(
+                    heartbeat().vote,
+                    snapshot,
+                    async move { rx.await.unwrap_or(reason) },
+                    RPCOption::new(Duration::from_secs(4)),
+                )
+                .await
+        });
+        let reached = observe(&mut events, Event::Stage(phase)).await;
+        let charged = sender.shared.connections.available_permits() == 31;
+        let _ = cancel.send(expected.clone());
+        let result = call.await;
+        release(&sender, phase, &hold);
+        let a = sender.close().await;
+        let b = receiver.close().await;
+        assert!(
+            reached
+                && charged
+                && a.is_ok()
+                && b.is_ok()
+                && reclaimed(&sender)
+                && reclaimed(&receiver)
+        );
+        assert!(
+            matches!(result,Ok(Err(openraft::errors::StreamingError::Closed(ref c))) if *c==expected)
+        );
+        if phase != Stage::ReplyRead {
+            assert!(spy.calls.lock().unwrap().is_empty())
+        } else {
+            assert_eq!(spy.calls.lock().unwrap().len(), 1)
+        }
+    }
+}
+#[tokio::test]
+async fn rpc_attach_once_close_and_observed_dispatch_failure() {
+    use openraft::network::{NetVote, RaftNetworkFactory};
+    let f = Fixture::new();
+    let credentials = || Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let (mut owner, factory) = TransportOwner::pending(CLUSTER, node(2), credentials());
+    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reserved.local_addr().unwrap();
+    let first = owner.attach_reserved(&f.sm, Spy::exact(None), reserved, address);
+    let again = owner.begin_attach();
+    let health = owner.health();
+    let mut sender = f.owner(1, Spy::exact(None));
+    let mut client = sender.loopback_client(2, address);
+    let result = client
+        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+        .await;
+    let failed = owner.health();
+    let closed = owner.close().await;
+    let sender_closed = sender.close().await;
+    let after_close = owner.begin_attach();
+    drop(owner);
+    assert!(
+        first.is_ok()
+            && again.is_err()
+            && health == Health::Ready
+            && result.is_err()
+            && failed == Health::EngineUnavailable
+            && closed.is_ok()
+            && sender_closed.is_ok()
+            && after_close.is_err()
+    );
+    assert_eq!(factory.shared.strong_count(), 0);
+    let (mut failed, mut factory) = TransportOwner::pending(CLUSTER, node(2), credentials());
+    factory.loopback = true;
+    let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = held.local_addr().unwrap();
+    // Production endpoint refusal is terminal too, without consuming the reservation.
+    let result = failed
+        .attach(&f.sm, Spy::exact(None), &address.to_string())
+        .await;
+    let duplicate = failed.begin_attach();
+    let mut client = factory
+        .new_client(1, &openraft::BasicNode::new(address.to_string()))
+        .await;
+    let refused = client
+        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+        .await;
+    let closed = failed.close().await;
+    drop(held);
+    assert!(
+        result.is_err()
+            && duplicate.is_err()
+            && refused.is_err()
+            && closed.is_ok()
+            && reclaimed(&failed)
+    );
+}
+#[tokio::test]
+async fn rpc_snapshot_does_not_hold_heartbeat_client_and_stream_is_sequential() {
+    use futures_util::StreamExt;
+    use openraft::network::{NetSnapshot, NetStreamAppend, NetTransferLeader};
+    let f = Fixture::new();
+    let hold = Arc::new(Semaphore::new(0));
+    let (entered, rx) = oneshot::channel();
+    let spy = Arc::new(RpcSpy {
+        calls: Mutex::new(Vec::new()),
+        deny: false,
+        snapshot_gate: Some(hold.clone()),
+        snapshot_entered: Mutex::new(Some(entered)),
+    });
+    let mut receiver = f.owner(2, spy.clone());
+    let address = listening(&mut receiver).await;
+    let mut sender = f.owner(1, Spy::exact(None));
+    let mut snapshot_client = sender.loopback_client(2, address);
+    let mut heartbeat_client = sender.loopback_client(2, address);
+    let snapshot = full_snapshot(&f);
+    let pending = tokio::spawn(async move {
+        snapshot_client
+            .full_snapshot(
+                heartbeat().vote,
+                snapshot,
+                std::future::pending(),
+                RPCOption::new(Duration::from_secs(4)),
+            )
+            .await
+    });
+    let observed = timeout(OBSERVE, rx).await.is_ok_and(|r| r.is_ok());
+    let heartbeat_result = heartbeat_client
+        .append_entries(heartbeat(), RPCOption::new(Duration::from_secs(4)))
+        .await;
+    hold.add_permits(1);
+    let snapshot_result = pending.await;
+    let input = vec![heartbeat(), entries()];
+    let expected: Vec<_> = input
+        .iter()
+        .map(|r| peer_wire::encode_request(route(), r).unwrap())
+        .collect();
+    let output = match heartbeat_client
+        .stream_append(
+            futures_util::stream::iter(input),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await
+    {
+        Ok(stream) => stream.collect::<Vec<_>>().await,
+        Err(e) => vec![Err(e)],
+    };
+    let before = sender.shared.connections.available_permits();
+    let transfer = heartbeat_client
+        .transfer_leader(
+            openraft::raft::TransferLeaderRequest::new(heartbeat().vote, 2, None),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await;
+    let unchanged = sender.shared.connections.available_permits() == before;
+    let a = sender.close().await;
+    let b = receiver.close().await;
+    assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+    assert!(
+        observed
+            && matches!(heartbeat_result, Ok(Ok(None)))
+            && matches!(snapshot_result, Ok(Ok(_)))
+            && transfer.is_err()
+            && unchanged
+    );
+    assert_eq!(output.len(), 2);
+    assert!(matches!(output[0], Ok(Ok(None))));
+    assert!(matches!(output[1],Ok(Ok(Some(p))) if p==log_id(7,1,1)));
+    assert_eq!(&spy.calls.lock().unwrap()[2..], expected.as_slice());
+    // A protocol conflict terminates the pinned sequential stream after one RPC.
+    let spy = Spy::exact(Some(Err(AppendError::Conflict {
+        log_id: log_id(1, 1, 0),
+        hint: None,
+    })));
+    let mut receiver = f.owner(2, spy.clone());
+    let address = listening(&mut receiver).await;
+    let mut sender = f.owner(1, Spy::exact(None));
+    let mut c = sender.loopback_client(2, address);
+    let mut r = heartbeat();
+    r.prev_log_id = Some(log_id(1, 1, 0));
+    let output = match c
+        .stream_append(
+            futures_util::stream::iter(vec![r, heartbeat()]),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await
+    {
+        Ok(stream) => stream.collect::<Vec<_>>().await,
+        Err(e) => vec![Err(e)],
+    };
+    let a = sender.close().await;
+    let b = receiver.close().await;
+    assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+    assert_eq!(output.len(), 1);
+    assert!(matches!(output[0], Ok(Err(AppendError::Conflict { .. }))));
+    assert_eq!(spy.count(), 1);
 }
