@@ -141,6 +141,183 @@ fn content(response: CallToolResult) -> Value {
 }
 
 #[tokio::test]
+async fn foreground_discovery_rendering_tracks_capability_before_and_after_cache() {
+    for mode in [
+        IdentityMode::CurrentUser,
+        IdentityMode::DevelopmentCurrentUser,
+        IdentityMode::DedicatedAccount,
+    ] {
+        for stopped in [None, Some("shutdown"), Some("quarantined")] {
+            let dir = crate::service::application::tests::private_temp();
+            let activity = Arc::new(Activity::open(dir.path()).unwrap());
+            let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = probes.clone();
+            let mut executor = Execution::probe_fixture(move |_, _| {
+                count.fetch_add(1, Ordering::AcqRel);
+                Ok(output())
+            });
+            Arc::get_mut(&mut executor).unwrap().identity_mode = mode;
+            match stopped {
+                Some("shutdown") => executor.shutdown(),
+                Some("quarantined") => executor.quarantined.store(true, Ordering::Release),
+                _ => {}
+            }
+            let expected = executor.capability();
+            let available = mode != IdentityMode::DedicatedAccount && stopped.is_none();
+            let inventory = crate::mcp::Inventory {
+                execution: Some(executor.clone()),
+                activity: activity.clone(),
+                principal: Some(crate::mcp::Principal("fixture-agent".into())),
+            };
+            let (s, c) = tokio::io::duplex(65536);
+            let server =
+                tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+            let client = ().serve(c).await.unwrap();
+            let before = content(
+                client
+                    .call_tool(CallToolRequestParams::new("list_hosts"))
+                    .await
+                    .unwrap(),
+            );
+            let discovery = client
+                .call_tool(CallToolRequestParams::new("discover_tools"))
+                .await;
+            // Both stop paths must preserve an already released cache. Each
+            // unavailable case above starts fresh, without a prior observation.
+            if available {
+                executor.shutdown();
+            }
+            let shutdown_cache = if available {
+                let observed = content(
+                    client
+                        .call_tool(CallToolRequestParams::new("list_hosts"))
+                        .await
+                        .unwrap(),
+                );
+                executor.quarantined.store(true, Ordering::Release);
+                Some(observed)
+            } else {
+                None
+            };
+            let after = content(
+                client
+                    .call_tool(CallToolRequestParams::new("list_hosts"))
+                    .await
+                    .unwrap(),
+            );
+            client.cancel().await.unwrap();
+            server.await.unwrap().unwrap();
+            assert!(executor.drain().await);
+
+            let host = &before["hosts"][0];
+            assert_eq!(host["execution"], expected);
+            assert_eq!(host["execution_available"], available);
+            assert_eq!(host["execution"]["mode"], mode.as_str());
+            assert_eq!(host["execution"]["dedicated"], false);
+            assert!(host["execution"]["rights"].is_null());
+            assert_eq!(
+                host["tool_discovery"],
+                if available {
+                    "discover_tools"
+                } else {
+                    "not_configured"
+                }
+            );
+            assert!(activity.tool_cache().is_some() == available);
+            if mode == IdentityMode::DedicatedAccount {
+                assert_eq!(
+                    host["execution_unavailable_reason"],
+                    "dedicated_account_setup_required"
+                );
+                assert!(host["execution"]["matches_current_user"].is_null());
+            } else {
+                assert_eq!(host["execution_unavailable_reason"], json!(stopped));
+                assert_eq!(host["execution"]["matches_current_user"], true);
+            }
+            assert_eq!(
+                host["execution"]["isolation"],
+                if mode == IdentityMode::DevelopmentCurrentUser {
+                    json!("none_shares_owner_user")
+                } else {
+                    json!(false)
+                }
+            );
+            if available {
+                let released = content(discovery.unwrap());
+                assert_eq!(released["outcome"], "succeeded");
+                assert_eq!(probes.load(Ordering::Acquire), TOOLS.len());
+                let stopped_host = &shutdown_cache.as_ref().unwrap()["hosts"][0];
+                assert_eq!(stopped_host["tool_discovery"], "cached");
+                assert_eq!(stopped_host["tools"], released["tools"]);
+                assert_eq!(stopped_host["execution_available"], false);
+                assert_eq!(stopped_host["execution_unavailable_reason"], "shutdown");
+                assert_eq!(after["hosts"][0]["tool_discovery"], "cached");
+                assert_eq!(after["hosts"][0]["tools"], released["tools"]);
+                assert_eq!(
+                    after["hosts"][0]["tools_observed_at"],
+                    activity.tool_cache().unwrap().observed_at_ms
+                );
+                assert_eq!(
+                    after["hosts"][0]["last_observed_identity"],
+                    released["observed_identity"]
+                );
+                assert_eq!(after["hosts"][0]["execution_available"], false);
+                assert_eq!(
+                    after["hosts"][0]["execution_unavailable_reason"],
+                    "quarantined"
+                );
+            } else {
+                assert!(discovery.is_err());
+                assert_eq!(
+                    probes.load(Ordering::Acquire),
+                    0,
+                    "unavailable never falls back to a probe"
+                );
+                assert_eq!(after["hosts"][0]["execution"], expected);
+                assert_eq!(after["hosts"][0]["tool_discovery"], "not_configured");
+                assert!(after["hosts"][0].get("tools").is_none());
+                assert!(after["hosts"][0].get("last_observed_identity").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn inventory_only_discovery_rendering_stays_unconfigured() {
+    let dir = crate::service::application::tests::private_temp();
+    let activity = Arc::new(Activity::open(dir.path()).unwrap());
+    let inventory = crate::mcp::Inventory {
+        execution: None,
+        activity: activity.clone(),
+        principal: Some(crate::mcp::Principal("fixture-agent".into())),
+    };
+    let (s, c) = tokio::io::duplex(65536);
+    let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
+    let client = ().serve(c).await.unwrap();
+    let hosts = content(
+        client
+            .call_tool(CallToolRequestParams::new("list_hosts"))
+            .await
+            .unwrap(),
+    );
+    let discovery = client
+        .call_tool(CallToolRequestParams::new("discover_tools"))
+        .await;
+    client.cancel().await.unwrap();
+    server.await.unwrap().unwrap();
+    let host = &hosts["hosts"][0];
+    assert_eq!(
+        host["execution"],
+        json!({"available":false,"reason":"not_configured"})
+    );
+    assert_eq!(host["execution_available"], false);
+    assert_eq!(host["execution_unavailable_reason"], "not_configured");
+    assert_eq!(host["tool_discovery"], "not_configured");
+    assert!(discovery.is_err());
+    assert!(activity.tool_cache().is_none());
+}
+
+#[tokio::test]
 async fn normal_current_user_dispatch_and_activity_keep_distinct_legacy_provenance() {
     let dir = crate::service::application::tests::private_temp();
     let activity = Arc::new(Activity::open(dir.path()).unwrap());
@@ -254,6 +431,19 @@ async fn dedicated_selection_is_setup_required_and_never_invokes_current_user_ba
     let (s, c) = tokio::io::duplex(65536);
     let server = tokio::spawn(async move { inventory.serve(s).await.unwrap().waiting().await });
     let client = ().serve(c).await.unwrap();
+    let hosts = content(
+        client
+            .call_tool(CallToolRequestParams::new("list_hosts"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(hosts["hosts"][0]["execution"], capability);
+    assert_eq!(hosts["hosts"][0]["execution_available"], false);
+    assert_eq!(hosts["hosts"][0]["tool_discovery"], "not_configured");
+    assert_eq!(
+        hosts["hosts"][0]["execution_unavailable_reason"],
+        "dedicated_account_setup_required"
+    );
     for request in [
         CallToolRequestParams::new("run_command")
             .with_arguments(json!({"tool":"cargo"}).as_object().unwrap().clone()),
@@ -278,8 +468,20 @@ async fn dedicated_selection_is_setup_required_and_never_invokes_current_user_ba
             },
         )
         .unwrap();
-    assert_eq!(page.activities.len(), 2);
-    for row in page.activities {
+    assert_eq!(page.activities.len(), 3);
+    let (reads, executions): (Vec<_>, Vec<_>) = page
+        .activities
+        .into_iter()
+        .partition(|row| row.tool == crate::store::Tool::ListHosts);
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].outcome, Outcome::Succeeded);
+    assert_eq!(
+        reads[0].execution_mode,
+        Some(IdentityMode::DedicatedAccount)
+    );
+    assert!(reads[0].metadata.observed_id.is_none() && reads[0].metadata.rights.is_none());
+    assert_eq!(executions.len(), 2);
+    for row in executions {
         assert_eq!(row.execution_mode, Some(IdentityMode::DedicatedAccount));
         assert_eq!(row.outcome, Outcome::Refused);
         assert!(row.metadata.observed_id.is_none() && row.metadata.rights.is_none());

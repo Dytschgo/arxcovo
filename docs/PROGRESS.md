@@ -4728,3 +4728,62 @@ returned summary, without altering original artifacts. Fresh independent Sol
 review and all corrected-head gates remain required before merge. Currentsource
 is not yet published beyondf5, so the completed failed matrix is not interrupted.
 M2OPEN/M3UNCHECKED, fullv1 remains active; no historical engine-counter reset.
+
+## PR183 exactd30 reviewed; Unix golden mismatch holds delivery
+
+Published the two audited test-line corrections at
+`d30c79af8ac363fdb4e39420b0e15425ab5738cd`. Fresh independent Sol6.1/medium
+review SOURCE GO, Standards/Spec PASS, zero material findings;17source and
+7artifact identities verified. Exact-head attestation/comment6984414642 and
+agent-review success published. No production body change or binary rebuild.
+
+Normal CI44345053750 attempt1 Ubuntu failed after141s:592PASS/1FAIL/22skip/
+85unrun,28.206s test body. The failure is the e7 MCP cache/no-cache golden
+source comparison: actual discovery capability condition differs from its
+old golden. Clippy and the earlier schema cases pass. Full evidence and
+bounded-log identity are in
+[third-source checkpoint](evidence/windows-execution-choice-pr183-golden-observation.md).
+Windows running/macOS queued at the captured read; no final matrix claim.
+
+Coordinator Sol6.1/high assigned fresh independent Sol6.1/high READ-ONLY
+disposition of golden intent, capability behavior and related source pins.
+No further correction authorized by review alone, no test/build/native probe
+requested and no CI rerun/dispatch/cancellation/source push. Prior two
+integration-correction followups and all failures stay visible. PR183 held,
+PR182 HOLD/NOFIX, engineSol3/3 exhausted and historicalOpus0/2 unchanged.
+M2OPEN/M3UNCHECKED. D paths verified; C free37,570,359,296bytes at this
+checkpoint, above20GB. No new large local build, owner/admin/VM/data/cache or
+babysitter action. Full v1 remains incomplete.
+
+The d30 failed-check notification triggered one terminal matrix read: all3jobs
+FAIL on the same golden assertion. macOS572PASS/1FAIL/8skip/73unrun,258s job;
+Windows625/1/36/66,335s; Ubuntu unchanged. Workflow563s. All three bounded logs
+and per-case counts/hashes retained onD; no rerun/dispatch/cancellation. Later
+Rust binaries and Node/smokes remain UNRUN, no full-job duration acceptance.
+
+Fresh independent Sol6.1/high disposition returned: stale source fixture,
+no confirmed production regression; two Standards findings (golden plus missing
+unavailable-foreground SDK coverage), Spec0. Report copied to
+[golden disposition](reviews/windows-execution-choice-golden-disposition.md).
+Under existing owner-authorized current-user work, coordinator addresses those
+two small test findings directly, preserving the complete source golden and all
+existing assertions. No production function/schema/engine/permission change.
+No new fix grant is inferred from the reviewer. The initial focused local check
+passed6/7 but its added list_hosts call created one legitimate read row, exposing
+the old dedicated fixture's exact2-row assumption. The test now separately
+requires that one successful read and the same two dedicated refused rows;
+failure log retained, no assertion removed. Corrected focused verification is
+running onD. This is test bookkeeping, not an engine/backend failure or repair.
+
+The second focused check also6PASS/1FAIL: the newly separated read expected
+no execution mode, but actual foreground reads deliberately retain the selected
+mode (mcp.rs start_execution). Corrected that source-proven test assertion to
+DedicatedAccount, retaining no-raw-identity/rights checks. Both failed logs remain.
+Final focused7/7PASS,0.747s body/18.50s compile. New9-case SDK capability matrix,
+inventory-only, actual Windows dedicated-settings refusal, E7 golden/W8 domain
+pins and installed/legacy cache roundtrips pass. Windows all-target ClippyPASS
+5.69s tool report, fmt/diffPASS. No production body, old source pin manifest,
+normal binary/runtime, engine/native or policy change. No former-predicate
+mutation or broad suite was run. D evidence at arx-pr183-golden-correction.
+Fresh exact-head independent review and all normal hosted gates remain needed;
+stop on a new failure for disposition. Historical counters unchanged.
