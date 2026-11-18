@@ -30,6 +30,30 @@ function sample(spans = [[0, 400, 500], [0, 400, 500], [0, 400, 500]], seconds =
 }
 const measure = ({ run, jobs }, listed = run, kind = 'main', repositoryId) => queueMeasurement(duration(run), run, jobs, listed, kind, repositoryId);
 
+test('split nine-job CI receives no queue credit and retains the original 900-second wall rule', () => {
+  for (const seconds of [900, 901, 1000]) {
+    const data = sample(undefined, seconds);
+    const original = data.jobs.jobs;
+    data.jobs.jobs = ['rust', 'ui', 'verify'].flatMap((phase, phaseIndex) => original.map((job, osIndex) => ({
+      ...job, id: phaseIndex * 3 + osIndex + 1,
+      name: job.name.replace('verify', phase),
+      labels: phase === 'verify' ? ['ubuntu-latest'] : job.labels,
+    })));
+    data.jobs.total_count = 9;
+    const result = measure(data);
+    assert.equal(result.seconds, seconds);
+    assert.equal(result.credit, 'unavailable:jobs-invalid');
+    for (const key of ['queueCreditSeconds', 'chargedSeconds', 'longestJobSeconds']) assert.equal(result[key], null);
+    assert.deepEqual(result.jobs, []);
+    if (seconds === 900) assert.equal(budget(result, null, false), true);
+    else {
+      assert.throws(() => budget(result, null, false));
+      assert.throws(() => budget(result, measure(sample()), true));
+    }
+    assert.throws(() => budget(measure(sample([[0, 0, 1000], [0, 0, 1000], [0, 0, 1000]], 1000)), result, true));
+  }
+});
+
 test('geometry: concurrent waits, execution overlap, serial gaps, prefix/tail and no-pending idle', () => {
   for (const [spans, seconds, Q] of [
     [[[0, 400, 500], [0, 400, 500], [0, 400, 500]], 1000, 400],

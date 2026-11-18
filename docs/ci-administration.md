@@ -117,3 +117,12 @@ Trusted current policy reads failed attempt1 at905s; ADR0025 would withhold
 credit for that failed attempt. No retroactive pass is promised. #163 is the
 next merge candidate, ahead of all features, subject to the reviewed pinned
 owner-authorized route above and fresh qualifying main after activation.
+
+### Parallel validation proposal, 2026-11-18
+
+[ADR0031](adr/0031-parallel-ci-validation.md) keeps the three protected `verify`
+contexts as fail-closed completion gates over parallel Rust and UI matrices.
+No branch-protection edit is needed. The existing charged-v1 implementation is
+unchanged and rejects this nine-job layout for credit, using the original
+900-second wall limit. First-attempt hosted validation and independent review
+are required before activation; no speedup or PR182 release is established yet.

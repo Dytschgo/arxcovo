@@ -65,6 +65,15 @@ starting 200s earlier while Ubuntu runs would count as a reduction made of queue
 is removed, because it accepted queue variance. Candidate selection is unchanged: same head SHA, same
 `head_repository.id`, highest `run_number`, attempt 1.
 
+## Later topology change
+
+[ADR0031](0031-parallel-ci-validation.md) proposes parallel workers with the
+existing required checks retained as completion gates. This ADR's three-job
+credit validator is unchanged: the split layout receives no queue credit and
+uses the original 900-second wall rule. The single-job workflow pin described
+below is historical once ADR0031 is activated; it is not widened to grant credit
+to dependency gates or additional jobs.
+
 ## Trusted inputs and validation
 
 The evaluator keeps its existing read, `GET repos/{repo}/actions/runs/{id}/attempts/1`. It adds one read:

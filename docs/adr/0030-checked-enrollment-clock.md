@@ -1,7 +1,9 @@
 # 0030: Checked host clock at enrollment boundaries
 
-Status: design accepted after independent Sol 6.1/high review on 2026-11-18;
-implementation and required gates pending.
+Status: merged as PR184 after independent Sol reviews and green required
+corrected-head gates on 2026-11-18; resulting-main first CI44379630740 attempt1
+passed. The clock remains unwired to live startup. No runtime time-health
+acceptance follows.
 
 Enrollment currently receives an infallible timestamp before proposing redemption,
 before signing, and before returning a certificate. An unavailable or visibly
