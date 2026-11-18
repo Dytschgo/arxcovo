@@ -3622,3 +3622,7 @@ Owner instruction: use Astra6.2 as code reviewer if stuck. Root confirmed Codexg
 ### Astra stuck-path disposition adopted - 2026-11-18
 
 Astra6.2/high review76fab91b: required founder refusal branches remain unknown; new query test stopped before query. Existing panic paths bypass explicit shutdown, so teardown evidence is absent, not a proven leak or cause. Cinvalid/Tunrun retained; artificial mutex treatment duplicates coveredtimeout behavior and is not admitted. Root adopts a higher-information Ubuntu diagnostic: scope three failing calls plus observed fourthco-runner, capture actualrefusal branch/workeredges and cleanup separately. Prepare contract only before newsource; proposed carrier is one new instrumentedrevision through existing normal Ubuntuverify/fullCI, not a rerun or workflow/settings change. Record actual overlap; green/missingoverlap proves no reproduction. Independent Astra review precedes runtime/publication. Sol6.1 remains builder, no exhausted fix reset; PR176held.
+
+### Ubuntu diagnostic contract review - 2026-11-18
+
+Sol6.1/high brief f26c0825 retainedb10ac552 specifies actualrefusal tags, fixedworkeredges and primary-error cleanup before originalassertions. Root flaggedprocfs trust/overlap feasibility before sourceauthorization. Independent Astra6.2/high contractreview is running, tasked to keep the diagnostic minimal and resolve scope/trust gaps. No source/build/runtime/network changes; PR176held, Cinvalid/Tunrun, counters unchanged, hardware **unverified on real hardware**.
