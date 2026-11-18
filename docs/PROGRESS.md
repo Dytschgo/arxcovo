@@ -3718,3 +3718,12 @@ allfive gates/new identity3 eachOS/Windows<=660s/freshgreenmain. Full details an
 artifact hashes: [application](evidence/m3-founder-postshutdown-application.md).
 LastmergedPR176 unchanged; M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged.
 Hardware **unverified on real hardware**. Existing babysitter left intact.
+
+Astra6.2/high independent actual-source review PASS at77de123f: CFG exterior and
+original observer byte-identity verified; anchored proof one emitter-line delta;
+prior identity review applicable by source identity;12local artifact hashes checked.
+Nonblocking missing/zero/saturated late formatter assertion gap retained, no source
+change. [Review](reviews/m3-founder-postshutdown-actual-astra62-review.md).
+Only accurate review/outcome docs may follow before final-source identity check.
+One authorized normal hosted firstattempt will start on publication; no rerun,
+no runtimefix credit, Sol3/3 unchanged. Full-access does not relax any hard gate.
