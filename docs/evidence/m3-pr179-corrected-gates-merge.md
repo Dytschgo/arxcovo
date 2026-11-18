@@ -41,3 +41,22 @@ LastmergedPR179; M2OPEN/M3UNCHECKED. API is guardedwatermark only; actualadapter
 quorum/race/cancellation and production admission remain separate proof gaps.
 Hardware **unverified on real hardware**. Owner PC/setup/containerplan local
 commits preserved, no native/admin/container action. Existing babysitter untouched.
+
+## Exact-main first-attempt confirmation
+
+Coordinator Sol6.1/high personally checked main6bf8f46bc87a05bed01e342c1a37f68427e4c16b
+CI44276313116 attempt1SUCCESS,09:28:57–09:38:22Z565s wall. Jobs Windows561s,
+Ubuntu288s/macOS419s. Verified exactly7newtestsPASS eachOS and Node48/48eachOS.
+FullRust Windows662PASS/36skip, Ubuntu654PASS/22skip, macOS622PASS/8skip.
+Bounded perjoblogs<8MiB retainedD:/Temp/arx-pr179-main-6bf8f46, SHA256:
+windows246721bytes a198239bb862b350b172a45ee53f07d0b60bac30e7851da31d299fa877017afd
+ubuntu248877bytes e3c81243bdacbaf78d11060a09c708d17be2212e717ae6e2798b52a75e200986
+macos229980bytes f192a775823d7b57d6f7d84fbb82f4f4ee911cab019fafaa862f1d1f758a0ca9
+Existing node scripts/ci-budget.mjs --record executed with D TMP/TEMP; validated
+history565wall/563charged/2idlequeuecredit,longestjob561, no statusmutation.
+Automaticpolicy44277813800SUCCESS on sameexactmain. No rerun/dispatch.
+OptionalWindows sample all_pass,nextest0,wall29266ms,orphans0,e_s540. This single
+passing observation does not erase prior PRsample3pass5fail, diagnosecause or earn
+stability/re-enable/repair credit. Counters unchanged, no newfix/diagnostic authority.
+M2OPEN/M3UNCHECKED; API quorum/race/cancel and real transport remain unproven.
+Hardware **unverified on real hardware**. Native PC waits verified owner setup.

@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**New main6bf8f46 first CI pending after PR179; previous main GREEN:** exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -40,8 +40,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR179 as6bf8f46bc87a05bed01e342c1a37f68427e4c16b from reviewed2f888992. Allfive gatesSUCCESS; CI44274746575 attempt1GREEN537s, Windows533s. New7tests and Node48 eachOS PASS. Premerge exactmain6f4618c/CI44269052508 GREEN checked immediately.
-- Current work: resulting exact-main first CI pending; featuremerges held until GREEN. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
-- Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.- M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
+- Current work: exact-main CI44276313116 attempt1GREEN565s verified. Deliver preserved owner-PC/container-plan docs and bound first peer-transport prerequisite. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
+- Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.
+- M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
 ## Ordering and M2 closure plan
@@ -3908,3 +3909,15 @@ M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged. Owner PC checklist/ADR0023
 containerplan commits remain preserved locally for separate delivery. No owner
 account/admin/native/container actions. Next verify exact-main firstattempt, then
 continue containerplan prerequisites with independent review and normalgates.
+
+## Green main and peer-transport prerequisite (2026-11-18)
+
+Coordinator Sol6.1/high verified exactmain6bf8f46/CI44276313116 attempt1GREEN565wall,
+563charged/2validatedqueuecredit. New7andNode48eachOSPASS, optionalWindowssample
+all_pass but no stability/re-enable/fixcredit. [Evidence](evidence/m3-pr179-corrected-gates-merge.md).
+Existing historyrecorder ran; automaticpolicy44277813800SUCCESS. No rerun/dispatch.
+Sol6.1/high assigned read-only source-grounded first peerprotocol contract for
+containerprerequisites, no implementation/test/engine/container run. Next docs
+delivery carries ownerPCchecklist/ADR0023/containerplan and preserved evidence
+onto greenmain without duplicating mergedRust/testsource. M2OPEN/M3UNCHECKED,
+Sol3/3exhausted/Opus0/2unchanged; hardware unverified. Owner native setup stillpending.
