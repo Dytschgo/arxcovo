@@ -3930,3 +3930,13 @@ compilable forceNone mutation (codec has no originalrequest from which to invent
 an ack). LiveTLS handshake registrycallback blockingownership is an explicit
 separate prerequisite. Independent Sol doc/technical review running; no code/build/
 engine/network/container action. Allsource still exactgreenmain6bf8f46.
+
+Independent Sol6.1/high docs/architecture review PASS at eec2cad6: Standards0/
+Spec0/Security0. Non-doc source exactlymain6bf8f46; all6retainedloghashes verified,
+history565/563/2/561 correct; relative links/diffcheckPASS. Three protocolclarifications
+were applied and rechecked. ADR0026 accepted for purecodec prerequisite only;
+review explicitly permits status+reviewretention with unchangedprotocol/source.
+[Review](reviews/m3-container-prerequisites-sol61-review.md). Future dispatch must
+also validate sequenceinvariants; no liveTLS/engine authority from purecodec.
+Ready scoped docsPR for ownersteering/containerroute/firstcodec contract. No new
+runtime tests appropriate to docs-only change; normalhostedgates stillrequired.

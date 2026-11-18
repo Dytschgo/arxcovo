@@ -1,6 +1,6 @@
 # 0026: Bounded peer wire codec before live transport
 
-Status: proposed for independent review, 2026-11-18.
+Status: accepted for the pure codec prerequisite only, 2026-11-18, after independent Sol 6.1/high technical review. No live transport or dispatch authority.
 
 The three-container acceptance route needs real peer transport. Existing mem_net
 is an in-process fixture, and the executable has no cluster listener/startup path.
