@@ -57,3 +57,20 @@ PR176 state are context only, not independently fetched or reused as source proo
 No PR/push/watch/merge. Last merged PR unchanged; Sol3/3 historical Opus0/2 unchanged;
 M2 open, M3 unchecked. Hardware **unverified on real hardware**. No admission,
 transport, custody, freshness, owner-authority or production acceptance claim.
+
+## Root guard correction after Astra review - 2026-11-18
+
+Astra b989fb90 reviewed092dcf9c: production/three Rust blobs match contract;
+B1 raw matching accepted block-commented tests/bindings and B2 accepted async.
+Root changes only the new identity guard: reject block-comment delimiters in
+the three guarded files (currently line comments only), anchor test declarations,
+and explicitly reject async signatures. Negative controls cover commented source,
+commented test attributes, each commented parent binding and each async test.
+This conservative block-comment fence is intentional; no Rust lexer is claimed.
+The first editing script accidentally changed the older fixture matcher too,
+causing six Python unpack errors. Root restored the entire pre-identity prefix
+from HEAD and compared every existing main function/class AST unchanged.
+Corrected CI-equivalent quarantine suite:9/9 passed in0.124s; diffcheck clean.
+No Rust or engine execution in this correction. Separate D-volume validation
+remains pending; its immutable Rust baseline is unchanged by this guard edit.
+Independent Astra delta recheck and hosted gates still required.

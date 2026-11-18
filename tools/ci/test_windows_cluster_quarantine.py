@@ -512,12 +512,16 @@ def assert_identity_inventory(source, tls, pki):
                                  'peer_identity_fresh_binding_controls',
                                  'peer_identity_assumed_founder_denied']
     for text in (source, tls, pki):
+        # Fail closed rather than parse nested Rust block comments. These three
+        # guarded files currently use line comments only.
+        assert "/*" not in text and "*/" not in text
         assert_issuance_required(text)
     functions = re.findall(r'(?m)^fn ([a-z0-9_]+)\(', source)
     assert len(functions) == len(set(functions))
-    tests = re.findall(r'((?:#\[[^\]]*\]\s*)+)(?:async )?fn ([a-z0-9_]+)\(', source)
+    tests = re.findall(r'(?m)^((?:#\[[^\]]*\]\s*)+)(async )?fn ([a-z0-9_]+)\(', source)
     actual = []
-    for attrs, name in tests:
+    for attrs, async_prefix, name in tests:
+        assert not async_prefix
         if 'test' in attrs:
             assert attrs.strip() == '#[test]'
             actual.append(name)
@@ -569,6 +573,7 @@ class IdentityInventoryTests(unittest.TestCase):
             original = [source, tls, pki][index]
             for replacement in ('', binding + '\n' + binding,
                                 binding.replace(name, 'absent'),
+                                '/*\n' + binding + '\n*/',
                                 '#[cfg(unix)]\n' + binding,
                                 binding.replace('#[cfg(test)]', ''),
                                 binding.replace('authenticated_identity_tests.rs', 'absent.rs')):
@@ -578,6 +583,14 @@ class IdentityInventoryTests(unittest.TestCase):
                 args[index] = original.replace(binding, replacement)
                 with self.assertRaises(AssertionError):
                     assert_identity_inventory(*args)
+        for name in IDENTITY_REQUIRED:
+            signature = 'fn ' + name + '('
+            for mutation in (source.replace(signature, 'async ' + signature),
+                             '/*\n' + source + '\n*/',
+                             source.replace('#[test]\n' + signature,
+                                            '/* #[test] */\n' + signature)):
+                with self.assertRaises(AssertionError):
+                    assert_identity_inventory(mutation, tls, pki)
         for weakened in ([], IDENTITY_REQUIRED[:-1], IDENTITY_REQUIRED + [IDENTITY_REQUIRED[0]]):
             with patch(__name__ + '.IDENTITY_REQUIRED', weakened):
                 with self.assertRaises(AssertionError):
