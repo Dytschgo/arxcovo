@@ -87,6 +87,17 @@ struct Pre {
     membership: bool,
 }
 fn init_refusal(e: RaftError<Arx, InitializeError<Arx>>) -> FoundError {
+    #[cfg(test)]
+    observation::phase_reply(
+        10,
+        match &e {
+            RaftError::APIError(InitializeError::NotAllowed(_)) => {
+                observation::Reason::InitNotAllowed
+            }
+            RaftError::APIError(_) => observation::Reason::ApiOther,
+            RaftError::Fatal(_) => observation::Reason::Fatal,
+        },
+    );
     match e {
         RaftError::APIError(InitializeError::NotAllowed(_)) => FoundError::AlreadyInitialized,
         _ => FoundError::Unavailable,
@@ -114,7 +125,7 @@ macro_rules! found_final {
     }};
 }
 #[cfg(test)]
-mod observation {
+pub(in crate::cluster::consensus) mod observation {
     use super::{FoundError, ISSUE_BUDGET, Instant};
     use std::cell::RefCell;
 
@@ -133,6 +144,9 @@ mod observation {
         len: usize,
         overflow: bool,
         pending: Option<&'static str>,
+        slots: Option<std::sync::Arc<Slots>>,
+        decision: Decision,
+        reason: Reason,
     }
     tokio::task_local! {
         static CAPTURE: RefCell<Buffer>;
@@ -190,6 +204,19 @@ mod observation {
     }
     pub(super) fn exit<T>(d: Instant, p: &'static str, r: &Result<T, FoundError>) {
         record(d, p, "exit", variant(r));
+        if p == "initialize" && r.is_ok() {
+            phase_reply(10, Reason::Ok);
+        }
+        if p == "leaderwait" {
+            phase_reply(
+                11,
+                if r.is_ok() {
+                    Reason::Ok
+                } else {
+                    Reason::ReplyError
+                },
+            );
+        }
     }
     pub(super) fn deadline_entry(d: Instant) {
         record(d, "finaldeadline", "enter", "Pending");
@@ -204,6 +231,9 @@ mod observation {
             len: 0,
             overflow: false,
             pending: None,
+            slots: None,
+            decision: Decision::Unknown,
+            reason: Reason::Unknown,
         });
         CAPTURE
             .scope(buffer, async {
@@ -233,27 +263,605 @@ mod observation {
             })
             .await
     }
+    use std::fmt::Write;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    const MAX_US: u128 = (1u128 << 48) - 2;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::cluster::consensus) enum Call {
+        QueryInitial,
+        ProofInitial,
+        F10Final,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::cluster::consensus) enum Reason {
+        Pending,
+        Ok,
+        Busy,
+        OwnersPoison,
+        OwnersClosed,
+        MissingRaft,
+        MissingStore,
+        MutexPoison,
+        StoreCorrupt,
+        StoreOther,
+        BlockingError,
+        ReceiverClosed,
+        SenderClosed,
+        Expired,
+        InitNotAllowed,
+        ApiOther,
+        Fatal,
+        Forward,
+        NoQuorum,
+        ReadyInnerError,
+        ReadyOuterError,
+        SubmitError,
+        ReplyError,
+        Unknown,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::cluster::consensus) enum Decision {
+        Unknown,
+        InnerOnTime,
+        ReadyLate,
+        WaitElapsed,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Lane {
+        Preflight,
+        Proposal,
+        Guard1,
+        Guard2,
+    }
+    #[derive(Clone, Copy)]
+    pub(in crate::cluster::consensus) enum Edge {
+        Admission,
+        OwnersGate,
+        OwnerEnter,
+        BlockingSubmit,
+        ClosureStart,
+        MutexAcquired,
+        StoreReply,
+        BlockingJoin,
+        OwnerSend,
+        CallerReply,
+        Submission,
+        SubmissionReply,
+        EngineReply,
+        LinearizerEnter,
+        LinearizerReply,
+        AppliedReady,
+        CallerExpiry,
+    }
+    impl Lane {
+        fn slot(self, edge: Edge) -> usize {
+            use Edge::*;
+            match self {
+                Self::Preflight => match edge {
+                    Admission => 0,
+                    OwnersGate => 1,
+                    OwnerEnter => 2,
+                    BlockingSubmit => 3,
+                    ClosureStart => 4,
+                    MutexAcquired => 5,
+                    StoreReply => 6,
+                    BlockingJoin => 7,
+                    OwnerSend => 8,
+                    CallerReply => 9,
+                    _ => unreachable!(),
+                },
+                Self::Proposal => match edge {
+                    Admission => 12,
+                    OwnersGate => 13,
+                    OwnerEnter => 14,
+                    Submission => 15,
+                    SubmissionReply => 16,
+                    EngineReply => 17,
+                    OwnerSend => 18,
+                    CallerReply => 19,
+                    _ => unreachable!(),
+                },
+                Self::Guard1 | Self::Guard2 => {
+                    let relative = match edge {
+                        Admission => 0,
+                        OwnersGate => 1,
+                        OwnerEnter => 2,
+                        LinearizerEnter => 3,
+                        LinearizerReply => 4,
+                        AppliedReady => 5,
+                        BlockingSubmit => 6,
+                        ClosureStart => 7,
+                        MutexAcquired => 8,
+                        StoreReply => 9,
+                        BlockingJoin => 10,
+                        OwnerSend => 11,
+                        CallerReply => 12,
+                        CallerExpiry => 13,
+                        _ => unreachable!(),
+                    };
+                    (if self == Self::Guard1 { 20 } else { 34 }) + relative
+                }
+            }
+        }
+    }
+    struct Slots {
+        words: [AtomicU64; 48],
+        start: Instant,
+    }
+    impl Slots {
+        fn new() -> Self {
+            Self {
+                words: std::array::from_fn(|_| AtomicU64::new(0)),
+                start: Instant::now(),
+            }
+        }
+        fn freeze(&self) -> [u64; 48] {
+            std::array::from_fn(|i| self.words[i].load(Ordering::Acquire))
+        }
+    }
+    #[derive(Clone)]
+    pub(in crate::cluster::consensus) struct Handle {
+        slots: Arc<Slots>,
+        lane: Lane,
+    }
+    pub(in crate::cluster::consensus) fn worker() -> Option<Handle> {
+        CAPTURE
+            .try_with(|cell| {
+                let b = cell.borrow();
+                let lane = match b.pending? {
+                    "preflight" => Lane::Preflight,
+                    "proposal" => Lane::Proposal,
+                    "guard1" => Lane::Guard1,
+                    "guard2" => Lane::Guard2,
+                    _ => return None,
+                };
+                Some(Handle {
+                    slots: b.slots.clone()?,
+                    lane,
+                })
+            })
+            .ok()
+            .flatten()
+    }
+    fn pack(us: u128, reason: Reason) -> u64 {
+        (((us > MAX_US) as u64) << 56) | (((us.min(MAX_US) as u64) + 1) << 8) | reason as u64
+    }
+    pub(in crate::cluster::consensus) fn mark(h: &Option<Handle>, edge: Edge, reason: Reason) {
+        if let Some(h) = h {
+            h.slots.words[h.lane.slot(edge)].store(
+                pack(h.slots.start.elapsed().as_micros(), reason),
+                Ordering::Release,
+            );
+        }
+    }
+    pub(in crate::cluster::consensus) fn caller(reason: Reason) {
+        let _ = CAPTURE.try_with(|cell| {
+            cell.borrow_mut().reason = reason;
+        });
+    }
+    pub(in crate::cluster::consensus) fn decision(tag: Decision) {
+        let _ = CAPTURE.try_with(|cell| {
+            cell.borrow_mut().decision = tag;
+        });
+    }
+    pub(in crate::cluster::consensus) fn phase_reply(index: usize, reason: Reason) {
+        let _ = CAPTURE.try_with(|cell| {
+            if let Some(slots) = &cell.borrow().slots {
+                slots.words[index].store(
+                    pack(slots.start.elapsed().as_micros(), reason),
+                    Ordering::Release,
+                );
+            }
+        });
+    }
+    pub(in crate::cluster::consensus) fn store_reason<T>(
+        r: &Result<T, super::StoreError>,
+    ) -> Reason {
+        match r {
+            Ok(_) => Reason::Ok,
+            Err(super::StoreError::Poisoned) => Reason::MutexPoison,
+            Err(super::StoreError::Corrupt) => Reason::StoreCorrupt,
+            Err(_) => Reason::StoreOther,
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(in crate::cluster::consensus) struct Marker {
+        wall_ms: Option<u64>,
+        elapsed_us: u64,
+    }
+    fn marker(start: Instant) -> Marker {
+        Marker {
+            wall_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok()),
+            elapsed_us: start.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        }
+    }
+    pub(in crate::cluster::consensus) struct Snapshot {
+        call: Call,
+        events: [Option<Event>; CAP],
+        len: usize,
+        overflow: bool,
+        words: [u64; 48],
+        decision: Decision,
+        reason: Reason,
+        result: &'static str,
+        start: Marker,
+        end: Marker,
+    }
+    // Sequential Acquire loads at capture return, before cleanup; no atomic worker snapshot.
+    pub(in crate::cluster::consensus) async fn capture_call<T>(
+        call: Call,
+        work: impl std::future::Future<Output = Result<T, FoundError>>,
+    ) -> (Result<T, FoundError>, Snapshot) {
+        let slots = Arc::new(Slots::new());
+        let start = marker(slots.start);
+        let buffer = RefCell::new(Buffer {
+            events: [None; CAP],
+            len: 0,
+            overflow: false,
+            pending: None,
+            slots: Some(slots.clone()),
+            decision: Decision::Unknown,
+            reason: Reason::Unknown,
+        });
+        CAPTURE
+            .scope(buffer, async {
+                let result = work.await;
+                let snapshot = CAPTURE.with(|cell| {
+                    let b = cell.borrow();
+                    Snapshot {
+                        call,
+                        events: b.events,
+                        len: b.len,
+                        overflow: b.overflow,
+                        words: slots.freeze(),
+                        decision: b.decision,
+                        reason: b.reason,
+                        result: variant(&result),
+                        start,
+                        end: marker(slots.start),
+                    }
+                });
+                (result, snapshot)
+            })
+            .await
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::cluster::consensus) enum Status {
+        Unknown,
+        Ok,
+        Failed,
+        Timeout,
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub(in crate::cluster::consensus) struct Cleanup {
+        pub(in crate::cluster::consensus) router: Status,
+        pub(in crate::cluster::consensus) shutdown: Status,
+        pub(in crate::cluster::consensus) store: Status,
+        pub(in crate::cluster::consensus) log: Status,
+    }
+    impl Cleanup {
+        pub(in crate::cluster::consensus) fn unknown() -> Self {
+            Self {
+                router: Status::Unknown,
+                shutdown: Status::Unknown,
+                store: Status::Unknown,
+                log: Status::Unknown,
+            }
+        }
+    }
+    pub(in crate::cluster::consensus) fn status(ok: bool) -> Status {
+        if ok { Status::Ok } else { Status::Failed }
+    }
+    pub(in crate::cluster::consensus) fn shutdown_status<T, E>(
+        r: &Result<Result<T, E>, tokio::time::error::Elapsed>,
+    ) -> Status {
+        match r {
+            Ok(Ok(_)) => Status::Ok,
+            Ok(Err(_)) => Status::Failed,
+            Err(_) => Status::Timeout,
+        }
+    }
+    struct Sink<const N: usize> {
+        bytes: [u8; N],
+        len: usize,
+        truncated: bool,
+    }
+    impl<const N: usize> Sink<N> {
+        fn new() -> Self {
+            Self {
+                bytes: [0; N],
+                len: 0,
+                truncated: false,
+            }
+        }
+        fn finish(&mut self) -> &str {
+            let footer = if self.truncated {
+                " truncated=1\n"
+            } else {
+                "\n"
+            };
+            self.bytes[self.len..self.len + footer.len()].copy_from_slice(footer.as_bytes());
+            self.len += footer.len();
+            std::str::from_utf8(&self.bytes[..self.len]).expect("ASCII sink")
+        }
+    }
+    impl<const N: usize> std::fmt::Write for Sink<N> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if self.truncated || !s.is_ascii() || self.len + s.len() > N.saturating_sub(13) {
+                self.truncated = true;
+                return Err(std::fmt::Error);
+            }
+            self.bytes[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+            Ok(())
+        }
+    }
+    fn format_snapshot(s: &Snapshot, c: Cleanup, out: &mut Sink<8192>) {
+        let _ = write!(
+            out,
+            "[FOUNDER-OBS] primary={:?} result={} reason={:?} call={:?} cutoff=capture_return sequential=1 overlap=Unknown cleanup_router={:?} cleanup_shutdown={:?} cleanup_store={:?} cleanup_log={:?}",
+            s.decision, s.result, s.reason, s.call, c.router, c.shutdown, c.store, c.log
+        );
+        let _ = write!(
+            out,
+            " start_wall_ms={:?} end_wall_ms={:?} start_elapsed_us={} end_elapsed_us={} overflow={} count={}",
+            s.start.wall_ms, s.end.wall_ms, s.start.elapsed_us, s.end.elapsed_us, s.overflow, s.len
+        );
+        for (i, w) in s.words.iter().enumerate() {
+            let _ = write!(
+                out,
+                "\nslot={} packed={} absent={} saturated={}",
+                i,
+                w,
+                *w == 0,
+                w >> 56 != 0
+            );
+        }
+        for e in s.events[..s.len].iter().flatten() {
+            let _ = write!(
+                out,
+                "\nelapsed_us={} remaining_us={} phase={} edge={} result={} pending={}",
+                e.elapsed_us.min(u64::MAX as u128),
+                e.remaining_us.min(u64::MAX as u128),
+                e.phase,
+                e.edge,
+                e.result,
+                e.pending.unwrap_or("none")
+            );
+        }
+    }
+    pub(in crate::cluster::consensus) fn emit(s: &Snapshot, c: Cleanup) {
+        let mut out = Sink::<8192>::new();
+        format_snapshot(s, c, &mut out);
+        eprint!("{}", out.finish());
+    }
+    pub(in crate::cluster::consensus) fn fourth_start() -> (Instant, Marker) {
+        let start = Instant::now();
+        (start, marker(start))
+    }
+    pub(in crate::cluster::consensus) fn fourth_end(pair: (Instant, Marker)) {
+        let end = marker(pair.0);
+        let mut out = Sink::<512>::new();
+        let _ = write!(
+            out,
+            "[FOUNDER-CO-RUNNER] start_wall_ms={:?} end_wall_ms={:?} start_elapsed_us={} end_elapsed_us={} overlap=Unknown",
+            pair.1.wall_ms, end.wall_ms, pair.1.elapsed_us, end.elapsed_us
+        );
+        eprint!("{}", out.finish());
+    }
+
+    #[cfg(test)]
+    mod observer_tests {
+        use super::*;
+        #[tokio::test]
+        async fn immutable_lane_isolation_and_optin() {
+            assert!(worker().is_none());
+            mark(&None, Edge::Admission, Reason::Ok);
+            let (result, snapshot) = capture_call(Call::QueryInitial, async {
+                enter(Instant::now() + ISSUE_BUDGET, "guard1");
+                let first = worker().unwrap();
+                enter(Instant::now() + ISSUE_BUDGET, "guard2");
+                let second = worker().unwrap();
+                mark(&Some(first.clone()), Edge::ClosureStart, Reason::Ok);
+                mark(&Some(second.clone()), Edge::ClosureStart, Reason::Pending);
+                Ok::<_, FoundError>((first, second))
+            })
+            .await;
+            let (first, second) = result.unwrap();
+            assert_eq!(first.lane, Lane::Guard1);
+            assert_eq!(second.lane, Lane::Guard2);
+            assert_ne!(snapshot.words[27], 0);
+            assert_ne!(snapshot.words[41], 0);
+            let (_, isolated) =
+                capture_call(Call::ProofInitial, async { Ok::<_, FoundError>(()) }).await;
+            assert_eq!(isolated.words, [0; 48]);
+            assert!(!Arc::ptr_eq(&first.slots, &Arc::new(Slots::new())));
+            assert!(worker().is_none());
+            capture(async {
+                assert!(worker().is_none());
+            })
+            .await;
+        }
+        #[test]
+        fn slot_packing_absence_saturation_cutoff() {
+            let slots = Arc::new(Slots::new());
+            assert_eq!(slots.freeze(), [0; 48]);
+            assert_eq!(pack(0, Reason::Ok), 256 | Reason::Ok as u64);
+            assert_eq!(
+                (pack(MAX_US, Reason::Ok) >> 8) & ((1u64 << 48) - 1),
+                MAX_US as u64 + 1
+            );
+            assert_eq!(pack(MAX_US, Reason::Ok) >> 56, 0);
+            assert_eq!(pack(MAX_US + 1, Reason::Ok) >> 56, 1);
+            let h = Some(Handle {
+                slots: slots.clone(),
+                lane: Lane::Guard1,
+            });
+            mark(&h, Edge::StoreReply, Reason::StoreCorrupt);
+            let frozen = slots.freeze();
+            mark(&h, Edge::OwnerSend, Reason::Pending);
+            assert_ne!(frozen[29], 0);
+            assert_eq!(frozen[31], 0);
+            assert_ne!(slots.freeze()[31], 0);
+            assert_eq!(frozen[43], 0);
+        }
+        #[tokio::test]
+        async fn formatter_cap_ascii_primary_newline() {
+            let (_, mut snapshot) = capture_call(Call::F10Final, async {
+                decision(Decision::ReadyLate);
+                caller(Reason::MissingRaft);
+                Err::<(), _>(FoundError::Unavailable)
+            })
+            .await;
+            snapshot.events = [Some(Event {
+                elapsed_us: u128::MAX,
+                remaining_us: u128::MAX,
+                phase: "preflight",
+                edge: "enter",
+                result: "Pending",
+                pending: Some("preflight"),
+            }); CAP];
+            snapshot.len = CAP;
+            snapshot.words = [u64::MAX; 48];
+            let mut out = Sink::<8192>::new();
+            format_snapshot(&snapshot, Cleanup::unknown(), &mut out);
+            while out.write_str("0123456789").is_ok() {}
+            let text = out.finish();
+            assert!(text.starts_with(
+                "[FOUNDER-OBS] primary=ReadyLate result=Unavailable reason=MissingRaft"
+            ));
+            assert!(text.len() <= 8192 && text.is_ascii() && text.ends_with(" truncated=1\n"));
+            let mut fourth = Sink::<512>::new();
+            assert!(fourth.write_str("marker").is_ok());
+            assert_eq!(fourth.finish(), "marker\n");
+            let mut ascii = Sink::<512>::new();
+            assert!(ascii.write_str("\u{e9}").is_err());
+            assert_eq!(ascii.finish(), " truncated=1\n");
+        }
+        #[tokio::test]
+        async fn error_cleanup_scalar_precedence() {
+            let (result, snapshot) = capture_call(Call::ProofInitial, async {
+                caller(Reason::MissingRaft);
+                decision(Decision::InnerOnTime);
+                Err::<(), _>(FoundError::Unavailable)
+            })
+            .await;
+            let mut cleanup = Cleanup::unknown();
+            cleanup.shutdown = Status::Failed;
+            let mut out = Sink::<8192>::new();
+            format_snapshot(&snapshot, cleanup, &mut out);
+            let text = out.finish();
+            assert!(
+                text.find("result=Unavailable").unwrap()
+                    < text.find("cleanup_shutdown=Failed").unwrap()
+            );
+            assert_eq!(result, Err(FoundError::Unavailable));
+            assert_eq!(
+                store_reason(&Err::<(), _>(super::super::StoreError::Poisoned)),
+                Reason::MutexPoison
+            );
+            assert_eq!(
+                store_reason(&Err::<(), _>(super::super::StoreError::Corrupt)),
+                Reason::StoreCorrupt
+            );
+            assert_eq!(
+                store_reason(&Ok::<_, super::super::StoreError>(())),
+                Reason::Ok
+            );
+            // Every closed scalar is ASCII; no engine error payload is formatted.
+            for reason in [Reason::SenderClosed, Reason::Unknown] {
+                let mut sink = Sink::<512>::new();
+                write!(sink, "{reason:?}").unwrap();
+                assert!(sink.finish().is_ascii());
+            }
+        }
+    }
 }
 impl ConsensusNode {
     // Local admission snapshot only; never an authorization read.
     async fn preflight(&self) -> Result<Pre, FoundError> {
-        let permit = self
-            .read_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| FoundError::Busy)?;
+        #[cfg(test)]
+        let obs = observation::worker();
+        let permit = self.read_permits.clone().try_acquire_owned().map_err(|_| {
+            #[cfg(test)]
+            observation::mark(
+                &obs,
+                observation::Edge::Admission,
+                observation::Reason::Busy,
+            );
+            FoundError::Busy
+        })?;
+        #[cfg(test)]
+        observation::mark(&obs, observation::Edge::Admission, observation::Reason::Ok);
         let (tx, rx) = oneshot::channel();
         {
-            let mut owners = self.owners.lock().map_err(|_| FoundError::Unavailable)?;
+            let mut owners = self.owners.lock().map_err(|_| {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersPoison,
+                );
+                FoundError::Unavailable
+            })?;
             if owners.closed {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::OwnersClosed,
+                );
                 return Err(FoundError::Unavailable);
             }
             while owners.set.try_join_next().is_some() {}
+            #[cfg(test)]
+            if self.sm.is_none() {
+                #[cfg(test)]
+                observation::mark(
+                    &obs,
+                    observation::Edge::OwnersGate,
+                    observation::Reason::MissingStore,
+                );
+            }
             let sm = self.sm.as_ref().ok_or(FoundError::Unavailable)?.clone();
+            #[cfg(test)]
+            let owner_obs = obs.clone();
             owners.set.spawn(async move {
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::OwnerEnter,
+                    observation::Reason::Ok,
+                );
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::BlockingSubmit,
+                    observation::Reason::Pending,
+                );
+                #[cfg(test)]
+                let blocking_obs = owner_obs.clone();
                 let result = blocking(move || {
+                    #[cfg(test)]
+                    observation::mark(
+                        &blocking_obs,
+                        observation::Edge::ClosureStart,
+                        observation::Reason::Ok,
+                    );
                     let result = (|| {
                         let s = sm.0.lock().map_err(|_| StoreError::Poisoned)?;
+                        #[cfg(test)]
+                        observation::mark(
+                            &blocking_obs,
+                            observation::Edge::MutexAcquired,
+                            observation::Reason::Ok,
+                        );
                         Ok(Pre {
                             cluster: codec::cluster(s.state()),
                             founded: s.state().founded(),
@@ -262,16 +870,48 @@ impl ConsensusNode {
                             membership: s.membership().is_some(),
                         })
                     })();
+                    #[cfg(test)]
+                    observation::mark(
+                        &blocking_obs,
+                        observation::Edge::StoreReply,
+                        observation::store_reason(&result),
+                    );
                     drop(sm);
                     drop(permit);
                     result
                 })
                 .await
-                .map_err(|_| FoundError::Unavailable);
+                .map_err(|_| {
+                    #[cfg(test)]
+                    observation::mark(
+                        &owner_obs,
+                        observation::Edge::BlockingJoin,
+                        observation::Reason::BlockingError,
+                    );
+                    FoundError::Unavailable
+                });
+                #[cfg(test)]
+                observation::mark(
+                    &owner_obs,
+                    observation::Edge::OwnerSend,
+                    observation::Reason::Pending,
+                );
                 let _ = tx.send(result);
             });
         }
-        rx.await.unwrap_or(Err(FoundError::Unavailable))
+        {
+            #[cfg(test)]
+            let rx = async {
+                rx.await.inspect_err(|_| {
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerReply,
+                        observation::Reason::ReceiverClosed,
+                    );
+                })
+            };
+            rx.await.unwrap_or(Err(FoundError::Unavailable))
+        }
     }
     fn committed_founder(
         &self,
@@ -340,6 +980,10 @@ impl ConsensusNode {
             if !ca.leaf_fits(clock.now_ms()) {
                 return Err(FoundError::CaExpiring);
             }
+            #[cfg(test)]
+            if self.raft.is_none() {
+                observation::caller(observation::Reason::MissingRaft);
+            }
             let raft = self.raft.as_ref().ok_or(FoundError::Unavailable)?;
             found_phase!(
                 deadline,
@@ -403,8 +1047,21 @@ impl ConsensusNode {
         found_final!(
             deadline,
             match timeout_at(deadline, work).await {
-                Ok(r) if Instant::now() < deadline => r,
-                _ => Err(FoundError::Unavailable),
+                Ok(r) if Instant::now() < deadline => {
+                    #[cfg(test)]
+                    observation::decision(observation::Decision::InnerOnTime);
+                    r
+                }
+                #[cfg(test)]
+                Ok(_) => {
+                    observation::decision(observation::Decision::ReadyLate);
+                    Err(FoundError::Unavailable)
+                }
+                _ => {
+                    #[cfg(test)]
+                    observation::decision(observation::Decision::WaitElapsed);
+                    Err(FoundError::Unavailable)
+                }
             }
         )
     }

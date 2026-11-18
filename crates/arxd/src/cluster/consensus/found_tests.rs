@@ -549,8 +549,22 @@ bounded!(f10_drop_bounded, async {
     drop(gate);
     released(&n).await;
     uninitialized(&n);
-    issue(&n, &ca, &csr).await.unwrap();
+    let (found, snapshot) =
+        observation::capture_call(observation::Call::F10Final, issue(&n, &ca, &csr)).await;
+    match found {
+        Ok(_) => (),
+        Err(error) => {
+            let shutdown = n.shutdown().await;
+            let mut cleanup = observation::Cleanup::unknown();
+            cleanup.shutdown = observation::status(shutdown.is_ok());
+            cleanup.store = observation::status(n.sm_weak.upgrade().is_none());
+            cleanup.log = observation::status(n.log_weak.upgrade().is_none());
+            observation::emit(&snapshot, cleanup);
+            panic!("original founder refusal: {error}");
+        }
+    }
     n.shutdown().await.unwrap();
+    observation::emit(&snapshot, observation::Cleanup::unknown());
 });
 bounded!(f10_outer_budget, async {
     let d = private_temp();
