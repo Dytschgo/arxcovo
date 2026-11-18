@@ -106,7 +106,7 @@ pub(crate) struct Hold {
     /// Notified when the held handler's `call_tool` returns.
     pub(crate) left: tokio::sync::Notify,
 }
-#[cfg(test)]
+#[cfg(all(test, windows))]
 impl Hold {
     pub(crate) fn new(point: Checkpoint) -> Arc<Self> {
         Arc::new(Self {
@@ -144,6 +144,7 @@ impl Execution {
     }
     /// Normal current-user mode with a held handler. Shutdown refuses before
     /// the probe, which panics if a held request were ever executed.
+    #[cfg(windows)]
     pub(crate) fn hold_fixture(hold: Arc<Hold>) -> Arc<Self> {
         let mut execution = Self::build(
             Settings {

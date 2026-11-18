@@ -4551,3 +4551,98 @@ PR and independent exact-head review attestation, then required hosted gates.
 No docs-only diagnostic run is manufactured. M2 OPEN / M3 UNCHECKED, full v1
 incomplete; native/VM/other OS paths remain **unverified on real hardware**.
 Engine Sol 3/3 exhausted, historical Opus 0/2 and PR182 HOLD/NOFIX unchanged.
+
+## PR183 published; first required hosted gates pending
+
+Coordinator published exact `bfd8aeb48b48fe354d58b927db1bd000f9978497` as
+[PR183](https://github.com/Dytschgo/arxcovo/pull/183), based on freshly verified
+green main `cd890750`. All 14 feature source files match independently reviewed
+`7a42ffed`; the last delivery commit adds only evidence/docs. Linked immediately.
+First [CI44334571677](https://github.com/Dytschgo/arxcovo/actions/runs/44334571677)
+is attempt 1 for this exact head. No rerun/dispatch. Independent Sol 6.1/medium
+attestation task is verifying published-head applicability and will post the
+qualifying source-review result without waiving hosted gates.
+
+Local source GO, 31 focused + 2 foreground PASS, fmt/Clippy/build PASS, and the
+12-check production v2 PASS are recorded above. The original v1 invalid-input
+FAIL and ten local integration ACL setup failures remain. Merge requires all
+five required checks, applicable independent review, Windows feature duration
+at most 660 s, and fresh live exact-main green immediately before merge; then
+verify resulting main's own first CI. No milestone acceptance is implied by
+publication. This status checkpoint stays local rather than causing another
+docs-only CI run. M2 OPEN / M3 UNCHECKED, full v1 remains incomplete.
+
+Independent Sol 6.1/medium applicability attestation is published as
+[comment6982922631](https://github.com/Dytschgo/arxcovo/pull/183#issuecomment-6982922631),
+with exact-head `agent-review=success` status59265886337. Root inspected its
+14-blob identity proof and the actual combined statuses: agent-review and
+ci-time-budget success; required hosted verify gates still pending. No bypass,
+formal self-approval, rerun or dispatch. The existing PR watch remains active.
+
+Coordinator used verification-setup guidance to prepare a private backend test
+entrypoint at `D:/Temp/arx-owner-entrypoint-20261118`: a copied normal binary with
+the exact reviewed hash, new private state/credentials, current-user default,
+MCP client JSON and foreground Start-Arxcovo.ps1. Launcher syntax, private owner/
+DACL, local identity pins, config paths and empty state were checked. Readiness
+and first-command/activity instructions are in that folder's README. The launcher
+is UNRUN and hosted gates remain pending; this is prepared backend tooling, not
+completed dashboard/VM/v1 or Claude Code acceptance. No service/account/client
+settings were installed or changed. All files stay on D:, C: free measured
+42,091,237,376 bytes. Publication/checkpoint source is unchanged; no new push.
+
+Independent useful M3 preparation during PR183's hosted wait: coordinator Sol
+6.1/high reviewed the prepared complete-RPC contract/decision, pinned OpenRaft
+factory/V2/snapshot APIs and actual consensus preflight/snapshot assertions.
+Contract baseline c96a1389 and held published2e4e0d3f have identical cluster source.
+Wire/factory/lifecycle choices are bounded, but implementation remains NO-GO:
+the draft itself requires an exact consistent learner fixture before source work
+and does not yet specify its persisted vote/log/applied/membership values or
+method sequence. Record is `D:/Temp/arx-complete-peer-rpc/whole-contract-review.md`.
+Next design closure is that concrete fixture table with source-level reasoning,
+not an engine trial or another founder attempt. Original drafts and PR183 source
+remain untouched. No build/test/control/transport/container execution occurred.
+PR182 HOLD/NOFIX, M2 OPEN/M3 UNCHECKED and all exhausted counters/fences remain.
+
+Assigned a bounded Sol 6.1/high design-only closure for that fixture gap, writing
+only `D:/Temp/arx-complete-rpc-learner-fixture-v1/{fixture.md,review-response.md}`.
+It must ground all persisted values/roles/requests in the existing Store and
+pinned OpenRaft APIs, resolve sender ownership/endpoint binding, and preserve the
+learner-only receiver without founder/initialize/settings work. No source,
+build/test/runtime/engine/network/CI action is authorized. Coordinator will review
+the returned design before any later contract amendment; held transport gates
+still apply. This independent preparation does not alter PR183 or its watch.
+
+## PR183 first CI failed; two demonstrated test-integration corrections
+
+Exact `bfd8aeb4`, first CI44334571677 attempt1 FAILURE. [Full checkpoint](evidence/windows-execution-choice-pr183-first-ci.md).
+Ubuntu failed Clippy: Windows pipe-fixture constructors/release were compiled but
+unused on non-Windows. Windows failed the service response-only reason-table
+test's schema assertion (expected3/actual4), after412 PASS/1 FAIL/36 skipped/
+279 unrun. All3 new SDK shutdown cases and28/31 focused cases passed hosted
+Windows; the3 store cases were unrun. Real Job dropped-before-first-poll and
+real bridge/SDK cases also passed hosted, without production-token qualification.
+Node/browser/Electron steps did not execute. Ubuntu tests did not execute.
+
+macOS was cancelled with runnerID0, empty runner name and no steps. GitHub
+annotations confirm no hosted runner acquired it and note arm64 capacity limits.
+The902s interval is queue/lifecycle, not measured execution. The bounded job-log
+request returned215-byte BlobNotFound, preserved separately from the two actual
+logs (78,055/174,014bytes, no truncation). Rawmetadata/annotations/loghashes and
+parsed exact Windows test names are in `D:/Temp/arx-pr183-first-ci`. No rerun,
+dispatch, workflow/runner/time-budget change or infrastructure repair claim.
+
+Coordinator Sol6.1/high corrected only the two demonstrated integration misses:
+Windows-only test-helper constructor gates and schema4 expectation, preserving
+all assertions. No production function body, engine or schema change. Local
+response-table+3SDK cases4/4 PASS, Windows Clippy PASS, fmt/diff PASS; Linux/macOS
+remain unverified until hosted checks. Evidence at
+`D:/Temp/arx-pr183-ci-integration`. Existing production binary remainsf8893673...
+4b48 and was not rebuilt/re-observed. Fresh independent exact-head review and all
+normal gates are still required before merge. Prior source/runtime proof applies
+to unchanged production behavior, not to unrun checks. M2OPEN/M3UNCHECKED,
+PR182HOLDNOFIX, engineSol3/3 and historicalOpus0/2 unchanged.
+
+The separate Sol6.1/high learner-fixture design returned only D: draft files,
+with exact seed/RPC/ownership values and explicit sender/prebound-listener seams
+still needing review. All builds/tests/runtime there remain UNRUN. Preserve that
+design for review after the current CI integration fix; no new source authority.
