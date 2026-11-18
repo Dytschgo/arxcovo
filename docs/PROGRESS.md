@@ -40,8 +40,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
-- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f, firstCI44312645314 queued; all required hosted gates pending. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
-- Blockers: M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
+- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
+- Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -4307,3 +4307,35 @@ Nextindependent engineering aftergates is complete peerRPC wire/driver (Vote,
 explicitPreVote,fullsnapshot) and actualstartup/join/custody/container path under
 freshboundedbrief/ADR/review, preserving pinnedlimits and exhaustedengine stoprule.
 Pending published-status checkpoint remains local; don't push solely togenerateCI.
+
+## PR182 first CI terminal; independent disposition HOLD
+
+Continuation classified priorgoalturn as progress (sourcePR182 published), then
+inspected actualsource/status. FirstCI44312645314 attempt1 CANCELLED atpublished
+2e4e0d3f: Ubuntu284sSUCCESS, Windows732sCANCELLED, macOS750sCANCELLED; wall1058s.
+Root retainedboundedDlogs and verified all32namedtransportcases eachoncePASS on
+EVERYOS. Rust698/706/666PASS, skips22/36/8; Node48 Ubuntu/Windows, macOS notrun.
+WindowsbrowserPASS/Electroninterrupted; macOScancellednpmci. No rerun/dispatch.
+[Evidence](evidence/m3-pr182-first-ci-held.md).
+
+Fresh independent Astra6.2/high (actualexecutedmodelverified) confirmedWindows
+12mjoblimit and109sof110sincreasebeforeElectronentry. UnderlyingslowdownUNKNOWN;
+noElectronhang/fix/rootcause claim. HOLD/NOFIX, Sol3/3 exhausted/Opus0/2 unchanged.
+[Disposition](reviews/m3-pr182-astra-disposition.md). Requiredchecks blockmerge
+anddependentM3sourceintegration. Maincd890750/CI44304025778 remainspriorGREEN.
+Allnewpublishedsourcefrozen; checkpointlocalonly, no trigger-onlypush.
+
+Independent usefulpreparation completed: Sol6.1/high completeRPC/factory draft
+D:/Temp/arx-complete-peer-rpc/{contract,decision}.md, with independentlyreviewed
+snapshot core-panic/crashfault trust boundary and actualVote/PreVote semantics;
+wholecontractreview/sourceauthorization pendingandgated. No runtime/sourceactions.
+
+Sol6.1/medium ownerjourneyaudit found configuredExecutor Native is intentionally
+refusal-only, capabilityfalse, serviceSYSTEM/root vs Standardbuildchild; UI/guest
+scaffolds and noMCPjoin/remotehostroute. Owneraccountsetup is prerequisite, not
+productactivation. ExactD7/D10/StageF/G fences preserved. Sol6.1/high prepared an
+INACTIVE Windowsdedicatedbackend contract, D:/Temp/arx-owner-test-path/windows-
+dedicated-executor-draft.md, nowindependentSol6.1/high whole-contractreviewactive.
+No activationflag, fake success, nativeprobe/admin or S4Udiagnosis resumption.
+This is independentM2sourcepreparation towardactualinstalledMCPcargo/feedjourney,
+notanotherPR182fix. M2 OPEN/M3 UNCHECKED; fullv1 milestonesremainobjective.
