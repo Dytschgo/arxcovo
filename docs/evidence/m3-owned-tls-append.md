@@ -13,7 +13,7 @@ Only five non-document files changed. Removing the private module declaration
 restores the exact canonical base consensus.rs bytes. Existing engine, PKI,
 wire/registry modules, settings, workflows and quarantine remain unchanged.
 
-## Frozen source
+## Baseline source (31 tests)
 
 | Path | Git blob |
 | --- | --- |
@@ -86,3 +86,34 @@ counter reset: Sol3/3 exhausted, historical Opus0/2 unchanged. Full RPCs, actual
 startup/join/custody/clock and container acceptance remain; real multi-host paths
 are **unverified on real hardware**. All scratch/build paths are D:; no owner
 admin, Lab Manager, VM/cache/user-data action or babysitter change.
+
+## Added aborted-but-unjoined ownership proof
+
+Final review confirmed the qualified case above did not prove a nonempty unjoined
+record. Only a new test was appended; production code and the original 63,943-byte
+31-test prefix remain unchanged. The added test holds an actual outbound TLS 1.3
+exchange at ClientAuthenticated with an RPC deadline beyond close grace. It
+observes `aborting`, a nonempty JoinSet, retained keeper and unchanged original
+close deadline before and after another cancelled close. It then releases gates
+and explicitly joins transport, caller, remote helper and clock observer before
+asserting Unclean/reclamation. The independent reviewer found the missing static
+oracle supplied; final source disposition follows this commit.
+
+First exact execution, without repeating the original 31:
+`cargo test -p arxd --lib --locked --offline cluster::consensus::peer_transport::tests::cancelled_close_retains_aborted_outbound_task_until_join -- --exact --test-threads=1`
+passed **1/1**, zero failed/ignored, 701 filtered. 23.679 seconds total, 23.17
+seconds compilation and 0.02 seconds test body. Formatting passed in 0.715 seconds,
+workspace all-target locked/offline Clippy in 4.444 seconds. Thus 32 distinct
+tests have passing evidence across two runs; no single 32-test run is claimed.
+
+The final tests.rs blob is `22ae4a9189e06aca022147b7913110cc48fb7fa9`, SHA256
+`672698ed398523cb756648b65f859cf7dfb9d624184e8f10350eae9aad619b9e`.
+The builder's earlier a654 hash was pre-format, not the compiled final source.
+All other four source blobs remain as in the baseline table.
+
+Separate records under the same D: log root preserve the original 29 artifacts:
+`artifact-index-close-retention.json`, `source-freeze-close-retention.json` and
+`close-retention-original-evidence-check.json`. New target log SHA256:
+`95c903dc5ad7d6b112aea6659ae654f748876f6d7b9c2db4b73600fd7fd7d849`;
+result JSON: `fa43fbf34ca3ac5b85389731d3b6013e54abfb4db363b346f6cd63bbd61266b7`.
+No failed runtime, engine test, control or policy change occurred for this addition.

@@ -1804,3 +1804,113 @@ async fn successful_close_releases_store_with_clients_shared_dispatcher_and_conf
     );
     drop((client, shared, spy, config, registry));
 }
+
+#[tokio::test]
+async fn cancelled_close_retains_aborted_outbound_task_until_join() {
+    use futures_util::FutureExt;
+
+    let f = Fixture::new();
+    let mut owner = f.owner(1, Spy::exact(None));
+    let mut rx = events(&owner);
+    let work_hold = gate(&owner, Stage::ClientAuthenticated);
+    let abort_hold = gate(&owner, Stage::CloseAborted);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = f.server_config(&f.server);
+    let mut client = owner.loopback_client(2, address);
+    let option = RPCOption::new(Duration::from_secs(30));
+    let exceeds_grace = option.soft_ttl() > CLOSE_BUDGET;
+    let (remote_authenticated_tx, remote_authenticated_rx) = oneshot::channel();
+    let (clock_tx, clock_rx) = std::sync::mpsc::channel();
+    let (clock_started_tx, clock_started_rx) = oneshot::channel();
+
+    // Freeze policy time through real TLS setup and the two close cancellations.
+    // The bounded observer prevents automatic time jumps and performs no TLS or I/O.
+    // All fallible fixture setup precedes its start; cleanup precedes assertions.
+    let clock_guard = tokio::task::spawn_blocking(move || {
+        let _ = clock_started_tx.send(());
+        clock_rx.recv_timeout(OBSERVE).is_ok()
+    });
+    let clock_started = timeout(OBSERVE, clock_started_rx).await;
+    tokio::time::pause();
+    let remote = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        let mut stream = TlsAcceptor::from(config)
+            .accept_with(socket, |connection| {
+                connection.set_buffer_limit(Some(65536))
+            })
+            .await?;
+        let tls13 = stream.get_ref().1.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
+        let _ = remote_authenticated_tx.send(tls13);
+        // The client is held after actual TLS authentication, before any frame write.
+        Ok::<_, io::Error>(read_frame(&mut stream).await.is_err())
+    });
+    let caller = tokio::spawn(async move { client.append_entries(heartbeat(), option).await });
+    let authenticated = observe(&mut rx, Event::Stage(Stage::ClientAuthenticated)).await;
+    let remote_authenticated = timeout(OBSERVE, remote_authenticated_rx).await;
+    let shared = owner.shared.clone();
+
+    let mut closing = Box::pin(owner.close());
+    let first_pending = closing.as_mut().now_or_never().is_none();
+    drop(closing);
+    let original_deadline = shared.state.lock().unwrap().close_deadline;
+    let first_cancel_retained = {
+        let state = shared.state.lock().unwrap();
+        state.closed && !state.tasks.is_empty() && state.keeper.is_some() && !state.finished
+    };
+
+    // The RPC's soft TTL outlives the original five-second close grace.
+    // One poll on this current-thread runtime issues abort without scheduling its
+    // task to completion or acknowledging its JoinSet record.
+    tokio::time::advance(CLOSE_BUDGET + Duration::from_secs(1)).await;
+    let mut closing = Box::pin(owner.close());
+    let abort_pending = closing.as_mut().now_or_never().is_none();
+    let observed_abort = rx
+        .try_recv()
+        .is_ok_and(|event| event == Event::Stage(Stage::CloseAborted));
+    let at_abort = {
+        let state = shared.state.lock().unwrap();
+        state.aborting
+            && !state.tasks.is_empty()
+            && state.keeper.is_some()
+            && !state.finished
+            && state.close_deadline == original_deadline
+    };
+    drop(closing);
+    let second_cancel_retained = {
+        let state = shared.state.lock().unwrap();
+        state.aborting
+            && !state.tasks.is_empty()
+            && state.keeper.is_some()
+            && !state.finished
+            && state.close_deadline == original_deadline
+    };
+    release(&owner, Stage::ClientAuthenticated, &work_hold);
+    release(&owner, Stage::CloseAborted, &abort_hold);
+    tokio::time::resume();
+    let closed = bounded_close(&mut owner).await;
+    let caller_result = join_peer(caller).await;
+    let remote_result = join_peer(remote).await;
+    let recovered = reclaimed(&owner);
+    let _ = clock_tx.send(());
+    let clock_joined = clock_guard.await;
+
+    assert!(
+        exceeds_grace
+            && matches!(clock_started, Ok(Ok(())))
+            && authenticated
+            && matches!(remote_authenticated, Ok(Ok(true)))
+            && first_pending
+            && original_deadline.is_some()
+            && first_cancel_retained
+            && abort_pending
+            && at_abort
+            && second_cancel_retained
+            && observed_abort
+            && matches!(caller_result, Some(Ok(Err(_))))
+            && matches!(remote_result, Some(Ok(Ok(true))))
+            && matches!(clock_joined, Ok(true))
+    );
+    assert_eq!(closed, Err(Refusal::Unclean));
+    assert!(recovered);
+}

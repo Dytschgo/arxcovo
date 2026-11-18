@@ -4252,3 +4252,12 @@ TLS exchange with TTL beyond close grace. Assert records/keeper/originaldeadline
 across another cancelled close, then actual joins/reclamation. Production source
 unchanged. Execute ONLY new test once plus relevant compile/lint; original31
 baseline retained, no blanket rerun. Controls remain unrun; final PASS pending.
+
+Added exact aborted-outbound-retention proof PASS1/1 firstonce,0failed/ignored,
+701filtered;23.679s total/23.17compile/.02test. FinalfmtPASS.715s and ClippyPASS
+4.444s. Core unchanged; old63943-byte31testprefix and all29baselineartifacts
+byte/hash preserved. Finaltests blob22ae4a9189e06aca022147b7913110cc48fb7fa9,
+SHA672698ed398523cb756648b65f859cf7dfb9d624184e8f10350eae9aad619b9e. Separate
+newartifact index/manifests retained; preformat a654 is not final. Evidence now
+covers32distincttests as31+1, no full32rerun. Independent final source PASS pending;
+prior Spec gap has new static oracle/actual passing evidence. No controls yet.
