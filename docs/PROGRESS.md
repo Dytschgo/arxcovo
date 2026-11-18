@@ -3958,3 +3958,18 @@ M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged; realhardware unverified.
 Owner PC native runs still await verified Standardaccount/caps/reserves; Linux
 sudoNNP/A12pending. Existing babysitter untouched. Pending-run checkpoint local
 only, not pushed to create redundantCI. Priorbranches/commits preserved.
+
+## PR180 executed Windows job timeout (2026-11-18)
+
+CI44279691035 attempt1Windowsjob134716782048 cancelled at12m joblimit after
+fmt/Clippy and662RustPASS; npmci cancelled, laterchecks unrun. Ubuntu/macOSPASS,
+main6bf8f46stillGREEN, but requiredWindowsgateBLOCKED. Independent Astra6.2/high
+retained-evidence disposition confirms executedtimeout/underlyingcauseunknown,
+not prestartinfra. [Evidence](evidence/m3-pr180-windows-job-timeout.md),
+[disposition](reviews/m3-pr180-job-timeout-astra62-disposition.md).
+No rerun/dispatch/timeout/quarantine/settings change or sourcefix. Sol3/3exhausted/
+Opus0/2unchanged. Continue separatelyauthorized genuine purecodec implementation
+locally underADR0026, not as timeoutrepair; Sol6.1/high builder assigned only
+consensus modulebinding/newpeer_wire.rs+synchronous tests. Independentactualsource
+review/normalnewsourcefirstattempt required before publication. No docs-onlypush
+solely to triggerCI. OwnerPCfences/babysitter intact; no native/admin/container run.
