@@ -4333,9 +4333,8 @@ wholecontractreview/sourceauthorization pendingandgated. No runtime/sourceaction
 Sol6.1/medium ownerjourneyaudit found configuredExecutor Native is intentionally
 refusal-only, capabilityfalse, serviceSYSTEM/root vs Standardbuildchild; UI/guest
 scaffolds and noMCPjoin/remotehostroute. Owneraccountsetup is prerequisite, not
-productactivation. ExactD7/D10/StageF/G fences preserved. Sol6.1/high prepared an
-INACTIVE Windowsdedicatedbackend contract, D:/Temp/arx-owner-test-path/windows-
-dedicated-executor-draft.md, nowindependentSol6.1/high whole-contractreviewactive.
+productactivation. ExactD7/D10/StageF/G fences preserved. Sol6.1/medium prepared an
+INACTIVE Windowsdedicatedbackend contract, D:/Temp/arx-owner-test-path/windows-dedicated-executor-draft.md, nowindependentSol6.1/high whole-contractreviewactive.
 No activationflag, fake success, nativeprobe/admin or S4Udiagnosis resumption.
 This is independentM2sourcepreparation towardactualinstalledMCPcargo/feedjourney,
 notanotherPR182fix. M2 OPEN/M3 UNCHECKED; fullv1 milestonesremainobjective.
