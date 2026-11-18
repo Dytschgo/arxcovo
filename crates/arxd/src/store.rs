@@ -116,7 +116,7 @@ impl Activity {
                     [hex::encode(random)],
                 )?;
             }
-            1..=3 => {}
+            1..=4 => {}
             _ => anyhow::bail!("unsupported local state version"),
         }
         read_host_id(&tx)?;
@@ -133,6 +133,29 @@ impl Activity {
         }
         if version < 3 {
             tx.execute_batch("ALTER TABLE activity ADD COLUMN identity_mode TEXT CHECK(identity_mode IS NULL OR (typeof(identity_mode)='text' AND identity_mode IN ('dedicated_account','development_current_user'))) CHECK(identity_mode IS NOT 'development_current_user' OR (observed_kind IS NULL AND observed_id IS NULL AND observed_gid IS NULL AND rights IS NULL AND (elevation IS NULL OR elevation=0) AND (integrity_rid IS NULL OR integrity_rid=8192) AND (observation_point IS NULL OR observation_point='pre_exec') AND (tree_boundary IS NULL OR tree_boundary='windows_job'))); PRAGMA user_version=3;")?;
+        }
+        if version < 4 {
+            validate_columns(&tx)?;
+            // SQLite cannot widen a CHECK in place. Rebuild transactionally,
+            // copying every historical value and the deleted-row sequence.
+            tx.execute_batch(
+                "DROP INDEX activity_visibility; ALTER TABLE activity RENAME TO activity_v3;",
+            )?;
+            tx.execute_batch(&schema())?;
+            tx.execute_batch("ALTER TABLE activity ADD COLUMN identity_mode TEXT CHECK(identity_mode IS NULL OR (typeof(identity_mode)='text' AND identity_mode IN ('dedicated_account','development_current_user','current_user'))) CHECK(identity_mode NOT IN ('development_current_user','current_user') OR (observed_kind IS NULL AND observed_id IS NULL AND observed_gid IS NULL AND rights IS NULL AND (elevation IS NULL OR elevation=0) AND (integrity_rid IS NULL OR integrity_rid=8192) AND (observation_point IS NULL OR observation_point='pre_exec') AND (tree_boundary IS NULL OR tree_boundary='windows_job')));")?;
+            let mut columns = vec![
+                "id",
+                "principal",
+                "actor_kind",
+                "class",
+                "tool",
+                "outcome",
+                "started_at_ms",
+                "finished_at_ms",
+            ];
+            columns.extend(FIELDS.iter().map(|(name, _)| *name));
+            let columns = columns.join(",");
+            tx.execute_batch(&format!("INSERT INTO activity({columns}) SELECT {columns} FROM activity_v3; INSERT INTO sqlite_sequence(name,seq) SELECT 'activity',seq FROM sqlite_sequence WHERE name='activity_v3' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity'); UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_v3'),0)) WHERE name='activity'; DROP TABLE activity_v3; PRAGMA user_version=4;"))?;
         }
         tx.execute(
             "UPDATE activity SET outcome='interrupted',finished_at_ms=?1 WHERE outcome='started'",
@@ -232,12 +255,10 @@ impl Activity {
         self.start_typed(principal, tool, false, Some(IdentityMode::DedicatedAccount))
     }
     pub fn start_development(&self, principal: &str, tool: &str) -> Result<i64> {
-        self.start_typed(
-            principal,
-            Tool::parse(tool)?,
-            false,
-            Some(IdentityMode::DevelopmentCurrentUser),
-        )
+        self.start_execution(principal, tool, IdentityMode::DevelopmentCurrentUser)
+    }
+    pub fn start_execution(&self, principal: &str, tool: &str, mode: IdentityMode) -> Result<i64> {
+        self.start_typed(principal, Tool::parse(tool)?, false, Some(mode))
     }
     /// Lifecycle records are daemon-only, with a fixed principal.
     pub fn start_lifecycle(&self, event: Lifecycle) -> Result<i64> {
@@ -418,6 +439,8 @@ impl Activity {
             entry.execution_mode = entry.metadata.identity_mode;
             if entry.execution_mode == Some(IdentityMode::DevelopmentCurrentUser) {
                 entry.claim = Some(crate::development::CLAIM.into());
+            } else if entry.execution_mode == Some(IdentityMode::CurrentUser) {
+                entry.claim = Some(crate::development::CURRENT_USER_CLAIM.into());
             }
             result.push(entry);
         }
@@ -754,22 +777,26 @@ pub struct Metadata {
 pub enum IdentityMode {
     DedicatedAccount,
     DevelopmentCurrentUser,
+    CurrentUser,
 }
 impl IdentityMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DedicatedAccount => "dedicated_account",
             Self::DevelopmentCurrentUser => "development_current_user",
+            Self::CurrentUser => "current_user",
         }
     }
 }
 impl Metadata {
     fn validate(&self) -> Result<()> {
-        if self.identity_mode == Some(IdentityMode::DevelopmentCurrentUser)
-            && (self.observed_id.is_some()
-                || self.observed_kind.is_some()
-                || self.observed_gid.is_some()
-                || self.rights.is_some())
+        if matches!(
+            self.identity_mode,
+            Some(IdentityMode::DevelopmentCurrentUser | IdentityMode::CurrentUser)
+        ) && (self.observed_id.is_some()
+            || self.observed_kind.is_some()
+            || self.observed_gid.is_some()
+            || self.rights.is_some())
         {
             anyhow::bail!("invalid development metadata");
         }

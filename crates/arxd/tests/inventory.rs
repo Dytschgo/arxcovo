@@ -39,6 +39,7 @@ fn config(path: &Path) -> (Config, String) {
         Config {
             execution: None,
             development_execution: None,
+            execution_settings: None,
             local: None,
             listen: Some("127.0.0.1:0".parse().unwrap()),
             state_dir: path.to_owned(),

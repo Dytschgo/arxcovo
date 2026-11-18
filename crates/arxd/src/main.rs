@@ -49,6 +49,7 @@ async fn foreground() {
             | "server-config"
             | "server-state"
             | "server-bind"
+            | "server-drain-unconfirmed"
             | "server-listener" => category.as_str(),
             _ => "transport-frame-or-io",
         };
@@ -129,7 +130,9 @@ async fn run() -> anyhow::Result<()> {
     };
     if let Some(execution) = &execution {
         execution.shutdown();
-        execution.drain().await;
+        if !execution.drain().await {
+            anyhow::bail!("server-drain-unconfirmed");
+        }
     }
     result
 }

@@ -60,7 +60,7 @@ impl ServerHandler for Inventory {
                         .clone(),
                     ),
                 ),
-                Tool::new("run_command", if self.activity.dedicated.is_some() { "Run a bounded command as the configured dedicated account" } else { "Run a configured tool in the explicitly enabled development mode" }, Arc::new(if self.activity.dedicated.is_some() { crate::service::executor::schema() } else { json!({"type":"object","required":["tool"],"properties":{"tool":{"type":"string","enum":crate::development::TOOLS},"args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},"cwd":{"type":"string","maxLength":4096},"timeout_s":{"type":"integer","minimum":1,"maximum":3600},"output_bytes":{"type":"integer","minimum":2,"maximum":8192}},"additionalProperties":false}) }.as_object().unwrap().clone())),
+                Tool::new("run_command", if self.activity.dedicated.is_some() { "Run a bounded command as the configured dedicated account" } else { "Run a bounded tool using the configured Windows execution account" }, Arc::new(if self.activity.dedicated.is_some() { crate::service::executor::schema() } else { json!({"type":"object","required":["tool"],"properties":{"tool":{"type":"string","enum":crate::development::TOOLS},"args":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":8192}},"cwd":{"type":"string","maxLength":4096},"timeout_s":{"type":"integer","minimum":1,"maximum":3600},"output_bytes":{"type":"integer","minimum":2,"maximum":8192}},"additionalProperties":false}) }.as_object().unwrap().clone())),
                 Tool::new("discover_tools", "Probe fixed tool names using the configured executor", Arc::new(json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone())),
             ],
             ..Default::default()
@@ -104,8 +104,9 @@ impl ServerHandler for Inventory {
             && matches!(label, "run_command" | "discover_tools")
         {
             self.activity.start_dedicated(&principal.0, label)
-        } else if self.execution.is_some() && self.activity.dedicated.is_none() {
-            self.activity.start_development(&principal.0, label)
+        } else if let Some(execution) = &self.execution {
+            self.activity
+                .start_execution(&principal.0, label, execution.identity_mode())
         } else {
             self.activity.start(&principal.0, label)
         }
@@ -167,11 +168,12 @@ impl ServerHandler for Inventory {
             } else {
                 None
             };
-            if (label == "run_command" && parsed.is_none())
+            if (self.principal.is_none() && self.execution.is_some())
+                || (label == "run_command" && parsed.is_none())
                 || (label == "discover_tools" && !args.is_empty())
             {
-                let m = if self.execution.is_some() {
-                    dev::metadata(None, None, Some(Reason::InvalidArguments))
+                let m = if let Some(execution) = &self.execution {
+                    execution.metadata(None, None, Some(Reason::InvalidArguments))
                 } else {
                     crate::store::Metadata {
                         reason: Some(Reason::InvalidArguments),
@@ -218,7 +220,9 @@ impl ServerHandler for Inventory {
                 result = work => result,
                 _ = context.ct.cancelled() => return Err(ErrorData::internal_error("cancelled", None)),
             }
-            .map_err(|r| ErrorData::internal_error(r.as_str(), None))?;
+            .map_err(|r| ErrorData::internal_error(r.as_str(),
+                (executor.identity_mode() == crate::store::IdentityMode::DedicatedAccount).then(||
+                    json!({"execution_mode":"dedicated_account","execution_reason":"dedicated_account_setup_required"}))))?;
             if let Some(observation) = observation {
                 self.activity.cache_discovery(observation, &result);
             }
@@ -288,7 +292,11 @@ impl ServerHandler for Inventory {
         }
         value["hosts"][0]["tool_discovery"] = json!(if self.activity.dedicated.is_some() {
             "unavailable"
-        } else if self.execution.is_some() {
+        } else if self
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.capability()["available"] == true)
+        {
             "discover_tools"
         } else {
             "not_configured"

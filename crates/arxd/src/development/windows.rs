@@ -940,12 +940,14 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 struct Facts {
     user: Vec<u8>,
     service: bool,
+    service_logon: bool,
+    session: u32,
     elevated: bool,
     integrity: u32,
     admin: bool,
 }
 fn policy(f: &Facts) -> std::result::Result<(), &'static str> {
-    if f.service {
+    if f.service || f.service_logon || f.session == 0 {
         Err("service_identity")
     } else if f.elevated {
         Err("elevated_identity")
@@ -1001,6 +1003,8 @@ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
         let user = sid_bytes((*(u.as_ptr().cast::<TOKEN_USER>())).User.Sid)?;
         let e = info(token.0, TokenElevation)?;
         let elevated = (*(e.as_ptr().cast::<TOKEN_ELEVATION>())).TokenIsElevated != 0;
+        let session = info(token.0, TokenSessionId)?;
+        let session = *session.as_ptr().cast::<u32>();
         let i = info(token.0, TokenIntegrityLevel)?;
         let sid = (*(i.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())).Label.Sid;
         if IsValidSid(sid) == 0 {
@@ -1021,7 +1025,11 @@ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
             return Err(Reason::PreflightFailed);
         }
         let mut admin = false;
+        let mut service_logon = false;
         for group in std::slice::from_raw_parts(groups.Groups.as_ptr(), count) {
+            if IsWellKnownSid(group.Sid, WinServiceSid) != 0 {
+                service_logon = true;
+            }
             if IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid) != 0
                 && group.Attributes&0x10 /* SE_GROUP_USE_FOR_DENY_ONLY */==0
             {
@@ -1034,6 +1042,8 @@ fn facts(process: HANDLE) -> std::result::Result<Facts, Reason> {
         Ok(Facts {
             user,
             service,
+            service_logon,
+            session,
             elevated,
             integrity,
             admin,
@@ -1543,8 +1553,8 @@ fn run_inner(
             }
             diagnostic!(native_replay::totals(stdout.total, stderr.total));
             Ok(ResultData {
-                execution_mode: MODE,
-                claim: CLAIM,
+                execution_mode: execution.identity_mode.as_str(),
+                claim: execution.claim(),
                 dedicated: false,
                 stop_reason: reason,
                 exit_code: if reason == StopReason::Exited {
@@ -2748,6 +2758,8 @@ pub(crate) mod tests {
         let mut f = Facts {
             user: vec![],
             service: false,
+            service_logon: false,
+            session: 1,
             elevated: false,
             integrity: 8192,
             admin: false,
@@ -2756,6 +2768,12 @@ pub(crate) mod tests {
         f.service = true;
         assert_eq!(policy(&f), Err("service_identity"));
         f.service = false;
+        f.service_logon = true;
+        assert_eq!(policy(&f), Err("service_identity"));
+        f.service_logon = false;
+        f.session = 0;
+        assert_eq!(policy(&f), Err("service_identity"));
+        f.session = 1;
         f.elevated = true;
         assert_eq!(policy(&f), Err("elevated_identity"));
         f.elevated = false;

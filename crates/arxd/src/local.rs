@@ -408,6 +408,7 @@ mod tests {
         let cfg = Arc::new(crate::config::Config {
             execution: None,
             development_execution: None,
+            execution_settings: None,
             local: None,
             listen: None,
             state_dir: dir.path().into(),

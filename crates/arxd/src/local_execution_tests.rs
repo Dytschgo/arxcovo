@@ -143,6 +143,7 @@ async fn development_execution_over_real_bridge_pipe_and_sdk() {
     let cfg = Arc::new(crate::config::Config {
         execution: Some(execution.clone()),
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
@@ -484,6 +485,7 @@ async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
     let cfg = Arc::new(crate::config::Config {
         execution: None,
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
@@ -662,6 +664,7 @@ async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
     let cfg = Arc::new(crate::config::Config {
         execution: None,
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
