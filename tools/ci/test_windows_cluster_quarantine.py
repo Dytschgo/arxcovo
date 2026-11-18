@@ -502,5 +502,87 @@ class OwnedQueryTests(unittest.TestCase):
                 assert_owned_query(source, module, parent)
 
 
+IDENTITY_REQUIRED = ['peer_identity_retains_verified_tuple',
+                     'peer_identity_fresh_binding_controls',
+                     'peer_identity_assumed_founder_denied']
+
+
+def assert_identity_inventory(source, tls, pki):
+    assert IDENTITY_REQUIRED == ['peer_identity_retains_verified_tuple',
+                                 'peer_identity_fresh_binding_controls',
+                                 'peer_identity_assumed_founder_denied']
+    for text in (source, tls, pki):
+        assert_issuance_required(text)
+    functions = re.findall(r'(?m)^fn ([a-z0-9_]+)\(', source)
+    assert len(functions) == len(set(functions))
+    tests = re.findall(r'((?:#\[[^\]]*\]\s*)+)(?:async )?fn ([a-z0-9_]+)\(', source)
+    actual = []
+    for attrs, name in tests:
+        if 'test' in attrs:
+            assert attrs.strip() == '#[test]'
+            actual.append(name)
+    assert sorted(actual) == sorted(IDENTITY_REQUIRED)
+    assert source.count('#[test]') == 3
+    for parent, name, binding in (
+        (pki, 'tls_tests', '#[cfg(test)]\nmod tls_tests;'),
+        (tls, 'authenticated_identity_tests', '#[cfg(test)]\n#[path = "authenticated_identity_tests.rs"]\nmod authenticated_identity_tests;'),
+    ):
+        assert parent.count(binding) == 1
+        assert parent.count('mod ' + name + ';') == 1
+        prefix = parent.split('mod ' + name + ';')[0]
+        attrs = re.search(r'((?:#\[[^\]]*\]\s*)+)$', prefix)
+        assert attrs and attrs[1].strip() == binding.rsplit('\nmod ', 1)[0]
+
+
+class IdentityInventoryTests(unittest.TestCase):
+    def test_exact_plain_tests_and_both_bindings(self):
+        base = ROOT / 'crates/arxd/src/cluster'
+        source = (base / 'pki/authenticated_identity_tests.rs').read_text(encoding='utf-8')
+        tls = (base / 'pki/tls_tests.rs').read_text(encoding='utf-8')
+        pki = (base / 'pki.rs').read_text(encoding='utf-8')
+        assert_identity_inventory(source, tls, pki)
+        mutants = ['', source.replace(IDENTITY_REQUIRED[0], 'renamed'),
+                   source.replace('#[test]', '', 1), source + source]
+        for mutant in mutants:
+            with self.assertRaises(AssertionError):
+                assert_identity_inventory(mutant, tls, pki)
+        hiding = ['#[ignore]', '#![cfg(unix)]', '#[cfg(not(windows))]',
+                  '#[cfg(windows)]', '#[cfg(target_os = "linux")]',
+                  '#[cfg_attr(all(), ignore)]', '#[cfg(any())]',
+                  '#[cfg(target_env = "msvc")]', '#[cfg(feature = "hidden")]']
+        for attr in hiding:
+            for index, text in enumerate((source, tls, pki)):
+                # Includes helper-level and parent-level hiding, not just tests.
+                replacements = [attr + '\n' + text]
+                if index == 0:
+                    replacements += [text.replace('fn ', attr + '\nfn ', 1),
+                                     text.replace('#[test]', attr + '\n#[test]', 1)]
+                for replacement in replacements:
+                    args = [source, tls, pki]
+                    args[index] = replacement
+                    with self.assertRaises(AssertionError):
+                        assert_identity_inventory(*args)
+        for index, name, binding in (
+            (1, 'authenticated_identity_tests', '#[cfg(test)]\n#[path = "authenticated_identity_tests.rs"]\nmod authenticated_identity_tests;'),
+            (2, 'tls_tests', '#[cfg(test)]\nmod tls_tests;'),
+        ):
+            original = [source, tls, pki][index]
+            for replacement in ('', binding + '\n' + binding,
+                                binding.replace(name, 'absent'),
+                                '#[cfg(unix)]\n' + binding,
+                                binding.replace('#[cfg(test)]', ''),
+                                binding.replace('authenticated_identity_tests.rs', 'absent.rs')):
+                if replacement == binding:
+                    continue
+                args = [source, tls, pki]
+                args[index] = original.replace(binding, replacement)
+                with self.assertRaises(AssertionError):
+                    assert_identity_inventory(*args)
+        for weakened in ([], IDENTITY_REQUIRED[:-1], IDENTITY_REQUIRED + [IDENTITY_REQUIRED[0]]):
+            with patch(__name__ + '.IDENTITY_REQUIRED', weakened):
+                with self.assertRaises(AssertionError):
+                    assert_identity_inventory(source, tls, pki)
+
+
 if __name__ == "__main__":
     unittest.main()

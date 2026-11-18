@@ -279,10 +279,19 @@ pub const SERVER_NAME: &str = "arxcovo.invalid";
 /// Trusted adapter for this module's reviewed configs; arbitrary insecure rustls
 /// configs in the same crate can forge evidence. This is not a capability fence.
 #[derive(Clone, Copy)]
-pub struct AuthenticatedPeer(NodeId);
+pub struct AuthenticatedPeer {
+    node: NodeId,
+    binding: Option<(ClusterId, KeyDigest)>,
+}
 impl AuthenticatedPeer {
     pub fn node(self) -> NodeId {
-        self.0
+        self.node
+    }
+    pub(in crate::cluster) fn authenticated_identity(
+        self,
+    ) -> Result<(ClusterId, NodeId, KeyDigest), VerifyRefusal> {
+        let (cluster, key) = self.binding.ok_or(VerifyRefusal::Incomplete)?;
+        Ok((cluster, self.node, key))
     }
     pub fn from_client(c: &ClientConnection) -> Result<Self, VerifyRefusal> {
         if c.is_handshaking() || c.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
@@ -303,12 +312,19 @@ impl AuthenticatedPeer {
         let [cert] = certs else {
             return Err(VerifyRefusal::Malformed);
         };
-        Ok(Self(peer_identity(cert)?.node))
+        let identity = peer_identity(cert)?;
+        Ok(Self {
+            node: identity.node,
+            binding: Some((identity.cluster, identity.key)),
+        })
     }
     /// Placeholder founder only: confers no certificate verification credit.
     #[cfg(test)]
     pub fn assume(node: NodeId) -> Self {
-        Self(node)
+        Self {
+            node,
+            binding: None,
+        }
     }
 }
 pub fn check_sender(authenticated: NodeId, claimed: u64) -> Result<(), VerifyRefusal> {
