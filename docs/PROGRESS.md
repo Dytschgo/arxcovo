@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR179 as6bf8f46bc87a05bed01e342c1a37f68427e4c16b from reviewed2f888992. Allfive gatesSUCCESS; CI44274746575 attempt1GREEN537s, Windows533s. New7tests and Node48 eachOS PASS. Premerge exactmain6f4618c/CI44269052508 GREEN checked immediately.
-- Current work: exact-main CI44276313116 attempt1GREEN565s verified. Deliver preserved owner-PC/container-plan docs and bound first peer-transport prerequisite. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
+- Current work: exact-main CI44276313116 attempt1GREEN565s verified. PR180 publishedb1cf9d50 delivers preserved owner-PC/container-plan docs and reviewed purepeerwire contract; CI44279691035 running, independentagent-reviewSUCCESS. Next source slice is purecodec only, no liveTLS/dispatch authority. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
 - Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3940,3 +3940,21 @@ review explicitly permits status+reviewretention with unchangedprotocol/source.
 also validate sequenceinvariants; no liveTLS/engine authority from purecodec.
 Ready scoped docsPR for ownersteering/containerroute/firstcodec contract. No new
 runtime tests appropriate to docs-only change; normalhostedgates stillrequired.
+
+## PR180 published: acceptance route and peer codec contract
+
+Coordinator Sol6.1/high published exactb1cf9d50abc87b7ac3858dad3a1daba3e9a9613b,
+[PR180](https://github.com/Dytschgo/arxcovo/pull/180), basedexactgreenmain6bf8f46.
+Independent Sol review6974982923/agent-reviewSUCCESS; final3docretentiondelta
+verified, no protocolsemantics or non-doc source changes. Allpreserved ownerPC/
+ADR0023/devsetup/containerplan/evidence delivered without duplicating mergedRust.
+[CI44279691035](https://github.com/Dytschgo/arxcovo/actions/runs/44279691035)
+firstattempt running. Normalgates/freshgreenmain before coordinator merge.
+No new runtime tests/build/engine/network/container action for docs-only work.
+ADR0026 accepted purecodec only; nextimplementation will need ownsource review/
+puretests/semanticcontrols/normalgates. LiveTLS handshake blockingownership,
+connectionlimits, actualtransport/join/custody/clock/containeracceptance remain.
+M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged; realhardware unverified.
+Owner PC native runs still await verified Standardaccount/caps/reserves; Linux
+sudoNNP/A12pending. Existing babysitter untouched. Pending-run checkpoint local
+only, not pushed to create redundantCI. Priorbranches/commits preserved.
