@@ -592,3 +592,7 @@ fn adversarial_pair_control_can_resume() {
     assert_eq!(c.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
     assert_eq!(s.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
 }
+
+#[cfg(test)]
+#[path = "authenticated_identity_tests.rs"]
+mod authenticated_identity_tests;

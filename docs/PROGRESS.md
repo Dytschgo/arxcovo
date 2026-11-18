@@ -2,16 +2,15 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `05b9c82930cd3812614fc20f5d03d0a5fa05952a`
-after owner-approved diagnostic PR177. CI44212212325 attempt1 succeeded:
-608s wall,605s charged,3s verified idle queue credit; Windows604s,
-Ubuntu343s/macOS425s. Founder13 passed on all OS. Automatic trusted policy
-44213556680 succeeded. The previous main09134085 F6/F7/F8 red remains
-unreproduced and unfixed; passing output hides the diagnostic trace.
-The diagnostic red-main exception is consumed; protection is unchanged.
-Normal M3 preparation may resume with fresh review, five gates and feature
-Windows<=660s still required. M2 open/M3 unchecked; Windows fixture28 and
-hardware paths remain **unverified on real hardware**.
+**Current main GREEN:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
+648s wall,645s charged,3s validated idle queue credit; Windows643s,
+Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
+Ubuntu/macOS/Windows), founder13 passed each OS. Automaticpolicy44230812083
+succeeded. PR Windows595s met the feature660s requirement. Protection unchanged.
+Passing output hides observer data: historical founder refusal cause remains
+unreproduced/unfixed, overlap Unknown, no stability/re-enable credit.
+M2 open/M3 unchecked; fixture28 and hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -40,9 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR177 as05b9c829 from reviewed1c7c9f52 under the explicit owner diagnostic exception; protection unchanged. First-main CI44212212325 green608wall/605charged; founder13 allOS.
-- Current work: PR176 owned anchor query refreshed onto green diagnostic main. Reviewed five feature files remain unchanged; fresh exact-head review and all hosted gates, including new query engine proof and Windows<=660s, remain required. Identity and membership-observation contracts are independently reviewed and local.
-- Blockers: no current red-main hold; prior founder failures remain unexplained, not fixed. Production join still needs admission, authenticated transport/discovery, owner/removal authority, custody and clock contracts. M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged; hardware **unverified on real hardware**.
+- Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
+- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Applied locally; fmt/Clippy/observer7/guard9 pass, Astra review pending. No rerun or runtime correction authorized.
+- Blockers: PR178 is held after Windows founder refusal; diagnostic review and first-attempt all-OS evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3642,3 +3641,89 @@ Root correctionc3d45d6d addresses Astra9da4bf2b five blockers: leafdrop, singlel
 ### Ubuntu observer publication decision - 2026-11-18
 
 Astra6.2/high recheck10d324e6 closes all five9da4bf2b blockers atba493dfc, no new blocker. Root confirmed currentmain05b9c829/CI44212212325 stillgreen and finalsourceunchanged from reviewedtree. Optionalmissing worker rows stayUnknown. Root authorizes one new-source normalfullCI observation via PR176 update; no manualdispatch/rerun/settings change. Existingqueryengineproof/allfivegates/Windows<=660s and freshmainhealth remain required; thisdiagnostic is notfix/stabilitycredit. Authorization D:/Temp/arx-pr176-ubuntu-diagnostic-publication/authorization.json. Cinvalid/Tunrun, counters unchanged; M2open/M3unchecked/hardware **unverified on real hardware**.
+
+### PR176 normal merge checkpoint - 2026-11-18
+
+Root verified exacthead14d94c61/currentmain05b9c829/greenmainrun44212212325, independentAstraPASS6967815508, allfivegreenPRgates, actualqueryproofPASSallOS and Windows595s. Normal squashmergee3e79089 readbacktree/protection equality passed. Evidence D:/Temp/arx-pr176-14d94c61-hosted; firstmainCI44229539357 actively awaited. No rerun/fix/stability/re-enable credit; newquery realengine proof on PR only untilmainpasses. Retainedidentity pureTLS builder continues independently.
+
+### PR176 first-main acceptance checkpoint - 2026-11-18
+
+Root actively awaited CI44229539357 exit0 and bounded/read retained full3OSlogs. All query proofs/founder13 passed; exact main e3e79089 verified. Pure charged-v1 calculation648wall/645charged/3credit, automaticpolicy44230812083success. No diagnosticrecordvisible on passing tests, so no phase/cause/overlap claim. Identity builder continues independently; next actualsource review must preserve mergedquery guard/inventories. Evidence D:/Temp/arx-pr176-14d94c61-hosted/main.
+
+### Identity integration and disk-resource disposition - 2026-11-18
+
+Sol6.1/high sourcea7596271/evidencea4d3bf8c: Clippy andstaticchecks passed, sole TLSinvocation failedduringcompile with Cfull, zero tests/mutants ran. Currentreadonlydriveinspection C~15.5GBfree,D~2.79TBfree; no cache deletion. Root integrated onto main e3e79089 (firstCI44229539357green648wall645charged), preserving3identitysourceblobs and AST-equal existingmain guardfunctions/classes. Additiveidentityguard gives9PASS. New validation grant places CargoHome/target/TMP/logs onD, preserves oldCbuild/logs, then permits one TLSbaseline plus designatedmutants afterpass. This is compile-infrastructure continuation, no failedtest rerun. IndependentAstraactualdiff review precedes publication. M2openM3unchecked/countersunchanged/hardware **unverified on real hardware**.
+
+- Root guard correction after Astra identity review: block-comment hiding and async signatures now rejected; guard9 PASS after restoring an accidentally edited older matcher. Existing main guard definitions AST-identical; Rust source unchanged. D-drive TLS validation and independent Astra recheck pending. No fix/stability credit; M2 open/M3 unchecked; counters unchanged; hardware **unverified on real hardware**.
+
+- Sol6.1 high identity D-drive validation passed: Clippy, TLS13/13, two intended semantic mutation failures with exact restoration. Root verified18 artifact hashes and integrated evidence6b572258. Astra B1/B2 closed; B3 line-commented cfg(test) corrected in both parent bindings. Independent final recheck and hosted gates remain pending; no engine/stability/real-hardware credit.
+
+- Astra6.2 high final identity recheck821b742f: B1/B2/B3 closed; all9 guard tests passed, all20 declared validation hashes independently verified. Root retained report as b5d1d600. Source remains unchanged; preparing identity PR with exact-head review, five hosted gates, Windows<=660s and fresh main required.
+
+- PR178 Windows failure observed and logs retained: existing founder proof exhausted shared5s while proposal pending; underlying cause unknown. Ubuntu/macOS identity3PASS each, Windows identity3unrun. No retry, fix, timing or quarantine change; counters unchanged. Local evidence m3-pr178-windows-founder-deadline.md awaits independent Astra disposition.
+
+- Astra6.2 high decoded PR178 founder trace (a60df7dd): final WaitElapsed confirmed; submission16Ok, responder17/18 absent at return. Earlier Ubuntu refusals remain unclassified. Sol6.1 high prepare-only post-shutdown scalar-slot patch assigned; actual source/execution grants pending, no new fix attempt. PR178 remains held; M2open/M3unchecked; hardware **unverified on real hardware**.
+
+## Agent-owned C: build cleanup inventory - 2026-11-18
+
+Before cleanup: C: free11,936,124,928 bytes; D: free2,788,865,925,120 bytes.
+New Rust validation already uses D:/Temp/arx-identity-d-validation-f4e7e857 for
+CARGO_TARGET_DIR, CARGO_HOME, TMP/TEMP and logs. No new C: build outputs allowed.
+Future delegated worktrees must also be on D:; do not launch a new worktree if
+the orchestration tool cannot honor that destination. Existing prepare-only task
+is not building. Shared D:/Code/Arxcovo/target is on D:, not a C: cleanup target.
+
+Deletion allowlist, recorded BEFORE deletion (one task-owned output only):
+- C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-99c75fbd-e3b1351afc96bbcf/target/identity-validation/build
+  Original retained-identity builder's private CARGO_TARGET_DIR; evidence
+  docs/evidence/m3-authenticated-identity.md records its provenance and compile
+  disk failure. Inventory:3,822 files,2,392,806,227 logical bytes. Resolved exact
+  target and every ancestor/descendant checked: no reparse points. Worktree has
+  no tracked changes; no cargo/rustc/clippy-driver processes were listed.
+  Preserve adjacent cargo-home cache, logs, all source and Git worktree data.
+No other directory has been admitted for deletion. No user/cache/LabManager/VM
+data is included. Remaining old worktrees have unmerged source/evidence and are
+not disposable build output. Post-cleanup free space and owner notice pending.
+
+### C: cleanup result
+
+The single allowlisted build directory was removed with native PowerShell
+Remove-Item -LiteralPath after exact absolute-path and reparse checks. Removal
+completed; adjacent cargo-home and logs still exist. Source/Git worktree retained.
+After cleanup: C: free15,358,304,256 bytes; D: free2,788,865,662,976 bytes.
+Observed C: increase3,422,179,328 bytes is a whole-volume measurement; concurrent
+activity prevents attributing all of it to the2,392,806,227 logical-byte target.
+C: remains near full. Owner informed: further non-agent cleanup is an owner
+action. No other deletion authorized by provenance in this audit. Future build
+outputs and agent worktrees must use D:; no new C: worktree will be launched.
+No cache/user/LabManager/VM data removed.
+
+- Astra6.2 medium independently reviewed unapplied post-shutdown patch from D:
+  shared checkout (read-only, no new C: worktree). Static PASS, one nonblocking
+  formatter cleanup-field test-coverage advisory. No compile/runtime proof.
+  Patch fdc45d75c0e24bc1e0bc74c9182944fd718e89880b68c20c7b86cedc3545d7fd
+  remains unapplied. Owner grant for source/compile/new diagnostic CI remains
+  pending; PR178 held. No new C: output or runtime fix attempt.
+
+## Autonomous recovery diagnostic application (2026-11-18)
+
+Owner fresh steering authorizes prepared diagnostic application/compile/purechecks,
+independent actual-source review and one new-source first-attempt hosted observation.
+Sol6.1/high coordinator confirmed full-access and clean35272c19, applied retained
+patch plus four-field cleanup test advisory. D-only fmt/ClippyPASS; corrected pure
+observer filter7/7PASS (initial filter selected0, no credit); quarantineguard9PASS.
+No local engine, runtimefix, timeout/quarantine changes or newfixattempt. Source
+review Astra6.2/high pending; PR178 remains held until reviewed publication and
+allfive gates/new identity3 eachOS/Windows<=660s/freshgreenmain. Full details and
+artifact hashes: [application](evidence/m3-founder-postshutdown-application.md).
+LastmergedPR176 unchanged; M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged.
+Hardware **unverified on real hardware**. Existing babysitter left intact.
+
+Astra6.2/high independent actual-source review PASS at77de123f: CFG exterior and
+original observer byte-identity verified; anchored proof one emitter-line delta;
+prior identity review applicable by source identity;12local artifact hashes checked.
+Nonblocking missing/zero/saturated late formatter assertion gap retained, no source
+change. [Review](reviews/m3-founder-postshutdown-actual-astra62-review.md).
+Only accurate review/outcome docs may follow before final-source identity check.
+One authorized normal hosted firstattempt will start on publication; no rerun,
+no runtimefix credit, Sol3/3 unchanged. Full-access does not relax any hard gate.

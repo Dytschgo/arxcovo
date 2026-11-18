@@ -190,7 +190,7 @@ async fn anchored_preproof_single_voter() {
         cleanup.shutdown = observation::shutdown_status(&shutdown);
         cleanup.store = observation::status(n.sm_weak.upgrade().is_none());
         cleanup.log = observation::status(n.log_weak.upgrade().is_none());
-        observation::emit(captured.as_ref().unwrap(), cleanup);
+        observation::emit_proof_refusal(captured.as_ref().unwrap(), cleanup);
         panic!("original founder refusal: {error}");
     }
     timeout_at(cleanup_deadline, n.shutdown())
