@@ -40,8 +40,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
-- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Applied locally; fmt/Clippy/observer7/guard9 pass, Astra review pending. No rerun or runtime correction authorized.
-- Blockers: PR178 is held after Windows founder refusal; diagnostic review and first-attempt all-OS evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
+- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Published reviewed diagnostic head11a34312; fmt/Clippy/observer7/guard9 pass, independent Astra applied-source PASS. First-attempt normal all-OS CI44267088243 running; agent-review/ci-time-budget green, OS checks pending. No rerun or runtime correction authorized.
+- Blockers: PR178 is held after Windows founder refusal; first-attempt all-OS CI44267088243 evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3727,3 +3727,20 @@ change. [Review](reviews/m3-founder-postshutdown-actual-astra62-review.md).
 Only accurate review/outcome docs may follow before final-source identity check.
 One authorized normal hosted firstattempt will start on publication; no rerun,
 no runtimefix credit, Sol3/3 unchanged. Full-access does not relax any hard gate.
+
+## Published recovery observation (2026-11-18)
+
+Coordinator published11a34312afb6027b82478686fc1e728c01cd393b to PR178 after
+Astra independent PASS. Verified only review/PROGRESS docs follow reviewed77de123f;
+all non-doc source identical. Exact-head independent attribution posted as
+[review6973198836](https://github.com/Dytschgo/arxcovo/pull/178#issuecomment-6973198836),
+agent-review success; ci-time-budget success. Normal full-suite all-OS
+[CI44267088243](https://github.com/Dytschgo/arxcovo/actions/runs/44267088243)
+is in progress on the new head, its sole first attempt; three OS checks pending.
+No old-head rerun. Stop and classify outcome without runtimefix/reset/retry.
+Local checkpoint intentionally not pushed while observation runs; no docs-only
+new CI to manufacture another attempt. PR body updated to current diagnostic scope.
+Existing main exacte3e79089 CI44229539357 attempt1 success confirmed again.
+Allfive gates/identity3 eachOS/Windows<=660s/freshgreenmain required before merge.
+LastmergedPR176; M2OPEN/M3UNCHECKED; Sol3/3 exhausted, historicalOpus0/2 unchanged.
+Hardware **unverified on real hardware**. No babysitter changes.
