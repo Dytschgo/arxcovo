@@ -30,3 +30,19 @@ nonblockingregistrycandidate remains D:/Temp/arx-peer-registry-design.md, notbui
 oracceptedsource. LiveTLS ownership/actualtransport/join/custody/clock/container
 proofs remain. M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged. Hardware
 **unverified on real hardware**. Existingbabysitter and allfences unchanged.
+
+## Exact-main PR180 confirmation
+
+Coordinator Sol6.1/high checked CI44286225997 attempt1SUCCESS on exactmain
+8b36405e932ef2921a3c8d71dbaf7ed001314de7. 10:31:32–10:43:01Z689s wall;
+Windows685s, Ubuntu314s/macOS468s. RequiredmainhealthGREEN; featurePRWindows512s
+remains separate successful<=660s proof. Existinghistoryrecorder validated686s
+charged/3s eligiblequeuecredit/685s longestjob. No settings/budget override.
+Codec8namedtestsPASS eachOS, Node48/48eachOS. FullRust Windows670PASS/36skip,
+Ubuntu662PASS/22skip, macOS630PASS/8skip. OptionalWindows sample skipped_budget
+at e_s693, no case executed or coverage/stabilitycredit. No rerun/dispatch.
+Logs each<8MiB retainedD:/Temp/arx-pr180-main-8b36405, hashes:
+windows245675bytes b15c409864dd56a8d15ad3a60f92f8fe83f0b5add529873f44036e2abbc08914
+ubuntu250590bytes c0cc4e8250f6040f555457b5a04cd0a425d81ac55e21bf25252c226e3012fdfb
+macos231696bytes c147bec1f734380df0a3ea811d7c6697129fb86bc959c68bd0c110660b71e71e
+M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged. No transport/hardwarecredit.
