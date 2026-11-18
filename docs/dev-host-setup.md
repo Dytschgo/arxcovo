@@ -26,3 +26,28 @@ Run these checks as the dedicated account, recording bounded outputs without cre
 5. Exercise real Windows/Ubuntu creation, guest commands, snapshot break/restore, expiry cleanup, disk-cap rejection and RAM/CPU reserve rejection. Observe actual process memory and disk allocation. Leave every unexercised path labelled **unverified on real hardware**.
 
 Sources: [QEMU WHPX prerequisites](https://www.qemu.org/docs/master/system/whpx.html), [Microsoft virtualization hardware requirements](https://learn.microsoft.com/windows-server/virtualization/hyper-v/host-hardware-requirements).
+
+## Owner-authorized M2 setup on this PC (2026-11-18)
+
+Dylan has designated this Windows PC for applicable M2 native acceptance. Before
+agents run it, the owner must complete this short subset of the checklist above:
+
+- Create the dedicated `Arxcovo` Standard account, outside Administrators and
+  Hyper-V Administrators. Keep its password out of chat and logs.
+- Create `D:\ArxcovoData` for test data, builds and evidence; grant the account
+  modify access there without broad D: or personal-folder access.
+- Configure and verify a 200 GiB aggregate disk cap with at least 50 GiB free on D:,
+  reserving 16 GiB RAM and half the logical CPUs for the owner. A folder name or
+  planned setting is not enforcement; native workloads wait for verified fences.
+- Install required Rust/build tools for that account. Any protected service
+  installation or required logon rights are owner steps once the verified installer
+  is ready; do not make speculative service/privilege changes.
+
+The coordinator sent this checklist to Dylan before any native run. Account
+existence and enforcement remain unverified; no owner credentials were requested.
+Run acceptance only as that account after preflight; no fallback to the owner's
+login. All task data, build output and TMP/TEMP are on D:. QEMU/WHPX and official
+Windows/Ubuntu guest media are later M4 requirements, unnecessary for M2 alone.
+Linux-specific A7/A11 sudo/NNP and A12 need a qualifying Linux host and remain
+hardware-pending. Existing Lab Manager paths/state and agent-windows-test stay
+untouched. No admin or native acceptance action has been performed here.

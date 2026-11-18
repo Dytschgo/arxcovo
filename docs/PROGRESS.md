@@ -3844,3 +3844,25 @@ Independent Sol6.1/high correctionPASS, Standards0/Spec0/Security0; exacttestblo
 allbyte/oldrecord/duplicateguards preserved; productionbudget/runtimeunchanged.
 [Review](reviews/m3-pr179-history-count-sol61-review.md). OldrunWindows stillrunning;
 retain its firstattempt evidence before publishing correction. No PRrerun/dispatch.
+
+## Babysitter-relayed owner steering: M2 PC and M3 containers (2026-11-18)
+
+Acknowledged Dylan's delegated steering and recorded it in ADR0023. This Windows
+PC is authorized as the M2 host for applicable native gaps, subject to owner-created
+Standard account, enforced disk cap and owner CPU/RAM reserves. Sent one short
+checklist from docs/dev-host-setup.md before any native execution. Owner setup is
+pending/unverified; agents perform no admin steps and never use the owner's login
+as fallback. All data, VM disks, builds and TMP/TEMP go to D:. Lab Manager/state/
+agent-windows-test remain untouched. Linux A7/A11 sudo/NNP and A12 cannot close
+on Windows and remain qualifying-Linux-host pending; M2 stays OPEN.
+
+M3 acceptance target is three containers on hosted Ubuntu with real network
+transport, kill-one/write-preservation and expired/reused-code refusals. No local
+hypervisor install is needed for this preferred path. Assigned Sol6.1/high a
+read-only implementation plan grounded in actual source; no container/CI/native
+run yet. VM/container credit only; real multi-host hardware remains **unverified
+on real hardware**. Transport/custody/clock gaps remain explicit prerequisites,
+not permission to replace real paths with mem_net or mocks. M3 stays UNCHECKED.
+Sol3/3 exhausted/Opus0/2 unchanged; no founder diagnostic/fix or Linux hosted retry.
+Existing babysitter schedule untouched. PR179's independently reviewed history
+assertion correction remains local, awaiting original Windows result before push.
