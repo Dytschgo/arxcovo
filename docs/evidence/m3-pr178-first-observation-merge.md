@@ -54,3 +54,10 @@ Main logSHA256:
 windows.log41bb88ad67f99276a263922ce5aec565c2718a294dce3f48460398f40e8cee50
 ubuntu.log05ac16bb5cbb4d3249031397328e9e6869e77cf3c928f925a1939166084b3178
 macos.log07bb07134436fb9c6c5b7da92701de148738409ae76c6fb7fab3bc9ccb8c874b
+
+The existing node scripts/ci-budget.mjs --record command was executed with
+GITHUB_REPOSITORY=Dytschgo/arxcovo and D TMP/TEMP. It validates the first-attempt
+run/jobs through existing policy logic and appended docs/ci-duration-history.json:
+603s wall,600s charged,3s eligible idle queue credit,longest job598s.
+Automatic policy44270989478 completedSUCCESS on exactmain6f4618c.
+No status/protection/budget bypass or CI dispatch occurred.

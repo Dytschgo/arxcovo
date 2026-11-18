@@ -3769,3 +3769,12 @@ no new source yet. Must use reviewed allowlist/pure checks, no founder engine ch
 Existing local docs checkpoints retained for next substantive source PR, not pushed
 solely to create another diagnostic CI. LastmergedPR178; M2OPEN/M3UNCHECKED,
 Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.
+
+Existing CI history recorder executed for main44269052508:603wall/600charged,
+3validatedidlequeuecredit,longest598. Automaticpolicy44270989478SUCCESS.
+New root branch work/m3-membership-observation begins exactgreenmain6f4618c;
+all four unpublished docs checkpoints cherry-picked intact. Prior branch preserved.
+No worktree or C build created. Independent Sol contract scope inspection found
+no separate stronger observation brief: L2 D3/B4 and self-admission following
+kernel apply. Existing anchor_query is intentionally local/advisory and remains
+frozen; a standalone unused wrapper would not fulfill fresh observation.
