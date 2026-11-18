@@ -4004,3 +4004,12 @@ hashes verified, strengthened8/8 outputs inspected. [Source review](reviews/m3-p
 Threeguardcontrols assignedonce with exactrestore; reviewerreads committedbaseline
 whiletemporaryworktreemutants run. Futureoutcomes separatelyattributed. No retry/
 merge/timeout authority or stabilitycredit; PR180oldcancelledgate remainsretained.
+
+Builder Sol6.1/high all3pure codeccontrols compiled andfailed intendedassertions
+once each; rootread allpatches/logs/time/restoration. M2checkertextmismatch was
+bookkeeping only, retained; no M1/M2repeat, unrunM3 onceafterexplicitsteering.
+Exactrestoration aftereach and finalnon-docidentity toreviewed6a27902c verified.
+No postrestore runtime rerun; retainedbinaryM3mutant. Independent sourcePASS
+applicable under exactrestore/docsretentionconditions. Genuinecodecfeature ready
+for publication asPR180 finalscope; olddocsjobtimeout retained, no performance/
+stabilityfixclaim, no timeout/quarantine/settings/counterchange.
