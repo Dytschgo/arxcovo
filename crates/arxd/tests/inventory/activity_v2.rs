@@ -253,7 +253,7 @@ fn v1_migration_is_lossless_and_failure_is_atomic() {
             assert_eq!(
                 db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                3
+                4
             );
             let p = page(&store, &args(50, None, true));
             assert_eq!(p.activities.len(), 2);
@@ -710,7 +710,7 @@ fn v3_development_constraints_and_v2_migration_preserve_identity_sequence() {
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        3
+        4
     );
     assert!(
         page(&store, &args(50, None, false))

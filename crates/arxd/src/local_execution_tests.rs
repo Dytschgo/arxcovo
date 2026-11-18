@@ -15,6 +15,54 @@ use sha2::{Digest, Sha256};
 
 type Peer = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
+#[tokio::test]
+async fn foreground_listener_stop_joins_connections_and_rejects_later_calls() {
+    let state = private_dir();
+    let token = "c".repeat(64);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let config = Arc::new(crate::config::Config {
+        execution: None,
+        execution_settings: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![crate::config::Agent {
+            principal: "fixture-agent".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+    });
+    let activity = Arc::new(crate::store::Activity::open(state.path()).unwrap());
+    let listener = Listener::bind(&endpoint).unwrap();
+    let stop = crate::service::Shutdown::default();
+    let server = tokio::spawn(listener.run_until(config, activity, stop.clone()));
+    let peer = connect(&address, &token).await;
+    call(&peer, "list_hosts", json!({})).await.unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), call(&peer, "list_hosts", json!({})))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        db(state.path())
+            .query_row::<i64, _, _>("SELECT count(*) FROM activity", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    let _ = peer.cancel().await;
+}
+
 fn private_dir() -> tempfile::TempDir {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
@@ -143,6 +191,7 @@ async fn development_execution_over_real_bridge_pipe_and_sdk() {
     let cfg = Arc::new(crate::config::Config {
         execution: Some(execution.clone()),
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
@@ -484,6 +533,7 @@ async fn dedicated_fake_bridge_schema_audit_and_storage_boundaries() {
     let cfg = Arc::new(crate::config::Config {
         execution: None,
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
@@ -662,6 +712,7 @@ async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
     let cfg = Arc::new(crate::config::Config {
         execution: None,
         development_execution: None,
+        execution_settings: None,
         local: None,
         listen: None,
         state_dir: state.path().into(),
@@ -728,4 +779,181 @@ async fn dedicated_sdk_cancellation(automatic_timeout: bool) {
     stop.cancel();
     server.await.unwrap().unwrap();
     execution.drain().await.unwrap();
+}
+
+// Foreground shutdown versus detached SDK handlers. rmcp spawns each request
+// handler without a join handle, so joining the listener's connection tasks does
+// not join handlers. Each case parks one real run_command handler at a fixed
+// point over the real pipe, bridge, listener and SDK, then performs foreground
+// shutdown order: executor shutdown, listener stop/join, then drain.
+struct HeldShutdown {
+    _state: tempfile::TempDir,
+    state: std::path::PathBuf,
+    execution: Arc<Execution>,
+    hold: Arc<crate::development::Hold>,
+    peer: Peer,
+    request: tokio::task::JoinHandle<bool>,
+}
+/// Releases a parked handler on every exit path, including a failed assertion.
+struct ReleaseHold(Arc<crate::development::Hold>);
+impl Drop for ReleaseHold {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+async fn held_then_shutdown(point: crate::development::Checkpoint) -> HeldShutdown {
+    let state = private_dir();
+    let token = "d".repeat(64);
+    let address = format!(r"\\.\pipe\arxcovo-{}", rand::random::<u64>());
+    let endpoint = Endpoint {
+        address: address.clone(),
+        client_identity: platform::current_identity().unwrap(),
+    };
+    let hold = crate::development::Hold::new(point);
+    let execution = Execution::hold_fixture(hold.clone());
+    let config = Arc::new(crate::config::Config {
+        execution: Some(execution.clone()),
+        execution_settings: None,
+        development_execution: None,
+        local: None,
+        listen: None,
+        state_dir: state.path().into(),
+        agents: vec![crate::config::Agent {
+            principal: "fixture-agent".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+    });
+    let activity = Arc::new(crate::store::Activity::open(state.path()).unwrap());
+    let listener = Listener::bind(&endpoint).unwrap();
+    let stop = crate::service::Shutdown::default();
+    let server = tokio::spawn(listener.run_until(config, activity, stop.clone()));
+    let peer = connect(&address, &token).await;
+    let client = peer.peer().clone();
+    let request = tokio::spawn(async move {
+        client
+            .call_tool(params("run_command", json!({"tool":"cargo"})))
+            .await
+            .is_ok()
+    });
+    tokio::time::timeout(Duration::from_secs(10), hold.reached.notified())
+        .await
+        .expect("SDK handler reached the held point");
+    let rows = outcomes(state.path());
+    match point {
+        crate::development::Checkpoint::Entry => assert!(rows.is_empty()),
+        crate::development::Checkpoint::Started => assert_eq!(rows, ["started"]),
+    }
+    execution.shutdown();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    HeldShutdown {
+        state: state.path().into(),
+        _state: state,
+        execution,
+        hold,
+        peer,
+        request,
+    }
+}
+fn outcomes(dir: &Path) -> Vec<String> {
+    db(dir)
+        .prepare("SELECT outcome || coalesce(':' || reason, '') FROM activity ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+async fn finish_held(held: HeldShutdown) {
+    // The connection was aborted, so the client sees a transport error, never success.
+    let succeeded = tokio::time::timeout(Duration::from_secs(10), held.request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!succeeded);
+    let _ = held.peer.cancel().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_drain_waits_for_sdk_handler_held_after_started_row() {
+    let held = held_then_shutdown(crate::development::Checkpoint::Started).await;
+    let _release = ReleaseHold(held.hold.clone());
+    let execution = held.execution.clone();
+    let mut drain = tokio::spawn(async move { execution.drain().await });
+    if let Ok(acknowledged) = tokio::time::timeout(Duration::from_millis(500), &mut drain).await {
+        assert!(
+            !acknowledged.unwrap(),
+            "drain acknowledged quiescence while an admitted handler held rows {:?}",
+            outcomes(&held.state)
+        );
+    }
+    held.hold.release();
+    tokio::time::timeout(Duration::from_secs(5), held.hold.left.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap()
+            .unwrap(),
+        "drain must confirm the held handler's terminal audit"
+    );
+    // Drain returned only after the worker committed the terminal refusal.
+    assert_eq!(outcomes(&held.state), ["refused:shutdown"]);
+    finish_held(held).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_drain_is_unconfirmed_while_held_handler_never_resumes() {
+    let held = held_then_shutdown(crate::development::Checkpoint::Started).await;
+    let _release = ReleaseHold(held.hold.clone());
+    let started = tokio::time::Instant::now();
+    assert!(
+        !held.execution.drain().await,
+        "drain acknowledged quiescence while an admitted handler held rows {:?}",
+        outcomes(&held.state)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    // An unconfirmed drain does not invent completion.
+    assert_eq!(outcomes(&held.state), ["started"]);
+    held.hold.release();
+    let mut confirmed = false;
+    for _ in 0..3 {
+        if held.execution.drain().await {
+            confirmed = true;
+            break;
+        }
+    }
+    assert!(confirmed);
+    assert_eq!(outcomes(&held.state), ["refused:shutdown"]);
+    finish_held(held).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sdk_handler_polled_after_drain_cannot_write_activity() {
+    let held = held_then_shutdown(crate::development::Checkpoint::Entry).await;
+    let _release = ReleaseHold(held.hold.clone());
+    // Nothing was admitted before drain closed admission.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), held.execution.drain())
+            .await
+            .unwrap()
+    );
+    held.hold.release();
+    tokio::time::timeout(Duration::from_secs(5), held.hold.left.notified())
+        .await
+        .unwrap();
+    // Allow a late worker, if one had been registered, to reach its commit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        outcomes(&held.state).is_empty(),
+        "a handler polled after acknowledged drain wrote rows {:?}",
+        outcomes(&held.state)
+    );
+    assert!(held.execution.drain().await);
+    finish_held(held).await;
 }

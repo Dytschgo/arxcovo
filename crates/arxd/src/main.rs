@@ -49,16 +49,20 @@ async fn foreground() {
             | "server-config"
             | "server-state"
             | "server-bind"
+            | "server-drain-unconfirmed"
             | "server-listener" => category.as_str(),
             _ => "transport-frame-or-io",
         };
         eprintln!("arxd: {safe}");
-        std::process::exit(if safe == "server-config" { 3 } else { 1 });
+        std::process::exit(foreground_exit_code(safe));
     }
     // Tokio stdin uses a blocking OS read that cannot be cancelled. Explicitly
     // terminate after transport EOF so a client holding stdin open cannot keep
     // an otherwise finished bridge alive during runtime shutdown.
     std::process::exit(0);
+}
+fn foreground_exit_code(category: &str) -> i32 {
+    if category == "server-config" { 3 } else { 1 }
 }
 async fn run() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -93,15 +97,18 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!("no configured listener");
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut local_shutdown = shutdown_rx.clone();
+    let local_shutdown = arxd::service::Shutdown::default();
+    let local_stop = local_shutdown.clone();
+    let has_local = local.is_some();
+    let has_http = http.is_some();
     let local_config = config.clone();
     let local_activity = activity.clone();
     let local_run = async move {
         match local {
-            Some(listener) => tokio::select! {
-                result = listener.run(local_config, local_activity) => result.context("server-listener"),
-                _ = local_shutdown.changed() => Ok(()),
-            },
+            Some(listener) => listener
+                .run_until(local_config, local_activity, local_stop)
+                .await
+                .context("server-listener"),
             None => std::future::pending().await,
         }
     };
@@ -117,19 +124,33 @@ async fn run() -> anyhow::Result<()> {
         }
     };
     tokio::pin!(local_run, http_run);
-    let result = tokio::select! {
-        result = &mut local_run => result,
-        result = &mut http_run => result,
-        _ = tokio::signal::ctrl_c() => {
-            if let Some(execution) = &execution { execution.shutdown(); }
-            let _ = shutdown_tx.send(true);
-            // Bound HTTP drain; local connections are aborted when this returns.
-            tokio::time::timeout(std::time::Duration::from_secs(5), &mut http_run).await.unwrap_or(Ok(()))
-        },
+    let (mut result, local_done, http_done) = tokio::select! {
+        result = &mut local_run => (result, true, false),
+        result = &mut http_run => (result, false, true),
+        _ = tokio::signal::ctrl_c() => (Ok(()), false, false),
     };
     if let Some(execution) = &execution {
         execution.shutdown();
-        execution.drain().await;
+    }
+    local_shutdown.cancel();
+    let _ = shutdown_tx.send(true);
+    // Stop the listener and join its connection tasks. SDK request handlers are
+    // detached from those tasks; drain closes execution admission and waits for
+    // every admitted handler's terminal audit.
+    if has_local && !local_done {
+        result = result.and(local_run.await);
+    }
+    if has_http && !http_done {
+        result = result.and(
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut http_run)
+                .await
+                .unwrap_or(Ok(())),
+        );
+    }
+    if let Some(execution) = &execution
+        && !execution.drain().await
+    {
+        anyhow::bail!("server-drain-unconfirmed");
     }
     result
 }
@@ -150,6 +171,11 @@ async fn serve_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unconfirmed_drain_has_a_nonzero_foreground_exit() {
+        assert_eq!(foreground_exit_code("server-drain-unconfirmed"), 1);
+        assert_eq!(foreground_exit_code("server-config"), 3);
+    }
     #[tokio::test]
     async fn http_shutdown_drains_inflight_response() {
         let started = Arc::new(tokio::sync::Notify::new());

@@ -419,7 +419,7 @@ async fn response_only_reason_table_completes_and_reads_back_without_private_dat
             assert_eq!(
                 db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
                     .unwrap(),
-                3
+                4
             );
             let columns: Vec<String> = db
                 .prepare("PRAGMA table_info(activity)")

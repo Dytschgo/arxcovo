@@ -137,6 +137,16 @@ impl Listener {
     ) -> Result<()> {
         run_listener(self.0, config, activity).await
     }
+    /// Stop accepting connections and join aborted connection tasks. Detached
+    /// SDK request handlers are fenced by execution admission, not this join.
+    pub async fn run_until(
+        self,
+        config: Arc<crate::config::Config>,
+        activity: Arc<crate::store::Activity>,
+        stop: crate::service::Shutdown,
+    ) -> Result<()> {
+        run_listener_until(self.0, config, activity, stop).await
+    }
 }
 async fn run_listener(
     listener: impl Acceptor,
@@ -408,6 +418,7 @@ mod tests {
         let cfg = Arc::new(crate::config::Config {
             execution: None,
             development_execution: None,
+            execution_settings: None,
             local: None,
             listen: None,
             state_dir: dir.path().into(),

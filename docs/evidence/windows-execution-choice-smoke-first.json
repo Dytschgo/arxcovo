@@ -1,0 +1,36 @@
+{
+  "source": "ba959133eea5b1b8be35b39ef0ce393e21743e7b",
+  "report": {
+    "production_binary": true,
+    "fixture_bypass": false,
+    "steps": [
+      "omitted-mode-defaults-to-available-current-user",
+      "actual-cargo-current-user-job-cleanup",
+      "one-correlated-command-row",
+      "durable-current-user-provenance",
+      "durable-job-identity-and-cleanup",
+      "no-raw-owner-identity-or-rights",
+      "activity-id-filter-correlates-terminal-command",
+      "terminal-command-persists-across-daemon-restart"
+    ],
+    "binary_sha256": "e856d8381f5a2a56582a2d4b25cc8d67f54cbb7ce2ca06c05b25d9fe0fe62829",
+    "restart_method": "forced-daemon-stop-after-observed-terminal-commit-and-child-cleanup",
+    "graceful_shutdown_proved": false,
+    "outcome": "FAIL",
+    "failure_type": "RuntimeError",
+    "failure_category": "production-daemon-refused-startup",
+    "elapsed_seconds": 0.828
+  },
+  "outer": {
+    "exit": 1,
+    "elapsedSeconds": 0.9896318,
+    "outerDeadlineSeconds": 90,
+    "binarySha256": "e856d8381f5a2a56582a2d4b25cc8d67f54cbb7ce2ca06c05b25d9fe0fe62829"
+  },
+  "disposition": {
+    "dedicatedFixtureAccountLength": 21,
+    "contractMaximum": 20,
+    "syntheticFixtureExceedsContract": true,
+    "CFreeBytes": 51484405760
+  }
+}

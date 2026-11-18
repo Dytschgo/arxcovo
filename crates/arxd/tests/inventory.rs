@@ -39,6 +39,7 @@ fn config(path: &Path) -> (Config, String) {
         Config {
             execution: None,
             development_execution: None,
+            execution_settings: None,
             local: None,
             listen: Some("127.0.0.1:0".parse().unwrap()),
             state_dir: path.to_owned(),
@@ -712,7 +713,7 @@ fn corrupt_identity_fails_closed_without_replacement() {
         "UPDATE local_host_identity SET host_id=printf('%0100000d',0)",
         "DELETE FROM local_host_identity",
         "DROP TABLE local_host_identity",
-        "PRAGMA user_version=4",
+        "PRAGMA user_version=5",
         "PRAGMA user_version=0",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(1,NULL)",
         "DROP TABLE local_host_identity; CREATE TABLE local_host_identity(singleton,host_id); INSERT INTO local_host_identity VALUES(2,printf('%064d',0))",

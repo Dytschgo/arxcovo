@@ -14,6 +14,8 @@ use subtle::ConstantTimeEq;
 pub struct Config {
     #[serde(skip)]
     pub execution: Option<std::sync::Arc<crate::development::Execution>>,
+    #[serde(rename = "execution")]
+    pub execution_settings: Option<crate::development::WindowsSettings>,
     pub development_execution: Option<crate::development::Settings>,
     pub listen: Option<SocketAddr>,
     pub state_dir: PathBuf,
@@ -41,22 +43,43 @@ impl Config {
         let mut value: Self =
             serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
         value.validate()?;
+        if let Some(execution) = &value.execution_settings {
+            execution.disjoint(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("invalid configuration"))?,
+            )?;
+        }
         if let Some(dev) = &value.development_execution {
             dev.disjoint(
                 path.parent()
                     .ok_or_else(|| anyhow::anyhow!("invalid configuration"))?,
             )?;
         }
-        value.execution = value
-            .development_execution
-            .clone()
-            .map(crate::development::Execution::new)
-            .transpose()?;
+        value.execution = if let Some(settings) = value.execution_settings.clone() {
+            Some(crate::development::Execution::from_windows(settings)?)
+        } else {
+            value
+                .development_execution
+                .clone()
+                .map(crate::development::Execution::new)
+                .transpose()?
+        };
         Ok(value)
     }
-    /// Development execution is Windows-only, never with HTTP, and its workspace
+    /// Foreground execution is Windows-only, never with HTTP, and its workspace
     /// is disjoint from private state. Config::load also checks the config dir.
     pub fn validate_development(&self) -> Result<()> {
+        if let Some(execution) = &self.execution_settings {
+            if self.development_execution.is_some()
+                || !cfg!(windows)
+                || self.listen.is_some()
+                || self.local.is_none()
+            {
+                bail!("invalid execution configuration");
+            }
+            execution.validate()?;
+            execution.disjoint(&self.state_dir)?;
+        }
         if let Some(dev) = &self.development_execution {
             if !cfg!(windows) || self.listen.is_some() {
                 bail!("invalid development configuration");

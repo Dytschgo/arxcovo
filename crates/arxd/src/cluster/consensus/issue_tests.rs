@@ -19,6 +19,11 @@ impl SignerClock for Clock {
         self.0.load(Ordering::SeqCst)
     }
 }
+impl super::super::checked_clock::CheckedClock for Clock {
+    fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+        Ok(SignerClock::now_ms(self))
+    }
+}
 fn csr() -> Vec<u8> {
     CertificateParams::default()
         .serialize_request(&KeyPair::generate().unwrap())
@@ -55,6 +60,23 @@ async fn entered(wait: oneshot::Receiver<()>) {
         .unwrap();
 }
 fn assert_send<T: Send>(_: T) {}
+
+struct FailingClock {
+    calls: AtomicU64,
+    fail_at: u64,
+    error: ClockError,
+    now: u64,
+}
+impl CheckedClock for FailingClock {
+    fn sample_ms(&self) -> Result<u64, ClockError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+            Err(self.error)
+        } else {
+            Ok(self.now)
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     target_os = "windows",
@@ -421,6 +443,106 @@ async fn i6_actual_post_wait_clock() {
                 ca.signs.load(Ordering::SeqCst),
                 usize::from(case == 1 || case == 2 || case == 5)
             );
+        }
+        // Checked failures at proposal, pre-sign, and pre-release boundaries.
+        // Keep this matrix in the existing engine fixture/quarantine and budget.
+        // Synthetic time advances beyond the original six cases' high water.
+        for (case, (fail_at, error)) in (1..=3)
+            .flat_map(|stage| {
+                [
+                    ClockError::Unavailable,
+                    ClockError::InvalidTime,
+                    ClockError::Anomaly,
+                    ClockError::Behind,
+                    ClockError::Rollback,
+                ]
+                .map(|error| (stage, error))
+            })
+            .enumerate()
+        {
+            let base = NOW + 12_000_000 + case as u64 * 2_000_000;
+            let code = code(180 + case as u8);
+            c.write(mint(&code, 180 + case as u8, base)).await;
+            let ca = ClusterCa::ephemeral([1; 16], base);
+            let clock = FailingClock {
+                calls: AtomicU64::new(0),
+                fail_at,
+                error,
+                now: base,
+            };
+            let der = csr();
+            let n = c.node(l);
+            let before = n
+                .raft
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow_watched()
+                .last_log_index;
+            let result = n.enroll(&ca, &clock, input(&code, 2), &der).await;
+            let expected = if error == ClockError::Rollback {
+                IssueError::ClockRollback
+            } else {
+                IssueError::Unavailable
+            };
+            assert_eq!(
+                result.err(),
+                Some(expected),
+                "no credential may be released"
+            );
+            assert_eq!(
+                expected.joiner_reply(),
+                if error == ClockError::Rollback {
+                    JoinerReply::Rejected
+                } else {
+                    JoinerReply::RetryLater
+                }
+            );
+            assert_eq!(clock.calls.load(Ordering::SeqCst), fail_at);
+            assert_eq!(ca.signs.load(Ordering::SeqCst), usize::from(fail_at == 3));
+            assert_eq!(n.issue_permits.available_permits(), MAX_ISSUING);
+            if fail_at == 1 {
+                assert_eq!(
+                    before,
+                    n.raft
+                        .as_ref()
+                        .unwrap()
+                        .metrics()
+                        .borrow_watched()
+                        .last_log_index,
+                    "clock refusal must precede proposal"
+                );
+            }
+            let response = n
+                .propose_response(Command::redeem(
+                    code.cluster(),
+                    [2; 16],
+                    code.code_id(),
+                    &code.proof(),
+                    ProvenCsr::parse(&der).unwrap().digest(),
+                    code.anchor(),
+                    base,
+                ))
+                .await
+                .unwrap();
+            let Some(Outcome::Enrolled(grant)) = response.data.0 else {
+                panic!("clock refusal must leave a redeemable code or consumed replay");
+            };
+            assert_eq!(grant.replay(), fail_at > 1);
+            // Release only this case's synthetic member so later cases test
+            // clock refusal rather than the unchanged registry capacity.
+            let removed = n
+                .propose_response(Command::Remove {
+                    cluster: code.cluster(),
+                    node: grant.node(),
+                    proposed_at_ms: base,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                removed.data.0,
+                Some(Outcome::Removed { replay: false })
+            ));
         }
         c.finish().await;
     })

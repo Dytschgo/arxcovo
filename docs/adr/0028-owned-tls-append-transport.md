@@ -85,5 +85,3 @@ builds, tests, controls or acceptance runs were made for this decision. Existing
 Sol 3/3 exhausted and historical Opus 0/2 counters and stop rules remain intact.
 M2 remains OPEN, M3 UNCHECKED, and real multi-host paths are **unverified on real
 hardware**. Independent source review and implementation evidence remain required.
-
-
