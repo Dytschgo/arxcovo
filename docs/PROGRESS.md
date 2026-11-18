@@ -3626,3 +3626,7 @@ Astra6.2/high review76fab91b: required founder refusal branches remain unknown; 
 ### Ubuntu diagnostic contract review - 2026-11-18
 
 Sol6.1/high brief f26c0825 retainedb10ac552 specifies actualrefusal tags, fixedworkeredges and primary-error cleanup before originalassertions. Root flaggedprocfs trust/overlap feasibility before sourceauthorization. Independent Astra6.2/high contractreview is running, tasked to keep the diagnostic minimal and resolve scope/trust gaps. No source/build/runtime/network changes; PR176held, Cinvalid/Tunrun, counters unchanged, hardware **unverified on real hardware**.
+
+### Corrected Ubuntu diagnostic implementation grant - 2026-11-18
+
+Root applied all four Astra2be92556 contract corrections asbbe9a443: immutableguardlane, missingRaftcallerreason, returned-Err-onlycleanup, no procfs/host/processreader. Sol6.1/high localimplementation active under explicitcompilebudget: oneClippy+oneoptionalmechanicalbatch/recheck, onefocusedpure-recorder invocation, no localengine/failingcase/mutation/runrepeat. ExactdiffAstrareview beforepublication, no push/CIgrantyet. Caps/clock/drop/primaryerror requirements retained. PR176held; countersunchanged,M2openM3unchecked,hardware **unverified on real hardware**.
