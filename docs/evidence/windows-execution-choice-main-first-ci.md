@@ -31,3 +31,31 @@ native observations were repeated. Windows/full matrix and resulting-main health
 remain pending. Owner launcher and actual Claude Code acceptance remain UNRUN.
 M2 OPEN / M3 UNCHECKED, full v1 incomplete. Prior engine/founder exhausted holds
 and PR182 HOLD/NOFIX remain unchanged.
+
+## Terminal first-attempt result
+
+Exact same run44351538977 attempt1 completed SUCCESS,641s workflow wall.
+Policy's existing charged-v1 validator, applied to exact attempt1 run/jobs,
+reports639s charged,2s validated idle-queue credit,longest job636s. No policy
+calculation changed. Main history records this actual result; earlier entries
+and prior failures stay intact.
+
+Windows134968209866 SUCCESS636s:694RustPASS/36skip,171.767s test body,
+48NodePASS plus UI unit/browser/Electron smokePASS. Every selected Rust case
+ran; all10activity_v2 cases and corrected inventory case passed. Windows log
+249809bytes SHA256
+`d750649e1f6861dd5f4f00ac01ffe59b8c64955dc3f5a7489011a6e8685893da`,
+exit0/no truncation. All three bounded logs and terminal distinct case lists
+retained under the same D: root.
+
+Optional Windows sample outcome=skipped_budget,nextest=none; no sample case,
+stability,re-enable or repair credit. The previous PR sample4PASS/4FAIL remains
+separate. No runtime/founder/timeout/quarantine/capacity adjustment, rerun or
+dispatch. This proves exact-main health under existing required policy, not
+full M2/native/VM/container acceptance.
+
+Coordinator started work/v1-current-user-acceptance from this verified main and
+carried only the three applicable unpublished docs checkpoints. Old branch and
+all original checkpoint commits remain preserved; no merged Rust was duplicated.
+No docs-only diagnostic PR/push. Owner backend entrypoint remains prepared/UNRUN;
+actual Claude Code and other milestone acceptance are still missing.
