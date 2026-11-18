@@ -2,19 +2,19 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN, budget satisfied:** exact `10aa891f27906e0c73e48396c5c812cab7d4523a`
-after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
-629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
-ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
-the root pure measurement of retained attempt1/job data confirms charged-v1.
-Owner's pinned budget-only bootstrap is consumed. Original strict five checks,
-app bindings and all other protection fences were restored and read back.
-Merge tree equals reviewed head22a09eae. Later hourly recovery slots are no-ops.
-Prior main3022d601's failed905s first attempt remains uncredited and historical.
-Normal feature preparation can resume; every PR still needs independent review,
-all five gates, fresh exact-main green and its applicable Windows timing limit.
-M2 open/M3 unchecked; Windows fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**.
+**Current main RED:** exact `09134085dce93742d8812821dbe11834dcee7a9c`
+after docs-only PR175. First-attempt CI44198128467 failed Windows nextest:
+found_tests::f6_adapters at319 and f8_store_privacy at449 unwrapped Unavailable;
+f7_clock_guard_order at434 did not return expected ClockRollback. These required
+single-node founder tests are outside the existing three-node fixture quarantine.
+Ubuntu/macOS passed. No cause, rerun, fix, waiver or new quarantine claimed.
+Feature publication and merges are held. Fresh independent Sol diagnosis is
+assigned; exhausted Sol3/3 and historical Opus0/2 counters remain unchanged.
+PR176's previous source review passed but public status was withheld on main
+drift; its docs-only parent refresh remains local and unpushed.
+Historical policy activation main10aa891f passed632s wall/629s charged,
+ADR0025 active, original five protection checks restored; the exception is consumed.
+M2 open/M3 unchecked; hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -3563,3 +3563,23 @@ Root Sol coordinator executed independently reviewed executor SHA2562b2866045120
 ### First active queue-policy main verified - 2026-11-17
 
 Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f attempt1 passed; charged-v1 measurement632s wall/629s charged/3s credit applied. Automatic trusted policy44179754154 completed success. All original protection fences remain restored. No further retry, waiver or feature merge occurred. Owned-query refresh and retained-identity prerequisite can resume normal preparation.
+
+### PR175 first-main founder red - 2026-11-18
+
+Root actively awaited CI44198128467, exit1. Required Windows F6/F7/F8 founder tests failed; no infrastructure retry applies. Raw failure log retained D:/Temp/arx-pr175-main/failed.log, SHA256 50706e4fd294eaf4552c0f8d4165b7a93895f1a9db5a2f52cecca2b2865319ff. Fresh independent Sol6.1 high diagnosis requested; no fix credit, quarantine or retry. PR176 publication/merge held.
+
+### Founder red local control disposition - 2026-11-18
+
+Fresh independent Sol6.1 high disposition20870818: one sequential exact-source F6/F7/F8 control passed in0.405s test time; hosted failure not reproduced and cause unproven. No source fix, probe, repeated test or quarantine. Logs/hashes/process cleanup retained. Root is preparing a reviewable bounded single-F6 observation patch before authorizing any probe execution. Main09134085 remains RED; PR176 held; Sol3/3 and historical Opus0/2 unchanged. M2 open/M3 unchecked, hardware **unverified on real hardware**.
+
+### Single F6 diagnostic grant - 2026-11-18
+
+Root accepted prepared patch206e4610 and independent Sol6.1 high safetyPASSb6a28f1a; authorized one compilation plus one exact natural F6 invocation under the preregistered plan. No repeats, injection, mechanical repair, budget/assertion/ownership change or hosted action. Execution task is active and completion tracked; temporary source must restore exactly after any outcome. This is diagnosis only, no exhausted fix attempt reset. Main09134085 remains RED; PR176 held; M2 open/M3 unchecked and hardware **unverified on real hardware**.
+
+### Hosted founder observation candidate - 2026-11-18
+
+Root Sol coordinator retained Sol6.1/high one-F6 result25aad48a: complete14-event trace, all phases Ok, final35.415ms, local source restored; hosted red unreproduced. Root prepared the same reviewed probe as a test-only hosted diagnostic candidate and ran cargo fmt only. Production macro expansions remain identity expressions. No test budget, assertion, retry, clock call, permit or owner behavior is changed. Independent actual-source review precedes one normal PR CI observation; no merge onto red main is authorized. This is no fix or stability credit. Main09134085 RED; PR176 held, counters unchanged; hardware **unverified on real hardware**.
+
+### Diagnostic CI static guard rejection - 2026-11-18
+
+PR177 head3c2d04c3 CI44203071298 failed the same issuance-scope guard on all OS before Rust checks or F6. No hosted phase observation occurred. Guard correctly rejects cfg(not(test)); root replaced split macro definitions with one definition per macro, using cfg(test) only on observation statements. Guard remains unchanged and passes7/7; fmt/diff checks passed. Non-test expansion now uses a single-evaluation let/result block rather than literal expression tokens; independent review of lifetime/drop equivalence is required before any push. No tests rerun, no fix/stability credit; main09134085 RED and PR176 held. Raw failurelog SHA256 afc8c19955785b9457f04c2fc3096e8f24127ef5a6efefc5b63e3d14657644f9.
