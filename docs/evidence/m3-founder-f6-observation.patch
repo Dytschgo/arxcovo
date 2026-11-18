@@ -1,0 +1,208 @@
+--- a/crates/arxd/src/cluster/consensus/found.rs
++++ b/crates/arxd/src/cluster/consensus/found.rs
+@@ -92,6 +92,127 @@
+         _ => FoundError::Unavailable,
+     }
+ }
++// Temporary F6 observation: production expansions are expression identities.
++#[cfg(not(test))]
++macro_rules! found_phase {
++    ($deadline:expr, $phase:literal, $work:expr) => { $work };
++}
++#[cfg(test)]
++macro_rules! found_phase {
++    ($deadline:expr, $phase:literal, $work:expr) => {{
++        observation::enter($deadline, $phase);
++        let result = $work;
++        observation::exit($deadline, $phase, &result);
++        result
++    }};
++}
++#[cfg(not(test))]
++macro_rules! found_final {
++    ($deadline:expr, $work:expr) => { $work };
++}
++#[cfg(test)]
++macro_rules! found_final {
++    ($deadline:expr, $work:expr) => {{
++        observation::deadline_entry($deadline);
++        let result = $work;
++        observation::deadline_exit($deadline, &result);
++        result
++    }};
++}
++#[cfg(test)]
++mod observation {
++    use super::{FoundError, ISSUE_BUDGET, Instant};
++    use std::cell::RefCell;
++
++    const CAP: usize = 24;
++    #[derive(Clone, Copy)]
++    struct Event {
++        elapsed_us: u128,
++        remaining_us: u128,
++        phase: &'static str,
++        edge: &'static str,
++        result: &'static str,
++        pending: Option<&'static str>,
++    }
++    struct Buffer {
++        events: [Option<Event>; CAP],
++        len: usize,
++        overflow: bool,
++        pending: Option<&'static str>,
++    }
++    tokio::task_local! {
++        static CAPTURE: RefCell<Buffer>;
++    }
++    fn variant<T>(r: &Result<T, FoundError>) -> &'static str {
++        match r {
++            Ok(_) => "Ok",
++            Err(FoundError::Busy) => "Busy",
++            Err(FoundError::Unavailable) => "Unavailable",
++            Err(FoundError::NotFounder) => "NotFounder",
++            Err(FoundError::AlreadyInitialized) => "AlreadyInitialized",
++            Err(FoundError::FounderAllocation) => "FounderAllocation",
++            Err(FoundError::Rng) => "Rng",
++            Err(FoundError::BadCsr(_)) => "BadCsr",
++            Err(FoundError::Rejected(_)) => "Rejected",
++            Err(FoundError::WrongNode) => "WrongNode",
++            Err(FoundError::StaleIssuer) => "StaleIssuer",
++            Err(FoundError::Revoked) => "Revoked",
++            Err(FoundError::ClockRollback) => "ClockRollback",
++            Err(FoundError::CaExpiring) => "CaExpiring",
++            Err(FoundError::Sign) => "Sign",
++        }
++    }
++    fn record(deadline: Instant, phase: &'static str, edge: &'static str,
++              result: &'static str) {
++        let _ = CAPTURE.try_with(|cell| {
++            let mut b = cell.borrow_mut();
++            if phase != "finaldeadline" && edge == "enter" { b.pending = Some(phase); }
++            if phase != "finaldeadline" && edge == "exit" { b.pending = None; }
++            let now = Instant::now();
++            let event = Event {
++                elapsed_us: now.saturating_duration_since(deadline - ISSUE_BUDGET).as_micros(),
++                remaining_us: deadline.saturating_duration_since(now).as_micros(),
++                phase, edge, result, pending: b.pending,
++            };
++            let i = b.len;
++            if i < CAP { b.events[i] = Some(event); b.len += 1; }
++            else { b.overflow = true; }
++        });
++    }
++    pub(super) fn enter(d: Instant, p: &'static str) { record(d, p, "enter", "Pending"); }
++    pub(super) fn exit<T>(d: Instant, p: &'static str, r: &Result<T, FoundError>) {
++        record(d, p, "exit", variant(r));
++    }
++    pub(super) fn deadline_entry(d: Instant) {
++        record(d, "finaldeadline", "enter", "Pending");
++    }
++    pub(super) fn deadline_exit<T>(d: Instant, r: &Result<T, FoundError>) {
++        record(d, "finaldeadline", "exit", variant(r));
++    }
++    // Only F6's first issue is scoped; no spawn, yield, sleep, global lock or node ID.
++    pub(super) async fn capture<T>(work: impl std::future::Future<Output = T>) -> T {
++        let buffer = RefCell::new(Buffer {
++            events: [None; CAP], len: 0, overflow: false, pending: None,
++        });
++        CAPTURE.scope(buffer, async {
++            let result = work.await;
++            // found has returned: its work and issue permit have already dropped.
++            // One bounded emission; never Debug-format the issuance result.
++            CAPTURE.with(|cell| {
++                let b = cell.borrow();
++                let mut text = format!("[DEBUG-F6-OBS] overflow={} count={}", b.overflow, b.len);
++                use std::fmt::Write;
++                for e in b.events[..b.len].iter().flatten() {
++                    let _ = write!(text, "\nelapsed_us={} remaining_us={} phase={} edge={} result={} pending={}",
++                        e.elapsed_us, e.remaining_us, e.phase, e.edge, e.result,
++                        e.pending.unwrap_or("none"));
++                }
++                eprintln!("{text}");
++            });
++            result
++        }).await
++    }
++}
+ impl ConsensusNode {
+     // Local admission snapshot only; never an authorization read.
+     async fn preflight(&self) -> Result<Pre, FoundError> {
+@@ -187,7 +308,7 @@
+             if self.id != FOUNDER.get() {
+                 return Err(FoundError::NotFounder);
+             }
+-            let pre = self.preflight().await?;
++            let pre = found_phase!(deadline, "preflight", self.preflight().await)?;
+             if pre.founded || pre.applied || pre.membership {
+                 return Err(FoundError::AlreadyInitialized);
+             }
+@@ -199,18 +320,18 @@
+                 return Err(FoundError::CaExpiring);
+             }
+             let raft = self.raft.as_ref().ok_or(FoundError::Unavailable)?;
+-            raft.initialize(BTreeMap::from([(1, addr)]))
++            found_phase!(deadline, "initialize", raft.initialize(BTreeMap::from([(1, addr)]))
+                 .await
+-                .map_err(init_refusal)?;
+-            raft.wait(Some(deadline.saturating_duration_since(Instant::now())))
++                .map_err(init_refusal))?;
++            found_phase!(deadline, "leaderwait", raft.wait(Some(deadline.saturating_duration_since(Instant::now())))
+                 .metrics(
+                     |m| m.current_leader == Some(1) && m.state == openraft::ServerState::Leader,
+                     "founder leader",
+                 )
+                 .await
+-                .map_err(|_| FoundError::Unavailable)?;
++                .map_err(|_| FoundError::Unavailable))?;
+             let t0 = clock.now_ms();
+-            let resp = self
++            let resp = found_phase!(deadline, "proposal", self
+                 .propose_response(Command::Found {
+                     cluster: pre.cluster,
+                     members: FoundMembers::new([(FOUNDER, csr.digest())])
+@@ -221,9 +342,9 @@
+                 .map_err(|e| match e {
+                     ProposeError::Busy => FoundError::Busy,
+                     _ => FoundError::Unavailable,
+-                })?;
++                }))?;
+             let ticket = self.committed_founder(resp, pre.cluster, csr.digest())?;
+-            self.founder_guard(&ticket).await?;
++            found_phase!(deadline, "guard1", self.founder_guard(&ticket).await)?;
+             let pre_now = clock.now_ms();
+             if pre_now < t0 {
+                 return Err(FoundError::ClockRollback);
+@@ -232,7 +353,7 @@
+                 IssueError::CaExpiring => FoundError::CaExpiring,
+                 _ => FoundError::Sign,
+             })?;
+-            self.founder_guard(&ticket).await?;
++            found_phase!(deadline, "guard2", self.founder_guard(&ticket).await)?;
+             let post_now = clock.now_ms();
+             if post_now < pre_now {
+                 return Err(FoundError::ClockRollback);
+@@ -247,10 +368,10 @@
+                 },
+             })
+         };
+-        match timeout_at(deadline, work).await {
++        found_final!(deadline, match timeout_at(deadline, work).await {
+             Ok(r) if Instant::now() < deadline => r,
+             _ => Err(FoundError::Unavailable),
+-        }
++        })
+     }
+ }
+ #[cfg(test)]
+--- a/crates/arxd/src/cluster/consensus/found_tests.rs
++++ b/crates/arxd/src/cluster/consensus/found_tests.rs
+@@ -316,7 +316,7 @@
+     let mut n = start(d.path(), 1, 2).await;
+     let (_, csr) = request();
+     let ca = ClusterCa::ephemeral([1; 16], NOW);
+-    issue(&n, &ca, &csr).await.unwrap();
++    observation::capture(issue(&n, &ca, &csr)).await.unwrap();
+     let key = ProvenCsr::parse(&csr).unwrap().digest();
+     let response = |node, data| openraft::raft::ClientWriteResponse::<Arx> {
+         log_id: LogId::new(

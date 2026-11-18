@@ -2,20 +2,16 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `09134085dce93742d8812821dbe11834dcee7a9c`
-after docs checkpoint PR175; CI44198128467 running. Historical policy activation main:
-after PR163. First-attempt CI44177880021 passed all three OS jobs:632s wall,
-629s charged,3s verified idle queue credit; Windows628s/macOS435s/Ubuntu286s.
-ADR0025 is active on trusted main. Automatic policy run44179754154 succeeded;
-the root pure measurement of retained attempt1/job data confirms charged-v1.
-Owner's pinned budget-only bootstrap is consumed. Original strict five checks,
-app bindings and all other protection fences were restored and read back.
-Merge tree equals reviewed head22a09eae. Later hourly recovery slots are no-ops.
-Prior main3022d601's failed905s first attempt remains uncredited and historical.
-Normal feature preparation can resume; every PR still needs independent review,
-all five gates, fresh exact-main green and its applicable Windows timing limit.
-M2 open/M3 unchecked; Windows fixture28 remains unverified on hosted Windows and
-**unverified on real hardware**.
+**Current main GREEN:** exact `05b9c82930cd3812614fc20f5d03d0a5fa05952a`
+after owner-approved diagnostic PR177. CI44212212325 attempt1 succeeded:
+608s wall,605s charged,3s verified idle queue credit; Windows604s,
+Ubuntu343s/macOS425s. Founder13 passed on all OS. Automatic trusted policy
+44213556680 succeeded. The previous main09134085 F6/F7/F8 red remains
+unreproduced and unfixed; passing output hides the diagnostic trace.
+The diagnostic red-main exception is consumed; protection is unchanged.
+Normal M3 preparation may resume with fresh review, five gates and feature
+Windows<=660s still required. M2 open/M3 unchecked; Windows fixture28 and
+hardware paths remain **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
 wall, Windows604s, Ubuntu241s, macOS292s; all92 tracked cases on every OS and
@@ -42,11 +38,11 @@ PR145 was merged after the first red main run without accounting for it; the coo
 **Before every merge:** read the latest CI run for the live main SHA as well as the PR's five required gates. It must have completed successfully on that exact main SHA; a red, pending, cancelled or missing main run blocks the merge. Re-read main immediately before merge. `ci-time-budget` checks elapsed duration only and is not a substitute for this health check. Record the checked main run and verdict in the merge checkpoint. No bypass or stacked merge onto red main. If main turns red while its repair is prepared, the merge remains blocked; any exception requires explicit owner steering recorded before use, and no rerun is performed solely to manufacture green evidence.
 
 
-## Current state - 2026-11-17
+## Current state - 2026-11-18
 
-- Last merged: PR175 as09134085, reviewed head4a9a592b; all five gates passed. New exact-main CI44198128467 pending; prior10aa891f green632s wall/629s charged.
-- Current work: owned anchor-query kernel is integrated onto active-policy main; source and integration reviews passed. Hosted first-run engine proof, exact-head review and all five gates remain required. PR175 publishes the separately reviewed activation checkpoint.
-- Blockers: no current CI budget deadlock. Production joining still needs public dispatch, discovery, owner/removal authorization, custody/control identity and clock contracts. Windows fixture28 remains unverified; M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged.
+- Last merged: PR177 as05b9c829 from reviewed1c7c9f52 under the explicit owner diagnostic exception; protection unchanged. First-main CI44212212325 green608wall/605charged; founder13 allOS.
+- Current work: PR176 owned anchor query refreshed onto green diagnostic main. Reviewed five feature files remain unchanged; fresh exact-head review and all hosted gates, including new query engine proof and Windows<=660s, remain required. Identity and membership-observation contracts are independently reviewed and local.
+- Blockers: no current red-main hold; prior founder failures remain unexplained, not fixed. Production join still needs admission, authenticated transport/discovery, owner/removal authority, custody and clock contracts. M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged; hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3565,10 +3561,34 @@ Root Sol coordinator executed independently reviewed executor SHA2562b2866045120
 
 Root Sol coordinator actively awaited CI44177880021 to exit0. Exact main10aa891f attempt1 passed; charged-v1 measurement632s wall/629s charged/3s credit applied. Automatic trusted policy44179754154 completed success. All original protection fences remain restored. No further retry, waiver or feature merge occurred. Owned-query refresh and retained-identity prerequisite can resume normal preparation.
 
-### Owned anchor query publication preparation - 2026-11-18
+### PR175 first-main founder red - 2026-11-18
 
-Sol6.1/high sourcef9d0a413 and integration2c599ffd reviewed independently (89efaaf5,3ca94b38). Five feature files remain byte-identical; fmt/guard8/sampler60 and final diff/UTF8 checks passed. Earlier26selected Rust cases and two compiled mutation kills are reused with exact-restoration qualifications. The new single-voter engine test remains hosted-first on all OS; Windows verify<=660s, all five gates and fresh green main required. Identity-retention design remains separately local and is excluded from this PR. M2 open/M3 unchecked, counters unchanged, hardware **unverified on real hardware**.
+Root actively awaited CI44198128467, exit1. Required Windows F6/F7/F8 founder tests failed; no infrastructure retry applies. Raw failure log retained D:/Temp/arx-pr175-main/failed.log, SHA256 50706e4fd294eaf4552c0f8d4165b7a93895f1a9db5a2f52cecca2b2865319ff. Fresh independent Sol6.1 high diagnosis requested; no fix credit, quarantine or retry. PR176 publication/merge held.
 
-### Query publication parent refresh - 2026-11-18
+### Founder red local control disposition - 2026-11-18
 
-PR175 merged while PR176 review ran. Reviewer found no source blockers but withheld public writes on main drift. Refreshed locally onto09134085 with PROGRESS conflict retaining query checkpoint and current main-pending status. Source remains reviewedf9d0a413; new exact-main CI44198128467 must pass before push, then a fresh exact-head review is required.
+Fresh independent Sol6.1 high disposition20870818: one sequential exact-source F6/F7/F8 control passed in0.405s test time; hosted failure not reproduced and cause unproven. No source fix, probe, repeated test or quarantine. Logs/hashes/process cleanup retained. Root is preparing a reviewable bounded single-F6 observation patch before authorizing any probe execution. Main09134085 remains RED; PR176 held; Sol3/3 and historical Opus0/2 unchanged. M2 open/M3 unchecked, hardware **unverified on real hardware**.
+
+### Single F6 diagnostic grant - 2026-11-18
+
+Root accepted prepared patch206e4610 and independent Sol6.1 high safetyPASSb6a28f1a; authorized one compilation plus one exact natural F6 invocation under the preregistered plan. No repeats, injection, mechanical repair, budget/assertion/ownership change or hosted action. Execution task is active and completion tracked; temporary source must restore exactly after any outcome. This is diagnosis only, no exhausted fix attempt reset. Main09134085 remains RED; PR176 held; M2 open/M3 unchecked and hardware **unverified on real hardware**.
+
+### Hosted founder observation candidate - 2026-11-18
+
+Root Sol coordinator retained Sol6.1/high one-F6 result25aad48a: complete14-event trace, all phases Ok, final35.415ms, local source restored; hosted red unreproduced. Root prepared the same reviewed probe as a test-only hosted diagnostic candidate and ran cargo fmt only. Production macro expansions remain identity expressions. No test budget, assertion, retry, clock call, permit or owner behavior is changed. Independent actual-source review precedes one normal PR CI observation; no merge onto red main is authorized. This is no fix or stability credit. Main09134085 RED; PR176 held, counters unchanged; hardware **unverified on real hardware**.
+
+### Diagnostic CI static guard rejection - 2026-11-18
+
+PR177 head3c2d04c3 CI44203071298 failed the same issuance-scope guard on all OS before Rust checks or F6. No hosted phase observation occurred. Guard correctly rejects cfg(not(test)); root replaced split macro definitions with one definition per macro, using cfg(test) only on observation statements. Guard remains unchanged and passes7/7; fmt/diff checks passed. Non-test expansion now uses a single-evaluation let/result block rather than literal expression tokens; independent review of lifetime/drop equivalence is required before any push. No tests rerun, no fix/stability credit; main09134085 RED and PR176 held. Raw failurelog SHA256 afc8c19955785b9457f04c2fc3096e8f24127ef5a6efefc5b63e3d14657644f9.
+
+### Owner-approved PR177 diagnostic merge - 2026-11-18
+
+Owner statement: Approve PR177 diagnostic merge. Root pinned head1c7c9f52/main09134085 and all five green gates, then merged05b9c829 through normal protection. No protection API writes; full before/after protection equality and reviewed tree equality passed. Authorization and raw readback retained D:/Temp/arx-pr177-approved-merge. Active main wait CI44212212325; no source fix, retry or feature merge authorized. Earlier approval-pending text is historical; this exception is consumed and not reusable.
+
+### First diagnostic-main CI verified - 2026-11-18
+
+Root actively awaited CI44212212325 to exit0, retained full three-platform logs and parsed founder13PASS eachOS. Pure charged-v1 calculation608wall/605charged/3credit; automaticpolicy44213556680success. Protection remained unchanged; no sourcefix/stabilitycredit or further exception. Main-red hold cleared for normal PR176 refresh. Evidence D:/Temp/arx-pr177-approved-merge/main-success.json and measurement.json.
+
+### PR176 refresh after approved diagnostic merge - 2026-11-18
+
+Root integrated main05b9c829 after exact CI44212212325 success. Five query feature files remain byte-identical reviewedf9d0a413. Parent changes add reviewed diagnostic test instrumentation only outside the feature diff. Fresh guard8 and fmt/diff checks required before push; previous26selected cases/Clippy/mutants retained with restoration qualifications. Hosted query engine case remains first-run evidence, not locally exercised. Exact-head review, all five gates and featureWindows<=660s required.

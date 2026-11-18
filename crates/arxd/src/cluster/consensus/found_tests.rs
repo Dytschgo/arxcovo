@@ -316,7 +316,7 @@ bounded!(f6_adapters, async {
     let mut n = start(d.path(), 1, 2).await;
     let (_, csr) = request();
     let ca = ClusterCa::ephemeral([1; 16], NOW);
-    issue(&n, &ca, &csr).await.unwrap();
+    observation::capture(issue(&n, &ca, &csr)).await.unwrap();
     let key = ProvenCsr::parse(&csr).unwrap().digest();
     let response = |node, data| openraft::raft::ClientWriteResponse::<Arx> {
         log_id: LogId::new(
