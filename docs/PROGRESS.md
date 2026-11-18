@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR180 as8b36405e932ef2921a3c8d71dbaf7ed001314de7 from reviewed548a22ff. Allfive gatesSUCCESS; CI44284448547 attempt1GREEN528s, Windows512s. Codec8andNode48eachOSPASS; optionalWindows8allpass with no stabilitycredit. Premerge main6bf8f46/CI44276313116GREEN checked immediately.
-- Current work: exact-main CI44286225997 attempt1GREEN689s verified. Continue toward owner-testablev1: nonblocking registry callback, then realtransport/genuinejoin/containeracceptance. Callback needs boundedbrief/ADR/independentreview before source.
+- Current work: exact-main CI44286225997 attempt1GREEN689s verified. Continue toward owner-testablev1: callbackPR181 published8e5091b9, independentreviewPASS, CI44290836331 running. Local4/4 and2meaningfulcontrols/exactrestore complete. Next realTLS/TCP ownedtransport design prepared; genuinejoin/containeracceptance stillneeded.
 - Blockers: M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4074,3 +4074,25 @@ Zeroexecution harnesssetupmetadata issue retained, no semanticrun repeated.
 No postrestore runtime rerun; retainedM2binary, hostedcompiles reviewedbaseline.
 Ready sourcePR for try-lockcallback, no fullTLS/network/container/SQLhealthclaim.
 M2OPEN/M3UNCHECKED,countersunchanged, no ownerPCnative/admin operation.
+
+## PR181 callback published; real TLS next
+
+Coordinator Sol6.1/high published exact8e5091b9796ec8b4b2fb1f1d813007dae9d246b6,
+[PR181](https://github.com/Dytschgo/arxcovo/pull/181), basegreenmain8b36405.
+Independent sourceSol review6976624630/agent-reviewSUCCESS afterexactrestore/
+docsretentionidentity verification. Local4PASS+2intendedcontrolkills; hosted
+[CI44290836331](https://github.com/Dytschgo/arxcovo/actions/runs/44290836331)
+normalfirstattempt running. Allfive/new4eachOS/Windows<=660s/freshgreenmain before
+coordinator merge; then resultingmain ownfirstCI. No postrestore runtime rerun.
+
+Existinggoal remains firstviableowner-testableversion, notcomplete. Next actual
+realTLS/TCP Appendtransport proposal retainedD:/Temp/arx-owned-tls-design.md with
+primarysources and verifiedhalfclose lifecycle (stilluntested), followed bycomplete
+Vote/PreVote/snapshot and genuinejoin/containerproof. No source/dependency/capacity/
+newinboundpolicy accepted until nextlivecontract/ADR+independentreview. TLSowner
+mustretainstorethroughcallbacks, drain/releasebeforeunchangednode.shutdown to
+avoidreleaseproofcycle. M2OPEN/M3UNCHECKED, Sol3/3exhausted/Opus0/2unchanged;
+no enginefix/timeout/quarantine change. OwnerPCnativeaccount/caps/reserves pending,
+LinuxA7/A11sudoNNP/A12pending; no native/admin/LabManager/VM/container action.
+Existingbabysitter untouched; priorbranches/docs preserved. Pendingcheckpoint local
+only, notpushed to manufactureanotherCI. Goalnotmarkedcomplete.
