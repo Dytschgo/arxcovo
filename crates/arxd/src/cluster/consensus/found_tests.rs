@@ -13,6 +13,11 @@ impl SignerClock for Clock {
         NOW
     }
 }
+impl super::super::checked_clock::CheckedClock for Clock {
+    fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+        Ok(SignerClock::now_ms(self))
+    }
+}
 fn request() -> (KeyPair, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
     let der = CertificateParams::default()

@@ -25,6 +25,11 @@ impl SignerClock for Clock {
         1_000_000
     }
 }
+impl super::checked_clock::CheckedClock for Clock {
+    fn sample_ms(&self) -> Result<u64, super::checked_clock::ClockError> {
+        Ok(SignerClock::now_ms(self))
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn anchored_preproof_single_voter() {

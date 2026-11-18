@@ -20,6 +20,11 @@ impl SignerClock for Clock {
         pki::NOW
     }
 }
+impl super::super::checked_clock::CheckedClock for Clock {
+    fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+        Ok(SignerClock::now_ms(self))
+    }
+}
 async fn enroll(c: &mut Cluster, ca: &ClusterCa, key: &KeyPair, marker: u8) -> IssuedLeaf {
     let code = code(marker);
     c.extra_markers.push(key.serialize_der());

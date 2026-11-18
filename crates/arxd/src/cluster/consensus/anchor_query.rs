@@ -23,7 +23,7 @@ impl ConsensusNode {
     pub(in crate::cluster) async fn anchor_query(
         &self,
         query: &[u8],
-        clock: &dyn issue::SignerClock,
+        clock: &dyn checked_clock::CheckedClock,
     ) -> Result<Vec<u8>, AnchorQueryError> {
         let deadline = Instant::now() + READ_BUDGET;
         if query.len() != 32 {
@@ -33,7 +33,9 @@ impl ConsensusNode {
         let mut code: CodeId = [0; 16];
         cluster.copy_from_slice(&query[..16]);
         code.copy_from_slice(&query[16..]);
-        let now_ms = clock.now_ms();
+        let now_ms = clock
+            .sample_ms()
+            .map_err(|_| AnchorQueryError::Unavailable)?;
         let issue_unit = self
             .issue_permits
             .clone()

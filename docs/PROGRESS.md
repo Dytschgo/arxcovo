@@ -2,7 +2,9 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exactcd8907500dcd89fddc0c659590f962cbf03c7ed5, CI44304025778 attempt1 SUCCESS626wall/624charged/2queuecredit; Windows622s, Ubuntu236s, macOS439s. Registry4/Node48 eachOS PASS; optional Windows sample budget-skipped, no cases. **Previous verified main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 after PR183. First push CI44351538977 attempt1 SUCCESS641wall/639charged/2validatedqueuecredit; Windows636s,Ubuntu348s,macOS368s. Rust694/680/648PASS and48Node/UI/browser/ElectronPASS eachOS. Optional Windows sample budget-skipped, no sample credit. Full M2/v1 acceptance remains incomplete.
+
+**Previous verified main GREEN:** exactcd8907500dcd89fddc0c659590f962cbf03c7ed5, CI44304025778 attempt1 SUCCESS626wall/624charged/2queuecredit; Windows622s, Ubuntu236s, macOS439s. Registry4/Node48 eachOS PASS; optional Windows sample budget-skipped, no cases. **Previous verified main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,8 +41,12 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
-- Current work: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
+- Current feature PR184: checked enrollment clock; head1cd91ef6 first CI44368904104 attempt1 failed Ubuntu22s/Windows52s at the mandatory test inventory guard, before Rust validation; macOS queued at the recorded read. Independent Sol6.1/high Standards PASS / Spec P1 missing new anchor inventory, no success attestation. Mechanical inventory correction locally9/9PASS, Rust unchanged; corrected-head independent recheck and normal required CI pending. No merge or acceptance yet.
+- Last merged: PR183 as08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 from reviewed29a3317f. All5gates SUCCESS; first PR CI44349045277 GREEN594s wall, Windows589s<=660, Ubuntu291s/macOS464s. Fresh exactmaincd890750/CI44304025778 SUCCESS checked immediately before guarded merge. Resulting exact-main firstCI44351538977 GREEN641s wall/639charged/2queuecredit.
+- Previous merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
+- Current owner-preview delivery: PR183 MERGED and exact-main first CI GREEN. Private D: backend package is prepared/syntax-audited with the reviewed binary; launcher and actual Claude Code acceptance remain UNRUN. This is a backend preview, not completed M2 or fullv1.
+- Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
+- Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4787,3 +4793,299 @@ normal binary/runtime, engine/native or policy change. No former-predicate
 mutation or broad suite was run. D evidence at arx-pr183-golden-correction.
 Fresh exact-head independent review and all normal hosted gates remain needed;
 stop on a new failure for disposition. Historical counters unchanged.
+
+Published actual test-only correction at
+`29a3317f4fa2e7b12783b4906053f3f7a6663a89` on existing PR183, with committed
+terminal d30 evidence and independent disposition. Frozen19source/9artifact
+manifest under D:/Temp/arx-pr183-golden-correction. Fresh independent Sol6.1/medium
+exact-head delta review active; normal CI44349045277 attempt1 is in progress at
+that exact head. No manual rerun/dispatch and no cancellation of the completed
+failed observation. Existing PR watch persists. This publication checkpoint
+remains local; no docs-only diagnostic push. Required gates/merge remain pending.
+
+Independent Sol6.1/medium correction review returned SOURCE GO, Standards/Spec
+PASS0material.19source/9artifact pins and actual delta verified; golden/coverage
+findings closed for source. Attestation6984948836 and exact29a agent-review
+success posted after identity rechecks. Report retained at
+D:/Temp/arx-pr183-golden-correction-review/review.md. On that completion event,
+one CI status read found all3jobs running with runners acquired: Windows
+134959286418, Ubuntu134959287041, macOS134959287697. Metadata retained at
+D:/Temp/arx-pr183-29a-first-ci. No hosted pass or merge is inferred. Review
+did not personally run tests; existing runtime/native limits remain.
+
+While these gates run, coordinator Sol6.1/high prepared a complete M3 contract
+candidate at D:/Temp/arx-complete-rpc-closure/contract-v2.md, SHA256
+c921bbae5747b9c7e19292c425fbb6fae24d5ba52b5b2adcacbeeabfcfa69c5d.
+It combines the original unchanged full-RPC contract, a proposed explicit
+test-only listener/sender qualification and the exact returned learner fixture.
+Six input/output identities frozen; current cluster source unchanged from the
+fixture's original bfd source, parameters/store ordering/cached primary pins
+inspected. Pre-return startup failure remains truthfully cleanup-unconfirmed,
+never a hard-wall guarantee or engine repair. Fresh independent Sol6.1/high
+architecture-only closure review active; no source/build/test/runtime/engine/
+network/container action authorized. PR182 HOLD/NOFIX remains a prerequisite;
+M2OPEN/M3UNCHECKED, exhausted counters unchanged. This is unpublished design
+preparation, not another diagnostic PR or acceptance claim.
+
+## Owner package static audit and M3 design closure
+
+Coordinator Sol6.1/high independently rechecked the prepared private D: owner
+backend package without launching it. Binary remains exactf8893673...4b48 from
+reviewed7a production source; later published source29a differs only in tests.
+Private ACL/owner, all package ancestors/no-reparse, D child scratch/workspace,
+synthetic credential/local identity binding, private bridge args and launcher
+syntax pass; state still empty. No credential/owner identity value printed.
+Audit helper's initial PowerShell Split-Path parameter error was corrected;
+neither audit failure started application work. Proof retained at
+D:/Temp/arx-owner-readiness-audit/readiness-audit.json. C free37,323,993,088bytes.
+README updated to current delivery state; original preparation proofs untouched.
+No daemon/native/client model call or credential request. Claude Code acceptance
+still UNRUN; isolated client preflight was unauthenticated. Hosted/main gates
+must clear before actual owner entrypoint testing; this is a backend preview,
+not fullv1 or M2 acceptance.
+
+Fresh independent Sol6.1/high complete M3 candidate review returned Design GO,
+Standards/Spec0material; exact learner-fixture gap closed and both test-only
+construction qualifications explicitly accepted. Six bundle hashes, six Git
+blobs and four cached primary-source hashes verified. Report and identity proof
+at D:/Temp/arx-complete-rpc-closure-review. No source/execution grant follows;
+PR182 HOLD/NOFIX remains the transport prerequisite. M2OPEN/M3UNCHECKED,
+engineSol3/3exhausted/historicalOpus0/2 unchanged.
+
+On that completion event, one exact29aCI44349045277 read found UbuntuSUCCESS291s
+(680RustPASS/22skip,51.365s body), macOSSUCCESS464s (648PASS/8skip,72.620s body),
+Windows still running. Both complete jobs include browser/Electron smoke PASS.
+Bounded D logs retained, exit0/no truncation,8MiB/45s limits; no rerun/dispatch.
+No full matrix, Windows budget, exact-main or merge acceptance is inferred.
+
+Per-case partial proof additionally confirms all10activity_v2 cases and the
+corrected inventory corruption case executed and passed on Ubuntu/macOS, plus
+48Node tests and both smoke paths each. Earlier local ACL failures remain
+unchanged; hosted evidence is platform-specific, not a local setup/backend fix.
+[Reviewed-source checkpoint](evidence/windows-execution-choice-pr183-reviewed-ci.md)
+and D:/Temp/arx-pr183-29a-first-ci/partial-execution-proof.json retain the scope.
+
+## PR183 merged after full green gates; first exact-main CI pending
+
+Coordinator Sol6.1/high retained the final Windows log:694RustPASS/36skip,
+184.200s body;48Node/UI/browser/ElectronPASS. Complete PR matrix GREEN594s wall:
+Windows589s<=660, Ubuntu291s,macOS464s. All10activity_v2 and corrected inventory
+case passed eachOS. Optional sample4PASS/4FAIL, U6owners_left49/owners_waited55,
+truncated1row2362bytes; no stability/re-enable/fix credit. Bounded all3logs,
+hashes/cases/durations retained. Prior failures remain, no rerun/dispatch.
+
+Immediately before merge at16:48:36UTC, live maincd890750 and its own
+CI44304025778 attempt1 SUCCESS reverified, alongside exact29a head/base/CLEAN
+and5green gates. Guarded squash merge succeeded as08c4b999; remote main/merged
+PR verified, crate diff versus reviewed29a empty. PR183 unwatched after merge.
+Local checkpoint0ffafc39/source branch preserved; no unpushed docs discarded.
+[Terminal/merge evidence](evidence/windows-execution-choice-pr183-reviewed-ci.md).
+
+First resulting-main pushCI44351538977 attempt1 running with all runners:
+Windows134968209866,Ubuntu134968210365,macOS134968210476. Metadata onD at
+arx-pr183-merge-main. Main health remains PENDING; previous626s history unchanged,
+no fabricated pending-green duration entry. Owner preview remains prepared/UNRUN;
+actual Claude Code acceptance and full M2/v1 acceptance still missing.
+
+While main gates run, a separate Sol6.1/high READ-ONLY architecture task prepares
+the remaining trusted-clock/expiry-security/evidence contract onD. It may inspect
+source and propose a bounded draft only; no source/runtime/CI action or altered
+15minuteTTL/CI budget/controlled-vs-real-time evidence credit. Existing accepted
+complete RPC design stays frozen; PR182 HOLD/NOFIX and all exhausted counters
+remain. M2OPEN/M3UNCHECKED. No admin/VM/LabManager/cache/userdata/babysitter action.
+
+## Actual Claude Code acceptance preparation (unrun)
+
+Coordinator Sol6.1/high pinned a concrete draft at
+D:/Temp/arx-claude-acceptance-plan/brief.md: actual Claude Code uses only Arxcovo
+MCP list_hosts, one exact cargo--version, list_activity and correlated id lookup,
+with real trace plus durable-row verification. Requires exact-main green,
+independently reviewed bounded runner/cleanup and actual isolated client auth.
+No model/client/daemon/auth/native run occurred. Current inherited OAuth/API-key
+presence checks both false; existing owner credential/config/keychain untouched.
+Installed help distinguishes bare API-key-only from normal OAuth; no auth or
+provider/billing assumption. Product-client acceptance is separate from Claude
+engineering routing; full M2/v1 is not replaced by this one Windows journey.
+
+Attempted Sol6.1/high runner-preparation delegation was cancelled by the tool
+before launch, with no child task handle. It was not retried or replaced with a
+native/background agent. Only the local brief was prepared. Exact CLI settings,
+wrapper ownership and cleanup remain explicitly unresolved before execution;
+no request_secret is opened until a concrete eligible runner is ready.
+Existing source/backend entrypoint remains prepared/UNRUN, mainCI pending.
+
+Clock-design Sol6.1/high task returned source-only DRAFT at
+D:/Temp/arx-m3-clock-expiry-design/{contract.md,evidence-path.md,pin-manifest.json}.
+It distinguishes missing production time-health integration, logical deterministic
+timestamps, fresh signer refusal and possible late state consumption for an
+earlier queued request. That is not proof of successful late certificate/join.
+No production expiry vulnerability or stricter no-late-allocation mandate is
+inferred. Fresh independent Sol6.1/high review active; explicitly challenge
+whether a qualified-health-API requirement is necessary under existing spec or
+whether a simpler honest trusted-host UTC model suffices. No unrequested time
+infrastructure, stronger acceptance condition or source/fix grant is adopted.
+Controlled-clock vs real15minute evidence distinction and existing budgets remain.
+
+At that task completion, one exact-mainCI read found UbuntuSUCCESS348s and
+macOSSUCCESS368s, Windows still running. Rust680/648PASS, all10activity_v2 and
+inventory corruption casesPASS,48Node/UI/browser/ElectronPASS each. Full bounded
+logs and per-case proof retained onD. Main remains PENDING, no duration-history
+green entry and no owner runtime/client launch. See
+[main first-CI checkpoint](evidence/windows-execution-choice-main-first-ci.md).
+
+## Exact PR183 resulting-main health GREEN; docs carried without Rust
+
+Coordinator Sol6.1/high verified CI44351538977 attempt1 SUCCESS at exact main
+08c4b999. Existing policy measurement641wall/639charged/2idlequeuecredit,
+longestWindows636s; Ubuntu348s/macOS368s. Windows694RustPASS/36skip171.767s
+body, all10activity_v2 and inventory casePASS;48Node/UI/browser/ElectronPASS
+eachOS. Optional Windows sample skipped_budget, no cases or stability/fix credit.
+All3bounded logs/hashes/testnames and exactattempt1metadata retained onD.
+Actual charged-v1 record appended to duration history without changing policy
+or previous records. No rerun/dispatch. Full M2OPEN/M3UNCHECKED remains.
+
+Created work/v1-current-user-acceptance from verified origin/main08c4b999 and
+carried only docs0ffafc39/d5bb89c8/5f270e21 as7ca04176/7a1ef160/4466b958.
+Old branch/checkpoints preserved; crate diff to new main empty. This checkpoint
+and history remain local, not a docs-only CI trigger. Backend preview package
+may now be presented with its actual limits; launcher itself still UNRUN.
+
+Clock review returned conditional bounded Design GO, with one speculative-
+generality concern and one scope finding: mandatory qualified UTC-health API
+exceeds the originating spec. A conditional trusted host-OS UTC premise plus
+explicit anomaly refusal can suffice. Settle exact comparison/latch/restart/
+suspend mechanics and fallible enrollment/anchor API before source. Late
+queued consumption is not a demonstrated late successful join. Preserve the
+real15minute evidence gap and founder/PR182/exhausted holds. No new prerequisite
+or clock source implementation is adopted by that review alone.
+
+## Owner disk steering completed; current v1 blockers retained
+
+Coordinator Sol6.1/high completed the authorized old-worktree cleanup on
+2026-11-18. The initial 810-worktree inventory contained 716 old clean trees,
+64 trees whose ignored Python/C#/helper output was subsequently classified,
+6 dirty/untracked trees and 24 created today. Normal Git removal without force
+removed 776. Four partially removed roots were then verified against their
+preserved commits before removing residual generated files and identical source;
+junctions were unlinked without following their targets. Final count is 780
+removed and 30 protected trees still present and registered. All 810 recovery
+refs match the original HEADs. Existing branches and current uncommitted main-CI
+checkpoints were preserved; application source still equals merged main08c4b999.
+
+Worktree-batch C: free-space measurements were 35,407,282,176 bytes before,
+524,247,322,624 after batch 1, 577,711,296,512 after batch 2, and
+580,643,573,760 after residual cleanup. Final verification measured
+689,380,073,472 bytes; separate cleanup activity means these drive-wide deltas
+are not an exact Arxcovo reclaimed-size measurement. Earlier removal of three
+attributable Arxcovo Cargo targets raised C: from 17,622,765,568 to
+27,456,466,944 bytes. No build/test was run during cleanup. All future scratch,
+Cargo output/home, npm cache and Playwright browser paths remain explicitly D:.
+
+The Runtrace production database was already on D:. T3 Code's installation/state
+database and Codex history are distinct; none was moved or modified. Substantial
+Runtrace test scratch was observed on C: and preserved for the separate project
+cleanup thread. Its prompt was supplied at
+D:/Temp/other-project-c-cleanup-prompt.txt. No other-project process, LabManager,
+VM, installed state, credentials, cache or user data was removed by this cleanup.
+[Bounded verification and recovery details](evidence/arxcovo-worktree-cleanup-20261118.md).
+
+The exact clock API settlement received independent Sol6.1/high NO-GO:
+found_tests.rs has a legacy-only Clock passed to enroll, conflicting with the
+draft checked-trait API and unchanged-fixture allowlist. Other pure-clock model
+mechanics had no remaining design blocker. Report and 25 unchanged input hashes:
+D:/Temp/arx-clock-settlement-review/{review.md,pin-proof.json}. No source, compile,
+runtime, founder diagnostic, retry or additional fix occurred. Resolve that narrow
+compatibility scope before implementation. PR182 HOLD/NOFIX, exhausted engine
+Sol3/3 and historical Opus0/2 remain unchanged. M2 OPEN / M3 UNCHECKED;
+unexercised paths remain **unverified on real hardware**.
+
+Next bounded task: independent Sol6.1/high review of
+D:/Temp/arx-clock-scope/fixture-scope-resolution-v2.md, SHA256
+1d9b46a9bca5e6eca1137933d43613aab061d48854ddee80e4390ac4ba2e1319.
+It proposes one explicit checked-trait implementation for the existing private
+found_tests Clock, preserving its legacy implementation and every existing
+test/setup/assertion/timing line. No parallel issuer API or blanket conversion.
+Review is read-only and pending at
+D:/Temp/arx-clock-fixture-scope-review-v2; implementation has not started.
+This resolves the coordinator draft's file allowlist only if reviewed coherent;
+it does not relax the owner's founder diagnostic/fix hold or any attempt limit.
+
+Independent Sol6.1/high fixture-scope review returned Design GO, Standards0 /
+Spec0, at D:/Temp/arx-clock-fixture-scope-review-v2/review.md. Actual call graph
+and module visibility were inspected; P1 is closed by that one explicit test
+implementation. No compiler/runtime claim follows. Authorized next source slice
+is the reviewed checked-clock module and issuer/anchor plumbing with exact
+fixture adaptations, local pure tests/test compilation only, then independent
+source review and normal gates. No live transport/startup or held repair work.
+
+Sol6.1/high source builder is active on work/m3-checked-enrollment-clock from
+805408cb, using the reviewed scope. Coordinator added
+[ADR0030](adr/0030-checked-enrollment-clock.md) with the trust premise, arithmetic,
+availability limits and unwired startup boundary. Local validation permits pure
+checked-clock execution and compilation only; issuer engine coverage remains
+locally UNRUN and must preserve the existing quarantine inventory. No CI run,
+source acceptance or live time/transport credit has been claimed.
+
+Checked-clock source delivery: Sol6.1/high implemented the ten-file allowlist;
+14/14 isolated pure tests PASS (0.01s harness), Clippy PASS16.196s and all-target
+test compilation PASS38.456s, no engine/runtime tests. Coordinator self-review
+caught the 15-case matrix's potential MAX_MEMBERS exhaustion before execution;
+test-only per-case Remove plus an explicit removal assertion now preserves the
+unchanged capacity. Post-correction fmt/Clippy/no-run PASS0.748/4.741/18.186s.
+Pure module/tests are hash-identical to the earlier 14-pass source, not rerun.
+Original six issuer cases, founder fixture body, guards and quarantine inventory
+remain. [Local evidence](evidence/checked-enrollment-clock-local.md) records exact
+pre/post-correction scope; independent source review and hosted gates pending.
+
+Test compilation replaced the shared target arxd.exe with an unobserved build
+df79751b; do not reuse the old f889 runtime claim for that path. The separate
+owner-preview bin/arxd.exe was rehashed and remains f8893673...6224b48; no packet
+launch occurred. No runtime/fix authority or exhausted counter changed.
+
+## Checked-clock PR184 published; first normal gates pending
+
+Coordinator published1cd91ef62cf74945b18f4c56efbfc7c613474760 as
+[PR184](https://github.com/Dytschgo/arxcovo/pull/184), linked to this thread.
+Before publication, live main08c4b999 and first CI44351538977 attempt1 SUCCESS
+were reverified at18:21:25UTC; no rerun/dispatch. The actual new-source PR's
+first normal CI is44368904104 attempt1, QUEUED at one metadata observation.
+No per-job execution, duration or passing credit yet. Retained metadata:
+D:/Temp/arx-v1-continuation/pr184-first-runs.json.
+
+Fresh independent Sol6.1/high source review/attestation task is active with
+the exact base/head, all17 PR files, original contracts, pre/post-correction
+evidence and unchanged holds. Returned selection: codex/gpt-6.1-sol,
+reasoningEffort high, serviceTier default. Review output will be
+D:/Temp/arx-pr184-independent-review/review.md. Only that independent reviewer
+may attest source PASS; required CI remains mandatory. This local checkpoint
+is unpublished to preserve the reviewed PR head and avoid an extra CI trigger.
+
+No new founder diagnostic/fix, engine attempt, timeout/quarantine/policy/capacity
+change or PR182 integration. Existing babysitter untouched. M2 OPEN /
+M3 UNCHECKED; full v1 and actual Claude Code acceptance remain incomplete.
+
+## PR184 first-CI inventory failure preserved; narrow registration correction
+
+Independent Sol6.1/high review returned Standards PASS / Spec one P1: the new
+anchor test was not in QUERY_LOCAL_REQUIRED. Ubuntu22s and Windows52s failed
+the exact-inventory guard, nine tests/one failure; Rust validation skipped.
+macOS remained queued at the single follow-up metadata read. Bounded D: logs,
+hashes, job metadata and honest UNRUN limits are retained in
+[first failure evidence](evidence/checked-enrollment-clock-ci-first-failure.md).
+No clock/engine/founder runtime failure or hosted passing credit is inferred.
+
+Coordinator Sol6.1/high reproduced the pure guard failure once, then added the
+single test name to the mandatory list and updated its exact count4to5. All
+nine guard tests PASS0.133s harness/0.324s command, including existing negative
+checks for every required test. Rust source is unchanged. This is required-test
+registration, not a quarantine/filter/workflow/timeout/capacity relaxation. Prior
+failed head/evidence and all engine/founder holds remain. New source will receive
+a fresh independent delta recheck and normal CI, with no rerun/dispatch.
+
+While review/CI ran, coordinator inspected the installed Claude Code help and
+official settings documentation for the real-client path. No cancelled delegation
+was restarted; no client/model/daemon/auth or owner credential/config/keychain
+action occurred. The native CLI is available; its documented restricted/tools/
+strict-MCP controls and managed-policy precedence require an explicit runner
+boundary. Existing Python MCP observer is not actual Claude Code acceptance.
+No new runnable runner or credential request has been claimed.

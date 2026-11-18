@@ -39,6 +39,11 @@ impl issue::SignerClock for Clock {
         1_000_000
     }
 }
+impl super::super::checked_clock::CheckedClock for Clock {
+    fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+        Ok(issue::SignerClock::now_ms(self))
+    }
+}
 fn query(c: &JoinCode) -> Vec<u8> {
     let mut q = c.cluster().to_vec();
     q.extend(c.code_id());
@@ -230,6 +235,56 @@ fn propagate(r: std::thread::Result<()>) {
 }
 
 #[tokio::test]
+async fn checked_clock_refusal_has_no_submission_and_malformed_has_no_sample() {
+    use super::super::checked_clock::{CheckedClock, ClockError};
+    struct FailingClock {
+        calls: std::sync::atomic::AtomicUsize,
+        error: ClockError,
+    }
+    impl CheckedClock for FailingClock {
+        fn sample_ms(&self) -> Result<u64, ClockError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error)
+        }
+    }
+    let dir = private_temp();
+    let key = KeyDigest::of_spki(b"founder").unwrap();
+    let c = code(key, [2; 32]);
+    let q = query(&c);
+    let mut n = durable(dir.path(), key, &c, false);
+    for error in [
+        ClockError::Unavailable,
+        ClockError::InvalidTime,
+        ClockError::Anomaly,
+        ClockError::Behind,
+        ClockError::Rollback,
+    ] {
+        let clock = FailingClock {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            error,
+        };
+        for len in [0, 31, 33, 4096] {
+            assert_eq!(
+                n.anchor_query(&vec![0; len], &clock).await,
+                Err(AnchorQueryError::Refused)
+            );
+        }
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            n.anchor_query(&q, &clock).await,
+            Err(AnchorQueryError::Unavailable)
+        );
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(n.read_blocking.load(Ordering::SeqCst), 0);
+        assert!(n.owners.lock().unwrap().set.is_empty());
+        assert_eq!(n.sm_weak.strong_count(), 1);
+        assert_eq!(n.issue_permits.available_permits(), 4);
+        assert_eq!(n.read_permits.available_permits(), 8);
+    }
+    n.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn owned_query_dropped_callers_and_read_admission() {
     let dir = private_temp();
     let key = KeyDigest::of_spki(b"founder").unwrap();
@@ -241,6 +296,11 @@ async fn owned_query_dropped_callers_and_read_admission() {
         fn now_ms(&self) -> u64 {
             self.0.fetch_add(1, Ordering::SeqCst);
             1_000_000
+        }
+    }
+    impl super::super::checked_clock::CheckedClock for CountClock {
+        fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+            Ok(issue::SignerClock::now_ms(self))
         }
     }
     let clock = CountClock(std::sync::atomic::AtomicUsize::new(0));
@@ -347,6 +407,11 @@ async fn owned_query_bounds_poison_and_no_submission() {
             panic!("malformed input sampled clock")
         }
     }
+    impl super::super::checked_clock::CheckedClock for NeverClock {
+        fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+            Ok(issue::SignerClock::now_ms(self))
+        }
+    }
     for len in [0, 31, 33, 4096] {
         assert_eq!(
             n.anchor_query(&vec![0; len], &NeverClock).await,
@@ -363,6 +428,11 @@ async fn owned_query_bounds_poison_and_no_submission() {
         fn now_ms(&self) -> u64 {
             std::thread::sleep(READ_BUDGET + Duration::from_millis(20));
             1_000_000
+        }
+    }
+    impl super::super::checked_clock::CheckedClock for SlowClock {
+        fn sample_ms(&self) -> Result<u64, super::super::checked_clock::ClockError> {
+            Ok(issue::SignerClock::now_ms(self))
         }
     }
     assert_eq!(
