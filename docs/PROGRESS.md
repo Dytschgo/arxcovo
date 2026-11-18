@@ -2,14 +2,14 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main CI pending:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
-after PR176, reviewed head14d94c61, normal all-five-gate merge without exception.
-First main CI44229539357 running; no integration-on-main credit yet.
-PR CI44227925667 passed all OS; query proof0.089s Ubuntu/0.215s macOS/2.574s
-Windows. Founder13 passed each OS, Windowsverify595s<=660. Passing output hides
-diagnostic records, so historical founder cause and overlap remain unknown.
-Protection unchanged and reviewed-tree equality verified. Prior main05b9c829
-CI44212212325 green608wall/605charged; prior founder red remains unfixed.
+**Current main GREEN:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
+648s wall,645s charged,3s validated idle queue credit; Windows643s,
+Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
+Ubuntu/macOS/Windows), founder13 passed each OS. Automaticpolicy44230812083
+succeeded. PR Windows595s met the feature660s requirement. Protection unchanged.
+Passing output hides observer data: historical founder refusal cause remains
+unreproduced/unfixed, overlap Unknown, no stability/re-enable credit.
 M2 open/M3 unchecked; fixture28 and hardware **unverified on real hardware**.
 
 **Historical PR173 green:** main59a665c CI44114182696 attempt1 passed in609s
@@ -39,9 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR177 as05b9c829 from reviewed1c7c9f52 under the explicit owner diagnostic exception; protection unchanged. First-main CI44212212325 green608wall/605charged; founder13 allOS.
-- Current work: PR176 owned anchor query refreshed onto green diagnostic main. Reviewed five feature files remain unchanged; fresh exact-head review and all hosted gates, including new query engine proof and Windows<=660s, remain required. Identity and membership-observation contracts are independently reviewed and local.
-- Blockers: no current red-main hold; prior founder failures remain unexplained, not fixed. Production join still needs admission, authenticated transport/discovery, owner/removal authority, custody and clock contracts. M2 open/M3 unchecked; Sol3/3 and historical Opus0/2 unchanged; hardware **unverified on real hardware**.
+- Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
+- Current work: Sol6.1 high retained authenticated cluster/node/key slice is building locally on prior verified green main05b9c829. It needs refresh onto this main, independent source/exact-head review and all normal gates before publication/merge.
+- Blockers: no current CI hold. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3645,3 +3645,7 @@ Astra6.2/high recheck10d324e6 closes all five9da4bf2b blockers atba493dfc, no ne
 ### PR176 normal merge checkpoint - 2026-11-18
 
 Root verified exacthead14d94c61/currentmain05b9c829/greenmainrun44212212325, independentAstraPASS6967815508, allfivegreenPRgates, actualqueryproofPASSallOS and Windows595s. Normal squashmergee3e79089 readbacktree/protection equality passed. Evidence D:/Temp/arx-pr176-14d94c61-hosted; firstmainCI44229539357 actively awaited. No rerun/fix/stability/re-enable credit; newquery realengine proof on PR only untilmainpasses. Retainedidentity pureTLS builder continues independently.
+
+### PR176 first-main acceptance checkpoint - 2026-11-18
+
+Root actively awaited CI44229539357 exit0 and bounded/read retained full3OSlogs. All query proofs/founder13 passed; exact main e3e79089 verified. Pure charged-v1 calculation648wall/645charged/3credit, automaticpolicy44230812083success. No diagnosticrecordvisible on passing tests, so no phase/cause/overlap claim. Identity builder continues independently; next actualsource review must preserve mergedquery guard/inventories. Evidence D:/Temp/arx-pr176-14d94c61-hosted/main.
