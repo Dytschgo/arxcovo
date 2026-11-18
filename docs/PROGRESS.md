@@ -3630,3 +3630,7 @@ Sol6.1/high brief f26c0825 retainedb10ac552 specifies actualrefusal tags, fixedw
 ### Corrected Ubuntu diagnostic implementation grant - 2026-11-18
 
 Root applied all four Astra2be92556 contract corrections asbbe9a443: immutableguardlane, missingRaftcallerreason, returned-Err-onlycleanup, no procfs/host/processreader. Sol6.1/high localimplementation active under explicitcompilebudget: oneClippy+oneoptionalmechanicalbatch/recheck, onefocusedpure-recorder invocation, no localengine/failingcase/mutation/runrepeat. ExactdiffAstrareview beforepublication, no push/CIgrantyet. Caps/clock/drop/primaryerror requirements retained. PR176held; countersunchanged,M2openM3unchecked,hardware **unverified on real hardware**.
+
+### Ubuntu observer local candidate and gaps - 2026-11-18
+
+Sol6.1/high source84522a3b and evidencea5f7d37e retainedlocally (ea4542d2/30547a71). FinalClippy and pure4passed after1/1mechanicalbatch; fmt/guard8/sampler60 passed beforebatch, no finalsource rerun claimed. Knownbranchattributiongaps remain; source is notpublication-ready. Root requested Astra6.2/high exactdiffreview, including non-test semantics, success/failurecleanup, missingbranchdistinctions and1121linecomplexity. No furtherbuilderedits orCIuntilrootdisposition. Noengine/runtimefailingcase rerun, nofixcredit; PR176held/M2openM3unchecked/hardware **unverified on real hardware**.
