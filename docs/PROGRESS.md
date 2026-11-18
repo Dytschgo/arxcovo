@@ -3663,3 +3663,24 @@ Sol6.1/high sourcea7596271/evidencea4d3bf8c: Clippy andstaticchecks passed, sole
 - PR178 Windows failure observed and logs retained: existing founder proof exhausted shared5s while proposal pending; underlying cause unknown. Ubuntu/macOS identity3PASS each, Windows identity3unrun. No retry, fix, timing or quarantine change; counters unchanged. Local evidence m3-pr178-windows-founder-deadline.md awaits independent Astra disposition.
 
 - Astra6.2 high decoded PR178 founder trace (a60df7dd): final WaitElapsed confirmed; submission16Ok, responder17/18 absent at return. Earlier Ubuntu refusals remain unclassified. Sol6.1 high prepare-only post-shutdown scalar-slot patch assigned; actual source/execution grants pending, no new fix attempt. PR178 remains held; M2open/M3unchecked; hardware **unverified on real hardware**.
+
+## Agent-owned C: build cleanup inventory - 2026-11-18
+
+Before cleanup: C: free11,936,124,928 bytes; D: free2,788,865,925,120 bytes.
+New Rust validation already uses D:/Temp/arx-identity-d-validation-f4e7e857 for
+CARGO_TARGET_DIR, CARGO_HOME, TMP/TEMP and logs. No new C: build outputs allowed.
+Future delegated worktrees must also be on D:; do not launch a new worktree if
+the orchestration tool cannot honor that destination. Existing prepare-only task
+is not building. Shared D:/Code/Arxcovo/target is on D:, not a C: cleanup target.
+
+Deletion allowlist, recorded BEFORE deletion (one task-owned output only):
+- C:/Users/DylanFerraro/.t3/worktrees/Arxcovo/t3-99c75fbd-e3b1351afc96bbcf/target/identity-validation/build
+  Original retained-identity builder's private CARGO_TARGET_DIR; evidence
+  docs/evidence/m3-authenticated-identity.md records its provenance and compile
+  disk failure. Inventory:3,822 files,2,392,806,227 logical bytes. Resolved exact
+  target and every ancestor/descendant checked: no reparse points. Worktree has
+  no tracked changes; no cargo/rustc/clippy-driver processes were listed.
+  Preserve adjacent cargo-home cache, logs, all source and Git worktree data.
+No other directory has been admitted for deletion. No user/cache/LabManager/VM
+data is included. Remaining old worktrees have unmerged source/evidence and are
+not disposable build output. Post-cleanup free space and owner notice pending.
