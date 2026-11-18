@@ -65,6 +65,18 @@ starting 200s earlier while Ubuntu runs would count as a reduction made of queue
 is removed, because it accepted queue variance. Candidate selection is unchanged: same head SHA, same
 `head_repository.id`, highest `run_number`, attempt 1.
 
+## Later topology change
+
+[ADR0031](0031-parallel-ci-validation.md) proposes parallel workers with the
+existing required checks retained as completion gates. Its first implementation
+left this ADR's three-job validator unchanged; the 949-second first attempt was
+held without credit. A prospective amendment accepts only the exact nine-job
+layout described there, with gate creation at or after all six workers finish,
+the same sweep and 900-second charged threshold, and unchanged wall fallback for
+defects. It needs fresh source review and a normal new-head first attempt; it
+does not reclassify that held run. The original single-job pin below remains the
+historical legacy contract. Arbitrary dependencies/jobs are never creditable.
+
 ## Trusted inputs and validation
 
 The evaluator keeps its existing read, `GET repos/{repo}/actions/runs/{id}/attempts/1`. It adds one read:
@@ -82,7 +94,7 @@ The amendment adds no metadata-validation throw path and never grants queue cred
 `main`, a candidate must be `pull_request`); `head_sha` is not the listed 40-hex SHA; a candidate's
 `head_repository.id` is wrong; S or U is not a strict timestamp; or U − S ≠ `seconds` or lies outside 0..604800.
 
-**`jobs-invalid`** is set when any of these holds: `total_count` or `jobs.length` is not 3; an id is not a safe
+For the legacy three-job layout, **`jobs-invalid`** is set when any of these holds: `total_count` or `jobs.length` is not 3; an id is not a safe
 integer ≥ 1, or ids repeat; `run_id`, `run_attempt` or `head_sha` does not match the run (its id, 1, its SHA); the
 names are not exactly `verify (ubuntu-latest)`, `verify (windows-latest)` and `verify (macos-latest)`, once each;
 `labels` is not deep-equal to `[os in name]`; `status ≠ completed`; `conclusion` is empty; c, s or e is null or not
@@ -91,11 +103,24 @@ A strict timestamp matches `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$` and round-tr
 dates like Feb 30 are rejected. Labels are compared only for equality and never used to skip a job. A skipped job,
 a cancelled job that never started, and partial data all give `jobs-invalid`. A complete run or job that did not
 succeed gives `not-green`: its charged time is computed but not credited.
-`ci-workflow.test.mjs` pins trusted main to one job, `verify`, with matrix `os` exactly the three labels. It also
-pins: no `needs`, job-level `if`, `environment` or `services`, and one top-level `concurrency`. With these pins,
-created→started on main is runner assignment only. A PR-controlled workflow cannot hide execution, because of the
-invariant. The longest-job check rejects a queue-only win with unchanged execution times. Runtime noise can
-still change that value; a `ci-speed` PR must name and independently review the actual execution-time change.
+The prospective split layout additionally accepts exactly nine jobs named and
+labelled as ADR0031 specifies: six unconditional Rust/UI workers and three Ubuntu
+completion gates, with each gate created at or after every worker completes.
+All shared identity/timestamp/status checks above remain; every job participates
+in the same sweep. Unknown counts, duplicate/missing/extra names, wrong worker or
+gate labels, and early-created gates withhold credit and use wall fallback.
+
+The original `ci-workflow.test.mjs` pin covered one `verify` matrix job. Its
+successor pins exactly `rust`, `ui`, and `verify`: both worker matrices retain
+three OSes and have no needs/job-if/environment/services/job-concurrency; verify
+requires both complete matrices with always() and the fail-closed success/success
+check. Top-level concurrency, permissions, command inventory, tool pins and
+12-minute limits remain pinned. Gate creation times additionally prevent granting
+credit for dependency waits. Metadata alone cannot prove a candidate's work;
+exact-source independent review remains mandatory. The longest-job check rejects
+a queue-only win with unchanged execution times. Runtime noise can still change
+that value; a `ci-speed` PR must identify and independently review the actual
+structural change rather than claiming a charged reduction from queue alone.
 
 ## Status description (≤140 chars, `Main run {id}:` invalidation marker unchanged)
 
