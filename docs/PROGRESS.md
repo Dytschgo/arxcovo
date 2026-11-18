@@ -4066,3 +4066,11 @@ requested preciseEOF/halfclose rule to avoid extrabyte-detection deadlock; notye
 acceptedlivecontract. Nextslice must be realTLS/TCPAppend transport, notanother
 unrelatedhelper, then completeVote/PreVote/fullsnapshot+networkedengineproof and
 actualjoin. Allnormalreviews/fences remain; no enginefix or CIbudgetchange.
+
+IndependentSol6.1 sourcePASS4cases/12artifacthashes verified, allaxes0findings;
+[review](reviews/m3-peer-registry-source-sol61-review.md). Bothdesignatedcontrols
+compiled/intendedassertionfailed onceeach, exactrestoreaftereach verifiedbyroot.
+Zeroexecution harnesssetupmetadata issue retained, no semanticrun repeated.
+No postrestore runtime rerun; retainedM2binary, hostedcompiles reviewedbaseline.
+Ready sourcePR for try-lockcallback, no fullTLS/network/container/SQLhealthclaim.
+M2OPEN/M3UNCHECKED,countersunchanged, no ownerPCnative/admin operation.

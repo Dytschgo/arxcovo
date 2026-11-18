@@ -51,3 +51,39 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  format.stdout.
 774deabd7941679adfd5d9e86a59f5e823749b5cfee6086e50631739eacb7a69  pure.json
 76046240f322b95238d4f5bd2c2c0708bd6e7f1aaf6b01238b9b86e1016aa1bf  pure.stderr.txt
 dc21d2110c4df7bddecd21d44d72979ddf9e0f4c4d7061eb9d9cd30e667e7602  pure.stdout.txt
+
+## Two designated controls and restoration
+
+Independent Sol6.1 sourcePASS at3b5cdccc; rootassigned exactly2purecontrols onceeach.
+M1 try_lock->lock compiled29.31s; heldmutex test savedtimeout, releasedguard and
+joinedhelper, then expectedUnavailable observationassertion142 failed.1test/exit101,
+34.838s. M2 Weak->strong compiled30.51s; strongcountassert179 failed2!=1.1test/
+exit101,30.963s. Both ownedprocesses exited/no timeout. Rootread allpatches,
+stdout/stderr/time/exit and restoremanifests; intendedsemanticassertionsconfirmed.
+
+Beforecontrols, runner replacementmetadata setup failed (PowerShell nestedarray
+flattening) BEFOREmutantsourcewritten orCargo launched. Originalissue retained
+insemantic-harness-setup.json; correctednamedmetadata. Zeroexecution atsetup;
+eachsemanticcontrol ranonce, neither repeated. No baseline/testsource fix.
+
+Exactbaseline restored afterEACH, peer_registryblob1d4a4082ed0d9e253625dd34d0884f4347d1e204,
+SHA256fdb6ca772ae496b7e795bcb520e882e8a40614402ad9fba07ae93cafadf9771a.
+Rootverified finalhash and empty ALLnon-doc diff vs reviewed3b5cdccc. No postrestore
+runtime rerun; retainedbinaryM2mutant. Prior4PASS/Clippy apply bysourceidentity,
+normalhostedCI compilesbaseline. Independentreviewapplicability conditions met;
+mutantoutcomes attributedbuilder/root, not reviewerexecution. No enginefix or
+counterreset, no runtime/CIdeadline/settings/quarantine change.
+
+Additional control artifact SHA256:
+678c1b9a8eb260932c558ec1303c3270559573b5442427dc5048f789229c4d1c  m1.json
+dcd02e1cc9ff66a8916ae6258f9e44163640bc0550ff1edf830b87e8d18dbe5d  m1.patch
+134a85d6ed847a7820384a2d1dc9675730fc7a4af7d6433b37fbe8dd2912b803  m1.restoration.json
+f8b2e334fd4677990337803fed3bc0fbaad47ac50f0e0ba6c690730ba89282b4  m1.stderr.txt
+da9b01fe7a016aeb543893fd1ac661acfde20e44097a75ceff59aa356f86b338  m1.stdout.txt
+66d86d540b593b1d15419bb5ab0e0ef9b1ddfc93bf77b896383bbb8308b554e3  m2.json
+4b4843782377f8b5b4a36e9af0cb7bf2c8b21b19295ff68629ec2b70406fb0d5  m2.patch
+813e2681b0dfc497412a38a8dbbfaddcb5224115f7574fe2df18947c7a010ca7  m2.restoration.json
+f97a91dc5c74769dadffe632a1b2ea1800ca931668bcc83db8564e234d9e92fd  m2.stderr.txt
+98945dc1077d8dd38a5f4b0cc325e603881f7426bf5cee84818aa00fb0b55b8e  m2.stdout.txt
+57292adfd91e73002886edf25617bda25aba3da9057663ba5741e7231f07dfd7  semantic-baseline.json
+91a16f8d460a9863b6a0296b4bf2adbc7fc427b100d2702c6e5342dbb07a688f  semantic-harness-setup.json
