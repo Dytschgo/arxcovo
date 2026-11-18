@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR178 as6f4618c76256c2ead9dfb501c2c3946fde14a81b from reviewed11a34312. Allfive gates passed; CI44267088243 attempt1SUCCESS633s, Windows629s. Identity3/observer3 passed eachOS. Premerge exactmain e3e79089/CI44229539357 GREEN verified.
-- Current work: exact-main CI44269052508 first-attemptGREEN603s confirmed. Continue independent M3 membership observation prerequisite underADR0023. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
+- Current work: exact-main CI44269052508 first-attemptGREEN603s confirmed. PR179 published reviewed d4bd38b4 fresh membership observation prerequisite; CI44272864519 firstattempt running, independent agent-review success. Seven pure tests pass,3guard mutants killed/exactsource restored. Normal allfive/freshgreenmain/Windows<=660s pending. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
 - Blockers: M2 owner/hardware acceptance incomplete; M3 admission/transport/discovery/removal authority/custody/clock and production integration remain. Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3810,3 +3810,20 @@ Gitblobe925a7e2/SHA256617d60d7... verified; non-doc tree identical to reviewed1d
 No postrestore runtime rerun, retained binary is mutant3; hosted will compile restored
 source. Independent review applicability condition satisfied by exactrestore and
 accurate docs-only retention. Ready for normal featurePR, no founder rerun/repair.
+
+## PR179 published; hosted gates running (2026-11-18)
+
+Sol6.1/high coordinator published exactd4bd38b446899a380c16814af745c04cd1a3bb64,
+[PR179](https://github.com/Dytschgo/arxcovo/pull/179), basegreenmain6f4618c.
+Independent Sol6.1/high sourcePASS attributed at
+[review6974011455](https://github.com/Dytschgo/arxcovo/pull/179#issuecomment-6974011455),
+agent-reviewSUCCESS after verifying reviewed1d068d5f->final onlyaccuratedocs,
+non-doc tree/blobs unchanged after3mutant exactrestore. All7purebaselinePASS;
+no postrestoration runtime rerun, hosted compiles restoredsource.
+Normal all-OS [CI44272864519](https://github.com/Dytschgo/arxcovo/actions/runs/44272864519)
+firstattempt running. No old-head rerun/dispatch; new independentM3 source.
+Allfive gates, new7tests actualexecution eachOS, Windows<=660s and freshgreenmain
+required before coordinator merge. No production admission/adapterrace/quorum/
+cancel/hardware credit; Sol3/3 exhausted/Opus0/2 unchanged. M2OPEN/M3UNCHECKED.
+Local pending-run checkpoint intentionally unpushed to avoid redundantCI.
+Existing babysitter untouched. LastmergedPR178/main6f4618c CI44269052508GREEN.
