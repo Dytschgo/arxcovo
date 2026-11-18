@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR179 as6bf8f46bc87a05bed01e342c1a37f68427e4c16b from reviewed2f888992. Allfive gatesSUCCESS; CI44274746575 attempt1GREEN537s, Windows533s. New7tests and Node48 eachOS PASS. Premerge exactmain6f4618c/CI44269052508 GREEN checked immediately.
-- Current work: exact-main CI44276313116 attempt1GREEN565s verified. PR180 headb1cf9d50 held: CI44279691035 Windows executed12minute jobtimeout after662RustPASS, laterNode/UIchecks unrun. Astra disposition retained; no rerun/settings change. Separatelyauthorized Sol6.1 purecodec implementation running locally underADR0026, no liveTLS/dispatch authority. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
+- Current work: exact-main CI44276313116 attempt1GREEN565s verified. PR180 now genuinecodec head548a22ff; CI44284448547 firstattempt running, independentSol source reviewPASS. Local8/8 and3guardcontrols passed intendedchecks/exactrestore. Olddocsheadb1cf9d50 Windows12minute cancellation retained, no retry/performancefix/settings change. Codec grants no liveTLS/dispatch authority. Optional quarantinedWindows sample3pass/5fail inclU6StopOrphaned retained, no stability/re-enable/fixcredit. No further founder diagnostic/fix authorized.
 - Blockers: M2 designated-PC native work awaits owner-created Standardaccount and verifieddiskcap/CPU/RAMreserve; Linux-onlyA7/A11 andA12 hardwarepending. M3 realtransport/startup/custody/admission/clock and containeracceptance remain. Sol3/3 exhausted, Opus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -4013,3 +4013,21 @@ No postrestore runtime rerun; retainedbinaryM3mutant. Independent sourcePASS
 applicable under exactrestore/docsretentionconditions. Genuinecodecfeature ready
 for publication asPR180 finalscope; olddocsjobtimeout retained, no performance/
 stabilityfixclaim, no timeout/quarantine/settings/counterchange.
+
+## PR180 substantive codec head published (2026-11-18)
+
+Coordinator Sol6.1/high published exact548a22ff326f2f27427e1b793de9f7a8a530db3e
+and rewrote PR180 title/body around completed purecodec. Independent Sol source
+review6975675806/agent-reviewSUCCESS after verifying finalnon-doc identity to
+reviewed6a27902c and exactrestore. Originaldocs cancellation remainshistorical;
+no claimtofix timeouts or infer rootcause. No sameheadrerun/manualdispatch.
+[CI44284448547](https://github.com/Dytschgo/arxcovo/actions/runs/44284448547)
+normalallOS firstattempt running on genuine newsource. Existingwatch retained,
+no duplicatewatch. Allfive/new8eachOS/Windows<=660s/freshgreenmain required before
+coordinator merge; ifeligible verify resultingmain ownfirstCI before nextfeature.
+Baseline8PASS +3intendedsemantic kills/exactrestore recorded; no postrestore
+runtime rerun, hostedcompiles baseline. RetainedbinaryM3mutant. No liveTLS/network/
+engine/container/hardware acceptance. Sol3/3exhausted/Opus0/2 unchanged; M2OPEN/
+M3UNCHECKED. Owner PC setup/babysitter/fences intact. Future nonblockingregistry
+candidate stays separatelyprepared atD:/Temp/arx-peer-registry-design.md, unbuilt.
+Localpendingcheckpoint notpushed solely totrigger anotherCI.
