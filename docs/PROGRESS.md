@@ -3827,3 +3827,20 @@ required before coordinator merge. No production admission/adapterrace/quorum/
 cancel/hardware credit; Sol3/3 exhausted/Opus0/2 unchanged. M2OPEN/M3UNCHECKED.
 Local pending-run checkpoint intentionally unpushed to avoid redundantCI.
 Existing babysitter untouched. LastmergedPR178/main6f4618c CI44269052508GREEN.
+
+## PR179 Ubuntu pure-history assertion red (2026-11-18)
+
+CI44272864519 attempt1 Ubuntujob134693562006: Rust654/654PASS,new7PASS;
+npm policy tests47PASS/1FAIL, stale historicalcount30 vsactual31 after committed
+mainhistory append. Windows/macOS pending atfirstcapture. Root Sol6.1/high exact
+local test red reproduced31!=30; oneassertion now requires exactappendone relative
+toinitialhistory; fullNode48/48PASS. No engine/founder/policytimeout/quarantine
+change, no rerun/dispatch, countersSol3/3/Opus0/2unchanged. IndependentSol delta
+review pending; hold publication until review and completedoldrun evidence.
+[Evidence](evidence/m3-pr179-history-count-correction.md). Main6f4618c remainsGREEN.
+
+Independent Sol6.1/high correctionPASS, Standards0/Spec0/Security0; exacttestblob
+0d735fd47df5d20882990d28bf473e94bae48fdf. Reviewed red31!=30 and wholeNode48/48PASS,
+allbyte/oldrecord/duplicateguards preserved; productionbudget/runtimeunchanged.
+[Review](reviews/m3-pr179-history-count-sol61-review.md). OldrunWindows stillrunning;
+retain its firstattempt evidence before publishing correction. No PRrerun/dispatch.
