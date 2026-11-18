@@ -3997,3 +3997,10 @@ coverage advisory with3testlines, productionunchanged. Reviewer rechecked module
 blob9322c5c6. RootDfmt/Clippy7.95s/focused8PASS refreshed for newtestdelta. Planned
 controls refined to decoder-count/request-inner-trailing/acceptedackNone so each
 proves an intendedguard without unrelatedencoder/outerguard changes. No mutantyet.
+
+Independent Sol6.1/high actualcodec sourcePASS, all3axes0remainingfindings;
+innerrequesttrailingadvisoryclosed. Finalblob9322c5c6/SHAffb505d4,21originalartifact
+hashes verified, strengthened8/8 outputs inspected. [Source review](reviews/m3-peer-wire-v1-sol61-review.md).
+Threeguardcontrols assignedonce with exactrestore; reviewerreads committedbaseline
+whiletemporaryworktreemutants run. Futureoutcomes separatelyattributed. No retry/
+merge/timeout authority or stabilitycredit; PR180oldcancelledgate remainsretained.
