@@ -61,10 +61,12 @@ Extend existing cfg(test) found::observation module to
 pub(in crate::cluster::consensus); exports/types have that same restricted visibility.
 Keep existing capture API for F6. Add Call::{QueryInitial,ProofInitial,F10Final},
 async capture_call<T>(Call, impl Future<Output=T>) -> (T, Snapshot),
-worker() -> Option<Arc<Slots>>, mark(&Option<Arc<Slots>>, Edge, Reason),
+worker() -> Option<Handle>, mark(&Option<Handle>, Edge, Reason),
 and emit(&Snapshot, Cleanup). No arbitrary strings/callbacks enter these APIs.
 Task-local Buffer gains optional Arc<Slots> only in capture_call; pending phase
-selects preflight/proposal/guard1/guard2 lanes. fresh_read and propose_response
+selects preflight/proposal/guard1/guard2 lanes. Handle owns Arc<Slots> plus an
+immutable typed lane captured BEFORE spawn; workers never infer guard number.
+fresh_read and propose_response
 obtain handles synchronously before spawning; workers never consult task-local.
 Other callers, including enrollment/query and F6, receive None. Guards select
 separate lanes; no node-pointer/global registry, env flag or store lookup.
@@ -88,6 +90,9 @@ never move an engine error into the recorder. Owners_gate includes poison/closed
 missing engine/store; preflight store result precedes original Arc/permit drops.
 blocking_join means helper reply: adapter::blocking already collapses join errors;
 missing store_reply + BlockingError stays Unknown, never asserted JoinFailed.
+Add a caller-only MissingRaft marker at the existing check between preflight
+and initialize; it has no pending phase. Inspect the existing borrowed Option
+without a second Raft lookup or changed unwrap/error semantics.
 Initializer distinguishes NotAllowed from other API/fatal; proposal separates
 submission failure, engine failure, forwarding, receiver closed and success.
 Guard records original early expiry/closed checks without reevaluating them;
@@ -111,44 +116,38 @@ Observe guard local expiry similarly at its actual original decision arms.
 No formatting, printing or filesystem read in any found timed phase.
 ## Save failure, clean up, then enforce original success
 
-Three callers save the original Result<IssuedLeaf,FoundError> outside work.
-For each proof, on found Err only, retain that Result and return early from the
-35s work future; on Ok consume the leaf in the existing unmodified proof flow.
-Use an outer Option<Result<...>> and take its Ok value; keep Err until enforcement.
-Run existing blocking/TLS joins if present, router clear/drop, shutdown within
-original absolute 40s cleanup deadline, weak-store/log and handle assertions.
-Save each cleanup outcome without immediate unwrap; continue remaining cleanup
-within the SAME bound, report fixed scalar statuses separately. No replacement
-shutdown/drain or deadline extension. Startup absent remains cleanup Unknown.
-F10 saves final issue Result, then saves existing shutdown Result within its
-unchanged 20s wrapper. Its original released/uninitialized checks already ran;
-do not add another drain or assert capacity after shutdown as a substitute.
-Emit the frozen snapshot and cleanup status after timed work/cleanup, then enforce
-saved found success FIRST, then cleanup outcomes, then original work timeout.
-Cleanup failure cannot mask found Err. On success all original assertions remain.
-This covers returned found Err only: later proof panics, cancellation, startup
-panic and outer timeouts can still bypass cleanup/emission. No universal panic
-cleanup promise, Drop logger, catch_unwind framework or hidden retry.
-## Cross-process overlap with bounded self-only evidence
+Only the returned-founder-Err branches change cleanup behavior. On Ok move the
+leaf straight into the existing unmodified success flow; discard F10's Ok leaf at
+its original statement boundary. Retain the scalar snapshot for later emission.
+On proof Err save the Copy FoundError and snapshot outside the 35s work future
+and return early. Both nodes exist, with no blocking/TLS work yet submitted.
+Use common router clear/drop and shutdown sequence ONCE under existing absolute
+entry+40s cleanup bound. On this refusal branch only, save lock/shutdown/timeout/
+weak-store/log statuses without early unwrap, emit them, then fail on the original
+founder Result first. Success-path handles/assertions/cleanup remain unchanged.
+handles(n) removes/discards handles; do not claim it joins them.
+F10 must first reach original gate release/join, drain and uninitialized checks.
+On returned final refusal save it, attempt existing shutdown once under the same
+20s wrapper, emit separately and enforce found first. No extra drain or gate.
+Late proof panics, startup failure, outer timeout and cancellation retain original
+limitations; no universal cleanup, Drop logger, catch_unwind framework or retry.
+## Cross-process overlap with file-free markers
 
-At three capture entries/returns and fourth test body start/end, outside found,
-read host uptime centiseconds from /proc/uptime, boot identity from
-/proc/sys/kernel/random/boot_id and own /proc/{process::id()}/stat start ticks.
-Concrete reader: File::open + Read into fixed [u8;1025], at most 1025 bytes;
-reject >1024, malformed/truncated fields, symlink/reparse components and unavailable
-or untrusted proc mount. No read_to_end/string, process listing, env or commandline.
-Frozen-scope gap: portable std cannot certify proc mount/race safety. If root cannot
-establish trusted immutable procfs for this job, emit Unknown; do not expand scope.
-Keep only PID u32, startticks u64, SHA256 boot identity, uptime u64 and status enum;
-parse stat after its final ')' and discard all other bytes. Never emit raw bytes.
-Validate identity at both ends; same host digest and uptime clock required. Use
-one-centisecond uncertainty intervals; require strict overlap beyond resolution.
-All four recorded scope intervals must intersect; report pairwise otherwise.
-This establishes live scope overlap only, not simultaneous found phases or CPU use.
-Missing/hidden passing output, ambiguous identity, clock regression, unsupported OS
-or inability to validate proc safely => overlap Unknown. No platform cfg required:
-absent proc simply yields Unknown. No Windows global snapshot or process killing.
-This proves only recorded intervals, never descendant lineage or absent host load.
+OMIT all procfs/filesystem/process readers, PID/starttick/boot/host identifiers.
+Existing Ubuntu job+attempt+unique nextest case supply external same-job provenance.
+At three capture entries/returns and fourth body entry/exit, record checked integer
+SystemTime epoch units and each process-local Instant elapsed at the two boundaries.
+Fixed one-pair record per case; never compare separate Instant origins.
+If all four pairs are visible and unique, calculate intersection on the recorded
+wall clock with quantization: max(start+1 unit)<min(end). Label this conditional
+on a common stable wall clock. Regression, wall/elapsed mismatch, missing records/
+provenance or insufficient margin leaves overlap Unknown; agreement cannot exclude
+clock steps between samples. Verified monotonic cross-process overlap is Unknown.
+A wall intersection describes scope lifetimes, not simultaneous found phases,
+CPU use or historical cause. Hidden success output is missing evidence.
+Missing overlap must not discard independently observed primary-refusal evidence.
+No Windows/global process snapshot, environment read, filesystem trust exception,
+new dependency, platform predicate, or process killing is introduced.
 ## Bounds, admission and disposition
 
 Snapshot contains <=24 events (times clamped to u64), 48 slots and two self markers;
@@ -168,3 +167,13 @@ PROGRESS proposal: Sol6.1/high design only; Astra diagnostic adopted, full-suite
 carrier selected, exact-diff review/compile admission pending; C invalid/T unrun;
 PR176 held, M2 open/M3 unchecked, Sol3/3 exhausted/historical Opus0/2 unchanged;
 no fix credit; hardware **unverified on real hardware**. Babysitter unchanged.
+
+## Root disposition and implementation budget - 2026-11-18
+
+Root adopted all four Astra corrections from2be92556 in this revision.
+Authorize local implementation ONLY, with one workspace Clippy invocation plus
+at most one mechanical import/type/lint correction batch and one Clippy recheck.
+No semantic repair after a natural red. Fmt, unchanged static guard and bounded
+pure-recorder checks may run once; no local Raft/Windows engine or failing proof
+rerun. Exact-source Astra review precedes publication. No push/CI invocation is
+included in the implementation grant. Record every failure and actual/reused check.
