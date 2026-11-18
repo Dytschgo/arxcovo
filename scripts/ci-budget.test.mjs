@@ -82,7 +82,7 @@ test('synthetic record appends charged-v1 without modifying any old record bytes
   assert.deepEqual(result.posts, []);
   assert.ok(result.written.startsWith(result.initialHistory.slice(0, result.initialHistory.lastIndexOf(']')).trimEnd()));
   const before = JSON.parse(result.initialHistory), after = JSON.parse(result.written);
-  assert.equal(before.length, 30);
+  assert.equal(after.length, before.length + 1);
   assert.deepEqual(after.slice(0, -1), before);
   assert.equal(after.at(-1).metric, 'charged-v1');
   assert.equal(after.at(-1).chargedSeconds, 1200);

@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -39,10 +39,9 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
-- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Applied locally; fmt/Clippy/observer7/guard9 pass, Astra review pending. No rerun or runtime correction authorized.
-- Blockers: PR178 is held after Windows founder refusal; diagnostic review and first-attempt all-OS evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
-
+- Last merged: PR178 as6f4618c76256c2ead9dfb501c2c3946fde14a81b from reviewed11a34312. Allfive gates passed; CI44267088243 attempt1SUCCESS633s, Windows629s. Identity3/observer3 passed eachOS. Premerge exactmain e3e79089/CI44229539357 GREEN verified.
+- Current work: exact-main CI44269052508 first-attemptGREEN603s confirmed. PR179 published reviewed d4bd38b4 fresh membership observation prerequisite; CI44272864519 firstattempt Ubuntu/macOS failed only stale historycount assertion31!=30 after Rust suites passed. Windows pending. Independent reviewed one-line correction bfb1fc98 ready locally, fullNode48/48PASS; waiting oldrun completion before publication, no same-head rerun. Normal allfive/freshgreenmain/Windows<=660s pending. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
+- Blockers: M2 owner/hardware acceptance incomplete; M3 admission/transport/discovery/removal authority/custody/clock and production integration remain. Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -3727,3 +3726,121 @@ change. [Review](reviews/m3-founder-postshutdown-actual-astra62-review.md).
 Only accurate review/outcome docs may follow before final-source identity check.
 One authorized normal hosted firstattempt will start on publication; no rerun,
 no runtimefix credit, Sol3/3 unchanged. Full-access does not relax any hard gate.
+
+## Published recovery observation (2026-11-18)
+
+Coordinator published11a34312afb6027b82478686fc1e728c01cd393b to PR178 after
+Astra independent PASS. Verified only review/PROGRESS docs follow reviewed77de123f;
+all non-doc source identical. Exact-head independent attribution posted as
+[review6973198836](https://github.com/Dytschgo/arxcovo/pull/178#issuecomment-6973198836),
+agent-review success; ci-time-budget success. Normal full-suite all-OS
+[CI44267088243](https://github.com/Dytschgo/arxcovo/actions/runs/44267088243)
+is in progress on the new head, its sole first attempt; three OS checks pending.
+No old-head rerun. Stop and classify outcome without runtimefix/reset/retry.
+Local checkpoint intentionally not pushed while observation runs; no docs-only
+new CI to manufacture another attempt. PR body updated to current diagnostic scope.
+Existing main exacte3e79089 CI44229539357 attempt1 success confirmed again.
+Allfive gates/identity3 eachOS/Windows<=660s/freshgreenmain required before merge.
+LastmergedPR176; M2OPEN/M3UNCHECKED; Sol3/3 exhausted, historicalOpus0/2 unchanged.
+Hardware **unverified on real hardware**. No babysitter changes.
+
+## PR178 merged; exact-main health pending (2026-11-18)
+
+Sol6.1/high coordinator verified allfive gates at11a34312, independent Astra verdict,
+identity3 and observer3 eachOS, Windows629s<=660s. CI44267088243 attempt1SUCCESS633s.
+Founder proof passed allOS; refusal not reproduced, late prediction unresolved;
+optionalWindows sample skipped_budget (no cases). No rerun/fix/stability credit.
+Fresh premerge main exacte3e79089/CI44229539357 attempt1GREEN checked immediately.
+Normal expected-head squash merge succeeded as6f4618c76256c2ead9dfb501c2c3946fde14a81b,
+PR178 lastmerged; resulting exact-main CI pending, feature merges held for it.
+[Evidence](evidence/m3-pr178-first-observation-merge.md). Local checkpoints not pushed
+solely to start more CI. Next: verify first-main outcome, then independent M3 work
+under ADR0023; no further founder diagnostic/repair without fresh steering.
+M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.
+
+## Green main; next independent M3 prerequisite (2026-11-18)
+
+Sol6.1/high exactmain6f4618c CI44269052508 attempt1GREEN603s, Windows598s;
+identity3/observer3 and founder1 eachOS PASS. OptionalWindows sample budget-skipped,
+zero cases. Bounded D logs/hashes in PR178 merge evidence. No rerun/dispatch/fix.
+Sol6.1/high assigned read-only bounded membership observation contract feasibility,
+consistent registry+applied membership vs full effective/committed views/leader;
+no new source yet. Must use reviewed allowlist/pure checks, no founder engine changes.
+Existing local docs checkpoints retained for next substantive source PR, not pushed
+solely to create another diagnostic CI. LastmergedPR178; M2OPEN/M3UNCHECKED,
+Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.
+
+Existing CI history recorder executed for main44269052508:603wall/600charged,
+3validatedidlequeuecredit,longest598. Automaticpolicy44270989478SUCCESS.
+New root branch work/m3-membership-observation begins exactgreenmain6f4618c;
+all four unpublished docs checkpoints cherry-picked intact. Prior branch preserved.
+No worktree or C build created. Independent Sol contract scope inspection found
+no separate stronger observation brief: L2 D3/B4 and self-admission following
+kernel apply. Existing anchor_query is intentionally local/advisory and remains
+frozen; a standalone unused wrapper would not fulfill fresh observation.
+
+Sol6.1/high independent scope analysis complete; coordinator approves bounded
+fresh-membership observation adapter plus same-image pure validator, not unused
+scaffolding. Source builder Sol6.1/high assigned consensus module declaration+
+newmodule only, same-source baselinegreen6f4618c. No fresh_read/Owners/anchor_query
+or founder edits, no engine run. [Bounded brief](briefs/m3-fresh-membership-observation.md).
+D-only fmt/Clippy/focused pure tests and independent actual-source review before
+publication. Future live adapter/quorum/race/cancel proof remains separate; no
+production admission authority. Source builder running, no checks claimed yet.
+
+Sol6.1/high builder implemented bounded fresh observation module; final fmt and
+workspaceofflinealltargetClippyPASS, pure7/7PASS incl direct noengine synthetic API
+refusal. Initial2typeinferencecompileerrors fixed before tests; no semanticred.
+[Local evidence](evidence/m3-fresh-membership-observation.md). Independent separate
+Sol6.1/high actualsource review running. No engine/transport/admission credit;
+future live proof remains. Source frozen pendingreview; no publication yet.
+M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged, hardware unverified.
+
+Independent Sol6.1/high actualsource review PASS at1d068d5f; Standards0/Spec0/
+Security0. Verified12artifacthashes; fresh_read/Owners/etc byte-identical; seven
+sync tests no platformhiding. [Review](reviews/m3-fresh-membership-observation-sol61-review.md).
+Three planned pure semanticcontrols executing once each with exactsource restore;
+review applicability conditional on non-doc equality after restoration. No
+production admission/quorum/cancellation/race proof or enginefix credit.
+
+Builder Sol6.1/high completed3designated pure semanticcontrols once each: content,
+authorization and establishedleader omission each compiled and failed intended
+assertion. Coordinator read all logs/diffs/manifests; exactsource restored aftereach,
+Gitblobe925a7e2/SHA256617d60d7... verified; non-doc tree identical to reviewed1d068d5f.
+No postrestore runtime rerun, retained binary is mutant3; hosted will compile restored
+source. Independent review applicability condition satisfied by exactrestore and
+accurate docs-only retention. Ready for normal featurePR, no founder rerun/repair.
+
+## PR179 published; hosted gates running (2026-11-18)
+
+Sol6.1/high coordinator published exactd4bd38b446899a380c16814af745c04cd1a3bb64,
+[PR179](https://github.com/Dytschgo/arxcovo/pull/179), basegreenmain6f4618c.
+Independent Sol6.1/high sourcePASS attributed at
+[review6974011455](https://github.com/Dytschgo/arxcovo/pull/179#issuecomment-6974011455),
+agent-reviewSUCCESS after verifying reviewed1d068d5f->final onlyaccuratedocs,
+non-doc tree/blobs unchanged after3mutant exactrestore. All7purebaselinePASS;
+no postrestoration runtime rerun, hosted compiles restoredsource.
+Normal all-OS [CI44272864519](https://github.com/Dytschgo/arxcovo/actions/runs/44272864519)
+firstattempt running. No old-head rerun/dispatch; new independentM3 source.
+Allfive gates, new7tests actualexecution eachOS, Windows<=660s and freshgreenmain
+required before coordinator merge. No production admission/adapterrace/quorum/
+cancel/hardware credit; Sol3/3 exhausted/Opus0/2 unchanged. M2OPEN/M3UNCHECKED.
+Local pending-run checkpoint intentionally unpushed to avoid redundantCI.
+Existing babysitter untouched. LastmergedPR178/main6f4618c CI44269052508GREEN.
+
+## PR179 Ubuntu pure-history assertion red (2026-11-18)
+
+CI44272864519 attempt1 Ubuntujob134693562006: Rust654/654PASS,new7PASS;
+npm policy tests47PASS/1FAIL, stale historicalcount30 vsactual31 after committed
+mainhistory append. Windows/macOS pending atfirstcapture. Root Sol6.1/high exact
+local test red reproduced31!=30; oneassertion now requires exactappendone relative
+toinitialhistory; fullNode48/48PASS. No engine/founder/policytimeout/quarantine
+change, no rerun/dispatch, countersSol3/3/Opus0/2unchanged. IndependentSol delta
+review pending; hold publication until review and completedoldrun evidence.
+[Evidence](evidence/m3-pr179-history-count-correction.md). Main6f4618c remainsGREEN.
+
+Independent Sol6.1/high correctionPASS, Standards0/Spec0/Security0; exacttestblob
+0d735fd47df5d20882990d28bf473e94bae48fdf. Reviewed red31!=30 and wholeNode48/48PASS,
+allbyte/oldrecord/duplicateguards preserved; productionbudget/runtimeunchanged.
+[Review](reviews/m3-pr179-history-count-sol61-review.md). OldrunWindows stillrunning;
+retain its firstattempt evidence before publishing correction. No PRrerun/dispatch.

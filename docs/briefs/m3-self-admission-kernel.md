@@ -1,12 +1,12 @@
 # M3 self-admission prerequisite: retain authenticated leaf identity
 
-Current checkpoint (2026-11-18): identity prerequisite implemented on green main
-e3e79089; Clippy and pure TLS13 passed, both semantic mutants killed/restored.
-Independent Astra source and B1-B3 guard rechecks pass. Publication preparation
-is ready; exact-public-head review and hosted gates remain pending. Earlier
-policy and implementation holds below are historical. Production self-admission
-is not implemented or accepted by this prerequisite.
-
+Current checkpoint (2026-11-18): identity prerequisite merged as PR178,
+main6f4618c; first-main CI44269052508 attempt1GREEN603wall/600charged.
+Independent Astra source/guard reviews pass; identity3 passed eachOS.
+The founder diagnostic observation was green/no reproduction, no repair credit.
+Production self-admission is not implemented or accepted by this prerequisite.
+Earlier policy and implementation holds below are historical. The next bounded
+source slice is [fresh membership observation](m3-fresh-membership-observation.md).
 Sol 6.1 high, design only, 2026-11-17; no children. Implementation-ready proposal,
 Root and independent Sol contract review complete; source authorization remains
 blocked on policy recovery and fresh exact-main gates.

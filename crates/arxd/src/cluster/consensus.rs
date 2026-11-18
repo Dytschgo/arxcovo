@@ -147,6 +147,7 @@ impl std::error::Error for StartError {}
 mod adapter;
 pub(in crate::cluster) mod anchor_query;
 pub(in crate::cluster) mod issue;
+pub(in crate::cluster) mod membership_observation;
 
 use super::{
     log_store::VoteLogStore,
