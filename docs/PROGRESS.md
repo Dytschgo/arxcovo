@@ -4997,3 +4997,22 @@ runtime, founder diagnostic, retry or additional fix occurred. Resolve that narr
 compatibility scope before implementation. PR182 HOLD/NOFIX, exhausted engine
 Sol3/3 and historical Opus0/2 remain unchanged. M2 OPEN / M3 UNCHECKED;
 unexercised paths remain **unverified on real hardware**.
+
+Next bounded task: independent Sol6.1/high review of
+D:/Temp/arx-clock-scope/fixture-scope-resolution-v2.md, SHA256
+1d9b46a9bca5e6eca1137933d43613aab061d48854ddee80e4390ac4ba2e1319.
+It proposes one explicit checked-trait implementation for the existing private
+found_tests Clock, preserving its legacy implementation and every existing
+test/setup/assertion/timing line. No parallel issuer API or blanket conversion.
+Review is read-only and pending at
+D:/Temp/arx-clock-fixture-scope-review-v2; implementation has not started.
+This resolves the coordinator draft's file allowlist only if reviewed coherent;
+it does not relax the owner's founder diagnostic/fix hold or any attempt limit.
+
+Independent Sol6.1/high fixture-scope review returned Design GO, Standards0 /
+Spec0, at D:/Temp/arx-clock-fixture-scope-review-v2/review.md. Actual call graph
+and module visibility were inspected; P1 is closed by that one explicit test
+implementation. No compiler/runtime claim follows. Authorized next source slice
+is the reviewed checked-clock module and issuer/anchor plumbing with exact
+fixture adaptations, local pure tests/test compilation only, then independent
+source review and normal gates. No live transport/startup or held repair work.
