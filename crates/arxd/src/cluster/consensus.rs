@@ -150,6 +150,7 @@ mod checked_clock;
 pub(in crate::cluster) mod issue;
 pub(in crate::cluster) mod membership_observation;
 mod peer_registry;
+mod peer_transport;
 mod peer_wire;
 
 use super::{

@@ -2,7 +2,9 @@
 
 ## Main CI health and merge prerequisite
 
-**Current main GREEN:** exactff599a2433bc5a34967d965d0f0da2b3a4517cc8 after PR184. First push CI44379630740 attempt1 SUCCESS606wall/603charged/3validatedqueuecredit; Windows602s,Ubuntu280s,macOS265s. Rust709/695/663PASS, Node48 and UI/browser/Electron PASS eachOS; optional Windows sample8PASS, no stability/repair/re-enable credit. Actual policy history entry appended without changing prior records. **Previous verified main GREEN:** exact08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 after PR183, firstCI44351538977 attempt1 SUCCESS641wall/639charged/2validatedqueuecredit; Windows636s,Ubuntu348s,macOS368s. Full M2/v1 acceptance remains incomplete.
+**Current main GREEN:** exacte11b0767f1d108313824a5fd2600516561d70391 after guarded PR185 merge from reviewed7141c1dc. First normal push CI44399330997 attempt1 SUCCESS920wall/827charged/93validatedidle, longestWindowsRust515s. All9jobs SUCCESS; Rust709/695/663PASS, Node60/UI/browser/Electron eachOS PASS. Existing policy history37th record appended preserving previous bytes. No speedup/repair/stability claim. Owner-authorized normal PR182 refresh can proceed; source review/normalfirstCI still required. M2 OPEN/M3 UNCHECKED.
+
+**Previous verified main GREEN:** exactff599a2433bc5a34967d965d0f0da2b3a4517cc8 after PR184. First push CI44379630740 attempt1 SUCCESS606wall/603charged/3validatedqueuecredit; Windows602s,Ubuntu280s,macOS265s. Rust709/695/663PASS, Node48 and UI/browser/Electron PASS eachOS; optional Windows sample8PASS, no stability/repair/re-enable credit. Actual policy history entry appended without changing prior records. **Previous verified main GREEN:** exact08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 after PR183, firstCI44351538977 attempt1 SUCCESS641wall/639charged/2validatedqueuecredit; Windows636s,Ubuntu348s,macOS368s. Full M2/v1 acceptance remains incomplete.
 
 **Previous verified main GREEN:** exactcd8907500dcd89fddc0c659590f962cbf03c7ed5, CI44304025778 attempt1 SUCCESS626wall/624charged/2queuecredit; Windows622s, Ubuntu236s, macOS439s. Registry4/Node48 eachOS PASS; optional Windows sample budget-skipped, no cases. **Previous verified main GREEN:** exact8b36405e932ef2921a3c8d71dbaf7ed001314de7, CI44286225997 attempt1SUCCESS689wall/686charged/3queuecredit, Windows685s/Ubuntu314s/macOS468s. Codec8/Node48eachOSPASS; optionalWindowssample budget-skipped, no cases. Previous main GREEN: exact6bf8f46bc87a05bed01e342c1a37f68427e4c16b, firstCI44276313116 attempt1SUCCESS565wall/563charged/2validatedqueuecredit; Windows561s/Ubuntu288s/macOS419s. New7tests/Node48 eachOS PASS. OptionalWindows8case sample all_pass on this observation only, no stability/re-enable/fix credit. Previous main GREEN: exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
@@ -41,14 +43,15 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## Current state - 2026-11-18
 
-- Last merged: PR184 asff599a2433bc5a34967d965d0f0da2b3a4517cc8 from reviewed a3cf0cd2. All5gates SUCCESS; first corrected-head CI44370386768 attempt1 GREEN627s wall, Windows474s<=660, Ubuntu221s/macOS320s. Fresh exactmain08c4b999/latest CI44351538977 firstattempt SUCCESS and all exact-head gates rechecked19:21:05UTC before guarded squash merge. Merged crates/tools match reviewed head; PR unwatched. Own first mainCI44379630740 attempt1 GREEN606wall/603charged/3queuecredit.
+- Last merged: PR185 ase11b0767f1d108313824a5fd2600516561d70391 from reviewed7141c1dc. Fresh exact-mainff599a24/latest44379630740 firstGREEN and all5exact-headgates checked21:13:59UTC before guarded coordinator squash merge. PR first627wall/622charged/5idle, WindowsRust607<=660; all9jobsSUCCESS. Entire merged tree matches reviewed head, PR unwatched. Own firstmainCI44399330997 attempt1 qualifiedGREEN920wall/827charged/93idle, WindowsRust515s. PR182 normal refresh authorized; merge still gated.
+- Previous merged: PR184 asff599a2433bc5a34967d965d0f0da2b3a4517cc8 from reviewed a3cf0cd2. All5gates SUCCESS; first corrected-head CI44370386768 attempt1 GREEN627s wall, Windows474s<=660, Ubuntu221s/macOS320s. Fresh exactmain08c4b999/latest CI44351538977 firstattempt SUCCESS and all exact-head gates rechecked19:21:05UTC before guarded squash merge. Merged crates/tools match reviewed head; PR unwatched. Own first mainCI44379630740 attempt1 GREEN606wall/603charged/3queuecredit.
 - Previous merged: PR183 as08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 from reviewed29a3317f. All5gates SUCCESS; first PR CI44349045277 GREEN594s wall, Windows589s<=660, Ubuntu291s/macOS464s. Fresh exactmaincd890750/CI44304025778 SUCCESS checked immediately before guarded merge. Resulting exact-main firstCI44351538977 GREEN641s wall/639charged/2queuecredit.
 - Previous merged: PR181 ascd8907500dcd89fddc0c659590f962cbf03c7ed5 from reviewed8e5091b9. All five gates SUCCESS; CI44290836331 attempt1 GREEN598s, Windows594s. Registry4 and Node48 eachOS PASS; optional Windows sample budget-skipped. Premerge exactmain8b36405/CI44286225997 GREEN checked immediately.
 - Current owner-preview delivery: PR183 MERGED and exact-main first CI GREEN. Private D: backend package is prepared/syntax-audited with the reviewed binary; launcher and actual Claude Code acceptance remain UNRUN. This is a backend preview, not completed M2 or fullv1.
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
-- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185) original598firstCI44389444133 all9PASS949wall remains HOLD under its original rule. Prospective validator b0a986f9 firstCI44395332475 hit the same lint error in all3UI jobs; independent review NO-GO1Standards/0Spec. Coordinator corrected only a test reference to globalThis.structuredClone, reproduced before and verified npm lint +60Node tests after. Fresh corrected-head review/normalfirstCI still required. Existing900charged principle/math and strict topology remain; no retrospective credit, engine grant/counter reset. PR182 held; OAuth unchanged.
+- Active work: PR185 merged/unwatched, own firstmain qualifiedgreen. PR182 normal refresh onto exacte11b0767 prepared: all executable paths auto-merged, four doc-only conflicts resolved with latest preserved checkpoints; original transport/test blobs unchanged, exactly five non-doc paths over greenmain. fmt/all-target offline Clippy PASS42.845s, zero local runtime tests. Fresh independent integrated review and normal new-head first CI remain required. No transport/engine fix grant or counter reset; M2/M3/OAuth fences remain.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -5329,3 +5332,96 @@ lint rules, callers, limits/history unchanged. This is correction1 for this
 CI-only lint issue; engine Sol3/3/historicalOpus0/2 unchanged. Fresh corrected-head
 independent review and normal first CI remain mandatory; no source-free retry,
 rerun, dispatch, diagnostic or acceptance credit. Original949 HOLD preserved.
+
+## PR185 corrected lint head reviewed; own first hosted attempt pending
+
+b0 firstCI44395332475 attempt1 reached terminal FAILURE504wall BEFORE corrected
+source was pushed: all3Rust jobs SUCCESS (Windows427s/709PASS, Ubuntu146s/695PASS,
+macOS189s/663PASS; existing36/22/8skip); all3UI jobs failed lint and all3verify
+gates failed closed. All9 bounded logs, exact counts/durations/hashes and terminal
+metadata retained in D:/Temp/arx-ci-split-b0. No cancellation, rerun or dispatch.
+
+Coordinator published7141c1dc81315c6aaf688343741c155d2282f387, linked immediately
+and rewrote PR185 description around the final prospective contract and honest
+failure/correction evidence. Normal firstCI44396900780 attempt1 discovered once,
+incomplete. Fresh independent separate Sol6.1/medium delta review verified the
+single-line correction and reusable policy/workflow/fixture/history identities:
+Standards0/Spec0, source GO. Report/pins D:/Temp/arx-ci-split-lint-review;
+[attestation](https://github.com/Dytschgo/arxcovo/pull/185#issuecomment-6991559983),
+exact-head agent-review success59301105218 after separate live/local rechecks.
+Reviewer ran no tests. Hosted snapshot was incomplete; no acceptance implied.
+
+Keep the existing PR watch; no duplicate watch/polling or new diagnostic run.
+This checkpoint stays unpublished above7141. Need all first-attempt worker/gate
+logs and validated charged<=900 (wall<=900 on invalid metadata), every job<=12m,
+Windows worker<=660 and fresh exact-head/main gates before merge. Then verify
+own exact-main first CI before normal PR182 refresh. No source-free checkpoint
+push, runtime fix, counter reset or M2/M3 acceptance. Original949null HOLD and
+history preserved; engineSol3/3/historicalOpus0/2 unchanged. OAuth/babysitter and
+owner host setup untouched; relevant paths **unverified on real hardware**.
+
+## PR185 qualified first CI and guarded merge; exact-main follow-up
+
+First exact7141CI44396900780 attempt1 SUCCESS627wall/622charged/5validatedidle,
+longestWindowsRust607s. Rust709/695/663PASS (36/22/8skip), Node60 and UI/browser/
+Electron PASS eachOS; all3verify gates SUCCESS. Existing14pureclock+anchor each
+once, issueri6UnixPASS/Windowssourcequarantine unchanged. OptionalWindows8PASS,
+orphans0,33.188s: no stability/repair/re-enable credit. All9 bounded D logs and
+actual source-policy/case/timing proof retained. [Qualified observation](evidence/parallel-ci-pr185-green.md).
+This is no charged/execution reduction over base603/602; no such claim is needed
+or made for a healthy-main budget. Original949HOLD/b0lintFAIL remain preserved.
+
+At21:13:59UTC coordinator freshly verified live mainff599a24/latestCI44379630740
+attempt1SUCCESS, exactPR7141/baseff OPEN/CLEAN, all5gatesSUCCESS, unchanged strict
+protection/enforcedadmins, attestation and separate main-ref reread. Guarded merge
+succeeded ase11b0767f1d108313824a5fd2600516561d70391; actual merged state/main/tree
+verified, fulltree exactly reviewed7141. Unwatched PR185. No rerun/dispatch/bypass.
+
+Own exact-main first normalCI44399330997 attempt1 is incomplete. One bounded
+foreground observation follows that exact push-run handle, without a PR polling
+loop or new CI invocation; observation expiry cannot classify the CI terminal.
+No PR182 refresh until own-main first-green/budget proof. Local source-preserving
+transport refresh preparation can read held branch only. Main history unchanged
+until its real completed measurement; M2OPEN/M3UNCHECKED and exhausted counters
+remain. No founder/engine/native repair or OAuth/host/babysitter action.
+
+## PR185 exact-main first CI qualified; normal PR182 refresh opened
+
+Single observer for exactmaine11b0767 CI44399330997 attempt1 completedSUCCESS.
+All9jobs passed; actualpolicy920wall/827charged/93validatedidle, longest515s.
+Rust Windows709PASS/36skip(515job/209.647body), Ubuntu695/22(192/51.455), macOS663/8
+(304/80.453); Node60 and UI/browser/Electron PASS eachOS. Existing14pureclock+
+anchor once eachOS, issuerUnixPASS/Windowssourcequarantine unchanged. Automatic
+sample8PASS/orphans0/31.906s gives no stability/repair/re-enable credit. All9bounded
+Dlogs, metadata/case/timing/actualpolicy proof retained. [Main evidence](evidence/parallel-ci-main-first-green.md).
+Record37 appended to actual policy history, all previous bytes preserved; no
+old949HOLD/b0FAIL/candidate reclassification. Fullwall920 remains visible.
+
+Fresh remote read confirmed main still e11 and PR182 still open at2e4e0d3f,
+only existing source-review comment, no unhandled new request. Held local48c6022e
+contains only docs above2e; both added evidence/review files match main blobs.
+Owner-authorized refresh may now merge greenmain normally with mechanical
+conflict resolution and preserve all docs; no rebase/forcepush/source-fix reset.
+Transport core/tests/dependency/module addition must retain existing behavior,
+then pure compile/guards and independent actual integration review before new
+normal hosted gates. No local runtime/control/founder/engine/native experiment.
+M2 OPEN/M3 UNCHECKED, engineSol3/3/historicalOpus0/2 unchanged. OAuth unchanged.
+
+## PR182 normal refresh prepared after qualified green main
+
+Coordinator Sol6.1/high normally merged exacte11 into local48c6022e; preserved
+2e4published source and all3localdoc commits as ancestors plus explicit recovery
+ref. All code auto-merged. Four doc conflicts only: latest Progress/history37
+and applicable unpublished CI evidence carried from006ad7e8; ADR28/brief differ
+only in trailing blanks. Old versions/branches/evidence preserved. Exactly five
+non-doc paths over main; core07a81194/test22ae4a91 Git blobs remain identical to
+old reviewed/published source, dependency/module addition unchanged. No source
+repair or new implementation. [Refresh evidence](evidence/m3-pr182-ci-refresh.md).
+
+fmt and workspace all-target Clippy --locked --offline -Dwarnings PASS42.845s,
+explicit D target/home/scratch/cache, Cfree>689GB. No local runtime/control/native/
+founder/engine/client test. Fresh independent integrated-source review and normal
+new-head first CI (32cases eachOS/allgates/Windows<=660/charged<=900/freshmain)
+still mandatory. Original first cancellations/HOLD evidence and exhausted
+engineSol3/3/historicalOpus0/2 unchanged. No rerun/dispatch/forcepush/bypass.
+M2 OPEN/M3 UNCHECKED; relevant paths **unverified on real hardware**. OAuth unchanged.

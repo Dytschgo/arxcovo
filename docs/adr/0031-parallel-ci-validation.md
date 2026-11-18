@@ -1,6 +1,6 @@
 # ADR 0031: parallel Rust and UI validation
 
-Status: prospective budget adaptation implemented; source review and new-head CI pending. Original first attempt held.
+Status: merged as e11b0767; reviewed7141 first CI qualified627wall/622charged, own first-main qualified920wall/827charged/93idle. Original first attempt remains held.
 
 ## Context
 

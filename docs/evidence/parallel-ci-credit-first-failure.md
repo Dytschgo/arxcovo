@@ -34,3 +34,17 @@ dispatch is authorized. Any supersession follows unchanged PR concurrency, and
 unfinished old-head jobs must not be reported as passed. EngineSol3/3 and
 historicalOpus0/2 unchanged; M2 OPEN/M3 UNCHECKED, relevant paths **unverified on
 real hardware**. OAuth, host setup and babysitter untouched.
+
+## Terminal follow-up before corrected-source publication
+
+The old b0 attempt completed FAILURE in504 seconds wall before7141c1dc was
+pushed. Rust Windows427s/709PASS, Ubuntu146s/695PASS and macOS189s/663PASS, with
+existing36/22/8skips. All three UI jobs failed lint, and all three verify gates
+failed closed. All nine logs and final metadata/counts/durations/hashes are now
+retained under the same D root in all-log-manifest.json and
+final-execution-proof.json. No supersession cancellation occurred.
+
+Corrected7141c1dc received fresh independent Sol6.1/medium Standards/Spec GO,
+[attestation](https://github.com/Dytschgo/arxcovo/pull/185#issuecomment-6991559983)
+and agent-review success59301105218. Its normal first CI44396900780 is a separate
+incomplete observation; this source review does not establish hosted acceptance.
