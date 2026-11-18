@@ -4646,3 +4646,10 @@ The separate Sol6.1/high learner-fixture design returned only D: draft files,
 with exact seed/RPC/ownership values and explicit sender/prebound-listener seams
 still needing review. All builds/tests/runtime there remain UNRUN. Preserve that
 design for review after the current CI integration fix; no new source authority.
+
+Related-assertion impact search also found a stale schema3 expectation after
+successful hot-journal reopen in store/crash_tests.rs. Corrected only that literal
+to4; native child/recovery remains UNRUN locally and requires hosted execution.
+All journal, integrity, rollback and privacy oracles remain. The separate damaged
+v3 migration rollback expectation stays3 intentionally. No additional runtime or
+native attempt follows from this test expectation correction.

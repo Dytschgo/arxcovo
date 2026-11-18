@@ -40,6 +40,12 @@ The two demonstrated integration corrections are deliberately narrow:
 - Expect schema 4 in the response-only test, retaining every behavior/privacy/
   column assertion. Do not change the schema or fixture permissions.
 
+A related-assertion search found the same stale expected 3 after successful
+hot-journal reopen in store/crash_tests.rs. It is also updated to 4, with recovery,
+journal, privacy and integrity assertions unchanged. That native child/recovery
+case is UNRUN locally and must execute in the normal hosted suite. The remaining
+expected 3 in damaged-v3 rollback is intentional and retained.
+
 Coordinator Sol 6.1/high applied those test-only corrections. Local focused
 response-table plus three SDK regressions: **4 PASS** (22.636 s command / 7.87 s
 body). Windows all-target workspace Clippy with -D warnings PASS (6.078 s), fmt
