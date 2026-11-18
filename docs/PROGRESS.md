@@ -3795,3 +3795,10 @@ refusal. Initial2typeinferencecompileerrors fixed before tests; no semanticred.
 Sol6.1/high actualsource review running. No engine/transport/admission credit;
 future live proof remains. Source frozen pendingreview; no publication yet.
 M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged, hardware unverified.
+
+Independent Sol6.1/high actualsource review PASS at1d068d5f; Standards0/Spec0/
+Security0. Verified12artifacthashes; fresh_read/Owners/etc byte-identical; seven
+sync tests no platformhiding. [Review](reviews/m3-fresh-membership-observation-sol61-review.md).
+Three planned pure semanticcontrols executing once each with exactsource restore;
+review applicability conditional on non-doc equality after restoration. No
+production admission/quorum/cancellation/race proof or enginefix credit.
