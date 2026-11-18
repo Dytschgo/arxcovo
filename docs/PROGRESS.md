@@ -3649,3 +3649,7 @@ Root verified exacthead14d94c61/currentmain05b9c829/greenmainrun44212212325, ind
 ### PR176 first-main acceptance checkpoint - 2026-11-18
 
 Root actively awaited CI44229539357 exit0 and bounded/read retained full3OSlogs. All query proofs/founder13 passed; exact main e3e79089 verified. Pure charged-v1 calculation648wall/645charged/3credit, automaticpolicy44230812083success. No diagnosticrecordvisible on passing tests, so no phase/cause/overlap claim. Identity builder continues independently; next actualsource review must preserve mergedquery guard/inventories. Evidence D:/Temp/arx-pr176-14d94c61-hosted/main.
+
+### Identity integration and disk-resource disposition - 2026-11-18
+
+Sol6.1/high sourcea7596271/evidencea4d3bf8c: Clippy andstaticchecks passed, sole TLSinvocation failedduringcompile with Cfull, zero tests/mutants ran. Currentreadonlydriveinspection C~15.5GBfree,D~2.79TBfree; no cache deletion. Root integrated onto main e3e79089 (firstCI44229539357green648wall645charged), preserving3identitysourceblobs and AST-equal existingmain guardfunctions/classes. Additiveidentityguard gives9PASS. New validation grant places CargoHome/target/TMP/logs onD, preserves oldCbuild/logs, then permits one TLSbaseline plus designatedmutants afterpass. This is compile-infrastructure continuation, no failedtest rerun. IndependentAstraactualdiff review precedes publication. M2openM3unchecked/countersunchanged/hardware **unverified on real hardware**.
