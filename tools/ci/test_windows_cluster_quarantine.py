@@ -532,6 +532,7 @@ def assert_identity_inventory(source, tls, pki):
         (tls, 'authenticated_identity_tests', '#[cfg(test)]\n#[path = "authenticated_identity_tests.rs"]\nmod authenticated_identity_tests;'),
     ):
         assert parent.count(binding) == 1
+        assert len(re.findall(r"(?m)^" + re.escape(binding), parent)) == 1
         assert parent.count('mod ' + name + ';') == 1
         prefix = parent.split('mod ' + name + ';')[0]
         attrs = re.search(r'((?:#\[[^\]]*\]\s*)+)$', prefix)
@@ -576,6 +577,7 @@ class IdentityInventoryTests(unittest.TestCase):
                                 '/*\n' + binding + '\n*/',
                                 '#[cfg(unix)]\n' + binding,
                                 binding.replace('#[cfg(test)]', ''),
+                                binding.replace('#[cfg(test)]', '// #[cfg(test)]'),
                                 binding.replace('authenticated_identity_tests.rs', 'absent.rs')):
                 if replacement == binding:
                     continue
