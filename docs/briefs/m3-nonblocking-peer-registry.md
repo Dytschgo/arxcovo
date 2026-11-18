@@ -12,7 +12,7 @@ On eachcall upgrade weak; absent=>VerifyRefusal::Unavailable. Use try_lock only;
 contention and Mutex poisoning=>Unavailable without recovering the poisonedguard. Call
 actual state().authorize_peer(cluster,node,key) while holding this localguard,
 mapping WrongCluster/NotMember/KeyMismatch to existing staticrefusals. Dropguard
-and temporarystrongstore before completion. No explicit query or persistence I/O, await, queue, retry, clock or tasks; no 
+and temporarystrongstore before completion. No explicit query or persistence I/O, await, queue, retry, clock or tasks; no
 newcapacity. Lookup uses existing boundedregistry. Publicfactory/rawidentity notadded.
 
 Storecontention may reject a legitimate handshake: explicit fail-closed availability
