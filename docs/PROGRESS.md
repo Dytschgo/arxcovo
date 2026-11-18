@@ -48,7 +48,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: PR182 required cancellations/Windows feature gate, no fix authority. M2 production Native intentionally refuses pending native qualification/Stage G; owner setup alone does not enable builds. M2PCnative work awaits owner-created Standardaccount/verifiedcaps/reserves; Linux-onlyA7/A11 andA12pending. M3 liveTLS ownership/realtransport/startup/join/custody/clock/containeracceptance remain. Sol3/3exhausted/Opus0/2unchanged; hardware **unverified on real hardware**.
-- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185) first CI44389444133 attempt1 at59800c76 passed all9jobs but took949s wall: HOLD under its initial900wall rule despite all5requiredgreen. Logs/counts/times retained. Fresh independent Sol6.1/high disposition recommends a prospective exact-nine-job adaptation of existing charged-v1, keeping900 threshold/math and strict gate timestamps; implementation/new review/new-head first attempt pending. Old source GO does not cover the amendment, and the949 result is not retroactively credited. PR182 remains held, no engine fix grant/counter reset. OAuth unchanged.
+- Active CI work: [PR185](https://github.com/Dytschgo/arxcovo/pull/185) original598firstCI44389444133 all9PASS949wall remains HOLD under its original rule. Prospective validator b0a986f9 firstCI44395332475 hit the same lint error in all3UI jobs; independent review NO-GO1Standards/0Spec. Coordinator corrected only a test reference to globalThis.structuredClone, reproduced before and verified npm lint +60Node tests after. Fresh corrected-head review/normalfirstCI still required. Existing900charged principle/math and strict topology remain; no retrospective credit, engine grant/counter reset. PR182 held; OAuth unchanged.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
@@ -5310,3 +5310,22 @@ D:/Temp/arx-ci-split-credit-builder. Original949null-policy HOLD, history,
 workflow/callers/evaluator/source guards unchanged. Coordinator inspected the
 actual diff/tests/fixture and report. Fresh independent exact-head review and
 normal new-head hosted measurement still mandatory; no retroactive adoption.
+
+## Prospective CI validator: new-head lint finding and bounded correction
+
+Published b0a986f9 with genuine policy source changes, immediate link and updated
+PR185 description; its normal firstCI44395332475 attempt1 was discovered once.
+Fresh independent Sol6.1/high reviewer withheld attestation when all3UI jobs
+failed lint. Bounded D logs establish one shared no-undef at policy.test.mjs:198;
+no Node test/browser/desktop behavior ran after that lint failure. First snapshot
+had Rust Ubuntu success and Windows/macOS still running; no final runtime count
+claimed. [Failure/correction evidence](evidence/parallel-ci-credit-first-failure.md).
+
+Reviewer NO-GO: Standards1 (bare structuredClone), Spec0. Coordinator acknowledged
+the missing local lint check, reproduced the failure once, changed exactly one
+test identifier to existing globalThis.structuredClone, then npm lint PASS2.780s
+and Node60/60 PASS6.153s, diff check PASS. Production policy, fixture, workflow,
+lint rules, callers, limits/history unchanged. This is correction1 for this
+CI-only lint issue; engine Sol3/3/historicalOpus0/2 unchanged. Fresh corrected-head
+independent review and normal first CI remain mandatory; no source-free retry,
+rerun, dispatch, diagnostic or acceptance credit. Original949 HOLD preserved.

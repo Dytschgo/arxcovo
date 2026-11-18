@@ -195,7 +195,7 @@ test('exact-nine preserves attempt, run, repository and SHA trust for run and al
     ['run_started_at', null], ['run_started_at', '2026-02-30T00:00:00Z'],
     ['updated_at', iso(604801)], ['updated_at', iso(-1)], ['updated_at', '2026-01-01T00:20:00.000Z'],
   ]) {
-    const data = splitSample(); const listed = structuredClone(data.run); data.run[key] = value;
+    const data = splitSample(); const listed = globalThis.structuredClone(data.run); data.run[key] = value;
     const result = queueMeasurement(duration(listed), data.run, data.jobs, listed, 'main');
     assert.equal(result.credit, 'unavailable:run-invalid', `run.${key}`);
     assert.equal(result.chargedSeconds, null);
