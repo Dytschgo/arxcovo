@@ -2,7 +2,7 @@
 
 ## Main CI health and merge prerequisite
 
-**Previous main GREEN; new main6f4618c CI44269052508 pending after PR178:** exact `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
+**Current main GREEN:** exact6f4618c76256c2ead9dfb501c2c3946fde14a81b, first CI44269052508 attempt1SUCCESS603s wall; Windows598s/Ubuntu224s/macOS427s. Identity3/observer3/founder1 eachOS PASS. No refusal reproduction or repair credit. OptionalWindows sample skipped_budget, no sample case credit. Previous green: `e3e79089e6c36f6483cb3db8842e5894f26ee00d`
 after PR176, reviewed head14d94c61. First-attempt CI44229539357 passed:
 648s wall,645s charged,3s validated idle queue credit; Windows643s,
 Ubuntu343s/macOS447s. Query engine proof passed each OS (0.143s/0.278s/1.215s,
@@ -40,7 +40,7 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR178 as6f4618c76256c2ead9dfb501c2c3946fde14a81b from reviewed11a34312. Allfive gates passed; CI44267088243 attempt1SUCCESS633s, Windows629s. Identity3/observer3 passed eachOS. Premerge exactmain e3e79089/CI44229539357 GREEN verified.
-- Current work: resulting exact-main CI44269052508 running. Feature merges held until this exact run is GREEN. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
+- Current work: exact-main CI44269052508 first-attemptGREEN603s confirmed. Continue independent M3 membership observation prerequisite underADR0023. Founder refusal did not reproduce; late prediction unresolved, no fix/stability credit and no further founder run authorized.
 - Blockers: M2 owner/hardware acceptance incomplete; M3 admission/transport/discovery/removal authority/custody/clock and production integration remain. Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3757,3 +3757,15 @@ PR178 lastmerged; resulting exact-main CI pending, feature merges held for it.
 solely to start more CI. Next: verify first-main outcome, then independent M3 work
 under ADR0023; no further founder diagnostic/repair without fresh steering.
 M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.
+
+## Green main; next independent M3 prerequisite (2026-11-18)
+
+Sol6.1/high exactmain6f4618c CI44269052508 attempt1GREEN603s, Windows598s;
+identity3/observer3 and founder1 eachOS PASS. OptionalWindows sample budget-skipped,
+zero cases. Bounded D logs/hashes in PR178 merge evidence. No rerun/dispatch/fix.
+Sol6.1/high assigned read-only bounded membership observation contract feasibility,
+consistent registry+applied membership vs full effective/committed views/leader;
+no new source yet. Must use reviewed allowlist/pure checks, no founder engine changes.
+Existing local docs checkpoints retained for next substantive source PR, not pushed
+solely to create another diagnostic CI. LastmergedPR178; M2OPEN/M3UNCHECKED,
+Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.

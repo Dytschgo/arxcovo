@@ -33,3 +33,24 @@ No bypass/admin/forcepush/protection changes. Resulting exact-main CI still pend
 Do not claim new main GREEN until its own first attempt completes. LastmergedPR178;
 M2OPEN/M3UNCHECKED, Sol3/3 exhausted, historicalOpus0/2 unchanged.
 Hardware **unverified on real hardware**. Existing babysitter untouched.
+
+## Exact-main verification — 2026-11-18
+
+Sol6.1/high coordinator verified CI44269052508 attempt1 completedSUCCESS on exact
+live main6f4618c76256c2ead9dfb501c2c3946fde14a81b. Started08:40:38Z, completed08:50:41Z:
+603s wall; jobs Windows598s, Ubuntu224s, macOS427s. All job conclusionsSUCCESS.
+No queue-credit claim made from these timestamps. Bound each job log read to8MiB;
+actual sizes Windows404158, Ubuntu419658, macOS383265 bytes. Logs retained only
+at D:/Temp/arx-pr178-main-6f4618c (no raw logs committed).
+Verified exact PASS counts: identity3 and observer3 eachOS, founder proof1eachOS.
+Full nextest Windows655passed/36skipped, Ubuntu647passed/22skipped, macOS615passed/8skipped.
+Founder Windows0.905s/Ubuntu0.119s/macOS0.287s. No postshutdown refusal rows; cause
+still unreproduced/unfixed, late prediction unresolved, no stability credit.
+OptionalWindows sample push skipped_budget e_s606; guard60PASS, zero sample cases.
+No rerun/dispatch/repair. Main green removes its merge hold only; M2OPEN/M3UNCHECKED.
+Sol3/3 exhausted, historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
+
+Main logSHA256:
+windows.log41bb88ad67f99276a263922ce5aec565c2718a294dce3f48460398f40e8cee50
+ubuntu.log05ac16bb5cbb4d3249031397328e9e6869e77cf3c928f925a1939166084b3178
+macos.log07bb07134436fb9c6c5b7da92701de148738409ae76c6fb7fab3bc9ccb8c874b
