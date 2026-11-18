@@ -40,3 +40,28 @@ another diagnostic run solely for documentation. This callback is a transport
 prerequisite only: M2 OPEN / M3 UNCHECKED; hardware **unverified on real hardware**.
 Sol3/3 exhausted and historical Opus0/2 unchanged. No engine fix, diagnostic
 rerun, dispatch, timeout/quarantine change or native owner-PC test.
+
+## Exact-main first-attempt confirmation
+
+Exact main `cd8907500dcd89fddc0c659590f962cbf03c7ed5` passed
+[CI44304025778](https://github.com/Dytschgo/arxcovo/actions/runs/44304025778)
+on attempt 1. 12:27:04–12:37:30Z: 626 seconds wall, 624 charged and two seconds
+validated idle queue credit under the existing recorder. Windows 622 seconds,
+Ubuntu 236 seconds, macOS 439 seconds. The history record was appended through
+the unchanged `scripts/ci-budget.mjs --record`; no policy override.
+
+Each OS ran all four named registry tests successfully and Node 48/48. Full Rust:
+Windows 674 passed / 36 skipped, Ubuntu 666 / 22, macOS 634 / 8. Optional Windows
+sample was `skipped_budget`, e_s=631: no cases or diagnostic credit. No rerun or
+dispatch. Bounded per-job logs at `D:/Temp/arx-pr181-main-cd890750`:
+
+| File | Job | Bytes | SHA256 |
+| --- | ---: | ---: | --- |
+| windows.log | 134800790689 | 246329 | 12042828966d6fcfec5c1398f74d0c3d2f468518d0300e058c875138db52f067 |
+| ubuntu.log | 134800790871 | 251386 | b63050da082fa3ed8fd27cc7f38637f74fdc8b4248e3aef774f251a17597219e |
+| macos.log | 134800790196 | 232568 | 8c91c99b2d2d23cd6175a6062f1c3dff2c2faed1d9ceb986c1969ee829dd6051 |
+
+This closes the one-time PR181 exact-main followup. Continue the independently
+reviewed owned-TLS prerequisite; M2 OPEN / M3 UNCHECKED and all prior stop rules
+remain. No live transport, container or hardware acceptance follows from callback
+CI success.
