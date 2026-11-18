@@ -4398,3 +4398,58 @@ M2 OPEN / M3 UNCHECKED. Dedicated/service/elevated/VM/Linux paths remain
 **unverified on real hardware**. The optional dedicated setting is unavailable;
 it never falls back. No admin, Lab Manager, VM, cache deletion, user-data or
 babysitter action occurred. The full v1 goal remains active.
+
+Owner routing update (2026-11-18): if the next tests for this current-user
+implementation fail, give Opus 5.5 the exact failure evidence for a bounded
+implementation attempt. This is the owner's explicit exception to Claude-only-UI
+routing for this task. No Opus attempt has started. Existing engine Sol 3/3,
+historical Opus 0/2, PR182 HOLD/NOFIX and all host/data/admin fences are unchanged.
+The fresh independent Sol 6.1/high review targets committed `ba959133`; source
+is frozen while it runs. No test rerun or new CI dispatch follows from this note.
+
+Smoke preparation is now complete at
+`D:/Temp/arx-current-user-smoke-20261118-v1`: fresh owner-private task directories,
+ephemeral synthetic-agent credentials, omitted-mode normal config, and separate
+explicit dedicated-choice config. Read-only checks confirm current-user owner/
+DACL, local identity pins, credential hash agreement, no HTTP, D: child scratch,
+no existing activity database and the binary hash matching the frozen manifest.
+Sanitized `preparation-proof.json` records those booleans and C: free
+52,801,110,016 bytes. No daemon or child command has started. The real journey
+still awaits the exact-source review gate; no milestone credit is taken.
+
+## Current-user production observation; Opus escalation authorized
+
+Independent Sol 6.1/high [second review](reviews/windows-execution-choice-second-review.md)
+at exact `ba959133` closes S1 migration coverage but keeps F1 OPEN: rmcp 3.9.0
+detaches request handlers, so joining connection tasks alone does not fence a
+handler paused between its started-row commit and dispatch registration. Pending
+workers are now tracked correctly, but admission is not yet synchronized with
+shutdown. Source acceptance/merge remains NO-GO. The reviewer separately permits
+the bounded production smoke with a finite outer deadline.
+
+Coordinator ran that genuine production observation once with a 90-second outer
+deadline, exact binary SHA-256 `e856d8381f5a2a56582a2d4b25cc8d67f54cbb7ce2ca06c05b25d9fe0fe62829`,
+fresh private D: fixtures and no policy bypass. Current-user inventory, actual
+`cargo --version`, actual Job identity/cleanup, correlated durable terminal row,
+privacy fields and persistence across forced daemon restart all passed. Forced
+stop followed observed terminal commit/child cleanup; graceful shutdown was not
+proved. This Python client is not Claude Code acceptance.
+
+The combined observation is FAIL (exit 1, driver 0.828 s; outer wall 0.990 s):
+the subsequent dedicated fixture daemon refused startup. Inspection establishes
+that the synthetic fixture account has 21 characters against the documented
+maximum 20. This is invalid test input, not evidence of a dedicated-backend
+runtime defect. No retry or silent fixture repair was performed. Sanitized
+`report.json`, `outer-outcome.json`, `failure-disposition.json` and hash manifest
+are retained in `D:/Temp/arx-current-user-smoke-20261118-v1`; private configs are
+not copied into evidence. All launched handles were stopped. C: free at the
+failure checkpoint was 51,484,405,760 bytes; scratch stayed on D:.
+
+The owner's conditional Opus 5.5 request now applies to the failed combined test.
+Give Opus the exact static F1 evidence and failed observation for one bounded
+current-user lifecycle correction, with a deterministic real SDK pre-dispatch
+regression required before claiming closure. A fresh valid-input fixture may be
+prepared separately, preserving v1 evidence; no runtime replay before review.
+This is current-user work under the explicit routing exception. PR182 HOLD/NOFIX,
+engine Sol 3/3 exhausted, historical Opus 0/2 and all native/admin/data fences
+remain unchanged. M2 OPEN / M3 UNCHECKED; the full v1 objective remains active.
