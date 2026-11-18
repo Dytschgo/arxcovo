@@ -40,8 +40,8 @@ PR145 was merged after the first red main run without accounting for it; the coo
 ## Current state - 2026-11-18
 
 - Last merged: PR176 as e3e79089 from reviewed14d94c61, normal five-gate merge; first-main CI44229539357 green648wall/645charged, query proof and founder13 eachOS.
-- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Sol6.1 high is preparing an unapplied two-slot post-shutdown observation patch; no rerun or runtime correction authorized.
-- Blockers: no current CI hold. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
+- Current work: PR178 head363d5320 is held after Windows CI44262803622 failed existing anchored_preproof_single_voter during found(). Trace records final WaitElapsed with proposal pending after leaderwait used about4.55s; cleanup returnedOk. Ubuntu/macOS passed all3 new identity tests; Windows identity3 unrun. Astra disposition a60df7dd confirms successful submission and no owner-observed responder outcome at capture; commit/apply timing remains unknown. Owner fresh recovery steering authorizes applying the prepared two-slot diagnostic, D-only compile/pure checks, independent actual-source review and one new-source first-attempt hosted observation. Applied locally; fmt/Clippy/observer7/guard9 pass, Astra review pending. No rerun or runtime correction authorized.
+- Blockers: PR178 is held after Windows founder refusal; diagnostic review and first-attempt all-OS evidence pending. M2 owner/hardware acceptance remains incomplete; M3 still needs admission/transport/discovery/removal authority/custody/clock contracts and production integration. Historical founder refusal cause unresolved; sharedSol3/3/historicalOpus0/2 unchanged. Hardware **unverified on real hardware**.
 
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
@@ -3704,3 +3704,17 @@ No cache/user/LabManager/VM data removed.
   Patch fdc45d75c0e24bc1e0bc74c9182944fd718e89880b68c20c7b86cedc3545d7fd
   remains unapplied. Owner grant for source/compile/new diagnostic CI remains
   pending; PR178 held. No new C: output or runtime fix attempt.
+
+## Autonomous recovery diagnostic application (2026-11-18)
+
+Owner fresh steering authorizes prepared diagnostic application/compile/purechecks,
+independent actual-source review and one new-source first-attempt hosted observation.
+Sol6.1/high coordinator confirmed full-access and clean35272c19, applied retained
+patch plus four-field cleanup test advisory. D-only fmt/ClippyPASS; corrected pure
+observer filter7/7PASS (initial filter selected0, no credit); quarantineguard9PASS.
+No local engine, runtimefix, timeout/quarantine changes or newfixattempt. Source
+review Astra6.2/high pending; PR178 remains held until reviewed publication and
+allfive gates/new identity3 eachOS/Windows<=660s/freshgreenmain. Full details and
+artifact hashes: [application](evidence/m3-founder-postshutdown-application.md).
+LastmergedPR176 unchanged; M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged.
+Hardware **unverified on real hardware**. Existing babysitter left intact.
