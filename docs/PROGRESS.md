@@ -3778,3 +3778,12 @@ No worktree or C build created. Independent Sol contract scope inspection found
 no separate stronger observation brief: L2 D3/B4 and self-admission following
 kernel apply. Existing anchor_query is intentionally local/advisory and remains
 frozen; a standalone unused wrapper would not fulfill fresh observation.
+
+Sol6.1/high independent scope analysis complete; coordinator approves bounded
+fresh-membership observation adapter plus same-image pure validator, not unused
+scaffolding. Source builder Sol6.1/high assigned consensus module declaration+
+newmodule only, same-source baselinegreen6f4618c. No fresh_read/Owners/anchor_query
+or founder edits, no engine run. [Bounded brief](briefs/m3-fresh-membership-observation.md).
+D-only fmt/Clippy/focused pure tests and independent actual-source review before
+publication. Future live adapter/quorum/race/cancel proof remains separate; no
+production admission authority. Source builder running, no checks claimed yet.
