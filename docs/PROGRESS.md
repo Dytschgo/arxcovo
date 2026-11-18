@@ -3983,3 +3983,11 @@ inbounddeadlinepolicy remainsneeded. No callback/transport implementation or tes
 Current purecodec source draft validating; initialClippy hadtypeAPI compileerrors,
 mechanicallycorrected withinnewmodule beforesemanticexecution. Independent Sol
 actualsourcereview started; no runtimefix/counterreset.
+
+Sol6.1/high builder completedpurecodec exact2sourcepaths. Finalfmt/ClippyPASS,
+focused8/8PASS32.420s inclcompile; initial6derivedOpenRaftgenerics compileerrors
+mechanicallycorrected beforetests, no semanticred. Sourcefrozenblobs8fc25217/
+b0a2b564, independentSol6.1 actualreviewrunning; no mutantsyet. [Evidence](evidence/m3-peer-wire-v1.md).
+No engine/runtime/socket/TLS/transport/container acceptance; no timeoutrepairclaim,
+Sol3/3exhausted/Opus0/2unchanged. PR180oldheadWindowscancelledgate stillretained;
+no sourcepublication until independentreview and plannedsemanticcontrols.
