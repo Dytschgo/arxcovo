@@ -4233,3 +4233,12 @@ Corrected --lib target is required for the first actual focused transport run;
 no test is being repeated by correcting a zero-execution target. Same-term/higher-
 node HigherVote advisory can be added before that run. EngineSol3/3 exhausted and
 Opus0/2 unchanged; no founder diagnostic/fix/rerun, settings or quarantine change.
+
+First actual owned TLS library baseline PASS31/31,0failed/ignored,670filtered;
+35.469s total,33.30compile/1.75test. Finalfmt PASS (duration not captured),
+workspacealltargetsClippy PASS4.438s. Root verified29artifact hashes/sizes and all
+5sourcehashes, exact module-only base restoration. [Evidence](evidence/m3-owned-tls-append.md).
+Wrong-target zero-execution log retained without credit. Final source review now
+pending, including builder-flagged aborted-but-unjoined cancellation qualification
+(no nonempty JoinSet assertion atCloseAborted). No controls/hosted check/merge yet.
+M2 OPEN/M3 UNCHECKED; source frozen, engine counters and all owner fences intact.
