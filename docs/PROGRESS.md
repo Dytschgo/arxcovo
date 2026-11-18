@@ -3684,3 +3684,16 @@ Deletion allowlist, recorded BEFORE deletion (one task-owned output only):
 No other directory has been admitted for deletion. No user/cache/LabManager/VM
 data is included. Remaining old worktrees have unmerged source/evidence and are
 not disposable build output. Post-cleanup free space and owner notice pending.
+
+### C: cleanup result
+
+The single allowlisted build directory was removed with native PowerShell
+Remove-Item -LiteralPath after exact absolute-path and reparse checks. Removal
+completed; adjacent cargo-home and logs still exist. Source/Git worktree retained.
+After cleanup: C: free15,358,304,256 bytes; D: free2,788,865,662,976 bytes.
+Observed C: increase3,422,179,328 bytes is a whole-volume measurement; concurrent
+activity prevents attributing all of it to the2,392,806,227 logical-byte target.
+C: remains near full. Owner informed: further non-agent cleanup is an owner
+action. No other deletion authorized by provenance in this audit. Future build
+outputs and agent worktrees must use D:; no new C: worktree will be launched.
+No cache/user/LabManager/VM data removed.
