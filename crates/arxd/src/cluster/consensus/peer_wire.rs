@@ -57,7 +57,7 @@ pub(super) struct Header {
     pub(super) kind: Kind,
     pub(super) payload_len: usize,
 }
-fn parsed<T>(r: Result<T, StoreError>) -> Result<T, WireError> {
+pub(super) fn parsed<T>(r: Result<T, StoreError>) -> Result<T, WireError> {
     r.map_err(|_| WireError::Malformed)
 }
 
@@ -139,7 +139,7 @@ fn body(bytes: &[u8], kind: Kind) -> Result<(Route, &[u8]), WireError> {
         bytes.get(HEADER_LEN..end).ok_or(WireError::Malformed)?,
     ))
 }
-fn put_id(out: &mut Vec<u8>, value: Id) -> Result<(), WireError> {
+pub(super) fn put_id(out: &mut Vec<u8>, value: Id) -> Result<(), WireError> {
     if value.index > i64::MAX as u64 {
         return Err(WireError::Limit);
     }
@@ -148,7 +148,7 @@ fn put_id(out: &mut Vec<u8>, value: Id) -> Result<(), WireError> {
     out.extend(value.index.to_be_bytes());
     Ok(())
 }
-fn get_id(r: &mut Reader<'_>) -> Result<Id, WireError> {
+pub(super) fn get_id(r: &mut Reader<'_>) -> Result<Id, WireError> {
     let p = LogPos {
         term: parsed(r.u64())?,
         leader: parsed(r.u64())?,
@@ -159,26 +159,26 @@ fn get_id(r: &mut Reader<'_>) -> Result<Id, WireError> {
     }
     Ok(id(p))
 }
-fn put_optional(out: &mut Vec<u8>, value: Option<Id>) -> Result<(), WireError> {
+pub(super) fn put_optional(out: &mut Vec<u8>, value: Option<Id>) -> Result<(), WireError> {
     out.push(u8::from(value.is_some()));
     if let Some(value) = value {
         put_id(out, value)?;
     }
     Ok(())
 }
-fn get_optional(r: &mut Reader<'_>) -> Result<Option<Id>, WireError> {
+pub(super) fn get_optional(r: &mut Reader<'_>) -> Result<Option<Id>, WireError> {
     if parsed(r.flag())? {
         Ok(Some(get_id(r)?))
     } else {
         Ok(None)
     }
 }
-fn put_vote(out: &mut Vec<u8>, value: Vote<LeaderId>) {
+pub(super) fn put_vote(out: &mut Vec<u8>, value: Vote<LeaderId>) {
     out.extend(value.leader_id.term.to_be_bytes());
     out.extend(value.leader_id.node_id.to_be_bytes());
     out.push(u8::from(value.committed));
 }
-fn get_vote(r: &mut Reader<'_>) -> Result<Vote<LeaderId>, WireError> {
+pub(super) fn get_vote(r: &mut Reader<'_>) -> Result<Vote<LeaderId>, WireError> {
     Ok(vote(StoredVote {
         term: parsed(r.u64())?,
         node: parsed(r.u64())?,
@@ -246,6 +246,12 @@ pub(super) fn encode_request(
     route: Route,
     request: &AppendEntriesRequest<Arx>,
 ) -> Result<Vec<u8>, WireError> {
+    let payload = encode_append_body(request)?;
+    frame(route, Kind::AppendRequest, &payload)
+}
+pub(super) fn encode_append_body(
+    request: &AppendEntriesRequest<Arx>,
+) -> Result<Vec<u8>, WireError> {
     if request.entries.len() > crate::cluster::log_store::MAX_APPEND {
         return Err(WireError::Limit);
     }
@@ -271,12 +277,15 @@ pub(super) fn encode_request(
         );
         payload.extend(bytes);
     }
-    frame(route, Kind::AppendRequest, &payload)
+    Ok(payload)
 }
 pub(super) fn decode_request(
     bytes: &[u8],
 ) -> Result<(Route, AppendEntriesRequest<Arx>), WireError> {
     let (route, bytes) = body(bytes, Kind::AppendRequest)?;
+    Ok((route, decode_append_body(bytes)?))
+}
+pub(super) fn decode_append_body(bytes: &[u8]) -> Result<AppendEntriesRequest<Arx>, WireError> {
     let mut r = Reader(bytes);
     let vote = get_vote(&mut r)?;
     let prev_log_id = get_optional(&mut r)?;
@@ -297,17 +306,17 @@ pub(super) fn decode_request(
     if !r.0.is_empty() {
         return Err(WireError::Malformed);
     }
-    Ok((
-        route,
-        AppendEntriesRequest {
-            vote,
-            prev_log_id,
-            entries,
-            leader_commit,
-        },
-    ))
+    Ok(AppendEntriesRequest {
+        vote,
+        prev_log_id,
+        entries,
+        leader_commit,
+    })
 }
 pub(super) fn encode_reply(route: Route, reply: &AppendResult<Arx>) -> Result<Vec<u8>, WireError> {
+    frame(route, Kind::AppendReply, &encode_append_reply_body(reply)?)
+}
+pub(super) fn encode_append_reply_body(reply: &AppendResult<Arx>) -> Result<Vec<u8>, WireError> {
     let mut payload = Vec::new();
     match reply {
         Ok(accepted) => {
@@ -323,10 +332,13 @@ pub(super) fn encode_reply(route: Route, reply: &AppendResult<Arx>) -> Result<Ve
             put_vote(&mut payload, *vote);
         }
     }
-    frame(route, Kind::AppendReply, &payload)
+    Ok(payload)
 }
 pub(super) fn decode_reply(bytes: &[u8]) -> Result<(Route, AppendResult<Arx>), WireError> {
     let (route, bytes) = body(bytes, Kind::AppendReply)?;
+    Ok((route, decode_append_reply_body(bytes)?))
+}
+pub(super) fn decode_append_reply_body(bytes: &[u8]) -> Result<AppendResult<Arx>, WireError> {
     let mut r = Reader(bytes);
     let reply = match parsed(r.bytes(1))?[0] {
         0 => Ok(get_optional(&mut r)?),
@@ -340,7 +352,7 @@ pub(super) fn decode_reply(bytes: &[u8]) -> Result<(Route, AppendResult<Arx>), W
     if !r.0.is_empty() {
         return Err(WireError::Malformed);
     }
-    Ok((route, reply))
+    Ok(reply)
 }
 
 #[cfg(test)]
