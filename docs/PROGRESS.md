@@ -3697,3 +3697,10 @@ C: remains near full. Owner informed: further non-agent cleanup is an owner
 action. No other deletion authorized by provenance in this audit. Future build
 outputs and agent worktrees must use D:; no new C: worktree will be launched.
 No cache/user/LabManager/VM data removed.
+
+- Astra6.2 medium independently reviewed unapplied post-shutdown patch from D:
+  shared checkout (read-only, no new C: worktree). Static PASS, one nonblocking
+  formatter cleanup-field test-coverage advisory. No compile/runtime proof.
+  Patch fdc45d75c0e24bc1e0bc74c9182944fd718e89880b68c20c7b86cedc3545d7fd
+  remains unapplied. Owner grant for source/compile/new diagnostic CI remains
+  pending; PR178 held. No new C: output or runtime fix attempt.
