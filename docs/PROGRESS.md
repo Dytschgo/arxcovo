@@ -3744,3 +3744,17 @@ Existing main exacte3e79089 CI44229539357 attempt1 success confirmed again.
 Allfive gates/identity3 eachOS/Windows<=660s/freshgreenmain required before merge.
 LastmergedPR176; M2OPEN/M3UNCHECKED; Sol3/3 exhausted, historicalOpus0/2 unchanged.
 Hardware **unverified on real hardware**. No babysitter changes.
+
+## PR178 merged; exact-main health pending (2026-11-18)
+
+Sol6.1/high coordinator verified allfive gates at11a34312, independent Astra verdict,
+identity3 and observer3 eachOS, Windows629s<=660s. CI44267088243 attempt1SUCCESS633s.
+Founder proof passed allOS; refusal not reproduced, late prediction unresolved;
+optionalWindows sample skipped_budget (no cases). No rerun/fix/stability credit.
+Fresh premerge main exacte3e79089/CI44229539357 attempt1GREEN checked immediately.
+Normal expected-head squash merge succeeded as6f4618c76256c2ead9dfb501c2c3946fde14a81b,
+PR178 lastmerged; resulting exact-main CI pending, feature merges held for it.
+[Evidence](evidence/m3-pr178-first-observation-merge.md). Local checkpoints not pushed
+solely to start more CI. Next: verify first-main outcome, then independent M3 work
+under ADR0023; no further founder diagnostic/repair without fresh steering.
+M2OPEN/M3UNCHECKED, Sol3/3 exhausted/Opus0/2 unchanged; hardware **unverified on real hardware**.
