@@ -12,7 +12,7 @@ scheduling: first stopped before A8 on owner-file fixture assertions
 245 pass/17 fail, A8 passing in 0.435/0.424 s. Owner fixture failures include
 SetNamedSecurityInfoW returning 5 instead of 0; no owner administration or
 out-of-scope repair attempted. Retained Windows logs contain 47 PASS
-observations, 1.725–3.580 s; PR192 passed in 1.864 s. Failing iteration and
+observations, 1.725â€“3.580 s; PR192 passed in 1.864 s. Failing iteration and
 phase remain unknown. Load is compatible but unproved.
 
 Local-only diagnostic branch records bounded scalar phase timestamps only
