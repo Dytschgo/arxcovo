@@ -309,6 +309,17 @@ impl StateStore {
     pub(in crate::cluster) fn hold_drop(&mut self, gate: DropGate) {
         self.gate = Some(gate);
     }
+    /// Pure bounded inspection before any consensus dispatch can mutate state.
+    pub(super) fn inspect_snapshot(
+        blob: &[u8],
+        cluster: ClusterId,
+    ) -> Result<SnapshotPositions, StoreError> {
+        let image = decode(blob)?;
+        if codec::cluster(&image.state) != cluster {
+            return Err(StoreError::WrongCluster);
+        }
+        Ok((image.applied, image.membership))
+    }
     pub(super) fn peek(blob: &[u8]) -> Result<SnapshotPositions, StoreError> {
         let image = decode(blob)?;
         Ok((image.applied, image.membership))

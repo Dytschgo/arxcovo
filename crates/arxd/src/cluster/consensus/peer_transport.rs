@@ -1,12 +1,12 @@
 //! Private one-exchange Append transport. No factory, engine or service startup wiring.
-use super::{Arx, Id, SmAdapter, peer_registry, peer_wire};
+use super::{Arx, Id, SmAdapter, peer_registry, peer_rpc_wire as peer_wire};
 use crate::cluster::{
     enrollment::{ClusterId, NodeId},
     pki::verify::{self, AuthenticatedPeer, PeerVerifier, Registry},
 };
 use openraft::{
     errors::{RPCError, Unreachable},
-    network::{NetAppend, RPCOption},
+    network::RPCOption,
     raft::{AppendEntriesRequest, AppendError, AppendResult},
 };
 use rustls::{
@@ -19,7 +19,7 @@ use std::{
     future::{Future, poll_fn},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     task::{Poll, ready},
     time::Duration,
 };
@@ -38,13 +38,24 @@ const INBOUND_BUDGET: Duration = Duration::from_secs(5);
 const CLOSE_BUDGET: Duration = Duration::from_secs(5);
 const SEND_BUFFER: usize = 65536;
 
-type DispatchFuture = Pin<Box<dyn Future<Output = Result<AppendResult<Arx>, Refusal>> + Send>>;
+pub(super) type DispatchFuture =
+    Pin<Box<dyn Future<Output = Result<AppendResult<Arx>, Refusal>> + Send>>;
 /// Implementations must not retain store ownership outside the transport keeper.
-trait AppendDispatch: Send + Sync {
+pub(super) trait AppendDispatch: Send + Sync {
     fn append(&self, request: AppendEntriesRequest<Arx>) -> DispatchFuture;
+    fn ballot(&self, _request: openraft::raft::VoteRequest<Arx>, _pre: bool) -> BallotFuture {
+        Box::pin(async { Err(Refusal::Dispatch) })
+    }
+    fn snapshot(
+        &self,
+        _vote: super::Vote<super::LeaderId>,
+        _snapshot: openraft::Snapshot<super::LeaderId, super::Members, Vec<u8>>,
+    ) -> SnapshotFuture {
+        Box::pin(async { Err(Refusal::Dispatch) })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
+pub(super) enum Refusal {
     Busy,
     Closed,
     NotReady,
@@ -73,7 +84,7 @@ impl std::fmt::Display for Refusal {
     }
 }
 impl std::error::Error for Refusal {}
-fn rpc_error(reason: Refusal) -> RPCError<Arx> {
+pub(super) fn rpc_error(reason: Refusal) -> RPCError<Arx> {
     RPCError::Unreachable(Unreachable::new(&reason))
 }
 fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
@@ -94,11 +105,11 @@ fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
     }
     Ok(address)
 }
-struct Credentials {
-    root: CertificateDer<'static>,
-    leaf: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-    time: Arc<dyn TimeProvider>,
+pub(super) struct Credentials {
+    pub(super) root: CertificateDer<'static>,
+    pub(super) leaf: CertificateDer<'static>,
+    pub(super) key: PrivateKeyDer<'static>,
+    pub(super) time: Arc<dyn TimeProvider>,
 }
 struct Resources {
     cluster: ClusterId,
@@ -128,6 +139,8 @@ impl Resources {
     }
 }
 struct State {
+    pending: Option<Credentials>,
+    attach_attempted: bool,
     closed: bool,
     resources: Option<Arc<Resources>>,
     keeper: Option<SmAdapter>,
@@ -142,6 +155,9 @@ struct State {
     releasing: bool,
 }
 struct Shared {
+    cluster: ClusterId,
+    node: NodeId,
+    failed: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     connections: Arc<Semaphore>,
     handshakes: Arc<Semaphore>,
@@ -149,12 +165,12 @@ struct Shared {
     #[cfg(test)]
     hooks: TestHooks,
 }
-struct TransportOwner {
+pub(super) struct TransportOwner {
     shared: Arc<Shared>,
 }
 #[derive(Clone)]
-struct AppendClient {
-    shared: Arc<Shared>,
+pub(super) struct AppendClient {
+    shared: Weak<Shared>,
     target: Option<NodeId>,
     address: Result<SocketAddr, Refusal>,
 }
@@ -180,6 +196,9 @@ impl Shared {
         if state.closed {
             return Err(Refusal::Closed);
         }
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Refusal::Dispatch);
+        }
         Self::reap(state);
         if state.tasks.len() >= CONNECTIONS {
             return Err(Refusal::Busy);
@@ -203,39 +222,26 @@ impl Shared {
     }
 }
 impl TransportOwner {
-    fn new(
+    #[cfg(test)]
+    pub(super) fn new(
         cluster: ClusterId,
         node: NodeId,
         sm: &SmAdapter,
         credentials: Credentials,
         dispatch: Arc<dyn AppendDispatch>,
     ) -> Result<Self, Refusal> {
-        let registry = peer_registry::registry(sm);
-        let verifier = PeerVerifier::new(credentials.root.clone(), cluster, registry.clone())
-            .map_err(|_| Refusal::Tls)?
-            .server();
-        let server = Arc::new(
-            verify::server_config(
-                verifier,
-                credentials.leaf.clone(),
-                credentials.key.clone_key(),
-                credentials.time.clone(),
-            )
-            .map_err(|_| Refusal::Tls)?,
-        );
+        let resources = make_resources(cluster, node, sm, credentials, dispatch)?;
         let (stop, _) = watch::channel(false);
         Ok(Self {
             shared: Arc::new(Shared {
+                cluster,
+                node,
+                failed: std::sync::atomic::AtomicBool::new(false),
                 state: Mutex::new(State {
+                    pending: None,
+                    attach_attempted: true,
                     closed: false,
-                    resources: Some(Arc::new(Resources {
-                        cluster,
-                        node,
-                        registry,
-                        credentials,
-                        server,
-                        dispatch,
-                    })),
+                    resources: Some(resources),
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -254,17 +260,17 @@ impl TransportOwner {
             }),
         })
     }
-    fn client(&self, target: u64, address: &str) -> AppendClient {
+    pub(super) fn client(&self, target: u64, address: &str) -> AppendClient {
         AppendClient {
-            shared: self.shared.clone(),
+            shared: Arc::downgrade(&self.shared),
             target: NodeId::new(target),
             address: endpoint(address),
         }
     }
     #[cfg(test)]
-    fn loopback_client(&self, target: u64, address: SocketAddr) -> AppendClient {
+    pub(super) fn loopback_client(&self, target: u64, address: SocketAddr) -> AppendClient {
         AppendClient {
-            shared: self.shared.clone(),
+            shared: Arc::downgrade(&self.shared),
             target: NodeId::new(target),
             address: if address.ip().is_loopback() && address.port() != 0 {
                 Ok(address)
@@ -273,7 +279,7 @@ impl TransportOwner {
             },
         }
     }
-    async fn listen(&mut self, address: &str) -> Result<(), Refusal> {
+    pub(super) async fn listen(&mut self, address: &str) -> Result<(), Refusal> {
         if self.shared.closed() {
             return Err(Refusal::Closed);
         }
@@ -283,7 +289,7 @@ impl TransportOwner {
             .map_err(|_| Refusal::Address)?;
         self.listen_on(listener)
     }
-    fn listen_on(&mut self, listener: TcpListener) -> Result<(), Refusal> {
+    pub(super) fn listen_on(&mut self, listener: TcpListener) -> Result<(), Refusal> {
         let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
         if state.closed {
             return Err(Refusal::Closed);
@@ -291,7 +297,11 @@ impl TransportOwner {
         if state.resources.is_none() || state.accept.is_some() {
             return Err(Refusal::NotReady);
         }
-        let shared = self.shared.clone();
+        Self::register_listener(&self.shared, &mut state, listener);
+        Ok(())
+    }
+    fn register_listener(shared: &Arc<Shared>, state: &mut State, listener: TcpListener) {
+        let shared = shared.clone();
         let mut stop = shared.stop.subscribe();
         state.accept = Some(tokio::spawn(async move {
             loop {
@@ -345,10 +355,9 @@ impl TransportOwner {
                 drop(join_errors);
             }
         }));
-        Ok(())
     }
     /// All handles remain in State across every await and cancelled close future.
-    async fn close(&mut self) -> Result<(), Refusal> {
+    pub(super) async fn close(&mut self) -> Result<(), Refusal> {
         let deadline = {
             let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
             if state.finished {
@@ -426,7 +435,7 @@ impl TransportOwner {
             }
         }
         // Cancelling here also leaves each handle and keeper in persistent State.
-        let (resources, keeper, join_errors, unclean) = poll_fn(|cx| {
+        let (resources, keeper, pending, join_errors, unclean) = poll_fn(|cx| {
             let Ok(mut state) = self.shared.state.lock() else {
                 return Poll::Ready(Err(Refusal::Unclean));
             };
@@ -453,6 +462,7 @@ impl TransportOwner {
             Poll::Ready(Ok((
                 state.resources.take(),
                 state.keeper.take(),
+                state.pending.take(),
                 join_errors,
                 state.unclean,
             )))
@@ -464,6 +474,7 @@ impl TransportOwner {
         drop(join_errors);
         drop(resources);
         drop(keeper);
+        drop(pending);
         let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
         state.releasing = false;
         state.finished = true;
@@ -493,6 +504,9 @@ impl Drop for TransportOwner {
 fn before_dispatch(shared: &Shared, deadline: Instant) -> Result<(), Refusal> {
     if Instant::now() >= deadline {
         return Err(Refusal::Deadline);
+    }
+    if shared.failed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(Refusal::Dispatch);
     }
     if shared.closed() {
         return Err(Refusal::Closed);
@@ -536,7 +550,7 @@ fn reply_shape(
 async fn read_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     expected: peer_wire::Route,
-    kind: peer_wire::Kind,
+    kind: Option<peer_wire::Kind>,
 ) -> Result<Vec<u8>, Refusal> {
     let mut fixed = [0; peer_wire::HEADER_LEN];
     stream
@@ -544,7 +558,9 @@ async fn read_frame<S: AsyncRead + Unpin>(
         .await
         .map_err(|_| Refusal::Frame)?;
     let header = peer_wire::inspect_header(&fixed).map_err(|_| Refusal::Frame)?;
-    if header.kind != kind || header.route != expected {
+    if kind.map_or_else(|| header.kind.reply().is_err(), |kind| header.kind != kind)
+        || header.route != expected
+    {
         return Err(Refusal::Frame);
     }
     let total = fixed
@@ -599,90 +615,129 @@ async fn inbound(
         source: peer.1.get(),
         target: resources.node.get(),
     };
-    let frame = read_frame(&mut stream, route, peer_wire::Kind::AppendRequest).await?;
+    let frame = read_frame(&mut stream, route, None).await?;
     stage(shared, Stage::RequestRead).await;
     before_dispatch(shared, deadline)?;
     clean_end(&mut stream).await?;
-    let (_, request) = peer_wire::decode_request(&frame).map_err(|_| Refusal::Frame)?;
-    request_shape(&request, peer.1)?;
-    let sent_last = request
-        .entries
-        .last()
-        .map(|entry| entry.log_id)
-        .or(request.prev_log_id);
-    let sent_prev = request.prev_log_id;
-    let sent_vote = request.vote;
+    let request = Request::decode(&frame)?;
+    request.shape(resources.cluster, peer.1)?;
+    let expected = request.expected();
     stage(shared, Stage::BeforeDispatch).await;
     before_dispatch(shared, deadline)?;
     (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
     before_dispatch(shared, deadline)?;
-    let reply = resources.dispatch.append(request).await?;
-    reply_shape(sent_last, sent_prev, sent_vote, &reply)?;
-    let frame = peer_wire::encode_reply(
-        peer_wire::Route {
-            cluster: route.cluster,
-            source: route.target,
-            target: route.source,
-        },
-        &reply,
-    )
-    .map_err(|_| Refusal::Frame)?;
+    let reply = match request {
+        Request::Append(r) => resources.dispatch.append(r).await.map(Reply::Append),
+        Request::Ballot(r, pre) => resources
+            .dispatch
+            .ballot(r, pre)
+            .await
+            .map(|r| Reply::Ballot(r, pre)),
+        Request::Snapshot(v, s) => resources.dispatch.snapshot(v, s).await.map(Reply::Snapshot),
+    };
+    if matches!(reply, Err(Refusal::Dispatch)) {
+        shared
+            .failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let reply = reply?;
+    expected.check(&reply)?;
+    let frame = reply.encode(peer_wire::Route {
+        cluster: route.cluster,
+        source: route.target,
+        target: route.source,
+    })?;
     stage(shared, Stage::BeforeReply).await;
     if Instant::now() >= deadline {
         return Err(Refusal::Deadline);
     }
     send_frame(&mut stream, &frame).await
 }
-impl NetAppend<Arx> for AppendClient {
-    async fn append_entries(
+impl AppendClient {
+    async fn exchange(
         &mut self,
-        request: AppendEntriesRequest<Arx>,
+        request: Request,
         option: RPCOption,
-    ) -> Result<AppendResult<Arx>, RPCError<Arx>> {
+        mut cancel: Pin<Box<dyn Future<Output = openraft::errors::ReplicationClosed> + Send>>,
+    ) -> Result<Reply, ExchangeError> {
         let entry = Instant::now();
+        if let Some(reason) = poll_fn(|cx| {
+            Poll::Ready(match cancel.as_mut().poll(cx) {
+                Poll::Ready(r) => Some(r),
+                Poll::Pending => None,
+            })
+        })
+        .await
+        {
+            return Err(ExchangeError::Cancelled(reason));
+        }
         // The pinned soft_ttl implementation multiplies before dividing. Refuse
         // overflow rather than allowing an adversarial duration to panic.
         option
             .hard_ttl()
             .checked_mul(3)
-            .ok_or_else(|| rpc_error(Refusal::Deadline))?;
+            .ok_or(ExchangeError::Refused(Refusal::Deadline))?;
         let ttl = option.soft_ttl();
         let deadline = entry
             .checked_add(ttl)
             .filter(|_| !ttl.is_zero())
-            .ok_or_else(|| rpc_error(Refusal::Deadline))?;
-        let address = self.address.map_err(rpc_error)?;
-        let target = self.target.ok_or_else(|| rpc_error(Refusal::Address))?;
+            .ok_or(ExchangeError::Refused(Refusal::Deadline))?;
+        let shared = self
+            .shared
+            .upgrade()
+            .ok_or(ExchangeError::Refused(Refusal::Closed))?;
+        let address = self.address.map_err(ExchangeError::Refused)?;
+        let target = self
+            .target
+            .ok_or(ExchangeError::Refused(Refusal::Address))?;
         let (tx, rx) = oneshot::channel();
         // Declared outside the lock scope so refusal unwinding unlocks first.
         let mut join_errors = Vec::new();
         {
-            let mut state = self
-                .shared
+            let mut state = shared
                 .state
                 .lock()
-                .map_err(|_| rpc_error(Refusal::Unclean))?;
-            let admitted = self.shared.admission(&mut state);
+                .map_err(|_| ExchangeError::Refused(Refusal::Unclean))?;
+            let admitted = shared.admission(&mut state);
             if !state.closed {
                 join_errors.append(&mut state.join_errors);
             }
-            let admission = admitted.map_err(rpc_error)?;
-            let shared = self.shared.clone();
+            let admission = admitted.map_err(ExchangeError::Refused)?;
+            let shared = shared.clone();
             state.tasks.spawn(async move {
                 let Admission {
                     resources,
                     connection: _connection,
                     handshake,
                 } = admission;
-                let result = timeout_at(
+                let result = tokio::select! { biased;
+                    reason = &mut cancel => Err(ExchangeError::Cancelled(reason)),
+                    result = timeout_at(
                     deadline,
                     outbound(
                         &shared, resources, address, target, request, handshake, deadline, &tx,
                     ),
-                )
-                .await
-                .unwrap_or(Err(Refusal::Deadline));
-                let reason = result.as_ref().err().copied();
+                ) => result.unwrap_or(Err(Refusal::Deadline)).map_err(ExchangeError::Refused),
+                };
+                let result = if matches!(result, Err(ExchangeError::Cancelled(_))) {
+                    result
+                } else {
+                    match poll_fn(|cx| {
+                        Poll::Ready(match cancel.as_mut().poll(cx) {
+                            Poll::Ready(c) => Some(c),
+                            Poll::Pending => None,
+                        })
+                    })
+                    .await
+                    {
+                        Some(c) => Err(ExchangeError::Cancelled(c)),
+                        None => result,
+                    }
+                };
+                let reason = result.as_ref().err().map(|e| match e {
+                    ExchangeError::Refused(r) => *r,
+                    ExchangeError::Cancelled(_) => Refusal::Closed,
+                });
                 // Socket/resources are gone; task retains its connection unit until return.
                 let _ = tx.send(result);
                 event(&shared, Event::Finished(reason));
@@ -690,8 +745,8 @@ impl NetAppend<Arx> for AppendClient {
         }
         drop(join_errors);
         match timeout_at(deadline, rx).await {
-            Ok(Ok(result)) if Instant::now() < deadline => result.map_err(rpc_error),
-            _ => Err(rpc_error(Refusal::Deadline)),
+            Ok(Ok(result)) if Instant::now() < deadline => result,
+            _ => Err(ExchangeError::Refused(Refusal::Deadline)),
         }
     }
 }
@@ -701,29 +756,24 @@ async fn outbound(
     resources: Arc<Resources>,
     address: SocketAddr,
     target: NodeId,
-    request: AppendEntriesRequest<Arx>,
+    request: Request,
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
-    caller: &oneshot::Sender<Result<AppendResult<Arx>, Refusal>>,
-) -> Result<AppendResult<Arx>, Refusal> {
+    caller: &oneshot::Sender<Result<Reply, ExchangeError>>,
+) -> Result<Reply, Refusal> {
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    request_shape(&request, resources.node)?;
-    let sent_last = request
-        .entries
-        .last()
-        .map(|entry| entry.log_id)
-        .or(request.prev_log_id);
-    let sent_prev = request.prev_log_id;
-    let sent_vote = request.vote;
+    request.shape(resources.cluster, resources.node)?;
+    let expected = request.expected();
+    let kind = request.kind().reply().map_err(|_| Refusal::Frame)?;
     let route = peer_wire::Route {
         cluster: resources.cluster,
         source: resources.node.get(),
         target: target.get(),
     };
-    let frame = peer_wire::encode_request(route, &request).map_err(|_| Refusal::Frame)?;
+    let frame = request.encode(route)?;
     let config = resources.client_config(target)?;
     stage(shared, Stage::BeforeConnect).await;
     before_dispatch(shared, deadline)?;
@@ -758,6 +808,19 @@ async fn outbound(
     if peer.0 != resources.cluster || peer.1 != target {
         return Err(Refusal::Identity);
     }
+    #[cfg(test)]
+    if kind == peer_wire::Kind::SnapshotReply {
+        stream
+            .write_all(&frame[..frame.len() - 1])
+            .await
+            .map_err(|_| Refusal::Frame)?;
+        stream.flush().await.map_err(|_| Refusal::Frame)?;
+        stage(shared, Stage::SnapshotPartialBody).await;
+        send_frame(&mut stream, &frame[frame.len() - 1..]).await?;
+    } else {
+        send_frame(&mut stream, &frame).await?;
+    }
+    #[cfg(not(test))]
     send_frame(&mut stream, &frame).await?;
     let frame = read_frame(
         &mut stream,
@@ -766,7 +829,7 @@ async fn outbound(
             source: route.target,
             target: route.source,
         },
-        peer_wire::Kind::AppendReply,
+        Some(kind),
     )
     .await?;
     stage(shared, Stage::ReplyRead).await;
@@ -775,8 +838,8 @@ async fn outbound(
         return Err(Refusal::Closed);
     }
     clean_end(&mut stream).await?;
-    let (_, reply) = peer_wire::decode_reply(&frame).map_err(|_| Refusal::Frame)?;
-    reply_shape(sent_last, sent_prev, sent_vote, &reply)?;
+    let reply = Reply::decode(&frame, kind)?;
+    expected.check(&reply)?;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
@@ -803,6 +866,8 @@ enum Stage {
     ReplyRead,
     #[cfg(test)]
     CloseAborted,
+    #[cfg(test)]
+    SnapshotPartialBody,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
@@ -843,3 +908,479 @@ impl TestHooks {
 }
 #[cfg(test)]
 mod tests;
+pub(super) type BallotFuture =
+    Pin<Box<dyn Future<Output = Result<openraft::raft::VoteResponse<Arx>, Refusal>> + Send>>;
+pub(super) type SnapshotFuture =
+    Pin<Box<dyn Future<Output = Result<openraft::raft::SnapshotResponse<Arx>, Refusal>> + Send>>;
+type Ballot = openraft::raft::VoteRequest<Arx>;
+type BallotReply = openraft::raft::VoteResponse<Arx>;
+type Snapshot = openraft::Snapshot<super::LeaderId, super::Members, Vec<u8>>;
+type BallotVote = super::Vote<super::LeaderId>;
+enum Request {
+    Append(AppendEntriesRequest<Arx>),
+    Ballot(Ballot, bool),
+    Snapshot(BallotVote, Snapshot),
+}
+enum Reply {
+    Append(AppendResult<Arx>),
+    Ballot(BallotReply, bool),
+    Snapshot(openraft::raft::SnapshotResponse<Arx>),
+}
+enum ExchangeError {
+    Refused(Refusal),
+    Cancelled(openraft::errors::ReplicationClosed),
+}
+enum Expected {
+    Append(Option<Id>, Option<Id>, BallotVote),
+    Ballot(BallotVote, Option<Id>, bool),
+    Snapshot(BallotVote),
+}
+impl Request {
+    fn kind(&self) -> peer_wire::Kind {
+        use peer_wire::Kind::*;
+        match self {
+            Self::Append(_) => AppendRequest,
+            Self::Ballot(_, false) => VoteRequest,
+            Self::Ballot(_, true) => PreVoteRequest,
+            Self::Snapshot(..) => SnapshotRequest,
+        }
+    }
+    fn expected(&self) -> Expected {
+        match self {
+            Self::Append(r) => Expected::Append(
+                r.entries.last().map(|e| e.log_id).or(r.prev_log_id),
+                r.prev_log_id,
+                r.vote,
+            ),
+            Self::Ballot(r, p) => Expected::Ballot(r.vote, r.last_log_id, *p),
+            Self::Snapshot(v, _) => Expected::Snapshot(*v),
+        }
+    }
+    fn shape(&self, c: crate::cluster::enrollment::ClusterId, n: NodeId) -> Result<(), Refusal> {
+        match self {
+            Self::Append(r) => request_shape(r, n),
+            Self::Ballot(r, _) => {
+                if r.vote.leader_id.node_id == n.get() {
+                    Ok(())
+                } else {
+                    Err(Refusal::Frame)
+                }
+            }
+            Self::Snapshot(v, s) => {
+                if !v.committed || v.leader_id.node_id != n.get() {
+                    return Err(Refusal::Frame);
+                }
+                peer_wire::inspect_snapshot(c, *v, s).map_err(|_| Refusal::Frame)
+            }
+        }
+    }
+    fn encode(&self, r: peer_wire::Route) -> Result<Vec<u8>, Refusal> {
+        match self {
+            Self::Append(q) => peer_wire::encode_request(r, q),
+            Self::Ballot(q, _) => peer_wire::encode_vote(r, self.kind(), q),
+            Self::Snapshot(v, s) => peer_wire::encode_snapshot(r, *v, s),
+        }
+        .map_err(|_| Refusal::Frame)
+    }
+    fn decode(b: &[u8]) -> Result<Self, Refusal> {
+        let h = peer_wire::inspect_header(b.get(..44).ok_or(Refusal::Frame)?)
+            .map_err(|_| Refusal::Frame)?;
+        use peer_wire::Kind::*;
+        match h.kind {
+            AppendRequest => peer_wire::decode_request(b).map(|(_, r)| Self::Append(r)),
+            VoteRequest | PreVoteRequest => peer_wire::decode_vote(b, h.kind)
+                .map(|(_, r)| Self::Ballot(r, h.kind == PreVoteRequest)),
+            SnapshotRequest => peer_wire::decode_snapshot(b).map(|(_, v, s)| Self::Snapshot(v, s)),
+            _ => return Err(Refusal::Frame),
+        }
+        .map_err(|_| Refusal::Frame)
+    }
+}
+impl Reply {
+    fn encode(&self, r: peer_wire::Route) -> Result<Vec<u8>, Refusal> {
+        match self {
+            Self::Append(q) => peer_wire::encode_reply(r, q),
+            Self::Ballot(q, p) => peer_wire::encode_vote_reply(
+                r,
+                if *p {
+                    peer_wire::Kind::PreVoteReply
+                } else {
+                    peer_wire::Kind::VoteReply
+                },
+                q,
+            ),
+            Self::Snapshot(q) => peer_wire::encode_snapshot_reply(r, q),
+        }
+        .map_err(|_| Refusal::Frame)
+    }
+    fn decode(b: &[u8], k: peer_wire::Kind) -> Result<Self, Refusal> {
+        use peer_wire::Kind::*;
+        match k {
+            AppendReply => peer_wire::decode_reply(b).map(|(_, r)| Self::Append(r)),
+            VoteReply | PreVoteReply => {
+                peer_wire::decode_vote_reply(b, k).map(|(_, r)| Self::Ballot(r, k == PreVoteReply))
+            }
+            SnapshotReply => peer_wire::decode_snapshot_reply(b).map(|(_, r)| Self::Snapshot(r)),
+            _ => return Err(Refusal::Frame),
+        }
+        .map_err(|_| Refusal::Frame)
+    }
+}
+impl Expected {
+    fn check(&self, r: &Reply) -> Result<(), Refusal> {
+        let valid = match (self, r) {
+            (Self::Append(l, p, v), Reply::Append(r)) => return reply_shape(*l, *p, *v, r),
+            (Self::Ballot(v, l, p), Reply::Ballot(r, q)) => {
+                p == q
+                    && (!r.vote_granted
+                        || (r.last_log_id <= *l
+                            && if *p {
+                                matches!(
+                                    r.vote.partial_cmp(v),
+                                    Some(Ordering::Less | Ordering::Equal)
+                                )
+                            } else {
+                                r.vote == *v
+                            }))
+            }
+            (Self::Snapshot(v), Reply::Snapshot(r)) => matches!(
+                r.vote.partial_cmp(v),
+                Some(Ordering::Equal | Ordering::Greater)
+            ),
+            _ => false,
+        };
+        if valid { Ok(()) } else { Err(Refusal::Frame) }
+    }
+}
+fn unary_error(e: ExchangeError) -> RPCError<Arx> {
+    rpc_error(match e {
+        ExchangeError::Refused(r) => r,
+        ExchangeError::Cancelled(_) => Refusal::Closed,
+    })
+}
+impl openraft::network::RaftNetworkV2<Arx> for AppendClient {
+    type SnapshotData = Vec<u8>;
+    async fn append_entries(
+        &mut self,
+        r: AppendEntriesRequest<Arx>,
+        o: RPCOption,
+    ) -> Result<AppendResult<Arx>, RPCError<Arx>> {
+        match self
+            .exchange(Request::Append(r), o, Box::pin(std::future::pending()))
+            .await
+            .map_err(unary_error)?
+        {
+            Reply::Append(r) => Ok(r),
+            _ => Err(rpc_error(Refusal::Frame)),
+        }
+    }
+    async fn vote(&mut self, r: Ballot, o: RPCOption) -> Result<BallotReply, RPCError<Arx>> {
+        self.send_ballot(r, false, o).await
+    }
+    async fn pre_vote(&mut self, r: Ballot, o: RPCOption) -> Result<BallotReply, RPCError<Arx>> {
+        self.send_ballot(r, true, o).await
+    }
+    async fn full_snapshot(
+        &mut self,
+        v: BallotVote,
+        s: Snapshot,
+        cancel: impl Future<Output = openraft::errors::ReplicationClosed> + Send + 'static,
+        o: RPCOption,
+    ) -> Result<openraft::raft::SnapshotResponse<Arx>, openraft::errors::StreamingError<Arx>> {
+        use openraft::errors::StreamingError;
+        match self
+            .exchange(Request::Snapshot(v, s), o, Box::pin(cancel))
+            .await
+        {
+            Ok(Reply::Snapshot(r)) => Ok(r),
+            Err(ExchangeError::Cancelled(c)) => Err(StreamingError::Closed(c)),
+            Err(ExchangeError::Refused(r)) => {
+                Err(StreamingError::Unreachable(Unreachable::new(&r)))
+            }
+            _ => Err(StreamingError::Unreachable(Unreachable::new(
+                &Refusal::Frame,
+            ))),
+        }
+    }
+    async fn transfer_leader(
+        &mut self,
+        _: openraft::raft::TransferLeaderRequest<Arx>,
+        _: RPCOption,
+    ) -> Result<openraft::raft::TransferLeaderResponse<Arx>, RPCError<Arx>> {
+        Err(rpc_error(Refusal::NotReady))
+    }
+}
+impl AppendClient {
+    async fn send_ballot(
+        &mut self,
+        r: Ballot,
+        p: bool,
+        o: RPCOption,
+    ) -> Result<BallotReply, RPCError<Arx>> {
+        match self
+            .exchange(Request::Ballot(r, p), o, Box::pin(std::future::pending()))
+            .await
+            .map_err(unary_error)?
+        {
+            Reply::Ballot(r, _) => Ok(r),
+            _ => Err(rpc_error(Refusal::Frame)),
+        }
+    }
+}
+
+fn make_resources(
+    cluster: ClusterId,
+    node: NodeId,
+    sm: &SmAdapter,
+    credentials: Credentials,
+    dispatch: Arc<dyn AppendDispatch>,
+) -> Result<Arc<Resources>, Refusal> {
+    let registry = peer_registry::registry(sm);
+    let verifier = PeerVerifier::new(credentials.root.clone(), cluster, registry.clone())
+        .map_err(|_| Refusal::Tls)?
+        .server();
+    let server = Arc::new(
+        verify::server_config(
+            verifier,
+            credentials.leaf.clone(),
+            credentials.key.clone_key(),
+            credentials.time.clone(),
+        )
+        .map_err(|_| Refusal::Tls)?,
+    );
+    Ok(Arc::new(Resources {
+        cluster,
+        node,
+        registry,
+        credentials,
+        server,
+        dispatch,
+    }))
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Health {
+    Pending,
+    Attaching,
+    Ready,
+    Closing,
+    Closed,
+    EngineUnavailable,
+}
+#[derive(Clone)]
+pub(super) struct PeerFactory {
+    shared: Weak<Shared>,
+    #[cfg(test)]
+    loopback: bool,
+}
+impl PeerFactory {
+    fn client(&self, target: u64, node: &openraft::BasicNode) -> AppendClient {
+        AppendClient {
+            shared: self.shared.clone(),
+            target: NodeId::new(target),
+            address: {
+                #[cfg(test)]
+                if self.loopback {
+                    return AppendClient {
+                        shared: self.shared.clone(),
+                        target: NodeId::new(target),
+                        address: node
+                            .addr
+                            .parse::<SocketAddr>()
+                            .map_err(|_| Refusal::Address)
+                            .and_then(|a| {
+                                if a.ip().is_loopback()
+                                    && a.port() != 0
+                                    && a.to_string() == node.addr
+                                {
+                                    Ok(a)
+                                } else {
+                                    Err(Refusal::Address)
+                                }
+                            }),
+                    };
+                }
+                endpoint(&node.addr)
+            },
+        }
+    }
+}
+impl openraft::network::RaftNetworkFactory<Arx> for PeerFactory {
+    type Network = AppendClient;
+    async fn new_client(&mut self, t: u64, n: &openraft::BasicNode) -> AppendClient {
+        self.client(t, n)
+    }
+    async fn new_heartbeat_client(&mut self, t: u64, n: &openraft::BasicNode) -> AppendClient {
+        self.client(t, n)
+    }
+    async fn new_snapshot_client(&mut self, t: u64, n: &openraft::BasicNode) -> AppendClient {
+        self.client(t, n)
+    }
+}
+impl TransportOwner {
+    pub(super) fn pending(
+        cluster: ClusterId,
+        node: NodeId,
+        credentials: Credentials,
+    ) -> (Self, PeerFactory) {
+        let (stop, _) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            cluster,
+            node,
+            failed: std::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(State {
+                pending: Some(credentials),
+                attach_attempted: false,
+                closed: false,
+                resources: None,
+                keeper: None,
+                tasks: JoinSet::new(),
+                join_errors: Vec::new(),
+                accept: None,
+                close_deadline: None,
+                aborting: false,
+                unclean: false,
+                finished: false,
+                releasing: false,
+            }),
+            connections: Arc::new(Semaphore::new(CONNECTIONS)),
+            handshakes: Arc::new(Semaphore::new(HANDSHAKES)),
+            stop,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
+        });
+        let factory = PeerFactory {
+            shared: Arc::downgrade(&shared),
+            #[cfg(test)]
+            loopback: false,
+        };
+        (Self { shared }, factory)
+    }
+    pub(super) fn health(&self) -> Health {
+        if self
+            .shared
+            .failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Health::EngineUnavailable;
+        }
+        let Ok(s) = self.shared.state.lock() else {
+            return Health::EngineUnavailable;
+        };
+        if s.finished {
+            Health::Closed
+        } else if s.closed {
+            Health::Closing
+        } else if s.resources.is_some() {
+            Health::Ready
+        } else if s.attach_attempted {
+            Health::Attaching
+        } else {
+            Health::Pending
+        }
+    }
+    pub(super) async fn attach(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        address: &str,
+    ) -> Result<(), Refusal> {
+        let credentials = self.begin_attach()?;
+        let resources = make_resources(
+            self.shared.cluster,
+            self.shared.node,
+            sm,
+            credentials,
+            dispatch,
+        )?;
+        let listener = TcpListener::bind(endpoint(address)?)
+            .await
+            .map_err(|_| Refusal::Address)?;
+        self.publish(sm, resources, listener)
+    }
+    fn begin_attach(&self) -> Result<Credentials, Refusal> {
+        let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
+        if state.closed {
+            return Err(Refusal::Closed);
+        }
+        if state.attach_attempted {
+            return Err(Refusal::NotReady);
+        }
+        state.attach_attempted = true;
+        state.pending.take().ok_or(Refusal::NotReady)
+    }
+    fn publish(
+        &mut self,
+        sm: &SmAdapter,
+        resources: Arc<Resources>,
+        listener: TcpListener,
+    ) -> Result<(), Refusal> {
+        // Publish and register accept under the same gate; no task can be admitted between them.
+        let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
+        if state.closed {
+            return Err(Refusal::Closed);
+        }
+        state.resources = Some(resources);
+        state.keeper = Some(sm.clone());
+        Self::register_listener(&self.shared, &mut state, listener);
+        Ok(())
+    }
+    pub(super) fn joined(&self) -> bool {
+        self.shared.state.lock().is_ok_and(|s| {
+            s.finished
+                && s.accept.is_none()
+                && s.tasks.is_empty()
+                && s.resources.is_none()
+                && s.keeper.is_none()
+        })
+    }
+}
+
+#[cfg(test)]
+impl TransportOwner {
+    fn attach_reserved(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        listener: TcpListener,
+        expected: SocketAddr,
+    ) -> Result<(), Refusal> {
+        let credentials = self.begin_attach()?;
+        if !expected.ip().is_loopback()
+            || expected.port() == 0
+            || listener.local_addr().map_err(|_| Refusal::Address)? != expected
+        {
+            return Err(Refusal::Address);
+        }
+        let snapshot = {
+            let store = sm.0.try_lock().map_err(|_| Refusal::Identity)?;
+            if let Some((_, m)) = store.membership() {
+                let membership = super::decode(m).map_err(|_| Refusal::Identity)?;
+                if membership
+                    .get_node(&self.shared.node.get())
+                    .is_none_or(|n| n.addr != expected.to_string())
+                {
+                    return Err(Refusal::Address);
+                }
+            }
+            store.snapshot()
+        };
+        super::StateStore::inspect_snapshot(&snapshot, self.shared.cluster)
+            .map_err(|_| Refusal::Identity)?;
+        let resources = make_resources(
+            self.shared.cluster,
+            self.shared.node,
+            sm,
+            credentials,
+            dispatch,
+        )?;
+        self.publish(sm, resources, listener)
+    }
+}
+
+impl TransportOwner {
+    pub(super) fn observe_failure(&self) {
+        self.shared
+            .failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
