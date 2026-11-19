@@ -451,19 +451,29 @@ impl ConsensusNode {
                     observation::Edge::OwnerSend,
                     observation::Reason::Pending,
                 );
-                let _ = tx.send(result);
+                let _sent = tx.send(result).is_ok();
+                #[cfg(test)]
+                observation::sent(&owner_obs, _sent);
             });
         }
         {
             #[cfg(test)]
             let rx = async {
-                rx.await.inspect_err(|_| {
-                    observation::mark(
-                        &obs,
-                        observation::Edge::CallerReply,
-                        observation::Reason::ReceiverClosed,
-                    );
-                })
+                rx.await
+                    .inspect(|_| {
+                        observation::mark(
+                            &obs,
+                            observation::Edge::CallerReply,
+                            observation::Reason::Ok,
+                        );
+                    })
+                    .inspect_err(|_| {
+                        observation::mark(
+                            &obs,
+                            observation::Edge::CallerReply,
+                            observation::Reason::ReceiverClosed,
+                        );
+                    })
             };
             rx.await.unwrap_or(Err(ProposeError::Unknown))
         }
