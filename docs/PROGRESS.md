@@ -32,6 +32,23 @@ Report `D:/Temp/arx-owner-rename-sol-review/review.md`, SHA256
 by coordinator). Next: Sol builder ports extraction + termination + regression
 tests onto main without 8275376d's diagnostics, then exact-head review, PR,
 normal CI, merge, then PR190 integration under its preserved workflow.
+**PR191 (main-first rename fix) HOLD, 2026-11-19.** Sol 6.1/high builder made
+`919c7fec` from main `8bd12b7f` (2 files, +104/−19, no diagnostics). Red control
+failed as expected. fmt/Clippy pass, owner_windows 26/26, `^service::` 264/264.
+Report `D:/Temp/arx-rename-main-fix/report.md` SHA256 `6b2f883a…841a`. Separate
+Sol 6.1/high exact-head review: Standards PASS, Spec PASS, no findings;
+agent-review success 59399595370; report `D:/Temp/arx-pr191-review/review.md`
+SHA256 `394864f1…5f89`. First CI 44591771802 attempt 1 FAILED Windows Rust only:
+`anchor_query_tests::owned_anchor_query_single_voter` returned the original
+founder refusal at anchor_query_tests.rs:708 (proposal pending at the 5 s final
+deadline: initialize exit 1.343 s, leaderwait exit 3.297 s). Fail-fast stopped
+at 47/792, so the owner_windows tests did not run on the hosted runner. Ubuntu
+and macOS Rust and all UI jobs passed. Log
+`D:/Temp/arx-pr191-ci/windows-rust.log` SHA256 `94285201…2e5d`. This is the
+same founder signature as PR189 on a change that does not touch consensus, so the
+founder refusal is now observed on main-equivalent source; cause UNKNOWN. No
+rerun. PR191 waits on the founder diagnostic, which is now the critical path.
+
 Main and PR190 have identical pre-fix owner-file source. The
 council decision requires a proved shared fix to land on main first and then be
 verified under PR190 conditions. PR189 founder-deadline investigation follows on
