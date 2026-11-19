@@ -615,29 +615,18 @@ impl WindowsOwnerStore {
                 return Err(Failure::Conflict);
             }
             let id = identity(&s.file)?;
-            let name: Vec<u16> = s.target.as_os_str().encode_wide().collect();
-            let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-            let size = offset + name.len() * 2;
-            let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-            let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            let flags = if s.expected.is_some() {
+                RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS
+            } else {
+                0
+            };
+            let (mut buf, size) = rename_info(&s.target, flags);
             unsafe {
-                (*info).Anonymous.Flags = if s.expected.is_some() {
-                    RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS
-                } else {
-                    0
-                };
-                (*info).RootDirectory = null_mut();
-                (*info).FileNameLength = (name.len() * 2) as u32;
-                std::ptr::copy_nonoverlapping(
-                    name.as_ptr(),
-                    std::ptr::addr_of_mut!((*info).FileName).cast(),
-                    name.len(),
-                );
                 rename_attempted = true;
                 if SetFileInformationByHandle(
                     s.file.as_raw_handle(),
                     FileRenameInfoEx,
-                    info.cast(),
+                    buf.as_mut_ptr().cast(),
                     size as u32,
                 ) == 0
                 {
@@ -668,6 +657,29 @@ impl WindowsOwnerStore {
         }
         result
     }
+}
+/// FILE_RENAME_INFO for a full target path with a null root: a zeroed, fully
+/// initialised buffer and the byte size declared to SetFileInformationByHandle.
+/// FileNameLength excludes the terminator, but the Win32 wrapper reads
+/// FileName up to a NUL, so the zeroed terminator lies inside the declared
+/// size and allocation.
+fn rename_info(target: &Path, flags: u32) -> (Vec<usize>, usize) {
+    let name: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = offset + (name.len() + 1) * 2;
+    let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.Flags = flags;
+        (*info).RootDirectory = null_mut();
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast(),
+            name.len(),
+        );
+    }
+    (buf, size)
 }
 impl OwnerStore for WindowsOwnerStore {
     fn record(&mut self) -> Result<Option<(OwnerRecord, [u8; 32])>, Failure> {
