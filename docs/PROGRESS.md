@@ -1,5 +1,53 @@
 # Arxcovo progress
 
+## Current state (2026-11-19 21:30 UTC, coordinator Claude Opus 5.5 / high)
+
+Sections below this one are dated checkpoints and are **historical** unless they
+say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
+PR188 as the last merge, that is superseded by this summary.
+
+- **Routing (owner, 2026-11-19):** coordination moved to Claude Opus 5.5/high
+  because the provider rejected every Sol coordinator turn. Sol 6.1 remains the
+  route for engineering and independent reviews; Claude for UI; one independent
+  reviewer per PR; at most two builders and one reviewer; coordinator-only merge.
+  Fallback chain when an agent is blocked or fails: Sol → Opus → Fable →
+  Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
+  must stay independent of the builder. No Sol delegate was blocked this session.
+- **Main:** `05ba5b87` (PR193). Previous main `95b4b651` push CI 44616170358
+  attempt 1 green (all nine jobs); `05ba5b87` push CI recorded in the next
+  checkpoint.
+- **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
+  commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
+  e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
+  attempt 1/3), PR191 `ba11ffb0` (Windows rename target termination fix, the
+  shared defect behind PR190's owner-file failures), PR190 `5dff15f8` (pinned
+  SQLite identity proof and CI verification; rebuilt on main without the three
+  superseded Opus recovery commits; N1/N2 and all 26 owner_windows tests passed
+  under its unchanged workflow), PR189 `95b4b651` (retained offline startup owner;
+  rebuilt as main plus its single source commit), PR193 `05ba5b87` (cfg(test) A8
+  lifecycle phase trace). Every merge had an independent exact-head Sol 6.1
+  review, all five required gates green and green main rechecked immediately
+  before a head-guarded squash merge.
+- **Open failures (cause unknown, traces now on main):** Windows founder
+  five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
+  PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
+  PR193 CI 44602605879 W1); load sensitivity reproduced locally, hosted cause
+  unproved; mitigated by PR194. Counters: Engine Sol 3/3 exhausted, historical
+  Opus 0/2 unchanged; e7 family 1/3.
+- **Risk:** Windows Rust job margin under its 12 minute timeout is thin since
+  PR194 (10m36s once; later main runs 8m53s, 9m25s, 6m14s, 5m05s).
+- **Next M3 work:** Sol 6.1/high read-only plan
+  `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…a1`): 16 ordered
+  one-PR slices to the three-container acceptance. Next: store-only bound SQLite
+  store construction (ADR 0035 second slice), no Engine/startup/deadline change.
+  Open decisions D1 custody, D2 partial founding, D3 endpoint discovery, D4
+  remote delegation, D5 real-time expiry evidence, D6 exhausted Engine boundary
+  (slice 5+ needs explicit owner authority before crossing it), D7 owner/hardware.
+- **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
+  host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
+  dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
+  **unverified on real hardware**.
+
 ## Main 92003177: E7 A8 timeout diagnosis (2026-11-19)
 
 OpenAI / GPT-6.1 Sol / high diagnostic builder; failure counter **0/3**.
@@ -726,7 +774,7 @@ preflight and source-only prerequisites grant no container or hardware credit.
 Engine Sol3/3 exhausted and historical Opus0/2 unchanged; OAuth wait and the
 existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 
-## Current state - 2026-11-18
+## Historical checkpoint - 2026-11-18 (superseded by the current state at the top)
 
 - Last merged: PR188 as8bd12b7f4954f4622b4487fad054e4a32e5d551a from reviewede3516afd. FirstPRCI44447890537 attempt1GREEN595wall/590charged/5idle,Win580/all9jobs; CA2eachOS and all5gates passed. Optional U6StopOrphaned/owners13 preserved, no credit/fix. Fresh9b4c/mainfirstGREEN/protection/head/pin rechecked03:15:55UTC before guarded merge03:16:02UTC; treeequalse351, PRunwatched. Own firstmain44450232774 GREEN568wall/563charged/5idle,Win553/all9jobs/CA2eachOS; history41 preserves40.
 - Previous merged: PR187 as9b4ccbde4362249fe06a775643c3bc8b6369c3c8 from reviewed9a48b474. FirstCI44442166258 attempt1SUCCESS580wall/576charged/4idle, WindowsRust567s, Rust788/775/743PASS, new20/21/21casesonce. All5gates/currentmaineea/first44432988620/protection checked02:21:57UTC before expected-head guarded squash; treeequals9a48, PRunwatched. Own firstmainCI44443788836 nowGREEN585wall/580charged/5idle, WindowsRust554s/all9jobsPASS, same20/21/21newcasesonce; history40 recorded preserving prior39.
