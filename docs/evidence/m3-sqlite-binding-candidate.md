@@ -55,3 +55,19 @@ wiring, first normal hosted execution and all required checks. Store-only and
 Engine integration remain later slices. PR189 stays HOLD/unwatched; no founder
 diagnostic/fix/retry authority. M2 OPEN / M3 UNCHECKED;
 **unverified on real hardware**; operational NO-GO.
+
+Source review at70036105 found one P2: architecture macros alone admitted Unix
+x32/ILP32. Root correction016ffaf8 adds sizeof(void*)==8 to the actual native
+qualification predicate, refreshes patch provenance and adds three width-policy
+source controls to the verifier. Six compile-only checks use that exact extracted
+function, real32/64-bit MSVC pointer code generation and controlled Unix OS/arch
+macros. Optimized refusal constants cover32-bit pointer cases and unsupported
+OS/arch; supported64-bit cases retain success. No native Unix or x32 library/
+filesystem execution is claimed. The initial assembly parser expected spaces
+instead of tabs; that failure is retained and its successful first compilation
+was reused. No source mutant or executable ran.
+
+Correction checks: targeted Windows10PASS (8.537s command/body0.01s), all-target
+check4.371s, Clippy5.051s, fmt0.835s, verifier33 source/inventory negatives PASS.
+Fresh metadata and build messages are retained at `D:/Temp/arx-binding-width-fix`.
+Independent exact-source re-review remains required; CI wiring/native gaps stay open.

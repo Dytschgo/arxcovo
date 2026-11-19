@@ -360,7 +360,15 @@ four input and140 artifact hashes/lengths; original upstream whitespace retained
 Windows10 targeted cases,73 extracted build-guard cases and30 inventory negatives
 PASS; check/all-target Clippy/fmt PASS. Unix/cross-target and listed native negative
 gaps remain UNRUN. Two missing-provider links failed as expected, a narrower
-control than linking an actual unpatched library. Source/qualification review next;
+control than linking an actual unpatched library. Independent Sol6.1/high review
+at70036105: Standards0/Spec1P2, source NO-GO for missing explicit Unix64-bit ABI
+qualification. Root corrected this in `016ffaf8`: actual native predicate requires
+sizeof(void*)==8; pins/hunks and three verifier width-policy controls updated.
+Six extracted-predicate compile cases cover real32/64-bit MSVC code generation
+with Unix architecture macros; not native Unix/x32 execution. Ten binding tests,
+33 source/inventory controls, check/Clippy/fmt PASS after correction. First assembly
+parser whitespace failure retained; first successful compilation reused. Focused
+independent re-review next; native/platform gaps and CI wiring remain open;
 no hosted/operational acceptance. [Candidate evidence](evidence/m3-sqlite-binding-candidate.md).
 Output/evidence `D:/Temp/arx-bound-binding-build-v1`.
 Both slices exclude Engine/start/shutdown/
