@@ -69,8 +69,10 @@ capacity increase or exhausted-attempt reset is authorized by this plan.
 
 ## Expiry evidence and other hard prerequisites
 
-CODE_TTL_MS is 900000 ms. Current rejection uses proposed/signer time, while the
-trusted-clock/skew/fail-closed contract remains unresolved. Waiting a real fifteen
+CODE_TTL_MS is 900000 ms. ADR0030 now settles the conditional trusted-host-UTC
+model and fallible checked-clock adapter. Runtime recovered-floor acquisition,
+caller wiring, TLS time and qualifying restart/suspend/UTC evidence remain open;
+that source prerequisite does not prove real-time expiry. Waiting a real fifteen
 minutes plus build and acceptance cannot fit the existing CI budget. A narrowly
 reviewed controlled-clock test across real transport can prove expiry-policy
 rejection, labelled controlled-clock evidence. It cannot establish real-time

@@ -60,16 +60,75 @@ PR145 was merged after the first red main run without accounting for it; the coo
 
 ## M3 full-RPC resumption — 2026-11-19
 
+**Current:** exact-source independent Sol6.1/high GO at `e3afd1f5`, followed by
+four first-execution learner observations PASS (P/V/A/S). Test body times
+1.46/1.52/2.27/0.87s; both transport closes, node shutdown, reclaimed32/4,
+release flags and same-directory readback PASS each case. This is local Windows
+component evidence, not joining/container or M2 native acceptance. Bounded logs,
+exclusive attempt markers, structured evidence and hashes are retained at
+`D:/Temp/arx-m3-rpc-engine-once`. No Engine fix or retry occurred.
+
 Coordinator resumed after the T3 restart. The cancelled Sol6.1/high preflight had
 completed both retained files before cancellation: `D:/Temp/arx-m3-resume-preflight/preflight.md`
 and `pin-proof.json`. The recorded report hash matches; frozen contract and
 source/API identities remain applicable. No duplicate preflight or runtime was
 started. Main first-attempt health is now verified above.
 
-Next: Sol6.1/high engineering of the independently accepted complete peer-RPC
-contract, on green main with preserved unpublished documentation. One serialized
-source builder; exact-source independent Sol review before real Engine fixture
-execution and normal final PR gates. Full RPC precedes production startup, key
+Sol6.1/high engineering completed candidate `a46a5203160c6725310d60a580884094d3694d3a`
+on `work/m3-complete-peer-rpc` from green main with preserved documentation
+(`084b1648`). Seven allowed source paths;52unique non-Engine cases passed, two
+original test failures retained, fmt/all-target Clippy PASS. Coordinator verified
+all44 returned source/evidence pins. Four learner Engine cases compiled but UNRUN;
+coverage gaps remain explicit in [candidate evidence](evidence/m3-complete-peer-rpc.md).
+
+Independent Sol6.1/high source and fixture review at `a46a5203`: Standards0,
+Spec3, observation NO-GO and merge NO-GO. S1 requires persistent failed-cleanup
+ownership and first-failure evidence; S2 requires exact membership, reclaimed
+capacity, sender seed and unchanged enrollment oracles; S3 requires the missing
+method-specific validation. No production regression was established. Report and
+pins: `D:/Temp/arx-m3-rpc-source-review-v1`.
+
+Sol6.1/high corrections committed as `e0e6fae2a02db1a3cea864204e961386400e00e4`:
+two allowed source paths, retained supervision/evidence, expanded oracles and
+method-specific matrix.61safe cases passed before final refinements; directly
+affected cases were rechecked after those edits. Final fmt/all-target Clippy
+PASS. Coordinator verified all453 manifest entries. The valid-image proof gives
+a conservative upper bound16361bytes under unchanged storage limits, so a valid
+16384byte image cannot be constructed; independent acceptance is pending.
+
+Independent round2 at `e0e6fae2`: Standards0/Spec1 residual P2. S2/S3 source
+findings CLOSED; the narrow impossible16384byte positive fixture exception is
+accepted. S1 still needed structured setup-error/panic evidence, so the four-case
+observation gate remained NO-GO. No Engine case ran.
+
+Coordinator Sol6.1/high corrected the residual setup and portable-output issue in
+one test file, commits `663a3d93` and `e3afd1f5de86038567ade0adaeee9e743d35810a`.
+Genuine second-bind failure/panic and portable-output/artifact-failure regressions
+PASS, plus two existing evidence/supervision cases. The two affected cases were
+rechecked after fallible temp-directory refinement; final fmt/all-target Clippy
+PASS. Setup errors retain structured first failure, registered release flags and
+explicit unconfirmed cleanup/readback; evidence failure refuses before startup.
+No engine/runtime fix or production source change. [ADR0032](adr/0032-complete-peer-rpc-factory.md)
+records the accepted design and narrow boundary exception, with execution pending.
+
+Independent round3 completed: SOURCE GO, Standards0/Spec0, S1 CLOSED and bounded
+P/V/A/S observation GO. Report: `D:/Temp/arx-m3-rpc-source-review-v3`. The four
+nominal observations above then passed without retries. Local correction bundle:
+`D:/Temp/arx-m3-rpc-evidence-fix`.
+
+Two bounded recording-only semantic controls completed, Sol6.1/high: each baseline
+passed once and each mutant failed once at its intended semantic assertion.
+Synthetic PreVote grant was caught while Pending; snapshot-match bypass was
+caught at the unauthorized-dispatch assertion. Exact bytes restored after each;
+all7source pins match, `git diff -- crates` empty, final fmt/Clippy PASS. Coordinator
+verified all83 returned artifact entries and the raw failures. Output:
+`D:/Temp/arx-m3-rpc-controls-once`. No Engine reruns or new fix authority.
+Local Windows quarantine guard9/9 PASS in0.192s; no quarantine changes.
+In parallel, [Sol6.1/high next startup/custody contract](t3-thread://v2/950f5165-f55d-4ffd-9b15-4b87e10b4d15/thread:delegated-task:command%3Amcp%3Abddacdb1-6679-4a64-ac51-bc2209d4eb27%3Adelegate-task%3Aarxcovo-m3-startup-custody-contract-e3afd1f5-v1)
+is read-only preparation from committed source, no implementation or acceptance.
+Preparing the peer-RPC PR; independent final exact-head review and normal required
+hosted gates remain. No hosted result is claimed yet. Builder
+artifacts remain at `D:/Temp/arx-m3-full-rpc-build-v1`. Full RPC precedes production startup, key
 custody and admission, then genuine network three-container acceptance. The
 preflight and source-only prerequisites grant no container or hardware credit.
 Engine Sol3/3 exhausted and historical Opus0/2 unchanged; OAuth wait and the
