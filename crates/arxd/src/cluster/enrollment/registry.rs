@@ -39,6 +39,9 @@ impl std::fmt::Display for PeerRefusal {
     }
 }
 impl EnrollmentState {
+    pub(in crate::cluster) fn committed_ms(&self) -> u64 {
+        self.committed_ms
+    }
     pub(in crate::cluster) fn founded(&self) -> bool {
         self.founded
     }
@@ -97,5 +100,36 @@ impl EnrollmentState {
         }
         self.members.remove(&node);
         Outcome::Removed { replay: false }
+    }
+}
+
+#[cfg(test)]
+mod startup_floor_tests {
+    use super::*;
+    #[test]
+    fn committed_floor_reads_actual_apply_without_mutation() {
+        let mut s = EnrollmentState::new([1; 16], NodeId::new(2).unwrap());
+        assert_eq!(s.committed_ms(), 0);
+        let command = Command::Found {
+            cluster: [1; 16],
+            members: FoundMembers::new([(
+                NodeId::new(1).unwrap(),
+                KeyDigest::of_spki(b"synthetic").unwrap(),
+            )])
+            .unwrap(),
+            proposed_at_ms: 8765,
+        };
+        s.apply(
+            &command,
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 1,
+            },
+            None,
+        );
+        let before = s.clone();
+        assert_eq!(s.committed_ms(), 8765);
+        assert_eq!(s, before);
     }
 }

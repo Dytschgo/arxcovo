@@ -154,6 +154,7 @@ mod peer_registry;
 mod peer_rpc_wire;
 mod peer_transport;
 mod peer_wire;
+mod startup_recovery;
 
 use super::{
     log_store::VoteLogStore,

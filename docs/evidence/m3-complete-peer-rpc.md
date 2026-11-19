@@ -1,5 +1,12 @@
 # Complete peer RPC candidate
 
+Current status: merged as `eea7af57c944d134d50ab284f1bf9b003246073e` after
+independent final GO and first hosted CI490wall/484charged. All67focused cases
+passed once eachOS. [Merge evidence](m3-pr186-first-ci.md). Own first-main
+CI44432988620 qualified560wall/556charged/4idle; [main evidence](m3-pr186-main-first-ci.md).
+M2 OPEN / M3 UNCHECKED. Earlier sections below preserve
+the candidate's staged evidence and historical holds.
+
 2026-11-19. Sol6.1/high implementation on verified main
 `e2908c98dfcdf97cb8e0aba431bafdb51f328c95`, after PR182. Source base
 `084b1648b9b87e40d7fc5da0b75b785f0145e866`; candidate
@@ -189,8 +196,22 @@ Windows quarantine guard9/9 also passed locally in0.192s; its policy is unchange
 
 ## Gates still open
 
-- Final exact-source independent review, normal cross-platform required CI and
-  measured policy budget. No hosted check is claimed for this candidate.
+- PR186 merged from `0a323793986d705785eff7e409cc85a75cce2836`. Source7files match
+  reviewed/observed/restored `e3afd1f5`; the added commit records documentation.
+  First normal CI44431134508 attempt1 passed; no rerun/dispatch. Its main's own
+  firstCI44432988620 qualified560wall/556charged/4idle, all9jobs PASS.
+- Independent final review completed GO, Standards0/Spec0, with exact-head
+  `agent-review=success`59319264686 and Conversation attestation6996145608.
+  Report/proof retained at `D:/Temp/arx-pr186-final-review`.
+- Partial first-CI proof: Ubuntu754PASS/22skip,175s job/51.342s tests; macOS722PASS/
+  8skip,251s job/72.661s tests. Each executed all67focused source cases once,
+  including all4learner cases. All three UI jobs passed Node60/browser/Electron:
+  Windows77s,Ubuntu136s,macOS61s. Five logs bounded8MiB/45s each, all untruncated,
+  retained with hashes at `D:/Temp/arx-pr186-first-ci`. Windows Rust remained in
+  progress at this snapshot; no terminal run/gate/budget acceptance is claimed.
+- Final source/evidence review, PR hosted gates/budget and main's first CI health
+  are complete; production joining/containers are still
+  separate dependencies, not acceptance supplied by this transport slice.
 
 Engine Sol3/3 exhausted and historical Opus0/2 remain unchanged. No retry,
 founder diagnostic, runtime fix, setting change or acceptance credit follows from

@@ -1,0 +1,533 @@
+//! Offline layout ownership, under the explicit no-external-writer premise.
+//! Handles and identity rechecks detect replacement; this is not a sandbox
+//! against an arbitrary writer running as the same account.
+#![allow(dead_code)]
+use serde::Deserialize;
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Read,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum Mode {
+    CreateFounder,
+    Join,
+    RecoverFounder,
+    RecoverJoiner,
+}
+impl Mode {
+    pub(super) fn recovery(self) -> bool {
+        matches!(self, Self::RecoverFounder | Self::RecoverJoiner)
+    }
+    pub(super) fn founder(self) -> bool {
+        matches!(self, Self::CreateFounder | Self::RecoverFounder)
+    }
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Plan {
+    pub mode: Mode,
+    pub config: PathBuf,
+    pub state: PathBuf,
+    pub credentials: PathBuf,
+    pub workspace: PathBuf,
+    pub peer: String,
+    pub enrollment: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refusal {
+    Plan,
+    Layout,
+    Ownership,
+    Unavailable,
+    Identity,
+    Store,
+    Clock,
+    Provenance,
+}
+type Result<T> = std::result::Result<T, Refusal>;
+fn endpoint(s: &str) -> Result<SocketAddr> {
+    let a: SocketAddr = s.parse().map_err(|_| Refusal::Plan)?;
+    if matches!(a,SocketAddr::V6(v) if v.scope_id()!=0) {
+        return Err(Refusal::Plan);
+    }
+    let safe = match a.ip() {
+        std::net::IpAddr::V4(v) => !v.is_link_local(),
+        std::net::IpAddr::V6(v) => !v.is_unicast_link_local() && v.to_ipv4_mapped().is_none(),
+    };
+    if s.len() > 64
+        || s != a.to_string()
+        || a.port() == 0
+        || a.ip().is_unspecified()
+        || a.ip().is_multicast()
+        || !safe
+    {
+        return Err(Refusal::Plan);
+    }
+    Ok(a)
+}
+impl Plan {
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 16384 {
+            return Err(Refusal::Plan);
+        }
+        let p: Self = serde_json::from_slice(bytes).map_err(|_| Refusal::Plan)?;
+        p.validate()?;
+        Ok(p)
+    }
+    fn validate(&self) -> Result<()> {
+        let p = self;
+        if endpoint(&p.peer)? == endpoint(&p.enrollment)? {
+            return Err(Refusal::Plan);
+        }
+        for path in [&p.config, &p.state, &p.credentials, &p.workspace] {
+            crate::config::checked_path(path).map_err(|_| Refusal::Layout)?;
+        }
+        let paths = [&p.config, &p.state, &p.credentials, &p.workspace];
+        for (i, a) in paths.iter().enumerate() {
+            for b in &paths[i + 1..] {
+                if a.starts_with(b) || b.starts_with(a) {
+                    return Err(Refusal::Layout);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObjectId(u64, u64);
+#[cfg(unix)]
+fn object(file: &File) -> Result<ObjectId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().map_err(|_| Refusal::Unavailable)?;
+    if m.is_file() && m.nlink() != 1 {
+        return Err(Refusal::Layout);
+    }
+    Ok(ObjectId(m.dev(), m.ino()))
+}
+#[cfg(windows)]
+fn object(file: &File) -> Result<ObjectId> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(Refusal::Unavailable);
+    }
+    if info.dwFileAttributes & 0x400 != 0
+        || (info.dwFileAttributes & 0x10 == 0 && info.nNumberOfLinks != 1)
+    {
+        return Err(Refusal::Layout);
+    }
+    Ok(ObjectId(
+        info.dwVolumeSerialNumber as u64,
+        (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+    ))
+}
+#[cfg(not(any(unix, windows)))]
+fn object(_: &File) -> Result<ObjectId> {
+    Err(Refusal::Unavailable)
+}
+fn options(directory: bool) -> OpenOptions {
+    let mut o = OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(3)
+            .custom_flags(0x00200000 | if directory { 0x02000000 } else { 0 });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | if directory { libc::O_DIRECTORY } else { 0 });
+    }
+    o
+}
+pub(super) struct Guard {
+    path: PathBuf,
+    file: File,
+    id: ObjectId,
+}
+impl Guard {
+    fn open(path: &Path, directory: bool, private: bool) -> Result<Self> {
+        crate::config::checked_path(path).map_err(|_| Refusal::Layout)?;
+        if private {
+            crate::security::private(path).map_err(|_| Refusal::Layout)?;
+        }
+        let file = options(directory).open(path).map_err(|_| Refusal::Layout)?;
+        let m = file.metadata().map_err(|_| Refusal::Layout)?;
+        if m.is_dir() != directory || (!directory && !m.is_file()) {
+            return Err(Refusal::Layout);
+        }
+        let id = object(&file)?;
+        Ok(Self {
+            path: path.into(),
+            file,
+            id,
+        })
+    }
+    fn recheck(&self) -> Result<()> {
+        let other = Self::open(
+            &self.path,
+            self.file.metadata().map_err(|_| Refusal::Layout)?.is_dir(),
+            false,
+        )?;
+        if other.id != self.id || object(&self.file)? != self.id {
+            return Err(Refusal::Layout);
+        }
+        Ok(())
+    }
+}
+pub(super) struct Owner {
+    pub plan: Plan,
+    guards: Vec<Guard>,
+    // The real OS lock remains held until this object is dropped.
+    lock: File,
+    entries: Vec<String>,
+}
+const STATE: &[&str] = &[
+    "cluster-owner.lock",
+    "cluster-state.lock",
+    "cluster-log.lock",
+    "cluster-state.sqlite3",
+    "cluster-log.sqlite3",
+    "cluster-state.sqlite3-journal",
+    "cluster-log.sqlite3-journal",
+    "cluster-state.sqlite3-wal",
+    "cluster-log.sqlite3-wal",
+    "cluster-state.sqlite3-shm",
+    "cluster-log.sqlite3-shm",
+];
+impl Owner {
+    pub(super) fn acquire(plan: Plan) -> Result<Self> {
+        plan.validate()?;
+        let mut guards = Vec::new();
+        let mut root_ids = Vec::new();
+        let mut ancestor_ids = Vec::new();
+        for (path, directory) in [
+            (&plan.config, false),
+            (&plan.state, true),
+            (&plan.credentials, true),
+            (&plan.workspace, true),
+        ] {
+            let g = Guard::open(path, directory, path != &plan.workspace)?;
+            if guards.iter().any(|old: &Guard| old.id == g.id) {
+                return Err(Refusal::Layout);
+            }
+            root_ids.push(g.id);
+            guards.push(g);
+            let mut ancestor = path.parent();
+            while let Some(p) = ancestor {
+                if p.as_os_str().is_empty() {
+                    break;
+                }
+                let g = Guard::open(p, true, false)?;
+                ancestor_ids.push(g.id);
+                guards.push(g);
+                ancestor = p.parent();
+            }
+        }
+        if root_ids.iter().any(|id| ancestor_ids.contains(id)) {
+            return Err(Refusal::Layout);
+        }
+        let mut entries = Vec::new();
+        for e in fs::read_dir(&plan.state)
+            .map_err(|_| Refusal::Layout)?
+            .take(STATE.len() + 1)
+        {
+            let e = e.map_err(|_| Refusal::Layout)?;
+            let name = e.file_name().into_string().map_err(|_| Refusal::Layout)?;
+            if !STATE.contains(&name.as_str()) {
+                return Err(Refusal::Layout);
+            }
+            let g = Guard::open(&e.path(), false, true)?;
+            if guards.iter().any(|old| old.id == g.id) {
+                return Err(Refusal::Layout);
+            }
+            guards.push(g);
+            entries.push(name);
+        }
+        let credential_entries: Vec<_> = fs::read_dir(&plan.credentials)
+            .map_err(|_| Refusal::Layout)?
+            .take(4)
+            .collect();
+        if !plan.mode.recovery() && !credential_entries.is_empty() {
+            return Err(Refusal::Layout);
+        }
+        if plan.mode.recovery() || !entries.is_empty() {
+            for name in [
+                "cluster-owner.lock",
+                "cluster-state.lock",
+                "cluster-log.lock",
+                "cluster-state.sqlite3",
+                "cluster-log.sqlite3",
+            ] {
+                if !entries.iter().any(|v| v == name) {
+                    return Err(Refusal::Layout);
+                }
+            }
+            for name in &entries {
+                if name.ends_with("-shm")
+                    || ((name.ends_with("-wal") || name.ends_with("-journal"))
+                        && fs::metadata(plan.state.join(name))
+                            .map_err(|_| Refusal::Layout)?
+                            .len()
+                            != 0)
+                {
+                    return Err(Refusal::Store);
+                }
+            }
+        }
+        if plan.mode.recovery() {
+            let mut names = Vec::new();
+            for e in credential_entries {
+                let e = e.map_err(|_| Refusal::Layout)?;
+                let name = e.file_name().into_string().map_err(|_| Refusal::Layout)?;
+                if name != "identity.json"
+                    && name != "ca.der"
+                    && !super::join_receipt::basename(&name)
+                {
+                    return Err(Refusal::Layout);
+                }
+                let g = Guard::open(&e.path(), false, true)?;
+                if guards.iter().any(|old| old.id == g.id) {
+                    return Err(Refusal::Layout);
+                }
+                guards.push(g);
+                names.push(name);
+            }
+            if names.len() != 3
+                || !names.iter().any(|v| v == "identity.json")
+                || !names.iter().any(|v| v == "ca.der")
+            {
+                return Err(Refusal::Identity);
+            }
+        }
+        let lock_path = plan.state.join("cluster-owner.lock");
+        let mut o = options(false);
+        o.write(true);
+        if entries.is_empty() {
+            o.create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+        }
+        let lock = o.open(&lock_path).map_err(|_| Refusal::Ownership)?;
+        lock.try_lock().map_err(|_| Refusal::Ownership)?;
+        guards.push(Guard::open(&lock_path, false, true)?);
+        if !entries.iter().any(|v| v == "cluster-owner.lock") {
+            entries.push("cluster-owner.lock".into());
+        }
+        let owner = Self {
+            plan,
+            guards,
+            lock,
+            entries,
+        };
+        owner.recheck()?;
+        Ok(owner)
+    }
+    pub(super) fn recheck(&self) -> Result<()> {
+        for g in &self.guards {
+            g.recheck()?;
+        }
+        let mut entries = fs::read_dir(&self.plan.state)
+            .map_err(|_| Refusal::Layout)?
+            .take(STATE.len() + 1)
+            .map(|e| {
+                e.map_err(|_| Refusal::Layout)?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| Refusal::Layout)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut expected = self.entries.clone();
+        entries.sort();
+        expected.sort();
+        if entries != expected {
+            return Err(Refusal::Layout);
+        }
+        let count = fs::read_dir(&self.plan.credentials)
+            .map_err(|_| Refusal::Layout)?
+            .take(4)
+            .count();
+        if count != if self.plan.mode.recovery() { 3 } else { 0 } {
+            return Err(Refusal::Layout);
+        }
+        Ok(())
+    }
+    pub(super) fn has_stores(&self) -> bool {
+        self.entries.iter().any(|n| n == "cluster-state.sqlite3")
+    }
+    pub(super) fn read(&self, name: &str, max: u64) -> Result<Vec<u8>> {
+        let path = self.plan.credentials.join(name);
+        let g = self
+            .guards
+            .iter()
+            .find(|g| g.path == path)
+            .ok_or(Refusal::Identity)?;
+        g.recheck()?;
+        let mut file = g.file.try_clone().map_err(|_| Refusal::Layout)?;
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(max + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Refusal::Layout)?;
+        if bytes.len() as u64 > max {
+            return Err(Refusal::Identity);
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::cluster) mod tests {
+    use super::*;
+    pub(in crate::cluster) struct Layout {
+        pub root: tempfile::TempDir,
+    }
+    impl Layout {
+        pub(in crate::cluster) fn new() -> Self {
+            let root = crate::service::application::tests::private_temp();
+            for name in ["state", "credentials", "workspace"] {
+                fs::create_dir(root.path().join(name)).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+            }
+            let l = Self { root };
+            l.write("config", b"{}");
+            l
+        }
+        pub(in crate::cluster) fn write(&self, name: &str, bytes: &[u8]) {
+            let path = self.root.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        pub(in crate::cluster) fn plan(&self, mode: &str) -> Plan {
+            let r = self.root.path();
+            Plan::parse(&serde_json::to_vec(&serde_json::json!({"mode":mode,"config":r.join("config"),"state":r.join("state"),"credentials":r.join("credentials"),"workspace":r.join("workspace"),"peer":"127.0.0.1:7001","enrollment":"127.0.0.1:7002"})).unwrap()).unwrap()
+        }
+        pub(in crate::cluster) fn snapshot(&self) -> Vec<(String, Vec<u8>)> {
+            let mut all = Vec::new();
+            for dir in ["state", "credentials"] {
+                for entry in fs::read_dir(self.root.path().join(dir)).unwrap() {
+                    let e = entry.unwrap();
+                    let bytes = if e.metadata().unwrap().len() == 0 {
+                        Vec::new()
+                    } else {
+                        fs::read(e.path()).unwrap()
+                    };
+                    all.push((format!("{dir}/{}", e.file_name().to_str().unwrap()), bytes));
+                }
+            }
+            all.sort();
+            all
+        }
+    }
+    #[test]
+    fn strict_plan_and_endpoints() {
+        let l = Layout::new();
+        let p = l.plan("create-founder");
+        assert_eq!(p.mode, Mode::CreateFounder);
+        for s in [
+            "0.0.0.0:1",
+            "127.0.0.1:0",
+            "localhost:3",
+            "169.254.1.2:4",
+            "[::ffff:127.0.0.1]:5",
+            "[fe80::1%3]:6",
+        ] {
+            assert!(endpoint(s).is_err(), "{s}");
+        }
+        assert!(Plan::parse(&vec![b' '; 16385]).is_err());
+        assert!(Plan::parse(br#"{"mode":"auto"}"#).is_err());
+    }
+    #[test]
+    fn retained_owner_duplicate_and_occupied_fresh() {
+        let l = Layout::new();
+        let o = Owner::acquire(l.plan("join")).unwrap();
+        let before = l.snapshot();
+        assert!(Owner::acquire(l.plan("join")).is_err());
+        assert_eq!(l.snapshot(), before);
+        let path = l.root.path().join("state/cluster-owner.lock");
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(f.try_lock().is_err());
+        drop(o);
+        assert!(f.try_lock().is_ok());
+    }
+    #[test]
+    fn overlap_alias_and_object_replacement() {
+        let l = Layout::new();
+        let mut p = l.plan("join");
+        p.credentials = p.state.clone();
+        assert!(Owner::acquire(p).is_err());
+        #[cfg(windows)]
+        {
+            let l = Layout::new();
+            let mut p = l.plan("join");
+            fs::create_dir(p.state.join("nested")).unwrap();
+            p.credentials = PathBuf::from(p.state.join("nested").to_str().unwrap().to_uppercase());
+            assert!(Owner::acquire(p).is_err());
+            let l = Layout::new();
+            fs::hard_link(
+                l.root.path().join("config"),
+                l.root.path().join("state/cluster-owner.lock"),
+            )
+            .unwrap();
+            assert!(Owner::acquire(l.plan("join")).is_err());
+        }
+        let l = Layout::new();
+        let o = Owner::acquire(l.plan("join")).unwrap();
+        l.write("state/unexpected", b"x");
+        assert_eq!(o.recheck(), Err(Refusal::Layout));
+        // Handles prevent replacement on Windows; Unix detects changed object IDs.
+        let path = l.root.path().join("config");
+        let renamed = fs::rename(&path, l.root.path().join("old-config"));
+        #[cfg(windows)]
+        assert!(renamed.is_err());
+        #[cfg(unix)]
+        {
+            renamed.unwrap();
+            l.write("config", b"{}");
+            assert_eq!(o.recheck(), Err(Refusal::Layout));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn reparse_and_hardlink_refuse() {
+        use std::os::unix::fs::symlink;
+        let l = Layout::new();
+        symlink(
+            l.root.path().join("config"),
+            l.root.path().join("state/cluster-owner.lock"),
+        )
+        .unwrap();
+        assert!(Owner::acquire(l.plan("join")).is_err());
+        let l = Layout::new();
+        fs::hard_link(
+            l.root.path().join("config"),
+            l.root.path().join("state/cluster-owner.lock"),
+        )
+        .unwrap();
+        assert!(Owner::acquire(l.plan("join")).is_err());
+    }
+}
