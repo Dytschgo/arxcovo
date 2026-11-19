@@ -173,9 +173,10 @@ pub struct VoteLogStore {
     poisoned: bool,
     #[cfg(test)]
     gate: Option<DropGate>,
-    _lock: File,
+    _lock: Option<File>,
     #[cfg(test)]
     hook: Option<(std::path::PathBuf, bool)>,
+    _bound: Option<super::bound_open::BoundLease>,
     // Must stay last: struct fields drop in declaration order.
     release: ReleaseAck,
 }
@@ -187,7 +188,16 @@ impl std::fmt::Debug for VoteLogStore {
             .finish_non_exhaustive()
     }
 }
+pub(super) struct InitializedLog {
+    meta: Meta,
+    release: ReleaseAck,
+}
 impl VoteLogStore {
+    #[cfg(test)]
+    pub(super) fn bound_pointer(&self) -> usize {
+        (unsafe { self.db.handle() }) as usize
+    }
+
     pub(super) fn released(&self) -> Released {
         self.release.released()
     }
@@ -195,8 +205,11 @@ impl VoteLogStore {
     pub(in crate::cluster) fn hold_drop(&mut self, gate: DropGate) {
         self.gate = Some(gate);
     }
-    pub fn open(dir: &Path, cluster: ClusterId) -> Result<Self, StoreError> {
-        let (lock, mut db) = open_db(dir, "cluster-log", 2048)?;
+    fn initialize_db(
+        db: &mut Connection,
+        dir: &Path,
+        cluster: ClusterId,
+    ) -> Result<InitializedLog, StoreError> {
         let tx = db.transaction()?;
         let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
@@ -252,16 +265,54 @@ impl VoteLogStore {
                 crate::security::private(&p).map_err(|_| StoreError::Io)?;
             }
         }
+        Ok(InitializedLog {
+            meta,
+            release: release_pair().0,
+        })
+    }
+    pub(super) fn initialize_bound(
+        pending: &mut super::bound_open::BoundDb,
+        cluster: ClusterId,
+    ) -> Result<InitializedLog, StoreError> {
+        super::state_store::configure_db(&pending.db, "cluster-log", 2048)?;
+        #[cfg(test)]
+        super::bound_open::tests::initialization(&pending.db, &pending.dir)?;
+        Self::initialize_db(&mut pending.db, &pending.dir, cluster)
+    }
+    pub(super) fn from_initialized(
+        bound: super::bound_open::BoundDb,
+        initialized: InitializedLog,
+    ) -> Self {
+        let super::bound_open::BoundDb { db, dir: _, lease } = bound;
+        let InitializedLog { meta, release } = initialized;
+        Self {
+            db,
+            meta,
+            poisoned: false,
+            #[cfg(test)]
+            gate: None,
+            _lock: None,
+            #[cfg(test)]
+            hook: None,
+            _bound: Some(lease),
+            release,
+        }
+    }
+    pub fn open(dir: &Path, cluster: ClusterId) -> Result<Self, StoreError> {
+        let (lock, mut db) = open_db(dir, "cluster-log", 2048)?;
+        let initialized = Self::initialize_db(&mut db, dir, cluster)?;
+        let InitializedLog { meta, release } = initialized;
         Ok(Self {
             db,
             meta,
             poisoned: false,
             #[cfg(test)]
             gate: None,
-            _lock: lock,
+            _lock: Some(lock),
             #[cfg(test)]
             hook: None,
-            release: release_pair().0,
+            _bound: None,
+            release,
         })
     }
     fn healthy(&self) -> Result<(), StoreError> {

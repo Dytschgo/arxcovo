@@ -154,6 +154,10 @@ pub(super) struct Guard {
     id: ObjectId,
 }
 impl Guard {
+    pub(super) fn bound_duplicate(&self) -> Result<File> {
+        self.recheck()?;
+        self.file.try_clone().map_err(|_| Refusal::Unavailable)
+    }
     fn open(path: &Path, directory: bool, private: bool) -> Result<Self> {
         crate::config::checked_path(path).map_err(|_| Refusal::Layout)?;
         if private {
@@ -189,6 +193,7 @@ pub(super) struct Owner {
     // The real OS lock remains held until this object is dropped.
     lock: File,
     entries: Vec<String>,
+    pub(super) bound_attempt: super::bound_open::BoundAttempt,
 }
 const STATE: &[&str] = &[
     "cluster-owner.lock",
@@ -330,6 +335,7 @@ impl Owner {
             guards,
             lock,
             entries,
+            bound_attempt: super::bound_open::BoundAttempt::Ready,
         };
         owner.recheck()?;
         Ok(owner)
@@ -454,6 +460,127 @@ impl Owner {
             }
         }
         self.guards.extend(staged);
+        self.entries = entries;
+        Ok(())
+    }
+    pub(super) fn bound_guard(&self, name: &str) -> Result<File> {
+        let path = self.plan.state.join(name);
+        let guard = self
+            .guards
+            .iter()
+            .find(|g| g.path == path)
+            .ok_or(Refusal::Layout)?;
+        guard.recheck()?;
+        guard.file.try_clone().map_err(|_| Refusal::Unavailable)
+    }
+    pub(super) fn bound_create(&self, name: &str) -> Result<Guard> {
+        if ![
+            "cluster-state.lock",
+            "cluster-log.lock",
+            "cluster-state.sqlite3",
+            "cluster-log.sqlite3",
+        ]
+        .contains(&name)
+        {
+            return Err(Refusal::Layout);
+        }
+        let path = self.plan.state.join(name);
+        crate::config::checked_path(&path).map_err(|_| Refusal::Layout)?;
+        let mut o = options(false);
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let file = o.open(&path).map_err(|_| Refusal::Layout)?;
+        let id = object(&file)?;
+        Ok(Guard { path, file, id })
+    }
+    pub(super) fn bound_validate(&self, staged: &[Guard], complete: bool) -> Result<()> {
+        for g in self.guards.iter().chain(staged) {
+            g.recheck()?;
+            if g.path.parent() == Some(self.plan.state.as_path()) {
+                crate::security::private(&g.path).map_err(|_| Refusal::Layout)?;
+            }
+        }
+        let mut expected = self.entries.clone();
+        for g in staged {
+            let name = g
+                .path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or(Refusal::Layout)?;
+            if expected.iter().any(|v| v == name) {
+                return Err(Refusal::Layout);
+            }
+            expected.push(name.to_owned());
+        }
+        let mut actual = Vec::new();
+        for entry in fs::read_dir(&self.plan.state)
+            .map_err(|_| Refusal::Layout)?
+            .take(STATE.len() + 1)
+        {
+            let e = entry.map_err(|_| Refusal::Layout)?;
+            let name = e.file_name().into_string().map_err(|_| Refusal::Layout)?;
+            if !expected.contains(&name) {
+                if !complete
+                    || ![
+                        "cluster-state.sqlite3-journal",
+                        "cluster-log.sqlite3-journal",
+                    ]
+                    .contains(&name.as_str())
+                {
+                    return Err(Refusal::Layout);
+                }
+                let g = Guard::open(&e.path(), false, true)?;
+                if g.file.metadata().map_err(|_| Refusal::Layout)?.len() != 0 {
+                    return Err(Refusal::Store);
+                }
+            } else if name.ends_with("-wal")
+                || name.ends_with("-shm")
+                || (name.ends_with("-journal")
+                    && e.metadata().map_err(|_| Refusal::Layout)?.len() != 0)
+            {
+                return Err(Refusal::Store);
+            }
+            actual.push(name);
+        }
+        if expected.iter().any(|n| !actual.contains(n)) {
+            return Err(Refusal::Layout);
+        }
+        if fs::read_dir(&self.plan.credentials)
+            .map_err(|_| Refusal::Layout)?
+            .take(4)
+            .count()
+            != if self.plan.mode.recovery() { 3 } else { 0 }
+        {
+            return Err(Refusal::Layout);
+        }
+        Ok(())
+    }
+    pub(super) fn bound_install(&mut self, staged: &mut Vec<Guard>) -> Result<()> {
+        self.bound_validate(staged, true)?;
+        let mut journals = Vec::new();
+        for name in [
+            "cluster-state.sqlite3-journal",
+            "cluster-log.sqlite3-journal",
+        ] {
+            if !self.entries.iter().any(|v| v == name) && self.plan.state.join(name).exists() {
+                journals.push(Guard::open(&self.plan.state.join(name), false, true)?);
+            }
+        }
+        // Allocate before changing the original baseline; only field moves follow.
+        let mut entries = self.entries.clone();
+        entries.extend(
+            staged
+                .iter()
+                .chain(&journals)
+                .map(|g| g.path.file_name().unwrap().to_str().unwrap().to_owned()),
+        );
+        self.guards.reserve(staged.len() + journals.len());
+        self.guards.append(staged);
+        self.guards.append(&mut journals);
         self.entries = entries;
         Ok(())
     }

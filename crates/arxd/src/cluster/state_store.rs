@@ -214,9 +214,10 @@ pub struct StateStore {
     poisoned: bool,
     #[cfg(test)]
     gate: Option<DropGate>,
-    _lock: File,
+    _lock: Option<File>,
     #[cfg(test)]
     hook: Option<(std::path::PathBuf, bool)>,
+    _bound: Option<super::bound_open::BoundLease>,
     // Must stay last: struct fields drop in declaration order.
     release: ReleaseAck,
 }
@@ -279,6 +280,10 @@ pub(super) fn open_db(
     private(&path)?;
     drop(file);
     let db = Connection::open(&path)?;
+    configure_db(&db, stem, max_pages)?;
+    Ok((lock, db))
+}
+pub(super) fn configure_db(db: &Connection, stem: &str, max_pages: u64) -> Result<(), StoreError> {
     db.busy_timeout(Duration::from_millis(250))?;
     db.execute_batch(&format!("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA max_page_count={max_pages};"))?;
     let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
@@ -298,10 +303,20 @@ pub(super) fn open_db(
     if mode != "truncate" {
         return Err(StoreError::Unsupported);
     }
-    Ok((lock, db))
+    Ok(())
 }
 type SnapshotPositions = (Option<LogPos>, Option<(LogPos, MembershipBlob)>);
+pub(super) struct InitializedState {
+    image: Image,
+    blob: Vec<u8>,
+    release: ReleaseAck,
+}
 impl StateStore {
+    #[cfg(test)]
+    pub(super) fn bound_pointer(&self) -> usize {
+        (unsafe { self.db.handle() }) as usize
+    }
+
     pub(super) fn released(&self) -> Released {
         self.release.released()
     }
@@ -324,8 +339,11 @@ impl StateStore {
         let image = decode(blob)?;
         Ok((image.applied, image.membership))
     }
-    pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
-        let (lock, mut db) = open_db(dir, "cluster-state", 64)?;
+    fn initialize_db(
+        db: &mut Connection,
+        dir: &Path,
+        init: Init,
+    ) -> Result<InitializedState, StoreError> {
         let tx = db.transaction()?;
         let v: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if v == 0 {
@@ -358,6 +376,53 @@ impl StateStore {
                 private(&p)?;
             }
         }
+        Ok(InitializedState {
+            image,
+            blob,
+            release: release_pair().0,
+        })
+    }
+    pub(super) fn initialize_bound(
+        pending: &mut super::bound_open::BoundDb,
+        init: Init,
+    ) -> Result<InitializedState, StoreError> {
+        super::state_store::configure_db(&pending.db, "cluster-state", 64)?;
+        #[cfg(test)]
+        super::bound_open::tests::initialization(&pending.db, &pending.dir)?;
+        Self::initialize_db(&mut pending.db, &pending.dir, init)
+    }
+    pub(super) fn from_initialized(
+        bound: super::bound_open::BoundDb,
+        initialized: InitializedState,
+    ) -> Self {
+        let super::bound_open::BoundDb { db, dir: _, lease } = bound;
+        let InitializedState {
+            image,
+            blob,
+            release,
+        } = initialized;
+        Self {
+            db,
+            image,
+            blob,
+            poisoned: false,
+            #[cfg(test)]
+            gate: None,
+            _lock: None,
+            #[cfg(test)]
+            hook: None,
+            _bound: Some(lease),
+            release,
+        }
+    }
+    pub fn open(dir: &Path, init: Init) -> Result<Self, StoreError> {
+        let (lock, mut db) = open_db(dir, "cluster-state", 64)?;
+        let initialized = Self::initialize_db(&mut db, dir, init)?;
+        let InitializedState {
+            image,
+            blob,
+            release,
+        } = initialized;
         Ok(Self {
             db,
             image,
@@ -365,10 +430,11 @@ impl StateStore {
             poisoned: false,
             #[cfg(test)]
             gate: None,
-            _lock: lock,
+            _lock: Some(lock),
             #[cfg(test)]
             hook: None,
-            release: release_pair().0,
+            _bound: None,
+            release,
         })
     }
     pub fn applied(&self) -> Option<LogPos> {
