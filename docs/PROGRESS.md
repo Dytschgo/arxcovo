@@ -378,7 +378,41 @@ and executes native cases once. Exact extracted PowerShell step passed locally
 offline in1.328s; injected metadata/check/verifier exits37/38/39 propagated. Initial
 outer test wrapper omitted LASTEXITCODE propagation; its failure is preserved,
 then corrected to match runner exit handling. No product failure or Engine run.
-Workflow integration needs independent review and normal first hosted execution;
+Independent Sol6.1/high workflow/final-candidate review completed GO at14ace1cc,
+Standards0/Spec0, reportSHA368463e3; coordinator verified report and304 retained
+evidence pin entries. Fresh live main8bd/latestfirst44450232774 attempt1SUCCESS
+rechecked2026-11-19T07:01:44Z before normal push. Published
+[PR190](https://github.com/Dytschgo/arxcovo/pull/190) at unchanged exact
+`14ace1ccee4834f2b8030c31e22b55ed1b668e63`, linked immediately. Independent
+[attestation](https://github.com/Dytschgo/arxcovo/pull/190#issuecomment-7002303126)
+and exact-head agent-review SUCCESS59339314382 published; root verified312 retained
+pin entries. First CI44476535131 attempt1 is non-green: all3 UI workers58PASS/2FAIL
+at exact workflow/Cargo-variable inventories; macOS Rust fails build guard on
+DYLD_FALLBACK_LIBRARY_PATH before tests. Ubuntu Rust786PASS/22skip/body52.300s,
+all9 binding cases once. First run now terminal FAILURE414wall, Windows393s:
+673PASS/2FAIL/36skip/125UNRUN (body61.592s), both owner_windows n1/n2 fail publish
+with Io; underlying cause UNKNOWN, separate from PR189 founder refusals. All10
+Windows binding cases passed once. All3 verify gates failed closed14/6/10s.
+All9 bounded D logs retained once (five reused plus four remaining), none truncated,
+`D:/Temp/arx-pr190-first-ci`. Policy409rawcharged/5potentialidle withheld:not-green,
+no history append/rerun/dispatch. Fresh independent Astra6.2/high evidence-only
+Windows disposition completed HOLD/UNKNOWN at
+`D:/Temp/arx-pr190-windows-disposition`, reportSHA023988f5; root verified22 retained
+file/manifest pins and nine logs. Both failures are first create-new publication,
+not exact-hash replacement. Publish Io can arise before/at/after rename; native
+error, failed operation and final file state remain unobserved. New exported TMP/
+TEMP reaches default-temp fixtures, a concrete causal path but no proven cause.
+Both named PR189 founder cases passed once here, not closure of that separate
+hold. No new native retry/fix allowance or counter change. Scoped Node/Mac work
+continues; PR190 unwatch confirmed true-to-false for held-head inbox handoff.
+Root corrected the two stale Node expectations with exact new literals (no guard
+weakening), six focused workflow tests PASS; local unpublished source076f156a.
+Independent Sol6.1/high design-only macOS Cargo loader-environment correction
+active at `D:/Temp/arx-pr190-macos-guard-design`; no guard weakening applied yet.
+Preserve this failed first outcome; no new push before the scoped corrections
+and unknown Windows failure have appropriate independent disposition/review.
+No Engine/founder fix, counter reset or timeout/quarantine change. This checkpoint
+stays unpublished rather than creating a documentation-only CI run;
 no hosted/operational acceptance. [Candidate evidence](evidence/m3-sqlite-binding-candidate.md).
 Output/evidence `D:/Temp/arx-bound-binding-build-v1`.
 Both slices exclude Engine/start/shutdown/
