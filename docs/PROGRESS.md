@@ -5761,3 +5761,24 @@ Clean local passes do not explain hosted failures. Hosted observation and
 independent review remain coordinator work; no PR created here. Evidence and
 full traces: D:/Temp/arx-founder-diag/report.md and sibling logs/intervals.md.
 M2 OPEN, M3 UNCHECKED; hardware **unverified on real hardware**.
+
+### Founder recorder review correction (2026-11-19; Sol 6.1/high)
+
+Read independent review of 759be9d1 (review SHA256
+7d433eb5faddeae2c378079cb76f36e0b13a1eb2f38a1d8fcd49a0264661d53e).
+One authorized correction: registry bind/lookup use try_lock and omit evidence
+on contention/poison; entry boundary timestamp precedes lookup. Deterministic
+private-registry held-lock and poison test has no sleeps. Published metrics
+borrow copies three scalars and drops before recording or clock sampling; it
+remains a synchronous published read, not a strict try-read. Exhaustive Slots
+shape/type guard restored including trace [AtomicU64; 20]. Optional index cleanup
+deferred. No production/deadline/workflow changes or architecture deviation.
+
+Acceptance: fmt and all-target Clippy -D warnings passed first check; recorder
+9/9, focal 3/3 once each, one default-scheduled consensus subset 214/214 (7.144 s).
+No failure reproduced; clean local evidence does not explain hosted failures.
+Evidence: D:/Temp/arx-founder-diag/report.md and correction-*.log. Prior evidence
+preserved. One correction only, no further fix attempts. Hosted observation and
+merge HOLD pending independent exact-head review; no push/PR/hosted actions.
+Last merged PR unchanged. Engine Sol 3/3 exhausted, Opus 0/2 unchanged.
+M2 OPEN, M3 UNCHECKED; hardware **unverified on real hardware**.

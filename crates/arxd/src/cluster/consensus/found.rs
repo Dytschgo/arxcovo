@@ -439,29 +439,50 @@ pub(in crate::cluster::consensus) mod observation {
                     ),
                     Ordering::Release,
                 );
-                let mut bindings = BINDINGS.lock().unwrap();
-                bindings.retain(|(log, sm, w)| {
-                    w.strong_count() != 0
-                        && *log != node.log_weak.as_ptr() as usize
-                        && *sm != node.sm_weak.as_ptr() as usize
-                });
-                if bindings.len() < 64 {
-                    bindings.push((
-                        node.log_weak.as_ptr() as usize,
-                        node.sm_weak.as_ptr() as usize,
-                        Arc::downgrade(slots),
-                    ));
-                }
+                register(
+                    &BINDINGS,
+                    node.log_weak.as_ptr() as usize,
+                    node.sm_weak.as_ptr() as usize,
+                    slots,
+                );
             }
         });
     }
+    fn register(
+        registry: &std::sync::Mutex<Vec<Binding>>,
+        log: usize,
+        sm: usize,
+        slots: &Arc<Slots>,
+    ) {
+        // Contention and poison omit evidence; neither is permission to wait.
+        let Ok(mut bindings) = registry.try_lock() else {
+            return;
+        };
+        bindings.retain(|(old_log, old_sm, w)| {
+            w.strong_count() != 0 && *old_log != log && *old_sm != sm
+        });
+        if bindings.len() < 64 {
+            bindings.push((log, sm, Arc::downgrade(slots)));
+        }
+    }
     pub(in crate::cluster::consensus) fn entry(store: usize, p: super::LogPos, stage: usize) {
-        let slots = BINDINGS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(log, sm, _)| *log == store || *sm == store)
-            .and_then(|(_, _, w)| w.upgrade());
+        // Sample the actual boundary before any recorder lookup.
+        let at = Instant::now();
+        entry_at(&BINDINGS, at, store, p, stage);
+    }
+    fn entry_at(
+        registry: &std::sync::Mutex<Vec<Binding>>,
+        at: Instant,
+        store: usize,
+        p: super::LogPos,
+        stage: usize,
+    ) {
+        let slots = registry.try_lock().ok().and_then(|bindings| {
+            bindings
+                .iter()
+                .find(|(log, sm, _)| *log == store || *sm == store)
+                .and_then(|(_, _, w)| w.upgrade())
+        });
         if let Some(slots) = slots {
             let base = if stage == 4 { 1 } else { 17 };
             for (i, v) in [p.term, p.leader, p.index].into_iter().enumerate() {
@@ -474,7 +495,10 @@ pub(in crate::cluster::consensus) mod observation {
             }
             let _ = slots.trace[stage].compare_exchange(
                 0,
-                pack(slots.start.elapsed().as_micros(), Reason::Ok),
+                pack(
+                    at.saturating_duration_since(slots.start).as_micros(),
+                    Reason::Ok,
+                ),
                 Ordering::Release,
                 Ordering::Relaxed,
             );
@@ -495,15 +519,16 @@ pub(in crate::cluster::consensus) mod observation {
         let _ = CAPTURE.try_with(|cell| {
             if let (Some(slots), Some(raft)) = (&cell.borrow().slots, &node.raft) {
                 let rx = raft.metrics();
-                let m = rx.borrow_watched();
-                for (i, v) in [
-                    m.last_log_index,
-                    m.local_committed.map(|p| p.index),
-                    m.last_applied.map(|p| p.index),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                // Published borrow is a synchronous read lock, not a strict try-read.
+                let scalars = {
+                    let m = rx.borrow_watched();
+                    [
+                        m.last_log_index,
+                        m.local_committed.map(|p| p.index),
+                        m.last_applied.map(|p| p.index),
+                    ]
+                };
+                for (i, v) in scalars.into_iter().enumerate() {
                     slots.trace[base + 1 + i]
                         .store(v.map_or(0, |v| v.saturating_add(1)), Ordering::Release);
                 }
@@ -827,8 +852,13 @@ pub(in crate::cluster::consensus) mod observation {
         #[test]
         fn postshutdown_pair_preserves_return_cut_and_scalar_shape() {
             // Exhaustive destructuring fails compilation if hidden fields are added.
-            let Slots { words, start, .. }: Slots = Slots::new();
+            let Slots {
+                words,
+                trace,
+                start,
+            }: Slots = Slots::new();
             let _: [AtomicU64; 48] = words;
+            let _: [AtomicU64; 20] = trace;
             let _: Instant = start;
             let slots = Slots::new();
             slots.words[16].store(pack(1, Reason::Ok), Ordering::Release);
@@ -966,8 +996,9 @@ pub(in crate::cluster::consensus) mod observation {
         #[test]
         fn found_entry_markers_are_scoped_once_and_do_not_retain_stores() {
             let slots = Arc::new(Slots::new());
+            let registry = std::sync::Mutex::new(Vec::new());
             // Synthetic fixture identities are internal and never rendered.
-            BINDINGS
+            registry
                 .lock()
                 .unwrap()
                 .push((usize::MAX, usize::MAX - 1, Arc::downgrade(&slots)));
@@ -976,15 +1007,15 @@ pub(in crate::cluster::consensus) mod observation {
                 leader: 1,
                 index: 7,
             };
-            entry(usize::MAX, p, 4);
-            entry(usize::MAX - 1, p, 5);
-            entry(usize::MAX - 1, p, 6);
-            entry(usize::MAX - 1, p, 7);
+            entry_at(&registry, Instant::now(), usize::MAX, p, 4);
+            entry_at(&registry, Instant::now(), usize::MAX - 1, p, 5);
+            entry_at(&registry, Instant::now(), usize::MAX - 1, p, 6);
+            entry_at(&registry, Instant::now(), usize::MAX - 1, p, 7);
             let frozen: [u64; 20] = std::array::from_fn(|i| slots.trace[i].load(Ordering::Acquire));
             assert_eq!(&frozen[1..4], &[4, 2, 8]);
             assert_eq!(&frozen[17..20], &[4, 2, 8]);
             assert!(frozen[4..8].windows(2).all(|v| v[0] != 0 && v[0] <= v[1]));
-            entry(usize::MAX, p, 4);
+            entry_at(&registry, Instant::now(), usize::MAX, p, 4);
             assert_eq!(slots.trace[4].load(Ordering::Acquire), frozen[4]);
             let unrelated = Arc::new(Slots::new());
             assert!(
@@ -996,10 +1027,44 @@ pub(in crate::cluster::consensus) mod observation {
             let weak = Arc::downgrade(&slots);
             drop(slots);
             assert!(weak.upgrade().is_none());
-            BINDINGS
+            registry
                 .lock()
                 .unwrap()
                 .retain(|(log, _, _)| *log != usize::MAX);
+        }
+        #[test]
+        fn registry_contention_and_poison_omit_evidence() {
+            let slots = Arc::new(Slots::new());
+            let registry = std::sync::Mutex::new(Vec::new());
+            register(&registry, 1, 2, &slots);
+            let p = super::super::LogPos {
+                term: 1,
+                leader: 1,
+                index: 2,
+            };
+            let at = slots.start + std::time::Duration::from_micros(123);
+            {
+                let held = registry.lock().unwrap();
+                // Same-thread calls while holding the lock deterministically exercise skip.
+                register(&registry, 3, 4, &slots);
+                entry_at(&registry, at, 1, p, 4);
+                assert_eq!(held.len(), 1);
+                assert!(slots.trace.iter().all(|w| w.load(Ordering::Acquire) == 0));
+            }
+            entry_at(&registry, at, 1, p, 4);
+            assert_eq!(
+                slots.trace[4].load(Ordering::Acquire),
+                pack(123, Reason::Ok)
+            );
+            // Poison a private registry, never the process-global registry.
+            let poisoned = std::sync::Mutex::new(Vec::new());
+            let _ = std::panic::catch_unwind(|| {
+                let _held = poisoned.lock().unwrap();
+                panic!("private recorder registry poison");
+            });
+            register(&poisoned, 1, 2, &slots);
+            entry_at(&poisoned, at, 1, p, 5);
+            assert_eq!(slots.trace[5].load(Ordering::Acquire), 0);
         }
         #[test]
         fn slot_packing_absence_saturation_cutoff() {
