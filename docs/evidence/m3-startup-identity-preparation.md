@@ -4,7 +4,8 @@
 main `eea7af57` and preserved documentation only. Six allowed Rust paths changed.
 Builder OpenAI GPT-6.1 Sol/high commits `a9291113` and `2eb3ba10`; coordinator
 Sol6.1/high corrections `90fb1521`; coverage Sol6.1/high `937065c1`.
-Source acceptance, required hosted checks and merge remain pending.
+Independent source GO at `e77c1e4e` is recorded below; final delta/exact-head review,
+required hosted checks and merge remain pending.
 
 ## Result boundary
 
@@ -67,8 +68,20 @@ applicable results, not claimed executions at the final commit.
 
 ## Remaining gates and limits
 
-Fresh independent exact-source review must settle S1–S3 and coverage before PR
-acceptance. Normal first-attempt Linux/macOS/Windows CI and all required gates
+Fresh independent Sol6.1/high source review at `e77c1e4e` closed S1–S3 and the
+significant validator gaps: SOURCE GO, Standards0/Spec1 nonblocking P3. Report and
+pins: `D:/Temp/arx-m3-startup-source-review-v2`. The P3 identified the brief's
+additional literal codec fixture prescription. Coordinator added a single pure
+test with handwritten founder/joiner v1 JSON bytes, independent typed values and
+exact serialization equality. Its opaque leaf bytes qualify codec shape only;
+separate real-certificate tests provide crypto outcomes. Exact-name test PASS
+first execution15.617s including compilation; body<0.01s. fmt and all-target
+locked/offline Clippy PASS5.442s. Raw evidence: `D:/Temp/arx-m3-startup-final`.
+Only test code changed; focused independent delta/exact-head review is pending.
+
+Before publication, live main remained `eea7af57`, latest push CI44432988620
+attempt1 completed SUCCESS, freshly read alongside branch metadata. No rerun or
+dispatch. Normal first-attempt Linux/macOS/Windows CI and all required gates
 remain mandatory. Unix file replacement, platform alias/reparse paths and other
 unexecuted hardware paths receive no local credit. No local Engine/founder,
 native executor, production/client, network or container observation occurred.
