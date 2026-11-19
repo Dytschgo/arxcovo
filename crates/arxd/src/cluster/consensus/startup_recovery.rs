@@ -6,12 +6,12 @@ use super::{
 };
 use crate::cluster::{
     enrollment::{
-        ClusterId,
+        ClusterId, NodeId,
         codec::{self, Reader},
     },
     join_receipt::{ExpectedIdentity, PublicIdentity},
     log_store::{MAX_LIVE, VoteLogStore},
-    startup_plan::{Owner, Plan, Refusal},
+    startup_plan::{Mode, Owner, Plan, Refusal},
     state_store::{Entry, Init, LogPos, MembershipBlob, StateStore, StoreError, get_pos, put_pos},
 };
 use rusqlite::{Connection, OpenFlags};
@@ -22,6 +22,190 @@ type Result<T> = std::result::Result<T, Refusal>;
 pub(super) struct Prepared {
     owner: Owner,
     pub observation: Observation,
+    binding: Option<(ClusterId, NodeId)>,
+    fresh_cluster: Option<ClusterId>,
+    creation: Creation,
+}
+enum Creation {
+    Ready,
+    Begun,
+    Failed(Refusal),
+}
+pub(super) struct StartIntent {
+    pub(super) mode: Mode,
+    pub(super) cluster: ClusterId,
+    pub(super) node: NodeId,
+    pub(super) peer: std::net::SocketAddr,
+    pub(super) enrollment: std::net::SocketAddr,
+}
+pub(super) struct Retained {
+    owner: Owner,
+    observation: Observation,
+    intent: StartIntent,
+}
+pub(super) struct StartInputs<'a> {
+    pub(super) dir: &'a Path,
+    pub(super) node: NodeId,
+    pub(super) init: Init,
+    pub(super) peer: std::net::SocketAddr,
+    pub(super) enrollment: std::net::SocketAddr,
+}
+impl Prepared {
+    // Exact ownership-return contract: refusal returns the same Prepared inline.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn handoff(
+        mut self,
+        intent: StartIntent,
+    ) -> std::result::Result<Retained, (Refusal, Self)> {
+        let refusal = match self.creation {
+            Creation::Failed(r) => Some(r),
+            Creation::Begun => Some(Refusal::Store),
+            Creation::Ready => None,
+        };
+        if let Some(r) = refusal {
+            return Err((r, self));
+        }
+        if let Err(r) = self.validate_intent(&intent) {
+            return Err((r, self));
+        }
+        if matches!(self.observation, Observation::Fresh) {
+            // Retain Prepared outside the caught mutable borrow on ordinary unwind.
+            // Abort/process destruction has no retention guarantee.
+            self.creation = Creation::Begun;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = initialize_fresh(&mut self.owner, intent.cluster);
+                if let Err(r) = result {
+                    self.creation = Creation::Failed(r);
+                }
+                #[cfg(test)]
+                tests::after_creation_result(&result);
+                result
+            }));
+            let refusal = match outcome {
+                Ok(Ok(())) => None,
+                Ok(Err(r)) => Some(r),
+                Err(_) => Some(match self.creation {
+                    Creation::Failed(r) => r,
+                    _ => Refusal::Store,
+                }),
+            };
+            if let Some(r) = refusal {
+                self.creation = Creation::Failed(r);
+                return Err((r, self));
+            }
+        }
+        if matches!(self.creation, Creation::Begun) {
+            self.observation = Observation::UntouchedGenesis {
+                cluster: intent.cluster,
+            };
+        }
+        Ok(Retained {
+            owner: self.owner,
+            observation: self.observation,
+            intent,
+        })
+    }
+    fn validate_intent(&self, intent: &StartIntent) -> Result<()> {
+        self.owner.recheck()?;
+        if intent.mode != self.owner.plan.mode
+            || Some(intent.peer) != self.owner.plan.peer.parse().ok()
+            || Some(intent.enrollment) != self.owner.plan.enrollment.parse().ok()
+        {
+            return Err(Refusal::Plan);
+        }
+        if intent.mode.recovery() {
+            if !matches!(self.observation, Observation::Recovered { .. })
+                || self.binding != Some((intent.cluster, intent.node))
+            {
+                return Err(Refusal::Identity);
+            }
+        } else {
+            if intent.mode != Mode::CreateFounder || self.fresh_cluster.is_none() {
+                return Err(Refusal::Provenance);
+            }
+            if self.fresh_cluster != Some(intent.cluster) || intent.node.get() != 1 {
+                return Err(Refusal::Identity);
+            }
+            match self.observation {
+                Observation::Fresh => self.owner.fresh_baseline()?,
+                Observation::UntouchedGenesis { cluster } if cluster == intent.cluster => {}
+                _ => return Err(Refusal::Provenance),
+            }
+        }
+        Ok(())
+    }
+}
+impl Retained {
+    pub(super) fn recheck(&self) -> Result<()> {
+        self.owner.recheck()
+    }
+    /// Checked paths only, never an actual-open Engine capability.
+    pub(super) fn checked_inputs(&self) -> Result<StartInputs<'_>> {
+        self.recheck()?;
+        Ok(StartInputs {
+            dir: &self.owner.plan.state,
+            node: self.intent.node,
+            init: Init {
+                cluster: self.intent.cluster,
+                first_free: NodeId::new(2).unwrap(),
+            },
+            peer: self.intent.peer,
+            enrollment: self.intent.enrollment,
+        })
+    }
+}
+fn initialize_fresh(owner: &mut Owner, cluster: ClusterId) -> Result<()> {
+    owner.fresh_baseline()?;
+    let mut log = VoteLogStore::open(&owner.plan.state, cluster).map_err(|_| Refusal::Store)?;
+    #[cfg(test)]
+    tests::creation_phase("first-open", owner)?;
+    let sm = StateStore::open(
+        &owner.plan.state,
+        Init {
+            cluster,
+            first_free: NodeId::new(2).unwrap(),
+        },
+    )
+    .map_err(|_| Refusal::Store)?;
+    let untouched =
+        crate::cluster::enrollment::EnrollmentState::new(cluster, NodeId::new(2).unwrap());
+    let state = log.log_state().map_err(|_| Refusal::Store)?;
+    if log.vote().map_err(|_| Refusal::Store)?.is_some()
+        || state.last.is_some()
+        || state.purged.is_some()
+        || log.live().map_err(|_| Refusal::Store)? != 0
+        || sm.applied().is_some()
+        || sm.membership().is_some()
+        || *sm.state() != untouched
+    {
+        return Err(Refusal::Provenance);
+    }
+    preflight(&mut log, &sm).map_err(|_| Refusal::Store)?;
+    #[cfg(test)]
+    tests::creation_phase("before-capture", owner)?;
+    owner.capture_created_stores()?;
+    #[cfg(test)]
+    tests::creation_phase("captured", owner)?;
+    drop(sm);
+    drop(log);
+    #[cfg(test)]
+    tests::creation_phase("dropped", owner)?;
+    let _locks = store_locks(owner)?;
+    let inspected = inspect_state(&owner.plan.state, cluster)?;
+    let log = inspect_log(&owner.plan.state, cluster)?;
+    validate_preflight(inspected.applied, &log).map_err(|_| Refusal::Store)?;
+    if inspected.applied.is_some()
+        || inspected.membership.is_some()
+        || log.purged.is_some()
+        || log.last.is_some()
+        || log.has_vote
+        || snapshot_state(&inspected.snapshot).map_err(|_| Refusal::Store)? != untouched
+    {
+        return Err(Refusal::Provenance);
+    }
+    #[cfg(test)]
+    tests::creation_phase("inspected", owner)?;
+    owner.recheck()
 }
 pub(super) enum Observation {
     Fresh,
@@ -78,11 +262,17 @@ pub(super) fn prepare(
             return Ok(Prepared {
                 owner,
                 observation: Observation::UntouchedGenesis { cluster },
+                binding: None,
+                fresh_cluster,
+                creation: Creation::Ready,
             });
         }
         return Ok(Prepared {
             owner,
             observation: Observation::Fresh,
+            binding: None,
+            fresh_cluster,
+            creation: Creation::Ready,
         });
     }
     let expected = expected.ok_or(Refusal::Identity)?;
@@ -163,6 +353,9 @@ pub(super) fn prepare(
     owner.recheck()?;
     Ok(Prepared {
         owner,
+        binding: Some((expected.cluster, expected.node)),
+        fresh_cluster,
+        creation: Creation::Ready,
         observation: Observation::Recovered {
             floor,
             sample,
@@ -606,6 +799,556 @@ mod tests {
             SCHEMA_PROBE.with(|slot| *slot.borrow_mut() = None);
         }
     }
+    thread_local! {
+        static CREATION_FAULT: std::cell::RefCell<Option<(&'static str, bool)>> = const { std::cell::RefCell::new(None) };
+        static EFFECT: std::cell::RefCell<Vec<(String, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct CreationFault;
+    impl CreationFault {
+        fn new(stage: &'static str, panic: bool) -> Self {
+            CREATION_FAULT.with(|s| {
+                assert!(s.borrow_mut().replace((stage, panic)).is_none());
+            });
+            Self
+        }
+    }
+    impl Drop for CreationFault {
+        fn drop(&mut self) {
+            CREATION_FAULT.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    fn state_bytes(owner: &Owner) -> Vec<(String, Vec<u8>)> {
+        let mut rows = std::fs::read_dir(&owner.plan.state)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().into_string().unwrap(),
+                    if e.metadata().unwrap().len() == 0 {
+                        Vec::new()
+                    } else {
+                        std::fs::read(e.path()).unwrap()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+    pub(super) fn after_creation_result(result: &Result<()>) {
+        if result.is_err() && CREATION_FAULT.with(|s| s.borrow().is_some_and(|(_, panic)| panic)) {
+            panic!("ordinary unwind after recorded first refusal");
+        }
+    }
+    pub(super) fn creation_phase(stage: &str, owner: &Owner) -> Result<()> {
+        use crate::cluster::startup_plan::tests::objects;
+        eprintln!("{stage}: {:?}", objects(&owner.plan.state));
+        if stage == "before-capture" {
+            assert_eq!(owner.recheck(), Err(Refusal::Layout));
+        }
+        let fault = CREATION_FAULT.with(|s| *s.borrow());
+        if let Some((target, panic)) = fault
+            && target == stage
+        {
+            EFFECT.with(|s| *s.borrow_mut() = state_bytes(owner));
+            if panic && stage == "captured" {
+                panic!("ordinary creation unwind");
+            }
+            return Err(Refusal::Clock);
+        }
+        Ok(())
+    }
+    fn intent(mode: Mode) -> StartIntent {
+        StartIntent {
+            mode,
+            cluster: [1; 16],
+            node: NodeId::new(1).unwrap(),
+            peer: "127.0.0.1:7001".parse().unwrap(),
+            enrollment: "127.0.0.1:7002".parse().unwrap(),
+        }
+    }
+    #[test]
+    fn handoff_genuine_fresh_capture_drop_inspection() {
+        let l = Layout::new();
+        let prepared = prepare(l.plan("create-founder"), None, Some([1; 16]), false).unwrap();
+        creation_phase("owner-only", &prepared.owner).unwrap();
+        let original = crate::cluster::startup_plan::tests::guards(&prepared.owner);
+        probe_outer(&prepared.owner.plan.state, true);
+        let retained = match prepared.handoff(intent(Mode::CreateFounder)) {
+            Ok(r) => r,
+            Err((r, _owner)) => panic!("genuine positive failed: {r:?}"),
+        };
+        assert!(
+            matches!(retained.observation, Observation::UntouchedGenesis { cluster } if cluster == [1;16])
+        );
+        assert_eq!(
+            &crate::cluster::startup_plan::tests::guards(&retained.owner)[..original.len()],
+            original.as_slice()
+        );
+        probe_outer(&retained.owner.plan.state, true);
+        let inputs = retained.checked_inputs().unwrap();
+        assert_eq!(inputs.init.cluster, [1; 16]);
+        assert_eq!(inputs.init.first_free.get(), 2);
+        assert_eq!(inputs.dir, retained.owner.plan.state);
+        assert_eq!(inputs.node.get(), 1);
+        assert_eq!(inputs.peer, intent(Mode::CreateFounder).peer);
+        assert_eq!(inputs.enrollment, intent(Mode::CreateFounder).enrollment);
+        let dir = retained.owner.plan.state.clone();
+        drop(retained);
+        probe_outer(&dir, false);
+    }
+    fn probe_outer(dir: &Path, held: bool) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("cluster-owner.lock"))
+            .unwrap();
+        assert_eq!(file.try_lock().is_err(), held);
+    }
+    #[test]
+    fn handoff_existing_owner_moves_and_intent_refusals() {
+        for recovery in [false, true] {
+            let l = Layout::new();
+            initialized(&l);
+            let expected = if recovery {
+                let e = identity(&l);
+                found(&l, &e, 0); // store command only; no ConsensusNode/Engine
+                Some(e)
+            } else {
+                None
+            };
+            let mode = if recovery {
+                Mode::RecoverFounder
+            } else {
+                Mode::CreateFounder
+            };
+            let plan_mode = if recovery {
+                "recover-founder"
+            } else {
+                "create-founder"
+            };
+            let mut prepared =
+                prepare(l.plan(plan_mode), expected.as_ref(), Some([1; 16]), false).unwrap();
+            let original = crate::cluster::startup_plan::tests::guards(&prepared.owner);
+            let bytes = l.snapshot();
+            for case in 0..5 {
+                let mut bad = intent(mode);
+                let refusal = match case {
+                    0 => {
+                        bad.mode = Mode::RecoverJoiner;
+                        Refusal::Plan
+                    }
+                    1 => {
+                        bad.peer.set_port(7003);
+                        Refusal::Plan
+                    }
+                    2 => {
+                        bad.enrollment.set_port(7003);
+                        Refusal::Plan
+                    }
+                    3 => {
+                        bad.cluster = [2; 16];
+                        Refusal::Identity
+                    }
+                    _ => {
+                        bad.node = NodeId::new(2).unwrap();
+                        Refusal::Identity
+                    }
+                };
+                let (r, returned) = prepared.handoff(bad).err().unwrap();
+                assert_eq!(r, refusal);
+                assert!(matches!(returned.creation, Creation::Ready));
+                assert_eq!(l.snapshot(), bytes);
+                assert_eq!(
+                    crate::cluster::startup_plan::tests::guards(&returned.owner),
+                    original
+                );
+                probe_outer(&returned.owner.plan.state, true);
+                prepared = returned;
+            }
+            let retained = prepared.handoff(intent(mode)).ok().unwrap();
+            assert_eq!(l.snapshot(), bytes);
+            assert_eq!(
+                crate::cluster::startup_plan::tests::guards(&retained.owner),
+                original
+            );
+            retained.checked_inputs().unwrap();
+            probe_outer(&retained.owner.plan.state, true);
+            let dir = retained.owner.plan.state.clone();
+            drop(retained);
+            probe_outer(&dir, false);
+        }
+    }
+    #[test]
+    fn handoff_missing_cluster_join_and_fresh_refusals() {
+        for case in 0..7 {
+            let l = Layout::new();
+            let join = case == 1;
+            let mode = if join {
+                Mode::Join
+            } else {
+                Mode::CreateFounder
+            };
+            let prepared = prepare(
+                l.plan(if join { "join" } else { "create-founder" }),
+                None,
+                if case == 0 { None } else { Some([1; 16]) },
+                false,
+            )
+            .unwrap();
+            let bytes = l.snapshot();
+            let mut bad = intent(mode);
+            let refusal = match case {
+                0 | 1 => Refusal::Provenance,
+                2 => {
+                    bad.cluster = [2; 16];
+                    Refusal::Identity
+                }
+                3 => {
+                    bad.node = NodeId::new(2).unwrap();
+                    Refusal::Identity
+                }
+                4 => {
+                    bad.mode = Mode::RecoverFounder;
+                    Refusal::Plan
+                }
+                5 => {
+                    bad.peer.set_port(7003);
+                    Refusal::Plan
+                }
+                _ => {
+                    bad.enrollment.set_port(7003);
+                    Refusal::Plan
+                }
+            };
+            let (r, prepared) = prepared.handoff(bad).err().unwrap();
+            assert_eq!(r, refusal);
+            assert_eq!(l.snapshot(), bytes);
+            assert!(matches!(prepared.creation, Creation::Ready));
+            probe_outer(&prepared.owner.plan.state, true);
+            if case >= 2 {
+                let retained = prepared.handoff(intent(mode)).ok().unwrap();
+                retained.checked_inputs().unwrap();
+            }
+        }
+    }
+    #[test]
+    fn handoff_real_stage_failure_sticky_and_unwind() {
+        use crate::cluster::startup_plan::tests::{CaptureFault, baseline};
+        for stage in [
+            "first-open",
+            "before-capture",
+            "staged",
+            "captured",
+            "dropped",
+            "inspected",
+            "unwind",
+            "refusal-unwind",
+        ] {
+            let l = Layout::new();
+            let prepared = prepare(l.plan("create-founder"), None, Some([1; 16]), false).unwrap();
+            let original = baseline(&prepared.owner);
+            let fault = CreationFault::new(
+                match stage {
+                    "unwind" => "captured",
+                    "refusal-unwind" => "first-open",
+                    _ => stage,
+                },
+                matches!(stage, "unwind" | "refusal-unwind"),
+            );
+            let staged = (stage == "staged").then(CaptureFault::new);
+            let (r, mut prepared) = prepared.handoff(intent(Mode::CreateFounder)).err().unwrap();
+            assert_eq!(
+                r,
+                if stage == "unwind" {
+                    Refusal::Store
+                } else {
+                    Refusal::Clock
+                }
+            );
+            assert!(matches!(prepared.creation, Creation::Failed(first) if first == r));
+            if stage != "staged" {
+                EFFECT.with(|s| assert_eq!(state_bytes(&prepared.owner), *s.borrow()));
+            } else {
+                assert_eq!(baseline(&prepared.owner), original);
+                assert_eq!(
+                    state_bytes(&prepared.owner),
+                    crate::cluster::startup_plan::tests::capture_effect()
+                );
+            }
+            probe_outer(&prepared.owner.plan.state, true);
+            drop(staged);
+            drop(fault);
+            // Explicit fixture restoration only: make a valid-looking genesis
+            // layout after partial first-open; production never repairs anything.
+            if matches!(stage, "first-open" | "refusal-unwind") {
+                drop(StateStore::open(&prepared.owner.plan.state, init()).unwrap());
+            }
+            // Existing-only independent OS locks are available after RAII store
+            // drop; this observes lock availability, not SQLite close success.
+            let mut locks = Vec::new();
+            for stem in ["cluster-log", "cluster-state"] {
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(prepared.owner.plan.state.join(format!("{stem}.lock")))
+                    .unwrap();
+                f.try_lock().unwrap();
+                locks.push(f);
+            }
+            let inspected = inspect_state(&prepared.owner.plan.state, [1; 16]).unwrap();
+            let inspected_log = inspect_log(&prepared.owner.plan.state, [1; 16]).unwrap();
+            assert!(inspected.applied.is_none() && inspected.membership.is_none());
+            assert!(
+                inspected_log.purged.is_none()
+                    && inspected_log.last.is_none()
+                    && !inspected_log.has_vote
+            );
+            assert_eq!(
+                snapshot_state(&inspected.snapshot).unwrap(),
+                crate::cluster::enrollment::EnrollmentState::new([1; 16], NodeId::new(2).unwrap())
+            );
+            drop(locks);
+            let restored = state_bytes(&prepared.owner);
+            for _ in 0..2 {
+                let mut bad = intent(Mode::Join);
+                bad.cluster = [9; 16];
+                let (again, returned) = prepared.handoff(bad).err().unwrap();
+                assert_eq!(again, r); // sticky before intent/filesystem access
+                assert_eq!(state_bytes(&returned.owner), restored);
+                probe_outer(&returned.owner.plan.state, true);
+                prepared = returned;
+            }
+        }
+    }
+    fn owned_stores(owner: &Owner) -> (VoteLogStore, StateStore) {
+        (
+            VoteLogStore::open(&owner.plan.state, [1; 16]).unwrap(),
+            StateStore::open(&owner.plan.state, init()).unwrap(),
+        )
+    }
+    fn fixture_remove(path: &Path) -> bool {
+        match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) => {
+                #[cfg(windows)]
+                {
+                    assert!(matches!(e.raw_os_error(), Some(5 | 32 | 33)), "{e}");
+                    eprintln!(
+                        "Windows prevention ONLY; mutation branch UNQUALIFIED: {}: {e}",
+                        path.display()
+                    );
+                    false
+                }
+                #[cfg(not(windows))]
+                panic!("required mutation failed: {e}")
+            }
+        }
+    }
+    #[test]
+    fn handoff_capture_all_journal_masks_and_transitions() {
+        use crate::cluster::startup_plan::tests::{baseline, guards};
+        for (transition_bit, transition_stem) in ["cluster-log", "cluster-state"].iter().enumerate()
+        {
+            for mask in 0..4 {
+                let l = Layout::new();
+                let mut prepared =
+                    prepare(l.plan("create-founder"), None, Some([1; 16]), false).unwrap();
+                let original = guards(&prepared.owner);
+                let (log, sm) = owned_stores(&prepared.owner);
+                assert_eq!(prepared.owner.recheck(), Err(Refusal::Layout));
+                let mut qualified = true;
+                for (bit, stem) in ["cluster-log", "cluster-state"].iter().enumerate() {
+                    if mask & (1 << bit) == 0 {
+                        qualified &= fixture_remove(
+                            &prepared
+                                .owner
+                                .plan
+                                .state
+                                .join(format!("{stem}.sqlite3-journal")),
+                        );
+                    }
+                }
+                if !qualified {
+                    continue;
+                }
+                prepared.owner.capture_created_stores().unwrap();
+                assert_eq!(
+                    &guards(&prepared.owner)[..original.len()],
+                    original.as_slice()
+                );
+                let fixed = baseline(&prepared.owner);
+                let captured =
+                    crate::cluster::startup_plan::tests::objects(&prepared.owner.plan.state);
+                drop(log);
+                drop(sm);
+                prepared.owner.recheck().unwrap();
+                {
+                    let _locks = store_locks(&prepared.owner).unwrap();
+                    let state = inspect_state(&prepared.owner.plan.state, [1; 16]).unwrap();
+                    let log = inspect_log(&prepared.owner.plan.state, [1; 16]).unwrap();
+                    assert!(state.applied.is_none() && state.membership.is_none());
+                    assert!(log.purged.is_none() && log.last.is_none() && !log.has_vote);
+                    validate_preflight(state.applied, &log).unwrap();
+                }
+                assert_eq!(
+                    crate::cluster::startup_plan::tests::objects(&prepared.owner.plan.state),
+                    captured
+                );
+                prepared.owner.recheck().unwrap();
+                assert_eq!(
+                    prepared.owner.capture_created_stores(),
+                    Err(Refusal::Provenance)
+                );
+                assert_eq!(baseline(&prepared.owner), fixed);
+                // Test each actual post-capture transition in an isolated mask fixture.
+                let journal = prepared
+                    .owner
+                    .plan
+                    .state
+                    .join(format!("{transition_stem}.sqlite3-journal"));
+                if mask & (1 << transition_bit) == 0 {
+                    l.write(&format!("state/{transition_stem}.sqlite3-journal"), b"");
+                    assert_eq!(prepared.owner.recheck(), Err(Refusal::Layout));
+                } else {
+                    std::fs::write(&journal, b"grew").unwrap();
+                    assert_eq!(prepared.owner.recheck(), Err(Refusal::Store));
+                    std::fs::write(&journal, b"").unwrap(); // explicit test restoration
+                    prepared.owner.recheck().unwrap();
+                    if fixture_remove(&journal) {
+                        assert_eq!(prepared.owner.recheck(), Err(Refusal::Layout));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn handoff_capture_negatives_preserve_baseline() {
+        use crate::cluster::startup_plan::tests::{baseline, guards};
+        for case in [
+            "nonzero",
+            "wal",
+            "shm",
+            "missing-db",
+            "missing-lock",
+            "unknown",
+            "hardlink",
+            "symlink",
+            "directory",
+        ] {
+            let l = Layout::new();
+            let mut prepared =
+                prepare(l.plan("create-founder"), None, Some([1; 16]), false).unwrap();
+            let original = guards(&prepared.owner);
+            let base = baseline(&prepared.owner);
+            let (log, sm) = owned_stores(&prepared.owner);
+            let dir = prepared.owner.plan.state.clone();
+            let mutate = match case {
+                "nonzero" => {
+                    l.write("state/cluster-state.sqlite3-journal", b"x");
+                    true
+                }
+                "wal" => {
+                    l.write("state/cluster-state.sqlite3-wal", b"");
+                    true
+                }
+                "shm" => {
+                    l.write("state/cluster-log.sqlite3-shm", b"");
+                    true
+                }
+                "unknown" => {
+                    l.write("state/unexpected", b"");
+                    true
+                }
+                "missing-db" => fixture_remove(&dir.join("cluster-state.sqlite3")),
+                "missing-lock" => fixture_remove(&dir.join("cluster-log.lock")),
+                "hardlink" | "symlink" | "directory" => {
+                    let target = dir.join("cluster-state.sqlite3-journal");
+                    if fixture_remove(&target) {
+                        match case {
+                            "hardlink" => {
+                                std::fs::hard_link(dir.join("cluster-log.sqlite3"), &target)
+                                    .unwrap()
+                            }
+                            "symlink" => {
+                                #[cfg(unix)]
+                                std::os::unix::fs::symlink(
+                                    dir.join("cluster-log.sqlite3"),
+                                    &target,
+                                )
+                                .unwrap();
+                                #[cfg(windows)]
+                                {
+                                    // No owner privilege request; Windows link creation is unqualified.
+                                    eprintln!(
+                                        "symlink mutation UNRUN on Windows (no admin action)"
+                                    );
+                                    continue;
+                                }
+                            }
+                            _ => std::fs::create_dir(&target).unwrap(),
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => unreachable!(),
+            };
+            if !mutate {
+                continue;
+            }
+            assert!(prepared.owner.capture_created_stores().is_err(), "{case}");
+            assert_eq!(baseline(&prepared.owner), base, "{case}");
+            assert_eq!(guards(&prepared.owner), original, "{case}");
+            probe_outer(&dir, true);
+            drop(log);
+            drop(sm);
+        }
+    }
+    #[test]
+    fn handoff_retained_journal_replacement_and_unknown_refuse() {
+        for case in ["replacement", "unknown", "wal", "shm"] {
+            let l = Layout::new();
+            let prepared = prepare(l.plan("create-founder"), None, Some([1; 16]), false).unwrap();
+            let retained = prepared.handoff(intent(Mode::CreateFounder)).ok().unwrap();
+            retained.checked_inputs().unwrap();
+            let dir = &retained.owner.plan.state;
+            if case == "replacement" {
+                let journal = dir.join("cluster-log.sqlite3-journal");
+                let backup = l.root.path().join("saved-journal");
+                match std::fs::rename(&journal, backup) {
+                    Ok(()) => {
+                        l.write("state/cluster-log.sqlite3-journal", b"");
+                    }
+                    Err(e) => {
+                        #[cfg(windows)]
+                        {
+                            assert!(matches!(e.raw_os_error(), Some(5 | 32 | 33)), "{e}");
+                            eprintln!(
+                                "Windows replacement prevented ONLY; replacement refusal UNQUALIFIED"
+                            );
+                            continue;
+                        }
+                        #[cfg(not(windows))]
+                        panic!("replacement must happen: {e}");
+                    }
+                }
+            } else {
+                l.write(
+                    match case {
+                        "wal" => "state/cluster-state.sqlite3-wal",
+                        "shm" => "state/cluster-state.sqlite3-shm",
+                        _ => "state/unknown",
+                    },
+                    b"",
+                );
+            }
+            assert_eq!(retained.recheck(), Err(Refusal::Layout));
+            assert!(matches!(retained.checked_inputs(), Err(Refusal::Layout)));
+            probe_outer(dir, true);
+        }
+    }
     fn init() -> Init {
         Init {
             cluster: [1; 16],
@@ -742,7 +1485,20 @@ mod tests {
             }
             _ => panic!("exact recovered membership required"),
         }
-        drop(prepared);
+        let original = crate::cluster::startup_plan::tests::guards(&prepared.owner);
+        probe_outer(&dir, true);
+        let mut join_intent = intent(Mode::RecoverJoiner);
+        join_intent.node = expected.node;
+        let retained = prepared.handoff(join_intent).ok().unwrap();
+        retained.checked_inputs().unwrap();
+        assert_eq!(
+            crate::cluster::startup_plan::tests::guards(&retained.owner),
+            original
+        );
+        assert_eq!(l.snapshot(), before);
+        probe_outer(&dir, true);
+        drop(retained);
+        probe_outer(&dir, false);
         assert_eq!(l.snapshot(), before);
         assert!(matches!(
             prepare(l.plan("recover-founder"), Some(&expected), None, false),
