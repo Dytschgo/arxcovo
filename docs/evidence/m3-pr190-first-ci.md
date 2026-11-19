@@ -62,4 +62,15 @@ Initial seven pure tests ran before this turn's fresh free-space snapshot; all
 commands used explicit D paths and the later snapshot measured689GB free. No large
 build ran before that measurement. Independent combined correction review is next.
 Existing founder/Engine holds and exhausted counters remain.
+Independent combined review atb52c5366 accepted the contract amendment but found
+one P2 malformed-config error boundary, reportSHA256
+`52c92c98dfcd532884f4325d8107c44b04bc62e211db7d8edf141e3ecb657c7d`.
+Root source correction07dc74f8 validates target-table/entry shapes. A real CLI
+regression failed on all five array/scalar cases before the fix and passes after:
+nonzero exit, exact generic refusal, no traceback/value/private path disclosure.
+Eight unit tests pass, including benign target-table counterparts. The exact
+proof step passes offline2.071321s with33 verifier controls; malformed target
+preflight prevents a Cargo sentinel call. Evidence
+`D:/Temp/arx-pr190-config-shape`; independent focused source recheck remains pending.
+No new native/macOS/Windows-owner/Engine/founder observation or CI rerun occurred.
 M2 OPEN / M3 UNCHECKED; **unverified on real hardware**; operational NO-GO.

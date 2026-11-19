@@ -416,7 +416,13 @@ new proof step passed locally offline6.007s, including33 verifier controls and
 Cargo/rustc identities; check/Clippy/fmt PASS. Configured-loader CLI failure blocked
 the Cargo sentinel without exposing its value. Mac host positives/native execution
 UNRUN. Windows TMP/TEMP propagation remains unchanged, with no I/O fix claim.
-Combined correction awaits independent source/contract review before any push.
+Independent Sol6.1/high correction review atb52c5366: amendment GO, Standards0/
+Spec1P2, source NO-GO because malformed Cargo target tables bypass generic error
+normalization. Root correction07dc74f8 validates both target table and entries;
+five malformed CLI fixtures failed before and pass with the exact generic message
+after, without tracebacks/value/path disclosure. Eight preflight tests PASS; exact
+proof step exit0/offline2.071s with33 verifier controls; malformed target also stops
+the Cargo sentinel. Focused independent recheck next; no push or native retry.
 Preserve this failed first outcome; no new push before the scoped corrections
 and unknown Windows failure have appropriate independent disposition/review.
 No Engine/founder fix, counter reset or timeout/quarantine change. This checkpoint
