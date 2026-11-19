@@ -600,5 +600,55 @@ class IdentityInventoryTests(unittest.TestCase):
                     assert_identity_inventory(source, tls, pki)
 
 
+
+
+# Kept in this module because the existing static CI step selects this file.
+HEAVY_FILTER = (
+    'test(/^service::unix_bridge::tests::e6::/) | '
+    'test(/^service::unix_bridge::tests::e7::/) | '
+    'test(/^service::executor::tests::/)'
+)
+
+
+def assert_heavy_service_group(source):
+    import tomllib
+    # Exact semantic shape forbids retries, timeout/fail-fast/default-slot changes,
+    # widened platform scope, extra overrides and accidental extra membership.
+    assert tomllib.loads(source) == {
+        'test-groups': {'windows-heavy-service': {'max-threads': 2}},
+        'profile': {'default': {'overrides': [{
+            'platform': 'cfg(windows)',
+            'filter': HEAVY_FILTER,
+            'test-group': 'windows-heavy-service',
+        }]}},
+    }
+
+
+class HeavyServiceGroupTests(unittest.TestCase):
+    def test_windows_only_group_contract_and_mutants(self):
+        source = (ROOT / '.config/nextest.toml').read_text(encoding='utf-8')
+        assert_heavy_service_group(source)
+        mutants = [
+            '',
+            source.replace('windows-heavy-service', 'other-group'),
+            source.replace('max-threads = 2', 'max-threads = 1'),
+            source.replace('max-threads = 2', 'max-threads = 4'),
+            source.replace("platform = 'cfg(windows)'", ''),
+            source.replace('cfg(windows)', 'cfg(any(windows, unix))'),
+            source.replace('cfg(windows)', 'cfg(unix)'),
+            source + '\nretries = 1\n',
+            source + '\n[profile.ci]\nretries = 1\n',
+            source.replace("[[profile.default.overrides]]",
+                           "[profile.default]\nretries = 1\n\n[[profile.default.overrides]]"),
+        ]
+        filters = HEAVY_FILTER.split(' | ')
+        for item in filters:
+            mutants.append(source.replace(HEAVY_FILTER,
+                                           ' | '.join(f for f in filters if f != item)))
+        for mutant in mutants:
+            with self.subTest(mutant=mutant):
+                with self.assertRaises(AssertionError):
+                    assert_heavy_service_group(mutant)
+
 if __name__ == "__main__":
     unittest.main()
