@@ -122,6 +122,24 @@ a blocking hold). Load sensitivity reproduced; hosted cause unproved. Ranked:
 bound increase last. Coordinator selects (1) as e7 family fix attempt 1/3, with
 an ADR and CI-time measurement; founder concurrency is assessed separately.
 
+**PR194 MERGED (e7 family fix attempt 1/3, mitigation), 2026-11-19.** Squash
+`76a8bc68d0093b7a2fa922b2b514e4cb96634800` from reviewed head `4539b850` onto
+red main `92003177`, under the 2026-11-16 babysitter clarification permitting a
+reviewed repair PR to restore red main; feature PRs stay blocked until main CI
+is green. Windows-only nextest group `windows-heavy-service` (max-threads 2;
+e6, e7, executor tests; 57 members), tools/ci mutation test, ADR 0036. Builder
+Sol 6.1/high (`D:/Temp/arx-heavy-group/report.md`, SHA256 `f4c259dd…3cc2`):
+static 133/3 skipped, fmt, Clippy, service 262/262, three red-stress-control
+runs 262/262. Separate Sol 6.1/high exact-head review PASS, Standards 0/Spec 0,
+agent-review 59407981293 (`D:/Temp/arx-pr194-review/review.md`, SHA256
+`3657048e…e73a`). CI 44606597490 attempt 1, all nine jobs SUCCESS, 10m49s wall;
+Windows Rust job 10m36s (84 s under its 12 min timeout), nextest phase 365.6 s
+(previously 187–251 s), 792/792 passed; a8 4.169 s, w1_w4 2.121 s. Log
+`D:/Temp/arx-pr194-ci/win.log` SHA256 `6280cabf…f405`. **Risk:** the Windows
+job margin under its 12 min timeout is now thin. One clean run proves nothing
+about intermittency; this is a mitigation, not a proved cause fix. Main push CI
+on `76a8bc68` pending.
+
 **PR191 first CI on rebased head `7466e5aa`:** CI 44599400768 attempt 1, all
 nine jobs SUCCESS (~9 min wall). Windows Rust 794/794 passed, 36 skipped,
 including all 26 owner_windows tests, `rename_info_terminates_name_inside_declared_size`
