@@ -1,0 +1,9 @@
+# Windows service-fixture contention mitigation; see ADR0036.
+# Keep nextest's global concurrency, timeouts and failure behavior at defaults.
+[test-groups.windows-heavy-service]
+max-threads = 2
+
+[[profile.default.overrides]]
+platform = 'cfg(windows)'
+filter = 'test(/^service::unix_bridge::tests::e6::/) | test(/^service::unix_bridge::tests::e7::/) | test(/^service::executor::tests::/)'
+test-group = 'windows-heavy-service'
