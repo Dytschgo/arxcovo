@@ -2,6 +2,27 @@
 
 ## Main CI health and merge prerequisite
 
+**PR190 corrected-source CI HOLD:** exact8216987b, first normal
+44484921164 attempt1 FAILED. Windows Rust411s: 673 pass/2 owner-file Io failures,
+125 selected unrun, 36 skipped. N1 failed first publication at104; N2 failed
+second publication at153, later than old14ace's132. Fresh independent
+Astra6.2/high disposition confirms HOLD/cause unknown; no native diagnostic/fix/
+retry authority. Report SHA870c476fa80861a718aebd1762bf15ee7075f3ceeb4bfd5657879915b19c533e
+in `D:/Temp/arx-pr190-821-astra-disposition/`. Six review refs and all37
+corrected/historical manifest inputs reverified. Mac directory-test wording
+corrected: it observes system directories; patched SQLite guard evidence is separate.
+Ubuntu193s/786pass and macOS212s/754pass succeeded; all3UI workers passed60Node,
+browser and Electron smoke. Binding10Windows/9eachUnix passed once each;
+loader8tests and verifier33negative controls passed eachOS. All3aggregate gates
+failed closed. Nine bounded D logs retained, none truncated; policy425wall/
+420rawcharged/5potentialidle withheld:not-green, history unchanged. Independent
+Sol6.1/high exact-head attestation7003529631/status59343063652 remains source GO
+only (Standards0/Spec0). Coordinator verified71input/15publication-record hashes
+and50Gitblobs. [Corrected first-CI evidence](evidence/m3-pr190-corrected-first-ci.md).
+No rerun/dispatch/merge/qualification/stability/repair credit. Existing old190Io
+and PR189 founder holds remain; EngineSol3/3 exhausted, historicalOpus0/2
+unchanged. M2 OPEN / M3 UNCHECKED; **unverified on real hardware**.
+
 **Standing pre-start recovery rule (owner oversight reiterated 2026-11-19):** a
 cancelled job with zero executed steps, no assigned runner and an explicit
 runner-acquisition failure is retried on the unchanged head **without owner
@@ -422,7 +443,13 @@ normalization. Root correction07dc74f8 validates both target table and entries;
 five malformed CLI fixtures failed before and pass with the exact generic message
 after, without tracebacks/value/path disclosure. Eight preflight tests PASS; exact
 proof step exit0/offline2.071s with33 verifier controls; malformed target also stops
-the Cargo sentinel. Focused independent recheck next; no push or native retry.
+the Cargo sentinel. Focused independent Sol6.1/high recheck completed GO at8216987b,
+Standards0/Spec0/SP1 closed, reportSHAa8b805c0 verified. Fresh live main8bd/latest
+first44450232774 attempt1SUCCESS checked2026-11-19T08:06:46Z before normal push.
+PR190 updated to exact `8216987b4f11e228fc560e85f8f2a8029f8a478d`; linked immediately
+after push. First failed14ace CI remains preserved; no rerun/native retry. Fresh
+exact-head attestation and first normal corrected-source CI remain pending.
+This checkpoint is unpublished; no docs-only push to manufacture another run.
 Preserve this failed first outcome; no new push before the scoped corrections
 and unknown Windows failure have appropriate independent disposition/review.
 No Engine/founder fix, counter reset or timeout/quarantine change. This checkpoint
