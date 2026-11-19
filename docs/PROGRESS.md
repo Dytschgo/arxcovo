@@ -1,6 +1,15 @@
 # Arxcovo progress
 
 ## Main CI health and merge prerequisite
+**Goal BLOCKED, 2026-11-19 09:48 UTC:** after three consecutive revalidated
+no-progress turns, the goal tool returned blocked for the unchanged full v1
+objective. PR189/190 native UNKNOWN holds still lack further diagnostic/fix/retry
+authority; M2 actual-Claude acceptance also awaits existing owner OAuth and
+qualifying host setup. No active process/review wait or independent functional
+step remains. Evidence: `D:/Temp/arx-v1-blocked-audit/turn-{1,2,3}.json`.
+Resume needs an external prerequisite or explicit scoped authority change;
+generic continuation does not reset counters. No reruns/dispatches, source
+changes, pushes or merges. Local checkpoints are preserved; v1 is NOT complete.
 **Readiness documentation independently reviewed (2026-11-19):** separate
 Sol6.1/high reviewer returned documentation-only source GO atc9c1b026,
 Standards0/Spec0. Report SHA256
