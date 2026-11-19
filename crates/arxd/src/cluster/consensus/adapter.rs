@@ -185,6 +185,11 @@ impl RaftLogStorage<Arx> for LogAdapter {
                     blocking(move || {
                         #[cfg(test)]
                         super::diagnostics::started(Arc::as_ptr(&store) as usize, submitted, false);
+                        #[cfg(test)]
+                        let found = b.iter().find_map(|(p, e)| {
+                            matches!(e, StoredEntry::Enrollment(Command::Found { .. }))
+                                .then_some(*p)
+                        });
                         let r = store
                             .lock()
                             .map_err(|_| StoreError::Poisoned)
@@ -202,6 +207,12 @@ impl RaftLogStorage<Arx> for LogAdapter {
                             });
                         #[cfg(test)]
                         let store_id = Arc::as_ptr(&store) as usize;
+                        #[cfg(test)]
+                        if r.is_ok()
+                            && let Some(p) = found
+                        {
+                            issue::found::observation::entry(store_id, p, 4);
+                        }
                         // A cancelled caller can reopen as soon as it receives the
                         // callback. Release this worker's ownership (including the
                         // file lock if it is last) before publishing completion.
@@ -313,6 +324,14 @@ impl RaftStateMachine<Arx> for SmAdapter {
             let (p, e) = to_stored(e).map_err(err)?;
             let store = self.0.clone();
             #[cfg(test)]
+            let found = matches!(&e, StoredEntry::Enrollment(Command::Found { .. }));
+            #[cfg(test)]
+            let store_id = Arc::as_ptr(&store) as usize;
+            #[cfg(test)]
+            if found {
+                issue::found::observation::entry(store_id, p, 5);
+            }
+            #[cfg(test)]
             let _span = super::diagnostics::span(
                 Arc::as_ptr(&store) as usize,
                 super::diagnostics::Op::Apply,
@@ -324,10 +343,19 @@ impl RaftStateMachine<Arx> for SmAdapter {
                 super::diagnostics::started(Arc::as_ptr(&store) as usize, submitted, true);
                 #[cfg(test)]
                 pause_apply(Arc::as_ptr(&store) as usize);
-                store.lock().map_err(|_| StoreError::Poisoned)?.apply(p, &e)
+                let result = store.lock().map_err(|_| StoreError::Poisoned)?.apply(p, &e);
+                #[cfg(test)]
+                if found && result.is_ok() {
+                    issue::found::observation::entry(store_id, p, 6);
+                }
+                result
             })
             .await?;
             if let Some(r) = responder {
+                #[cfg(test)]
+                if found {
+                    issue::found::observation::entry(store_id, p, 7);
+                }
                 r.send(Applied(outcome));
             }
         }

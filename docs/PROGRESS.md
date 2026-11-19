@@ -5738,3 +5738,26 @@ without substituting mem_net/direct3voter initialization for acceptance. No fix
 counter reset, timeout/quarantine/runner change, owner admin/VM/cache/userdata or
 babysitter action. OAuth stays owner input. M2OPEN/M3UNCHECKED; hardware
 **unverified on real hardware**. Local docs remain unpublished until normal delivery.
+
+### Founder deadline diagnostic (2026-11-19; Sol 6.1/high)
+
+Task-only branch `diag/founder-deadline-trace` starts at main
+`8bd12b7f4954f4622b4487fad054e4a32e5d551a`. Test-only bounded scalar
+recorder adds actual Found append/apply positions, durable append completion,
+apply arrival/store success/responder boundary, owner send disposition, caller
+receipt and nonwaiting published metrics against the original monotonic deadline.
+Original refusal, five-second budget, cleanup/permit/weak checks and CI unchanged.
+No architecture deviation, product fix, merge or hosted action. Last merged PR
+record remains unchanged. Engine counters remain Sol 3/3 exhausted, Opus 0/2.
+
+Acceptance: workspace build passed; fmt check passed; all-target workspace Clippy
+with -D warnings passed after one permitted compile correction (wrong stored-entry
+type name and watch borrow API). Six recorder tests passed. Three focal tests
+passed once each; three default-scheduled consensus nextest runs each passed
+213/213. No founder refusal reproduced. Twelve captured founder invocations had
+matching append/apply term/leader/index 1/1/2, store success at 28,344–74,072 us,
+caller receipt at 28,452–74,234 us, before approximately 5,000,000 us deadlines.
+Clean local passes do not explain hosted failures. Hosted observation and
+independent review remain coordinator work; no PR created here. Evidence and
+full traces: D:/Temp/arx-founder-diag/report.md and sibling logs/intervals.md.
+M2 OPEN, M3 UNCHECKED; hardware **unverified on real hardware**.

@@ -129,6 +129,7 @@ macro_rules! found_final {
 #[cfg(test)]
 pub(in crate::cluster::consensus) mod observation {
     use super::{FoundError, ISSUE_BUDGET, Instant};
+    use openraft::type_config::async_runtime::watch::WatchReceiver;
     use std::cell::RefCell;
 
     const CAP: usize = 24;
@@ -386,12 +387,14 @@ pub(in crate::cluster::consensus) mod observation {
     }
     struct Slots {
         words: [AtomicU64; 48],
+        trace: [AtomicU64; 20],
         start: Instant,
     }
     impl Slots {
         fn new() -> Self {
             Self {
                 words: std::array::from_fn(|_| AtomicU64::new(0)),
+                trace: std::array::from_fn(|_| AtomicU64::new(0)),
                 start: Instant::now(),
             }
         }
@@ -422,6 +425,94 @@ pub(in crate::cluster::consensus) mod observation {
             })
             .ok()
             .flatten()
+    }
+    // Bounded weak registry: fixture identity is never emitted or retained as ownership.
+    type Binding = (usize, usize, std::sync::Weak<Slots>);
+    static BINDINGS: std::sync::Mutex<Vec<Binding>> = std::sync::Mutex::new(Vec::new());
+    pub(super) fn bind(node: &super::ConsensusNode, deadline: Instant) {
+        let _ = CAPTURE.try_with(|cell| {
+            if let Some(slots) = &cell.borrow().slots {
+                slots.trace[0].store(
+                    pack(
+                        deadline.duration_since(slots.start).as_micros(),
+                        Reason::Pending,
+                    ),
+                    Ordering::Release,
+                );
+                let mut bindings = BINDINGS.lock().unwrap();
+                bindings.retain(|(log, sm, w)| {
+                    w.strong_count() != 0
+                        && *log != node.log_weak.as_ptr() as usize
+                        && *sm != node.sm_weak.as_ptr() as usize
+                });
+                if bindings.len() < 64 {
+                    bindings.push((
+                        node.log_weak.as_ptr() as usize,
+                        node.sm_weak.as_ptr() as usize,
+                        Arc::downgrade(slots),
+                    ));
+                }
+            }
+        });
+    }
+    pub(in crate::cluster::consensus) fn entry(store: usize, p: super::LogPos, stage: usize) {
+        let slots = BINDINGS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(log, sm, _)| *log == store || *sm == store)
+            .and_then(|(_, _, w)| w.upgrade());
+        if let Some(slots) = slots {
+            let base = if stage == 4 { 1 } else { 17 };
+            for (i, v) in [p.term, p.leader, p.index].into_iter().enumerate() {
+                let _ = slots.trace[base + i].compare_exchange(
+                    0,
+                    v.saturating_add(1),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+            }
+            let _ = slots.trace[stage].compare_exchange(
+                0,
+                pack(slots.start.elapsed().as_micros(), Reason::Ok),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    pub(in crate::cluster::consensus) fn sent(h: &Option<Handle>, ok: bool) {
+        if let Some(h) = h {
+            h.slots.trace[8].store(
+                pack(
+                    h.slots.start.elapsed().as_micros(),
+                    if ok { Reason::Ok } else { Reason::SenderClosed },
+                ),
+                Ordering::Release,
+            );
+        }
+    }
+    pub(super) fn metrics(node: &super::ConsensusNode, base: usize) {
+        let _ = CAPTURE.try_with(|cell| {
+            if let (Some(slots), Some(raft)) = (&cell.borrow().slots, &node.raft) {
+                let rx = raft.metrics();
+                let m = rx.borrow_watched();
+                for (i, v) in [
+                    m.last_log_index,
+                    m.local_committed.map(|p| p.index),
+                    m.last_applied.map(|p| p.index),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    slots.trace[base + 1 + i]
+                        .store(v.map_or(0, |v| v.saturating_add(1)), Ordering::Release);
+                }
+                slots.trace[base].store(
+                    pack(slots.start.elapsed().as_micros(), Reason::Ok),
+                    Ordering::Release,
+                );
+            }
+        });
     }
     fn pack(us: u128, reason: Reason) -> u64 {
         (((us > MAX_US) as u64) << 56) | (((us.min(MAX_US) as u64) + 1) << 8) | reason as u64
@@ -501,6 +592,7 @@ pub(in crate::cluster::consensus) mod observation {
         len: usize,
         overflow: bool,
         words: [u64; 48],
+        trace: [u64; 20],
         decision: Decision,
         reason: Reason,
         result: &'static str,
@@ -536,6 +628,7 @@ pub(in crate::cluster::consensus) mod observation {
                         len: b.len,
                         overflow: b.overflow,
                         words: slots.freeze(),
+                        trace: std::array::from_fn(|i| slots.trace[i].load(Ordering::Acquire)),
                         decision: b.decision,
                         reason: b.reason,
                         result: variant(&result),
@@ -631,6 +724,14 @@ pub(in crate::cluster::consensus) mod observation {
             " start_wall_ms={:?} end_wall_ms={:?} start_elapsed_us={} end_elapsed_us={} overflow={} count={}",
             s.start.wall_ms, s.end.wall_ms, s.start.elapsed_us, s.end.elapsed_us, s.overflow, s.len
         );
+        // Time words use pack encoding; positions are value+1 (0 absent).
+        let _ = write!(
+            out,
+            "\ntrace_schema=deadline,append_term,append_leader,append_index,append_ok,apply_arrival,store_ok,responder_boundary,owner_send,entry_metrics_time,last_log,local_committed,last_applied,decision_metrics_time,last_log,local_committed,last_applied,apply_term,apply_leader,apply_index"
+        );
+        for (i, w) in s.trace.iter().enumerate() {
+            let _ = write!(out, "\ntrace={} scalar={}", i, w);
+        }
         for (i, w) in s.words.iter().enumerate() {
             let _ = write!(
                 out,
@@ -726,7 +827,7 @@ pub(in crate::cluster::consensus) mod observation {
         #[test]
         fn postshutdown_pair_preserves_return_cut_and_scalar_shape() {
             // Exhaustive destructuring fails compilation if hidden fields are added.
-            let Slots { words, start }: Slots = Slots::new();
+            let Slots { words, start, .. }: Slots = Slots::new();
             let _: [AtomicU64; 48] = words;
             let _: Instant = start;
             let slots = Slots::new();
@@ -861,6 +962,44 @@ pub(in crate::cluster::consensus) mod observation {
                 });
             })
             .await;
+        }
+        #[test]
+        fn found_entry_markers_are_scoped_once_and_do_not_retain_stores() {
+            let slots = Arc::new(Slots::new());
+            // Synthetic fixture identities are internal and never rendered.
+            BINDINGS
+                .lock()
+                .unwrap()
+                .push((usize::MAX, usize::MAX - 1, Arc::downgrade(&slots)));
+            let p = super::super::LogPos {
+                term: 3,
+                leader: 1,
+                index: 7,
+            };
+            entry(usize::MAX, p, 4);
+            entry(usize::MAX - 1, p, 5);
+            entry(usize::MAX - 1, p, 6);
+            entry(usize::MAX - 1, p, 7);
+            let frozen: [u64; 20] = std::array::from_fn(|i| slots.trace[i].load(Ordering::Acquire));
+            assert_eq!(&frozen[1..4], &[4, 2, 8]);
+            assert_eq!(&frozen[17..20], &[4, 2, 8]);
+            assert!(frozen[4..8].windows(2).all(|v| v[0] != 0 && v[0] <= v[1]));
+            entry(usize::MAX, p, 4);
+            assert_eq!(slots.trace[4].load(Ordering::Acquire), frozen[4]);
+            let unrelated = Arc::new(Slots::new());
+            assert!(
+                unrelated
+                    .trace
+                    .iter()
+                    .all(|v| v.load(Ordering::Acquire) == 0)
+            );
+            let weak = Arc::downgrade(&slots);
+            drop(slots);
+            assert!(weak.upgrade().is_none());
+            BINDINGS
+                .lock()
+                .unwrap()
+                .retain(|(log, _, _)| *log != usize::MAX);
         }
         #[test]
         fn slot_packing_absence_saturation_cutoff() {
@@ -1140,6 +1279,8 @@ impl ConsensusNode {
         csr: &[u8],
     ) -> Result<IssuedLeaf, FoundError> {
         let deadline = Instant::now() + ISSUE_BUDGET;
+        #[cfg(test)]
+        observation::bind(self, deadline);
         let _permit = self
             .issue_permits
             .try_acquire()
@@ -1191,6 +1332,8 @@ impl ConsensusNode {
                         FoundError::Unavailable
                     })
             )?;
+            #[cfg(test)]
+            observation::metrics(self, 9);
             let t0 = clock.now_ms();
             let resp = found_phase!(
                 deadline,
@@ -1237,15 +1380,21 @@ impl ConsensusNode {
             match timeout_at(deadline, work).await {
                 Ok(r) if Instant::now() < deadline => {
                     #[cfg(test)]
+                    observation::metrics(self, 13);
+                    #[cfg(test)]
                     observation::decision(observation::Decision::InnerOnTime);
                     r
                 }
                 #[cfg(test)]
                 Ok(_) => {
+                    observation::metrics(self, 13);
+                    #[cfg(test)]
                     observation::decision(observation::Decision::ReadyLate);
                     Err(FoundError::Unavailable)
                 }
                 _ => {
+                    #[cfg(test)]
+                    observation::metrics(self, 13);
                     #[cfg(test)]
                     observation::decision(observation::Decision::WaitElapsed);
                     Err(FoundError::Unavailable)
