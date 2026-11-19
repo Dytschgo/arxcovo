@@ -484,8 +484,12 @@ impl Owner {
         {
             return Err(Refusal::Layout);
         }
+        // checked_path requires an existing object. Only the fixed leaf is new.
+        crate::config::checked_path(&self.plan.state).map_err(|_| Refusal::Layout)?;
+        for guard in &self.guards {
+            guard.recheck()?;
+        }
         let path = self.plan.state.join(name);
-        crate::config::checked_path(&path).map_err(|_| Refusal::Layout)?;
         let mut o = options(false);
         o.write(true).create_new(true);
         #[cfg(unix)]
