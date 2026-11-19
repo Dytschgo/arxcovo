@@ -17,7 +17,15 @@ ci-time-budget/agent-review/protection, timeouts and quarantine unchanged. The
 earlier demand for new approval for PR182's zero-step cancellation was incorrect
 and is superseded by this standing rule (previously applied for PR163).
 
-**Current main GREEN:** exact `eea7af57c944d134d50ab284f1bf9b003246073e` after PR186.
+**Current main GREEN:** exact `9b4ccbde4362249fe06a775643c3bc8b6369c3c8`
+after guarded PR187 merge. Entire tree equals reviewed published9a48b474.
+First normal push CI44443788836 attempt1 SUCCESS585wall/580charged/5validatedidle,
+longestWindowsRust554s. All9jobs PASS, Rust788/775/743 and new20/21/21casesonce,
+Node60/browser/Electron eachOS PASS. Nine bounded D logs/counts/durations retained;
+history40 appended preserving prior39. No rerun/dispatch/stability or re-enable
+credit. [Main evidence](evidence/m3-pr187-main-first-ci.md).
+
+**Previous verified main GREEN:** exact `eea7af57c944d134d50ab284f1bf9b003246073e` after PR186.
 Normal first push CI44432988620 attempt1 SUCCESS560wall/556charged/4validatedidle,
 longestWindowsRust537s. All9jobs PASS, Rust768/754/722 and all67focused cases once
 eachOS; Node60/browser/Electron eachOS PASS. History39 appended preserving previous
@@ -175,15 +183,29 @@ reviewed source/docs Git blobs. P3 concerned the brief's additional literal code
 fixture promise. Coordinator added one pure test with handwritten founder/joiner
 v1 bytes and independent typed expectations; exact test PASS15.617s including
 compilation, body<0.01s; fmt and all-target Clippy PASS5.442s. Evidence:
-`D:/Temp/arx-m3-startup-final`. No production code change. Focused independent
-delta/exact-published-head review and normal hosted gates remain pending.
+`D:/Temp/arx-m3-startup-final`. No production code change. Independent final
+Sol6.1/high delta/exact-head review PASS, Standards0/Spec0/P3closed, report/pins at
+`D:/Temp/arx-pr187-final-review`; [attestation](https://github.com/Dytschgo/arxcovo/pull/187#issuecomment-6997578360)
+and exact-head agent-review SUCCESS59324182918 verified. Separate Sol6.1/high
+four-path carried-CI-evidence review PASS, Standards0/Spec0;61 retained hashes,
+all18 prior logs and history byte preservation checked at
+`D:/Temp/arx-pr187-carried-evidence-review`.
 [Candidate evidence](evidence/m3-startup-identity-preparation.md). B remains a
 separate blocked dependency contract. [ADR0033](adr/0033-startup-identity-preparation.md)
 and [brief](briefs/m3-startup-identity-preparation.md) adopt the accepted scope.
 Standing owner authorization for ordinary continuation remains.
 Offline A source and selected pure/store fixtures have run; no Engine/network/
-production runtime. Final independent exact-head review and normal required gates remain
-mandatory. This design does not grant withheld B runtime. Founder caller bridge
+production runtime. PR187 first CI44442166258 attempt1 SUCCESS580wall/576charged/
+4idle, all9jobs/5required gates PASS. New20Windows/21eachUnix cases passed exactly
+once, including actual Unix replacement/alias tests; Rust788/775/743, skipped36/22/8.
+WindowsRust567s; UI Node60/browser/Electron eachOS PASS. All9logs bounded8MiB/45s
+retained at `D:/Temp/arx-pr187-first-ci`. Fresh main eea/first44432988620 GREEN,
+strict protection/admin enforcement and exact-head/source review were rechecked
+02:21:57UTC before guarded squash merge as9b4ccbde. Full tree equals9a48, PR is
+unwatched. [Merge evidence](evidence/m3-pr187-first-ci.md). Own exact-main first
+CI44443788836 now qualifies SUCCESS585wall/580charged/5idle; all9bounded logs,
+exact-name counts and history40 insertion proof at `D:/Temp/arx-pr187-main-9b4c`.
+This grants no withheld B runtime. Founder caller bridge
 draft at `D:/Temp/arx-m3-founder-caller-bridge-v1` received independent Sol6.1/high
 conditional Design GO, Standards0/Spec0; source/runtime/merge remain withheld.
 Report/proof: `D:/Temp/arx-m3-founder-bridge-review-v1`. Coordinator reverified
@@ -195,6 +217,29 @@ No raw result/DER may escape its final gate. Next is a concrete one-shot ownersh
 pure-test source contract pinned to independently accepted A, alongside qualified
 sealed custody and actual Found-origin publication prerequisites. No B source or
 runtime grant, retry or new founder diagnostic follows this design result.
+Concrete dormant-mechanics draft SHA99254b61 is retained at
+`D:/Temp/arx-m3-founder-bridge-contract-v1`. Independent Sol6.1/high review:
+conditional Design GO, full five-file source NO-GO; Standards1/Spec2. ST1 rejects
+speculative lifecycle implementation with fake integration evidence; SP1 needs
+an actual CA no-sign oracle; SP2 needs real retained-owner/custody/publication
+endpoints. Report/pins: `D:/Temp/arx-m3-founder-bridge-contract-review-v1`.
+Coordinator verified its report hash; no source or runtime ran.
+
+Coordinator Sol6.1/high deferred the whole reducer/transport/lifecycle slice and
+wrote narrow test-only contract SHA78c651fc at `D:/Temp/arx-founder-ca-oracle-v1`.
+Only prospective source path pki/ca.rs, cfg(test) additions: direct finite-CA and
+timestamp-conversion no-sign checks with valid-time controls. Existing sealed
+IssueTicket fixture already used by PKI tests can avoid touching frozen founder
+files; an independent review must settle that generic CA-oracle substitution.
+No new subject implementer, factory, production API or sealing facade. ST1/SP2
+operational prerequisites remain deferred, not claimed closed. Independent
+Sol6.1/high scope review is active at `D:/Temp/arx-founder-ca-oracle-review-v1`.
+
+New branch `work/m3-ca-sentinel-oracle` starts from freshly reverified green main
+9b4c/first44443788836. Seven applicable unpublished docs/history paths carried from
+preserved checkpointfebba988; no duplicate Rust. No new test/source execution or
+PR yet. Existing owner authority covers ordinary continuation after technical
+scope gates; exhausted counters and all runtime holds remain unchanged.
 [PR186](https://github.com/Dytschgo/arxcovo/pull/186) merged as `eea7af57` from exact
 published `0a323793986d705785eff7e409cc85a75cce2836`, base verified main `e2908c98`.
 Normal first CI44431134508 attempt1 SUCCESS; no rerun/dispatch. Source7files
@@ -219,7 +264,8 @@ existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 
 ## Current state - 2026-11-18
 
-- Last merged: PR186 as eea7af57c944d134d50ab284f1bf9b003246073e from reviewed0a. FirstPRCI44431134508 attempt1SUCCESS490wall/484charged/6idle, WindowsRust468s, Rust768/754/722 and focused67eachOS PASS. All5gates/protection/currentmaine290firstGREEN rechecked00:56:01UTC, guarded merge00:56:07UTC; fulltreeequals0a, PRunwatched. OwnfirstmainCI44432988620 attempt1GREEN560wall/556charged/4idle, WindowsRust537s/all9jobsPASS; history39.
+- Last merged: PR187 as9b4ccbde4362249fe06a775643c3bc8b6369c3c8 from reviewed9a48b474. FirstCI44442166258 attempt1SUCCESS580wall/576charged/4idle, WindowsRust567s, Rust788/775/743PASS, new20/21/21casesonce. All5gates/currentmaineea/first44432988620/protection checked02:21:57UTC before expected-head guarded squash; treeequals9a48, PRunwatched. Own firstmainCI44443788836 nowGREEN585wall/580charged/5idle, WindowsRust554s/all9jobsPASS, same20/21/21newcasesonce; history40 recorded preserving prior39.
+- Previous merged: PR186 as eea7af57c944d134d50ab284f1bf9b003246073e from reviewed0a. FirstPRCI44431134508 attempt1SUCCESS490wall/484charged/6idle, WindowsRust468s, Rust768/754/722 and focused67eachOS PASS. All5gates/protection/currentmaine290firstGREEN rechecked00:56:01UTC, guarded merge00:56:07UTC; fulltreeequals0a, PRunwatched. OwnfirstmainCI44432988620 attempt1GREEN560wall/556charged/4idle, WindowsRust537s/all9jobsPASS; history39.
 - Previous merged: PR182 ase2908c98dfcdf97cb8e0aba431bafdb51f328c95 from reviewed834 after standing zero-start recovery1of4. All5normalgates SUCCESS, source32cases once eachOS, strict protection and fresh main e11/827charged confirmed. Full merged tree equals reviewed834; PR unwatched. Own firstCI44418600817 attempt1 qualified GREEN537wall/531charged/6idle.
 - Previous merged: PR185 ase11b0767f1d108313824a5fd2600516561d70391 from reviewed7141c1dc. Fresh exact-mainff599a24/latest44379630740 firstGREEN and all5exact-headgates checked21:13:59UTC before guarded coordinator squash merge. PR first627wall/622charged/5idle, WindowsRust607<=660; all9jobsSUCCESS. Entire merged tree matches reviewed head, PR unwatched. Own firstmainCI44399330997 attempt1 qualifiedGREEN920wall/827charged/93idle, WindowsRust515s. PR182 normal refresh authorized; merge still gated.
 - Previous merged: PR184 asff599a2433bc5a34967d965d0f0da2b3a4517cc8 from reviewed a3cf0cd2. All5gates SUCCESS; first corrected-head CI44370386768 attempt1 GREEN627s wall, Windows474s<=660, Ubuntu221s/macOS320s. Fresh exactmain08c4b999/latest CI44351538977 firstattempt SUCCESS and all exact-head gates rechecked19:21:05UTC before guarded squash merge. Merged crates/tools match reviewed head; PR unwatched. Own first mainCI44379630740 attempt1 GREEN606wall/603charged/3queuecredit.
@@ -229,7 +275,7 @@ existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: M2 native host setup and owner OAuth remain pending; Linux A7/A11/A12 hardware pending. PR182 allocation recovery completed under standing authority; no further approval block. M3 full peer RPC/startup/custody/admission/container acceptance remain to implement/verify after main health. Exhausted engineSol3/3/historyOpus0/2 unchanged; hardware **unverified on real hardware**.
-- Active work: PR186 and its exact-main first CI are green. Offline startup A received SOURCE GO at e77c1e4e; nonblocking literal-fixture discrepancy corrected with one passing pure test, final independent delta review/normal hosted gates pending. Separate founder caller bridge received conditional Design GO only; its concrete source contract/custody prerequisites and live startup/admission/container route remain open. No approval loop or exhausted counter reset.
+- Active work: PR187 and its own exact-main first CI are green. Full dormant bridge source slice NO-GO; coordinator narrowed next scope to direct CA no-sign tests only, under independent Sol6.1/high contract review. No new source/runtime has run. Owner-bound handoff, qualified custody/publication and live startup/admission/container route remain open. No approval loop or exhausted counter reset.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 

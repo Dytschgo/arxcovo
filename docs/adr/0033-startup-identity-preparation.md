@@ -1,6 +1,6 @@
 # ADR0033: Offline startup identity preparation
 
-Status: design accepted; candidate implemented, source acceptance and hosted gates pending.
+Status: accepted and merged in PR187; exact-main first CI green. Offline component only.
 Date: 2026-11-19.
 
 ## Context

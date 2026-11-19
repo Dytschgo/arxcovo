@@ -4,8 +4,10 @@
 main `eea7af57` and preserved documentation only. Six allowed Rust paths changed.
 Builder OpenAI GPT-6.1 Sol/high commits `a9291113` and `2eb3ba10`; coordinator
 Sol6.1/high corrections `90fb1521`; coverage Sol6.1/high `937065c1`.
-Independent source GO at `e77c1e4e` is recorded below; final delta/exact-head review,
-required hosted checks and merge remain pending.
+Independent source GO at `e77c1e4e` and final delta GO at published9a48 are recorded
+below. PR187 merged as9b4ccbde after first hosted CI and all required gates;
+[merge evidence](m3-pr187-first-ci.md). Own main first CI44443788836 is green,
+585wall/580charged; [main evidence](m3-pr187-main-first-ci.md).
 
 ## Result boundary
 
@@ -77,13 +79,18 @@ exact serialization equality. Its opaque leaf bytes qualify codec shape only;
 separate real-certificate tests provide crypto outcomes. Exact-name test PASS
 first execution15.617s including compilation; body<0.01s. fmt and all-target
 locked/offline Clippy PASS5.442s. Raw evidence: `D:/Temp/arx-m3-startup-final`.
-Only test code changed; focused independent delta/exact-head review is pending.
+Only test code changed. Focused independent Sol6.1/high delta/exact-head review
+PASS, Standards0/Spec0, P3closed; attestation6997578360 and agent-review status
+59324182918 verified. Report/pins: `D:/Temp/arx-pr187-final-review`.
 
 Before publication, live main remained `eea7af57`, latest push CI44432988620
 attempt1 completed SUCCESS, freshly read alongside branch metadata. No rerun or
 dispatch. Normal first-attempt Linux/macOS/Windows CI and all required gates
-remain mandatory. Unix file replacement, platform alias/reparse paths and other
-unexecuted hardware paths receive no local credit. No local Engine/founder,
+passed in normal firstCI44442166258,580wall/576charged/4idle. All20Windows and
+21eachUnix new cases passed once, including actual Unix replacement/alias tests.
+This is hosted component coverage; Windows local replacement remains OS
+prevention only. Privilege-dependent/unexecuted hardware paths receive no credit.
+No local Engine/founder,
 native executor, production/client, network or container observation occurred.
 
 All scratch/cache/target paths were explicitly D:. Coverage checks measured over

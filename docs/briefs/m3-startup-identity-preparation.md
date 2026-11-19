@@ -1,6 +1,6 @@
 # Offline startup identity and recovery preparation
 
-Accepted technical design, 2026-11-19; candidate implemented, source acceptance pending. Origin contract:
+Accepted technical design, 2026-11-19; implemented and merged in PR187 as9b4ccbde after independent reviews and normal hosted gates. Exact-main first CI44443788836 is green. Origin contract:
 `D:/Temp/arx-m3-startup-contract-v2/contract.md`,21916bytes,SHA256
 `fe9bcaaa0d9fbe2aeb89edebc0e0cea6eb0f3b272d580a857b095934fefe930f`.
 Independent Sol6.1/high Design GO: `D:/Temp/arx-m3-startup-contract-review-v2/report.md`,
