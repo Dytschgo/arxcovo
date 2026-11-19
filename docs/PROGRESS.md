@@ -108,6 +108,19 @@ repair/quarantine PR onto red main; not used. Windows wall-clock timeouts now
 seen in three tests (founder 5 s deadline, e7 a8 10 s bound, e7 w1_w4 5 s
 gate). The e7 `Gate::hold` busy-spins with `yield_now` for up to 15 s
 (e7.rs:12-19). Hypothesis only; no cause assigned. e7 family fix counter 0/3.
+Sol 6.1/high family diagnosis (`D:/Temp/arx-e7-family-diag/report.md`, SHA256
+`170f6a34…7326`): the A8 setup hold and W1 dispatch hold already run on Tokio's
+blocking pool (application.rs:275), so "spin blocks a worker" does not fit; the
+founder failures had no service-test overlap. CI has no `.config/nextest.toml`
+(four unweighted test processes on the hosted runner; many fixtures create
+4-worker runtimes). Local load control: unix_bridge subset at 4 CPUs/16 threads
+46 pass; service subset at 2 CPUs/32 threads 262 pass; at 2 CPUs/64 threads
+261 pass + 1 timeout at e7.rs:747 (1 s admission observer; fixture already uses
+a blocking hold). Load sensitivity reproduced; hosted cause unproved. Ranked:
+(1) Windows nextest test-group capping heavy service fixtures at 2 concurrent,
+(2) Condvar/Notify rendezvous, (3) offload hooks only if traced, (4) owner-level
+bound increase last. Coordinator selects (1) as e7 family fix attempt 1/3, with
+an ADR and CI-time measurement; founder concurrency is assessed separately.
 
 **PR191 first CI on rebased head `7466e5aa`:** CI 44599400768 attempt 1, all
 nine jobs SUCCESS (~9 min wall). Windows Rust 794/794 passed, 36 skipped,
