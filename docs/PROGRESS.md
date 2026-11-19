@@ -1,6 +1,20 @@
 # Arxcovo progress
 
 ## Main CI health and merge prerequisite
+**V1 readiness audit (2026-11-19):** Sol6.1/high coordinator corrected README's
+obsolete claim that binaries only print scaffold identity, distinguished Windows
+foreground/current-user preview from the protected installed-service route, and
+added the [complete milestone readiness map](v1-readiness.md). UI remains a
+scaffold; this documentation does not substitute preview success for v1.
+Static validation checked31local links, six source blobs against recorded merged
+main8bd12b7f, CLI dispatch and package commands. Receipt:
+`D:/Temp/arx-v1-frontier-audit/validation.json`. No builds/tests/daemon/client/
+credential reads/native/VM/CI actions; no fresh main health claim. Review/required
+checks remain mandatory before any future PR delivery; these docs stay local.
+Next implementation is still gated by held PR189/190 native prerequisites;
+M2 actual-Claude acceptance awaits the existing owner OAuth/environment steps.
+No new diagnostic/fix/retry authority or counter reset follows this audit.
+M2 OPEN / M3 UNCHECKED; **unverified on real hardware**.
 
 **PR190 corrected-source CI HOLD:** exact8216987b, first normal
 44484921164 attempt1 FAILED. Windows Rust411s: 673 pass/2 owner-file Io failures,
