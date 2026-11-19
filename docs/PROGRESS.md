@@ -1,5 +1,31 @@
 # Arxcovo progress
 
+## Main 92003177: E7 A8 timeout diagnosis (2026-11-19)
+
+OpenAI / GPT-6.1 Sol / high diagnostic builder; failure counter **0/3**.
+Latest merged PR192; main push CI 44599348252 Windows Rust red at E7 A8
+outer lifecycle timeout (15.248 s total). No product fix or hosted rerun.
+Exact main local baseline: five isolated nextest passes in
+0.240/0.220/0.222/0.223/0.267 s. Three service selections under default
+scheduling: first stopped before A8 on owner-file fixture assertions
+(181 pass/11 fail/70 unrun); next two disabled fail-fast only, each
+245 pass/17 fail, A8 passing in 0.435/0.424 s. Owner fixture failures include
+SetNamedSecurityInfoW returning 5 instead of 0; no owner administration or
+out-of-scope repair attempted. Retained Windows logs contain 47 PASS
+observations, 1.725–3.580 s; PR192 passed in 1.864 s. Failing iteration and
+phase remain unknown. Load is compatible but unproved.
+
+Local-only diagnostic branch records bounded scalar phase timestamps only
+on outer timeout, with no waits or timeout/scheduling changes. Static CI
+unit gate: 132 tests OK (3 skipped); fmt check, workspace all-target Clippy
+-D warnings and diff check passed. Instrumented focal validation passed
+in 0.205 s. No push/PR/merge. Report and full historical log table:
+D:/Temp/arx-e7-a8-diag/report.md and history.csv. Coordinator should route
+independent review and hosted diagnostic publication before considering a
+fix. Main-green prerequisite remains blocked; no native acceptance claim.
+Hardware paths beyond these fixtures are **unverified on real hardware**.
+
+
 ## Main CI health and merge prerequisite
 **Coordinator handoff (2026-11-19, owner routing update).** Sol coordinator
 threads (6.1, then a short-lived 6.2 thread) were rejected by the provider on
