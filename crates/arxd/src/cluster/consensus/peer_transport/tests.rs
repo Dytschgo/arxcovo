@@ -1920,6 +1920,7 @@ async fn cancelled_close_retains_aborted_outbound_task_until_join() {
 struct RpcSpy {
     calls: Mutex<Vec<Vec<u8>>>,
     deny: bool,
+    snapshot_vote: Option<BallotVote>,
     snapshot_gate: Option<Arc<Semaphore>>,
     snapshot_entered: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -1969,6 +1970,7 @@ impl AppendDispatch for RpcSpy {
             let _ = entered.send(());
         }
         let gate = self.snapshot_gate.clone();
+        let v = self.snapshot_vote.unwrap_or(v);
         Box::pin(async move {
             if let Some(g) = gate {
                 let _ = g.acquire().await;
@@ -1981,6 +1983,7 @@ fn rpc_spy(deny: bool) -> Arc<RpcSpy> {
     Arc::new(RpcSpy {
         calls: Mutex::new(Vec::new()),
         deny,
+        snapshot_vote: None,
         snapshot_gate: None,
         snapshot_entered: Mutex::new(None),
     })
@@ -2270,10 +2273,109 @@ fn seed_learner(
     }
     Ok(snapshot)
 }
+// Process-persistent ownership: cancellation of an observer never drops its worker.
+// Entries are bounded by the four once-only histories. Incomplete joins retain
+// the entire case; no background cleanup, abort, or clean result is fabricated.
+type LearnerWorker = Arc<tokio::sync::Mutex<tokio::task::JoinHandle<Result<(), &'static str>>>>;
+static LEARNER_WORKERS: Mutex<Vec<LearnerWorker>> = Mutex::new(Vec::new());
+static LEARNER_EVIDENCE: Mutex<BTreeMap<u8, Vec<u8>>> = Mutex::new(BTreeMap::new());
+static LEARNER_RETAINED: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
+#[derive(Default, Debug, serde::Serialize)]
+struct LearnerEvidence {
+    first: Option<&'static str>,
+    startup: Option<&'static str>,
+    body: Option<Result<(), &'static str>>,
+    transport: Option<(String, String)>,
+    reclaimed: Option<(bool, bool)>,
+    shutdown: Option<serde_json::Value>,
+    released: Option<(bool, bool)>,
+    readback: Option<Result<(), &'static str>>,
+    readback_observed: Option<bool>,
+    readback_released: Option<(bool, bool, bool)>,
+    weak_refused: Option<bool>,
+}
+impl LearnerEvidence {
+    fn checkpoint(&mut self, case: u8) {
+        if self.save(case).is_err() {
+            self.fail("evidence artifact write failed");
+        }
+        // Even a filesystem failure cannot cancel cleanup or destroy its report.
+        LEARNER_EVIDENCE.lock().unwrap().insert(
+            case,
+            serde_json::to_vec(self).expect("bounded static evidence"),
+        );
+    }
+    fn fail(&mut self, reason: &'static str) {
+        self.first.get_or_insert(reason);
+    }
+    fn save(&self, case: u8) -> Result<(), &'static str> {
+        let root = std::env::var("ARX_OBSERVER_ROOT").map_err(|_| "observer root")?;
+        let path = std::path::Path::new(&root);
+        if !path.is_absolute() || !root.replace('\\', "/").starts_with("D:/Temp/arx-m3-") {
+            return Err("unsafe observer root");
+        }
+        for ancestor in path.ancestors() {
+            if observer_reparse(ancestor)? {
+                return Err("observer reparse point");
+            }
+        }
+        let destination = path.join(format!("learner-{case}-evidence.json"));
+        if destination.exists() && observer_reparse(&destination)? {
+            return Err("evidence reparse point");
+        }
+        std::fs::write(
+            path.join(format!("learner-{case}-evidence.json")),
+            serde_json::to_vec_pretty(self).map_err(|_| "evidence encode")?,
+        )
+        .map_err(|_| "evidence write")
+    }
+}
+fn observer_reparse(path: &std::path::Path) -> Result<bool, &'static str> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "observer metadata")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(metadata.file_attributes() & 0x400 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(metadata.file_type().is_symlink())
+    }
+}
+async fn supervised_learner_once(case: u8) -> Result<(), &'static str> {
+    let worker = {
+        let mut workers = LEARNER_WORKERS.lock().map_err(|_| "supervisor lock")?;
+        if case >= 4 || workers.len() >= 4 {
+            return Err("once-only supervisor full");
+        }
+        let worker = Arc::new(tokio::sync::Mutex::new(tokio::spawn(async move {
+            let result = learner_once(case).await;
+            // A setup error also survives in bounded terminal evidence.
+            let root = std::env::var("ARX_OBSERVER_ROOT").unwrap_or_default();
+            if root == "D:/Temp/arx-m3-rpc-review-corrections-v1" {
+                let destination =
+                    std::path::Path::new(&root).join(format!("learner-{case}-terminal.json"));
+                if !destination.exists() || observer_reparse(&destination) == Ok(false) {
+                    let _ = std::fs::write(destination, serde_json::to_vec(&result).unwrap());
+                }
+            }
+            result
+        })));
+        workers.push(worker.clone());
+        worker
+    };
+    observe_learner_worker(worker).await
+}
+async fn observe_learner_worker(worker: LearnerWorker) -> Result<(), &'static str> {
+    let mut handle = worker.lock().await;
+    (&mut *handle).await.map_err(|_| "supervisor join")?
+}
 async fn learner_once(case: u8) -> Result<(), &'static str> {
     use super::super::{ConsensusNode, MembershipBlob, Params, VoteLogStore, WireMembership};
     use futures_util::FutureExt;
     use openraft::network::{NetSnapshot, NetVote, RaftNetworkFactory};
+    let mut evidence = LearnerEvidence::default();
+    evidence.checkpoint(case);
     let mut f = Fixture::new();
     let port = 43181 + u16::from(case) * 2;
     let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|_| "address")?;
@@ -2304,7 +2406,7 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     let sd = private_temp().keep();
     let rd = private_temp().keep();
     let original = seed_learner(&rd, &f, &m, None)?;
-    seed_learner(&sd, &f, &m, None)?;
+    let sender_original = seed_learner(&sd, &f, &m, None)?;
     let donor_snapshot = if case == 3 {
         let donor = private_temp().keep();
         Some(seed_learner(
@@ -2327,6 +2429,11 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     f.sm = SmAdapter(Arc::new(Mutex::new(
         StateStore::open(&sd, init).map_err(|_| "sender reopen")?,
     )));
+    let mut original_enrollment = Vec::new();
+    crate::cluster::enrollment::codec::encode(
+        f.sm.0.lock().map_err(|_| "sender enrollment lock")?.state(),
+        &mut original_enrollment,
+    );
     let sender_release = f.sm.0.lock().map_err(|_| "sender lock")?.released();
     let sender_weak = Arc::downgrade(&f.sm.0);
     let credentials = |identity: &Identity| Credentials {
@@ -2354,14 +2461,73 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     // Preserve sole startup handle on observation expiry. Never abort/drop/retry it.
     let (startup_observed, started) = match timeout(OBSERVE, &mut startup).await {
         Ok(r) => (true, r),
-        Err(_) => (false, startup.await),
+        Err(_) => {
+            evidence.startup = Some("observation expired; startup worker retained");
+            evidence.fail("startup observation expired");
+            evidence.checkpoint(case);
+            (false, startup.await)
+        }
     };
+    evidence.startup = Some(if startup_observed {
+        "observed"
+    } else {
+        "observation expired; worker joined"
+    });
+    if !startup_observed {
+        evidence.fail("startup observation expired");
+    }
+    evidence.checkpoint(case);
     let mut receiver_node = match started {
         Ok(Ok(n)) => n,
-        _ => {
-            let _ = sender.close().await;
-            let _ = receiver.close().await;
-            return Err("startup failed; Engine cleanup unconfirmed");
+        failure => {
+            evidence.startup = Some(if failure.is_err() {
+                "startup worker join failed"
+            } else {
+                "startup Fatal before node returned"
+            });
+            evidence.fail("startup failed; Engine cleanup unconfirmed");
+            let sc = sender.close().await;
+            let rc = receiver.close().await;
+            evidence.transport = Some((format!("{sc:?}"), format!("{rc:?}")));
+            evidence.reclaimed = Some((reclaimed(&sender), reclaimed(&receiver)));
+            evidence.checkpoint(case);
+            // Pre-return Fatal exposes no Engine/release handle. Only attempt one
+            // owned offline reopen after transport joins; it cannot erase Fatal.
+            if sender.joined() && receiver.joined() {
+                let rdir = rd.clone();
+                let mut reopen =
+                    tokio::task::spawn_blocking(move || -> Result<(), &'static str> {
+                        let log =
+                            VoteLogStore::open(&rdir, CLUSTER).map_err(|_| "fatal log reopen")?;
+                        let sm = StateStore::open(&rdir, init).map_err(|_| "fatal state reopen")?;
+                        let lr = log.released();
+                        let sr = sm.released();
+                        drop(log);
+                        drop(sm);
+                        if !lr.is_set() || !sr.is_set() {
+                            return Err("fatal reopened stores release");
+                        }
+                        Ok(())
+                    });
+                let result = match timeout(OBSERVE, &mut reopen).await {
+                    Ok(r) => {
+                        evidence.readback_observed = Some(true);
+                        r
+                    }
+                    Err(_) => {
+                        evidence.readback_observed = Some(false);
+                        evidence.checkpoint(case);
+                        reopen.await
+                    }
+                };
+                evidence.readback = Some(result.unwrap_or(Err("fatal readback worker join")));
+                evidence.checkpoint(case);
+            }
+            LEARNER_RETAINED
+                .lock()
+                .unwrap()
+                .push(Box::new((sender, receiver, f, sl, rl, sf, pending)));
+            return Err(evidence.first.unwrap());
         }
     };
     let log_release = receiver_node.log_released.clone();
@@ -2393,7 +2559,13 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
         let metrics = raft.metrics();
         let initial = metrics.borrow_watched().clone();
         drop(metrics);
-        if initial.state != openraft::ServerState::Learner
+        let expected_membership = openraft::StoredMembership::new(
+            Some(log_id(1, 1, 1)),
+            super::super::decode(&m).map_err(|_| "initial membership decode")?,
+        );
+        if *initial.membership_config != expected_membership
+            || *initial.committed_membership_config != expected_membership
+            || initial.state != openraft::ServerState::Learner
             || initial.last_applied != Some(log_id(1, 1, 1))
             || initial.local_committed != Some(log_id(1, 1, 1))
             || initial.vote
@@ -2521,12 +2693,53 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     .catch_unwind()
     .await;
     // No test assertions/panic before explicit joins and unchanged node shutdown.
-    let sc = sender.close().await;
-    let rc = receiver.close().await;
+    let body = outcome.unwrap_or(Err("fixture body panic"));
+    evidence.body = Some(body);
+    if let Err(reason) = body {
+        evidence.fail(reason);
+    }
+    evidence.checkpoint(case);
+    let sc = timeout(Duration::from_secs(15), sender.close())
+        .await
+        .unwrap_or(Err(Refusal::Deadline));
+    let rc = timeout(Duration::from_secs(15), receiver.close())
+        .await
+        .unwrap_or(Err(Refusal::Deadline));
+    evidence.transport = Some((format!("{sc:?}"), format!("{rc:?}")));
+    evidence.reclaimed = Some((reclaimed(&sender), reclaimed(&receiver)));
+    if sc.is_err() || rc.is_err() {
+        evidence.fail("transport close failed");
+    }
+    evidence.checkpoint(case);
     if !sender.joined() || !receiver.joined() {
-        return Err("transport cleanup unconfirmed; node shutdown withheld");
+        evidence.fail("transport cleanup unconfirmed; node shutdown withheld");
+        evidence.checkpoint(case);
+        LEARNER_RETAINED.lock().unwrap().push(Box::new((
+            sender,
+            receiver,
+            receiver_node,
+            f,
+            sf,
+            pending,
+        )));
+        return Err(evidence.first.unwrap());
     }
     let shutdown = receiver_node.shutdown().await;
+    evidence.shutdown = Some(match &shutdown {
+        Ok(()) => serde_json::json!({"outcome": "Ok"}),
+        Err(super::super::Orphaned(r)) => serde_json::json!({
+            "outcome": "Orphaned", "first": format!("{:?}", r.first),
+            "engine": format!("{:?}", r.engine), "engine_ms": r.engine_ms,
+            "owners_done_at_start": r.owners_done_at_start, "owners_waited": r.owners_waited,
+            "owners_left": r.owners_left, "owners_panicked": r.owners_panicked,
+            "last_owner_join_ms": r.last_owner_join_ms, "propose_held": r.propose_held,
+            "read_held": r.read_held, "log_strong": r.log_strong, "sm_strong": r.sm_strong,
+            "total_ms": r.total_ms
+        }),
+    });
+    if shutdown.is_err() {
+        evidence.fail("node shutdown failed");
+    }
     let owners_released = log_release.is_set()
         && sm_release.is_set()
         && log_weak.strong_count() == 0
@@ -2534,6 +2747,11 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     drop(receiver_node);
     drop(f.sm);
     let sender_released = sender_release.is_set() && sender_weak.strong_count() == 0;
+    evidence.released = Some((owners_released, sender_released));
+    if !owners_released || !sender_released {
+        evidence.fail("store release incomplete");
+    }
+    evidence.checkpoint(case);
     // Weak factory/client handles remain live during exact same-directory readback.
     let expected_rows = {
         let e = StoredEntry::Enrollment(Command::Found {
@@ -2580,120 +2798,159 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     };
     let k1 = f.client.digest();
     let k2 = f.server.digest();
-    let mut readback = tokio::task::spawn_blocking(move || -> Result<(), &'static str> {
+    let mut readback = tokio::task::spawn_blocking(move || {
         let mut log = VoteLogStore::open(&rd, CLUSTER).map_err(|_| "receiver log reopen")?;
         let sm = StateStore::open(&rd, init).map_err(|_| "receiver state reopen")?;
-        let expected = LogPos {
-            term: if case == 2 { 3 } else { 1 },
-            leader: 1,
-            index: if case >= 2 { 2 } else { 1 },
-        };
-        if sm.applied() != Some(expected)
-            || sm.membership()
-                != Some(&(
-                    LogPos {
-                        term: 1,
-                        leader: 1,
-                        index: 1,
-                    },
-                    m,
-                ))
-        {
-            return Err("reopened position/membership");
-        }
-        if log.vote().map_err(|_| "reopen vote")?
-            != Some(StoredVote {
-                term: if case == 0 { 2 } else { 3 },
-                node: 1,
-                committed: case >= 2,
-            })
-        {
-            return Err("persisted vote");
-        }
-        if expected_snapshot.is_some_and(|b| sm.snapshot() != b) {
-            return Err("reopened snapshot bytes");
-        }
-        if log.entries(0, 3, 3).map_err(|_| "reopened rows")? != expected_rows {
-            return Err("reopened exact rows");
-        }
-        if sm.state().authorize_peer(CLUSTER, node(1), k1).is_err()
-            || sm.state().authorize_peer(CLUSTER, node(2), k2).is_err()
-        {
-            return Err("reopened applied registry");
-        }
-
-        let state = log.log_state().map_err(|_| "reopened log state")?;
-        if state.last != Some(expected)
-            || state.purged != if case == 3 { Some(expected) } else { None }
-        {
-            return Err("reopened log bounds");
-        }
-        if log.live().map_err(|_| "reopen live")?
-            != if case == 3 {
-                0
-            } else if case == 2 {
-                3
-            } else {
-                2
-            }
-        {
-            return Err("reopened row count");
-        }
-        super::super::preflight(&mut log, &sm).map_err(|_| "reopened preflight")?;
         let lr = log.released();
         let sr = sm.released();
+        let receiver_result = (|| -> Result<(), &'static str> {
+            let expected = LogPos {
+                term: if case == 2 { 3 } else { 1 },
+                leader: 1,
+                index: if case >= 2 { 2 } else { 1 },
+            };
+            if sm.applied() != Some(expected)
+                || sm.membership()
+                    != Some(&(
+                        LogPos {
+                            term: 1,
+                            leader: 1,
+                            index: 1,
+                        },
+                        m,
+                    ))
+            {
+                return Err("reopened position/membership");
+            }
+            if log.vote().map_err(|_| "reopen vote")?
+                != Some(StoredVote {
+                    term: if case == 0 { 2 } else { 3 },
+                    node: 1,
+                    committed: case >= 2,
+                })
+            {
+                return Err("persisted vote");
+            }
+            if expected_snapshot.is_some_and(|b| sm.snapshot() != b) {
+                return Err("reopened snapshot bytes");
+            }
+            if log.entries(0, 3, 3).map_err(|_| "reopened rows")? != expected_rows {
+                return Err("reopened exact rows");
+            }
+            if sm.state().authorize_peer(CLUSTER, node(1), k1).is_err()
+                || sm.state().authorize_peer(CLUSTER, node(2), k2).is_err()
+            {
+                return Err("reopened applied registry");
+            }
+
+            let state = log.log_state().map_err(|_| "reopened log state")?;
+            if state.last != Some(expected)
+                || state.purged != if case == 3 { Some(expected) } else { None }
+            {
+                return Err("reopened log bounds");
+            }
+            if log.live().map_err(|_| "reopen live")?
+                != if case == 3 {
+                    0
+                } else if case == 2 {
+                    3
+                } else {
+                    2
+                }
+            {
+                return Err("reopened row count");
+            }
+            super::super::preflight(&mut log, &sm).map_err(|_| "reopened preflight")?;
+            let mut enrollment = Vec::new();
+            crate::cluster::enrollment::codec::encode(sm.state(), &mut enrollment);
+            if enrollment != original_enrollment {
+                return Err("receiver enrollment bytes changed");
+            }
+            Ok(())
+        })();
         drop(log);
         drop(sm);
-        let sender = StateStore::open(&sd, init).map_err(|_| "sender state reopen")?;
-        let ss = sender.released();
-        drop(sender);
-        if !lr.is_set() || !sr.is_set() || !ss.is_set() {
-            return Err("reopen release");
-        };
-        Ok(())
+        let sender_result = (|| -> Result<bool, &'static str> {
+            let sender = StateStore::open(&sd, init).map_err(|_| "sender state reopen")?;
+            if sender.snapshot() != sender_original {
+                return Err("sender seed changed");
+            }
+            let ss = sender.released();
+            drop(sender);
+            Ok(ss.is_set())
+        })();
+        let releases = (
+            lr.is_set(),
+            sr.is_set(),
+            sender_result.as_ref().is_ok_and(|v| *v),
+        );
+        let result = receiver_result.and(sender_result.map(|_| ()));
+        Ok::<_, &'static str>((result, releases))
     });
     let (readback_observed, reopened) = match timeout(OBSERVE, &mut readback).await {
         Ok(r) => (true, r),
-        Err(_) => (false, readback.await),
+        Err(_) => {
+            evidence.readback_observed = Some(false);
+            evidence.fail("readback observation expired; worker retained");
+            evidence.checkpoint(case);
+            (false, readback.await)
+        }
     };
-    let reopened = reopened.map_err(|_| "readback worker join")?;
+    let reopened = match reopened.unwrap_or(Err("readback worker join")) {
+        Ok((result, releases)) => {
+            evidence.readback_released = Some(releases);
+            if let Err(reason) = result {
+                evidence.fail(reason);
+            }
+            if releases != (true, true, true) {
+                evidence.fail("reopened stores not released");
+            }
+            result
+        }
+        Err(reason) => Err(reason),
+    };
+    evidence.readback = Some(reopened);
+    evidence.readback_observed = Some(readback_observed);
     if !readback_observed {
-        return Err("readback observation expired; worker joined");
+        evidence.fail("readback observation expired; worker joined");
     }
-
+    if let Err(reason) = reopened {
+        evidence.fail(reason);
+    }
     let weak_refused = pending
         .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
         .await
         .is_err();
-    drop((sf, pending));
-    if sc.is_err()
-        || rc.is_err()
-        || shutdown.is_err()
-        || !owners_released
-        || !sender_released
-        || !weak_refused
-    {
-        return Err("joined teardown/release");
+    evidence.weak_refused = Some(weak_refused);
+    if !weak_refused {
+        evidence.fail("closed weak client accepted");
     }
-    reopened?;
-    outcome.map_err(|_| "fixture body panic after cleanup")??;
-    Ok(())
+    if !reclaimed(&sender) || !reclaimed(&receiver) {
+        evidence.fail("transport units not reclaimed");
+    }
+    evidence.checkpoint(case);
+    // Factories and weak clients outlive all reopen oracles.
+    drop((sf, pending));
+    match evidence.first {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
 }
 #[tokio::test]
 async fn rpc_learner_p_once() {
-    assert!(learner_once(0).await.is_ok())
+    assert_eq!(supervised_learner_once(0).await, Ok(()))
 }
 #[tokio::test]
 async fn rpc_learner_v_once() {
-    assert!(learner_once(1).await.is_ok())
+    assert_eq!(supervised_learner_once(1).await, Ok(()))
 }
 #[tokio::test]
 async fn rpc_learner_a_once() {
-    assert!(learner_once(2).await.is_ok())
+    assert_eq!(supervised_learner_once(2).await, Ok(()))
 }
 #[tokio::test]
 async fn rpc_learner_s_once() {
-    assert!(learner_once(3).await.is_ok())
+    assert_eq!(supervised_learner_once(3).await, Ok(()))
 }
 #[tokio::test]
 async fn rpc_snapshot_cancel_owned_future_at_tls_and_reply_phases() {
@@ -2702,6 +2959,7 @@ async fn rpc_snapshot_cancel_owned_future_at_tls_and_reply_phases() {
         Stage::ClientHandshake,
         Stage::ClientAuthenticated,
         Stage::ReplyRead,
+        Stage::SnapshotPartialBody,
     ] {
         let f = Fixture::new();
         let spy = rpc_spy(false);
@@ -2726,7 +2984,9 @@ async fn rpc_snapshot_cancel_owned_future_at_tls_and_reply_phases() {
                 .await
         });
         let reached = observe(&mut events, Event::Stage(phase)).await;
-        let charged = sender.shared.connections.available_permits() == 31;
+        let charged = sender.shared.connections.available_permits() == 31
+            && (phase != Stage::SnapshotPartialBody
+                || sender.shared.handshakes.available_permits() == 4);
         let _ = cancel.send(expected.clone());
         let result = call.await;
         release(&sender, phase, &hold);
@@ -2822,6 +3082,7 @@ async fn rpc_snapshot_does_not_hold_heartbeat_client_and_stream_is_sequential() 
     let spy = Arc::new(RpcSpy {
         calls: Mutex::new(Vec::new()),
         deny: false,
+        snapshot_vote: None,
         snapshot_gate: Some(hold.clone()),
         snapshot_entered: Mutex::new(Some(entered)),
     });
@@ -2970,4 +3231,422 @@ async fn rpc_all_new_methods_fail_closed_on_final_registry_remove_contention_and
             assert!(spy.calls.lock().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn rpc_evidence_keeps_first_failure_and_retained_ownership() {
+    let mut e = LearnerEvidence {
+        body: Some(Err("body first")),
+        ..Default::default()
+    };
+    e.fail("body first");
+    e.transport = Some(("Unclean".into(), "Ok".into()));
+    e.fail("cleanup later");
+    e.readback = Some(Err("readback last"));
+    e.fail("readback last");
+    let bytes = serde_json::to_vec(&e).unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded["first"], "body first");
+    assert_eq!(decoded["body"]["Err"], "body first");
+    assert_eq!(decoded["readback"]["Err"], "readback last");
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    LEARNER_RETAINED.lock().unwrap().push(Box::new(owner));
+    assert_eq!(weak.strong_count(), 1);
+    let retained = LEARNER_RETAINED.lock().unwrap().pop().unwrap();
+    assert_eq!(weak.strong_count(), 1);
+    drop(retained);
+    assert_eq!(weak.strong_count(), 0);
+}
+async fn recording_call(mut c: AppendClient, method: u8, s: Snapshot) -> bool {
+    use openraft::network::{NetSnapshot, NetVote};
+    let o = RPCOption::new(Duration::from_secs(4));
+    match method {
+        0 => c.vote(ballot_request(), o).await.is_ok(),
+        1 => c.pre_vote(ballot_request(), o).await.is_ok(),
+        2 => c
+            .full_snapshot(heartbeat().vote, s, std::future::pending(), o)
+            .await
+            .is_ok(),
+        _ => c.append_entries(heartbeat(), o).await.is_ok(),
+    }
+}
+#[tokio::test]
+async fn rpc_new_methods_reauthorize_target_after_reply() {
+    for method in 0..3 {
+        let f = Fixture::new();
+        let spy = rpc_spy(false);
+        let mut receiver = f.owner(2, spy.clone());
+        let address = listening(&mut receiver).await;
+        let mut sender = f.owner(1, Spy::exact(None));
+        let hold = gate(&sender, Stage::ReplyRead);
+        let mut rx = events(&sender);
+        let c = sender.loopback_client(2, address);
+        let s = full_snapshot(&f);
+        let call = tokio::spawn(recording_call(c, method, s));
+        let reached = observe(&mut rx, Event::Stage(Stage::ReplyRead)).await;
+        let removed = f.remove(2);
+        release(&sender, Stage::ReplyRead, &hold);
+        let result = call.await;
+        let a = sender.close().await;
+        let b = receiver.close().await;
+        assert!(reached && removed && matches!(result, Ok(false)));
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+    }
+}
+#[tokio::test]
+async fn rpc_snapshot_preserves_higher_vote_result() {
+    use openraft::network::NetSnapshot;
+    let f = Fixture::new();
+    let higher = vote(StoredVote {
+        term: 9,
+        node: 2,
+        committed: true,
+    });
+    let spy = Arc::new(RpcSpy {
+        calls: Mutex::new(Vec::new()),
+        deny: false,
+        snapshot_vote: Some(higher),
+        snapshot_gate: None,
+        snapshot_entered: Mutex::new(None),
+    });
+    let mut receiver = f.owner(2, spy.clone());
+    let address = listening(&mut receiver).await;
+    let mut sender = f.owner(1, Spy::exact(None));
+    let result = sender
+        .loopback_client(2, address)
+        .full_snapshot(
+            heartbeat().vote,
+            full_snapshot(&f),
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(4)),
+        )
+        .await;
+    let a = sender.close().await;
+    let b = receiver.close().await;
+    assert_eq!(result.unwrap().vote, higher);
+    assert_eq!(spy.calls.lock().unwrap().len(), 1);
+    assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+}
+#[tokio::test]
+async fn rpc_new_method_caller_loss_and_close_races() {
+    for method in 0..3 {
+        for close_first in [false, true] {
+            let f = Fixture::new();
+            let spy = rpc_spy(false);
+            let mut receiver = f.owner(2, spy.clone());
+            let address = listening(&mut receiver).await;
+            let mut sender = f.owner(1, Spy::exact(None));
+            let hold = gate(&sender, Stage::ClientAuthenticated);
+            let mut rx = events(&sender);
+            let c = sender.loopback_client(2, address);
+            let call = tokio::spawn(recording_call(c, method, full_snapshot(&f)));
+            let reached = observe(&mut rx, Event::Stage(Stage::ClientAuthenticated)).await;
+            let charged = sender.shared.connections.available_permits() == 31;
+            let mut close_pending = true;
+            if close_first {
+                // Poll close once to fence admission; cancellation retains original owner.
+                use futures_util::FutureExt;
+                close_pending = sender.close().now_or_never().is_none();
+            } else {
+                call.abort();
+            }
+            release(&sender, Stage::ClientAuthenticated, &hold);
+            let result = call.await;
+            let a = sender.close().await;
+            let b = receiver.close().await;
+            assert!(
+                reached
+                    && charged
+                    && close_pending
+                    && (result.is_err() || matches!(result, Ok(false)))
+            );
+            assert!(spy.calls.lock().unwrap().is_empty());
+            assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+        }
+    }
+}
+#[tokio::test]
+async fn rpc_mixed_methods_share_established_and_handshake_limits() {
+    for handshake in [false, true] {
+        let f = Fixture::new();
+        let spy = rpc_spy(false);
+        let mut receiver = f.owner(2, spy.clone());
+        let address = listening(&mut receiver).await;
+        let mut sender = f.owner(1, Spy::exact(None));
+        let phase = if handshake {
+            Stage::ClientHandshake
+        } else {
+            Stage::ClientAuthenticated
+        };
+        let hold = gate(&sender, phase);
+        let mut rx = events(&sender);
+        let n = if handshake { 4 } else { 32 };
+        let mut calls = Vec::new();
+        let mut reached = true;
+        for i in 0..n {
+            calls.push(tokio::spawn(recording_call(
+                sender.loopback_client(2, address),
+                (i % 4) as u8,
+                full_snapshot(&f),
+            )));
+            reached &= observe(&mut rx, Event::Stage(phase)).await;
+        }
+        let charged = sender.shared.connections.available_permits() == 32 - n
+            && sender.shared.handshakes.available_permits() == if handshake { 0 } else { 4 };
+        let mut refused = true;
+        for method in 0..4 {
+            refused &= !recording_call(
+                sender.loopback_client(2, address),
+                method,
+                full_snapshot(&f),
+            )
+            .await;
+        }
+        hold.add_permits(n);
+        let mut completed = true;
+        for c in calls {
+            completed &= c.await.is_ok_and(|v| v);
+        }
+        let a = sender.close().await;
+        let b = receiver.close().await;
+        assert!(reached && charged && refused && completed);
+        assert_eq!(spy.calls.lock().unwrap().len(), n);
+        assert!(a.is_ok() && b.is_ok() && reclaimed(&sender) && reclaimed(&receiver));
+    }
+}
+#[tokio::test]
+async fn rpc_partial_attach_and_publish_after_close_release_resources() {
+    let f = Fixture::new();
+    let credentials = || Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    for wrong_address in [true, false] {
+        let (mut owner, factory) = TransportOwner::pending(CLUSTER, node(2), credentials());
+        let baseline = Arc::strong_count(&f.sm.0);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let result = if wrong_address {
+            owner.attach_reserved(
+                &f.sm,
+                rpc_spy(false),
+                listener,
+                "127.0.0.1:1".parse().unwrap(),
+            )
+        } else {
+            let c = owner.begin_attach().unwrap();
+            let resources = make_resources(CLUSTER, node(2), &f.sm, c, rpc_spy(false)).unwrap();
+            let closed = owner.close().await;
+            assert!(closed.is_ok());
+            owner.publish(&f.sm, resources, listener)
+        };
+        let closed = owner.close().await;
+        let rebound = TcpListener::bind(addr).await;
+        assert!(result.is_err() && closed.is_ok() && reclaimed(&owner));
+        assert_eq!(Arc::strong_count(&f.sm.0), baseline);
+        assert!(rebound.is_ok());
+        assert!(factory.shared.upgrade().is_some());
+    }
+}
+
+// Independent wire construction deliberately bypasses the codec's sender checks.
+fn independent_snapshot_frame(
+    cluster: [u8; 16],
+    position: (u64, u64, u64),
+    membership_position: (u64, u64, u64),
+    membership: &[u8],
+    blob: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for n in [7u64, 1] {
+        body.extend(n.to_be_bytes());
+    }
+    body.push(1); // committed vote
+    body.push(1);
+    for n in [position.0, position.1, position.2] {
+        body.extend(n.to_be_bytes());
+    }
+    body.push(1);
+    for n in [
+        membership_position.0,
+        membership_position.1,
+        membership_position.2,
+    ] {
+        body.extend(n.to_be_bytes());
+    }
+    body.extend((membership.len() as u16).to_be_bytes());
+    body.extend(membership);
+    body.extend((blob.len() as u16).to_be_bytes());
+    body.extend(blob);
+    let mut frame = b"ARXP".to_vec();
+    frame.extend([2, 7, 0, 0]);
+    frame.extend((body.len() as u32).to_be_bytes());
+    frame.extend(cluster);
+    frame.extend(1u64.to_be_bytes());
+    frame.extend(2u64.to_be_bytes());
+    frame.extend(body);
+    frame
+}
+#[tokio::test]
+async fn rpc_snapshot_nondefault_membership_independent_binding_matrix() {
+    use super::super::{MembershipBlob, WireMembership};
+    let f = Fixture::new();
+    let membership = |voter, address: &str| {
+        WireMembership::new(
+            vec![std::collections::BTreeSet::from([voter])],
+            BTreeMap::from([(1, "127.0.0.1:43181".into()), (2, address.into())]),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    };
+    let m = membership(1, "127.0.0.1:43182");
+    f.sm.0
+        .lock()
+        .unwrap()
+        .apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 1,
+            },
+            &StoredEntry::Membership(MembershipBlob::new(m.clone()).unwrap()),
+        )
+        .unwrap();
+    let blob = f.sm.0.lock().unwrap().snapshot();
+    let valid = independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &m, &blob);
+    // Independent positive bytes must agree with canonical decoder before negatives.
+    let (_, v, snap) = peer_wire::decode_snapshot(&valid).unwrap();
+    assert_ne!(
+        snap.meta.last_membership,
+        openraft::StoredMembership::default()
+    );
+    assert_eq!(
+        peer_wire::encode_snapshot(route(), v, &snap).unwrap(),
+        valid
+    );
+    let config = membership(2, "127.0.0.1:43182");
+    let address = membership(1, "127.0.0.1:43184");
+    let mut corrupt = blob.clone();
+    corrupt[10] ^= 1;
+    let mut digest = blob.clone();
+    let last = digest.len() - 1;
+    digest[last] ^= 1;
+    let foreign_dir = private_temp();
+    let mut foreign = StateStore::open(
+        foreign_dir.path(),
+        Init {
+            cluster: [2; 16],
+            first_free: node(3),
+        },
+    )
+    .unwrap();
+    foreign
+        .apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 0,
+            },
+            &StoredEntry::Enrollment(Command::Found {
+                cluster: [2; 16],
+                members: FoundMembers::new([
+                    (node(1), f.client.digest()),
+                    (node(2), f.server.digest()),
+                ])
+                .unwrap(),
+                proposed_at_ms: 100,
+            }),
+        )
+        .unwrap();
+    foreign
+        .apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 1,
+            },
+            &StoredEntry::Membership(MembershipBlob::new(m.clone()).unwrap()),
+        )
+        .unwrap();
+    let foreign_blob = foreign.snapshot();
+    assert!(StateStore::inspect_snapshot(&foreign_blob, [2; 16]).is_ok());
+    drop(foreign);
+    let mut oversized_header = valid[..44].to_vec();
+    oversized_header[8..12].copy_from_slice(&20552u32.to_be_bytes());
+    let cases = [
+        oversized_header,
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &m, &foreign_blob),
+        independent_snapshot_frame(CLUSTER, (1, 1, 2), (1, 1, 1), &m, &blob),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 0), &m, &blob),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &config, &blob),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &address, &blob),
+        independent_snapshot_frame([2; 16], (1, 1, 1), (1, 1, 1), &m, &blob),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &m, &corrupt),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &m, &digest),
+        independent_snapshot_frame(CLUSTER, (1, 1, 1), (1, 1, 1), &m, &vec![0; 16385]),
+    ];
+    for frame in cases {
+        let spy = rpc_spy(false);
+        let mut owner = f.owner(2, spy.clone());
+        let result = raw_request(&f, &mut owner, &frame, false).await;
+        let closed = owner.close().await;
+        assert!(result.is_err() && spy.calls.lock().unwrap().is_empty());
+        assert!(closed.is_ok() && reclaimed(&owner));
+    }
+    let mut too_large = snap;
+    too_large.snapshot = vec![0; 16385];
+    assert!(peer_wire::encode_snapshot(route(), v, &too_large).is_err());
+    // Absolute decoder envelope: even all maximum fields cannot reach 16 KiB.
+    let envelope = 8 + 2 + 25 + 1 + 24 + 2 + 4096 + 34 + 2 + 16 * 40 + 32;
+    assert_eq!(envelope, 4866);
+    assert_eq!(envelope + 55 * 209, 16361);
+    assert!(envelope + 56 * 209 > 16384);
+}
+
+#[tokio::test]
+async fn rpc_supervisor_survives_observer_cancellation() {
+    let (release, released) = oneshot::channel();
+    let owned = Arc::new(());
+    let weak = Arc::downgrade(&owned);
+    let worker: LearnerWorker = Arc::new(tokio::sync::Mutex::new(tokio::spawn(async move {
+        let _owned = owned;
+        released.await.map_err(|_| "release lost")?;
+        Ok(())
+    })));
+    let observer = tokio::spawn(observe_learner_worker(worker.clone()));
+    tokio::task::yield_now().await;
+    observer.abort();
+    let cancelled = observer.await.is_err();
+    let retained = weak.strong_count() == 1;
+    release.send(()).unwrap();
+    let result = observe_learner_worker(worker).await;
+    assert!(cancelled && retained && result.is_ok());
+    assert_eq!(weak.strong_count(), 0);
+}
+
+#[tokio::test]
+async fn rpc_partial_attach_real_bind_failure_releases_temporary_resources() {
+    let f = Fixture::new();
+    let credentials = Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let (mut owner, factory) = TransportOwner::pending(CLUSTER, node(2), credentials);
+    let before = Arc::strong_count(&f.sm.0);
+    // RFC5737 documentation address is not a local interface in this fixture.
+    // This passes endpoint syntax, builds real TLS resources, then reaches OS bind.
+    let failed = owner.attach(&f.sm, rpc_spy(false), "192.0.2.1:43182").await;
+    let temporary_released = Arc::strong_count(&f.sm.0) == before;
+    let no_publication = owner.shared.state.lock().unwrap().resources.is_none();
+    let closed = owner.close().await;
+    assert_eq!(failed, Err(Refusal::Address));
+    assert!(temporary_released && no_publication && closed.is_ok() && reclaimed(&owner));
+    assert_eq!(factory.shared.strong_count(), 1);
 }

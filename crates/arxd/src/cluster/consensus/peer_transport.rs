@@ -808,6 +808,19 @@ async fn outbound(
     if peer.0 != resources.cluster || peer.1 != target {
         return Err(Refusal::Identity);
     }
+    #[cfg(test)]
+    if kind == peer_wire::Kind::SnapshotReply {
+        stream
+            .write_all(&frame[..frame.len() - 1])
+            .await
+            .map_err(|_| Refusal::Frame)?;
+        stream.flush().await.map_err(|_| Refusal::Frame)?;
+        stage(shared, Stage::SnapshotPartialBody).await;
+        send_frame(&mut stream, &frame[frame.len() - 1..]).await?;
+    } else {
+        send_frame(&mut stream, &frame).await?;
+    }
+    #[cfg(not(test))]
     send_frame(&mut stream, &frame).await?;
     let frame = read_frame(
         &mut stream,
@@ -853,6 +866,8 @@ enum Stage {
     ReplyRead,
     #[cfg(test)]
     CloseAborted,
+    #[cfg(test)]
+    SnapshotPartialBody,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
