@@ -245,8 +245,17 @@ impl StoreKind {
         }
     }
 }
+// Duplicates of the original guard share the Windows lock's handle lifetime.
+// Release the cooperative store lock explicitly after its connection has dropped,
+// while preserving the original Owner's identity guard.
+struct StoreLock(File);
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 pub(super) struct BoundLease {
-    _lock: File,
+    _lock: StoreLock,
     _guard: File,
     _identity: ObjectId,
 }
@@ -260,7 +269,7 @@ pub(super) struct BoundDb {
 struct Pending {
     db: Option<Connection>,
     bound: Option<BoundDb>,
-    lock: Option<File>,
+    lock: Option<StoreLock>,
     guard: Option<File>,
 }
 pub(super) struct BoundStores<'owner> {
@@ -358,6 +367,18 @@ impl<'owner> BoundStores<'owner> {
             }
         }
     }
+    // Closed store-only access; no raw connections, adapters or Engine escape.
+    fn validate_pair(
+        &mut self,
+        validate: impl FnOnce(&StateStore, &mut VoteLogStore) -> Result<(), StoreError>,
+    ) -> Result<(), BoundFailure> {
+        self.status()?;
+        validate(
+            self.state.as_ref().ok_or(BoundFailure::Unavailable)?,
+            self.log.as_mut().ok_or(BoundFailure::Unavailable)?,
+        )
+        .map_err(BoundFailure::Init)
+    }
     fn fail(&mut self, f: BoundFailure) {
         self.failure = Some(f);
         self.owner.bound_attempt = BoundAttempt::Failed(f);
@@ -395,11 +416,12 @@ impl<'owner> BoundStores<'owner> {
     fn open(&mut self, kind: StoreKind, fresh: bool, readonly: bool) -> Result<(), BoundFailure> {
         self.access();
         let stem = kind.stem();
-        self.pending.lock = Some(self.original(&format!("{stem}.lock"), fresh)?);
+        self.pending.lock = Some(StoreLock(self.original(&format!("{stem}.lock"), fresh)?));
         self.pending
             .lock
             .as_ref()
             .unwrap()
+            .0
             .try_lock()
             .map_err(|_| BoundFailure::Open(StoreError::Io))?;
         self.pending.guard = Some(self.original(&format!("{stem}.sqlite3"), fresh)?);
@@ -498,6 +520,9 @@ impl<'owner> BoundStores<'owner> {
         self.open(StoreKind::VoteLog, fresh, false)?;
         #[cfg(test)]
         tests::boundary("log-init", self)?;
+        if !fresh {
+            self.require_v2()?;
+        }
         let initialized =
             VoteLogStore::initialize_bound(self.pending.bound.as_mut().unwrap(), init.cluster)
                 .map_err(BoundFailure::Init)?;
@@ -510,7 +535,9 @@ impl<'owner> BoundStores<'owner> {
         if !matches!(intent, BoundIntent::Recovery(_)) {
             let state = self.state.as_ref().unwrap();
             let log = self.log.as_mut().unwrap();
-            if state.applied().is_some()
+            if *state.state()
+                != super::enrollment::EnrollmentState::new(init.cluster, init.first_free)
+                || state.applied().is_some()
                 || state.membership().is_some()
                 || log.vote().map_err(BoundFailure::Init)?.is_some()
                 || log
@@ -518,14 +545,34 @@ impl<'owner> BoundStores<'owner> {
                     .map_err(BoundFailure::Init)?
                     .purged
                     .is_some()
-                || !log
-                    .entries(0, u64::MAX, 513)
-                    .map_err(BoundFailure::Init)?
-                    .is_empty()
+                || log.live().map_err(BoundFailure::Init)? != 0
             {
                 return Err(BoundFailure::Layout);
             }
         }
+        self.validate_pair(|state, log| {
+            let metadata = log.log_state()?;
+            let valid = if let Some(applied) = state.applied() {
+                if applied.index > i64::MAX as u64 {
+                    return Err(StoreError::Corrupt);
+                }
+                let end = applied.index.checked_add(1).ok_or(StoreError::Corrupt)?;
+                match metadata.purged {
+                    Some(p) if p.index > applied.index => false,
+                    Some(p) if p.index == applied.index => p == applied,
+                    _ if metadata.last.is_none_or(|last| last.index < applied.index) => {
+                        metadata.last < Some(applied)
+                    }
+                    _ => {
+                        let rows = log.entries(applied.index, end, 1)?;
+                        rows.len() == 1 && rows[0].0 == applied
+                    }
+                }
+            } else {
+                metadata.purged.is_none()
+            };
+            valid.then_some(()).ok_or(StoreError::Corrupt)
+        })?;
         if fresh {
             self.owner
                 .bound_install(&mut self.staged)
@@ -595,6 +642,14 @@ pub(super) mod tests {
     fn retained_fresh_same_connections_and_spent_complete() {
         let l = layout();
         let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        for name in [
+            "cluster-state.lock",
+            "cluster-log.lock",
+            "cluster-state.sqlite3",
+            "cluster-log.sqlite3",
+        ] {
+            assert!(!owner.plan.state.join(name).exists());
+        }
         let stores = BoundStores::acquire(&mut owner, BoundIntent::Fresh(init()));
         assert_eq!(stores.status(), Ok(()));
         assert_eq!(stores.opens.len(), 2);
@@ -711,6 +766,175 @@ pub(super) mod tests {
         );
         drop(stores);
         assert_eq!(before, l.snapshot());
+    }
+
+    fn seeded() -> super::super::startup_plan::tests::Layout {
+        let l = layout();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        assert_eq!(
+            BoundStores::acquire(&mut owner, BoundIntent::Fresh(init())).status(),
+            Ok(())
+        );
+        l
+    }
+    fn recovery(l: &super::super::startup_plan::tests::Layout) -> Owner {
+        // Layout-only synthetic public fixtures; no credential parser or live startup.
+        for name in ["identity.json", "ca.der", "receipt"] {
+            l.write(&format!("credentials/{name}"), b"public-layout-fixture");
+        }
+        Owner::acquire(l.plan("recover-founder")).unwrap()
+    }
+    #[test]
+    fn retained_existing_pairs_recovery_and_same_connection_readback() {
+        let l = seeded();
+        let dir = l.root.path().join("state");
+        let position = super::super::state_store::LogPos {
+            term: 1,
+            leader: 1,
+            index: 0,
+        };
+        let entry = super::super::state_store::Entry::Blank;
+        {
+            let mut state = StateStore::open(&dir, init()).unwrap();
+            state.apply(position, &entry).unwrap();
+            let mut log = VoteLogStore::open(&dir, init().cluster).unwrap();
+            log.append(&[(position, entry)]).unwrap();
+        }
+        let mut owner = recovery(&l);
+        let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Recovery(init().cluster));
+        assert_eq!(stores.status(), Ok(()));
+        assert_eq!(
+            stores.state.as_ref().unwrap().bound_pointer(),
+            stores.opens[0]
+        );
+        assert_eq!(
+            stores.log.as_ref().unwrap().bound_pointer(),
+            stores.opens[1]
+        );
+        stores
+            .validate_pair(|state, log| {
+                assert_eq!(state.applied(), Some(position));
+                assert_eq!(log.entries(0, 1, 1)?.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn retained_nonfresh_version_zero_refused_preserving_bytes_and_layout() {
+        for recover in [false, true] {
+            for stem in ["cluster-state", "cluster-log"] {
+                let l = seeded();
+                let path = l.root.path().join(format!("state/{stem}.sqlite3"));
+                let db = open(&path);
+                db.pragma_update(None, "user_version", 0).unwrap();
+                drop(db);
+                let mut owner = if recover {
+                    recovery(&l)
+                } else {
+                    Owner::acquire(l.plan("create-founder")).unwrap()
+                };
+                let before = l.snapshot();
+                let objects = super::super::startup_plan::tests::objects(&owner.plan.state);
+                let intent = if recover {
+                    BoundIntent::Recovery(init().cluster)
+                } else {
+                    BoundIntent::UntouchedGenesis(init())
+                };
+                let stores = BoundStores::acquire(&mut owner, intent);
+                assert_eq!(
+                    stores.status(),
+                    Err(BoundFailure::Init(StoreError::Unsupported)),
+                    "{recover} {stem}"
+                );
+                drop(stores);
+                assert_eq!(l.snapshot(), before);
+                assert_eq!(
+                    super::super::startup_plan::tests::objects(&owner.plan.state),
+                    objects
+                );
+            }
+        }
+    }
+    #[test]
+    fn retained_genesis_requires_entire_enrollment_image() {
+        let l = seeded();
+        let mut other = init();
+        other.first_free = std::num::NonZeroU64::new(2).unwrap();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let before = l.snapshot();
+        let stores = BoundStores::acquire(&mut owner, BoundIntent::UntouchedGenesis(other));
+        assert_eq!(stores.status(), Err(BoundFailure::Layout));
+        drop(stores);
+        assert_eq!(l.snapshot(), before);
+    }
+    #[test]
+    fn retained_recovery_incompatible_purged_metadata_refused() {
+        let l = seeded();
+        let dir = l.root.path().join("state");
+        let mut log = VoteLogStore::open(&dir, init().cluster).unwrap();
+        log.purge(super::super::state_store::LogPos {
+            term: 1,
+            leader: 1,
+            index: 1,
+        })
+        .unwrap();
+        drop(log);
+        let mut owner = recovery(&l);
+        let before = l.snapshot();
+        let stores = BoundStores::acquire(&mut owner, BoundIntent::Recovery(init().cluster));
+        assert_eq!(
+            stores.status(),
+            Err(BoundFailure::Init(StoreError::Corrupt))
+        );
+        probe(&stores.owner.plan.state, "cluster-state", true);
+        probe(&stores.owner.plan.state, "cluster-log", true);
+        drop(stores);
+        probe(&owner.plan.state, "cluster-state", false);
+        probe(&owner.plan.state, "cluster-log", false);
+        assert_eq!(l.snapshot(), before);
+    }
+    #[test]
+    fn fresh_creation_rejects_existing_leaf_and_unsafe_names() {
+        let l = layout();
+        let owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        for name in [
+            "../escape",
+            "cluster-state.sqlite3/child",
+            "cluster-state.sqlite3:stream",
+            "unknown",
+        ] {
+            assert!(owner.bound_create(name).is_err(), "{name}");
+        }
+        let path = owner.plan.state.join("cluster-state.lock");
+        fs::write(&path, b"sentinel").unwrap();
+        assert!(owner.bound_create("cluster-state.lock").is_err());
+        assert_eq!(fs::read(path).unwrap(), b"sentinel");
+    }
+    #[test]
+    fn fresh_creation_rejects_reparse_leaf_and_parent() {
+        let l = layout();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let target = l.root.path().join("workspace");
+        let link = owner.plan.state.join("cluster-state.lock");
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction fixture prerequisite unavailable"
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(owner.bound_create("cluster-state.lock").is_err());
+        owner.plan.state = link;
+        assert!(owner.bound_create("cluster-log.lock").is_err());
+        assert!(!target.join("cluster-log.lock").exists());
     }
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, File) {
         let dir = crate::service::application::tests::private_temp();
