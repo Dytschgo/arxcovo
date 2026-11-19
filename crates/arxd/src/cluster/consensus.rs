@@ -451,12 +451,9 @@ impl ConsensusNode {
                     observation::Edge::OwnerSend,
                     observation::Reason::Pending,
                 );
+                let _sent = tx.send(result).is_ok();
                 #[cfg(test)]
-                let sent = tx.send(result).is_ok();
-                #[cfg(test)]
-                observation::sent(&owner_obs, sent);
-                #[cfg(not(test))]
-                let _ = tx.send(result);
+                observation::sent(&owner_obs, _sent);
             });
         }
         {
