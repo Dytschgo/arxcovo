@@ -804,8 +804,75 @@ mod a8 {
     use super::*;
     use crate::service::{Host, Reporter, Shutdown, State};
 
+    // Test-only scalar evidence: no locks, waits, paths or successful-run output.
+    // First timestamps keep repeated manual-clock and heartbeat events bounded.
+    const PHASES: [&str; 26] = [
+        "load",
+        "layout",
+        "store",
+        "start_enter",
+        "start_exit",
+        "bind",
+        "preflight",
+        "discovery_start",
+        "serve",
+        "setup_enter",
+        "gate_seen",
+        "gate_open",
+        "setup_exit",
+        "ready",
+        "row",
+        "dispatch",
+        "discovery_done",
+        "cancel",
+        "stop_accepting",
+        "drain_enter",
+        "drain_execution",
+        "drain_sequence",
+        "drain_blocking",
+        "drain_exit",
+        "stop_audit",
+        "release",
+    ];
+    struct PhaseTrace {
+        start: std::sync::OnceLock<std::time::Instant>,
+        micros: [std::sync::atomic::AtomicU64; PHASES.len()],
+    }
+    impl PhaseTrace {
+        fn new() -> Self {
+            Self {
+                start: std::sync::OnceLock::new(),
+                micros: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(u64::MAX)),
+            }
+        }
+        fn mark(&self, phase: usize) {
+            if let Some(start) = self.start.get() {
+                let elapsed = start.elapsed().as_micros().min(u128::from(u64::MAX - 1)) as u64;
+                let _ = self.micros[phase].compare_exchange(
+                    u64::MAX,
+                    elapsed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        fn emit(&self, iteration: usize) {
+            eprintln!(
+                "[DEBUG-e7-a8] iteration={iteration} elapsed_us={}",
+                self.start.get().unwrap().elapsed().as_micros()
+            );
+            for (name, time) in PHASES.iter().zip(&self.micros) {
+                let time = time.load(Ordering::Relaxed);
+                if time != u64::MAX {
+                    eprintln!("[DEBUG-e7-a8] {name}_us={time}");
+                }
+            }
+        }
+    }
+
     struct LifecycleFixture<'a> {
         app: App,
+        trace: Arc<PhaseTrace>,
         dir: &'a tempfile::TempDir,
         request: Shutdown,
         gate: Arc<Gate>,
@@ -815,29 +882,42 @@ mod a8 {
     }
     impl Application for LifecycleFixture<'_> {
         async fn load_config(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(0);
             Ok(()) // E7 fixture already owns synthetic configuration and store.
         }
         async fn verify_layout(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(1);
             Ok(())
         }
         async fn open_store(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(2);
             Ok(())
         }
         async fn service_start(&mut self) -> Result<(), ExitCode> {
-            self.app.service_start().await
+            self.trace.mark(3);
+            let result = self.app.service_start().await;
+            self.trace.mark(4);
+            result
         }
         async fn bind(&mut self, _: Shutdown) -> Result<(), ExitCode> {
+            self.trace.mark(5);
             Ok(()) // No socket, service manager or native identity operations.
         }
-        async fn preflight(&mut self) {}
+        async fn preflight(&mut self) {
+            self.trace.mark(6);
+        }
         fn start_discovery(&mut self) {
+            self.trace.mark(7);
             self.app.start_discovery();
         }
         async fn serve(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(8);
             self.gate.reached().await;
+            self.trace.mark(10);
             let pending = self.state.check();
             let before = rows(self.dir);
             let calls = self.calls.load(Ordering::Acquire);
+            self.trace.mark(11);
             self.gate.open(); // Release before assertions, including on failure.
             assert_eq!(pending, Err(Unavailable::MechanismUnavailable));
             assert!(before.is_empty(), "no discovery row before Ready");
@@ -849,22 +929,30 @@ mod a8 {
             })
             .await
             .expect("bounded startup discovery completion");
+            self.trace.mark(16);
             assert_eq!(self.state.check(), self.expected);
             // A second call after completion must not start another sequence.
             self.app.start_discovery();
+            self.trace.mark(17);
             self.request.cancel();
             std::future::pending().await
         }
         fn stop_accepting(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(18);
             self.app.stop_accepting()
         }
         async fn drain(&mut self) -> Result<(), ExitCode> {
-            self.app.drain().await
+            self.trace.mark(19);
+            let result = self.app.drain().await;
+            self.trace.mark(23);
+            result
         }
         async fn service_stop(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(24);
             self.app.service_stop().await
         }
         fn release(&mut self) -> Result<(), ExitCode> {
+            self.trace.mark(25);
             self.app.release()
         }
     }
@@ -880,11 +968,16 @@ mod a8 {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_ready_discovery_persisted_once_or_absent_on_setup_failure() {
-        for (failure, waiting, expected) in [
+        for (iteration, (failure, waiting, expected)) in [
             (false, false, Ok(())),
             (true, false, Err(Unavailable::MechanismUnavailable)),
             (false, true, Err(Unavailable::Quarantined)),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let trace = Arc::new(PhaseTrace::new());
+            let setup_trace = trace.clone();
             let dir = private_temp();
             let gate = Arc::new(Gate::default());
             let setup_gate = gate.clone();
@@ -895,6 +988,20 @@ mod a8 {
                 failure,
                 waiting,
                 Arc::new(move |point| {
+                    let phase = match point {
+                        "setup" => Some(9),
+                        "s10" => Some(12),
+                        "ready" => Some(13),
+                        "row" => Some(14),
+                        "dispatch" => Some(15),
+                        "drain_execution" => Some(20),
+                        "drain_sequence" => Some(21),
+                        "drain_blocking" => Some(22),
+                        _ => None,
+                    };
+                    if let Some(phase) = phase {
+                        setup_trace.mark(phase);
+                    }
                     if point == "setup" {
                         setup_gate.hold();
                     }
@@ -908,6 +1015,7 @@ mod a8 {
             let request = Shutdown::default();
             let mut fixture = LifecycleFixture {
                 app,
+                trace: trace.clone(),
                 dir: &dir,
                 request: request.clone(),
                 gate,
@@ -916,12 +1024,16 @@ mod a8 {
                 expected,
             };
             let mut reports = Reports::default();
+            trace.start.set(std::time::Instant::now()).unwrap();
             let code = tokio::time::timeout(
                 Duration::from_secs(10),
                 Host::run(&mut fixture, request, &mut reports),
             )
-            .await
-            .expect("bounded host lifecycle");
+            .await;
+            if code.is_err() {
+                trace.emit(iteration);
+            }
+            let code = code.expect("bounded host lifecycle");
             assert_eq!(code, ExitCode::Clean);
             // Heartbeats may repeat pending states on a slow worker.
             reports.0.dedup();
