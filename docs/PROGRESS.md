@@ -17,7 +17,13 @@ ci-time-budget/agent-review/protection, timeouts and quarantine unchanged. The
 earlier demand for new approval for PR182's zero-step cancellation was incorrect
 and is superseded by this standing rule (previously applied for PR163).
 
-**Current main GREEN:** exact `e2908c98dfcdf97cb8e0aba431bafdb51f328c95` after PR182. First normal push CI44418600817 attempt1 SUCCESS: 537s wall, 531s charged, 6s validated idle; longest Windows Rust523s. All9jobs PASS; Rust741/727/695 and all32transport cases once eachOS, Node60/browser/Electron eachOS PASS. Existing policy history record38 appended preserving older bytes. The earlier PR allocation failure and successful standing recovery remain separate historical evidence. M2 OPEN/M3 UNCHECKED. [Main evidence](evidence/m3-pr182-main-first-ci.md).
+**Current main GREEN:** exact `eea7af57c944d134d50ab284f1bf9b003246073e` after PR186.
+Normal first push CI44432988620 attempt1 SUCCESS560wall/556charged/4validatedidle,
+longestWindowsRust537s. All9jobs PASS, Rust768/754/722 and all67focused cases once
+eachOS; Node60/browser/Electron eachOS PASS. History39 appended preserving previous
+bytes. No rerun/dispatch, repair/stability or re-enable credit. [Main evidence](evidence/m3-pr186-main-first-ci.md).
+
+**Previous verified main GREEN:** exact `e2908c98dfcdf97cb8e0aba431bafdb51f328c95` after PR182. First normal push CI44418600817 attempt1 SUCCESS: 537s wall, 531s charged, 6s validated idle; longest Windows Rust523s. All9jobs PASS; Rust741/727/695 and all32transport cases once eachOS, Node60/browser/Electron eachOS PASS. Existing policy history record38 appended preserving older bytes. The earlier PR allocation failure and successful standing recovery remain separate historical evidence. M2 OPEN/M3 UNCHECKED. [Main evidence](evidence/m3-pr182-main-first-ci.md).
 
 **Previous verified main GREEN:** exacte11b0767f1d108313824a5fd2600516561d70391 after guarded PR185 merge from reviewed7141c1dc. First normal push CI44399330997 attempt1 SUCCESS920wall/827charged/93validatedidle, longestWindowsRust515s. All9jobs SUCCESS; Rust709/695/663PASS, Node60/UI/browser/Electron eachOS PASS. Existing policy history37th record appended preserving previous bytes. No speedup/repair/stability claim. Owner-authorized normal PR182 refresh can proceed; source review/normalfirstCI still required. M2 OPEN/M3 UNCHECKED.
 
@@ -124,10 +130,46 @@ all7source pins match, `git diff -- crates` empty, final fmt/Clippy PASS. Coordi
 verified all83 returned artifact entries and the raw failures. Output:
 `D:/Temp/arx-m3-rpc-controls-once`. No Engine reruns or new fix authority.
 Local Windows quarantine guard9/9 PASS in0.192s; no quarantine changes.
-In parallel, [Sol6.1/high next startup/custody contract](t3-thread://v2/950f5165-f55d-4ffd-9b15-4b87e10b4d15/thread:delegated-task:command%3Amcp%3Abddacdb1-6679-4a64-ac51-bc2209d4eb27%3Adelegate-task%3Aarxcovo-m3-startup-custody-contract-e3afd1f5-v1)
-is read-only preparation from committed source, no implementation or acceptance.
-Preparing the peer-RPC PR; independent final exact-head review and normal required
-hosted gates remain. No hosted result is claimed yet. Builder
+The Sol6.1/high startup/custody design task completed its read-only draft at
+`D:/Temp/arx-m3-startup-custody-contract-v1/contract.md`, SHA256
+`c01edb5b905465ada6b93608028768e3c56815d75408817a9231275b7128045b`.
+Coordinator verified27source pins. It proposes two ordered slices: offline identity/
+recovery preparation, then live startup/enrollment/admission. Custody, founder
+credential cycle, preproof continuation and lifecycle blockers remain explicit.
+Independent startup design round1 found Standards0/Spec3: distinct founder/joiner
+record roles, noninitializing existing-store recovery, and honest fresh-only
+genesis provenance. Exact draft NO-GO; minimum offline A conditionally viable.
+Coordinator Sol6.1/high corrected those precise clauses, removed the unneeded
+quarantine-guard path and preserved B's technical blockers. Revised draft:
+`D:/Temp/arx-m3-startup-contract-v2/contract.md`, SHA256
+`fe9bcaaa0d9fbe2aeb89edebc0e0cea6eb0f3b272d580a857b095934fefe930f`,2714words.
+All27source pins still match merged eea. [Focused independent design re-review](t3-thread://v2/950f5165-f55d-4ffd-9b15-4b87e10b4d15/thread:delegated-task:command%3Amcp%3Abddacdb1-6679-4a64-ac51-bc2209d4eb27%3Adelegate-task%3Aarxcovo-m3-startup-contract-review-fe9bcaaa-v2)
+completed Design GO, Standards0/Spec0 with narrow implementation constraints;
+report `D:/Temp/arx-m3-startup-contract-review-v2`. Read-only log validation must
+use current pinned grammars/accessors without modifying store cores, recover must
+preserve bytes/entries including absent locks, and returned preparation must retain
+real ownership. No key possession/readiness or arbitrary-writer defense is claimed.
+Main health is now verified. Next is one Sol6.1/high builder for the six-file
+offline A allowlist, no Engine/network/production runtime; B remains a separate
+blocked dependency contract. Owner authorization for ordinary continuation remains.
+No startup source or runtime has run yet; independent source review and normal
+required gates remain mandatory. This design does not grant withheld B runtime.
+[PR186](https://github.com/Dytschgo/arxcovo/pull/186) merged as `eea7af57` from exact
+published `0a323793986d705785eff7e409cc85a75cce2836`, base verified main `e2908c98`.
+Normal first CI44431134508 attempt1 SUCCESS; no rerun/dispatch. Source7files
+are byte-identical to reviewed/observed/restored `e3afd1f5`. Independent final
+Sol6.1/high review completed GO, Standards0/Spec0; [attestation](https://github.com/Dytschgo/arxcovo/pull/186#issuecomment-6996145608)
+and exact-head agent-review SUCCESS59319264686 posted. Report/proof retained at
+`D:/Temp/arx-pr186-final-review`.
+Terminal CI: WindowsRust768PASS/36skip,468s; Ubuntu754/22,175s; macOS722/8,251s.
+All67focused cases once eachOS, including P/V/A/S; UI Node60/browser/Electron
+eachOS PASS. Actual policy490wall/484charged/6idle; all9jobs and5required gates
+SUCCESS, strict protection/fresh main rechecked before guarded merge. All9bounded
+logs and proof at `D:/Temp/arx-pr186-first-ci`. Entire merged tree equals0a; PR is
+unwatched. Main firstCI44432988620 now qualified SUCCESS560wall/556charged/4idle;
+all9bounded logs/counts/durations and history39 retained. Revised offline A Design
+GO permits its scoped implementation; live B remains outside it. This local docs checkpoint will not be pushed just to
+create another CI run. Builder
 artifacts remain at `D:/Temp/arx-m3-full-rpc-build-v1`. Full RPC precedes production startup, key
 custody and admission, then genuine network three-container acceptance. The
 preflight and source-only prerequisites grant no container or hardware credit.
@@ -136,7 +178,8 @@ existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 
 ## Current state - 2026-11-18
 
-- Last merged: PR182 ase2908c98dfcdf97cb8e0aba431bafdb51f328c95 from reviewed834 after standing zero-start recovery1of4. All5normalgates SUCCESS, source32cases once eachOS, strict protection and fresh main e11/827charged confirmed. Full merged tree equals reviewed834; PR unwatched. Own firstCI44418600817 attempt1 qualified GREEN537wall/531charged/6idle.
+- Last merged: PR186 as eea7af57c944d134d50ab284f1bf9b003246073e from reviewed0a. FirstPRCI44431134508 attempt1SUCCESS490wall/484charged/6idle, WindowsRust468s, Rust768/754/722 and focused67eachOS PASS. All5gates/protection/currentmaine290firstGREEN rechecked00:56:01UTC, guarded merge00:56:07UTC; fulltreeequals0a, PRunwatched. OwnfirstmainCI44432988620 attempt1GREEN560wall/556charged/4idle, WindowsRust537s/all9jobsPASS; history39.
+- Previous merged: PR182 ase2908c98dfcdf97cb8e0aba431bafdb51f328c95 from reviewed834 after standing zero-start recovery1of4. All5normalgates SUCCESS, source32cases once eachOS, strict protection and fresh main e11/827charged confirmed. Full merged tree equals reviewed834; PR unwatched. Own firstCI44418600817 attempt1 qualified GREEN537wall/531charged/6idle.
 - Previous merged: PR185 ase11b0767f1d108313824a5fd2600516561d70391 from reviewed7141c1dc. Fresh exact-mainff599a24/latest44379630740 firstGREEN and all5exact-headgates checked21:13:59UTC before guarded coordinator squash merge. PR first627wall/622charged/5idle, WindowsRust607<=660; all9jobsSUCCESS. Entire merged tree matches reviewed head, PR unwatched. Own firstmainCI44399330997 attempt1 qualifiedGREEN920wall/827charged/93idle, WindowsRust515s. PR182 normal refresh authorized; merge still gated.
 - Previous merged: PR184 asff599a2433bc5a34967d965d0f0da2b3a4517cc8 from reviewed a3cf0cd2. All5gates SUCCESS; first corrected-head CI44370386768 attempt1 GREEN627s wall, Windows474s<=660, Ubuntu221s/macOS320s. Fresh exactmain08c4b999/latest CI44351538977 firstattempt SUCCESS and all exact-head gates rechecked19:21:05UTC before guarded squash merge. Merged crates/tools match reviewed head; PR unwatched. Own first mainCI44379630740 attempt1 GREEN606wall/603charged/3queuecredit.
 - Previous merged: PR183 as08c4b999c23f9b516b3a942039ebc3c3f1a6dd04 from reviewed29a3317f. All5gates SUCCESS; first PR CI44349045277 GREEN594s wall, Windows589s<=660, Ubuntu291s/macOS464s. Fresh exactmaincd890750/CI44304025778 SUCCESS checked immediately before guarded merge. Resulting exact-main firstCI44351538977 GREEN641s wall/639charged/2queuecredit.
