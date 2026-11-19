@@ -109,6 +109,8 @@ pub(super) fn prepare(
     // Existing SQL locks are held throughout immutable inspection. The outer
     // owner stays held across their release and the current-store openers.
     let locks = store_locks(&owner)?;
+    #[cfg(test)]
+    tests::phase("before-inspection", &owner);
     let StateInspection {
         snapshot,
         applied,
@@ -128,6 +130,8 @@ pub(super) fn prepare(
     HostClock::new(inspected.committed_ms())
         .sample_ms()
         .map_err(|_| Refusal::Clock)?;
+    #[cfg(test)]
+    tests::phase("before-open", &owner);
     owner.recheck()?;
     drop(locks);
     #[cfg(test)]
@@ -154,6 +158,8 @@ pub(super) fn prepare(
     let sample = clock.sample_ms().map_err(|_| Refusal::Clock)?;
     drop(log);
     drop(sm);
+    #[cfg(test)]
+    tests::phase("before-publication", &owner);
     owner.recheck()?;
     Ok(Prepared {
         owner,
@@ -445,6 +451,8 @@ fn inspect_log_connection(
     let mut rows = stmt.query([])?;
     let mut positions = Vec::new();
     while let Some(row) = rows.next()? {
+        #[cfg(test)]
+        tests::scan_row();
         if positions.len() == MAX_LIVE {
             return Err(StoreError::Corrupt);
         }
@@ -1088,5 +1096,350 @@ mod tests {
             0,
             "invalid applied index reached mutable store opener"
         );
+    }
+    type PhaseHook = Box<dyn FnMut(&'static str, &Owner)>;
+    thread_local! {
+        static PHASE: std::cell::RefCell<Option<PhaseHook>> = const { std::cell::RefCell::new(None) };
+        static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(super) fn phase(stage: &'static str, owner: &Owner) {
+        PHASE.with(|h| {
+            if let Some(h) = h.borrow_mut().as_mut() {
+                h(stage, owner);
+            }
+        });
+    }
+    pub(super) fn scan_row() {
+        SCANNED.with(|n| n.set(n.get() + 1));
+    }
+    struct ResetPhase;
+    impl Drop for ResetPhase {
+        fn drop(&mut self) {
+            PHASE.with(|h| *h.borrow_mut() = None);
+        }
+    }
+    fn pos(index: u64) -> LogPos {
+        LogPos {
+            term: 1,
+            leader: 1,
+            index,
+        }
+    }
+    // Independent fixture encoder, separate from either validator's encoding.
+    fn checksummed(mut payload: Vec<u8>) -> Vec<u8> {
+        payload.extend(Sha256::digest(&payload));
+        payload
+    }
+    fn blank_row(index: u64) -> Vec<u8> {
+        let mut b = b"ARXLE2\0\0".to_vec();
+        for n in [1u64, 1, index] {
+            b.extend(n.to_be_bytes());
+        }
+        b.push(0);
+        checksummed(b)
+    }
+    fn assert_log_readback(l: &Layout, vote: Option<crate::cluster::log_store::StoredVote>) {
+        let dir = l.root.path().join("state");
+        let before = l.snapshot();
+        let inspected = inspect_log(&dir, [1; 16]).unwrap();
+        let mut log = VoteLogStore::open(&dir, [1; 16]).unwrap();
+        assert_eq!(log.vote().unwrap(), vote);
+        assert_eq!(inspected.has_vote, vote.is_some());
+        let state = log.log_state().unwrap();
+        assert_eq!(inspected.purged, state.purged);
+        assert_eq!(inspected.last, state.last);
+        let rows = log.entries(0, i64::MAX as u64 + 1, MAX_LIVE).unwrap();
+        assert_eq!(
+            inspected.rows,
+            rows.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+        );
+        let sm = StateStore::open(&dir, init()).unwrap();
+        assert_eq!(
+            validate_preflight(sm.applied(), &inspected).is_ok(),
+            preflight(&mut log, &sm).is_ok()
+        );
+        drop(sm);
+        drop(log);
+        assert_eq!(l.snapshot(), before);
+    }
+    #[test]
+    fn validator_current_vote_tail_purge_and_preflight_conformance() {
+        use crate::cluster::log_store::StoredVote;
+        let l = Layout::new();
+        initialized(&l);
+        let expected = identity(&l);
+        found(&l, &expected, 17);
+        let dir = l.root.path().join("state");
+        let vote = StoredVote {
+            term: 7,
+            node: 9,
+            committed: true,
+        };
+        {
+            let mut log = VoteLogStore::open(&dir, [1; 16]).unwrap();
+            log.save_vote(vote).unwrap();
+            log.append(&[(pos(1), Entry::Blank), (pos(2), Entry::Blank)])
+                .unwrap();
+        }
+        assert_log_readback(&l, Some(vote));
+        // Syntactically valid purge beyond applied: both preflights must refuse.
+        {
+            let mut log = VoteLogStore::open(&dir, [1; 16]).unwrap();
+            log.purge(pos(1)).unwrap();
+        }
+        assert_log_readback(&l, Some(vote));
+        assert!(validate_preflight(Some(pos(0)), &inspect_log(&dir, [1; 16]).unwrap()).is_err());
+        {
+            let mut sm = StateStore::open(&dir, init()).unwrap();
+            sm.apply(pos(1), &Entry::Blank).unwrap();
+            sm.apply(pos(2), &Entry::Blank).unwrap();
+        }
+        {
+            let mut log = VoteLogStore::open(&dir, [1; 16]).unwrap();
+            log.purge(pos(2)).unwrap();
+        }
+        assert_log_readback(&l, Some(vote));
+        assert!(inspect_log(&dir, [1; 16]).unwrap().rows.is_empty());
+        assert!(validate_preflight(Some(pos(2)), &inspect_log(&dir, [1; 16]).unwrap()).is_ok());
+    }
+    #[test]
+    fn validator_512_boundary_and_513_overflow_sentinel() {
+        let l = Layout::new();
+        initialized(&l);
+        let dir = l.root.path().join("state");
+        {
+            let mut log = VoteLogStore::open(&dir, [1; 16]).unwrap();
+            for start in (0..512).step_by(64) {
+                let entries = (start..start + 64)
+                    .map(|i| (pos(i), Entry::Blank))
+                    .collect::<Vec<_>>();
+                log.append(&entries).unwrap();
+            }
+            let before = l.snapshot();
+            assert!(matches!(
+                log.append(&[(pos(512), Entry::Blank)]),
+                Err(StoreError::Full)
+            ));
+            assert_eq!(l.snapshot(), before);
+            assert_eq!(log.live().unwrap(), 512);
+        }
+        assert_log_readback(&l, None);
+        // Keep valid 512-row metadata: the additional independently encoded row
+        // must hit the sentinel before tail-equality validation.
+        let db = Connection::open(dir.join("cluster-log.sqlite3")).unwrap();
+        db.execute("INSERT INTO log VALUES(512,?1)", [blank_row(512)])
+            .unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM log", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            513
+        );
+        drop(db);
+        let before = l.snapshot();
+        SCANNED.with(|n| n.set(0));
+        assert!(matches!(inspect_log(&dir, [1; 16]), Err(Refusal::Store)));
+        assert_eq!(SCANNED.with(|n| n.get()), 513, "sentinel must be reached");
+        assert_eq!(l.snapshot(), before);
+        assert!(matches!(
+            VoteLogStore::open(&dir, [1; 16]),
+            Err(StoreError::Corrupt)
+        ));
+        assert_eq!(l.snapshot(), before);
+    }
+    #[test]
+    fn validator_independent_checksummed_grammar_and_extra_rows_refuse_unchanged() {
+        for variant in [
+            "row-magic",
+            "row-tag",
+            "row-trailing",
+            "meta-trailing",
+            "vote-flag",
+            "negative",
+            "extra-row",
+            "extra-meta",
+        ] {
+            let l = Layout::new();
+            initialized(&l);
+            let expected = identity(&l);
+            found(&l, &expected, 17);
+            let dir = l.root.path().join("state");
+            let db = Connection::open(dir.join("cluster-log.sqlite3")).unwrap();
+            if variant == "negative" || variant == "extra-meta" {
+                // Preserve exact schema; inject CHECK violations. Raw validator
+                // call below bypasses quick_check and proves its own refusal.
+                db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+            }
+            match variant {
+                "negative" => {
+                    db.execute("INSERT INTO log VALUES(-1,?1)", [blank_row(0)])
+                        .unwrap();
+                }
+                "extra-row" => {
+                    db.execute("INSERT INTO log VALUES(1,?1)", [blank_row(1)])
+                        .unwrap();
+                }
+                "extra-meta" => {
+                    db.execute("INSERT INTO meta SELECT 2,blob FROM meta", [])
+                        .unwrap();
+                }
+                _ => {
+                    let meta = variant.starts_with("meta") || variant == "vote-flag";
+                    let mut b: Vec<u8> = db
+                        .query_row(
+                            if meta {
+                                "SELECT blob FROM meta"
+                            } else {
+                                "SELECT body FROM log"
+                            },
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    b.truncate(b.len() - 32);
+                    match variant {
+                        "row-magic" => b[0] ^= 1,
+                        "row-tag" => b[32] = 255,
+                        "vote-flag" => b[26] = 2,
+                        _ => b.push(0),
+                    }
+                    let b = checksummed(b);
+                    assert!(
+                        reader(&b, if meta { 256 } else { 4163 }).is_ok(),
+                        "valid checksum: {variant}"
+                    );
+                    db.execute(
+                        if meta {
+                            "UPDATE meta SET blob=?1"
+                        } else {
+                            "UPDATE log SET body=?1"
+                        },
+                        [b],
+                    )
+                    .unwrap();
+                }
+            }
+            drop(db);
+            let before = l.snapshot();
+            let db = Connection::open_with_flags(
+                dir.join("cluster-log.sqlite3"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    inspect_log_connection(&db, [1; 16]),
+                    Err(StoreError::Corrupt)
+                ),
+                "{variant}"
+            );
+            drop(db);
+            assert!(
+                matches!(
+                    prepare(l.plan("recover-founder"), Some(&expected), None, false),
+                    Err(Refusal::Store)
+                ),
+                "{variant}"
+            );
+            assert_eq!(l.snapshot(), before, "{variant}: prepare refusal");
+            assert!(
+                matches!(VoteLogStore::open(&dir, [1; 16]), Err(StoreError::Corrupt)),
+                "{variant}"
+            );
+            assert_eq!(l.snapshot(), before, "{variant}: current opener refusal");
+            eprintln!(
+                "case={variant} checksum-valid/raw-validator=Corrupt/prepare=Store/current-store=Corrupt unchanged"
+            );
+        }
+    }
+    #[test]
+    fn retained_identity_interstage_replacement_observations() {
+        use std::{cell::RefCell, rc::Rc};
+        for stage in ["before-inspection", "before-open", "before-publication"] {
+            let l = Rc::new(Layout::new());
+            initialized(&l);
+            let expected = identity(&l);
+            found(&l, &expected, 17);
+            let before = l.snapshot();
+            let observation = Rc::new(RefCell::new(None));
+            let visits = Rc::new(RefCell::new(Vec::new()));
+            let hook_l = l.clone();
+            let hook_observation = observation.clone();
+            let hook_visits = visits.clone();
+            PHASE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |actual, owner| {
+                    hook_visits.borrow_mut().push(actual);
+                    if actual != stage {
+                        return;
+                    }
+                    let path = owner.plan.state.join("cluster-log.sqlite3");
+                    let bytes = std::fs::read(&path).unwrap();
+                    // Outside state: unexpected directory entries cannot explain refusal.
+                    let old = hook_l.root.path().join("displaced.sqlite3");
+                    let rename = std::fs::rename(&path, &old);
+                    let replaced = rename.is_ok();
+                    if replaced {
+                        hook_l.write("state/cluster-log.sqlite3", &bytes);
+                        assert_eq!(std::fs::read(&old).unwrap(), bytes);
+                    } else {
+                        eprintln!(
+                            "stage={stage} OS-denied rename: {:?}",
+                            rename.unwrap_err().raw_os_error()
+                        );
+                    }
+                    let snapshot = hook_l.snapshot();
+                    assert_eq!(snapshot, before, "identical entries and bytes after hook");
+                    *hook_observation.borrow_mut() = Some((replaced, snapshot));
+                }))
+            });
+            let reset = ResetPhase;
+            let result = prepare(l.plan("recover-founder"), Some(&expected), None, false);
+            drop(reset);
+            let (replaced, after_hook) = observation
+                .borrow_mut()
+                .take()
+                .expect("requested stage reached");
+            assert_eq!(
+                l.snapshot(),
+                after_hook,
+                "{stage}: call changed files after hook"
+            );
+            #[cfg(unix)]
+            assert!(
+                replaced,
+                "Unix replacement required to qualify identity oracle"
+            );
+            if replaced {
+                assert!(
+                    matches!(result, Err(Refusal::Layout)),
+                    "{stage}: identity refusal required"
+                );
+                // before-inspection reaches inspection before the next recheck.
+                let last = if stage == "before-inspection" {
+                    "before-open"
+                } else {
+                    stage
+                };
+                assert_eq!(visits.borrow().last().copied(), Some(last));
+                eprintln!(
+                    "stage={stage} actual-replacement=true result=Layout after-hook=after-call"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{stage}: denied mutation preserves valid preparation"
+                );
+                eprintln!(
+                    "stage={stage} actual-replacement=false result=Ok OS-prevention-only after-hook=after-call"
+                );
+            }
+            drop(result);
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(l.root.path().join("state/cluster-owner.lock"))
+                .unwrap();
+            f.try_lock().unwrap();
+        }
     }
 }
