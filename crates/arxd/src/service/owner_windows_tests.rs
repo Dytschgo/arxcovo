@@ -14,9 +14,12 @@ impl Fixture {
     }
 }
 fn fixture() -> (Fixture, ProtectionPolicy) {
+    fixture_in("owner")
+}
+fn fixture_in(leaf: &str) -> (Fixture, ProtectionPolicy) {
     let serial = FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let outer = tempfile::tempdir().unwrap();
-    let dir = outer.path().join("owner");
+    let dir = outer.path().join(leaf);
     let policy = prepare(&dir);
     (
         Fixture {
@@ -155,6 +158,76 @@ fn n2_exact_hash_replace_and_conflict_cleanup() {
         std::fs::read(d.path().join("arxd.json")).unwrap(),
         b"second"
     );
+}
+/// The Win32 rename wrapper reads FileName to its NUL, so the terminator
+/// must lie inside the declared size for every
+/// allocation residue. Inspects the buffer only; no rename call is made.
+#[test]
+fn rename_info_terminates_name_inside_declared_size() {
+    let mut residues = Vec::new();
+    for pad in 1..=4 {
+        let path = PathBuf::from(format!(r"D:\a\{}\arxd.json", "x".repeat(pad)));
+        let name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        residues.push(name.len() % 4);
+        for flags in [0, RENAME_REPLACE_IF_EXISTS | RENAME_POSIX_SEMANTICS] {
+            let (buf, size) = rename_info(&path, flags);
+            let allocated = buf.len() * std::mem::size_of::<usize>();
+            // SAFETY: the whole zeroed Vec allocation, viewed as bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), allocated) };
+            let info = unsafe { &*buf.as_ptr().cast::<FILE_RENAME_INFO>() };
+            assert_eq!(unsafe { info.Anonymous.Flags }, flags);
+            assert!(info.RootDirectory.is_null());
+            assert_eq!(info.FileNameLength as usize, name.len() * 2);
+            let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+            let end = offset + name.len() * 2;
+            let text: Vec<u16> = bytes[offset..end]
+                .chunks_exact(2)
+                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(text, name);
+            assert!(size <= allocated, "declared size inside allocation");
+            assert!(
+                size >= end + 2,
+                "terminator outside declared size: residue {}",
+                name.len() % 4
+            );
+            assert_eq!(bytes.get(end..end + 2), Some(&[0u8, 0][..]));
+        }
+    }
+    residues.sort();
+    assert_eq!(residues, [0, 1, 2, 3]);
+}
+/// Production create and exact-hash replace for every target-length residue.
+/// Before the terminator fix, residue 2 left no zero after the name inside
+/// the allocation; both hosted N1/N2 targets had that layout.
+#[test]
+fn publish_is_exact_for_every_target_length_residue() {
+    let mut residues = Vec::new();
+    for pad in 0..4 {
+        let (d, s) = {
+            let (d, p) = fixture_in(&format!("owner{}", "x".repeat(pad)));
+            let s = session(d.path(), p).unwrap();
+            (d, s)
+        };
+        let target = d.path().join("arxd.json");
+        residues.push(target.as_os_str().encode_wide().count() % 4);
+        let staged = s.stage("arxd.json", b"first", None, 100).unwrap();
+        s.publish(staged).unwrap();
+        let staged = s
+            .stage("arxd.json", b"second", Some(digest(b"first")), 100)
+            .unwrap();
+        s.publish(staged).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert!(!d.path().join("arxd.json.staging").exists());
+        let mut names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["arxd.json", "owner.lock"]);
+    }
+    residues.sort();
+    assert_eq!(residues, [0, 1, 2, 3]);
 }
 #[test]
 fn same_bytes_target_swap_conflicts_before_publication() {
