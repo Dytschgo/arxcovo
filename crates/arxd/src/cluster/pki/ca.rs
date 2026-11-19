@@ -11,6 +11,8 @@ pub struct ClusterCa {
     not_after_s: i64,
     #[cfg(test)]
     pub(crate) signs: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    conversion_attempts: std::sync::atomic::AtomicUsize,
 }
 impl ClusterCa {
     #[cfg(test)]
@@ -40,6 +42,7 @@ impl ClusterCa {
             cert_der,
             not_after_s: nb + validity_s,
             signs: std::sync::atomic::AtomicUsize::new(0),
+            conversion_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn leaf_validity(now_ms: u64) -> Result<(i64, i64), IssueError> {
@@ -80,6 +83,9 @@ impl ClusterCa {
         getrandom::fill(&mut serial).map_err(|_| IssueError::Sign)?;
         serial[0] = (serial[0] & 0x7f) | 0x40;
         let mut params = CertificateParams::default();
+        #[cfg(test)]
+        self.conversion_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         params.not_before =
             OffsetDateTime::from_unix_timestamp(nb).map_err(|_| IssueError::Sign)?;
         params.not_after = OffsetDateTime::from_unix_timestamp(na).map_err(|_| IssueError::Sign)?;
@@ -113,4 +119,85 @@ impl ClusterCa {
 pub fn fingerprint_of(der: &[u8]) -> crate::cluster::enrollment::CaFingerprint {
     use sha2::{Digest, Sha256};
     Sha256::digest(der).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::consensus::issue::test_ticket;
+    use std::sync::atomic::Ordering;
+    use x509_parser::parse_x509_certificate;
+
+    const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn sentinel_finite_ca_refuses_before_signing() {
+        let key = KeyPair::generate().unwrap();
+        let request = CertificateParams::default()
+            .serialize_request(&key)
+            .unwrap();
+        let csr = ProvenCsr::parse(request.der()).unwrap();
+        let ticket = test_ticket(csr.digest());
+        let ca = ClusterCa::ephemeral([1; 16], NOW);
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 0);
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 0);
+        assert!(!ca.leaf_fits(u64::MAX));
+        assert_eq!(
+            ca.sign_leaf(&ticket, &csr, u64::MAX),
+            Err(IssueError::CaExpiring)
+        );
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 0);
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 0);
+
+        let der = ca.sign_leaf(&ticket, &csr, NOW).unwrap();
+        assert!(!der.is_empty());
+        let (remaining, _) = parse_x509_certificate(&der).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 1);
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ca.sign_leaf(&ticket, &csr, u64::MAX),
+            Err(IssueError::CaExpiring)
+        );
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 1);
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sentinel_conversion_refuses_before_signing() {
+        let key = KeyPair::generate().unwrap();
+        let request = CertificateParams::default()
+            .serialize_request(&key)
+            .unwrap();
+        let csr = ProvenCsr::parse(request.der()).unwrap();
+        let ticket = test_ticket(csr.digest());
+        let mut ca = ClusterCa::ephemeral([1; 16], NOW);
+        // Private, deliberately inconsistent branch fixture: its real issuer
+        // and certificate remain finite. This is never a production CA policy.
+        ca.not_after_s = i64::MAX;
+        assert!(ca.leaf_fits(u64::MAX));
+        let seconds = i64::try_from(u64::MAX / 1000).unwrap();
+        assert_eq!(seconds, 18_446_744_073_709_551);
+        let not_before = seconds.checked_sub(60).unwrap();
+        let not_after = not_before.checked_add(2_592_000).unwrap();
+        assert_eq!(not_before, 18_446_744_073_709_491);
+        assert_eq!(not_after, 18_446_744_076_301_491);
+        assert!(OffsetDateTime::from_unix_timestamp(not_before).is_err());
+        assert!(OffsetDateTime::from_unix_timestamp(not_after).is_err());
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 0);
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(ca.sign_leaf(&ticket, &csr, u64::MAX), Err(IssueError::Sign));
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 0);
+
+        let der = ca.sign_leaf(&ticket, &csr, NOW).unwrap();
+        assert!(!der.is_empty());
+        let (remaining, _) = parse_x509_certificate(&der).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 1);
+        assert_eq!(ca.sign_leaf(&ticket, &csr, u64::MAX), Err(IssueError::Sign));
+        assert_eq!(ca.conversion_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(ca.signs.load(Ordering::SeqCst), 1);
+    }
 }
