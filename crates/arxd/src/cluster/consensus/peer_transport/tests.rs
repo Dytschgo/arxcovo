@@ -2360,9 +2360,19 @@ fn learner_evidence_root(
 ) -> Result<std::path::PathBuf, &'static str> {
     // Local commands set TMP/TEMP on D:. Hosted runners use their private temp.
     // Never fall back after a malformed explicit root.
-    let root = requested
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| private_temp().keep());
+    let root = match requested {
+        Some(root) => std::path::PathBuf::from(root),
+        None => {
+            let temp = std::env::temp_dir()
+                .canonicalize()
+                .map_err(|_| "observer temp root")?;
+            tempfile::Builder::new()
+                .prefix("arx-m3-evidence-")
+                .tempdir_in(temp)
+                .map_err(|_| "observer private directory")?
+                .keep()
+        }
+    };
     if !root.is_absolute() || !root.is_dir() {
         return Err("unsafe observer root");
     }
