@@ -2218,6 +2218,7 @@ fn seed_learner(
     f: &Fixture,
     m: &super::super::MembershipBlob,
     tail: Option<LogPos>,
+    releases: &mut Vec<crate::cluster::state_store::Released>,
 ) -> Result<Vec<u8>, &'static str> {
     use super::super::VoteLogStore;
     let init = Init {
@@ -2237,6 +2238,7 @@ fn seed_learner(
     };
     let l1 = LogPos { index: 1, ..l0 };
     let mut sm = StateStore::open(dir, init).map_err(|_| "seed sm open")?;
+    releases.push(sm.released());
     if !matches!(
         sm.apply(l0, &e),
         Ok(Some(Outcome::Founded { replay: false }))
@@ -2254,6 +2256,7 @@ fn seed_learner(
     let sr = sm.released();
     let mut log = VoteLogStore::open(dir, CLUSTER).map_err(|_| "seed log open")?;
     let lr = log.released();
+    releases.push(lr.clone());
     log.append(&rows).map_err(|_| "seed log append")?;
     let v = StoredVote {
         term: if tail.is_some() { 3 } else { 2 },
@@ -2282,6 +2285,10 @@ static LEARNER_EVIDENCE: Mutex<BTreeMap<u8, Vec<u8>>> = Mutex::new(BTreeMap::new
 static LEARNER_RETAINED: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
 #[derive(Default, Debug, serde::Serialize)]
 struct LearnerEvidence {
+    #[serde(skip)]
+    output: Option<std::path::PathBuf>,
+    setup: Option<SetupEvidence>,
+    artifact_error: Option<&'static str>,
     first: Option<&'static str>,
     startup: Option<&'static str>,
     body: Option<Result<(), &'static str>>,
@@ -2294,37 +2301,116 @@ struct LearnerEvidence {
     readback_released: Option<(bool, bool, bool)>,
     weak_refused: Option<bool>,
 }
+#[derive(Debug, serde::Serialize)]
+struct SetupEvidence {
+    outcome: Result<(), &'static str>,
+    dropped_reservations: Option<usize>,
+    registered_store_releases: Vec<bool>,
+    reopen: &'static str,
+    unregistered_resources: &'static str,
+}
+type SetupAttempt<T> = Result<Result<T, &'static str>, Box<dyn std::any::Any + Send>>;
+fn finish_learner_setup<T>(
+    case: u8,
+    evidence: &mut LearnerEvidence,
+    attempt: SetupAttempt<T>,
+    reservations: usize,
+    releases: &[crate::cluster::state_store::Released],
+) -> Result<T, &'static str> {
+    let result = attempt.unwrap_or(Err("setup panic; unregistered cleanup unconfirmed"));
+    evidence.setup = Some(SetupEvidence {
+        outcome: result.as_ref().map(|_| ()).map_err(|e| *e),
+        dropped_reservations: result.is_err().then_some(reservations),
+        registered_store_releases: releases.iter().map(|r| r.is_set()).collect(),
+        reopen: if result.is_err() {
+            "not attempted: seed may be partial; reopen unconfirmed"
+        } else {
+            "deferred to normal joined teardown"
+        },
+        unregistered_resources: if result.is_err() {
+            "setup future dropped; unregistered release unconfirmed"
+        } else {
+            "setup owners transferred to supervised history"
+        },
+    });
+    if let Err(reason) = &result {
+        evidence.fail(reason);
+    }
+    evidence.checkpoint(case);
+    match result {
+        Err(_) => Err(evidence.first.unwrap()),
+        Ok(value) if evidence.first.is_some() => {
+            // An unusable evidence destination must stop before Engine startup.
+            drop(value);
+            let reason = evidence.first.unwrap();
+            let setup = evidence.setup.as_mut().unwrap();
+            setup.outcome = Err(reason);
+            setup.dropped_reservations = Some(reservations);
+            setup.registered_store_releases = releases.iter().map(|r| r.is_set()).collect();
+            setup.reopen = "not attempted: evidence failed; reopen unconfirmed";
+            setup.unregistered_resources = "setup owners dropped before Engine startup";
+            evidence.checkpoint(case);
+            Err(reason)
+        }
+        Ok(value) => Ok(value),
+    }
+}
+fn learner_evidence_root(
+    requested: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf, &'static str> {
+    // Local commands set TMP/TEMP on D:. Hosted runners use their private temp.
+    // Never fall back after a malformed explicit root.
+    let root = requested
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| private_temp().keep());
+    if !root.is_absolute() || !root.is_dir() {
+        return Err("unsafe observer root");
+    }
+    for ancestor in root.ancestors() {
+        if observer_reparse(ancestor)? {
+            return Err("observer reparse point");
+        }
+    }
+    Ok(root)
+}
 impl LearnerEvidence {
     fn checkpoint(&mut self, case: u8) {
-        if self.save(case).is_err() {
+        if self.output.is_none() {
+            match learner_evidence_root(std::env::var_os("ARX_OBSERVER_ROOT")) {
+                Ok(root) => self.output = Some(root),
+                Err(reason) => self.fail(reason),
+            }
+        }
+        if let Err(reason) = self.save(case) {
+            self.artifact_error = Some(reason);
             self.fail("evidence artifact write failed");
         }
-        // Even a filesystem failure cannot cancel cleanup or destroy its report.
-        LEARNER_EVIDENCE.lock().unwrap().insert(
-            case,
-            serde_json::to_vec(self).expect("bounded static evidence"),
-        );
+        let bytes = serde_json::to_vec(self).expect("bounded static evidence");
+        // Failure evidence survives artifact errors in memory AND captured logs.
+        if self.first.is_some() {
+            eprintln!("ARX learner evidence: {}", String::from_utf8_lossy(&bytes));
+        }
+        LEARNER_EVIDENCE.lock().unwrap().insert(case, bytes);
     }
     fn fail(&mut self, reason: &'static str) {
         self.first.get_or_insert(reason);
     }
     fn save(&self, case: u8) -> Result<(), &'static str> {
-        let root = std::env::var("ARX_OBSERVER_ROOT").map_err(|_| "observer root")?;
-        let path = std::path::Path::new(&root);
-        if !path.is_absolute() || !root.replace('\\', "/").starts_with("D:/Temp/arx-m3-") {
-            return Err("unsafe observer root");
-        }
-        for ancestor in path.ancestors() {
+        let root = self.output.as_ref().ok_or("observer root")?;
+        for ancestor in root.ancestors() {
             if observer_reparse(ancestor)? {
                 return Err("observer reparse point");
             }
         }
-        let destination = path.join(format!("learner-{case}-evidence.json"));
-        if destination.exists() && observer_reparse(&destination)? {
-            return Err("evidence reparse point");
+        let destination = root.join(format!("learner-{case}-evidence.json"));
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) if observer_reparse(&destination)? => return Err("evidence reparse point"),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err("evidence metadata"),
         }
         std::fs::write(
-            path.join(format!("learner-{case}-evidence.json")),
+            destination,
             serde_json::to_vec_pretty(self).map_err(|_| "evidence encode")?,
         )
         .map_err(|_| "evidence write")
@@ -2349,17 +2435,7 @@ async fn supervised_learner_once(case: u8) -> Result<(), &'static str> {
             return Err("once-only supervisor full");
         }
         let worker = Arc::new(tokio::sync::Mutex::new(tokio::spawn(async move {
-            let result = learner_once(case).await;
-            // A setup error also survives in bounded terminal evidence.
-            let root = std::env::var("ARX_OBSERVER_ROOT").unwrap_or_default();
-            if root == "D:/Temp/arx-m3-rpc-review-corrections-v1" {
-                let destination =
-                    std::path::Path::new(&root).join(format!("learner-{case}-terminal.json"));
-                if !destination.exists() || observer_reparse(&destination) == Ok(false) {
-                    let _ = std::fs::write(destination, serde_json::to_vec(&result).unwrap());
-                }
-            }
-            result
+            learner_once(case).await
         })));
         workers.push(worker.clone());
         worker
@@ -2376,83 +2452,147 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
     use openraft::network::{NetSnapshot, NetVote, RaftNetworkFactory};
     let mut evidence = LearnerEvidence::default();
     evidence.checkpoint(case);
-    let mut f = Fixture::new();
-    let port = 43181 + u16::from(case) * 2;
-    let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|_| "address")?;
-    let ra: SocketAddr = format!("127.0.0.1:{}", port + 1)
-        .parse()
-        .map_err(|_| "address")?;
-    let sl = TcpListener::bind(sa)
-        .await
-        .map_err(|_| "sender reservation")?;
-    let rl = TcpListener::bind(ra)
-        .await
-        .map_err(|_| "receiver reservation")?;
-    if sl.local_addr().map_err(|_| "sender address")? != sa
-        || rl.local_addr().map_err(|_| "receiver address")? != ra
-    {
-        return Err("reservation identity");
-    }
-    let m = MembershipBlob::new(
-        WireMembership::new(
-            vec![std::collections::BTreeSet::from([1])],
-            BTreeMap::from([(1, sa.to_string()), (2, ra.to_string())]),
+    let mut reservations = 0;
+    let mut setup_releases = Vec::new();
+    // Every fallible pre-Engine step is in one scope. Errors and unwinding drop
+    // its sockets/stores before the terminal checkpoint observes registered acks.
+    let setup = std::panic::AssertUnwindSafe(async {
+        let mut f = Fixture::new();
+        setup_releases.push(
+            f.sm.0
+                .lock()
+                .map_err(|_| "fixture release observer")?
+                .released(),
+        );
+        let port = 43181 + u16::from(case) * 2;
+        let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|_| "address")?;
+        let ra: SocketAddr = format!("127.0.0.1:{}", port + 1)
+            .parse()
+            .map_err(|_| "address")?;
+        let sl = TcpListener::bind(sa)
+            .await
+            .map_err(|_| "sender reservation")?;
+        reservations += 1;
+        let rl = TcpListener::bind(ra)
+            .await
+            .map_err(|_| "receiver reservation")?;
+        reservations += 1;
+        if sl.local_addr().map_err(|_| "sender address")? != sa
+            || rl.local_addr().map_err(|_| "receiver address")? != ra
+        {
+            return Err("reservation identity");
+        }
+        let m = MembershipBlob::new(
+            WireMembership::new(
+                vec![std::collections::BTreeSet::from([1])],
+                BTreeMap::from([(1, sa.to_string()), (2, ra.to_string())]),
+            )
+            .map_err(|_| "membership")?
+            .encode()
+            .map_err(|_| "membership encoding")?,
         )
-        .map_err(|_| "membership")?
-        .encode()
-        .map_err(|_| "membership encoding")?,
-    )
-    .map_err(|_| "membership bounds")?;
-    let sd = private_temp().keep();
-    let rd = private_temp().keep();
-    let original = seed_learner(&rd, &f, &m, None)?;
-    let sender_original = seed_learner(&sd, &f, &m, None)?;
-    let donor_snapshot = if case == 3 {
-        let donor = private_temp().keep();
-        Some(seed_learner(
-            &donor,
-            &f,
-            &m,
-            Some(LogPos {
-                term: 1,
-                leader: 1,
-                index: 2,
-            }),
-        )?)
-    } else {
-        None
-    };
-    let init = Init {
-        cluster: CLUSTER,
-        first_free: node(3),
-    };
-    f.sm = SmAdapter(Arc::new(Mutex::new(
-        StateStore::open(&sd, init).map_err(|_| "sender reopen")?,
-    )));
-    let mut original_enrollment = Vec::new();
-    crate::cluster::enrollment::codec::encode(
-        f.sm.0.lock().map_err(|_| "sender enrollment lock")?.state(),
-        &mut original_enrollment,
-    );
-    let sender_release = f.sm.0.lock().map_err(|_| "sender lock")?.released();
-    let sender_weak = Arc::downgrade(&f.sm.0);
-    let credentials = |identity: &Identity| Credentials {
-        root: f.root.clone(),
-        leaf: identity.cert.clone(),
-        key: identity.private_key(),
-        time: Arc::new(pki::FixedTime(1001)),
-    };
-    let (mut sender, mut sf) = TransportOwner::pending(CLUSTER, node(1), credentials(&f.client));
-    sf.loopback = true;
-    let (mut receiver, mut rf) = TransportOwner::pending(CLUSTER, node(2), credentials(&f.server));
-    rf.loopback = true;
-    let mut pending = sf
-        .new_client(2, &openraft::BasicNode::new(ra.to_string()))
-        .await;
-    let pending_refused = pending
-        .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
-        .await
-        .is_err();
+        .map_err(|_| "membership bounds")?;
+        let sd = private_temp().keep();
+        let rd = private_temp().keep();
+        let original = seed_learner(&rd, &f, &m, None, &mut setup_releases)?;
+        let sender_original = seed_learner(&sd, &f, &m, None, &mut setup_releases)?;
+        let donor_snapshot = if case == 3 {
+            let donor = private_temp().keep();
+            Some(seed_learner(
+                &donor,
+                &f,
+                &m,
+                Some(LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 2,
+                }),
+                &mut setup_releases,
+            )?)
+        } else {
+            None
+        };
+        let init = Init {
+            cluster: CLUSTER,
+            first_free: node(3),
+        };
+        f.sm = SmAdapter(Arc::new(Mutex::new(
+            StateStore::open(&sd, init).map_err(|_| "sender reopen")?,
+        )));
+        let mut original_enrollment = Vec::new();
+        crate::cluster::enrollment::codec::encode(
+            f.sm.0.lock().map_err(|_| "sender enrollment lock")?.state(),
+            &mut original_enrollment,
+        );
+        let sender_release = f.sm.0.lock().map_err(|_| "sender lock")?.released();
+        setup_releases.push(sender_release.clone());
+        let sender_weak = Arc::downgrade(&f.sm.0);
+        let credentials = |identity: &Identity| Credentials {
+            root: f.root.clone(),
+            leaf: identity.cert.clone(),
+            key: identity.private_key(),
+            time: Arc::new(pki::FixedTime(1001)),
+        };
+        let (sender, mut sf) = TransportOwner::pending(CLUSTER, node(1), credentials(&f.client));
+        sf.loopback = true;
+        let (receiver, mut rf) = TransportOwner::pending(CLUSTER, node(2), credentials(&f.server));
+        rf.loopback = true;
+        let mut pending = sf
+            .new_client(2, &openraft::BasicNode::new(ra.to_string()))
+            .await;
+        let pending_refused = pending
+            .pre_vote(ballot_request(), RPCOption::new(Duration::from_secs(4)))
+            .await
+            .is_err();
+        Ok((
+            f,
+            sa,
+            ra,
+            sl,
+            rl,
+            m,
+            sd,
+            rd,
+            original,
+            sender_original,
+            donor_snapshot,
+            init,
+            original_enrollment,
+            sender_release,
+            sender_weak,
+            sender,
+            sf,
+            receiver,
+            rf,
+            pending,
+            pending_refused,
+        ))
+    })
+    .catch_unwind()
+    .await;
+    let (
+        f,
+        sa,
+        ra,
+        sl,
+        rl,
+        m,
+        sd,
+        rd,
+        original,
+        sender_original,
+        donor_snapshot,
+        init,
+        original_enrollment,
+        sender_release,
+        sender_weak,
+        mut sender,
+        mut sf,
+        mut receiver,
+        rf,
+        mut pending,
+        pending_refused,
+    ) = finish_learner_setup(case, &mut evidence, setup, reservations, &setup_releases)?;
     let rdir = rd.clone();
     let mut startup =
         tokio::spawn(
@@ -3256,6 +3396,116 @@ fn rpc_evidence_keeps_first_failure_and_retained_ownership() {
     let retained = LEARNER_RETAINED.lock().unwrap().pop().unwrap();
     assert_eq!(weak.strong_count(), 1);
     drop(retained);
+    assert_eq!(weak.strong_count(), 0);
+}
+#[tokio::test]
+async fn rpc_setup_error_and_panic_preserve_cleanup_evidence() {
+    use futures_util::FutureExt;
+    for panic in [false, true] {
+        let dir = private_temp();
+        let output = learner_evidence_root(None).unwrap();
+        let mut evidence = LearnerEvidence {
+            output: Some(output.clone()),
+            ..Default::default()
+        };
+        let init = Init {
+            cluster: CLUSTER,
+            first_free: node(3),
+        };
+        let mut releases = Vec::new();
+        let mut reservations = 0;
+        let mut address = None;
+        let attempt: SetupAttempt<()> = std::panic::AssertUnwindSafe(async {
+            let store = StateStore::open(dir.path(), init).unwrap();
+            releases.push(store.released());
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bound = socket.local_addr().unwrap();
+            address = Some(bound);
+            reservations += 1;
+            if panic {
+                panic!("controlled setup panic, no Engine");
+            }
+            // A genuine second reservation failure after a store and socket exist.
+            TcpListener::bind(bound)
+                .await
+                .map_err(|_| "receiver reservation")?;
+            Err("unexpected second bind")
+        })
+        .catch_unwind()
+        .await;
+        let result = finish_learner_setup(0, &mut evidence, attempt, reservations, &releases);
+        let bytes = std::fs::read(output.join("learner-0-evidence.json")).unwrap();
+        let recorded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let expected = if panic {
+            "setup panic; unregistered cleanup unconfirmed"
+        } else {
+            "receiver reservation"
+        };
+        // Independent safe cleanup observations; never start or retry an Engine.
+        let rebound = TcpListener::bind(address.unwrap()).await;
+        let reopened = StateStore::open(dir.path(), init).unwrap();
+        let released = reopened.released();
+        drop(reopened);
+        let cleanup = rebound.is_ok() && released.is_set() && releases.iter().all(|r| r.is_set());
+        drop(rebound);
+        assert!(cleanup);
+        assert_eq!(result, Err(expected));
+        assert_eq!(recorded["first"], expected);
+        assert_eq!(recorded["setup"]["outcome"]["Err"], expected);
+        assert_eq!(recorded["setup"]["dropped_reservations"], 1);
+        assert_eq!(
+            recorded["setup"]["registered_store_releases"],
+            serde_json::json!([true])
+        );
+        assert!(
+            recorded["setup"]["reopen"]
+                .as_str()
+                .unwrap()
+                .contains("unconfirmed")
+        );
+    }
+}
+#[test]
+fn rpc_evidence_portable_roots_and_write_failure_preserve_primary() {
+    let fallback = learner_evidence_root(None).unwrap();
+    assert!(fallback.is_absolute() && fallback.is_dir());
+    assert!(learner_evidence_root(Some("relative-root".into())).is_err());
+    assert_eq!(
+        learner_evidence_root(Some(fallback.clone().into_os_string())).unwrap(),
+        fallback
+    );
+    let mut evidence = LearnerEvidence {
+        output: Some(fallback.join("missing")),
+        ..Default::default()
+    };
+    let attempt: SetupAttempt<()> = Ok(Err("setup original"));
+    assert_eq!(
+        finish_learner_setup(1, &mut evidence, attempt, 0, &[]),
+        Err("setup original")
+    );
+    let bytes = LEARNER_EVIDENCE.lock().unwrap().get(&1).unwrap().clone();
+    let recorded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(recorded["first"], "setup original");
+    assert!(!recorded["artifact_error"].is_null());
+    assert_eq!(recorded["setup"]["outcome"]["Err"], "setup original");
+    // If setup succeeds but evidence cannot be written, its owners are dropped
+    // and startup is refused, with no discarded first failure.
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let attempt = Ok(Ok(owner));
+    assert!(
+        finish_learner_setup(
+            2,
+            &mut LearnerEvidence {
+                output: Some(fallback.join("missing")),
+                ..Default::default()
+            },
+            attempt,
+            0,
+            &[]
+        )
+        .is_err()
+    );
     assert_eq!(weak.strong_count(), 0);
 }
 async fn recording_call(mut c: AppendClient, method: u8, s: Snapshot) -> bool {
