@@ -230,15 +230,21 @@ wrote narrow test-only contract SHA78c651fc at `D:/Temp/arx-founder-ca-oracle-v1
 Only prospective source path pki/ca.rs, cfg(test) additions: direct finite-CA and
 timestamp-conversion no-sign checks with valid-time controls. Existing sealed
 IssueTicket fixture already used by PKI tests can avoid touching frozen founder
-files; an independent review must settle that generic CA-oracle substitution.
+files; independent review accepted that generic CA-oracle substitution.
 No new subject implementer, factory, production API or sealing facade. ST1/SP2
 operational prerequisites remain deferred, not claimed closed. Independent
-Sol6.1/high scope review is active at `D:/Temp/arx-founder-ca-oracle-review-v1`.
+Sol6.1/high scope review GO, Standards0/Spec0, at `D:/Temp/arx-founder-ca-oracle-review-v1`.
 
 New branch `work/m3-ca-sentinel-oracle` starts from freshly reverified green main
 9b4c/first44443788836. Seven applicable unpublished docs/history paths carried from
-preserved checkpointfebba988; no duplicate Rust. No new test/source execution or
-PR yet. Existing owner authority covers ordinary continuation after technical
+preserved checkpointfebba988; no duplicate Rust. Coordinator Sol6.1/high completed
+source-only99f892e8 in pki/ca.rs:87additions, all cfg(test). Both exact tests PASS
+first execution; valid-time controls produce fully consumed parsed DER, sentinel
+refuses before signing on finite and forced-conversion paths. Existing static
+guard9/9, final fmt and all-target Clippy PASS. Initial fmt failure (two line
+wraps, no test execution) retained. Exact-source review/hosted acceptance pending;
+[evidence](evidence/m3-ca-sentinel-oracle.md). No PR yet.
+Existing owner authority covers ordinary continuation after technical
 scope gates; exhausted counters and all runtime holds remain unchanged.
 [PR186](https://github.com/Dytschgo/arxcovo/pull/186) merged as `eea7af57` from exact
 published `0a323793986d705785eff7e409cc85a75cce2836`, base verified main `e2908c98`.
@@ -275,7 +281,7 @@ existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: M2 native host setup and owner OAuth remain pending; Linux A7/A11/A12 hardware pending. PR182 allocation recovery completed under standing authority; no further approval block. M3 full peer RPC/startup/custody/admission/container acceptance remain to implement/verify after main health. Exhausted engineSol3/3/historyOpus0/2 unchanged; hardware **unverified on real hardware**.
-- Active work: PR187 and its own exact-main first CI are green. Full dormant bridge source slice NO-GO; coordinator narrowed next scope to direct CA no-sign tests only, under independent Sol6.1/high contract review. No new source/runtime has run. Owner-bound handoff, qualified custody/publication and live startup/admission/container route remain open. No approval loop or exhausted counter reset.
+- Active work: PR187 and its own exact-main first CI are green. Full dormant bridge source slice NO-GO; independently accepted narrow CA test scope implemented99f892e8,2exacttests/staticguard/fmt/ClippyPASS, exact-source review and normal hosted acceptance pending. Unreviewed retained-owner handoff draft identifies Engine/store binding gaps; qualified custody/publication and live startup/admission/container route remain open. No approval loop or exhausted counter reset.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
