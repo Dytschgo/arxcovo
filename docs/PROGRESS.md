@@ -1,6 +1,69 @@
 # Arxcovo progress
 
 ## Main CI health and merge prerequisite
+**Coordinator handoff (2026-11-19, owner routing update).** Sol coordinator
+threads (6.1, then a short-lived 6.2 thread) were rejected by the provider on
+every turn. The owner moved coordination to a fresh thread on Claude Opus 5.5,
+high effort. Otherwise AGENTS.md routing stands: Sol for engineering and
+reviews where the provider allows it, Claude for UI, an independent reviewer
+for every PR, at most two builders and one reviewer. Only the coordinator
+merges after all required gates pass.
+**Owner fallback chain (2026-11-19):** when the provider blocks an agent or it
+fails, use the next model in Sol → Opus → Fable → Astra 6.2 → Grok → Muse →
+Gemini Neon, and record the substitution. This does not reset attempt
+counters, and a reviewer must still be independent of the builder (Opus built
+the PR190 rename commits, so Opus may not review them).
+
+Live main is still `8bd12b7f`; CI `44450232774` attempt 1 is green and PR188 is
+the last merge. PR189 at `d4c89fd0` and PR190 at `8216987b` are open with
+failed Windows Rust jobs and failed verify gates. The Opus 5.5/high recovery
+builder left `8275376d` (tracing), `2d88b3b7` (rename buffer extraction) and
+`c9e18783` (rename target termination) intact on the local PR190 branch.
+The builder reports a local buffer regression failure before the fix, then 27
+owner-file tests and 265 service tests passing after it. Hosted confirmation is
+pending. Independent GPT-6.1 Sol/high read-only review of the three pinned
+commits (launched by the failed 6.2 coordinator, completed 18:43 UTC): source
+GO for the termination repair, publication HOLD until a diagnostic-free
+main-based fix commit exists. Standards 1 and Spec 1 nonblocking (diagnostic
+wrappers should not ship; `site()` last-error values may be stale). Hosted
+cause remains UNKNOWN with a strongly compatible residue-2 length hypothesis.
+Report `D:/Temp/arx-owner-rename-sol-review/review.md`, SHA256
+`911ce6cf205160610ac1045a63e68f8906e40448ada2ecbd06b49949c780f3e8` (verified
+by coordinator). Next: Sol builder ports extraction + termination + regression
+tests onto main without 8275376d's diagnostics, then exact-head review, PR,
+normal CI, merge, then PR190 integration under its preserved workflow.
+Main and PR190 have identical pre-fix owner-file source. The
+council decision requires a proved shared fix to land on main first and then be
+verified under PR190 conditions. PR189 founder-deadline investigation follows on
+its own scope. Engine Sol 3/3 and historical Opus 0/2 remain unchanged.
+
+This PC is authorized for applicable M2 tests. The owner still owns the setup
+checklist and OAuth. M3 acceptance follows the
+[three-container plan](briefs/m3-three-container-acceptance.md) using real
+joining and failover over the network. M2 remains open and M3 acceptance is
+pending. Native and cluster paths beyond the recorded evidence are
+**unverified on real hardware**.
+
+**Owner-authorized Windows recovery council (2026-11-19).** Dylan superseded
+the diagnostic and fix stop for the Windows failures holding PR189 and PR190.
+Opus, Fable and Astra will propose and critique approaches before the
+coordinator assigns one builder. This is a scoped exception to normal model
+routing. Historical attempts remain recorded. The first round is read-only.
+The council will distinguish the founder deadline from the owner-file I/O
+failures and select a diagnostic that can distinguish causes before proposing
+a repair. Green required CI, independent review, and owner host and data
+boundaries still apply. Neither PR has merged. The prior blocked status below
+records the state before this instruction.
+Council discussion completed. Opus 5.5, Fable 5.2 and Astra 6.2 ran at high
+effort and critiqued each other's proposals. All three chose PR190 before
+PR189. Astra and Fable chose Opus as builder. Opus preferred Fable and a local
+rename-buffer probe. The coordinator selected Opus to capture the failing
+operation, its immediate native error and the fixture state. Fable downgraded
+the missing-terminator hypothesis because the code supplies the exact counted
+buffer size. Any fix will follow a discriminating observation. The founder
+deadline will be investigated separately. Proposals, critiques and decision
+are retained at `D:/Temp/arx-native-recovery-council/`.
+
 **Goal BLOCKED, 2026-11-19 09:48 UTC:** after three consecutive revalidated
 no-progress turns, the goal tool returned blocked for the unchanged full v1
 objective. PR189/190 native UNKNOWN holds still lack further diagnostic/fix/retry
