@@ -27,10 +27,12 @@ Exact maintained upstream hunks follow (no executable patch applicator):
 
 Unix native qualification additionally requires sizeof(void*)==8; architecture macros alone do not qualify x32/ILP32.
 
+Trusted Cargo invocations now preflight inherited/configured loader overrides. Only the exact DYLD_FALLBACK_LIBRARY_PATH key on the build-script macOS host is accepted inside the child guard, because Cargo sets host runtime search paths. This is not per-entry provenance or a loader sandbox. All static SQLite/ABI/VFS checks remain.
+
 ```diff
 --- upstream/build.rs
 +++ patched/build.rs
-@@ -1,3 +1,50 @@
+@@ -1,3 +1,54 @@
 +// ARXCOVO: this fork supports exactly the reviewed bundled configuration.
 +fn arxcovo_build_guard() {
 +    use std::collections::BTreeSet;
@@ -60,8 +62,10 @@ Unix native qualification additionally requires sizeof(void*)==8; architecture m
 +            println!("cargo:rerun-if-env-changed={prefix}_{name}");
 +        }
 +    }
-+    for (key, value) in env::vars_os() {
-+        let key = key.to_str().expect("non Unicode environment key").to_ascii_uppercase();
++    for (raw_key, value) in env::vars_os() {
++        let macos_cargo_fallback = cfg!(target_os = "macos")
++            && raw_key == std::ffi::OsStr::new("DYLD_FALLBACK_LIBRARY_PATH");
++        let key = raw_key.to_str().expect("non Unicode environment key").to_ascii_uppercase();
 +        let forbidden = key.contains("SQLITE") || key.contains("SQLCIPHER")
 +            || key.contains("CFLAGS") || key.contains("CPPFLAGS")
 +            || key.contains("CC_FORCE_DISABLE") || key.contains("CC_NO_DEFAULTS")
@@ -73,7 +77,9 @@ Unix native qualification additionally requires sizeof(void*)==8; architecture m
 +        let cargo_metadata = key.starts_with("CARGO_FEATURE_") || key=="CARGO_PKG_NAME"
 +            || key=="CARGO_MANIFEST_DIR" || key=="CARGO_MANIFEST_PATH";
 +        let empty_cargo_flags = key=="CARGO_ENCODED_RUSTFLAGS" && value.is_empty();
-+        assert!(!forbidden || cargo_metadata || empty_cargo_flags,
++        // Trusted invocations reject inherited/configured loader overrides first.
++        // Cargo itself adds this exact host-macOS variable; no provenance claim.
++        assert!(!forbidden || cargo_metadata || empty_cargo_flags || macos_cargo_fallback,
 +            "ARXCOVO unsupported build override: {key}");
 +    }
 +}
@@ -81,7 +87,7 @@ Unix native qualification additionally requires sizeof(void*)==8; architecture m
  use std::env;
  use std::path::Path;
  
-@@ -40,6 +87,7 @@
+@@ -40,6 +91,7 @@
  }
  
  fn main() {

@@ -118,8 +118,8 @@
   },
   "patched": {
     "build.rs": {
-      "sha256": "d79eba3dd2c3af0b9eddc3e486c9339c95e2db987d857e5c1edb3e3e582a5a00",
-      "bytes": 36151
+      "sha256": "1f233dee533454468155a90e9245b4a4363efb058b228a42981aff10283168b3",
+      "bytes": 36487
     },
     "sqlite3/sqlite3.c": {
       "sha256": "da4b7d20abad8139c9dd4344343770261dfb145d3a172b446a3dee128a78cf96",

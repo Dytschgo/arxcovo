@@ -47,13 +47,27 @@ def inventory(pins, observed):
     for name, original in pins['original'].items():
         require(observed[name] == pins['patched'].get(name, original), f'member mismatch: {name}')
 
-def configs(root):
+def loader_key(key):
+    # Match Rust's ASCII normalization, without widening the permitted child key.
+    upper = key.translate(str.maketrans('abcdefghijklmnopqrstuvwxyz',
+                                       'ABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+    return upper.startswith('DYLD_') or upper == 'LD_PRELOAD'
+
+def loader_environment(environment):
+    require(not any(loader_key(key) for key in environment), 'loader environment')
+
+def configs(root, *, loader=False):
     paths = [a / '.cargo' / name for a in [root,*root.parents] for name in ['config','config.toml']]
     require('CARGO_HOME' in os.environ, 'explicit CARGO_HOME required')
     paths += [Path(os.environ['CARGO_HOME'])/name for name in ['config','config.toml']]
     for p in paths:
         if p.exists():
             obj = tomllib.loads(read(p, 1_000_000).decode())
+            if loader:
+                require('include' not in obj, 'config includes unsupported')
+                entries = obj.get('env', {})
+                require(isinstance(entries, dict), 'invalid config environment')
+                loader_environment(entries)
             require(not any(k in obj for k in ['source','patch','replace']), f'Cargo substitution: {p}')
             for target in obj.get('target', {}).values():
                 require('sqlite3' not in target, f'links override: {p}')
@@ -63,11 +77,25 @@ def configs(root):
 
 def main():
     parser=argparse.ArgumentParser(__doc__)
-    parser.add_argument('--metadata', required=True, type=Path, help='fresh cargo metadata --locked --offline JSON')
-    parser.add_argument('--build-messages', required=True, type=Path, help='fresh cargo check --message-format=json output')
+    parser.add_argument('--check-loader-env', action='store_true', help='reject caller/config loader overrides before Cargo')
+    parser.add_argument('--metadata', type=Path, help='fresh cargo metadata --locked --offline JSON')
+    parser.add_argument('--build-messages', type=Path, help='fresh cargo check --message-format=json output')
     parser.add_argument('--self-test', action='store_true')
     args=parser.parse_args()
     root=Path(__file__).resolve().parent.parent
+    if args.check_loader_env:
+        if args.metadata or args.build_messages or args.self_test:
+            parser.error('loader preflight cannot be combined with full verification')
+        try:
+            loader_environment(os.environ)
+            configs(root, loader=True)
+        except (OSError, ValueError, TypeError, UnicodeError):
+            # Never expose inherited values, config contents or private paths.
+            raise SystemExit('Loader preflight refused inherited or configured overrides') from None
+        print('PASS: caller/config loader preflight; trusted Cargo may add host runtime paths')
+        return
+    if args.metadata is None or args.build_messages is None:
+        parser.error('full verification requires metadata and build messages')
     v=root/'vendor/libsqlite3-sys-0.35.0'
     pins=json.loads(read(v/'ARXCOVO-PINS.json',100_000))
     require(pins['archive_sha256']==UPSTREAM, 'archive checksum')

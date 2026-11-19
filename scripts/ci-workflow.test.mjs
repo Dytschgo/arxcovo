@@ -97,7 +97,13 @@ test('Rust retains every native, Python and package validation with exact comman
           }
           $metadata = Join-Path $proofRoot 'metadata.json'
           $messages = Join-Path $proofRoot 'build-messages.jsonl'
+          python -I -B -m unittest discover -s scripts -p 'test_bound_sqlite_loader.py'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo metadata --locked --format-version 1 > $metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --workspace --all-targets --locked --message-format=json > $messages
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -105,12 +111,33 @@ test('Rust retains every native, Python and package validation with exact comman
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-FileHash -Algorithm SHA256 -LiteralPath $metadata,$messages | Format-List
           rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo --version --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
-    'run: cargo clippy --workspace --all-targets --locked -- -D warnings',
+    `name: Preflight loader environment and lint Rust
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Read-only macOS stock-directory observations
         if: runner.os == 'macOS'
-        run: cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture`,
-    'run: cargo nextest run --workspace --locked',
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+    `name: Preflight loader environment and run workspace tests
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo nextest run --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
