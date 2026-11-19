@@ -69,7 +69,10 @@ def configs(root, *, loader=False):
                 require(isinstance(entries, dict), 'invalid config environment')
                 loader_environment(entries)
             require(not any(k in obj for k in ['source','patch','replace']), f'Cargo substitution: {p}')
-            for target in obj.get('target', {}).values():
+            targets = obj.get('target', {})
+            require(isinstance(targets, dict), 'invalid target table')
+            for target in targets.values():
+                require(isinstance(target, dict), 'invalid target entry')
                 require('sqlite3' not in target, f'links override: {p}')
     for k in os.environ:
         require(not k.startswith(('CARGO_SOURCE_', 'CARGO_PATCH_','CARGO_REPLACE_')),

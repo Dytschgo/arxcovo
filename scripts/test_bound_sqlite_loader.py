@@ -3,6 +3,8 @@ import importlib.util
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -65,6 +67,27 @@ class LoaderBoundary(unittest.TestCase):
     def test_benign_config_passes(self):
         for location in ['workspace', 'ancestor', 'home']:
             self.check_config(location, '[env]\nBENIGN={ value="ordinary", force=true }\n')
+            self.check_config(location, '[target.x86_64-pc-windows-msvc]\nlinker="ordinary"\n')
+
+    def test_malformed_target_cli_is_generic(self):
+        script = Path(__file__).with_name('check-bound-sqlite.py')
+        config = self.home / 'config.toml'
+        for text in ['target=[]\n', 'target="private-fixture-marker"\n',
+                     'target=42\n', '[target]\nnative=[]\n',
+                     '[target]\nnative="private-fixture-marker"\n']:
+            with self.subTest(text=text):
+                config.write_text(text, encoding='utf-8')
+                result = subprocess.run(
+                    [sys.executable, '-I', '-B', str(script), '--check-loader-env'],
+                    env={**os.environ, 'CARGO_HOME': str(self.home)},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+                self.assertEqual(result.stderr.strip(),
+                                 b'Loader preflight refused inherited or configured overrides')
+                self.assertNotIn(b'Traceback', result.stderr)
+                self.assertNotIn(str(self.base).encode(), result.stderr)
+                self.assertNotIn(b'private-fixture-marker', result.stderr)
 
     def test_malformed_and_non_table_config_refuse(self):
         for text in ['[env\n', 'env=[]\n']:
