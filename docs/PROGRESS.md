@@ -407,8 +407,16 @@ hold. No new native retry/fix allowance or counter change. Scoped Node/Mac work
 continues; PR190 unwatch confirmed true-to-false for held-head inbox handoff.
 Root corrected the two stale Node expectations with exact new literals (no guard
 weakening), six focused workflow tests PASS; local unpublished source076f156a.
-Independent Sol6.1/high design-only macOS Cargo loader-environment correction
-active at `D:/Temp/arx-pr190-macos-guard-design`; no guard weakening applied yet.
+Sol6.1/high macOS design completed contractSHA6039205c with pinned Cargo source:
+exact fallback key allowed only on actual macOS build-script host, caller/config
+loader overrides refused before Cargo. Root prepared the bounded guard/preflight/
+workflow correction, provenance and exact Node expectations. Seven pure preflight
+tests,15 actual Windows extracted-guard cases and six workflow cases PASS; exact
+new proof step passed locally offline6.007s, including33 verifier controls and
+Cargo/rustc identities; check/Clippy/fmt PASS. Configured-loader CLI failure blocked
+the Cargo sentinel without exposing its value. Mac host positives/native execution
+UNRUN. Windows TMP/TEMP propagation remains unchanged, with no I/O fix claim.
+Combined correction awaits independent source/contract review before any push.
 Preserve this failed first outcome; no new push before the scoped corrections
 and unknown Windows failure have appropriate independent disposition/review.
 No Engine/founder fix, counter reset or timeout/quarantine change. This checkpoint

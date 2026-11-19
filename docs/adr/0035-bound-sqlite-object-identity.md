@@ -37,3 +37,19 @@ initialization; it depends on this slice's source review and qualification.
 PR189 remains held after its unknown founder failure. No new founder diagnostic,
 fix or retry authority follows. M2 OPEN / M3 UNCHECKED;
 **unverified on real hardware**.
+
+PR190's first macOS check exposed a build-contract incompatibility: Cargo1.95's
+versioned source sets DYLD_FALLBACK_LIBRARY_PATH on build-script hosts. The failed
+job logged the key, not its value or provenance. A narrow correction is prepared
+from `D:/Temp/arx-pr190-macos-guard-design/contract.md`, SHA256
+`6039205c436fb9fcb325e4e8a0413830abfa28fa9accf68fc5f4ed2e0f218ded`.
+Independent correction review and hosted evidence remain required before acceptance.
+
+Reject inherited DYLD_*/LD_PRELOAD names and effective Cargo [env] loader entries
+before qualified Cargo invocations; refuse config includes. Do not erase values.
+Inside a macOS build-script host only, permit the exact raw fallback-library key
+that Cargo uses. Other loader/compiler/linker/SQLite override refusals and all
+static-link/source-ID/ABI/VFS checks remain. This is a trusted invocation contract,
+not proof of each search entry's provenance or a loader sandbox. Cargo config CLI
+overrides, alternate wrappers and unreviewed toolchain changes are not qualified.
+Current-user execution's shared access and the separate Windows I/O hold remain.

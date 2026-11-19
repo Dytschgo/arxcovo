@@ -44,7 +44,22 @@ failed operation and final file state unknown. The new exported temp root reache
 default-temp fixtures, but no resolved fixture paths were recorded and no causal
 attribution is established. Both PR189 founder cases passed once in this run;
 their earlier hold remains separate. No native retry/fix allowance follows.
-macOS guard correction is design-only, output
-`D:/Temp/arx-pr190-macos-guard-design`. No broad DYLD exemption or policy relaxation
-has been adopted. Existing founder/Engine holds and exhausted counters remain.
+macOS proposal `D:/Temp/arx-pr190-macos-guard-design/contract.md` is complete,
+SHA2566039205c436fb9fcb325e4e8a0413830abfa28fa9accf68fc5f4ed2e0f218ded.
+Root prepared its narrow source correction: inherited/configured loader preflight
+before Cargo, exact raw fallback key permitted only by macOS host cfg in the child,
+no broad DYLD exemption or variable clearing. Static SQLite/ABI/VFS rules remain.
+The exact workflow retains the same TMP/TEMP exports; the Windows I/O hold remains
+unknown and no fix or stability claim follows.
+
+Local correction evidence at `D:/Temp/arx-pr190-macos-correction`: seven pure
+preflight tests;15 extracted actual-guard cases on Windows, including target/HOST
+spoof refusal; six workflow cases; exact proof step exit0/offline6.0069095s with
+33 verifier controls; Clippy/fmt PASS. Configured-loader failure prevented a Cargo
+sentinel call through the actual workflow step, without logging the dummy value.
+No real loader injection, macOS host-positive or native owner-file execution ran.
+Initial seven pure tests ran before this turn's fresh free-space snapshot; all
+commands used explicit D paths and the later snapshot measured689GB free. No large
+build ran before that measurement. Independent combined correction review is next.
+Existing founder/Engine holds and exhausted counters remain.
 M2 OPEN / M3 UNCHECKED; **unverified on real hardware**; operational NO-GO.
