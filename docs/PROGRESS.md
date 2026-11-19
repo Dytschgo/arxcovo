@@ -149,11 +149,44 @@ report `D:/Temp/arx-m3-startup-contract-review-v2`. Read-only log validation mus
 use current pinned grammars/accessors without modifying store cores, recover must
 preserve bytes/entries including absent locks, and returned preparation must retain
 real ownership. No key possession/readiness or arbitrary-writer defense is claimed.
-Main health is now verified. Next is one Sol6.1/high builder for the six-file
-offline A allowlist, no Engine/network/production runtime; B remains a separate
-blocked dependency contract. Owner authorization for ordinary continuation remains.
-No startup source or runtime has run yet; independent source review and normal
-required gates remain mandatory. This design does not grant withheld B runtime.
+Main health is verified. Sol6.1/high offline A builder completed at `2eb3ba10`
+on `work/m3-startup-identity-preparation`, base `afcf2e9d` from green eea plus
+preserved docs only. Six allowed paths,13 distinct selected non-Engine tests PASS;
+fmt/all-target compilation/Clippy PASS with final-hash limitations retained at
+`D:/Temp/arx-m3-startup-build-v1`. Independent Sol6.1/high source review NO-GO:
+Standards0/Spec3 (schema-before-integrity, applied-index bound, retained membership).
+Report/pins: `D:/Temp/arx-m3-startup-source-review-v1`.
+Coordinator Sol6.1/high corrected these in source-only `90fb1521`; all9 recovery
+tests PASS, fmt/diff check and all-target Clippy PASS. Original S1 zero-traversal
+and S2 before-mutable-open regressions failed first; earlier weak S1 probes passed
+and are explicitly nonqualifying. Evidence: `D:/Temp/arx-m3-startup-review-fix`.
+Sol6.1/high coverage completed source-only `937065c1`; coordinator verified all32
+manifest entries and actual source hash.13 exact-name recovery tests PASS at this
+source, plus all-target no-run compilation, fmt and Clippy. Added real vote/purge/
+tail/preflight and512/513 overflow-sentinel conformance,8 independent checksummed
+grammar/row refusals, and3 phase-specific replacement hooks. Windows denied every
+rename with code32: OS prevention only, no executed identity-mismatch refusal.
+Unix replacement execution remains UNRUN pending hosted CI. Evidence and original
+zero-test selections are retained at `D:/Temp/arx-m3-startup-coverage-v1`.
+Fresh independent combined-source review and normal hosted gates remain pending.
+[Candidate evidence](evidence/m3-startup-identity-preparation.md). B remains a
+separate blocked dependency contract. [ADR0033](adr/0033-startup-identity-preparation.md)
+and [brief](briefs/m3-startup-identity-preparation.md) adopt the accepted scope.
+Standing owner authorization for ordinary continuation remains.
+Offline A source and selected pure/store fixtures have run; no Engine/network/
+production runtime. Independent source acceptance and normal required gates remain
+mandatory. This design does not grant withheld B runtime. Founder caller bridge
+draft at `D:/Temp/arx-m3-founder-caller-bridge-v1` received independent Sol6.1/high
+conditional Design GO, Standards0/Spec0; source/runtime/merge remain withheld.
+Report/proof: `D:/Temp/arx-m3-founder-bridge-review-v1`. Coordinator reverified
+22Gitpins,3context hashes, report hash,4dependency files and pinned time archive.
+Deferred credentials can break the private start/found/attach cycle. The exact
+clock wrapper can withhold a result after failure, but cannot promise refusal
+before initialization/proposal or no signing before a final-sample failure.
+No raw result/DER may escape its final gate. Next is a concrete one-shot ownership/
+pure-test source contract pinned to independently accepted A, alongside qualified
+sealed custody and actual Found-origin publication prerequisites. No B source or
+runtime grant, retry or new founder diagnostic follows this design result.
 [PR186](https://github.com/Dytschgo/arxcovo/pull/186) merged as `eea7af57` from exact
 published `0a323793986d705785eff7e409cc85a75cce2836`, base verified main `e2908c98`.
 Normal first CI44431134508 attempt1 SUCCESS; no rerun/dispatch. Source7files
@@ -188,7 +221,7 @@ existing babysitter remain untouched. M2 OPEN / M3 UNCHECKED.
 - Disk recovery completed: 780 old C: Arxcovo worktrees removed; 6 dirty/untracked and 24 created today retained. All 810 original HEADs have matching local recovery refs. C: free measured 35.4 GB before the worktree batches, 580.6 GB immediately after their final residual cleanup, and 689.4 GB at final verification with concurrent other-project cleanup. Do not attribute the whole drive increase to Arxcovo. No runtime databases moved. [Cleanup evidence](evidence/arxcovo-worktree-cleanup-20261118.md).
 - Held transport history: exact-main CI44304025778 attempt1 GREEN verified after PR181 merge. ADR0028 owned realTLS/TCP Append implementation has31/31 focused baseline PASS; added aborted-but-unjoined proof passed1/1, final independent source review PASS atb936dd20; both designated controls killed intended assertions once each, exact reviewed source restored; PR182 published2e4e0d3f HELD: firstCI44312645314 cancelled Windows732s/macOS750s, Ubuntu284sPASS; all32newcases passed eachOS. Fresh Astra6.2 disposition HOLD/NO FIX, underlying slowdown unknown. Disk correction applied: C: final69.36GB, explicit D: scratch rules independently reviewed. Unpublished docs carried to work/m3-owned-tls-append without duplicating merged source. Genuine join/container acceptance still needed.
 - Blockers: M2 native host setup and owner OAuth remain pending; Linux A7/A11/A12 hardware pending. PR182 allocation recovery completed under standing authority; no further approval block. M3 full peer RPC/startup/custody/admission/container acceptance remain to implement/verify after main health. Exhausted engineSol3/3/historyOpus0/2 unchanged; hardware **unverified on real hardware**.
-- Active work: PR182 merged; verify exact-main first44418600817. One targeted zero-step recovery passed in69s wall (MacUI49s), successful workers retained and dependent gates green. Original first912wall failure preserved. Standing recovery rule recorded above; no approval loop/counter reset. Read-only Sol6.1/high preflight refreshes already-reviewed fullRPC contract for current main, then M3 startup/custody/admission/container route.
+- Active work: PR186 and its exact-main first CI are green. Offline startup A review corrections90fb1521 and coverage937065c1 completed; fresh independent combined-source review pending. Separate founder caller bridge received conditional Design GO only; its concrete source contract/custody prerequisites and live startup/admission/container route remain open. No approval loop or exhausted counter reset.
 - M2 is incomplete. A1/A2, A3 Standard/None and empty-orphan A5 have bounded hosted credit; A6 and A8 have joined nonnative evidence. D9a A4 disposable present-residue and native omitted-kill are independently accepted; crash/A9/U9, A7-A12, full F/G and real-Runner PA6 remain open. Installed/dedicated paths are **unverified on real hardware**.
 - D7a-D7d are consumed, and D7e is now consumed by the accepted baseline dispatch. This baseline cannot close A4/M2 acceptance or grant the native omitted-kill case. Optional Windows replay and macOS grammar tracks remain parked.
 
