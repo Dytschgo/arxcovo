@@ -740,5 +740,90 @@
       "completed": "2026-11-19T02:31:31Z"
     }
   ]
+},
+{
+  "runId": 44450232774,
+  "sha": "8bd12b7f4954f4622b4487fad054e4a32e5d551a",
+  "seconds": 568,
+  "conclusion": "success",
+  "metric": "charged-v1",
+  "chargedSeconds": 563,
+  "queueCreditSeconds": 5,
+  "longestJobSeconds": 553,
+  "credit": "applied",
+  "jobs": [
+    {
+      "id": 135312071071,
+      "name": "rust (macos-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:09Z",
+      "completed": "2026-11-19T03:21:45Z"
+    },
+    {
+      "id": 135312070413,
+      "name": "rust (ubuntu-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:08Z",
+      "completed": "2026-11-19T03:18:47Z"
+    },
+    {
+      "id": 135312070673,
+      "name": "rust (windows-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:09Z",
+      "completed": "2026-11-19T03:25:22Z"
+    },
+    {
+      "id": 135312070881,
+      "name": "ui (macos-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:11Z",
+      "completed": "2026-11-19T03:17:11Z"
+    },
+    {
+      "id": 135312071048,
+      "name": "ui (ubuntu-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:09Z",
+      "completed": "2026-11-19T03:17:44Z"
+    },
+    {
+      "id": 135312070758,
+      "name": "ui (windows-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:16:06Z",
+      "started": "2026-11-19T03:16:09Z",
+      "completed": "2026-11-19T03:17:25Z"
+    },
+    {
+      "id": 135315677594,
+      "name": "verify (macos-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:25:22Z",
+      "started": "2026-11-19T03:25:25Z",
+      "completed": "2026-11-19T03:25:28Z"
+    },
+    {
+      "id": 135315677722,
+      "name": "verify (ubuntu-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:25:22Z",
+      "started": "2026-11-19T03:25:25Z",
+      "completed": "2026-11-19T03:25:32Z"
+    },
+    {
+      "id": 135315677802,
+      "name": "verify (windows-latest)",
+      "conclusion": "success",
+      "created": "2026-11-19T03:25:22Z",
+      "started": "2026-11-19T03:25:25Z",
+      "completed": "2026-11-19T03:25:32Z"
+    }
+  ]
 }
 ]

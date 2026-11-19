@@ -1,4 +1,10 @@
 # Installing and verifying the arxd service (owner guide)
+This guide covers the protected installed-service route and its historical
+baseline below. For the Windows per-user foreground backend preview, use
+[Windows execution accounts](windows-execution-accounts.md). That route defaults
+to the unelevated daemon account; it does not use the installed service's
+LocalSystem client identity. Neither route has complete M2 acceptance.
+See [v1 readiness](v1-readiness.md) for current delivery limits.
 
 Source baseline: actual main **`aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`**
 (2026-11-14 audit), not the local branch named main or unpublished diagnostics.

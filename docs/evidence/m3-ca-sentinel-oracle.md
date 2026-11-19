@@ -3,7 +3,8 @@
 Candidate99f892e8223585bc1f7a2649d94a2f6c2fdecc71, coordinator Sol6.1/high,
 2026-11-19. Only pki/ca.rs changes,87 additions, all cfg(test). Production
 statements/APIs, founder/Engine, subject seals, dependencies and CI are unchanged.
-Independent exact-source review and required hosted acceptance remain pending.
+Independent exact-source review and required hosted checks passed; PR188 merged
+as8bd12b7f. [Merge evidence](m3-pr188-first-ci.md), [main evidence](m3-pr188-main-first-ci.md).
 
 The dormant bridge slice remains source NO-GO. This test-only prerequisite
 addresses its missing CA oracle; it does not implement speculative lifecycle or
@@ -44,7 +45,7 @@ Raw results/exit records/source hash/diff and effective D environment are retain
 at `D:/Temp/arx-ca-sentinel-build-v1`. No local Engine/founder/native/daemon/client/
 network/container execution, admin/owner-data/LabManager/state/VM/cache/OAuth/
 babysitter action. EngineSol3/3EXHAUSTED/historyOpus0/2 unchanged. Unreviewed owner
-handoff draft at `D:/Temp/arx-m3-owner-handoff-design-v1` identifies frozen
-Engine/store-binding gaps; it grants no source/runtime scope. Qualified custody,
+handoff V2 at `D:/Temp/arx-m3-owner-handoff-design-v2` now has independent offline
+Design GO while frozen Engine/store-binding gaps remain; no runtime scope. Qualified custody,
 actual Found-origin publication and M3 acceptance remain open.
 M2 OPEN/M3 UNCHECKED; **unverified on real hardware**.

@@ -79,11 +79,65 @@ test('Rust retains every native, Python and package validation with exact comman
     `name: Pin Windows cluster quarantine scope
         run: python -I -m unittest discover -s tools/ci -p 'test_windows_cluster_quarantine.py'`,
     'run: cargo fmt --all --check',
-    'run: cargo clippy --workspace --all-targets --locked -- -D warnings',
+    `name: Verify pinned SQLite binding build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proofRoot = Join-Path $env:RUNNER_TEMP 'arx-bound-sqlite'
+          $env:TMP = Join-Path $proofRoot 'tmp'
+          $env:TEMP = $env:TMP
+          if (-not $env:CARGO_HOME) { $env:CARGO_HOME = Join-Path $HOME '.cargo' }
+          if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $env:GITHUB_WORKSPACE 'target' }
+          New-Item -ItemType Directory -Force -Path $proofRoot,$env:TMP | Out-Null
+          foreach ($name in @('TMP','TEMP','CARGO_HOME','CARGO_TARGET_DIR')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value.Contains("\`n") -or $value.Contains("\`r")) { throw 'Invalid build path' }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value"
+            Write-Output "$name=$value"
+          }
+          $metadata = Join-Path $proofRoot 'metadata.json'
+          $messages = Join-Path $proofRoot 'build-messages.jsonl'
+          python -I -B -m unittest discover -s scripts -p 'test_bound_sqlite_loader.py'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo metadata --locked --format-version 1 > $metadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --workspace --all-targets --locked --message-format=json > $messages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --metadata $metadata --build-messages $messages --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $metadata,$messages | Format-List
+          rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo --version --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+    `name: Preflight loader environment and lint Rust
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Read-only macOS stock-directory observations
         if: runner.os == 'macOS'
-        run: cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture`,
-    'run: cargo nextest run --workspace --locked',
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p arxd --locked --lib service::native::stock_directory_observations::fixed_system_directory_observations -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+    `name: Preflight loader environment and run workspace tests
+        shell: pwsh
+        run: |
+          python -I -B scripts/check-bound-sqlite.py --check-loader-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo nextest run --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
@@ -143,7 +197,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {
   assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
   assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 1);
-  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG']);
+  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR']);
   for (const path of ['../Cargo.toml', '../.cargo/config', '../.cargo/config.toml']) {
     const url = new URL(path, import.meta.url);
     if (existsSync(url)) {

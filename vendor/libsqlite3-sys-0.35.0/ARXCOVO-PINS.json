@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "archive_sha256": "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f",
+  "source_id": "2025-06-28 14:00:48 2af157d77fb1304a74176eaee7fbc7c7e932d946bf25325e9c26c91db19e3079",
+  "original": {
+    ".cargo_vcs_info.json": {
+      "sha256": "16475bf7c12522b83e71e82ca06f7ce4b74a198a05d80c9df81fb018e815b445",
+      "bytes": 108
+    },
+    ".gitignore": {
+      "sha256": "d89b7a44f37a816f5b0ca8297e0d17067ca5f41e45d1455b0a56d072679a00a6",
+      "bytes": 26
+    },
+    "Cargo.lock": {
+      "sha256": "be6c446fdd22c75d140690ebaa9b16a1048ca621b4b4852eec5e9a7e312d1c7c",
+      "bytes": 8750
+    },
+    "Cargo.toml": {
+      "sha256": "54d98d6bef7f15016cb6ffcf64fe7ab239e609d5ead0d8fdfa05384c57dcce29",
+      "bytes": 2357
+    },
+    "Cargo.toml.orig": {
+      "sha256": "58baf66cff8510596fc6ef7c37ba1d22ed9c74de6d6d8a0874ad75ed15b824ef",
+      "bytes": 1778
+    },
+    "LICENSE": {
+      "sha256": "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f",
+      "bytes": 1067
+    },
+    "README.md": {
+      "sha256": "0a16d929c3e35f1ef9b5ab9eae63e652473409f235fc5275d442a2f1bcd9b2d9",
+      "bytes": 15828
+    },
+    "Upgrade.md": {
+      "sha256": "d151a67d4bbb1a5a300d084d210d6cd238d833a6d4bd5d958ae7469a9deccb36",
+      "bytes": 1853
+    },
+    "bindgen-bindings/bindgen_3.14.0.rs": {
+      "sha256": "8e353165d424514aaf979cddbc8c05f779948900ae1b90f34e2b12114521452e",
+      "bytes": 96943
+    },
+    "bindgen-bindings/bindgen_3.14.0_ext.rs": {
+      "sha256": "cbc03ec6295b8186265baca6c5cc6b1337a0368c27f46d03a1cff24f2bb079df",
+      "bytes": 247691
+    },
+    "build.rs": {
+      "sha256": "5f1984827787b3e4777d89fb6626a4a0a3889fac875443cd074ebe5141ed7259",
+      "bytes": 33419
+    },
+    "sqlcipher/LICENSE": {
+      "sha256": "ea4fcb309f14a22065e1ea45362d494d320012249ed865fe9c7c0946db754131",
+      "bytes": 1467
+    },
+    "sqlcipher/bindgen_bundled_version.rs": {
+      "sha256": "55a5fe42292acbcd753e9c6e1ffbdddf160632fbbb18ccf0f392508bd936ed8e",
+      "bytes": 118533
+    },
+    "sqlcipher/sqlite3.c": {
+      "sha256": "f240498b2f20d6876905041417903b7fd837f964ad6c94c04727ef022f386151",
+      "bytes": 9301494
+    },
+    "sqlcipher/sqlite3.h": {
+      "sha256": "7df828fe118508d543476be6de79633522eb5222ae922cef467a619c5a003a48",
+      "bytes": 646009
+    },
+    "sqlcipher/sqlite3ext.h": {
+      "sha256": "b184dd1586d935133d37ad76fa353faf0a1021ff2fdedeedcc3498fff74bbb94",
+      "bytes": 38149
+    },
+    "sqlite3/bindgen_bundled_version.rs": {
+      "sha256": "7a1cb091cafc1955886b723bd4cf88fdcf3f1868004a1e9de0621f3746a2471e",
+      "bytes": 123490
+    },
+    "sqlite3/bindgen_bundled_version_ext.rs": {
+      "sha256": "513dab9012ef362dec769810ce97fb2160982300cf018438a24083f14508e4c9",
+      "bytes": 313878
+    },
+    "sqlite3/sqlite3.c": {
+      "sha256": "c9a0b6829b81d5f1b78392181f09744c818117a725667411d517b98149fcd3be",
+      "bytes": 9281384
+    },
+    "sqlite3/sqlite3.h": {
+      "sha256": "7db44ac3e95c465c30eea8d45d81474c7cda49ab76e8a681e752e535d1560f2e",
+      "bytes": 661946
+    },
+    "sqlite3/sqlite3ext.h": {
+      "sha256": "b184dd1586d935133d37ad76fa353faf0a1021ff2fdedeedcc3498fff74bbb94",
+      "bytes": 38149
+    },
+    "sqlite3/wasm32-wasi-vfs.c": {
+      "sha256": "b95842044da2b8777876b7d3fef8c9711e8c201fb4a4255dbac98729a456bb5d",
+      "bytes": 21443
+    },
+    "src/error.rs": {
+      "sha256": "74be652185b6884bb95c0b0347daf326e5323acd81e0d41158d5490e06184993",
+      "bytes": 16824
+    },
+    "src/lib.rs": {
+      "sha256": "c554c2afcef26fb107fdb867beb499f670e4aa628b0bcfbdeec709e48fd61157",
+      "bytes": 793
+    },
+    "upgrade.sh": {
+      "sha256": "19d9c8431d94bcff5d22cbdf627ff8bec1a8d047b2efa91fbe8d70ae155cbbce",
+      "bytes": 2114
+    },
+    "upgrade_sqlcipher.sh": {
+      "sha256": "4933703942151b2742ddfff25b3ee362ac7e4dd19039382682484d03a6885bd3",
+      "bytes": 1565
+    },
+    "wrapper.h": {
+      "sha256": "b78f576f7eeabf316e183d476b0f16344b6897680b4df47628d3ce38c0aa979a",
+      "bytes": 21
+    },
+    "wrapper_ext.h": {
+      "sha256": "fa7a53fea99318ee29d75e6d5fab4d7ed26e9599803268e6a24396265f2a6f3a",
+      "bytes": 25
+    }
+  },
+  "patched": {
+    "build.rs": {
+      "sha256": "1f233dee533454468155a90e9245b4a4363efb058b228a42981aff10283168b3",
+      "bytes": 36487
+    },
+    "sqlite3/sqlite3.c": {
+      "sha256": "da4b7d20abad8139c9dd4344343770261dfb145d3a172b446a3dee128a78cf96",
+      "bytes": 9286028
+    },
+    "sqlite3/sqlite3.h": {
+      "sha256": "286d1497a6d48f5bbf84ae851ff6b91f2d71fc41078458021dbb2dc8b89426da",
+      "bytes": 663764
+    },
+    "sqlite3/bindgen_bundled_version.rs": {
+      "sha256": "0bef46bc8a0fdc07aba954debef4bb8c2f047fedd1bdf50a243112b78e132e2a",
+      "bytes": 124185
+    }
+  }
+}
