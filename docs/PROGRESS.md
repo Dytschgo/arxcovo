@@ -49,6 +49,25 @@ same founder signature as PR189 on a change that does not touch consensus, so th
 founder refusal is now observed on main-equivalent source; cause UNKNOWN. No
 rerun. PR191 waits on the founder diagnostic, which is now the critical path.
 
+**PR192 MERGED (founder-deadline test-only trace), 2026-11-19.** Squash
+`92003177b72a907ddbefb446acbf7f8b0a406374` from reviewed head `39e149e6`, base
+main `8bd12b7f` (green CI 44450232774 attempt 1, rechecked before merge).
+Builder Sol 6.1/high (3 commits: recorder, nonwaiting registry correction, and
+removal of a `cfg(not(test))` that the static quarantine guard rejected on first
+CI 44596336272). Reviews, all separate Sol 6.1/high: round 1 HOLD (blocking
+registry wait, loosened `Slots` guard) at `D:/Temp/arx-founder-diag-review`;
+round 2 GO at `D:/Temp/arx-founder-diag-review2`; exact-head GO with
+quarantine gate 9/9 at `D:/Temp/arx-pr192-review3` (SHA256 `848ad902…e2a8`),
+agent-review 59402534228. CI 44596997600 attempt 1 all nine jobs SUCCESS,
+~10.5 min wall; Windows Rust 792/792 passed with 36 skipped, the three founder
+tests passing (1.476 s / 0.777 s / 0.426 s). This hosted observation is a clean
+pass: no trace emitted, historical founder cause still UNKNOWN. Local PC: no
+refusal reproduced in 12+ captures (apply and reply 28–74 ms of a 5 s budget).
+Future founder refusals on main now carry the trace. Engine counters Sol 3/3,
+Opus 0/2 unchanged; this was a diagnostic, not a fix.
+PR191 rebased by update-branch to `7466e5aa` (patch-identical to `919c7fec` by
+range-diff) on base `92003177`; exact-head re-review and CI pending.
+
 Main and PR190 have identical pre-fix owner-file source. The
 council decision requires a proved shared fix to land on main first and then be
 verified under PR190 conditions. PR189 founder-deadline investigation follows on
