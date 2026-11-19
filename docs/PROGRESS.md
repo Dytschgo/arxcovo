@@ -94,6 +94,21 @@ and phase unknown; load plausible but unproved. Failure-only scalar phase trace
 prepared at local `628f734b` on `diag/e7-a8-lifecycle-trace` (from `92003177`),
 pending independent review. Fix counter 0/3.
 
+**PR193 (A8 lifecycle trace) first CI FAILED, 2026-11-19.** Head `04b29b3c`
+(builder Sol 6.1/high `628f734b` plus coordinator UTF-8 fix); independent Sol
+review GO, then exact-head GO and agent-review 59405630784
+(`D:/Temp/arx-pr193-review/review.md`, SHA256 `da55883a…6049`). CI
+44602605879 Windows Rust failed a different e7 test:
+`service::unix_bridge::tests::e7::w1_w4_t20b_order_single_domain` at
+e7.rs:27, `Gate::reached` 5 s timeout Elapsed, 7.222 s; 717 passed / 1 failed
+/ 74 unrun. a8 passed in 2.935 s in that run. Log
+`D:/Temp/arx-pr193-ci/win.log` SHA256 `8c4b57c5…499a`. Intended merge
+authority was the 2026-11-16 babysitter clarification permitting a reviewed
+repair/quarantine PR onto red main; not used. Windows wall-clock timeouts now
+seen in three tests (founder 5 s deadline, e7 a8 10 s bound, e7 w1_w4 5 s
+gate). The e7 `Gate::hold` busy-spins with `yield_now` for up to 15 s
+(e7.rs:12-19). Hypothesis only; no cause assigned. e7 family fix counter 0/3.
+
 **PR191 first CI on rebased head `7466e5aa`:** CI 44599400768 attempt 1, all
 nine jobs SUCCESS (~9 min wall). Windows Rust 794/794 passed, 36 skipped,
 including all 26 owner_windows tests, `rename_info_terminates_name_inside_declared_size`
