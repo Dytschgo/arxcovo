@@ -337,6 +337,15 @@ impl Owner {
     pub(super) fn recheck(&self) -> Result<()> {
         for g in &self.guards {
             g.recheck()?;
+            if g.path.parent() == Some(self.plan.state.as_path())
+                && g.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-journal"))
+                && g.file.metadata().map_err(|_| Refusal::Layout)?.len() != 0
+            {
+                return Err(Refusal::Store);
+            }
         }
         let mut entries = fs::read_dir(&self.plan.state)
             .map_err(|_| Refusal::Layout)?
@@ -361,6 +370,91 @@ impl Owner {
         if count != if self.plan.mode.recovery() { 3 } else { 0 } {
             return Err(Refusal::Layout);
         }
+        Ok(())
+    }
+    pub(super) fn fresh_baseline(&self) -> Result<()> {
+        self.recheck()?;
+        if self.entries != ["cluster-owner.lock"] || self.plan.mode != Mode::CreateFounder {
+            return Err(Refusal::Provenance);
+        }
+        Ok(())
+    }
+    /// Fixed fresh-only delta; preserve all original guards and the outer lock.
+    pub(super) fn capture_created_stores(&mut self) -> Result<()> {
+        if self.entries != ["cluster-owner.lock"] || self.plan.mode != Mode::CreateFounder {
+            return Err(Refusal::Provenance);
+        }
+        for g in &self.guards {
+            g.recheck()?;
+        }
+        if fs::read_dir(&self.plan.credentials)
+            .map_err(|_| Refusal::Layout)?
+            .next()
+            .is_some()
+        {
+            return Err(Refusal::Layout);
+        }
+        let required = [
+            "cluster-owner.lock",
+            "cluster-log.lock",
+            "cluster-state.lock",
+            "cluster-log.sqlite3",
+            "cluster-state.sqlite3",
+        ];
+        let journals = [
+            "cluster-log.sqlite3-journal",
+            "cluster-state.sqlite3-journal",
+        ];
+        let mut entries = Vec::new();
+        let mut staged: Vec<Guard> = Vec::new();
+        for entry in fs::read_dir(&self.plan.state)
+            .map_err(|_| Refusal::Layout)?
+            .take(8)
+        {
+            let entry = entry.map_err(|_| Refusal::Layout)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Refusal::Layout)?;
+            if !required.contains(&name.as_str()) && !journals.contains(&name.as_str()) {
+                return Err(Refusal::Layout);
+            }
+            if name != "cluster-owner.lock" {
+                let g = Guard::open(&entry.path(), false, true)?;
+                if self.guards.iter().chain(&staged).any(|old| old.id == g.id) {
+                    return Err(Refusal::Layout);
+                }
+                if journals.contains(&name.as_str())
+                    && g.file.metadata().map_err(|_| Refusal::Layout)?.len() != 0
+                {
+                    return Err(Refusal::Store);
+                }
+                staged.push(g);
+                #[cfg(test)]
+                tests::capture_stage(staged.len(), self)?;
+            }
+            entries.push(name);
+        }
+        if required
+            .iter()
+            .any(|name| !entries.iter().any(|e| e == name))
+        {
+            return Err(Refusal::Layout);
+        }
+        for g in self.guards.iter().chain(&staged) {
+            g.recheck()?;
+            if g.path.parent() == Some(self.plan.state.as_path())
+                && g.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-journal"))
+                && g.file.metadata().map_err(|_| Refusal::Layout)?.len() != 0
+            {
+                return Err(Refusal::Store);
+            }
+        }
+        self.guards.extend(staged);
+        self.entries = entries;
         Ok(())
     }
     pub(super) fn has_stores(&self) -> bool {
@@ -390,6 +484,83 @@ impl Owner {
 #[cfg(test)]
 pub(in crate::cluster) mod tests {
     use super::*;
+    thread_local! {
+        static CAPTURE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CAPTURE_EFFECT: std::cell::RefCell<Vec<(String, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    pub(in crate::cluster) struct CaptureFault;
+    impl CaptureFault {
+        pub(in crate::cluster) fn new() -> Self {
+            CAPTURE_FAIL.with(|s| {
+                assert!(!s.replace(true));
+            });
+            Self
+        }
+    }
+    impl Drop for CaptureFault {
+        fn drop(&mut self) {
+            CAPTURE_FAIL.with(|s| s.set(false));
+        }
+    }
+    pub(in crate::cluster) fn capture_effect() -> Vec<(String, Vec<u8>)> {
+        CAPTURE_EFFECT.with(|s| s.borrow().clone())
+    }
+    pub(super) fn capture_stage(count: usize, owner: &Owner) -> Result<()> {
+        if count == 2 && CAPTURE_FAIL.with(|s| s.get()) {
+            let mut rows = fs::read_dir(&owner.plan.state)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().into_string().unwrap(),
+                        if e.metadata().unwrap().len() == 0 {
+                            Vec::new()
+                        } else {
+                            fs::read(e.path()).unwrap()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            CAPTURE_EFFECT.with(|s| *s.borrow_mut() = rows);
+            Err(Refusal::Clock)
+        } else {
+            Ok(())
+        }
+    }
+    pub(in crate::cluster) fn guards(owner: &Owner) -> Vec<(PathBuf, u64, u64)> {
+        owner
+            .guards
+            .iter()
+            .map(|g| {
+                g.recheck().unwrap();
+                (g.path.clone(), g.id.0, g.id.1)
+            })
+            .collect()
+    }
+    pub(in crate::cluster) fn baseline(owner: &Owner) -> (usize, Vec<String>) {
+        (owner.guards.len(), owner.entries.clone())
+    }
+    pub(in crate::cluster) fn objects(dir: &Path) -> Vec<(String, u64, u64, bool, u64)> {
+        let mut entries = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let f = options(false).open(e.path()).unwrap();
+                let id = object(&f).unwrap();
+                let m = f.metadata().unwrap();
+                (
+                    e.file_name().into_string().unwrap(),
+                    id.0,
+                    id.1,
+                    m.is_file(),
+                    m.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
     pub(in crate::cluster) struct Layout {
         pub root: tempfile::TempDir,
     }
