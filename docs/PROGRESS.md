@@ -66,7 +66,24 @@ refusal reproduced in 12+ captures (apply and reply 28–74 ms of a 5 s budget).
 Future founder refusals on main now carry the trace. Engine counters Sol 3/3,
 Opus 0/2 unchanged; this was a diagnostic, not a fix.
 PR191 rebased by update-branch to `7466e5aa` (patch-identical to `919c7fec` by
-range-diff) on base `92003177`; exact-head re-review and CI pending.
+range-diff) on base `92003177`; separate Sol 6.1 exact-head re-review PASS,
+agent-review 59403767769 (`D:/Temp/arx-pr191-review2/review.md`, SHA256
+`bd10edf5…0de3`).
+
+**MAIN RED at `92003177`, 2026-11-19.** First push CI 44599348252 attempt 1
+FAILED on Windows Rust only (Ubuntu/macOS Rust and all UI passed):
+`service::unix_bridge::tests::e7::a8::host_ready_discovery_persisted_once_or_absent_on_setup_failure`
+panicked at e7.rs:924, "bounded host lifecycle: Elapsed(())", the 10 s
+per-iteration timeout around `Host::run`, at 15.248 s while
+`t19_four_residue_calls_bound` (29 s), `t15_exhaustive_setup_failure_dispatch`
+(59 s) and `adr0017_dispatch_durable_matrix` (87 s) ran concurrently.
+712 passed / 1 failed / 79 unrun (fail-fast). Log
+`D:/Temp/arx-main-92003177-ci/win.log` SHA256 `ee2e9009…6eb5`. The same tree
+passed 792/792 in PR192 CI 44596997600. The test is unchanged since #103 and
+PR192 touched only cfg(test) consensus code, but no cause or attribution is
+assigned. New, separate failure: fix attempts 0/3. No rerun. All merges,
+including PR191, are blocked until main is green on its exact SHA. Bounded Sol
+diagnosis follows.
 
 Main and PR190 have identical pre-fix owner-file source. The
 council decision requires a proved shared fix to land on main first and then be
