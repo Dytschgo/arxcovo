@@ -137,8 +137,12 @@ Windows Rust job 10m36s (84 s under its 12 min timeout), nextest phase 365.6 s
 (previously 187–251 s), 792/792 passed; a8 4.169 s, w1_w4 2.121 s. Log
 `D:/Temp/arx-pr194-ci/win.log` SHA256 `6280cabf…f405`. **Risk:** the Windows
 job margin under its 12 min timeout is now thin. One clean run proves nothing
-about intermittency; this is a mitigation, not a proved cause fix. Main push CI
-on `76a8bc68` pending.
+about intermittency; this is a mitigation, not a proved cause fix.
+**MAIN GREEN at `76a8bc68`:** first push CI 44608721122 attempt 1 SUCCESS, all
+nine jobs, 9m15s wall; Windows Rust job 8m53s. Feature merges unblocked.
+PR191 rebased by update-branch to `abb759f6` (patch-identical by range-diff) on
+base `76a8bc68`; exact-head re-review and CI pending. PR193 waits until PR191
+merges.
 
 **PR191 first CI on rebased head `7466e5aa`:** CI 44599400768 attempt 1, all
 nine jobs SUCCESS (~9 min wall). Windows Rust 794/794 passed, 36 skipped,
