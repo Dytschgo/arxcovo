@@ -71,3 +71,23 @@ Correction checks: targeted Windows10PASS (8.537s command/body0.01s), all-target
 check4.371s, Clippy5.051s, fmt0.835s, verifier33 source/inventory negatives PASS.
 Fresh metadata and build messages are retained at `D:/Temp/arx-binding-width-fix`.
 Independent exact-source re-review remains required; CI wiring/native gaps stay open.
+
+Independent source re-review at69e170ca completed GO, Standards0/Spec0/SP1 closed;
+report SHA256 `c2880c1552e5a6a438d4ad4377e66ef60460509529c9cbde86971482721c66a3`.
+Qualification and next-store gates remain pending.
+
+Coordinator CI integration adds one required PowerShell step before Clippy and
+normal nextest in each existing Rust worker. It collects locked metadata and JSON
+all-target check output from the same head/build, runs the verifier self-test,
+records SHA256/compiler identity and propagates explicit Cargo/temp paths through
+GITHUB_ENV. It preserves all existing checks, matrices, deadlines and aggregates.
+The existing nextest step supplies native execution once; the new step adds no
+second targeted execution or Engine retry. Hosted qualification is still UNRUN.
+
+The exact extracted workflow step passed locally with offline Cargo and D-only
+paths (exit0,1.328s). Three injected command-failure controls propagated exit37
+(metadata),38(check),39(verifier). These mock process exits are workflow failure
+controls, not native binding evidence. The first test wrapper failed to propagate
+the called script's LASTEXITCODE to its own process; initial files/log remain,
+and corrected wrapper propagation matches the runner's exit handling.
+Evidence: `D:/Temp/arx-binding-ci-wiring`. Independent workflow review is pending.

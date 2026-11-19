@@ -368,7 +368,17 @@ Six extracted-predicate compile cases cover real32/64-bit MSVC code generation
 with Unix architecture macros; not native Unix/x32 execution. Ten binding tests,
 33 source/inventory controls, check/Clippy/fmt PASS after correction. First assembly
 parser whitespace failure retained; first successful compilation reused. Focused
-independent re-review next; native/platform gaps and CI wiring remain open;
+independent re-review completed SOURCE GO at69e170ca, Standards0/Spec0/SP1 closed,
+reportSHA c2880c15/pins `D:/Temp/arx-binding-source-review-v2` verified. Native/
+platform qualification remains pending. Coordinator added a required Rust-worker
+CI step collecting fresh locked metadata and same-build JSON messages, running
+verifier self-test and recording input hashes/compiler identity. Explicit Cargo
+paths and task temp propagate to later Rust steps; normal nextest remains unchanged
+and executes native cases once. Exact extracted PowerShell step passed locally
+offline in1.328s; injected metadata/check/verifier exits37/38/39 propagated. Initial
+outer test wrapper omitted LASTEXITCODE propagation; its failure is preserved,
+then corrected to match runner exit handling. No product failure or Engine run.
+Workflow integration needs independent review and normal first hosted execution;
 no hosted/operational acceptance. [Candidate evidence](evidence/m3-sqlite-binding-candidate.md).
 Output/evidence `D:/Temp/arx-bound-binding-build-v1`.
 Both slices exclude Engine/start/shutdown/
