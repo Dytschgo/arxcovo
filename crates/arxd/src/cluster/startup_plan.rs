@@ -564,6 +564,8 @@ impl Owner {
         Ok(())
     }
     pub(super) fn bound_install(&mut self, staged: &mut Vec<Guard>) -> Result<()> {
+        #[cfg(test)]
+        super::bound_open::tests::staging(self);
         self.bound_validate(staged, true)?;
         let mut journals = Vec::new();
         for name in [

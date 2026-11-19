@@ -285,6 +285,8 @@ pub(super) fn open_db(
 }
 pub(super) fn configure_db(db: &Connection, stem: &str, max_pages: u64) -> Result<(), StoreError> {
     db.busy_timeout(Duration::from_millis(250))?;
+    #[cfg(test)]
+    super::bound_open::tests::configure(db, stem)?;
     db.execute_batch(&format!("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE; PRAGMA locking_mode=NORMAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA temp_store=MEMORY; PRAGMA max_page_count={max_pages};"))?;
     let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
     for (key, max, exact) in [
@@ -388,7 +390,7 @@ impl StateStore {
     ) -> Result<InitializedState, StoreError> {
         super::state_store::configure_db(&pending.db, "cluster-state", 64)?;
         #[cfg(test)]
-        super::bound_open::tests::initialization(&pending.db, &pending.dir)?;
+        super::bound_open::tests::initialization(&pending.db, &pending.dir, "cluster-state")?;
         Self::initialize_db(&mut pending.db, &pending.dir, init)
     }
     pub(super) fn from_initialized(

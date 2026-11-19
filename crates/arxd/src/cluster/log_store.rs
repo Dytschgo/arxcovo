@@ -276,7 +276,7 @@ impl VoteLogStore {
     ) -> Result<InitializedLog, StoreError> {
         super::state_store::configure_db(&pending.db, "cluster-log", 2048)?;
         #[cfg(test)]
-        super::bound_open::tests::initialization(&pending.db, &pending.dir)?;
+        super::bound_open::tests::initialization(&pending.db, &pending.dir, "cluster-log")?;
         Self::initialize_db(&mut pending.db, &pending.dir, cluster)
     }
     pub(super) fn from_initialized(

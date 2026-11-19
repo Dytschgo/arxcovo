@@ -430,7 +430,14 @@ impl<'owner> BoundStores<'owner> {
             .map_err(|_| BoundFailure::Layout)?;
         let path = self.owner.plan.state.join(format!("{stem}.sqlite3"));
         #[cfg(test)]
-        tests::boundary("open", self)?;
+        {
+            if matches!(kind, StoreKind::VoteLog) {
+                tests::boundary("second", self)?;
+            }
+            tests::boundary("open", self)?;
+        }
+        #[cfg(test)]
+        let path = tests::sqlite_open_path(&path);
         let flags = if readonly {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
         } else {
@@ -464,6 +471,8 @@ impl<'owner> BoundStores<'owner> {
         Ok(())
     }
     fn require_v2(&self) -> Result<(), BoundFailure> {
+        #[cfg(test)]
+        tests::application_sql();
         let v: u32 = self
             .pending
             .bound
@@ -500,8 +509,6 @@ impl<'owner> BoundStores<'owner> {
             return Ok(());
         }
         self.open(StoreKind::State, fresh, false)?;
-        #[cfg(test)]
-        tests::boundary("state-init", self)?;
         if !fresh {
             self.require_v2()?;
         }
@@ -515,11 +522,7 @@ impl<'owner> BoundStores<'owner> {
         self.owner
             .bound_validate(&self.staged, true)
             .map_err(|_| BoundFailure::Layout)?;
-        #[cfg(test)]
-        tests::boundary("second", self)?;
         self.open(StoreKind::VoteLog, fresh, false)?;
-        #[cfg(test)]
-        tests::boundary("log-init", self)?;
         if !fresh {
             self.require_v2()?;
         }
@@ -601,9 +604,10 @@ pub(super) mod tests {
         if let Some((point, panic)) = FAULT.with(|f| *f.borrow())
             && point == name
         {
+            REACHED.with(|r| r.borrow_mut().push(name));
             probe(&stores.owner.plan.state, "cluster-owner", true);
             probe(&stores.owner.plan.state, "cluster-state", true);
-            if name == "log-init" || name == "preflight" {
+            if name == "second" || name == "preflight" {
                 probe(&stores.owner.plan.state, "cluster-log", true);
             }
             if panic {
@@ -613,21 +617,92 @@ pub(super) mod tests {
         }
         Ok(())
     }
+    thread_local! {
+        static SQL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static REACHED: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    pub(in crate::cluster) fn application_sql() {
+        SQL.with(|n| n.set(n.get() + 1));
+    }
+    pub(in crate::cluster) fn configure(db: &Connection, stem: &str) -> Result<(), StoreError> {
+        application_sql();
+        if FAULT.with(|f| *f.borrow())
+            == Some((
+                if stem == "cluster-state" {
+                    "state-pragma"
+                } else {
+                    "log-pragma"
+                },
+                false,
+            ))
+        {
+            // The real configure_db PRAGMA batch must refuse synchronous changes
+            // in this transaction. Do not manufacture its return value.
+            db.execute_batch("BEGIN")?;
+        }
+        Ok(())
+    }
     pub(in crate::cluster) fn initialization(
         db: &Connection,
         dir: &Path,
+        stem: &str,
     ) -> Result<(), StoreError> {
-        if let Some((point, panic)) = FAULT.with(|f| *f.borrow())
-            && point == "borrowed-init"
-        {
-            probe(dir, "cluster-owner", true);
-            probe(dir, "cluster-state", true);
-            if panic {
-                panic!("borrowed initialization unwind");
+        let state = stem == "cluster-state";
+        let phase = if state { "state-init" } else { "log-init" };
+        if let Some((point, panic)) = FAULT.with(|f| *f.borrow()) {
+            if point == phase || (state && point == "borrowed-init") {
+                REACHED.with(|r| r.borrow_mut().push(point));
+                probe(dir, "cluster-owner", true);
+                probe(dir, "cluster-state", true);
+                if !state {
+                    probe(dir, "cluster-log", true);
+                }
+                if panic {
+                    panic!("borrowed initialization unwind");
+                }
+                db.execute_batch("SELECT * FROM arxcovo_missing_injected_table")?;
             }
-            db.execute_batch("SELECT * FROM arxcovo_missing_injected_table")?;
+            if point == if state { "state-schema" } else { "log-schema" } {
+                // Real initializer CREATE TABLE now fails on this same connection.
+                db.execute_batch("PRAGMA query_only=ON")?;
+            }
         }
         Ok(())
+    }
+    pub(in crate::cluster) fn staging(owner: &Owner) {
+        if FAULT.with(|f| *f.borrow()) == Some(("staging", false)) {
+            probe(&owner.plan.state, "cluster-state", true);
+            probe(&owner.plan.state, "cluster-log", true);
+            fs::write(
+                owner.plan.state.join("unexpected-install-entry"),
+                b"fixture",
+            )
+            .unwrap();
+        }
+    }
+    fn sqlite_open_path(path: &Path) -> PathBuf {
+        match FAULT.with(|f| *f.borrow()).map(|(point, _)| point) {
+            Some("sqlite-open") => path.with_file_name("absent-sqlite-open.sqlite3"),
+            Some("mismatch") => {
+                #[cfg(windows)]
+                {
+                    // Windows denies renaming the retained original. Open a real
+                    // different private file instead, preserving the original guard.
+                    let other = path.with_file_name("different.sqlite3");
+                    fs::write(&other, b"").unwrap();
+                    other
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::rename(path, path.with_file_name("retained-original.sqlite3")).unwrap();
+                    fs::write(path, b"").unwrap();
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                    path.to_owned()
+                }
+            }
+            _ => path.to_owned(),
+        }
     }
     fn init() -> Init {
         Init {
@@ -689,6 +764,7 @@ pub(super) mod tests {
             for unwind in [false, true] {
                 let l = layout();
                 let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+                REACHED.with(|r| r.borrow_mut().clear());
                 FAULT.with(|f| *f.borrow_mut() = Some((point, unwind)));
                 let stores = BoundStores::acquire(&mut owner, BoundIntent::Fresh(init()));
                 FAULT.with(|f| *f.borrow_mut() = None);
@@ -698,13 +774,17 @@ pub(super) mod tests {
                     BoundFailure::Init(StoreError::Sql)
                 };
                 assert_eq!(stores.first_failure(), Some(first), "{point}");
+                REACHED.with(|r| assert_eq!(*r.borrow(), vec![point]));
                 probe(&stores.owner.plan.state, "cluster-owner", true);
                 probe(&stores.owner.plan.state, "cluster-state", true);
-                if point == "log-init" || point == "preflight" {
+                if matches!(point, "second" | "log-init" | "preflight") {
                     probe(&stores.owner.plan.state, "cluster-log", true);
                 }
                 drop(stores);
                 probe(&owner.plan.state, "cluster-state", false);
+                if matches!(point, "second" | "log-init" | "preflight") {
+                    probe(&owner.plan.state, "cluster-log", false);
+                }
                 // Restore a valid-looking pair on disk without replacing the original Owner.
                 drop(StateStore::open(&owner.plan.state, init()).unwrap());
                 drop(VoteLogStore::open(&owner.plan.state, init().cluster).unwrap());
@@ -766,6 +846,160 @@ pub(super) mod tests {
         );
         drop(stores);
         assert_eq!(before, l.snapshot());
+    }
+
+    // These fixtures mutate the owned operation, never fabricate its error.
+    fn real_failure(
+        owner: &mut Owner,
+        point: &'static str,
+        intent: BoundIntent,
+        expected: BoundFailure,
+        both: bool,
+    ) -> usize {
+        SQL.with(|n| n.set(0));
+        FAULT.with(|f| *f.borrow_mut() = Some((point, false)));
+        let stores = BoundStores::acquire(owner, intent);
+        FAULT.with(|f| *f.borrow_mut() = None);
+        assert_eq!(stores.status(), Err(expected), "{point}");
+        probe(&stores.owner.plan.state, "cluster-owner", true);
+        probe(&stores.owner.plan.state, "cluster-state", true);
+        if both {
+            probe(&stores.owner.plan.state, "cluster-log", true);
+        }
+        match point {
+            "sqlite-open" => {
+                assert!(stores.pending.guard.is_some());
+                assert!(stores.pending.db.is_none());
+                assert!(stores.opens.is_empty());
+            }
+            "mismatch" => {
+                assert!(stores.pending.guard.is_some());
+                assert!(stores.pending.db.is_some());
+                assert_eq!(stores.opens.len(), 1);
+                let actual = guard_id(
+                    &File::open(sqlite_open_path_for_witness(&stores.owner.plan.state)).unwrap(),
+                )
+                .unwrap();
+                assert_ne!(
+                    actual,
+                    guard_id(stores.pending.guard.as_ref().unwrap()).unwrap()
+                );
+            }
+            "staging" => {
+                assert!(stores.state.is_some() && stores.log.is_some());
+                assert_eq!(stores.opens.len(), 2);
+            }
+            _ => {
+                assert!(stores.pending.bound.is_some());
+                assert_eq!(stores.state.is_some(), both);
+            }
+        }
+        let sql = SQL.with(|n| n.get());
+        drop(stores);
+        probe(&owner.plan.state, "cluster-owner", true);
+        probe(&owner.plan.state, "cluster-state", false);
+        if both {
+            probe(&owner.plan.state, "cluster-log", false);
+        }
+        let before = super::super::startup_plan::tests::objects(&owner.plan.state);
+        let retry = BoundStores::acquire(owner, intent);
+        assert_eq!(retry.first_failure(), Some(expected));
+        assert_eq!(retry.accesses, 0);
+        assert!(retry.opens.is_empty());
+        drop(retry);
+        assert_eq!(
+            before,
+            super::super::startup_plan::tests::objects(&owner.plan.state)
+        );
+        assert_eq!(SQL.with(|n| n.get()), sql);
+        sql
+    }
+    fn sqlite_open_path_for_witness(dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            dir.join("different.sqlite3")
+        }
+        #[cfg(unix)]
+        {
+            dir.join("cluster-state.sqlite3")
+        }
+    }
+    #[test]
+    fn retained_actual_sqlite_open_failure_keeps_guard_and_lock() {
+        let l = layout();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        assert_eq!(
+            real_failure(
+                &mut owner,
+                "sqlite-open",
+                BoundIntent::Fresh(init()),
+                BoundFailure::Open(StoreError::Sql),
+                false
+            ),
+            0
+        );
+    }
+    #[test]
+    fn retained_actual_configure_and_schema_failures_keep_owned_connections() {
+        for point in ["state-pragma", "log-pragma", "state-schema", "log-schema"] {
+            let l = layout();
+            let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+            assert!(
+                real_failure(
+                    &mut owner,
+                    point,
+                    BoundIntent::Fresh(init()),
+                    BoundFailure::Init(StoreError::Sql),
+                    point.starts_with("log")
+                ) > 0
+            );
+        }
+    }
+    #[test]
+    fn retained_actual_install_refusal_keeps_both_stores_and_original_baseline() {
+        let l = layout();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let baseline = super::super::startup_plan::tests::baseline(&owner);
+        real_failure(
+            &mut owner,
+            "staging",
+            BoundIntent::Fresh(init()),
+            BoundFailure::Layout,
+            true,
+        );
+        assert_eq!(
+            super::super::startup_plan::tests::baseline(&owner),
+            baseline
+        );
+    }
+    #[test]
+    fn retained_constructor_mismatch_refuses_before_any_application_sql() {
+        let l = layout();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        assert_eq!(
+            real_failure(
+                &mut owner,
+                "mismatch",
+                BoundIntent::Fresh(init()),
+                BoundFailure::Identity,
+                false
+            ),
+            0
+        );
+        drop(owner);
+        // Also exercise the read-only constructor before any trusted version query.
+        let l = seeded();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        assert_eq!(
+            real_failure(
+                &mut owner,
+                "mismatch",
+                BoundIntent::Inspect(init().cluster),
+                BoundFailure::Identity,
+                false
+            ),
+            0
+        );
     }
 
     fn seeded() -> super::super::startup_plan::tests::Layout {
