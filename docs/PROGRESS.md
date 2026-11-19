@@ -353,8 +353,17 @@ implementation remains ordered behind its source and platform qualification.
 Current main8bd/latestfirst44450232774 SUCCESS rechecked before assignment.
 Preserved prior branch checkpointf69d2c61, created `work/m3-sqlite-object-binding`
 from green8bd and carried only nine applicable docs paths, without held PR189 Rust.
-Preparing sole Sol6.1/high source assignment: one-crate patch, low-level binding,
-verifier and named disposable tests. Both slices exclude Engine/start/shutdown/
+Sole Sol6.1/high builder completed source-only `9c3b6828ece7c9bd6baf04cae893005e6dfad139`
+from docs-only `5f8ce2bc`:35 allowlisted paths, one-crate patch, test-only low-level
+binding and verifier. Parent docs preserved. Coordinator verified35 source,
+four input and140 artifact hashes/lengths; original upstream whitespace retained.
+Windows10 targeted cases,73 extracted build-guard cases and30 inventory negatives
+PASS; check/all-target Clippy/fmt PASS. Unix/cross-target and listed native negative
+gaps remain UNRUN. Two missing-provider links failed as expected, a narrower
+control than linking an actual unpatched library. Source/qualification review next;
+no hosted/operational acceptance. [Candidate evidence](evidence/m3-sqlite-binding-candidate.md).
+Output/evidence `D:/Temp/arx-bound-binding-build-v1`.
+Both slices exclude Engine/start/shutdown/
 process-supervisor/founder/network activation; no historical fix counter reset.
 No dependency/store source changes, runtime or fourth fix attempt authorized here.
 [PR186](https://github.com/Dytschgo/arxcovo/pull/186) merged as `eea7af57` from exact
