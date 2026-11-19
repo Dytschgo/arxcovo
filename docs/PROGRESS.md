@@ -82,8 +82,25 @@ per-iteration timeout around `Host::run`, at 15.248 s while
 passed 792/792 in PR192 CI 44596997600. The test is unchanged since #103 and
 PR192 touched only cfg(test) consensus code, but no cause or attribution is
 assigned. New, separate failure: fix attempts 0/3. No rerun. All merges,
-including PR191, are blocked until main is green on its exact SHA. Bounded Sol
-diagnosis follows.
+including PR191, are blocked until main is green on its exact SHA.
+Sol 6.1/high diagnosis (`D:/Temp/arx-e7-a8-diag/report.md`, SHA256
+`3be0faf5…4f30`): the 10 s bound covers the whole fixture lifecycle (startup
+audit, setup gate, discovery, drain joins, stop audit). Retained Windows passes
+1.725–3.580 s (Ubuntu 0.060–0.289 s, macOS 0.057–0.422 s); the failure at
+15.248 s is far outside that range. Local PC: 5 isolated passes 0.22–0.27 s,
+two service-subset runs 0.42–0.44 s; not reproduced (local suites also hit the
+known D:\Temp WRITE_OWNER fixture precondition, unrelated). Failing iteration
+and phase unknown; load plausible but unproved. Failure-only scalar phase trace
+prepared at local `628f734b` on `diag/e7-a8-lifecycle-trace` (from `92003177`),
+pending independent review. Fix counter 0/3.
+
+**PR191 first CI on rebased head `7466e5aa`:** CI 44599400768 attempt 1, all
+nine jobs SUCCESS (~9 min wall). Windows Rust 794/794 passed, 36 skipped,
+including all 26 owner_windows tests, `rename_info_terminates_name_inside_declared_size`
+and `publish_is_exact_for_every_target_length_residue`; first hosted Windows
+run of the rename fix. e7::a8 passed in 1.846 s in that run. Log
+`D:/Temp/arx-pr191-ci/win-7466.log` SHA256 `9bf415e7…7628`. All five required
+gates green; merge HELD only by red main.
 
 Main and PR190 have identical pre-fix owner-file source. The
 council decision requires a proved shared fix to land on main first and then be
