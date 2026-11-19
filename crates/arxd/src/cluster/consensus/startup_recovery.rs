@@ -32,6 +32,7 @@ pub(super) enum Observation {
         floor: u64,
         sample: u64,
         applied: Option<LogPos>,
+        membership: Option<(LogPos, MembershipBlob)>,
         clock: HostClock,
     },
 }
@@ -54,14 +55,23 @@ pub(super) fn prepare(
         if owner.has_stores() {
             let _locks = store_locks(&owner)?;
             let cluster = fresh_cluster.ok_or(Refusal::Provenance)?;
-            let (snapshot, applied) = inspect_state(&owner.plan.state, cluster)?;
+            let StateInspection {
+                snapshot,
+                applied,
+                membership,
+            } = inspect_state(&owner.plan.state, cluster)?;
             let log = inspect_log(&owner.plan.state, cluster)?;
             let state = snapshot_state(&snapshot).map_err(|_| Refusal::Store)?;
             let untouched = crate::cluster::enrollment::EnrollmentState::new(
                 cluster,
                 std::num::NonZeroU64::new(2).unwrap(),
             );
-            if applied.is_some() || log.last.is_some() || log.has_vote || state != untouched {
+            if applied.is_some()
+                || membership.is_some()
+                || log.last.is_some()
+                || log.has_vote
+                || state != untouched
+            {
                 return Err(Refusal::Provenance);
             }
             owner.recheck()?;
@@ -99,7 +109,11 @@ pub(super) fn prepare(
     // Existing SQL locks are held throughout immutable inspection. The outer
     // owner stays held across their release and the current-store openers.
     let locks = store_locks(&owner)?;
-    let (snapshot, applied) = inspect_state(&owner.plan.state, expected.cluster)?;
+    let StateInspection {
+        snapshot,
+        applied,
+        membership,
+    } = inspect_state(&owner.plan.state, expected.cluster)?;
     let log = inspect_log(&owner.plan.state, expected.cluster)?;
     validate_preflight(applied, &log).map_err(|_| Refusal::Store)?;
     if applied.is_none_or(|p| {
@@ -116,6 +130,8 @@ pub(super) fn prepare(
         .map_err(|_| Refusal::Clock)?;
     owner.recheck()?;
     drop(locks);
+    #[cfg(test)]
+    tests::mark_mutable_open();
     let sm = StateStore::open(
         &owner.plan.state,
         Init {
@@ -124,7 +140,7 @@ pub(super) fn prepare(
         },
     )
     .map_err(|_| Refusal::Store)?;
-    if sm.snapshot() != snapshot {
+    if sm.snapshot() != snapshot || sm.membership() != membership.as_ref() {
         return Err(Refusal::Store);
     }
     let mut log =
@@ -145,6 +161,7 @@ pub(super) fn prepare(
             floor,
             sample,
             applied,
+            membership,
             clock,
         },
     })
@@ -199,6 +216,20 @@ fn readonly(dir: &Path, stem: &str, max_pages: u64, schema: &[(&str, &str)]) -> 
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| Refusal::Store)?;
+    let defensive = db
+        .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|_| Refusal::Store)?;
+    let trusted = db
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA,
+            false,
+        )
+        .map_err(|_| Refusal::Store)?;
+    if !defensive || trusted {
+        return Err(Refusal::Store);
+    }
+    #[cfg(test)]
+    tests::observe_schema_expression(&db);
     for (key, exact, max) in [
         ("user_version", Some(2), 2),
         ("page_size", Some(4096), 4096),
@@ -216,12 +247,6 @@ fn readonly(dir: &Path, stem: &str, max_pages: u64, schema: &[(&str, &str)]) -> 
     }
     db.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA query_only=ON;")
         .map_err(|_| Refusal::Store)?;
-    let integrity: String = db
-        .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
-        .map_err(|_| Refusal::Store)?;
-    if integrity != "ok" {
-        return Err(Refusal::Store);
-    }
     let mut stmt = db
         .prepare("SELECT type,substr(name,1,65),substr(sql,1,513) FROM sqlite_schema ORDER BY name LIMIT 4")
         .map_err(|_| Refusal::Store)?;
@@ -245,9 +270,24 @@ fn readonly(dir: &Path, stem: &str, max_pages: u64, schema: &[(&str, &str)]) -> 
         return Err(Refusal::Store);
     }
     drop(stmt);
+    // Integrity traversal evaluates CHECK expressions. Only the exact bounded
+    // current schemas are permitted to reach it, even with trusted_schema off.
+    #[cfg(test)]
+    tests::mark_integrity();
+    let integrity: String = db
+        .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+        .map_err(|_| Refusal::Store)?;
+    if integrity != "ok" {
+        return Err(Refusal::Store);
+    }
     Ok(db)
 }
-fn inspect_state(dir: &Path, cluster: ClusterId) -> Result<(Vec<u8>, Option<LogPos>)> {
+struct StateInspection {
+    snapshot: Vec<u8>,
+    applied: Option<LogPos>,
+    membership: Option<(LogPos, MembershipBlob)>,
+}
+fn inspect_state(dir: &Path, cluster: ClusterId) -> Result<StateInspection> {
     let db = readonly(
         dir,
         "cluster-state",
@@ -277,11 +317,16 @@ fn inspect_state(dir: &Path, cluster: ClusterId) -> Result<(Vec<u8>, Option<LogP
         return Err(Refusal::Store);
     }
     let blob = raw.to_vec();
-    let (applied, _) = StateStore::inspect_snapshot(&blob, cluster).map_err(|_| Refusal::Store)?;
+    let (applied, membership) =
+        StateStore::inspect_snapshot(&blob, cluster).map_err(|_| Refusal::Store)?;
     if rows.next().map_err(|_| Refusal::Store)?.is_some() {
         return Err(Refusal::Store);
     }
-    Ok((blob, applied))
+    Ok(StateInspection {
+        snapshot: blob,
+        applied,
+        membership,
+    })
 }
 fn snapshot_state(
     blob: &[u8],
@@ -467,6 +512,9 @@ fn validate_preflight(
     applied: Option<LogPos>,
     log: &LogInspection,
 ) -> std::result::Result<(), StoreError> {
+    if applied.is_some_and(|a| a.index > i64::MAX as u64) {
+        return Err(StoreError::Corrupt);
+    }
     let valid = match applied {
         Some(a) => match log.purged {
             Some(p) if p.index > a.index => false,
@@ -487,6 +535,69 @@ mod tests {
         join_receipt::{Origin, tests::fixture},
         startup_plan::tests::Layout,
     };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    thread_local! {
+        static SCHEMA_PROBE: std::cell::RefCell<Option<Arc<AtomicUsize>>> = const { std::cell::RefCell::new(None) };
+        static MUTABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static PROBE_CONNECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static INTEGRITY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(super) fn mark_mutable_open() {
+        MUTABLE_OPENS.with(|n| n.set(n.get() + 1));
+    }
+    pub(super) fn mark_integrity() {
+        INTEGRITY_CALLS.with(|n| n.set(n.get() + 1));
+    }
+    // Test-only harmless CHECK evaluation counter, deliberately INNOCUOUS so
+    // trusted_schema=OFF alone cannot masquerade as schema-before-traversal.
+    fn register_schema_probe(db: &Connection, count: Arc<AtomicUsize>) {
+        unsafe extern "C" fn evaluate(
+            context: *mut rusqlite::ffi::sqlite3_context,
+            _: i32,
+            _: *mut *mut rusqlite::ffi::sqlite3_value,
+        ) {
+            let count =
+                unsafe { &*rusqlite::ffi::sqlite3_user_data(context).cast::<AtomicUsize>() };
+            count.fetch_add(1, Ordering::SeqCst);
+            unsafe {
+                rusqlite::ffi::sqlite3_result_int(context, 1);
+            }
+        }
+        unsafe extern "C" fn release(data: *mut std::ffi::c_void) {
+            drop(unsafe { Arc::from_raw(data.cast::<AtomicUsize>()) });
+        }
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_create_function_v2(
+                db.handle(),
+                c"arx_schema_probe".as_ptr(),
+                1,
+                rusqlite::ffi::SQLITE_UTF8 | rusqlite::ffi::SQLITE_INNOCUOUS,
+                Arc::into_raw(count).cast_mut().cast(),
+                Some(evaluate),
+                None,
+                None,
+                Some(release),
+            )
+        };
+        assert_eq!(code, rusqlite::ffi::SQLITE_OK);
+    }
+    pub(super) fn observe_schema_expression(db: &Connection) {
+        SCHEMA_PROBE.with(|slot| {
+            if let Some(count) = slot.borrow().as_ref() {
+                PROBE_CONNECTIONS.with(|n| n.set(n.get() + 1));
+                register_schema_probe(db, count.clone());
+            }
+        });
+    }
+    struct ResetProbe;
+    impl Drop for ResetProbe {
+        fn drop(&mut self) {
+            SCHEMA_PROBE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
     fn init() -> Init {
         Init {
             cluster: [1; 16],
@@ -612,10 +723,17 @@ mod tests {
         drop(log);
         let before = l.snapshot();
         let prepared = prepare(l.plan("recover-joiner"), Some(&expected), None, false).unwrap();
-        assert!(matches!(
-            prepared.observation,
-            Observation::Recovered { floor: 12, .. }
-        ));
+        match &prepared.observation {
+            Observation::Recovered {
+                floor: 12,
+                membership: Some((position, blob)),
+                ..
+            } => {
+                assert_eq!(*position, p(1));
+                assert_eq!(blob.bytes(), m.encode().unwrap());
+            }
+            _ => panic!("exact recovered membership required"),
+        }
         drop(prepared);
         assert_eq!(l.snapshot(), before);
         assert!(matches!(
@@ -699,11 +817,13 @@ mod tests {
                     floor,
                     sample,
                     applied,
+                    membership,
                     clock,
                 } => {
                     assert_eq!(*floor, 123456);
                     assert!(*sample >= *floor);
                     assert_eq!(*applied, Some(expected.origin.position()));
+                    assert!(membership.is_none());
                     assert!(clock.sample_ms().is_ok());
                 }
                 _ => panic!("expected recovered"),
@@ -880,5 +1000,93 @@ mod tests {
             assert!(prepare(l.plan("recover-founder"), Some(&expected), None, false).is_err());
             assert_eq!(l.snapshot(), before);
         }
+    }
+    #[test]
+    fn unsupported_schema_refuses_without_evaluating_check() {
+        let l = Layout::new();
+        initialized(&l);
+        let expected = identity(&l);
+        found(&l, &expected, 17);
+        let count = Arc::new(AtomicUsize::new(0));
+        let db = Connection::open(l.root.path().join("state/cluster-state.sqlite3")).unwrap();
+        register_schema_probe(&db, count.clone());
+        db.execute_batch(
+            "CREATE TABLE extra(x CHECK(arx_schema_probe(x))); INSERT INTO extra VALUES(1);",
+        )
+        .unwrap();
+        count.store(0, Ordering::SeqCst);
+        let checked: String = db
+            .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(checked, "ok");
+        assert!(
+            count.load(Ordering::SeqCst) > 0,
+            "fixture CHECK must be observable"
+        );
+        drop(db);
+        count.store(0, Ordering::SeqCst);
+        let before = l.snapshot();
+        SCHEMA_PROBE.with(|slot| *slot.borrow_mut() = Some(count.clone()));
+        let _reset = ResetProbe;
+        let owner = Owner::acquire(l.plan("recover-founder")).unwrap();
+        let _locks = store_locks(&owner).unwrap();
+        PROBE_CONNECTIONS.with(|n| n.set(0));
+        INTEGRITY_CALLS.with(|n| n.set(0));
+        let result = inspect_state(&owner.plan.state, [1; 16]);
+        assert!(matches!(result, Err(Refusal::Store)));
+        assert_eq!(
+            PROBE_CONNECTIONS.with(|n| n.get()),
+            1,
+            "must reach read-only SQLite inspection"
+        );
+        assert_eq!(
+            INTEGRITY_CALLS.with(|n| n.get()),
+            0,
+            "unsupported schema reached integrity traversal"
+        );
+        assert_eq!(l.snapshot(), before);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "unsupported CHECK executed before schema rejection"
+        );
+    }
+    #[test]
+    fn oversized_applied_index_refuses_before_mutable_open() {
+        let l = Layout::new();
+        initialized(&l);
+        let expected = identity(&l);
+        found(&l, &expected, 17);
+        let db = Connection::open(l.root.path().join("state/cluster-state.sqlite3")).unwrap();
+        let mut blob: Vec<u8> = db
+            .query_row("SELECT snapshot FROM sm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blob[10], 1);
+        blob[27..35].copy_from_slice(&(i64::MAX as u64 + 1).to_be_bytes());
+        let n = blob.len() - 32;
+        let hash = Sha256::digest(&blob[..n]);
+        blob[n..].copy_from_slice(&hash);
+        assert_eq!(
+            StateStore::inspect_snapshot(&blob, [1; 16])
+                .unwrap()
+                .0
+                .unwrap()
+                .index,
+            i64::MAX as u64 + 1
+        );
+        db.execute("UPDATE sm SET snapshot=?1", [blob]).unwrap();
+        drop(db);
+        let before = l.snapshot();
+        MUTABLE_OPENS.with(|n| n.set(0));
+        assert!(matches!(
+            prepare(l.plan("recover-founder"), Some(&expected), None, false),
+            Err(Refusal::Store)
+        ));
+        assert_eq!(l.snapshot(), before);
+        assert_eq!(
+            MUTABLE_OPENS.with(|n| n.get()),
+            0,
+            "invalid applied index reached mutable store opener"
+        );
     }
 }
