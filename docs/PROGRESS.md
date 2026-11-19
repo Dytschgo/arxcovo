@@ -43,6 +43,35 @@ PR188 as the last merge, that is superseded by this summary.
   Open decisions D1 custody, D2 partial founding, D3 endpoint discovery, D4
   remote delegation, D5 real-time expiry evidence, D6 exhausted Engine boundary
   (slice 5+ needs explicit owner authority before crossing it), D7 owner/hardware.
+- **M3 slice 1, bound store construction (this PR):** first Sol 6.1/high
+  builder stopped at 3/3 failed fixes with partial `ea4ecad1` (3 new tests hit an
+  unexpected Layout refusal). Fresh independent Sol 6.1/high stuck-rule review
+  (`D:/Temp/arx-bound-store-review/review.md`, SHA256 `dc00a848…98b8`, four
+  bounded diagnostic runs, zero fixes) confirmed a product defect: fresh creation
+  ran `config::checked_path` on the absent new leaf (startup_plan.rs:488), plus
+  source findings SP2 (version-0 log could be initialized), SP3 (incomplete
+  untouched-genesis check), SP4 (recovery skipped pair compatibility) and ST1
+  (coverage). **Owner authorization (2026-11-19):** "I want that you solve those
+  things"; recorded as a new scoped assignment for exactly SP1–SP4 and ST1 with a
+  fresh 3-attempt budget for that scope. The first builder stays recorded 3/3
+  exhausted; Engine Sol 3/3 and Opus 0/2 unchanged. Second Sol 6.1/high builder
+  used 2/3 (`38f701e5`, `6b0928d4` on rebased `328aa5b4`); report
+  `D:/Temp/arx-bound-store-2/report.md` SHA256 `fff605cd…09ad`. Local Windows
+  NTFS: bound 20, state 17, log 16, startup-plan 3 tests pass; static gate,
+  fmt, Clippy, loader and SQLite verifier (33 negative controls) pass. Unix and
+  macOS unexercised locally. Independent exact-head review and hosted CI pending.
+- **M3 slice 3, custody (decision D1):** Sol 6.1/high contract
+  `D:/Temp/arx-m3-custody-d1/contract.md`; independent review GO with required
+  changes (`D:/Temp/arx-m3-custody-d1-review/review.md`, SHA256 `4a3ac971…7cfe`;
+  SP1 P2: freeze the envelope byte layout with independent codec fixtures).
+  Coordinator adopted contract decisions 1–5: hosted per-node daemon-only file
+  wrapping with authenticated envelopes first (native unsupported until
+  qualified; ADR 0037 to reconcile with ADR 0005/0009/0029); fixed 365-day CA,
+  unchanged 30-day leaves, refusal when a full leaf no longer fits, no renewal in
+  this slice (availability limitation recorded); minimal distinct-UID hosted
+  Ubuntu harness as evidence; D2 partial founding fail-closed, settled in slice 4
+  before any startup claim; daemon/build separation retained for remote
+  execution. Owner native route not requested. Contract revision in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
