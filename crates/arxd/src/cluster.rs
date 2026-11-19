@@ -1,3 +1,4 @@
+mod bound_open;
 pub mod consensus;
 pub mod enrollment;
 mod join_receipt;
