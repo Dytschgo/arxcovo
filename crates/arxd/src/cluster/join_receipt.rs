@@ -245,6 +245,48 @@ pub(in crate::cluster) mod tests {
         UnixTime::now()
     }
     #[test]
+    fn literal_v1_public_role_codec_fixtures() {
+        // Handwritten wire fixtures, independent of fixture() and Serialize.
+        // The leaf is deliberately opaque here: certificate verification has
+        // separate real-certificate coverage and is not claimed by this test.
+        const FOUNDER: &[u8] = br#"{"version":1,"cluster":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"node":1,"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ca":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"origin":{"role":"founder","term":7,"leader":1,"index":11},"leaf":[48,0],"artifact":"sealed-key"}"#;
+        const JOINER: &[u8] = br#"{"version":1,"cluster":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"node":2,"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"ca":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"origin":{"role":"joiner","term":7,"leader":1,"index":13,"anchors":[[1,[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9]]]},"leaf":[48,0],"artifact":"sealed-key"}"#;
+        for (bytes, node, origin) in [
+            (
+                FOUNDER,
+                1,
+                Origin::Found {
+                    term: 7,
+                    leader: 1,
+                    index: 11,
+                },
+            ),
+            (
+                JOINER,
+                2,
+                Origin::Redeem {
+                    term: 7,
+                    leader: 1,
+                    index: 13,
+                    anchors: vec![(1, [9; 32])],
+                },
+            ),
+        ] {
+            let expected = PublicIdentity {
+                version: 1,
+                cluster: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                node,
+                key: [0; 32],
+                ca: [3; 32],
+                origin,
+                leaf: vec![48, 0],
+                artifact: "sealed-key".into(),
+            };
+            assert_eq!(PublicIdentity::decode(bytes).unwrap(), expected);
+            assert_eq!(serde_json::to_vec(&expected).unwrap(), bytes);
+        }
+    }
+    #[test]
     fn public_roles_crypto_and_trusted_history() {
         for (n, origin) in [
             (
