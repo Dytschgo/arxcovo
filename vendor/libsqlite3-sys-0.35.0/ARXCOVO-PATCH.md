@@ -25,6 +25,8 @@ platforms. Windows NTFS evidence does not qualify other filesystems.
 
 Exact maintained upstream hunks follow (no executable patch applicator):
 
+Unix native qualification additionally requires sizeof(void*)==8; architecture macros alone do not qualify x32/ILP32.
+
 ```diff
 --- upstream/build.rs
 +++ patched/build.rs
@@ -87,28 +89,6 @@ Exact maintained upstream hunks follow (no executable patch applicator):
      let out_dir = env::var("OUT_DIR").unwrap();
      let out_path = Path::new(&out_dir).join("bindgen.rs");
      if cfg!(feature = "in_gecko") {
---- upstream/sqlite3/bindgen_bundled_version.rs
-+++ patched/sqlite3/bindgen_bundled_version.rs
-@@ -3518,3 +3518,19 @@
-         ) -> ::std::os::raw::c_int,
-     >,
- }
-+
-+// ARXCOVO private actual-open ABI v1; maintained without regenerating bindings.
-+pub const ARX_FCNTL_IDENTITY_V1: ::std::os::raw::c_int = 0x41525831;
-+#[repr(C)]
-+#[derive(Debug, Copy, Clone)]
-+pub struct ArxIdentityV1 {
-+    pub magic: u32, pub abi_version: u32, pub struct_bytes: u32,
-+    pub status: u32, pub os_errno: u32, pub vfs_kind: u32,
-+    pub dev_lo: u32, pub dev_hi: u32, pub ino_lo: u32, pub ino_hi: u32,
-+    pub nlink_lo: u32, pub nlink_hi: u32, pub mode: u32, pub flags: u32,
-+    pub reserved: [u32; 6],
-+}
-+unsafe extern "C" {
-+    pub fn sqlite3_arxcovo_bound_abi_v1() -> ::std::os::raw::c_int;
-+    pub fn sqlite3_arxcovo_qualify_main_v1(db: *mut sqlite3) -> ::std::os::raw::c_int;
-+}
 --- upstream/sqlite3/sqlite3.c
 +++ patched/sqlite3/sqlite3.c
 @@ -1548,6 +1548,36 @@
@@ -207,7 +187,7 @@ Exact maintained upstream hunks follow (no executable patch applicator):
  */
 +static int arxUnixNative(sqlite3_file *file, sqlite3_vfs *vfs){
 +#if (defined(__linux__) || defined(__APPLE__)) && (defined(__x86_64__) || defined(__aarch64__))
-+  return file && arxUnixVfs && vfs==arxUnixVfs
++  return sizeof(void*)==8 && file && arxUnixVfs && vfs==arxUnixVfs
 +      && file->pMethods==&posixIoMethods;
 +#else
 +  return 0;
@@ -313,4 +293,26 @@ Exact maintained upstream hunks follow (no executable patch applicator):
  #define SQLITE_FCNTL_FILE_POINTER            7
  #define SQLITE_FCNTL_SYNC_OMITTED            8
  #define SQLITE_FCNTL_WIN32_AV_RETRY          9
+--- upstream/sqlite3/bindgen_bundled_version.rs
++++ patched/sqlite3/bindgen_bundled_version.rs
+@@ -3518,3 +3518,19 @@
+         ) -> ::std::os::raw::c_int,
+     >,
+ }
++
++// ARXCOVO private actual-open ABI v1; maintained without regenerating bindings.
++pub const ARX_FCNTL_IDENTITY_V1: ::std::os::raw::c_int = 0x41525831;
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
++pub struct ArxIdentityV1 {
++    pub magic: u32, pub abi_version: u32, pub struct_bytes: u32,
++    pub status: u32, pub os_errno: u32, pub vfs_kind: u32,
++    pub dev_lo: u32, pub dev_hi: u32, pub ino_lo: u32, pub ino_hi: u32,
++    pub nlink_lo: u32, pub nlink_hi: u32, pub mode: u32, pub flags: u32,
++    pub reserved: [u32; 6],
++}
++unsafe extern "C" {
++    pub fn sqlite3_arxcovo_bound_abi_v1() -> ::std::os::raw::c_int;
++    pub fn sqlite3_arxcovo_qualify_main_v1(db: *mut sqlite3) -> ::std::os::raw::c_int;
++}
 ```

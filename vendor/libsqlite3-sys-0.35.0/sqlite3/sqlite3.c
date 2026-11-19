@@ -44714,7 +44714,7 @@ typedef const sqlite3_io_methods *(*finder_type)(const char*,unixFile*);
 */
 static int arxUnixNative(sqlite3_file *file, sqlite3_vfs *vfs){
 #if (defined(__linux__) || defined(__APPLE__)) && (defined(__x86_64__) || defined(__aarch64__))
-  return file && arxUnixVfs && vfs==arxUnixVfs
+  return sizeof(void*)==8 && file && arxUnixVfs && vfs==arxUnixVfs
       && file->pMethods==&posixIoMethods;
 #else
   return 0;

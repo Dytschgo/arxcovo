@@ -33,6 +33,13 @@ def read(path, limit=12_000_000):
 def digest(data):
     return {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
 
+def unix_abi_guard(source):
+    marker = 'static int arxUnixNative(sqlite3_file *file, sqlite3_vfs *vfs){'
+    require(source.count(marker) == 1, 'Unix native qualification definition')
+    body = source.split(marker, 1)[1].split('\n}', 1)[0]
+    require('return sizeof(void*)==8 && file && arxUnixVfs && vfs==arxUnixVfs' in body,
+            'Unix qualification requires 64-bit pointer ABI')
+
 def inventory(pins, observed):
     require(len(pins['original']) == 28, 'upstream count')
     require(set(pins['patched']) == PATCHED, 'patch footprint')
@@ -85,6 +92,8 @@ def main():
                 and 'sqlite3_arxcovo_qualify_main_v1' in data and 'sqlite3_arxcovo_bound_abi_v1' in data,
                 'ABI/source declaration')
     configs(root)
+    native_source=read(v/'sqlite3/sqlite3.c').decode()
+    unix_abi_guard(native_source)
     metadata=json.loads(read(args.metadata,20_000_000))
     packages=[p for p in metadata['packages'] if p['name']=='libsqlite3-sys']
     require(len(packages)==1 and Path(packages[0]['manifest_path']).resolve()==(v/'Cargo.toml').resolve(), 'effective fork path')
@@ -112,6 +121,16 @@ def main():
     require(1 <= len(candidates) <= 2 and len({hashlib.sha256(read(p)).digest() for p in candidates})==1, 'missing/ambiguous static SQLite library')
     negatives=0
     if args.self_test:
+        # Width policy checks are source controls, not native ILP32 execution.
+        for width in ['4', '16']:
+            wrong=native_source.replace('sizeof(void*)==8', f'sizeof(void*)=={width}')
+            try: unix_abi_guard(wrong)
+            except ValueError: negatives+=1
+            else: raise ValueError('unsupported Unix ABI width accepted')
+        wrong=native_source.replace('sizeof(void*)==8 && ', '')
+        try: unix_abi_guard(wrong)
+        except ValueError: negatives+=1
+        else: raise ValueError('missing Unix ABI width accepted')
         # Pure inventory negative controls: no source mutation or product execution.
         for name in sorted(files):
             wrong=dict(files); wrong[name]={'sha256':'0'*64,'bytes':0}
