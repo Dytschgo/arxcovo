@@ -83,7 +83,37 @@ PR188 as the last merge, that is superseded by this summary.
   this slice (availability limitation recorded); minimal distinct-UID hosted
   Ubuntu harness as evidence; D2 partial founding fail-closed, settled in slice 4
   before any startup claim; daemon/build separation retained for remote
-  execution. Owner native route not requested. Contract revision in progress.
+  execution. Owner native route not requested. Revised contract (frozen byte
+  layout, hex fixtures, builder brief) and ADR 0037 draft passed an independent
+  re-review GO (`D:/Temp/arx-m3-custody-d1-review2/review.md`, SHA256
+  `cadb9acb…7920`); coordinator split slice 3 into 3a (codec, custody module,
+  production CA loading/lifetime, ADR 0037; this PR #197) and 3b (hosted
+  distinct-UID harness plus one Linux CI step, pins first).
+- **PR #197, custody 3a:** Sol 6.1/high builder `0f5be417`, `8fad93fa`; the local
+  Linux cross-compile was unavailable (environment, not counted as a failed fix).
+  First hosted CI 44647000157 failed Ubuntu Clippy (collapsible_if in a Linux test)
+  and macOS `found_tests::f7_clock_guard_order` (new sign-time containment changed
+  the ephemeral test CA's behaviour); one final attempt fixed both in pki only
+  (`41fb1333`, `11afeeb9`; builder 3/3). CI 44647884144 then passed everywhere,
+  Ubuntu 811/811 including all six Linux custody file tests. Independent review of
+  the earlier head (`D:/Temp/arx-pr197-review/review.md`, SHA256 `90e6cffa…3310`):
+  CHANGES REQUESTED, P2 coverage for nonregular files, unsafe ancestors and
+  fresh-install failures. **Owner authorization (2026-11-20):** a new scoped
+  builder adds only those tests with a fresh 3-attempt budget. Result `0bab52f1`
+  (0/3 used; report `D:/Temp/arx-custody-3a-cov/report.md`, SHA256
+  `2a1cc5c2…059f087`): seven enabled Linux tests plus one ignored foreign-owner
+  fixture; local pki 38, issue 27 pass. Gaps: Linux runs only in hosted CI;
+  foreign-owner execution not run; a failure of the final sync after complete
+  bytes leaves a file the loader accepts. Rebased onto main `c8e6dab7`. Fresh
+  exact-head review pending.
+- **PR #196 merged** as `c8e6dab7` (M3 slice 1). Final independent review PASS,
+  0/0 findings (`D:/Temp/arx-pr196-review2/review.md`, SHA256 `f8ec7520…7819`),
+  all five gates green on head `da8da5d9`.
+- **M3 slice 2 (bound offline recovery):** Sol 6.1/high brief
+  `D:/Temp/arx-m3-step2/brief.md` (SHA256 `36b23a40…f96d`). Coordinator
+  decisions: keep the old inspector's layout entry policy (zero-length WAL
+  accepted) instead of tightening it, and keep the merged one-shot
+  Inspect/Complete behaviour. Independent brief review pending.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
