@@ -60,7 +60,7 @@ merged, as listed under "Merged this session".
 - **Risk:** Windows Rust job margin under its 12 minute timeout is thin since
   PR194 (10m36s once; later main runs 8m53s, 9m25s, 6m14s, 5m05s).
 - **Earlier M3 slice plan (superseded by steps 6–8 below):** Sol 6.1/high read-only plan
-  `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…a1`): 16 ordered
+  `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…1a`): 16 ordered
   one-PR slices to the three-container acceptance. Next: store-only bound SQLite
   store construction (ADR 0035 second slice), no Engine/startup/deadline change.
   Open decisions D1 custody, D2 partial founding, D3 endpoint discovery, D4
@@ -79,7 +79,7 @@ merged, as listed under "Merged this session".
   fresh 3-attempt budget for that scope. The first builder stays recorded 3/3
   exhausted; Engine Sol 3/3 and Opus 0/2 unchanged. Second Sol 6.1/high builder
   used 2/3 (`38f701e5`, `6b0928d4` on rebased `328aa5b4`); report
-  `D:/Temp/arx-bound-store-2/report.md` SHA256 `fff605cd…09ad`. Local Windows
+  `D:/Temp/arx-bound-store-2/report-before-st1.md` SHA256 `fff605cd…09ad`. Local Windows
   NTFS: bound 20, state 17, log 16, startup-plan 3 tests pass; static gate,
   fmt, Clippy, loader and SQLite verifier (33 negative controls) pass. Unix and
   macOS unexercised locally. First exact-head review (head `5e3efef0`,
@@ -133,7 +133,8 @@ merged, as listed under "Merged this session".
   0/0 findings (`D:/Temp/arx-pr196-review2/review.md`, SHA256 `f8ec7520…7819`),
   all five gates green on head `da8da5d9`.
 - **M3 slice 2 (bound offline recovery):** Sol 6.1/high brief
-  `D:/Temp/arx-m3-step2/brief.md` (SHA256 `36b23a40…f96d`). Coordinator
+  `D:/Temp/arx-m3-step2/brief.md` (original brief SHA256 `36b23a40…f96d`, as recorded in
+  `D:/Temp/arx-m3-step2-review/review.md`; the file now holds the revised brief below). Coordinator
   decisions: keep the old inspector's layout entry policy (zero-length WAL
   accepted) instead of tightening it, and keep the merged one-shot
   Inspect/Complete behaviour. Independent brief review pending.
@@ -156,7 +157,7 @@ merged, as listed under "Merged this session".
   then a stale interstage expectation; builder 3/3); each was diagnosed by an
   independent reviewer, the owner authorized further scoped builders (2026-11-20),
   and the final head `ce0fd7f8` passed review (`D:/Temp/arx-pr198-review3/review.md`,
-  SHA256 `b8c6a1a8…2162735`) with full Ubuntu and macOS suites green.
+  SHA256 `b8c6a1a8…7162735`) with full Ubuntu and macOS suites green.
 - **PR #197 merged** as `85eccce8` (custody 3a); main push CI 44717451865 green.
   Review of `b4c66e97` PASS (`D:/Temp/arx-pr197-review2/review.md`, SHA256
   `5d6f7dd1…b4`); crash durability recorded as unqualified.
@@ -182,7 +183,7 @@ merged, as listed under "Merged this session".
   durability as a later 4a-W; trusted restart-history source deferred to before the
   three-container restart test; no power-loss experiments on the owner PC. First builder
   stopped 3/3 at `f3d492d0` (a test expected `sealed-key` instead of `member-key`). Fresh
-  stuck-rule review (`D:/Temp/arx-m3-step4a-stuck/review.md`, SHA256 `c4c9cdcc…e2b6`)
+  stuck-rule review (`D:/Temp/arx-m3-step4a-stuck/review.md`, SHA256 `c4c9cdcc…b2e6`)
   added three P2 findings. **Owner authorization (2026-11-20):** new scoped builder,
   fresh 3 attempts; used 0/3, head `ae36438e`; report `D:/Temp/arx-m3-step4a-2/report.md`
   SHA256 `06d7ebdc…1d56`: 48 Windows tests pass (publication 1, PKI 38, receipt 4,
@@ -198,13 +199,15 @@ merged, as listed under "Merged this session".
   changes only via coordinator plus independent review (recorded in the pins). Round 1
   (`bd7c18a0`) stopped on a candidate `--list` exit 1; amendment A3 (discovery-only
   completed nonzero listings, exactly one zero-exit exact match) was reviewed
-  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a75`) and adopted
+  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a51`) and adopted
   verbatim. Round 2 (`40fdbb30`) qualified: all 13 custody cases passed on the hosted
   runner (founder create/deny/same-UID control/release/restart, both learners), each
   invocation selected=1/passed=1/failed=0, zero refusals, launcher 9.536 s of a 150 s
   ceiling, cleanup verified; no image re-pin was needed (the GLIBC 2.39 executable ran
-  in the pinned Ubuntu 24.04 image). Campaign report `D:/Temp/arx-pr199-q1/report.md`
-  SHA256 `9927642c…aa8d6`. Exact-head review of `40fdbb30`
+  in the pinned Ubuntu 24.04 image). Round-2 campaign report SHA256 `9927642c…aa8d6`
+  (verified in `D:/Temp/arx-pr199-review4/review.md`); the file now at
+  `D:/Temp/arx-pr199-q1/report.md` is the round-3 report cited below and retains the
+  round-2 summary. Exact-head review of `40fdbb30`
   (`D:/Temp/arx-pr199-review4/review.md`, SHA256 `0ebec5ea…ff2`): two P2 — this stale
   record (corrected in a docs commit) and missing actual scratch high-water bytes
   required by the pins. Campaign round 3 (code head `a660231e`) added the measurement
@@ -215,8 +218,8 @@ merged, as listed under "Merged this session".
   (`D:/Temp/arx-pr199-review5/review.md`, SHA256 `64eddd44…a2a`) closed SP4-1 and asked
   for this record to be brought up to date. Counters: four earlier 3b builders 3/3
   each; Q1 3/6 rounds used, stopped on qualification; Engine Sol 3/3, Opus 0/2.
-  The code under review is the round-3 head; later commits on this branch are docs
-  only.
+  At the round-3 review checkpoint, the code head was `a660231e`. The subsequent
+  commits on PR #199 were docs-only.
 - **Custody 3b harness (this PR):** adopted pins committed as
   [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
   `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
@@ -286,8 +289,8 @@ merged, as listed under "Merged this session".
   ordinary CI test of the real Engine start/close (no founding). At the time of the
   owner decision PR #202 still carried the superseded launcher; the merged version
   uses the ordinary CI test described below. Earlier
-  design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. AGENTS.md
-  updated in this docs PR.
+  design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. PR #203 updated
+  AGENTS.md.
 - **Owner decisions D3/D4 (2026-11-20):** D4 target-authorized delegation (host B
   trusts host A's authenticated assertions only for agents B explicitly grants; single
   use; Unknown when execution or cleanup is unconfirmed; B's standard build identity).
@@ -306,7 +309,7 @@ merged, as listed under "Merged this session".
   this observed scope; Engine counters Sol 3/3 and Opus 0/2 unchanged.
 - **PR #204 merged** as `c10fff18` (step 7a, outside D6). After the stuck-rule
   review the owner-authorized builder reached `f5abf8ff`; exact-head review
-  (`D:/Temp/arx-pr204-review/review.md`, SHA256 `990d3cc3…9d74`) held on one spec P2:
+  (`D:/Temp/arx-pr204-review/review.md`, SHA256 `990d3cc3…6d74`) held on one spec P2:
   the client could release Redeem with an unexpected frame already buffered after the
   valid Anchor. **Provider block (2026-11-20):** the Sol 6.2 fix delegate was refused
   by the provider ("flagged for possible cybersecurity risk"); no change was made and
@@ -320,7 +323,7 @@ merged, as listed under "Merged this session".
   inherent** that data still in flight can arrive after the check (the client refuses
   it at its next read). Builder `11e75b11` passed in attempt 1/3 with a deterministic
   exhausted-budget test (report `D:/Temp/arx-m3-step7a-4/report.md` SHA256
-  `fb9dc74e…2d22`). Main refresh `b7691e35` (byte-identical patch); review 3 PASS with
+  `fb9dc74e…9d22`). Main refresh `b7691e35` (byte-identical patch); review 3 PASS with
   zero findings (`D:/Temp/arx-pr204-review3/review.md`, SHA256 `1db2d432…b59c`),
   agent-review status 59502799642. Live issuance, durable join and multi-host paths
   are **unverified on real hardware**.
