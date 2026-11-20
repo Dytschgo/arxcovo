@@ -126,15 +126,15 @@ pub(in crate::cluster) fn exchange(
     assert_eq!(proof.len(), 32);
     Ok(proof.try_into().unwrap())
 }
-struct Fixture {
-    root: Vec<u8>,
-    good: Vec<u8>,
-    attacker: Vec<u8>,
-    good_key: KeyPair,
-    bad_key: KeyPair,
-    list: Vec<u8>,
-    bad_list: Vec<u8>,
-    code: JoinCode,
+pub(in crate::cluster) struct Fixture {
+    pub(in crate::cluster) root: Vec<u8>,
+    pub(in crate::cluster) good: Vec<u8>,
+    pub(in crate::cluster) attacker: Vec<u8>,
+    pub(in crate::cluster) good_key: KeyPair,
+    pub(in crate::cluster) bad_key: KeyPair,
+    pub(in crate::cluster) list: Vec<u8>,
+    pub(in crate::cluster) bad_list: Vec<u8>,
+    pub(in crate::cluster) code: JoinCode,
 }
 fn list(key: &KeyPair) -> Vec<u8> {
     let mut b = vec![1];
@@ -150,10 +150,10 @@ pub(super) fn test_client() -> PreproofClient {
     let f = fixture();
     PreproofClient::new(&f.code, &f.root, Arc::new(ProbeTime)).unwrap()
 }
-fn fixture() -> Fixture {
+pub(in crate::cluster) fn fixture() -> Fixture {
     fixture_identity([1; 16], 1)
 }
-fn fixture_identity(cluster: [u8; 16], node: u64) -> Fixture {
+pub(in crate::cluster) fn fixture_identity(cluster: [u8; 16], node: u64) -> Fixture {
     let key = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::default();
     ca.not_before = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
@@ -253,10 +253,7 @@ impl ResolvesServerCert for WrongSigner {
         Some(self.0.clone())
     }
 }
-#[test]
-fn adversary_certificate_verify_zero_proof() {
-    super::preproof::SIGNATURE_CALLS.with(|n| n.set(0));
-    let f = fixture();
+pub(in crate::cluster) fn wrong_signer_config(f: &Fixture) -> ServerConfig {
     let provider = Arc::new(ring::default_provider());
     let key = provider
         .key_provider
@@ -269,6 +266,14 @@ fn adversary_certificate_verify_zero_proof() {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(WrongSigner(Arc::new(certified))));
     config.send_tls13_tickets = 0;
+    config
+}
+
+#[test]
+fn adversary_certificate_verify_zero_proof() {
+    super::preproof::SIGNATURE_CALLS.with(|n| n.set(0));
+    let f = fixture();
+    let config = wrong_signer_config(&f);
     let s = ServerConnection::new(Arc::new(config)).unwrap();
     let list = f.list.clone();
     attack(f, s, list);

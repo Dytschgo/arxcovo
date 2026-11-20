@@ -1,9 +1,11 @@
-//! Private bootstrap probe. Chain trust alone grants no membership authority.
+//! Private bootstrap client. Chain trust alone grants no membership authority.
 use super::verify::{SERVER_NAME, peer_identity};
-use crate::cluster::enrollment::{BoundVoters, ClusterId, CodeId, JoinAnchor, JoinCode};
+use crate::cluster::enrollment::{
+    BoundVoters, ClusterId, JoinAnchor, JoinCode, RequestId,
+    session::{self, QuotaSocket, Reply, SOCKET_BUDGET, SocketLimits},
+};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, Error, ProtocolVersion, RootCertStore,
-    SignatureScheme,
+    ClientConfig, DigitallySignedStruct, Error, HandshakeKind, RootCertStore, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::{CryptoProvider, ring, verify_tls13_signature},
     pki_types::{CertificateDer, ServerName, UnixTime},
@@ -11,12 +13,14 @@ use rustls::{
     time_provider::TimeProvider,
 };
 use sha2::{Digest, Sha256};
-use std::{
-    io::{self, Read, Write},
-    sync::Arc,
+use std::{net::SocketAddr, sync::Arc};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    time::{Instant, timeout_at},
 };
+use tokio_rustls::TlsConnector;
 
-const QUOTA: usize = 128 * 1024;
 #[cfg(test)]
 thread_local! { pub(super) static SIGNATURE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +94,165 @@ impl ServerCertVerifier for BootstrapVerifier {
             .supported_schemes()
     }
 }
+fn client_config(
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+) -> Result<ClientConfig, Refused> {
+    if root.is_empty()
+        || root.len() > 4096
+        || <[u8; 32]>::from(Sha256::digest(root)) != code.ca_fingerprint()
+    {
+        return Err(Refused);
+    }
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(root.to_vec()))
+        .map_err(|_| Refused)?;
+    let provider = Arc::new(ring::default_provider());
+    let verifier = Arc::new(BootstrapVerifier {
+        cluster: code.cluster(),
+        roots,
+        provider: provider.clone(),
+    });
+    let mut config = ClientConfig::builder_with_details(provider, time)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| Refused)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.enable_sni = false;
+    config.resumption = rustls::client::Resumption::disabled();
+    config.enable_early_data = false;
+    Ok(config)
+}
+
+#[cfg(test)]
+pub(in crate::cluster) fn test_config(
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+) -> ClientConfig {
+    let mut config = client_config(code, root, time).unwrap();
+    config.resumption = rustls::client::Resumption::in_memory_sessions(8);
+    config
+}
+
+fn check_voters(
+    connection: &rustls::ClientConnection,
+    cluster: ClusterId,
+    anchor: JoinAnchor,
+    voters: &BoundVoters,
+) -> Result<(), Refused> {
+    if voters.anchor(cluster) != anchor {
+        return Err(Refused);
+    }
+    let Some([cert]) = connection.peer_certificates() else {
+        return Err(Refused);
+    };
+    let identity = peer_identity(cert).map_err(|_| Refused)?;
+    if identity.cluster != cluster || !voters.contains(identity.node, identity.key) {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::cluster) enum ExchangeError {
+    Refused,
+    PossibleEffect,
+}
+
+/// Bounded protocol data from a completed authenticated exchange.
+pub(in crate::cluster) struct Completed {
+    voters: BoundVoters,
+    reply: Reply,
+}
+
+impl Completed {
+    pub(in crate::cluster) fn voters(&self) -> &BoundVoters {
+        &self.voters
+    }
+
+    pub(in crate::cluster) fn reply(&self) -> &Reply {
+        &self.reply
+    }
+}
+
+/// A single checked operation using the caller's original code. The socket, TLS
+/// state and plaintext never escape this function, including on failure.
+pub(in crate::cluster) async fn exchange(
+    address: SocketAddr,
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+    request: RequestId,
+    csr: &[u8],
+    limits: SocketLimits,
+) -> Result<Completed, ExchangeError> {
+    let deadline = Instant::now() + SOCKET_BUDGET;
+    let config = client_config(code, root, time).map_err(|_| ExchangeError::Refused)?;
+    let (mut socket, voters, redeem) = timeout_at(deadline, async {
+        let tcp = TcpStream::connect(address).await.map_err(|_| Refused)?;
+        tcp.set_nodelay(true).map_err(|_| Refused)?;
+        let mut socket = TlsConnector::from(Arc::new(config))
+            .connect(
+                ServerName::try_from(SERVER_NAME).map_err(|_| Refused)?,
+                QuotaSocket::new(tcp, limits, deadline),
+            )
+            .await
+            .map_err(|_| Refused)?;
+        if socket.get_ref().1.handshake_kind() != Some(HandshakeKind::Full) {
+            return Err(Refused);
+        }
+        socket
+            .write_all(&session::query_frame(code.cluster(), code.code_id()))
+            .await
+            .map_err(|_| Refused)?;
+        socket.flush().await.map_err(|_| Refused)?;
+        let (challenge, voters) = session::receive_anchor(&mut socket).await?;
+        check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
+        // The Anchor reply must end its phase: no extra or out-of-order frame.
+        session::nothing_pending(&mut socket).await?;
+        Ok((
+            socket,
+            voters,
+            session::redeem_frame(code, request, challenge, csr)?,
+        ))
+    })
+    .await
+    .map_err(|_| ExchangeError::Refused)?
+    .map_err(|_: Refused| ExchangeError::Refused)?;
+    if Instant::now() >= deadline {
+        return Err(ExchangeError::Refused);
+    }
+
+    // From the first attempted write onward, errors may hide an issuer effect.
+    timeout_at(deadline, async {
+        socket.write_all(&redeem).await.map_err(|_| Refused)?;
+        socket.shutdown().await.map_err(|_| Refused)?;
+        let reply = session::receive_result(&mut socket).await?;
+        if Instant::now() >= deadline {
+            return Err(Refused);
+        }
+        Ok(Completed { voters, reply })
+    })
+    .await
+    .map_err(|_| ExchangeError::PossibleEffect)?
+    .map_err(|_| ExchangeError::PossibleEffect)
+}
+
+// Preserve the in-memory probe for the existing frozen test callers.
+#[cfg(test)]
+use crate::cluster::enrollment::CodeId;
+#[cfg(test)]
+use rustls::{ClientConnection, ProtocolVersion};
+#[cfg(test)]
+use std::io::{self, Read, Write};
+
+#[cfg(test)]
+const QUOTA: usize = 128 * 1024;
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Initial,
@@ -98,6 +261,7 @@ enum Phase {
     Released,
     Fatal,
 }
+#[cfg(test)]
 pub(in crate::cluster) struct PreproofClient {
     connection: ClientConnection,
     cluster: ClusterId,
@@ -108,37 +272,14 @@ pub(in crate::cluster) struct PreproofClient {
     incoming: usize,
     outgoing: usize,
 }
+#[cfg(test)]
 impl PreproofClient {
     pub(in crate::cluster) fn new(
         code: &JoinCode,
         root: &[u8],
         time: Arc<dyn TimeProvider>,
     ) -> Result<Self, Refused> {
-        if root.is_empty()
-            || root.len() > 4096
-            || <[u8; 32]>::from(Sha256::digest(root)) != code.ca_fingerprint()
-        {
-            return Err(Refused);
-        }
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(root.to_vec()))
-            .map_err(|_| Refused)?;
-        let provider = Arc::new(ring::default_provider());
-        let verifier = Arc::new(BootstrapVerifier {
-            cluster: code.cluster(),
-            roots,
-            provider: provider.clone(),
-        });
-        let mut config = ClientConfig::builder_with_details(provider, time)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Refused)?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        config.enable_sni = false;
-        config.resumption = rustls::client::Resumption::disabled();
-        config.enable_early_data = false;
+        let config = client_config(code, root, time)?;
         let mut connection = ClientConnection::new(
             Arc::new(config),
             ServerName::try_from(SERVER_NAME).map_err(|_| Refused)?,
@@ -246,16 +387,7 @@ impl PreproofClient {
         let Ok(voters) = BoundVoters::decode(bytes) else {
             return self.fail();
         };
-        if voters.anchor(self.cluster) != self.anchor {
-            return self.fail();
-        }
-        let Some([cert]) = self.connection.peer_certificates() else {
-            return self.fail();
-        };
-        let Ok(id) = peer_identity(cert) else {
-            return self.fail();
-        };
-        if id.cluster != self.cluster || !voters.contains(id.node, id.key) {
+        if check_voters(&self.connection, self.cluster, self.anchor, &voters).is_err() {
             return self.fail();
         }
         self.phase = Phase::Anchored;
@@ -279,10 +411,12 @@ impl PreproofClient {
         Ok(())
     }
 }
+#[cfg(test)]
 struct SliceWriter<'a> {
     buffer: &'a mut [u8],
     copied: usize,
 }
+#[cfg(test)]
 impl Write for SliceWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let n = bytes.len().min(self.buffer.len() - self.copied);
@@ -297,8 +431,8 @@ impl Write for SliceWriter<'_> {
 
 #[cfg(test)]
 mod quota_tests {
-    use super::super::preproof_tests::{ProbeTime, prepared, test_client};
     use super::*;
+    use crate::cluster::pki::preproof_tests::{ProbeTime, prepared, test_client};
     #[test]
     fn partial_proof_write_is_fatal_and_cannot_drain() {
         let (mut c, mut s, code) = prepared();
