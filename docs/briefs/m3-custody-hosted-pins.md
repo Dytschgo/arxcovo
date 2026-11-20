@@ -246,3 +246,17 @@ premise. The owner authorized it on 2026-11-20.
 - Stop conditions: the harness passes every adopted case (then normal exact-head review
   and merge), a step would require weakening a check, a pin change is needed and not yet
   approved, or round 6 ends without qualification. On stop, report evidence and options.
+
+## Amendment A3: discovery-only completed nonzero listings
+
+Coordinator adoption explicitly replaces Q1's all-candidate command-success requirement only for the fixed host discovery invocation `[candidate, --list, --exact, PROBE]`. It does not alter any other command-success predicate or tool policy.
+
+A regular, non-symlink, bounded CI build-output candidate which completes within all existing limits, drains its bounded pipes and is reaped with a positive nonzero returncode may be classified as an ineligible discovery non-match. This classification does not prove it is not libtest or that it is healthy. Record its candidate index, returncode, duration and bounded closed diagnostic class using the existing sanitization policy; never publish arbitrary output or additional paths. A nonzero listing advertising the exact probe test record refuses as conflicting evidence.
+
+The candidate's retained object, route, metadata and SHA256 checks must still succeed after listing, including unsuccessful listing. Spawn/read/reap errors, signal termination, timeouts, overflow, unsafe paths/objects, count/size bounds and identity/hash drift remain fatal and preserve first-failure and cleanup behavior. No general Refusal suppression or clearing of an already latched failure is permitted.
+
+Exactly one eligible candidate must exit zero and satisfy the existing exact_listing predicate: precisely the sole exact PROBE test record and one single-test/zero-benchmark summary. Zero or multiple eligible matches refuse. No first-match fallback, retry, Cargo invocation, candidate-scope expansion or relaxed parser is authorized. Existing at-most-16 candidates, 2-second listing limit and aggregate phase/work/total/evidence limits remain unchanged; no additional failure-count allowance is introduced.
+
+Selected-input identity/hash retention, stable staging, immutable source pins, ABI checks, in-image exact listing and all fixture/image/operational probe/release/restart/cleanup success requirements remain unchanged. A1/A2, image/UID/resource/time pins, gates, campaign usage and exhausted counters remain unchanged. Pure regression tests and independent exact-head implementation review remain required. This amendment and its review grant no additional attempts or hosted rounds and establish no custody qualification.
+
+Adopted by the coordinator on 2026-11-20 verbatim from the independent review `D:/Temp/arx-pr199-a3-review/review.md` (SHA256 `99dc5fbe…a75`), after campaign Q1 round 1 (head `bd7c18a0`) stopped with a candidate `--list` exit 1. A3 consumes no campaign round.
