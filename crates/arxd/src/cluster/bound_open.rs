@@ -962,11 +962,7 @@ pub(super) mod tests {
                 }
                 assert!(!path.exists());
                 let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .unwrap();
+                create_private_new(&path);
                 let before = l.snapshot();
                 SQL.with(|n| n.set(0));
                 let stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
@@ -1000,7 +996,7 @@ pub(super) mod tests {
                     fs::remove_file(&path).unwrap();
                 }
                 if mask & (1 << i) != 0 {
-                    fs::write(&path, b"").unwrap();
+                    l.write(&format!("state/{name}"), b"");
                 }
             }
             let before = l.snapshot();
@@ -1019,11 +1015,7 @@ pub(super) mod tests {
         assert_eq!(stores.status(), Ok(()));
         assert_eq!(
             stores.inspect(|_, _, _, _| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .unwrap();
+                create_private_new(&path);
                 Ok(())
             }),
             Err(BoundFailure::Inspection(
@@ -1033,6 +1025,16 @@ pub(super) mod tests {
         let before = l.snapshot();
         drop(stores);
         assert_eq!(l.snapshot(), before);
+    }
+    fn create_private_new(path: &Path) {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path).unwrap();
     }
     fn stores_path(l: &super::super::startup_plan::tests::Layout, stem: &str) -> PathBuf {
         l.root.path().join(format!("state/{stem}.sqlite3"))
@@ -1052,7 +1054,7 @@ pub(super) mod tests {
                     let l = seeded();
                     let path =
                         stores_path(&l, stem).with_file_name(format!("{stem}.sqlite3{suffix}"));
-                    fs::write(&path, b"").unwrap();
+                    l.write(&format!("state/{stem}.sqlite3{suffix}"), b"");
                     let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
                     let before = l.snapshot();
                     if change == "grow" {
@@ -1070,7 +1072,7 @@ pub(super) mod tests {
                             fs::remove_file(&path).unwrap_err();
                             if change == "replace" {
                                 let replacement = path.with_extension("replacement");
-                                fs::write(&replacement, b"").unwrap();
+                                l.write(&format!("state/{stem}.replacement"), b"");
                                 fs::rename(&replacement, &path).unwrap_err();
                                 fs::remove_file(&replacement).unwrap();
                             }
@@ -1082,7 +1084,7 @@ pub(super) mod tests {
                         {
                             if change == "replace" {
                                 let replacement = path.with_extension("replacement");
-                                fs::write(&replacement, b"").unwrap();
+                                l.write(&format!("state/{stem}.replacement"), b"");
                                 fs::rename(&replacement, &path).unwrap();
                             } else {
                                 fs::remove_file(&path).unwrap();

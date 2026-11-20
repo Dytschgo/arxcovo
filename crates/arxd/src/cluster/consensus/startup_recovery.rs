@@ -1809,6 +1809,7 @@ mod tests {
                 "truncated-log" => l.write("state/cluster-log.sqlite3", b"SQLite format 3\0"),
                 "sqlite-zero-log" => {
                     std::fs::remove_file(&log).unwrap();
+                    l.write("state/cluster-log.sqlite3", b"");
                     Connection::open(&log)
                         .unwrap()
                         .execute_batch("CREATE TABLE unrelated(x); PRAGMA user_version=0;")
@@ -1816,6 +1817,7 @@ mod tests {
                 }
                 "empty-schema-log" => {
                     std::fs::remove_file(&log).unwrap();
+                    l.write("state/cluster-log.sqlite3", b"");
                     Connection::open(&log)
                         .unwrap()
                         .execute_batch("VACUUM;")
