@@ -278,26 +278,7 @@ pub(super) fn prepare(
         });
     }
     let expected = expected.ok_or(Refusal::Identity)?;
-    if owner.plan.mode.founder() != expected.origin.founder() {
-        return Err(Refusal::Identity);
-    }
-    let record = PublicIdentity::decode(&owner.read("identity.json", 8192)?)
-        .map_err(|_| Refusal::Identity)?;
-    let root = owner.read("ca.der", 4096)?;
-    if owner.read(record.artifact(), 65536)?.is_empty() {
-        return Err(Refusal::Identity);
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| Refusal::Clock)?;
-    record
-        .verify(
-            expected,
-            &root,
-            rustls::pki_types::UnixTime::since_unix_epoch(now),
-        )
-        .map_err(|_| Refusal::Identity)?;
-    owner.recheck()?;
+    authenticate(&owner, expected)?;
     // Existing SQL locks are held throughout immutable inspection. The outer
     // owner stays held across their release and the current-store openers.
     #[cfg(test)]
@@ -370,23 +351,182 @@ fn inspect_pair(owner: &mut Owner, cluster: ClusterId) -> Result<(StateInspectio
     let mut bound = BoundStores::acquire(owner, BoundIntent::Inspect(cluster));
     bound
         .inspect(|state, state_file, log, log_file| {
-            let result = (|| {
-                state_schema(state, state_file)?;
-                log_schema(log, log_file)?;
-                integrity(state)?;
-                integrity(log)?;
-                let state = inspect_state_rows(state, cluster)?;
-                let log = inspect_log_rows(log, cluster)?;
-                validate_preflight(state.applied, &log).map_err(|_| Refusal::Store)?;
-                Ok((state, log))
-            })();
-            result.map_err(|_: Refusal| StoreError::Corrupt)
+            inspect_connections(state, state_file, log, log_file, cluster)
+                .map_err(|_| StoreError::Corrupt)
         })
         .map_err(|f| match f {
             BoundFailure::Inspection(refusal) => refusal,
             BoundFailure::Layout => Refusal::Layout,
             _ => Refusal::Store,
         })
+}
+fn authenticate(owner: &Owner, expected: &ExpectedIdentity) -> Result<()> {
+    if owner.plan.mode.founder() != expected.origin.founder() {
+        return Err(Refusal::Identity);
+    }
+    let record = PublicIdentity::decode(&owner.read("identity.json", 8192)?)
+        .map_err(|_| Refusal::Identity)?;
+    let root = owner.read("ca.der", 4096)?;
+    if owner.read(record.artifact(), 65536)?.is_empty() {
+        return Err(Refusal::Identity);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Refusal::Clock)?;
+    record
+        .verify(
+            expected,
+            &root,
+            rustls::pki_types::UnixTime::since_unix_epoch(now),
+        )
+        .map_err(|_| Refusal::Identity)?;
+    owner.recheck()?;
+    Ok(())
+}
+fn inspect_connections(
+    state: &Connection,
+    state_file: &File,
+    log: &Connection,
+    log_file: &File,
+    cluster: ClusterId,
+) -> Result<(StateInspection, LogInspection)> {
+    state_schema(state, state_file)?;
+    log_schema(log, log_file)?;
+    integrity(state)?;
+    integrity(log)?;
+    let state = inspect_state_rows(state, cluster)?;
+    let log = inspect_log_rows(log, cluster)?;
+    validate_preflight(state.applied, &log).map_err(|_| Refusal::Store)?;
+    Ok((state, log))
+}
+/// Closed operational preparation; never calls the terminal offline inspector.
+pub(super) fn prepare_bound(
+    owner: &mut Owner,
+    intent: &StartIntent,
+    expected: Option<&ExpectedIdentity>,
+) -> (crate::cluster::bound_open::OwnedStores, Option<Observation>) {
+    use crate::cluster::bound_open::{BoundFailure, BoundIntent, BoundStores};
+    let recovery = owner.plan.mode.recovery();
+    let existing = owner.has_stores();
+    let cluster = intent.cluster;
+    let init = Init {
+        cluster,
+        first_free: NodeId::new(2).unwrap(),
+    };
+    let bound_intent = if recovery {
+        BoundIntent::Recovery(cluster)
+    } else if existing {
+        BoundIntent::UntouchedGenesis(init)
+    } else {
+        BoundIntent::Fresh(init)
+    };
+    let validate_owner = |owner: &Owner| {
+        owner.recheck()?;
+        if intent.mode != owner.plan.mode
+            || Some(intent.peer) != owner.plan.peer.parse().ok()
+            || Some(intent.enrollment) != owner.plan.enrollment.parse().ok()
+        {
+            return Err(Refusal::Plan);
+        }
+        if recovery {
+            let e = expected.ok_or(Refusal::Identity)?;
+            if e.cluster != cluster || e.node != intent.node {
+                return Err(Refusal::Identity);
+            }
+            authenticate(owner, e)?;
+        } else if intent.mode != Mode::CreateFounder || intent.node.get() != 1 || expected.is_some()
+        {
+            return Err(Refusal::Identity);
+        }
+        Ok(())
+    };
+    let sample = std::cell::Cell::new(None);
+    let (stores, inspected) = BoundStores::operational(
+        owner,
+        bound_intent,
+        |stores| {
+            stores.validate_owner_for_start(validate_owner)?;
+            if !existing {
+                return Ok(None);
+            }
+            let pair = stores.inspect_for_start(cluster, |s, sf, l, lf| {
+                inspect_connections(s, sf, l, lf, cluster).map_err(|_| StoreError::Corrupt)
+            })?;
+            if recovery {
+                let e = expected.unwrap();
+                let state = &pair.0;
+                if state
+                    .applied
+                    .is_none_or(|p| p.index < e.origin.position().index || p < e.origin.position())
+                {
+                    return Err(BoundFailure::Inspection(Refusal::Identity));
+                }
+                let image = snapshot_state(&state.snapshot).map_err(BoundFailure::Init)?;
+                image
+                    .authorize_peer(e.cluster, e.node, e.key)
+                    .map_err(|_| BoundFailure::Inspection(Refusal::Identity))?;
+                HostClock::new(image.committed_ms())
+                    .sample_ms()
+                    .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?;
+            } else {
+                let (state, log) = &pair;
+                if state.applied.is_some()
+                    || state.membership.is_some()
+                    || log.last.is_some()
+                    || log.has_vote
+                    || snapshot_state(&state.snapshot).map_err(BoundFailure::Init)?
+                        != crate::cluster::enrollment::EnrollmentState::new(
+                            cluster,
+                            init.first_free,
+                        )
+                {
+                    return Err(BoundFailure::Inspection(Refusal::Provenance));
+                }
+            }
+            Ok(Some(pair))
+        },
+        |pair, state, log| {
+            if let Some((inspected, _)) = pair
+                && (state.snapshot() != inspected.snapshot
+                    || state.membership() != inspected.membership.as_ref())
+            {
+                return Err(BoundFailure::Inspection(Refusal::Store));
+            }
+            // Exact transferred objects; same unchanged preflight as legacy start.
+            preflight(log, state).map_err(BoundFailure::Init)?;
+            if let Some(e) = expected {
+                state
+                    .state()
+                    .authorize_peer(e.cluster, e.node, e.key)
+                    .map_err(|_| BoundFailure::Inspection(Refusal::Identity))?;
+                sample.set(Some(
+                    HostClock::new(state.state().committed_ms())
+                        .sample_ms()
+                        .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?,
+                ));
+            }
+            Ok(())
+        },
+    );
+    let observation = inspected.map(|pair| {
+        if recovery {
+            let (state, _) = pair.unwrap();
+            let image = snapshot_state(&state.snapshot).unwrap();
+            let floor = image.committed_ms();
+            let clock = HostClock::new(floor);
+            // Preserve the actual validated sample.
+            Observation::Recovered {
+                floor,
+                sample: sample.get().unwrap(),
+                applied: state.applied,
+                membership: state.membership,
+                clock,
+            }
+        } else {
+            Observation::UntouchedGenesis { cluster }
+        }
+    });
+    (stores, observation)
 }
 fn readonly(db: &Connection, file: &File, max_pages: u64, schema: &[(&str, &str)]) -> Result<()> {
     let len = file.metadata().map_err(|_| Refusal::Store)?.len();
@@ -1424,6 +1564,36 @@ mod tests {
         drop(sm);
         let mut log = VoteLogStore::open(&l.root.path().join("state"), [1; 16]).unwrap();
         log.append(&[(p, entry)]).unwrap();
+    }
+    #[test]
+    fn bound_recovery_reentry_refuses_without_filesystem_access() {
+        use crate::cluster::bound_open::{BoundAttempt, BoundFailure};
+
+        let l = Layout::new();
+        initialized(&l);
+        let expected = identity(&l);
+        found(&l, &expected, 1);
+        let plan = l.plan("recover-founder");
+        let intent = StartIntent {
+            mode: plan.mode,
+            cluster: expected.cluster,
+            node: expected.node,
+            peer: plan.peer.parse().unwrap(),
+            enrollment: plan.enrollment.parse().unwrap(),
+        };
+        let mut owner = Owner::acquire(plan).unwrap();
+        let (stores, observation) = prepare_bound(&mut owner, &intent, Some(&expected));
+        assert!(matches!(observation, Some(Observation::Recovered { .. })));
+        let (accesses, opens) = stores.io_counts();
+        assert!(accesses > 0);
+        assert_eq!(opens, 4);
+        assert_eq!(owner.bound_attempt, BoundAttempt::Complete);
+
+        let (mut retry, observation) = prepare_bound(&mut owner, &intent, Some(&expected));
+        assert!(observation.is_none());
+        assert!(matches!(retry.take_pair(), Err(BoundFailure::Unavailable)));
+        assert_eq!(retry.io_counts(), (0, 0));
+        assert_eq!(owner.bound_attempt, BoundAttempt::Complete);
     }
     #[test]
     fn joiner_recovery_uses_redeem_and_excludes_own_anchor() {

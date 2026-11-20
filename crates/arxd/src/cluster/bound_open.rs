@@ -242,13 +242,6 @@ pub(super) enum BoundAttempt {
     Failed(BoundFailure),
     Complete,
 }
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "intents have no live startup caller in store-only slice"
-    )
-)]
 #[derive(Clone, Copy)]
 pub(super) enum BoundIntent {
     Fresh(Init),
@@ -309,6 +302,40 @@ pub(super) struct BoundStores<'owner> {
     #[cfg(test)]
     opens: Vec<usize>,
 }
+// Owned slots outlive the short Owner borrow, including partial acquisitions.
+pub(super) struct OwnedStores {
+    state: Option<StateStore>,
+    log: Option<VoteLogStore>,
+    _inspection_state: Option<BoundDb>,
+    _pending: Pending,
+    _staged: Vec<Guard>,
+    failure: Option<BoundFailure>,
+    #[cfg(test)]
+    accesses: usize,
+    #[cfg(test)]
+    opens: Vec<usize>,
+}
+impl OwnedStores {
+    #[cfg(test)]
+    pub(super) fn io_counts(&self) -> (usize, usize) {
+        (self.accesses, self.opens.len())
+    }
+    #[cfg(test)]
+    pub(super) fn pointers(&self) -> (usize, usize) {
+        (
+            self.log.as_ref().unwrap().bound_pointer(),
+            self.state.as_ref().unwrap().bound_pointer(),
+        )
+    }
+    pub(super) fn take_pair(&mut self) -> Result<(StateStore, VoteLogStore), BoundFailure> {
+        self.failure.map_or(Ok(()), Err)?;
+        if self.state.is_none() || self.log.is_none() {
+            return Err(BoundFailure::Unavailable);
+        }
+        // All validation precedes these infallible moves.
+        Ok((self.state.take().unwrap(), self.log.take().unwrap()))
+    }
+}
 // Deliberately dormant until separately authorized startup integration. Tests exercise
 // this concrete entry point; no public capability or live caller is introduced.
 #[cfg_attr(
@@ -360,6 +387,105 @@ impl<'owner> BoundStores<'owner> {
             Err(_) => stores.fail(BoundFailure::Unwind),
         }
         stores
+    }
+    pub(super) fn into_owned(self) -> OwnedStores {
+        OwnedStores {
+            state: self.state,
+            log: self.log,
+            _inspection_state: self.inspection_state,
+            _pending: self.pending,
+            _staged: self.staged,
+            failure: self.failure,
+            #[cfg(test)]
+            accesses: self.accesses,
+            #[cfg(test)]
+            opens: self.opens,
+        }
+    }
+    /// One Begun interval covers readonly inspection and writable acquisition.
+    /// The caller's validation runs while every acquired slot remains owned.
+    pub(super) fn operational<T>(
+        owner: &'owner mut Owner,
+        intent: BoundIntent,
+        inspect: impl FnOnce(&mut Self) -> Result<T, BoundFailure>,
+        validate: impl FnOnce(&T, &StateStore, &mut VoteLogStore) -> Result<(), BoundFailure>,
+    ) -> (OwnedStores, Option<T>) {
+        let mut stores = Self {
+            state: None,
+            log: None,
+            inspection_state: None,
+            pending: Pending::default(),
+            staged: Vec::new(),
+            owner,
+            failure: None,
+            #[cfg(test)]
+            accesses: 0,
+            #[cfg(test)]
+            opens: Vec::new(),
+        };
+        let valid = match intent {
+            BoundIntent::Fresh(_) | BoundIntent::UntouchedGenesis(_) => {
+                stores.owner.plan.mode == super::startup_plan::Mode::CreateFounder
+            }
+            BoundIntent::Recovery(_) => stores.owner.plan.mode.recovery(),
+            BoundIntent::Inspect(_) => false,
+        };
+        match stores.owner.bound_attempt {
+            BoundAttempt::Failed(f) => stores.failure = Some(f),
+            BoundAttempt::Begun | BoundAttempt::Complete => {
+                stores.failure = Some(BoundFailure::Unavailable)
+            }
+            BoundAttempt::Ready if !valid => stores.fail(BoundFailure::Intent),
+            BoundAttempt::Ready => {}
+        }
+        if stores.failure.is_some() {
+            return (stores.into_owned(), None);
+        }
+        stores.owner.bound_attempt = BoundAttempt::Begun;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let observed = inspect(&mut stores)?;
+            // Successful readonly observations are retired in connection/lease order
+            // under the continuously held original outer lock.
+            stores.inspection_state = None;
+            stores.pending = Pending::default();
+            stores.construct(intent)?;
+            validate(
+                &observed,
+                stores.state.as_ref().unwrap(),
+                stores.log.as_mut().unwrap(),
+            )?;
+            Ok(observed)
+        }));
+        let observed = match result {
+            Ok(Ok(value)) => {
+                stores.owner.bound_attempt = BoundAttempt::Complete;
+                Some(value)
+            }
+            Ok(Err(f)) => {
+                stores.fail(f);
+                None
+            }
+            Err(_) => {
+                stores.fail(BoundFailure::Unwind);
+                None
+            }
+        };
+        (stores.into_owned(), observed)
+    }
+    pub(super) fn validate_owner_for_start(
+        &mut self,
+        validate: impl FnOnce(&Owner) -> Result<(), super::startup_plan::Refusal>,
+    ) -> Result<(), BoundFailure> {
+        self.access();
+        validate(self.owner).map_err(BoundFailure::Inspection)
+    }
+    pub(super) fn inspect_for_start<T>(
+        &mut self,
+        cluster: ClusterId,
+        read: impl FnOnce(&Connection, &File, &Connection, &File) -> Result<T, StoreError>,
+    ) -> Result<T, BoundFailure> {
+        self.construct(BoundIntent::Inspect(cluster))?;
+        self.inspect(read)
     }
     pub(super) fn inspect<T>(
         &mut self,
@@ -1456,6 +1582,45 @@ pub(super) mod tests {
         );
     }
 
+    #[test]
+    fn operational_failures_and_unwind_retain_actual_slots_without_retry() {
+        for (point, panic) in [
+            ("sqlite-open", false),
+            ("state-pragma", false),
+            ("state-schema", false),
+            ("log-init", false),
+            ("log-init", true),
+        ] {
+            let l = layout();
+            let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+            FAULT.with(|f| *f.borrow_mut() = Some((point, panic)));
+            let (mut slots, observed) = BoundStores::operational(
+                &mut owner,
+                BoundIntent::Fresh(init()),
+                |_| Ok(()),
+                |_, _, _| Ok(()),
+            );
+            FAULT.with(|f| *f.borrow_mut() = None);
+            assert!(observed.is_none());
+            assert!(slots.take_pair().is_err());
+            probe(&owner.plan.state, "cluster-state", true);
+            if point.starts_with("log") {
+                probe(&owner.plan.state, "cluster-log", true);
+            }
+            let first = slots.failure;
+            let (mut retry, _) = BoundStores::operational(
+                &mut owner,
+                BoundIntent::Fresh(init()),
+                |_| -> Result<(), BoundFailure> { panic!("must not retry") },
+                |_, _, _| Ok(()),
+            );
+            assert_eq!(retry.failure, first);
+            assert!(retry.take_pair().is_err());
+            drop(retry);
+            drop(slots);
+            probe(&owner.plan.state, "cluster-state", false);
+        }
+    }
     fn seeded() -> super::super::startup_plan::tests::Layout {
         let l = layout();
         let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
