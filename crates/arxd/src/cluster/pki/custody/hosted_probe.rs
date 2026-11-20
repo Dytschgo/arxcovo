@@ -387,7 +387,8 @@ fn hosted_custody_probe() {
             iov_len: 1,
         };
         // SAFETY: local buffer is live; remote pointer belongs to target and is never dereferenced locally.
-        errno_denied(unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) });
+        let result = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        errno_denied(libc::c_long::try_from(result).unwrap());
         // SAFETY: fixed non-mutating attach attempt must be refused by kernel policy.
         errno_denied(unsafe {
             libc::ptrace(
