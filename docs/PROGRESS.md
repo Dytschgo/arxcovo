@@ -20,9 +20,11 @@ merged, as listed under "Merged this session".
 - **Main:** `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
   44813492071 green. `9bfaedb5` (PR208) push CI 44809310046 was **red**: Ubuntu Rust
   job 136541460939 failed `issuance_publication::tests::files::publication_wrong_context_and_origin`
-  (tests.rs:500). Its negative-mutation loop wrote a fixed byte 99 into random
-  key/CA/cluster/anchor bytes, a no-op when the byte already was 99 (about 1/256 per
-  field); the test came with PR200, not PR208. No rerun. Repair PR209 (Sol 6.2/high,
+  (tests.rs:500). Its negative-mutation loop wrote a fixed byte 99 into the
+  member-key and CA digests and the cluster and anchor bytes. Only the generated
+  member-key and CA digests could already start at 99 (about 1/256 each), leaving the
+  identity unchanged. The cluster and anchor bytes started at 1 and 7, respectively.
+  The log left the failing field unlabeled. PR200 introduced this test, not PR208. No rerun. Repair PR209 (Sol 6.2/high,
   0/3 counted, test-only) merged as the third red-main repair.
   `57fc3fc8` (PR207) push CI 44804068081 and `26704348` (PR206) push CI 44800339696
   green. Earlier main
