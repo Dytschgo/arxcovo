@@ -13,9 +13,7 @@ PR188 as the last merge, that is superseded by this summary.
   Fallback chain when an agent is blocked or fails: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. No Sol delegate was blocked this session.
-- **Main:** `05ba5b87` (PR193). Previous main `95b4b651` push CI 44616170358
-  attempt 1 green (all nine jobs); `05ba5b87` push CI recorded in the next
-  checkpoint.
+- **Main:** `99076134` (PR201), push CI 44763436707 attempt 1 green.
 - **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
   commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
   e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
@@ -25,9 +23,14 @@ PR188 as the last merge, that is superseded by this summary.
   superseded Opus recovery commits; N1/N2 and all 26 owner_windows tests passed
   under its unchanged workflow), PR189 `95b4b651` (retained offline startup owner;
   rebuilt as main plus its single source commit), PR193 `05ba5b87` (cfg(test) A8
-  lifecycle phase trace). Every merge had an independent exact-head Sol 6.1
-  review, all five required gates green and green main rechecked immediately
-  before a head-guarded squash merge.
+  lifecycle phase trace), PR195 `fc83838d` (current-state docs), PR196 `c8e6dab7`
+  (M3 step 1, bound SQLite store construction), PR198 `be197a25` (step 2, bound
+  offline recovery), PR197 `85eccce8` (step 3a, custody codec and CA loading),
+  PR200 `e9e44c91` (step 4a, credential publication storage), PR199 `7aec97af`
+  (step 3b, hosted distinct-UID custody qualification), PR201 `99076134` (step 5a,
+  retained bound-start ownership). Every merge had an independent exact-head Sol
+  review (6.1, later 6.2), all five required gates green and green main rechecked
+  immediately before a head-guarded squash merge.
 - **Open failures (cause unknown, traces now on main):** Windows founder
   five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
   PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
