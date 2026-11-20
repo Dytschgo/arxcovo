@@ -114,7 +114,7 @@ PR188 as the last merge, that is superseded by this summary.
   decisions: keep the old inspector's layout entry policy (zero-length WAL
   accepted) instead of tightening it, and keep the merged one-shot
   Inspect/Complete behaviour. Independent brief review pending.
-- **M3 slice 2, bound offline recovery (this PR):** Sol 6.1/high brief
+- **M3 slice 2, bound offline recovery (PR #198, merged as `be197a25`):** Sol 6.1/high brief
   `D:/Temp/arx-m3-step2/brief.md` (SHA256 `16f003e1…ab50`) after an independent
   review requiring two clarifications. Coordinator decisions: keep the old
   inspector's layout entry policy (zero-length WAL accepted) through
@@ -129,7 +129,11 @@ PR188 as the last merge, that is superseded by this summary.
   `D:/Temp/arx-m3-step2-build2/report.md` SHA256 `85fe3e2c…cf3c`: recovery 23,
   bound 29, startup-plan 4 pass; Clippy, fmt, static gate, loader 8 and SQLite
   verifier 33 negative controls pass. Windows replacement/removal evidence is
-  sharing-denial prevention; Linux/macOS via hosted CI. Exact-head review pending.
+  sharing-denial prevention. Hosted Unix then failed twice (private fixture modes,
+  then a stale interstage expectation; builder 3/3); each was diagnosed by an
+  independent reviewer, the owner authorized further scoped builders (2026-11-20),
+  and the final head `ce0fd7f8` passed review (`D:/Temp/arx-pr198-review3/review.md`,
+  SHA256 `b8c6a1a8…2162735`) with full Ubuntu and macOS suites green.
 - **PR #197 merged** as `85eccce8` (custody 3a); main push CI 44717451865 green.
   Review of `b4c66e97` PASS (`D:/Temp/arx-pr197-review2/review.md`, SHA256
   `5d6f7dd1…b4`); crash durability recorded as unqualified.
@@ -160,12 +164,61 @@ PR188 as the last merge, that is superseded by this summary.
   fresh 3 attempts; used 0/3, head `ae36438e`; report `D:/Temp/arx-m3-step4a-2/report.md`
   SHA256 `06d7ebdc…1d56`: 48 Windows tests pass (publication 1, PKI 38, receipt 4,
   startup 5); Linux compile and runtime via hosted CI. Exact-head review pending.
-- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route and
-  ancestor checks) implemented and validated on the runner; preflight then refused the
-  uutils multicall `mkdir` (116 links). Amendment A2 (closed role-to-target map, ancestor
-  checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
-  in one run) independently reviewed GO with required changes and committed to the pins.
-  The fourth builder has one attempt left.
+- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route
+  and ancestor checks) and A2 (closed uutils role-to-target map, ancestor checks plus
+  verified `protected_hardlinks=1`, dispatch preserved, all refusals in one run) were
+  each independently reviewed and committed to the pins; the fourth builder then
+  validated all 12 tools on the runner and stopped 3/3 at a discovery `UnsafePath`.
+  A stuck-rule review (`D:/Temp/arx-pr199-discovery-review/review.md`, SHA256
+  `c8428a74…d9`) recommended a finite campaign. **Owner authorization (2026-11-20):**
+  hosted qualification campaign Q1, at most 6 rounds, fixed security semantics, pin
+  changes only via coordinator plus independent review (recorded in the pins). Round 1
+  (`bd7c18a0`) stopped on a candidate `--list` exit 1; amendment A3 (discovery-only
+  completed nonzero listings, exactly one zero-exit exact match) was reviewed
+  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a75`) and adopted
+  verbatim. Round 2 (`40fdbb30`) qualified: all 13 custody cases passed on the hosted
+  runner (founder create/deny/same-UID control/release/restart, both learners), each
+  invocation selected=1/passed=1/failed=0, zero refusals, launcher 9.536 s of a 150 s
+  ceiling, cleanup verified; no image re-pin was needed (the GLIBC 2.39 executable ran
+  in the pinned Ubuntu 24.04 image). Campaign report `D:/Temp/arx-pr199-q1/report.md`
+  SHA256 `9927642c…aa8d6`. Exact-head review of `40fdbb30`
+  (`D:/Temp/arx-pr199-review4/review.md`, SHA256 `0ebec5ea…ff2`): two P2 — this stale
+  record (corrected in a docs commit) and missing actual scratch high-water bytes
+  required by the pins. Campaign round 3 (code head `a660231e`) added the measurement
+  and requalified: all 13 cases passed again, zero refusals, launcher 8.828 s, cleanup
+  verified; task-scratch high-water 84,717,568 bytes, ext4 49,152 -> 90,112 bytes
+  peak, context 84,499,396 bytes, Docker image Size 50,089,568 bytes; updated report
+  `D:/Temp/arx-pr199-q1/report.md` SHA256 `443cf8e8…f7c8`. The review of `a660231e`
+  (`D:/Temp/arx-pr199-review5/review.md`, SHA256 `64eddd44…a2a`) closed SP4-1 and asked
+  for this record to be brought up to date. Counters: four earlier 3b builders 3/3
+  each; Q1 3/6 rounds used, stopped on qualification; Engine Sol 3/3, Opus 0/2.
+  The code under review is the round-3 head; later commits on this branch are docs
+  only.
+- **Custody 3b harness (this PR):** adopted pins committed as
+  [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
+  `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
+  SHA256 `e771b2e4…3f48`, both required changes folded in). Sol 6.1/high builder
+  `2cfb9f23` used 2/3; report `D:/Temp/arx-custody-3b-build/report.md` SHA256
+  `f732f8ef…5fd4`: 10 new launcher tests, existing Python gates, fmt, Windows
+  Clippy and 38 PKI tests pass locally. One Linux-only CI step added after the
+  workspace tests in the existing Rust worker; no other workflow change. The Linux
+  probe compile and the hosted qualification run are verified only by this PR's
+  hosted CI, whose first run is measured against the 12 minute worker timeout and
+  ADR 0031 budget.
+  First hosted CI failed (workflow pin test and a Linux type error; builder 3/3).
+  Independent diagnosis (`D:/Temp/arx-pr199-review/review.md`, SHA256
+  `85ddbc92…eb6`); **owner authorization (2026-11-20):** new scoped builder, fresh
+  3 attempts. It fixed all five findings, then hosted Clippy `manual_inspect` and
+  the review's SP-new2 per-case evidence requirement (folded in as a pins
+  requirement); builder 3/3 after the third hosted run. That run is the first real
+  harness execution: Linux lint and all 833 tests passed (Ubuntu job 223 s), but
+  the launcher stopped at preflight with `ToolOwnership` after 0.001 s, so no
+  isolation case ran; the review (`D:/Temp/arx-pr199-review3/review.md`, SHA256
+  `e4739b5d…34f9`) also found the result parser wrongly requires zero filtered
+  tests. **Owner authorization (2026-11-20):** a new builder with a fresh 3-attempt
+  budget first makes the preflight report the failing tool and rule (sanitized),
+  fixes the parser, then fixes the ownership cause only within a safe rule, and
+  stops and reports if the hosted runner cannot qualify.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths

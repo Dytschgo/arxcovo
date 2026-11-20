@@ -58,6 +58,13 @@ No renewal, rotation, automatic CA extension, shorter replacement leaf or key re
 
 ## Hosted harness and CI
 
+Slice 3b implements the coordinator-adopted 2026-11-20 hosted pins (SHA256
+`28f882cb018eb956c60c190f8718fb982923cd096adb608e15e194c51fa2e167`,
+design baseline `85eccce8a917446efc1ea9df6d9bd4b0c256c128`). Hosted
+execution and exact-head qualification remain pending; native and multi-host
+paths remain **unverified on real hardware**, and process restart does not
+qualify crash durability. The coordinator retains the full adopted revision.
+
 Implementation is split: slice 3a adds codec, CA/member owners and file-backend primitives; slice 3b will add the hosted distinct-UID harness and CI step. Slice 3a alone makes no custody-isolation qualification claim.
 
 Implementation is split: slice 3a adds codec, CA/member owners and file-backend primitives; slice 3b will add the hosted distinct-UID harness and CI step. Slice 3a alone makes no custody-isolation qualification claim.

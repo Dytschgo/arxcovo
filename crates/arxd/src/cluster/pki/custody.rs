@@ -5,6 +5,8 @@ use super::csr::ProvenCsr;
 use crate::cluster::enrollment::{ClusterId, MAX_TIME_MS, NodeId};
 use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 mod codec;
+#[cfg(all(test, target_os = "linux"))]
+mod hosted_probe;
 #[cfg(test)]
 mod tests;
 
