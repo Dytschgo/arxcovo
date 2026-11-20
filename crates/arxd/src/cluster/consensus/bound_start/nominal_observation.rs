@@ -50,6 +50,73 @@ fn original_guards(owner: &Owner) -> Option<GuardIds> {
     let id = |name| file_id(&owner.bound_guard(name).ok()?);
     Some([id(LOCKS[0])?, id(LOCKS[1])?, id(LOCKS[2])?])
 }
+struct GuardProof {
+    state_dir: PathBuf,
+    ids: Mutex<Option<GuardIds>>,
+}
+
+impl GuardProof {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            ids: Mutex::default(),
+        }
+    }
+
+    fn capture(&self, owner: &Owner) -> Result<(), &'static str> {
+        let guards = original_guards(owner).ok_or("owner_identity")?;
+        *self.ids.lock().unwrap() = Some(guards);
+        Ok(())
+    }
+
+    fn same_owner(&self, state: &State) -> Result<(), &'static str> {
+        let checked = state.owner.as_ref().and_then(original_guards);
+        if checked.is_some() && checked == *self.ids.lock().unwrap() {
+            Ok(())
+        } else {
+            Err("owner_identity")
+        }
+    }
+
+    fn probe(&self, index: usize, held: bool) -> bool {
+        let path = self.state_dir.join(LOCKS[index]);
+        let expected = self.ids.lock().unwrap().map(|ids| ids[index]);
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        else {
+            return false;
+        };
+        if expected.is_none() || file_id(&file) != expected {
+            return false;
+        }
+        match file.try_lock() {
+            Ok(()) => file.unlock().is_ok() && !held,
+            Err(std::fs::TryLockError::WouldBlock) => held,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+
+    fn locks(&self, state: &State, held: [bool; 3]) -> Result<[bool; 3], &'static str> {
+        self.same_owner(state)?;
+        Ok(std::array::from_fn(|i| self.probe(i, held[i])))
+    }
+
+    fn finish_close(
+        &self,
+        job: &Job,
+        actual: bool,
+        record: impl FnOnce(Result<[bool; 3], &'static str>),
+    ) {
+        let locks = self.locks(&job.state(), [true, false, false]);
+        record(locks);
+        job.finish_close(None, locks.is_ok_and(|locks| locks == [true; 3]), actual);
+    }
+}
+
 type Handshake = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 fn go() -> bool {
@@ -101,8 +168,7 @@ unsafe fn read_go(pipe: HANDLE) -> bool {
 
 pub(super) struct Witness {
     start: Instant,
-    state_dir: PathBuf,
-    guards: Mutex<Option<GuardIds>>,
+    guards: GuardProof,
     handshake: Mutex<Option<Handshake>>,
     first_failure: Mutex<bool>,
     pub(super) running: Notify,
@@ -117,8 +183,7 @@ impl Witness {
     ) -> Self {
         Self {
             start,
-            state_dir,
-            guards: Mutex::default(),
+            guards: GuardProof::new(state_dir),
             handshake: Mutex::new(Some((polled, detached))),
             first_failure: Mutex::new(false),
             running: Notify::new(),
@@ -204,8 +269,7 @@ impl Witness {
             .ok_or_else(|| self.fail("preparation"))?;
         let (_, opens) = stores.io_counts();
         self.check(opens == 2, "open_count")?;
-        let guards = original_guards(owner).ok_or_else(|| self.fail("owner_identity"))?;
-        *self.guards.lock().unwrap() = Some(guards);
+        self.guards.capture(owner).map_err(|code| self.fail(code))?;
         self.stage("prepared", "2");
         Ok(stores.pointers())
     }
@@ -224,49 +288,24 @@ impl Witness {
                 && sm_at == sm.0.lock().unwrap().bound_pointer(),
             "transfer_identity",
         )?;
-        self.same_owner(state)?;
+        self.guards
+            .same_owner(state)
+            .map_err(|code| self.fail(code))?;
         self.stage("transferred", "1 1 1");
         Ok(())
     }
 
-    fn same_owner(&self, state: &State) -> Result<(), ()> {
-        let checked = state.owner.as_ref().and_then(original_guards);
-        self.check(
-            checked.is_some() && checked == *self.guards.lock().unwrap(),
-            "owner_identity",
-        )
-    }
-
-    fn probe(&self, index: usize, held: bool) -> bool {
-        let path = self.state_dir.join(LOCKS[index]);
-        let expected = self.guards.lock().unwrap().map(|ids| ids[index]);
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-        else {
-            return false;
-        };
-        if expected.is_none() || file_id(&file) != expected {
-            return false;
-        }
-        match file.try_lock() {
-            Ok(()) => file.unlock().is_ok() && !held,
-            Err(std::fs::TryLockError::WouldBlock) => held,
-            Err(std::fs::TryLockError::Error(_)) => false,
-        }
-    }
-
-    fn locks(&self, state: &State, stage: &str, held: [bool; 3]) -> Result<(), ()> {
-        self.same_owner(state)?;
-        let [outer, sm, log] = std::array::from_fn(|i| self.probe(i, held[i]));
+    fn record_locks(&self, stage: &str, locks: Result<[bool; 3], &'static str>) -> Result<(), ()> {
+        let [outer, sm, log] = locks.map_err(|code| self.fail(code))?;
         self.stage(
             stage,
             format_args!("{} {} {}", u8::from(outer), u8::from(sm), u8::from(log)),
         );
         self.check(outer && sm && log, stage)
+    }
+
+    fn locks(&self, state: &State, stage: &str, held: [bool; 3]) -> Result<(), ()> {
+        self.record_locks(stage, self.guards.locks(state, held))
     }
 
     pub(super) fn driver_done(&self) {
@@ -275,9 +314,10 @@ impl Witness {
         self.running.notify_one();
     }
 
-    pub(super) fn before_disposal(&self, state: &State) -> bool {
-        self.locks(state, "before_disposal", [true, false, false])
-            .is_ok()
+    pub(super) fn finish_close(&self, job: &Job, actual: bool) {
+        self.guards.finish_close(job, actual, |locks| {
+            let _ = self.record_locks("before_disposal", locks);
+        });
     }
 
     pub(super) async fn first_poll<T, E>(
@@ -467,11 +507,52 @@ async fn nominal_real_engine_start_close() {
             "final_state",
         )
         .unwrap();
-    let outer_free = witness.probe(0, false);
+    let outer_free = witness.guards.probe(0, false);
     witness.stage("outer_released", u8::from(outer_free));
     witness.check(outer_free, "outer_release").unwrap();
     witness
         .check(clients.load(Ordering::SeqCst) == 0, "peer_client")
         .unwrap();
     witness.stage("finished", "1 1 0");
+}
+
+#[test]
+fn original_guard_refusal_keeps_close_unconfirmed() {
+    use crate::cluster::startup_plan::tests::Layout;
+
+    let layout = Layout::new();
+    let plan = layout.plan("create-founder");
+    let intent = StartIntent {
+        mode: plan.mode,
+        cluster: [1; 16],
+        node: NodeId::new(1).unwrap(),
+        peer: plan.peer.parse().unwrap(),
+        enrollment: plan.enrollment.parse().unwrap(),
+    };
+    let config = plan.config.clone();
+    let proof = GuardProof::new(plan.state.clone());
+    let job = Job::anchor();
+    job.prepare(plan, &intent, None);
+    assert_eq!(job.state().status, Status::Prepared);
+    proof.capture(job.state().owner.as_ref().unwrap()).unwrap();
+
+    drop(job.request_close());
+    assert!(job.begin_close());
+    // Adding a link makes rechecking the already-held original config refuse.
+    let alias = layout.root.path().join("config-alias");
+    std::fs::hard_link(config, &alias).unwrap();
+    let mut recorded = None;
+    proof.finish_close(job, true, |locks| recorded = Some(locks));
+
+    assert_eq!(recorded, Some(Err("owner_identity")));
+    assert_eq!(job.state().status, Status::Unconfirmed);
+    assert!(job.state().owner.is_some());
+    assert!(job.state().stores.is_some());
+    std::fs::remove_file(alias).unwrap();
+    job.finish_close(None, true, true);
+    assert_eq!(job.state().status, Status::Unconfirmed);
+    // This fixture never started an Engine. Release only its test resources.
+    let mut state = job.state();
+    drop(state.stores.take());
+    drop(state.owner.take());
 }

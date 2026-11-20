@@ -428,8 +428,6 @@ def observe(backend, clock, sleep, start, proof, custodian=Cutoff):
                 proof.uncertain("process_deadline")
         except (Exception, KeyboardInterrupt):
             proof.uncertain("job_termination")
-        if natural_code not in (None, 0):
-            proof.fail("child_exit")
         if not natural:
             pipe_failed = False
             while process is not None and clock() < wall:
@@ -455,6 +453,9 @@ def observe(backend, clock, sleep, start, proof, custodian=Cutoff):
             backend.close_input()
         except (Exception, KeyboardInterrupt):
             proof.uncertain("stdin_cleanup")
+    # A witness emitted before exit may only reach the reader during cleanup.
+    if natural_code not in (None, 0):
+        proof.fail("child_exit")
     if natural_code is not None and proof.test_status is not None:
         if (natural_code == 0) != (proof.test_status == "ok"):
             proof.uncertain("exit_status_mismatch")

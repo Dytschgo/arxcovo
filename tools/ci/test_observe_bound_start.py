@@ -251,15 +251,24 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(proof.first, "child_exit")
         self.assertIn("exit_status_mismatch", proof.uncertainty)
 
-    def test_outer_watchdog_arms_before_preflight_and_fences_resume(self):
+    def test_outer_watchdog_arms_before_bootstrap_and_fences_resume(self):
         adr = (Path(__file__).resolve().parents[2] /
                "docs/adr/0039-retained-bound-start-ownership.md").read_text(encoding="utf-8")
-        self.assertLess(adr.index("$custody.Arm($cutoff)"), adr.index("$worker.BeginInvoke()"))
-        start = adr.index("Require(CreateProcess(exe")
-        resume = adr.index("Require(ResumeThread", start)
-        self.assertIn("0x08080404", adr[start:resume])
-        self.assertIn("Require(IsProcessInJob", adr[start:resume])
-        self.assertIn("Require(!Cancelled && Environment.TickCount64 < work)", adr[start:resume])
+        qualification, entry = (part.split("```", 1)[0]
+                                for part in adr.split("```powershell\n")[1:])
+        self.assertLess(qualification.index("IsBackground = true }.Start()"),
+                        qualification.index("Task.Factory.StartNew"))
+        run = qualification.split("public static bool Run(", 1)[1]
+        self.assertLess(run.index("WithinWall("), run.index("PowerShell.Create()"))
+        self.assertLess(entry.index("::Run([Environment]::TickCount64"), entry.index("Add-Type"))
+        self.assertLess(entry.index("$custody.Watch($deadline)"), entry.index("Hold-Path $root $true"))
+
+        start = entry.index("Require(CreateProcess(exe")
+        resume = entry.index("Require(ResumeThread", start)
+        self.assertIn("0x08080404", entry[start:resume])
+        self.assertIn("Require(IsProcessInJob", entry[start:resume])
+        self.assertIn("!deadline.IsCancellationRequested && Environment.TickCount64 < work",
+                      entry[start:resume])
 
     def test_natural_nonzero_exit_survives_leaked_eof(self):
         child = FakeChild(clock := FakeClock(80000), leak=True)
@@ -270,6 +279,29 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(proof.first, "child_exit")
         self.assertEqual(out["natural_exit_code"], 23)
         self.assertEqual(out["exit_code"], 1)
+        self.assertIn("incomplete_cleanup", proof.uncertainty)
+
+    def test_cleanup_delivered_witness_failure_precedes_natural_nonzero_exit(self):
+        child = FakeChild(clock := FakeClock(80000), leak=True)
+        initial_poll, initial_read = child.poll, child.read
+        child.poll = lambda process: 23 if child.sent and not child.terminated else initial_poll(process)
+
+        def delayed_read(want):
+            if not child.terminated:
+                return b""
+            return initial_read(want)
+
+        child.read = delayed_read
+        child.data = (f"running 1 test\ntest {d6.CASE} ... ARX5B 1 admitted 1\n"
+                      "ARX5B 2 failure engine_start\n"
+                      "ARX5B 3 failure driver_join\nFAILED\n").encode("ascii")
+        stages = []
+        proof = d6.Proof(stages.append)
+        out = d6.observe(child, clock, clock.sleep, 1000, proof)
+        self.assertEqual(out["natural_exit_code"], 23)
+        self.assertEqual(out["exit_code"], 1)
+        self.assertEqual(proof.first, "engine_start")
+        self.assertEqual(stages[1]["values"], ["engine_start"])
         self.assertIn("incomplete_cleanup", proof.uncertainty)
 
     def test_failed_stdin_close_never_prevents_termination(self):

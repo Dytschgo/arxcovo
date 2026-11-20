@@ -447,8 +447,11 @@ where
                                     u8::from(owners)
                                 ),
                             );
-                            w.check(released && owners, "store_release").is_ok()
-                                && w.before_disposal(&job.state())
+                            if w.check(released && owners, "store_release").is_ok() {
+                                w.finish_close(job, actual);
+                                return;
+                            }
+                            false
                         }
                     } else {
                         released

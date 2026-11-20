@@ -105,22 +105,81 @@ Qualification includes the shell runtime and supports Windows PowerShell 7 on
 clock as the launcher. See the
 [clock compatibility record](https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/11/environment-tickcount-windows-behavior).
 
-Use this block only with that separate one-shot grant. Fill the two values from
-the grant before entry. The two exclusive files mark entry and launcher
-admission. A refusal at any point spends the authorization. Verified read
-handles inhibit writes and replacement through use. CPython runs with isolated
-imports, site initialization disabled and an explicit environment.
+As part of shell qualification, preload the managed deadline controller in the
+same PowerShell session. This declaration requires no observation inputs and
+creates no runspace, Job or child. The entry below takes the clock reading as
+it calls that controller. The controller arms its watchdog before any native
+compilation, runspace creation, Job creation or access to the staged inputs.
+
+The two exclusive files mark entry and launcher admission. A refusal at any
+point in the one-shot entry spends the authorization. Verified read handles
+inhibit writes and replacement through use. CPython runs with isolated imports,
+site initialization disabled and an explicit environment.
+
+```powershell
+Add-Type -TypeDefinition @'
+using System;
+using System.Management.Automation;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class D6Entry {
+    static int Remaining(long deadline) {
+        return (int)Math.Max(0, deadline - Environment.TickCount64);
+    }
+
+    public static bool WithinWall(long cutoff, long wall, Func<CancellationToken, bool> setup) {
+        var deadline = new CancellationTokenSource();
+        var completed = new ManualResetEventSlim(false);
+        // Arm a dedicated watchdog before creating the setup worker or runspace.
+        new Thread(() => {
+            if (!completed.Wait(Remaining(cutoff))) deadline.Cancel();
+        }) { IsBackground = true }.Start();
+
+        var worker = Task.Factory.StartNew(() => {
+            try {
+                deadline.Token.ThrowIfCancellationRequested();
+                return setup(deadline.Token);
+            } catch (Exception) {
+                return false;
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        if (!worker.Wait(Remaining(cutoff))) {
+            worker.Wait(Remaining(wall));
+            return false;
+        }
+        if (Environment.TickCount64 >= cutoff) return false;
+        completed.Set();
+        return worker.Result;
+    }
+
+    public static bool Run(long entry, string source) {
+        return WithinWall(entry + 89750, entry + 90000, deadline => {
+            using var shell = PowerShell.Create();
+            var output = shell.AddScript(source).AddArgument(entry).AddArgument(deadline).Invoke();
+            return !shell.HadErrors && output.Count == 1 &&
+                output[0].BaseObject is bool success && success;
+        });
+    }
+}
+'@
+```
+
+The qualified one-shot entry follows. Fill the two values from the grant
+before entry. Use this block only with the separate exact-head grant.
 
 ```powershell
 & {
-    $entry = [Environment]::TickCount64
-    $ErrorActionPreference = 'Stop'
-    $root = 'D:\Temp\arx-m3-step5b\observation'
-    $qualifiedPython = '<qualified absolute interpreter from the grant>'
-    $trustedDigest = '<trusted pins SHA256 from the grant>'
-    Add-Type -TypeDefinition @"
+    if (![D6Entry]::Run([Environment]::TickCount64, @'
+param([long]$entry, [Threading.CancellationToken]$deadline)
+$deadline.ThrowIfCancellationRequested()
+if ([Environment]::TickCount64 -ge $entry + 82000) { throw 'Deadline' }
+$ErrorActionPreference = 'Stop'
+$root = 'D:\Temp\arx-m3-step5b\observation'
+$qualifiedPython = '<qualified absolute interpreter from the grant>'
+$trustedDigest = '<trusted pins SHA256 from the grant>'
+Add-Type -TypeDefinition @"
 using System;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -237,10 +296,7 @@ public sealed class D6Custody : IDisposable {
     }
 
     readonly SafeFileHandle job;
-    readonly ManualResetEvent finished = new ManualResetEvent(false);
-    int cancelled;
-    public bool Cancelled => Volatile.Read(ref cancelled) != 0;
-    public bool CleanupConfirmed { get; private set; }
+
     public D6Custody() {
         job = CreateJobObject(IntPtr.Zero, null);
         var limits = new JobLimits();
@@ -254,26 +310,21 @@ public sealed class D6Custody : IDisposable {
     public static int Remaining(long deadline, long now) {
         return (int)Math.Max(0, deadline - now);
     }
-    public void Arm(long deadline) {
-        new Thread(() => {
-            if (!finished.WaitOne(Remaining(deadline, Environment.TickCount64))) Cancel();
-        }) { IsBackground = true }.Start();
-    }
-    public void Cancel() {
-        if (Interlocked.Exchange(ref cancelled, 1) != 0) return;
-        new Thread(() => {
+    public CancellationTokenRegistration Watch(CancellationToken deadline) {
+        return deadline.Register(() => {
             try { TerminateJobObject(job, 1); }
             catch (ObjectDisposedException) {}
-        }) { IsBackground = true }.Start();
+        });
     }
     bool Empty() {
         return QueryInformationJobObject(job, 1, out Accounting info,
             (uint)Marshal.SizeOf<Accounting>(), IntPtr.Zero) && info.Active == 0;
     }
-    public bool Run(string exe, string script, string[] env, string cwd, long entry) {
+    public bool Run(string exe, string script, string[] env, string cwd, long entry,
+        CancellationToken deadline) {
         long work = entry + 82000, wall = entry + 90000;
         IntPtr size = IntPtr.Zero, attrs = IntPtr.Zero, environment = IntPtr.Zero, jobList = IntPtr.Zero;
-        bool initialized = false;
+        bool initialized = false, cleanupConfirmed = false;
         var child = new ProcessInfo();
         var command = new StringBuilder("\"" + exe + "\" -I -S -B \"" + script + "\"");
         try {
@@ -289,23 +340,23 @@ public sealed class D6Custody : IDisposable {
             Array.Sort(env, StringComparer.OrdinalIgnoreCase);
             environment = Marshal.StringToHGlobalUni(string.Join("\0", env) + "\0");
             var startup = new Startup { Size = (uint)Marshal.SizeOf<Startup>(), Attributes = attrs };
-            Require(!Cancelled && Environment.TickCount64 < work);
+            Require(!deadline.IsCancellationRequested && Environment.TickCount64 < work);
             Require(CreateProcess(exe, command, IntPtr.Zero, IntPtr.Zero, false,
                 0x08080404, environment, cwd, ref startup, out child));
             Require(IsProcessInJob(child.Process, job, out bool member) && member);
-            Require(!Cancelled && Environment.TickCount64 < work);
+            Require(!deadline.IsCancellationRequested && Environment.TickCount64 < work);
             Require(ResumeThread(child.Thread) == 1);
             Require(WaitForSingleObject(child.Process,
                 (uint)Remaining(wall, Environment.TickCount64)) == 0);
-            Require(!Cancelled && Environment.TickCount64 < wall && Empty());
-            CleanupConfirmed = true;
+            Require(!deadline.IsCancellationRequested && Environment.TickCount64 < wall && Empty());
+            cleanupConfirmed = true;
             return GetExitCodeProcess(child.Process, out uint code) && code == 0;
         } finally {
-            if (!CleanupConfirmed) {
+            if (!cleanupConfirmed) {
                 bool stopped = TerminateJobObject(job, 1);
                 bool reaped = child.Process == IntPtr.Zero || WaitForSingleObject(child.Process,
                     (uint)Remaining(wall, Environment.TickCount64)) == 0;
-                CleanupConfirmed = stopped && reaped && Empty();
+                cleanupConfirmed = stopped && reaped && Empty();
             }
             if (child.Process != IntPtr.Zero) CloseHandle(child.Process);
             if (child.Thread != IntPtr.Zero) CloseHandle(child.Thread);
@@ -313,206 +364,182 @@ public sealed class D6Custody : IDisposable {
             if (initialized) DeleteProcThreadAttributeList(attrs);
             if (attrs != IntPtr.Zero) Marshal.FreeHGlobal(attrs);
             if (jobList != IntPtr.Zero) Marshal.FreeHGlobal(jobList);
+            Require(cleanupConfirmed);
         }
     }
-    public void Dispose() {
-        finished.Set();
-        job.Dispose();
-    }
+    public void Dispose() { job.Dispose(); }
 }
 "@
-
-    $custody = [D6Custody]::new()
-    $worker = [PowerShell]::Create()
-    $pending = $null
-    $preflight = {
-        param($entry, $root, $qualifiedPython, $trustedDigest, $custody)
-        $ErrorActionPreference = 'Stop'
-        $files = [Collections.Generic.List[IDisposable]]::new()
-        $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        try {
-            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-            $allowed = @($sid, 'S-1-5-18', 'S-1-5-32-544')
-            function Assert-Work {
-                if ([Environment]::TickCount64 -ge $entry + 82000) { throw 'Deadline' }
-            }
-            function Hold-Path([string]$path, [bool]$directory) {
-                Assert-Work
-                if (![IO.Path]::IsPathFullyQualified($path) -or
-                    [IO.Path]::GetFullPath($path) -cne $path -or
-                    $path -notmatch '^[A-Za-z]:\\') { throw 'Path' }
-                if ($directory -and $directories.Contains($path)) { return }
-                $parent = [IO.Path]::GetDirectoryName($path)
-                if ($parent) { Hold-Path $parent $true }
-                $handle = [D6Custody]::Hold($path, $directory)
-                $files.Add($handle)
-                if ($path -ceq $root -or $path.StartsWith("$root\", 'Ordinal')) {
-                    $acl = Get-Acl -LiteralPath $path
-                    $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-                    if (!$acl.AreAccessRulesCanonical -or $rules.Count -eq 0) { throw 'ACL' }
-                    foreach ($rule in $rules) {
-                        if ($rule.AccessControlType -eq 'Allow' -and
-                            $rule.IdentityReference.Value -notin $allowed) { throw 'ACL' }
-                    }
-                }
-                if ($directory) { [void]$directories.Add($path) } else { return $handle }
-            }
-            function Hold-Input([string]$path, [long]$cap) {
-                $stream = [IO.FileStream]::new((Hold-Path $path $false), 'Read')
-                $files.Add($stream)
-                if ($stream.Length -le 0 -or $stream.Length -gt $cap) { throw 'Size' }
-                return $stream
-            }
-            function Get-Digest([IO.Stream]$stream) {
-                Assert-Work
-                return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
-            }
-
-            Hold-Path $root $true
-            $drive = [IO.DriveInfo]::new('D')
-            if ($drive.DriveType -ne 'Fixed' -or $drive.DriveFormat -cne 'NTFS') { throw 'Volume' }
-            Assert-Work
-            [IO.File]::Open("$root\entry-claimed", 'CreateNew', 'Write', 'None').Dispose()
-            if ([Environment]::Version.Major -gt 10 -or $trustedDigest -cnotmatch '^[0-9a-f]{64}$') {
-                throw 'Qualification'
-            }
-            foreach ($name in [Environment]::GetEnvironmentVariables().Keys) {
-                if ($name -match '^(LD_|DYLD_|LIBSQLITE3_|SQLITE3_|ARX_STEP5B_)') { throw 'Overrides' }
-            }
-
-            $pinsStream = Hold-Input "$root\pins.json" 16384
-            if ((Get-Digest $pinsStream) -cne $trustedDigest) { throw 'Provenance' }
-            $pinsStream.Position = 0
-            $bytes = [byte[]]::new([int]$pinsStream.Length)
-            $pinsStream.ReadExactly($bytes, 0, $bytes.Length)
-            $pins = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable -Depth 8
-            if ($pins.python -cne $qualifiedPython) { throw 'Interpreter' }
-            $pythonStream = Hold-Input $qualifiedPython 32MB
-            if ((Get-Digest $pythonStream) -cne $pins.python_sha256) { throw 'Interpreter' }
-            $runtime = $pins.python_runtime
-            if ($runtime -isnot [Collections.IDictionary] -or $runtime.Count -lt 1 -or
-                $runtime.Count -gt 64) { throw 'Runtime inventory' }
-            $pythonDir = [IO.Path]::GetDirectoryName($qualifiedPython)
-            $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            [void]$names.Add([IO.Path]::GetFileName($qualifiedPython))
-            Hold-Path $pythonDir $true
-            foreach ($leaf in $runtime.Keys) {
-                if ($leaf -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,95}$' -or $leaf.EndsWith('.') -or
-                    !$names.Add($leaf) -or $runtime[$leaf] -cnotmatch '^[0-9a-f]{64}$' -or
-                    (Get-Digest (Hold-Input "$pythonDir\$leaf" 64MB)) -cne $runtime[$leaf]) {
-                    throw 'Runtime'
-                }
-            }
-            $seen = 0
-            foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($pythonDir)) {
-                Assert-Work
-                if (++$seen -gt 65 -or !$names.Contains([IO.Path]::GetFileName($item))) {
-                    throw 'Runtime inventory'
-                }
-            }
-            if ($seen -ne $names.Count) { throw 'Runtime inventory' }
-
-            $launcher = "$root\source\tools\ci\observe_bound_start.py"
-            $support = "$root\source\tools\ci\windows_diag_sample.py"
-            $launcherStream = Hold-Input $launcher 128KB
-            $supportStream = Hold-Input $support 128KB
-            if ((Get-Digest $launcherStream) -cne $pins.sha256.launcher -or
-                (Get-Digest $supportStream) -cne $pins.sha256.support) { throw 'Source' }
-
-            $scratch = @{
-                TMP = 'tmp'; TEMP = 'tmp'; CARGO_TARGET_DIR = 'target'; CARGO_HOME = 'cargo-home'
-                RUSTUP_HOME = 'rustup-home'; ARX_OBSERVER_ROOT = 'evidence'
-            }
-            foreach ($inputFile in @(
-                @('manifest', 'source-manifest.json', 16MB),
-                @('loader', 'loader.json', 64KB),
-                @('lockfile', 'source\Cargo.lock', 1MB),
-                @('driver', 'source\crates\arxd\src\cluster\consensus\bound_start.rs', 64KB),
-                @('case', 'source\crates\arxd\src\cluster\consensus\bound_start\nominal_observation.rs', 64KB)
-            )) {
-                $key, $leaf, $cap = $inputFile
-                if ((Get-Digest (Hold-Input "$root\$leaf" $cap)) -cne $pins.sha256[$key]) {
-                    throw 'Source'
-                }
-            }
-            $cap = [long]$pins.binary_bytes
-            if ($cap -le 0 -or $cap -gt 512MB) { throw 'Binary size' }
-            $binary = Hold-Input "$root\bin\arxd-step5b.exe" $cap
-            if ($binary.Length -ne $cap -or (Get-Digest $binary) -cne $pins.binary_sha256) {
-                throw 'Binary'
-            }
-            $rootEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            foreach ($leaf in 'entry-claimed','pins.json','source-manifest.json','loader.json',
-                'source','bin','tmp','target','cargo-home','rustup-home','evidence') {
-                [void]$rootEntries.Add($leaf)
-            }
-            foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($root)) {
-                Assert-Work
-                if (!$rootEntries.Remove([IO.Path]::GetFileName($item))) { throw 'Layout' }
-            }
-            if ($rootEntries.Count -ne 0) { throw 'Layout' }
-            $binEntries = [IO.Directory]::EnumerateFileSystemEntries("$root\bin").GetEnumerator()
-            try {
-                if (!$binEntries.MoveNext() -or $binEntries.Current -cne "$root\bin\arxd-step5b.exe" -or
-                    $binEntries.MoveNext()) { throw 'Binary layout' }
-            } finally {
-                $binEntries.Dispose()
-            }
-            $windows = [IO.Directory]::GetParent([Environment]::SystemDirectory).FullName
-            $environment = @(
-                "SYSTEMROOT=$windows", "WINDIR=$windows", "ARX_SCRATCH_ROOT=$root",
-                'CARGO_NET_OFFLINE=true', 'CARGO_PROFILE_DEV_DEBUG=0',
-                "ARX_STEP5B_ENTRY_MS=$entry", "ARX_STEP5B_PINS_SHA256=$trustedDigest"
-            )
-            foreach ($key in $scratch.Keys) {
-                $path = "$root\$($scratch[$key])"
-                Hold-Path $path $true
-                $environment += "$key=$path"
-            }
-            $tmpAcl = Get-Acl -LiteralPath "$root\tmp"
-            $tmpRules = $tmpAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-            $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
-            $full = [Security.AccessControl.FileSystemRights]::FullControl
-            $usable = @($tmpRules | Where-Object {
-                $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq 'Allow' -and
-                ($_.InheritanceFlags -band $inherit) -eq $inherit -and
-                ($_.FileSystemRights -band $full) -eq $full -and $_.PropagationFlags -eq 'None'
-            })
-            if ($usable.Count -eq 0) { throw 'Fixture ACL' }
-            Assert-Work
-            $custody.Run($qualifiedPython, $launcher, [string[]]$environment, $root, $entry)
-        } finally {
-            foreach ($handle in $files) { $handle.Dispose() }
-            $custody.Dispose()
-        }
-    }
+$deadline.ThrowIfCancellationRequested()
+if ([Environment]::TickCount64 -ge $entry + 82000) { throw 'Deadline' }
+$custody = [D6Custody]::new()
+$watch = $null
+try {
+    $watch = $custody.Watch($deadline)
+    $deadline.ThrowIfCancellationRequested()
+    $files = [Collections.Generic.List[IDisposable]]::new()
+    $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     try {
-        [void]$worker.AddScript($preflight.ToString()).AddArgument($entry).AddArgument($root).
-            AddArgument($qualifiedPython).AddArgument($trustedDigest).AddArgument($custody)
-        # Arm before entering the worker, leaving 250 ms for bounded cleanup proof.
-        $cutoff = $entry + 89750
-        $custody.Arm($cutoff)
-        $pending = $worker.BeginInvoke()
-        $stop = [D6Custody]::Remaining($cutoff, [Environment]::TickCount64)
-        if (!$pending.AsyncWaitHandle.WaitOne($stop)) {
-            $custody.Cancel()
-            $left = [D6Custody]::Remaining($entry + 90000, [Environment]::TickCount64)
-            if (!$pending.AsyncWaitHandle.WaitOne($left) -or !$custody.CleanupConfirmed) {
-                throw 'Outer cleanup unconfirmed'
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $allowed = @($sid, 'S-1-5-18', 'S-1-5-32-544')
+        function Assert-Work {
+            $deadline.ThrowIfCancellationRequested()
+            if ([Environment]::TickCount64 -ge $entry + 82000) { throw 'Deadline' }
+        }
+        function Hold-Path([string]$path, [bool]$directory) {
+            Assert-Work
+            if (![IO.Path]::IsPathFullyQualified($path) -or
+                [IO.Path]::GetFullPath($path) -cne $path -or
+                $path -notmatch '^[A-Za-z]:\\') { throw 'Path' }
+            if ($directory -and $directories.Contains($path)) { return }
+            $parent = [IO.Path]::GetDirectoryName($path)
+            if ($parent) { Hold-Path $parent $true }
+            $handle = [D6Custody]::Hold($path, $directory)
+            $files.Add($handle)
+            if ($path -ceq $root -or $path.StartsWith("$root\", 'Ordinal')) {
+                $acl = Get-Acl -LiteralPath $path
+                $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+                if (!$acl.AreAccessRulesCanonical -or $rules.Count -eq 0) { throw 'ACL' }
+                foreach ($rule in $rules) {
+                    if ($rule.AccessControlType -eq 'Allow' -and
+                        $rule.IdentityReference.Value -notin $allowed) { throw 'ACL' }
+                }
             }
-            throw 'Outer deadline'
+            if ($directory) { [void]$directories.Add($path) } else { return $handle }
         }
-        $result = $worker.EndInvoke($pending)
-        if ($result.Count -ne 1 -or $result[0].psobject.BaseObject -ne $true -or
-            [Environment]::TickCount64 -ge $entry + 90000) { throw 'Incomplete' }
-    } catch {
-        if ($null -ne $pending -and !$pending.IsCompleted) { $custody.Cancel() }
-        throw 'D6 entry refused or incomplete. Preserve evidence and stop.'
+        function Hold-Input([string]$path, [long]$cap) {
+            $stream = [IO.FileStream]::new((Hold-Path $path $false), 'Read')
+            $files.Add($stream)
+            if ($stream.Length -le 0 -or $stream.Length -gt $cap) { throw 'Size' }
+            return $stream
+        }
+        function Get-Digest([IO.Stream]$stream) {
+            Assert-Work
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        }
+
+        Hold-Path $root $true
+        $drive = [IO.DriveInfo]::new('D')
+        if ($drive.DriveType -ne 'Fixed' -or $drive.DriveFormat -cne 'NTFS') { throw 'Volume' }
+        Assert-Work
+        [IO.File]::Open("$root\entry-claimed", 'CreateNew', 'Write', 'None').Dispose()
+        if ([Environment]::Version.Major -gt 10 -or $trustedDigest -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Qualification'
+        }
+        foreach ($name in [Environment]::GetEnvironmentVariables().Keys) {
+            if ($name -match '^(LD_|DYLD_|LIBSQLITE3_|SQLITE3_|ARX_STEP5B_)') { throw 'Overrides' }
+        }
+
+        $pinsStream = Hold-Input "$root\pins.json" 16384
+        if ((Get-Digest $pinsStream) -cne $trustedDigest) { throw 'Provenance' }
+        $pinsStream.Position = 0
+        $bytes = [byte[]]::new([int]$pinsStream.Length)
+        $pinsStream.ReadExactly($bytes, 0, $bytes.Length)
+        $pins = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable -Depth 8
+        if ($pins.python -cne $qualifiedPython) { throw 'Interpreter' }
+        $pythonStream = Hold-Input $qualifiedPython 32MB
+        if ((Get-Digest $pythonStream) -cne $pins.python_sha256) { throw 'Interpreter' }
+        $runtime = $pins.python_runtime
+        if ($runtime -isnot [Collections.IDictionary] -or $runtime.Count -lt 1 -or
+            $runtime.Count -gt 64) { throw 'Runtime inventory' }
+        $pythonDir = [IO.Path]::GetDirectoryName($qualifiedPython)
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        [void]$names.Add([IO.Path]::GetFileName($qualifiedPython))
+        Hold-Path $pythonDir $true
+        foreach ($leaf in $runtime.Keys) {
+            if ($leaf -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,95}$' -or $leaf.EndsWith('.') -or
+                !$names.Add($leaf) -or $runtime[$leaf] -cnotmatch '^[0-9a-f]{64}$' -or
+                (Get-Digest (Hold-Input "$pythonDir\$leaf" 64MB)) -cne $runtime[$leaf]) {
+                throw 'Runtime'
+            }
+        }
+        $seen = 0
+        foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($pythonDir)) {
+            Assert-Work
+            if (++$seen -gt 65 -or !$names.Contains([IO.Path]::GetFileName($item))) {
+                throw 'Runtime inventory'
+            }
+        }
+        if ($seen -ne $names.Count) { throw 'Runtime inventory' }
+
+        $launcher = "$root\source\tools\ci\observe_bound_start.py"
+        $support = "$root\source\tools\ci\windows_diag_sample.py"
+        $launcherStream = Hold-Input $launcher 128KB
+        $supportStream = Hold-Input $support 128KB
+        if ((Get-Digest $launcherStream) -cne $pins.sha256.launcher -or
+            (Get-Digest $supportStream) -cne $pins.sha256.support) { throw 'Source' }
+
+        $scratch = @{
+            TMP = 'tmp'; TEMP = 'tmp'; CARGO_TARGET_DIR = 'target'; CARGO_HOME = 'cargo-home'
+            RUSTUP_HOME = 'rustup-home'; ARX_OBSERVER_ROOT = 'evidence'
+        }
+        foreach ($inputFile in @(
+            @('manifest', 'source-manifest.json', 16MB),
+            @('loader', 'loader.json', 64KB),
+            @('lockfile', 'source\Cargo.lock', 1MB),
+            @('driver', 'source\crates\arxd\src\cluster\consensus\bound_start.rs', 64KB),
+            @('case', 'source\crates\arxd\src\cluster\consensus\bound_start\nominal_observation.rs', 64KB)
+        )) {
+            $key, $leaf, $cap = $inputFile
+            if ((Get-Digest (Hold-Input "$root\$leaf" $cap)) -cne $pins.sha256[$key]) {
+                throw 'Source'
+            }
+        }
+        $cap = [long]$pins.binary_bytes
+        if ($cap -le 0 -or $cap -gt 512MB) { throw 'Binary size' }
+        $binary = Hold-Input "$root\bin\arxd-step5b.exe" $cap
+        if ($binary.Length -ne $cap -or (Get-Digest $binary) -cne $pins.binary_sha256) {
+            throw 'Binary'
+        }
+        $rootEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($leaf in 'entry-claimed','pins.json','source-manifest.json','loader.json',
+            'source','bin','tmp','target','cargo-home','rustup-home','evidence') {
+            [void]$rootEntries.Add($leaf)
+        }
+        foreach ($item in [IO.Directory]::EnumerateFileSystemEntries($root)) {
+            Assert-Work
+            if (!$rootEntries.Remove([IO.Path]::GetFileName($item))) { throw 'Layout' }
+        }
+        if ($rootEntries.Count -ne 0) { throw 'Layout' }
+        $binEntries = [IO.Directory]::EnumerateFileSystemEntries("$root\bin").GetEnumerator()
+        try {
+            if (!$binEntries.MoveNext() -or $binEntries.Current -cne "$root\bin\arxd-step5b.exe" -or
+                $binEntries.MoveNext()) { throw 'Binary layout' }
+        } finally {
+            $binEntries.Dispose()
+        }
+        $windows = [IO.Directory]::GetParent([Environment]::SystemDirectory).FullName
+        $environment = @(
+            "SYSTEMROOT=$windows", "WINDIR=$windows", "ARX_SCRATCH_ROOT=$root",
+            'CARGO_NET_OFFLINE=true', 'CARGO_PROFILE_DEV_DEBUG=0',
+            "ARX_STEP5B_ENTRY_MS=$entry", "ARX_STEP5B_PINS_SHA256=$trustedDigest"
+        )
+        foreach ($key in $scratch.Keys) {
+            $path = "$root\$($scratch[$key])"
+            Hold-Path $path $true
+            $environment += "$key=$path"
+        }
+        $tmpAcl = Get-Acl -LiteralPath "$root\tmp"
+        $tmpRules = $tmpAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+        $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+        $full = [Security.AccessControl.FileSystemRights]::FullControl
+        $usable = @($tmpRules | Where-Object {
+            $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq 'Allow' -and
+            ($_.InheritanceFlags -band $inherit) -eq $inherit -and
+            ($_.FileSystemRights -band $full) -eq $full -and $_.PropagationFlags -eq 'None'
+        })
+        if ($usable.Count -eq 0) { throw 'Fixture ACL' }
+        Assert-Work
+        $custody.Run($qualifiedPython, $launcher, [string[]]$environment, $root, $entry, $deadline)
     } finally {
-        if ($null -eq $pending -or $pending.IsCompleted) {
-            $worker.Dispose()
-            $custody.Dispose()
-        }
+        foreach ($handle in $files) { $handle.Dispose() }
+    }
+} finally {
+    if ($null -ne $watch) { $watch.Dispose() }
+    $custody.Dispose()
+}
+'@)) {
+        throw 'D6 entry refused or incomplete. Preserve evidence and stop.'
     }
 }
 ```
@@ -526,10 +553,12 @@ and atomically assigned to the unnamed kill-on-close Job through
 `PROC_THREAD_ATTRIBUTE_JOB_LIST`. The launcher verifies membership before resume
 and writes one stdin byte. A separate custodian enforces the test deadline
 independently of pipe draining and the bounded, ordered evidence writer.
-The outer wait is active across preflight and startup. It creates the launcher
-suspended in its own Job, verifies membership and fences resume. It stops the
-attributed Job at 89.75 seconds, leaving up to 250 ms for signaled-handle and
-zero-active proof. If creation is still in flight, the resume fence and
+The outer wait covers runspace startup, native compilation, Job setup,
+preflight and launcher creation. Work that reaches the Job registers it with
+the already-running watchdog before validation. The launcher enters that Job
+suspended, with membership and the absolute work deadline checked before
+resume. The watchdog signals the attributed Job at 89.75 seconds, leaving up
+to 250 ms for signaled-handle and zero-active proof. If creation is still in flight, the resume fence and
 kill-on-close remain in effect. Forced stop or missing cleanup proof is
 uncertainty. A complete result requires an unforced exit,
 pipe EOF, zero active members, ordered witness phases and successful in-process
