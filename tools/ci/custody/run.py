@@ -43,17 +43,26 @@ def require(condition, code, subject='launcher', predicate='required_condition',
 
 
 def safe(path, parent=None, directory=True, *, input_file=False, subject='filesystem'):
+    try:
+        return checked_path(path, parent, directory, input_file=input_file, subject=subject)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise Refusal('UnsafePath', subject, 'filesystem_error', error_type=type(error).__name__) from None
+
+
+def checked_path(path, parent=None, directory=True, *, input_file=False, subject='filesystem'):
     path = Path(path)
     require(path.is_absolute() and len(str(path)) <= 4096, 'UnsafePath', subject, 'absolute_bounded_path')
-    for p in [path, *path.parents]:
-        require(not p.is_symlink(), 'UnsafePath', subject, 'no_symlink_component')
+    for depth, p in enumerate([path, *path.parents]):
+        require(not p.is_symlink(), 'UnsafePath', subject, 'no_symlink_component', ancestor_depth=depth)
     require(path.resolve() == path, 'UnsafePath', subject, 'canonical_spelling')
     if parent:
         require(path.is_relative_to(parent) and path != parent, 'UnsafePath', subject, 'strict_descendant')
     m = path.lstat()
-    require(stat.S_ISDIR(m.st_mode) if directory else stat.S_ISREG(m.st_mode), 'UnsafePath', subject, 'directory_type' if directory else 'regular_type')
+    facts = dict(device=m.st_dev, inode=m.st_ino, uid=m.st_uid, gid=m.st_gid,
+                 mode=stat.S_IMODE(m.st_mode), nlink=m.st_nlink, file_type=stat.S_IFMT(m.st_mode))
+    require(stat.S_ISDIR(m.st_mode) if directory else stat.S_ISREG(m.st_mode), 'UnsafePath', subject, 'directory_type' if directory else 'regular_type', **facts)
     if not directory:
-        require(m.st_nlink >= 1 if input_file else m.st_nlink == 1, 'UnsafePath', subject, 'input_link_policy' if input_file else 'single_link', nlink=m.st_nlink)
+        require(m.st_nlink >= 1 if input_file else m.st_nlink == 1, 'UnsafePath', subject, 'input_link_policy' if input_file else 'single_link', **facts)
     return m
 
 
@@ -281,8 +290,9 @@ class BuildInput:
     Runner ownership and existing aliases are permitted for this role only.
     Pathname and descriptor identity, metadata and bytes must remain unchanged.
     """
-    def __init__(self, path, parent, subject, record):
+    def __init__(self, path, parent, subject, record, checkpoint=lambda: None):
         self.path, self.parent, self.subject, self.record = path, parent, subject, record
+        self.checkpoint = checkpoint
         self.fd = None
 
     def __enter__(self):
@@ -308,6 +318,7 @@ class BuildInput:
             raise
 
     def check(self):
+        self.checkpoint()
         for m, before in ((safe(self.path, self.parent, False, input_file=True, subject=self.subject), self.metadata),
                           (os.fstat(self.fd), self.open_metadata)):
             require((identity(m), m.st_size, m.st_mtime_ns, m.st_ctime_ns) == before,
@@ -318,6 +329,7 @@ class BuildInput:
         os.lseek(self.fd, 0, os.SEEK_SET)
         h, size = hashlib.sha256(), 0
         while data := os.read(self.fd, MIB):
+            self.checkpoint()
             size += len(data)
             require(size <= 128*MIB, 'CandidateBounds', self.subject, 'bounded_read')
             h.update(data)
@@ -392,6 +404,18 @@ def terminal(output):
 def exact_listing(output):
     names = [line[:-6] for line in output.decode('ascii').splitlines() if line.endswith(': test')]
     return names == [PROBE] and output.count(b'1 test, 0 benchmarks') == 1
+
+
+def command_role(argv):
+    """Closed operation labels, never command text or caller paths."""
+    if argv[0] == 'sudo':
+        return 'sudo-' + argv[2] if len(argv) > 2 and argv[2] in TOOLS else 'sudo-invalid'
+    if argv[0] == 'docker':
+        return 'docker-' + argv[1] if len(argv) > 1 and argv[1] in (
+            'build', 'image', 'create', 'inspect', 'start', 'exec', 'logs', 'rm', 'container') else 'docker-invalid'
+    if argv[0] == 'git':
+        return 'git-source' if len(argv) > 1 and argv[1] == 'show' else 'git-head'
+    return argv[0] if argv[0] in TOOLS else 'candidate-list'
 
 
 def choose(candidates):
@@ -489,14 +513,26 @@ class Child:
         require(self.clock() < self.deadline, 'HolderTimeout', 'alive', 'self.clock() < self.deadline')
         require(self.p.poll() is None, 'HolderExit', 'alive', 'self.p.poll() is None')
 
-    def finish(self):
+    def drain_and_reap(self):
         self.pump()
         if self.p.poll() is None or self.selector.get_map():
             return False
         self.p.wait(timeout=0)
         self.reaped = True
         self.selector.close()
+        return True
+
+    def finish(self):
+        if not self.drain_and_reap():
+            return False
         require(self.p.returncode == 0, 'CommandExit', 'finish', 'self.p.returncode == 0')
+        return True
+
+    def finish_discovery(self):
+        if not self.drain_and_reap():
+            return False
+        require(isinstance(self.p.returncode, int) and self.p.returncode >= 0,
+                'CommandExit', 'discovery-list', 'non_signal_completed_exit')
         return True
 
     def kill(self):
@@ -529,6 +565,7 @@ class Harness:
         self.cleanup_deadline = None
         self.run_id = os.urandom(8).hex()
         self.evidence = 0
+        self.evidence_exhausted = False
         self.tools = None
         self.case_results = set()
 
@@ -546,8 +583,17 @@ class Harness:
 
     def record(self, event, **facts):
         line = json.dumps({'event': event, **facts}, sort_keys=True)
-        self.evidence += len(line)
-        require(self.evidence <= LIMIT, 'EvidenceOverflow', 'record', 'self.evidence <= LIMIT')
+        size = len(line.encode('utf-8')) + 1
+        # Reserve only diagnostic space inside the unchanged total evidence cap.
+        if self.evidence + size > LIMIT - 256 or self.evidence_exhausted:
+            if not self.evidence_exhausted:
+                refusal = json.dumps(dict(event='refusal', code='EvidenceOverflow',
+                    subject='evidence', predicate='bounded_sink', bytes=self.evidence, cap=LIMIT), sort_keys=True)
+                self.evidence += len(refusal) + 1
+                print(refusal, flush=True)
+                self.evidence_exhausted = True
+            raise Refusal('EvidenceOverflow')
+        self.evidence += size
         print(line, flush=True)
 
     def bound_argv(self, argv):
@@ -566,14 +612,19 @@ class Harness:
             require(Path(role).is_absolute(), 'Arguments', 'bound_argv', 'Path(role).is_absolute()')
         return argv
 
-    def command(self, argv, phase, seconds=5, cleanup=False, observed=None):
+    def command(self, argv, phase, seconds=5, cleanup=False, observed=None, discovery=False):
+        if discovery:
+            require(not cleanup and phase == 'preflight' and seconds == 2 and len(argv) == 4 and
+                    Path(argv[0]).is_absolute() and argv[1:] == ['--list', '--exact', PROBE],
+                    'Arguments', 'discovery-list', 'fixed_host_listing_only')
         start = self.clock()
         deadline = min(self.cleanup_deadline or self.budget.start + 150, start + seconds) if cleanup else self.budget.deadline(phase, seconds)
         require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout', 'command', 'start < deadline')
-        child = self.spawn(self.bound_argv(argv), deadline, self.clock)
-        self.children.append(child)
+        child = None
         failure = None
         try:
+            child = self.spawn(self.bound_argv(argv), deadline, self.clock)
+            self.children.append(child)
             while True:
                 if not cleanup and self.holder:
                     self.check_work()
@@ -583,22 +634,24 @@ class Harness:
                     else:
                         self.holder.alive()
                 require(self.clock() < deadline, 'CommandTimeout', 'command', 'self.clock() < deadline')
-                if child.finish():
-                    return bytes(child.out)
+                finished = child.finish_discovery() if discovery else child.finish()
+                if finished:
+                    output = bytes(child.out)
+                    return (output, child.p.returncode) if discovery else output
                 time.sleep(.01)
         except Exception as error:
             failure = error
-            self.record('command-refusal', phase=phase, operation=argv[0] if argv[0] in TOOLS else 'candidate-list',
+            self.record('command-refusal', phase=phase, operation=command_role(argv),
                         predicate=str(error) if isinstance(error, Refusal) else type(error).__name__,
-                        returncode=child.p.returncode if hasattr(child, 'p') else None,
+                        returncode=child.p.returncode if child is not None and hasattr(child, 'p') else None,
                         seconds=round(self.clock() - start, 6),
                         missing_glibc=sorted(set(v.decode('ascii') for v in re.findall(
-                            rb"(GLIBC_[0-9]+\.[0-9]+)[^\r\n]{0,16}not found", bytes(child.out)))))
+                            rb"(GLIBC_[0-9]+\.[0-9]+)[^\r\n]{0,16}not found", bytes(child.out) if child else b''))))
             self.fail(error)
             raise
         finally:
             try:
-                if not child.reaped:
+                if child is not None and not child.reaped:
                     child.kill()
             except Exception as error:
                 if self.first is None:
@@ -607,7 +660,7 @@ class Harness:
                 if failure is None:
                     raise
             finally:
-                if observed is not None:
+                if observed is not None and child is not None:
                     observed['output'] = bytes(child.out)
                 if not cleanup:
                     self.budget.used[phase] += self.clock() - start
@@ -915,6 +968,19 @@ class Harness:
         self.run_nodes()
 
     def discover_and_stage(self, source, context):
+        start, used = self.clock(), self.budget.used['preflight']
+        def checkpoint():
+            self.budget.used['preflight'] = used + self.clock() - start
+            self.budget.deadline('preflight', 20)
+        try:
+            checkpoint()
+            self._discover_and_stage(source, context, checkpoint)
+            checkpoint()
+        finally:
+            # Include filesystem/hash/copy work once, together with commands.
+            self.budget.used['preflight'] = used + self.clock() - start
+
+    def _discover_and_stage(self, source, context, checkpoint):
         checkout = Path.cwd()
         safe(checkout, subject='checkout')
         target = Path(os.environ['CARGO_TARGET_DIR'])
@@ -933,14 +999,22 @@ class Harness:
                 subject = 'candidate-' + str(len(objects))
                 objects[path] = None
                 try:
-                    obj = stack.enter_context(BuildInput(path, deps, subject, self.record))
+                    obj = stack.enter_context(BuildInput(path, deps, subject, self.record, checkpoint))
                     objects[path] = obj
                     os.lseek(obj.fd, 0, os.SEEK_SET)
                     if os.read(obj.fd, 4) != b'\x7fELF':
                         continue
-                    listing = self.command([str(path), '--list', '--exact', PROBE], 'preflight', 2)
+                    started = self.clock()
+                    listing, returncode = self.command([str(path), '--list', '--exact', PROBE], 'preflight', 2, discovery=True)
                     obj.verify()
-                    candidates.append((path, listing, obj.sha, obj.sha))
+                    diagnostic = 'empty' if not listing else 'glibc-missing' if re.search(
+                        rb'GLIBC_[0-9]+\.[0-9]+[^\r\n]{0,16}not found', listing) else 'other'
+                    self.record('candidate-list', candidate=len(objects)-1, returncode=returncode,
+                                seconds=round(self.clock() - started, 6), diagnostic=diagnostic)
+                    require(returncode == 0 or (PROBE + ': test').encode() not in listing.splitlines(),
+                            'ProbeSelection', subject, 'nonzero_probe_record_conflict')
+                    if returncode == 0:
+                        candidates.append((path, listing, obj.sha, obj.sha))
                 except (Refusal, OSError) as error:
                     if failed is None:
                         failed = error
@@ -953,7 +1027,7 @@ class Harness:
             inputs = {}
             for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
                              'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
-                with BuildInput(checkout / relative, checkout, relative, self.record) as obj:
+                with BuildInput(checkout / relative, checkout, relative, self.record, checkpoint) as obj:
                     blob = self.command(['git', 'show', source + ':' + relative], 'preflight')
                     require(hashlib.sha256(blob).hexdigest() == obj.sha, 'SourcePin', relative, 'immutable_git_blob')
                     if relative.endswith('/Containerfile'):

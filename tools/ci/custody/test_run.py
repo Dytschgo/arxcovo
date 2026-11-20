@@ -994,7 +994,7 @@ class DiscoveryIntegrationTests(unittest.TestCase):
             path.write_bytes(blobs[relative])
         return deps, binary, context, blobs
 
-    def exercise(self, root, context, blobs, hook=None):
+    def exercise(self, root, context, blobs, hook=None, listings=None):
         h = run.Harness()
         calls, records = [], []
         h.record = lambda event, **facts: records.append(dict(event=event, **facts))
@@ -1007,7 +1007,7 @@ class DiscoveryIntegrationTests(unittest.TestCase):
             if argv[0] == 'readelf':
                 return b'/lib64/ld-linux-x86-64.so.2 NEEDED GLIBC_2.38'
             if argv[1:] == ['--list', '--exact', run.PROBE]:
-                return (run.PROBE + ': test\n1 test, 0 benchmarks\n').encode()
+                return listings[Path(argv[0]).name] if listings is not None else ((run.PROBE + ': test\n1 test, 0 benchmarks\n').encode(), 0)
             self.fail('unexpected downstream acquisition')
         h.command = command
         token = run.DIAGNOSTIC.set(h.record)
@@ -1153,6 +1153,201 @@ class DiscoveryIntegrationTests(unittest.TestCase):
             os.link(root / 'staged', root / 'alias')
             with self.assertRaisesRegex(run.Refusal, 'UnsafePath'):
                 run.digest(root / 'staged')
+
+
+
+    def test_a3_mixed_nonmatches_and_single_eligible_probe(self):
+        listing = (run.PROBE + ': test\n1 test, 0 benchmarks\n').encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            deps, binary, context, blobs = self.setup_tree(root)
+            outputs = {'arxd-test': (listing, 0)}
+            for index, (output, code) in enumerate(((b'', 1), (b"private-sentinel GLIBC_2.40' not found", 127), (b'private-sentinel', 2))):
+                name = 'arxd-other' + str(index)
+                path = deps / name
+                path.write_bytes(b'\x7fELFpublic-nonmatch')
+                path.chmod(0o755)
+                outputs[name] = output, code
+            records = self.exercise(root, context, blobs, listings=outputs)
+            evidence = [r for r in records if r['event'] == 'candidate-list']
+            self.assertEqual(len(evidence), 4)
+            self.assertEqual({r['diagnostic'] for r in evidence}, {'empty', 'glibc-missing', 'other'})
+            self.assertEqual({r['returncode'] for r in evidence}, {0, 1, 2, 127})
+            self.assertEqual({r['candidate'] for r in evidence}, {0, 1, 2, 3})
+            self.assertTrue(all(set(r) == {'event', 'candidate', 'returncode', 'seconds', 'diagnostic'} for r in evidence))
+            self.assertNotIn('private-sentinel', json.dumps(records))
+            self.assertEqual(records[-1]['event'], 'inputs')
+
+    def test_a3_nonzero_probe_record_conflict_zero_and_multiple(self):
+        listing = (run.PROBE + ': test\n1 test, 0 benchmarks\n').encode()
+        for scenario in ('conflict', 'extra-record-conflict', 'zero', 'multiple'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                deps, binary, context, blobs = self.setup_tree(root)
+                outputs = {'arxd-test': (listing, 0)}
+                if scenario == 'zero':
+                    outputs['arxd-test'] = b'', 1
+                else:
+                    other = deps / 'arxd-other'
+                    other.write_bytes(binary.read_bytes())
+                    other.chmod(0o755)
+                    outputs['arxd-other'] = (listing if scenario != 'extra-record-conflict' else b'other: test\n' + listing), (0 if scenario == 'multiple' else 1)
+                with self.assertRaisesRegex(run.Refusal, 'ProbeSelection'):
+                    self.exercise(root, context, blobs, listings=outputs)
+                self.assertEqual(list(context.iterdir()), [])
+                self.assertFalse(any(c[0] in ('docker', 'readelf', 'git') for c in self.last_calls))
+
+    def test_a3_identity_and_hash_checked_after_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            deps, binary, context, blobs = self.setup_tree(root)
+            def drift(argv):
+                if argv[1:] == ['--list', '--exact', run.PROBE]:
+                    binary.write_bytes(b'\x7fELFpublic-drift')
+            with self.assertRaisesRegex(run.Refusal, 'StagingIdentity|StagingHash'):
+                self.exercise(root, context, blobs, hook=drift, listings={'arxd-test': (b'', 1)})
+            self.assertFalse(any(r['event'] == 'candidate-list' for r in self.last_records))
+            self.assertEqual(list(context.iterdir()), [])
+
+
+class A3ProcessTests(unittest.TestCase):
+    def child(self, clock, code=1, output=b'', exit_at=0, drain_at=0, read_error=None, reap_error=None):
+        child = run.Child.__new__(run.Child)
+        child.clock, child.deadline = clock, 2
+        child.out, child.reaped = bytearray(output), False
+        child.killed = False
+        waits = []
+        def poll():
+            return code if clock() >= exit_at else None
+        def wait(timeout):
+            waits.append(timeout)
+            if reap_error:
+                raise reap_error
+            return code
+        child.p = SimpleNamespace(poll=poll, wait=wait, returncode=code)
+        child.selector = SimpleNamespace(get_map=lambda: {1: True} if clock() < drain_at else {},
+                                         close=lambda: None)
+        def pump():
+            if read_error:
+                raise read_error
+        child.pump = pump
+        def kill():
+            child.killed = child.reaped = True
+        child.kill = kill
+        return child, waits
+
+    def listing(self, harness):
+        return harness.command([str(Path('D:/fixed/arxd-test') if os.name == 'nt' else Path('/fixed/arxd-test')), '--list', '--exact', run.PROBE],
+                               'preflight', 2, discovery=True)
+
+    def test_a3_positive_exit_requires_completion_drain_and_reap(self):
+        clock = Clock()
+        child, waits = self.child(clock, code=2, output=b'private-sentinel', exit_at=.02, drain_at=.04)
+        h = run.Harness(clock, lambda *a: child)
+        with patch.object(run.time, 'sleep', clock.sleep):
+            output, code = self.listing(h)
+        self.assertEqual((output, code), (b'private-sentinel', 2))
+        self.assertGreaterEqual(clock(), .04)
+        self.assertEqual(waits, [0])
+        self.assertTrue(child.reaped)
+        self.assertIsNone(h.first)
+
+    def test_a3_signal_timeout_overflow_io_reap_and_spawn_are_fatal(self):
+        cases = (
+            ('signal', dict(code=-9), 'CommandExit'),
+            ('timeout-running', dict(exit_at=3), 'CommandTimeout'),
+            ('timeout-undrained', dict(drain_at=3), 'CommandTimeout'),
+            ('overflow', dict(read_error=run.Refusal('PipeOverflow')), 'PipeOverflow'),
+            ('read', dict(read_error=OSError('private-sentinel')), 'OSError'),
+            ('reap', dict(reap_error=OSError('private-sentinel')), 'OSError'),
+            ('spawn', {}, 'OSError'))
+        for label, options, expected in cases:
+            with self.subTest(label=label):
+                clock = Clock()
+                child, _ = self.child(clock, **options)
+                def spawn(*a):
+                    if label == 'spawn':
+                        raise OSError('private-sentinel')
+                    return child
+                h = run.Harness(clock, spawn)
+                output = io.StringIO()
+                with redirect_stdout(output), patch.object(run.time, 'sleep', clock.sleep):
+                    with self.assertRaises((run.Refusal, OSError)):
+                        self.listing(h)
+                self.assertEqual(h.first, expected)
+                self.assertNotIn('private-sentinel', output.getvalue())
+                if label != 'spawn':
+                    self.assertTrue(child.reaped)
+
+    def test_a3_normal_commands_still_latch_nonzero_and_preserve_prior_failure(self):
+        for existing in (None, 'SourcePin'):
+            clock = Clock()
+            child, _ = self.child(clock, code=1)
+            h = run.Harness(clock, lambda *a: child)
+            h.first = existing
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(run.Refusal, 'CommandExit'):
+                    h.command(['fixed'], 'probe')
+            self.assertEqual(h.first, existing or 'CommandExit')
+            self.assertEqual(h.secondary, ['CommandExit'] if existing else [])
+            self.assertTrue(child.reaped)
+        clock = Clock()
+        child, _ = self.child(clock, code=1)
+        h = run.Harness(clock, lambda *a: child)
+        h.first = 'SourcePin'
+        self.listing(h)
+        self.assertEqual(h.first, 'SourcePin')
+
+    def test_a3_scope_cannot_cover_other_commands(self):
+        h = run.Harness(Clock(), lambda *a: self.fail('must not spawn'))
+        for argv, phase, seconds, cleanup in ((['docker', '--list', '--exact', run.PROBE], 'preflight', 2, False),
+                                              (['/fixed/arxd', '--list', '--exact', run.PROBE], 'image', 2, False),
+                                              (['/fixed/arxd', '--list', '--exact', run.PROBE], 'preflight', 3, False),
+                                              (['/fixed/arxd', '--list', '--exact', run.PROBE], 'preflight', 2, True)):
+            with self.subTest(argv=argv, phase=phase, seconds=seconds, cleanup=cleanup):
+                with self.assertRaises(run.Refusal):
+                    h.command(argv, phase, seconds, cleanup, discovery=True)
+
+
+
+    def test_a3_failure_cleanup_and_first_error_preserved(self):
+        clock = Clock()
+        child, _ = self.child(clock, code=-9)
+        h = run.Harness(clock, lambda *a: child)
+        h.qualify = lambda: self.listing(h)
+        cleaned = []
+        h.cleanup = lambda: cleaned.append((h.first, child.reaped))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(h.run(), 1)
+        self.assertEqual(cleaned, [('CommandExit', True)])
+        self.assertEqual(h.first, 'CommandExit')
+
+    def test_evidence_overflow_has_bounded_sanitized_refusal(self):
+        h = run.Harness()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaisesRegex(run.Refusal, 'EvidenceOverflow'):
+                h.record('synthetic', payload='private-sentinel' * run.LIMIT)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['code'], 'EvidenceOverflow')
+        self.assertNotIn('private-sentinel', output.getvalue())
+        self.assertLessEqual(h.evidence, run.LIMIT)
+
+    def test_synchronous_discovery_time_counts_against_preflight(self):
+        clock = Clock()
+        h = run.Harness(clock)
+        h.budget.used['preflight'] = 1
+        def discovery(source, context, checkpoint):
+            clock.sleep(2)
+            checkpoint()
+            self.assertAlmostEqual(h.budget.used['preflight'], 3)
+            clock.sleep(18)
+            checkpoint()
+        h._discover_and_stage = discovery
+        with self.assertRaisesRegex(run.Refusal, 'PhaseTimeout'):
+            h.discover_and_stage('a'*40, Path('unused'))
+        self.assertAlmostEqual(h.budget.used['preflight'], 21)
 
 
 if __name__ == '__main__':
