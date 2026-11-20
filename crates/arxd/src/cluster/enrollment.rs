@@ -1,8 +1,11 @@
-//! Pure proposal-time enrollment. This module performs no I/O and proves no consensus commit.
+//! Proposal-time enrollment and a private bootstrap transport. Neither proves consensus commit.
 mod anchor;
 pub(in crate::cluster) use anchor::BoundVoters;
 mod code;
 mod registry;
+// Compiled for 7a verification. A live backend is a separate integration.
+#[allow(dead_code)]
+pub(super) mod session;
 pub use registry::{FoundMembers, FoundTooLarge, MAX_FOUND_WIRE, MAX_MEMBERS, PeerRefusal};
 pub(super) mod codec;
 use super::{membership::Membership, state_store::LogPos};
