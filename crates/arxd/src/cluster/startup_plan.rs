@@ -378,6 +378,37 @@ impl Owner {
         }
         Ok(())
     }
+    pub(super) fn inspect_validate(&self) -> Result<()> {
+        self.recheck()?;
+        for name in [
+            "cluster-owner.lock",
+            "cluster-state.lock",
+            "cluster-log.lock",
+            "cluster-state.sqlite3",
+            "cluster-log.sqlite3",
+        ] {
+            if !self.entries.iter().any(|entry| entry == name) {
+                return Err(Refusal::Layout);
+            }
+        }
+        for g in &self.guards {
+            if g.path.parent() == Some(self.plan.state.as_path()) {
+                crate::security::private(&g.path).map_err(|_| Refusal::Layout)?;
+                let name = g
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(Refusal::Layout)?;
+                if name.ends_with("-shm")
+                    || ((name.ends_with("-wal") || name.ends_with("-journal"))
+                        && g.file.metadata().map_err(|_| Refusal::Layout)?.len() != 0)
+                {
+                    return Err(Refusal::Store);
+                }
+            }
+        }
+        self.recheck()
+    }
     pub(super) fn fresh_baseline(&self) -> Result<()> {
         self.recheck()?;
         if self.entries != ["cluster-owner.lock"] || self.plan.mode != Mode::CreateFounder {
@@ -660,6 +691,14 @@ pub(in crate::cluster) mod tests {
         } else {
             Ok(())
         }
+    }
+    #[test]
+    fn inspection_requires_complete_original_layout() {
+        let l = Layout::new();
+        let owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let before = l.snapshot();
+        assert_eq!(owner.inspect_validate(), Err(Refusal::Layout));
+        assert_eq!(l.snapshot(), before);
     }
     pub(in crate::cluster) fn guards(owner: &Owner) -> Vec<(PathBuf, u64, u64)> {
         owner
