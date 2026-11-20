@@ -6,6 +6,8 @@ mod registry;
 #[allow(dead_code)] // Owner paste and locally qualified routes are wired in later steps.
 pub(super) mod transfer;
 // Compiled for 7a verification. A live backend is a separate integration.
+#[cfg(target_os = "linux")]
+pub(super) mod durable_join;
 #[allow(dead_code)]
 pub(super) mod session;
 pub use registry::{FoundMembers, FoundTooLarge, MAX_FOUND_WIRE, MAX_MEMBERS, PeerRefusal};

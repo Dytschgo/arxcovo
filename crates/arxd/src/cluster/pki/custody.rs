@@ -500,6 +500,118 @@ mod linux {
         }
     }
 
+    /// Staging for the learner role. This facade has no CA creation or load lane.
+    pub(in crate::cluster) struct LearnerCustody {
+        custody: Custody,
+        sealed: Option<SealedLearner>,
+    }
+
+    struct SealedLearner {
+        key: MemberKey,
+        source: File,
+        bytes: Vec<u8>,
+    }
+
+    impl LearnerCustody {
+        pub(in crate::cluster) fn create(
+            owner: &crate::cluster::startup_plan::Owner,
+            wrap: &Path,
+            store: &Path,
+        ) -> Result<Self, Error> {
+            owner.validate_fresh_join().map_err(|_| Error::Context)?;
+            for private in [wrap, store] {
+                for other in [
+                    &owner.plan.credentials,
+                    &owner.plan.state,
+                    &owner.plan.workspace,
+                    &owner.plan.config,
+                ] {
+                    if private.starts_with(other) || other.starts_with(private) {
+                        return Err(Error::Layout);
+                    }
+                }
+            }
+            let layout = FounderLayout::checked(owner)?;
+            let wrap = Root::open_checked(wrap, |m, leaf| layout.check(m, leaf))?;
+            let store = Root::open_checked(store, |m, leaf| layout.check(m, leaf))?;
+            Custody::check_roots(&wrap, &store)?;
+            Ok(Self {
+                custody: Custody::create_fresh_in_roots(wrap, store)?,
+                sealed: None,
+            })
+        }
+
+        pub(in crate::cluster) fn seal(
+            &mut self,
+            cluster: ClusterId,
+            root: [u8; 32],
+        ) -> Result<Vec<u8>, Error> {
+            let (sealed, csr) = self.custody.create_retained_member(cluster, root, true)?;
+            self.sealed = Some(sealed);
+            Ok(csr)
+        }
+
+        pub(in crate::cluster) fn installation(&self) -> [u8; 16] {
+            self.custody.installation
+        }
+
+        pub(in crate::cluster) fn member(&self) -> Result<MemberCopy<'_>, Error> {
+            if self.custody.inventory()? != ["custody-lock", "member-key"] {
+                return Err(Error::Layout);
+            }
+            let sealed = self.sealed.as_ref().ok_or(Error::Context)?;
+            let current = self.custody.store.file("member-key", false)?;
+            if !same(
+                &sealed.source.metadata().map_err(|_| Error::Layout)?,
+                &current.metadata().map_err(|_| Error::Layout)?,
+            ) || self.custody.store.read("member-key", 16384)? != sealed.bytes
+            {
+                return Err(Error::Ownership);
+            }
+            Ok(MemberCopy {
+                owner: &self.custody,
+                source: sealed.source.try_clone().map_err(|_| Error::Unavailable)?,
+                bytes: sealed.bytes.clone(),
+                context: sealed.key.context,
+            })
+        }
+
+        pub(in crate::cluster) fn match_leaf(
+            &self,
+            node: NodeId,
+            root: &[u8],
+            leaf: &[u8],
+            now: u64,
+        ) -> Result<(), Error> {
+            self.sealed
+                .as_ref()
+                .ok_or(Error::Context)?
+                .key
+                .check_leaf(node, root, leaf, Some(now))
+        }
+
+        #[cfg(test)]
+        pub(in crate::cluster) fn prove_original_key(&self, leaf: &[u8]) {
+            use ring::signature::{
+                ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair,
+                UnparsedPublicKey,
+            };
+            let private = codec::Secret(self.sealed.as_ref().unwrap().key.key.serialize_der());
+            let rng = ring::rand::SystemRandom::new();
+            let signer =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &private.0, &rng)
+                    .unwrap();
+            let (_, cert) = x509_parser::parse_x509_certificate(leaf).unwrap();
+            let signature = signer.sign(&rng, b"retained learner possession").unwrap();
+            UnparsedPublicKey::new(
+                &ECDSA_P256_SHA256_ASN1,
+                &cert.public_key().subject_public_key.data,
+            )
+            .verify(b"retained learner possession", signature.as_ref())
+            .unwrap();
+        }
+    }
+
     impl MemberCopy<'_> {
         pub(in crate::cluster) fn tls_key(
             &self,
@@ -718,6 +830,9 @@ mod linux {
             Ok(())
         }
         fn write(&mut self, wrap: bool, name: &str, bytes: &[u8]) -> Result<(), Error> {
+            self.write_retained(wrap, name, bytes).map(drop)
+        }
+        fn write_retained(&mut self, wrap: bool, name: &str, bytes: &[u8]) -> Result<File, Error> {
             self.seam()?;
             let root = if wrap { &self.wrap } else { &self.store };
             let mut f = root.file(name, true)?;
@@ -740,7 +855,7 @@ mod linux {
             ) {
                 return Err(Error::Ownership);
             }
-            Ok(())
+            Ok(f)
         }
         fn create<T>(
             &mut self,
@@ -805,6 +920,15 @@ mod linux {
             root: [u8; 32],
             learner: bool,
         ) -> Result<(MemberKey, Vec<u8>), Error> {
+            let (sealed, csr) = self.create_retained_member(cluster, root, learner)?;
+            Ok((sealed.key, csr))
+        }
+        fn create_retained_member(
+            &mut self,
+            cluster: ClusterId,
+            root: [u8; 32],
+            learner: bool,
+        ) -> Result<(SealedLearner, Vec<u8>), Error> {
             self.create(|s| {
                 let entries = s.inventory()?;
                 s.common_context(cluster, root)?;
@@ -824,11 +948,11 @@ mod linux {
                 };
                 let payload =
                     codec::Secret(codec::payload(Kind::Member, &key.serialize_der(), &[])?);
-                let sealed = codec::seal(&s.key, context, &payload.0)?;
-                s.write(false, "member-key", &sealed)?;
-                let owner = MemberKey { key, context };
-                let csr = owner.csr()?;
-                Ok((owner, csr))
+                let bytes = codec::seal(&s.key, context, &payload.0)?;
+                let source = s.write_retained(false, "member-key", &bytes)?;
+                let key = MemberKey { key, context };
+                let csr = key.csr()?;
+                Ok((SealedLearner { key, source, bytes }, csr))
             })
         }
         pub(super) fn load_member(
@@ -901,7 +1025,7 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use linux::member_copy;
 #[cfg(target_os = "linux")]
-pub(in crate::cluster) use linux::{FounderCustody, MemberCopy};
+pub(in crate::cluster) use linux::{FounderCustody, LearnerCustody, MemberCopy};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use tests::publication_fixture;

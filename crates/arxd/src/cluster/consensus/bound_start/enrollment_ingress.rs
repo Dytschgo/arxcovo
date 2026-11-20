@@ -106,6 +106,10 @@ impl Backend for Issuer {
         {
             eprintln!("P1 actual anchor_query refused: {error:?}");
         }
+        #[cfg(test)]
+        if let Some(observation) = &self.observation {
+            observation.record_anchor(&result);
+        }
         let bytes = result.map_err(|_| Refused)?;
         let voters = BoundVoters::decode(&bytes).map_err(|_| Refused)?;
         if !voters.contains(FOUNDER, self.ready.key) {
@@ -212,16 +216,29 @@ mod hosted {
     use tokio::time::timeout;
     use x509_parser::{extensions::GeneralName, prelude::*};
 
+    #[cfg(test)]
+    mod durable_join_campaign;
+
     #[derive(Default)]
     pub(in crate::cluster::consensus::bound_start) struct Observation {
         pub(super) anchor_calls: AtomicUsize,
         pub(super) redeem_calls: AtomicUsize,
+        #[cfg(test)]
+        anchor_outcomes:
+            Mutex<Vec<Result<Vec<u8>, crate::cluster::consensus::anchor_query::AnchorQueryError>>>,
         result: Mutex<Option<Result<(), issue::IssueError>>>,
         finished: Notify,
         release: Notify,
     }
 
     impl Observation {
+        #[cfg(test)]
+        pub(super) fn record_anchor(
+            &self,
+            result: &Result<Vec<u8>, crate::cluster::consensus::anchor_query::AnchorQueryError>,
+        ) {
+            self.anchor_outcomes.lock().unwrap().push(result.clone());
+        }
         pub(super) async fn complete(&self, result: Result<(), issue::IssueError>) {
             if let Err(error) = result {
                 eprintln!("P1 actual enroll refused: {error:?}");

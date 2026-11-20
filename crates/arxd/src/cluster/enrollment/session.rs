@@ -235,7 +235,7 @@ impl Reply {
         }
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(in crate::cluster) fn parts(&self) -> (NodeId, LogPos, &[u8]) {
         (self.node, self.original, &self.leaf)
     }
