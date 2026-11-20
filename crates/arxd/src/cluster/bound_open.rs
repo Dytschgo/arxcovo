@@ -190,6 +190,29 @@ fn verify(db: &mut Connection, original: &File, path: &Path) -> Result<ObjectId,
     Ok(actual)
 }
 
+fn immutable(path: &Path) -> rusqlite::Result<Connection> {
+    let text = path
+        .to_str()
+        .ok_or(rusqlite::Error::InvalidPath(path.to_owned()))?
+        .replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    let mut uri = String::from("file:");
+    for b in text.bytes() {
+        if b.is_ascii_alphanumeric() || b"/:_- .".contains(&b) && b != b' ' {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+}
+
 use super::{
     enrollment::ClusterId,
     log_store::VoteLogStore,
@@ -275,6 +298,7 @@ struct Pending {
 pub(super) struct BoundStores<'owner> {
     state: Option<StateStore>,
     log: Option<VoteLogStore>,
+    inspection_state: Option<BoundDb>,
     pending: Pending,
     staged: Vec<Guard>,
     owner: &'owner mut Owner,
@@ -295,6 +319,7 @@ impl<'owner> BoundStores<'owner> {
         let mut stores = Self {
             state: None,
             log: None,
+            inspection_state: None,
             pending: Pending::default(),
             staged: Vec::new(),
             owner,
@@ -337,7 +362,7 @@ impl<'owner> BoundStores<'owner> {
     }
     pub(super) fn inspect<T>(
         &mut self,
-        read: impl FnOnce(&Connection) -> Result<T, StoreError>,
+        read: impl FnOnce(&Connection, &File, &Connection, &File) -> Result<T, StoreError>,
     ) -> Result<T, BoundFailure> {
         self.status()?;
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -353,7 +378,28 @@ impl<'owner> BoundStores<'owner> {
             {
                 return Err(BoundFailure::Unavailable);
             }
-            read(&bound.db).map_err(BoundFailure::Init)
+            let state = self
+                .inspection_state
+                .as_ref()
+                .ok_or(BoundFailure::Unavailable)?;
+            if !state
+                .db
+                .is_readonly("main")
+                .map_err(|_| BoundFailure::Unavailable)?
+            {
+                return Err(BoundFailure::Unavailable);
+            }
+            let value = read(
+                &state.db,
+                &state.lease._guard,
+                &bound.db,
+                &bound.lease._guard,
+            )
+            .map_err(BoundFailure::Init)?;
+            self.owner
+                .inspect_validate()
+                .map_err(|_| BoundFailure::Layout)?;
+            Ok(value)
         }));
         match result {
             Ok(Ok(v)) => Ok(v),
@@ -425,9 +471,7 @@ impl<'owner> BoundStores<'owner> {
             .try_lock()
             .map_err(|_| BoundFailure::Open(StoreError::Io))?;
         self.pending.guard = Some(self.original(&format!("{stem}.sqlite3"), fresh)?);
-        self.owner
-            .bound_validate(&self.staged, true)
-            .map_err(|_| BoundFailure::Layout)?;
+        self.validate_open_layout(readonly)?;
         let path = self.owner.plan.state.join(format!("{stem}.sqlite3"));
         #[cfg(test)]
         {
@@ -444,8 +488,12 @@ impl<'owner> BoundStores<'owner> {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         };
         self.pending.db = Some(
-            Connection::open_with_flags(&path, flags)
-                .map_err(|_| BoundFailure::Open(StoreError::Sql))?,
+            if readonly {
+                immutable(&path)
+            } else {
+                Connection::open_with_flags(&path, flags)
+            }
+            .map_err(|_| BoundFailure::Open(StoreError::Sql))?,
         );
         #[cfg(test)]
         self.opens
@@ -456,9 +504,7 @@ impl<'owner> BoundStores<'owner> {
             &path,
         )
         .map_err(|_| BoundFailure::Identity)?;
-        self.owner
-            .bound_validate(&self.staged, true)
-            .map_err(|_| BoundFailure::Layout)?;
+        self.validate_open_layout(readonly)?;
         self.pending.bound = Some(BoundDb {
             db: self.pending.db.take().unwrap(),
             dir: self.owner.plan.state.clone(),
@@ -469,6 +515,14 @@ impl<'owner> BoundStores<'owner> {
             },
         });
         Ok(())
+    }
+    fn validate_open_layout(&self, readonly: bool) -> Result<(), BoundFailure> {
+        if readonly {
+            self.owner.inspect_validate()
+        } else {
+            self.owner.bound_validate(&self.staged, true)
+        }
+        .map_err(|_| BoundFailure::Layout)
     }
     fn require_v2(&self) -> Result<(), BoundFailure> {
         #[cfg(test)]
@@ -504,8 +558,28 @@ impl<'owner> BoundStores<'owner> {
             },
         };
         if matches!(intent, BoundIntent::Inspect(_)) {
+            self.owner
+                .inspect_validate()
+                .map_err(|_| BoundFailure::Layout)?;
             self.open(StoreKind::State, false, true)?;
-            self.require_v2()?;
+            self.inspection_state = self.pending.bound.take();
+            self.open(StoreKind::VoteLog, false, true)?;
+            #[cfg(test)]
+            tests::pair_final();
+            for (bound, kind) in [
+                (self.inspection_state.as_mut().unwrap(), StoreKind::State),
+                (self.pending.bound.as_mut().unwrap(), StoreKind::VoteLog),
+            ] {
+                verify(
+                    &mut bound.db,
+                    &bound.lease._guard,
+                    &bound.dir.join(format!("{}.sqlite3", kind.stem())),
+                )
+                .map_err(|_| BoundFailure::Identity)?;
+            }
+            self.owner
+                .inspect_validate()
+                .map_err(|_| BoundFailure::Layout)?;
             return Ok(());
         }
         self.open(StoreKind::State, fresh, false)?;
@@ -686,7 +760,29 @@ pub(super) mod tests {
         }
     }
     pub(super) fn sqlite_open_path(path: &Path) -> PathBuf {
-        match FAULT.with(|f| *f.borrow()).map(|(point, _)| point) {
+        let fault = FAULT.with(|f| *f.borrow()).map(|(point, _)| point);
+        let log = path.file_name().unwrap() == "cluster-log.sqlite3";
+        let fault = match fault {
+            Some("log-mismatch") if log => Some("pair-mismatch"),
+            Some("state-mismatch") if !log => Some("pair-mismatch"),
+            Some("log-open") if log => Some("sqlite-open"),
+            other => other,
+        };
+        match fault {
+            Some("pair-mismatch") => {
+                let other = path.with_file_name("different.sqlite3");
+                #[cfg(windows)]
+                {
+                    fs::copy(path, &other).unwrap();
+                    other
+                }
+                #[cfg(unix)]
+                {
+                    fs::rename(path, &other).unwrap();
+                    fs::copy(&other, path).unwrap();
+                    path.to_owned()
+                }
+            }
             Some("sqlite-open") => path.with_file_name("absent-sqlite-open.sqlite3"),
             Some("mismatch") => {
                 #[cfg(windows)]
@@ -707,6 +803,238 @@ pub(super) mod tests {
                 }
             }
             _ => path.to_owned(),
+        }
+    }
+    thread_local! { static PAIR_MUTATION: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)}; }
+    pub(super) fn pair_final() {
+        PAIR_MUTATION.with(|p| {
+            if let Some(path) = p.borrow().as_ref() {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(1)
+                    .unwrap();
+            }
+        });
+    }
+    #[test]
+    fn inspection_pair_gate_positive_and_failure_lifetimes() {
+        for fault in [
+            "healthy",
+            "state-mismatch",
+            "log-mismatch",
+            "log-open",
+            "second-panic",
+        ] {
+            let l = seeded();
+            let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+            let before = l.snapshot();
+            SQL.with(|n| n.set(0));
+            FAULT.with(|f| {
+                *f.borrow_mut() = match fault {
+                    "healthy" => None,
+                    "second-panic" => Some(("second", true)),
+                    other => Some((other, false)),
+                }
+            });
+            let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+            FAULT.with(|f| *f.borrow_mut() = None);
+            assert_eq!(SQL.with(|n| n.get()), 0);
+            if fault == "healthy" {
+                assert_eq!(stores.status(), Ok(()));
+                assert_eq!(stores.opens.len(), 2);
+                stores
+                    .inspect(|state, sf, log, lf| {
+                        for (db, file, stem) in
+                            [(state, sf, "cluster-state"), (log, lf, "cluster-log")]
+                        {
+                            assert!(db.is_readonly("main").unwrap());
+                            assert_eq!(
+                                guard_id(file).unwrap(),
+                                guard_id(&File::open(stores_path(&l, stem)).unwrap()).unwrap()
+                            );
+                            application_sql();
+                            assert_eq!(
+                                db.pragma_query_value::<u32, _>(None, "user_version", |r| r
+                                    .get(0))?,
+                                2
+                            );
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(SQL.with(|n| n.get()), 2);
+            } else {
+                let expected = match fault {
+                    "log-open" => BoundFailure::Open(StoreError::Sql),
+                    "second-panic" => BoundFailure::Unwind,
+                    _ => BoundFailure::Identity,
+                };
+                assert_eq!(stores.status(), Err(expected));
+                if fault != "state-mismatch" {
+                    assert!(stores.inspection_state.is_some());
+                }
+                if fault.ends_with("mismatch") {
+                    let db = stores.pending.db.as_mut().unwrap();
+                    assert_ne!(
+                        actual_id(db).unwrap(),
+                        guard_id(stores.pending.guard.as_ref().unwrap()).unwrap()
+                    );
+                }
+                assert_eq!(
+                    stores.inspect::<()>(|_, _, _, _| panic!("rejected pair queried")),
+                    Err(expected)
+                );
+            }
+            probe(&stores.owner.plan.state, "cluster-state", true);
+            if fault != "state-mismatch" {
+                probe(&stores.owner.plan.state, "cluster-log", true);
+            }
+            let failure = stores.first_failure();
+            drop(stores);
+            probe(&owner.plan.state, "cluster-state", false);
+            probe(&owner.plan.state, "cluster-log", false);
+            probe(&owner.plan.state, "cluster-owner", true);
+            let again = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+            assert_eq!(
+                again.status(),
+                Err(failure.unwrap_or(BoundFailure::Unavailable))
+            );
+            assert_eq!(again.accesses, 0);
+            drop(again);
+            if !fault.ends_with("mismatch") {
+                assert_eq!(l.snapshot(), before);
+            }
+        }
+    }
+    #[test]
+    fn inspection_callback_unwind_retains_complete_pair_and_first_failure() {
+        let l = seeded();
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+        assert_eq!(stores.status(), Ok(()));
+        assert_eq!(
+            stores.inspect::<()>(|_, _, _, _| panic!("ordinary callback unwind")),
+            Err(BoundFailure::Unwind)
+        );
+        probe(&stores.owner.plan.state, "cluster-state", true);
+        probe(&stores.owner.plan.state, "cluster-log", true);
+        drop(stores);
+        probe(&owner.plan.state, "cluster-state", false);
+        probe(&owner.plan.state, "cluster-log", false);
+        let again = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+        assert_eq!(again.status(), Err(BoundFailure::Unwind));
+        assert_eq!(again.accesses, 0);
+    }
+    #[test]
+    fn inspection_rejects_new_sidecars_without_repair() {
+        for stem in ["cluster-state", "cluster-log"] {
+            for suffix in ["-wal", "-journal"] {
+                let l = seeded();
+                let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+                l.write(&format!("state/{stem}.sqlite3{suffix}"), b"");
+                let before = l.snapshot();
+                SQL.with(|n| n.set(0));
+                let stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+                assert_eq!(stores.status(), Err(BoundFailure::Layout));
+                assert_eq!(SQL.with(|n| n.get()), 0);
+                drop(stores);
+                assert_eq!(l.snapshot(), before);
+            }
+        }
+    }
+    fn stores_path(l: &super::super::startup_plan::tests::Layout, stem: &str) -> PathBuf {
+        l.root.path().join(format!("state/{stem}.sqlite3"))
+    }
+    #[test]
+    fn inspection_sidecar_policy_original_zero_and_exact_layout() {
+        for stem in ["cluster-state", "cluster-log"] {
+            for suffix in ["-wal", "-journal"] {
+                for change in ["none", "grow", "remove", "pair-grow", "callback-grow"] {
+                    let l = seeded();
+                    let path =
+                        stores_path(&l, stem).with_file_name(format!("{stem}.sqlite3{suffix}"));
+                    fs::write(&path, b"").unwrap();
+                    let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+                    let before = l.snapshot();
+                    if change == "grow" {
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .unwrap()
+                            .set_len(1)
+                            .unwrap();
+                    }
+                    if change == "remove" {
+                        #[cfg(windows)]
+                        {
+                            fs::remove_file(&path).unwrap_err();
+                            continue;
+                        }
+                        #[cfg(unix)]
+                        {
+                            fs::remove_file(&path).unwrap();
+                            assert!(owner.inspect_validate().is_err());
+                            continue;
+                        }
+                    }
+
+                    SQL.with(|n| n.set(0));
+                    PAIR_MUTATION.with(|p| {
+                        *p.borrow_mut() = (change == "pair-grow").then_some(path.clone())
+                    });
+                    let mut stores =
+                        BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+                    FAULT.with(|f| *f.borrow_mut() = None);
+                    PAIR_MUTATION.with(|p| *p.borrow_mut() = None);
+                    assert_eq!(SQL.with(|n| n.get()), 0);
+                    if change == "grow" || change == "pair-grow" {
+                        assert_eq!(stores.status(), Err(BoundFailure::Layout));
+                    } else {
+                        assert_eq!(stores.status(), Ok(()));
+                        let result = stores.inspect(|s, _, l, _| {
+                            assert!(
+                                s.is_readonly("main").unwrap() && l.is_readonly("main").unwrap()
+                            );
+                            if change == "callback-grow" {
+                                fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&path)
+                                    .unwrap()
+                                    .set_len(1)
+                                    .unwrap();
+                            }
+                            Ok(())
+                        });
+                        assert_eq!(
+                            result,
+                            if change == "callback-grow" {
+                                Err(BoundFailure::Layout)
+                            } else {
+                                Ok(())
+                            }
+                        );
+                    }
+                    drop(stores);
+                    if change == "none" {
+                        assert_eq!(l.snapshot(), before);
+                    }
+                }
+            }
+            for suffix in ["-wal", "-journal", "-shm"] {
+                let l = seeded();
+                l.write(
+                    &format!("state/{stem}.sqlite3{suffix}"),
+                    if suffix == "-shm" { b"" } else { b"pending" },
+                );
+                let before = l.snapshot();
+                assert!(matches!(
+                    Owner::acquire(l.plan("create-founder")),
+                    Err(super::super::startup_plan::Refusal::Store)
+                ));
+                assert_eq!(l.snapshot(), before);
+            }
         }
     }
     fn init() -> Init {
@@ -831,7 +1159,7 @@ pub(super) mod tests {
         let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
         assert_eq!(stores.status(), Ok(()));
         assert_eq!(
-            stores.inspect(|db| Ok(db.pragma_query_value::<u32, _>(
+            stores.inspect(|db, _, _, _| Ok(db.pragma_query_value::<u32, _>(
                 None,
                 "user_version",
                 |r| r.get(0)
@@ -839,14 +1167,14 @@ pub(super) mod tests {
             Ok(2)
         );
         assert_eq!(
-            stores.inspect(|db| {
+            stores.inspect(|db, _, _, _| {
                 db.execute_batch("CREATE TABLE forbidden(x)")?;
                 Ok(())
             }),
             Err(BoundFailure::Init(StoreError::Sql))
         );
         assert_eq!(
-            stores.inspect(|_| panic!("must not access")),
+            stores.inspect(|_, _, _, _| panic!("must not access")),
             Err::<(), _>(BoundFailure::Init(StoreError::Sql))
         );
         drop(stores);
