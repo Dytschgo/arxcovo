@@ -67,6 +67,219 @@ def inspection():
                        {'Destination': '/store', 'Source': '/fixture/store', 'Type': 'bind'}]}
 
 
+class Filesystem:
+    """Descriptor model: opened objects survive pathname replacement."""
+    O_PATH, O_NOFOLLOW, O_CLOEXEC = 1, 2, 4
+
+    def __init__(self):
+        self.nodes, self.fds, self.nextfd = {}, {}, 10
+        self.opened = []
+        self.add('/', 0o40755)
+        for path in ('/usr', '/usr/bin', '/usr/sbin', '/etc', '/etc/alternatives',
+                     '/usr/lib', '/usr/lib/cargo', '/usr/lib/cargo/bin'):
+            self.add(path, 0o40755)
+        self.add(run.SUDO_TARGET, 0o104755)
+        self.link('/usr/bin/sudo', '/etc/alternatives/sudo')
+        self.link('/etc/alternatives/sudo', run.SUDO_TARGET)
+        for role in run.TOOLS:
+            if role != 'sudo':
+                self.add('/usr/bin/' + role, 0o100755)
+
+    def add(self, path, mode):
+        self.nodes[path] = SimpleNamespace(st_mode=mode, st_uid=0, st_gid=123,
+            st_dev=1, st_ino=len(self.nodes)+100, st_nlink=1)
+
+    def link(self, path, target):
+        self.add(path, 0o120777)
+        self.nodes[path].target = target
+
+    def name(self, name, dir_fd):
+        return name if name.startswith('/') else self.fds[dir_fd][0].rstrip('/') + '/' + name
+
+    def open(self, name, flags, dir_fd=None):
+        assert flags == self.O_PATH | self.O_NOFOLLOW | self.O_CLOEXEC
+        path = self.name(name, dir_fd)
+        self.opened.append(path)
+        if path not in self.nodes:
+            raise FileNotFoundError('private-sentinel')
+        self.nextfd += 1
+        self.fds[self.nextfd] = (path, self.nodes[path])
+        return self.nextfd
+
+    def fstat(self, fd):
+        return self.fds[fd][1]
+
+    def readlink(self, name, dir_fd):
+        return self.nodes[self.name(name, dir_fd)].target
+
+    def stat(self, name, dir_fd, follow_symlinks):
+        assert not follow_symlinks
+        return self.nodes[self.name(name, dir_fd)]
+
+    def close(self, fd):
+        del self.fds[fd]
+
+
+class ToolTests(unittest.TestCase):
+    def tool(self, fs, role='sudo', entry=None, records=None):
+        return run.trusted_tool(role, lambda event, **facts: records.append(dict(event=event, **facts))
+            if records is not None else None, fs, entry or '/usr/bin/' + role)
+
+    def refused(self, fs, role='sudo', entry=None):
+        records = []
+        with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
+            self.tool(fs, role, entry, records)
+        refusals = [r for r in records if r['event'] == 'tool-refusal']
+        self.assertEqual(len(refusals), 1)
+        self.assertNotIn('private-sentinel', json.dumps(records))
+        self.assertLess(len(json.dumps(refusals)), 1024)
+        self.assertFalse(fs.fds)
+        return refusals[0]
+
+    def test_exact_sudo_and_all_normal_roles(self):
+        fs = Filesystem()
+        for role in run.TOOLS:
+            obj = self.tool(fs, role)
+            self.assertEqual(obj.recheck(), run.SUDO_TARGET if role == 'sudo' else '/usr/bin/' + role)
+            obj.close()
+            self.assertFalse(fs.fds)
+        fs.add('/usr/sbin/mke2fs', 0o100755)
+        fs.link('/usr/bin/mkfs.ext4', '../sbin/mke2fs')
+        obj = self.tool(fs, 'mkfs.ext4')
+        self.assertEqual(obj.path, '/usr/sbin/mke2fs')
+        obj.close()
+
+    def test_every_ancestor_owner_and_write_bits(self):
+        baseline = Filesystem()
+        ancestors = [p for p, m in baseline.nodes.items() if run.stat.S_ISDIR(m.st_mode) and p != '/usr/sbin']
+        for path in ancestors:
+            for mutation in ('uid', 0o020, 0o002, 0o1002):
+                with self.subTest(path=path, mutation=mutation):
+                    fs = Filesystem()
+                    if mutation == 'uid':
+                        fs.nodes[path].st_uid = 1001
+                    else:
+                        fs.nodes[path].st_mode |= mutation
+                    self.refused(fs)
+
+    def test_target_predicates_and_opened_metadata(self):
+        for attr, value in (('st_uid', 1001), ('st_mode', 0o104775), ('st_mode', 0o104757),
+                            ('st_mode', 0o100755), ('st_mode', 0o104655),
+                            ('st_mode', 0o44755), ('st_nlink', 2)):
+            fs = Filesystem()
+            setattr(fs.nodes[run.SUDO_TARGET], attr, value)
+            facts = self.refused(fs)
+            self.assertEqual(facts['uid'], fs.nodes[run.SUDO_TARGET].st_uid)
+        fs = Filesystem()
+        original = fs.fstat
+        def fstat(fd):
+            m = original(fd)
+            if fs.fds[fd][0] == run.SUDO_TARGET:
+                return SimpleNamespace(**{**vars(m), 'st_uid': 1001})
+            return m
+        fs.fstat = fstat
+        self.assertEqual(self.refused(fs)['predicate'], 'owner_uid_root')
+
+    def test_exact_location_has_no_prefix_or_role_waiver(self):
+        for path in ('/usr/lib/cargo/bin/sudo-extra', '/usr/lib/cargo/bin/other',
+                     '/usr/lib/cargo/bin/sub/sudo', '/usr/lib/cargo/bin2/sudo',
+                     '/opt/private-sentinel/sudo'):
+            fs = Filesystem()
+            parts = path.split('/')[1:]
+            for i in range(1, len(parts)):
+                parent = '/' + '/'.join(parts[:i])
+                if parent not in fs.nodes:
+                    fs.add(parent, 0o40755)
+            fs.add(path, 0o104755)
+            fs.link('/etc/alternatives/sudo', path)
+            self.assertEqual(self.refused(fs)['predicate'], 'canonical_system_directory')
+        for role in ('docker', 'python3'):
+            fs = Filesystem()
+            fs.link('/usr/bin/' + role, run.SUDO_TARGET)
+            self.refused(fs, role)
+
+    def test_links_bounds_errors_and_erased_unsafe_traversal(self):
+        for target in ('/private-sentinel/missing', '/usr/bin/sudo', '/' + 'x'*4097):
+            fs = Filesystem()
+            fs.link('/etc/alternatives/sudo', target)
+            self.refused(fs)
+        fs = Filesystem()
+        fs.add('/usr/bin/unsafe', 0o40777)
+        fs.link('/usr/bin/sudo', 'unsafe/../sudo-real')
+        fs.add('/usr/bin/sudo-real', 0o104755)
+        self.assertEqual(self.refused(fs)['predicate'], 'not_group_or_other_writable')
+        fs = Filesystem()
+        fs.nodes['/etc'].st_mode = 0o100755
+        self.assertEqual(self.refused(fs)['predicate'], 'directory_component')
+        for method in ('open', 'fstat', 'stat', 'readlink'):
+            fs = Filesystem()
+            with patch.object(fs, method, side_effect=PermissionError('private-sentinel')):
+                facts = self.refused(fs)
+                self.assertEqual(facts['predicate'], 'filesystem_error')
+                self.assertIsNone(facts['uid'])
+
+    def test_replacement_at_lookup_open_and_before_use(self):
+        fs = Filesystem()
+        with patch.object(run.shutil, 'which', return_value='/usr/bin/sudo'):
+            fs.nodes[run.SUDO_TARGET].st_uid = 1001
+            with self.assertRaises(run.Refusal):
+                run.trusted_tool('sudo', lambda *a, **k: None, fs)
+        for kind in ('path', 'fd', 'link'):
+            fs = Filesystem()
+            records = []
+            obj = self.tool(fs, records=records)
+            if kind == 'path':
+                fs.nodes[run.SUDO_TARGET] = SimpleNamespace(**{**vars(fs.nodes[run.SUDO_TARGET]), 'st_ino': 999})
+            elif kind == 'fd':
+                fs.nodes[run.SUDO_TARGET].st_mode |= 0o020
+            else:
+                fs.link('/etc/alternatives/sudo', '/usr/bin/git')
+            with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
+                obj.recheck()
+            self.assertEqual(sum(r['event'] == 'tool-refusal' for r in records), 1)
+            obj.close()
+            self.assertFalse(fs.fds)
+
+    def test_fixed_lookup_and_captured_absolute_spawn(self):
+        fs = Filesystem()
+        with patch.dict(run.os.environ, {'PATH': '/private-sentinel'}), patch.object(
+                run.shutil, 'which', return_value='/usr/bin/sudo') as which:
+            obj = run.trusted_tool('sudo', lambda *a, **k: None, fs)
+            which.assert_called_once_with('sudo', path=run.SEARCH)
+            obj.close()
+        clock = Clock()
+        captured = []
+        def spawn(argv, deadline, _clock):
+            captured.append(argv)
+            return FakeChild(clock, terminal_at=0)
+        h = run.Harness(clock, spawn)
+        h.tools = {role: self.tool(fs, role) for role in run.TOOLS}
+        for role in ('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'mkdir', 'chown'):
+            h.command(['sudo', '-n', role, 'fixed-arg'], 'prepare')
+            self.assertEqual(captured[-1], [run.SUDO_TARGET, '-n', '/usr/bin/' + role, 'fixed-arg'])
+        for role in ('docker', 'readelf', 'git', 'python3'):
+            h.command([role, 'fixed-arg'], 'preflight')
+            self.assertEqual(captured[-1], ['/usr/bin/' + role, 'fixed-arg'])
+        args = run.exec_argv(CONTAINER, 'release')
+        h.command(args, 'probe')
+        self.assertEqual(captured[-1], ['/usr/bin/docker'] + args[1:])
+        for obj in h.tools.values():
+            obj.close()
+        self.assertFalse(fs.fds)
+
+    def test_refusal_latches_before_image_and_closes_tools(self):
+        fs = Filesystem()
+        fs.nodes['/usr'].st_mode |= 0o020
+        h = run.Harness(spawn=lambda *args: self.fail('spawned'))
+        def qualify():
+            h.tools = {}
+            h.tools['sudo'] = self.tool(fs)
+        with patch.object(h, 'qualify', side_effect=qualify), redirect_stdout(io.StringIO()):
+            self.assertEqual(h.run(), 1)
+        self.assertEqual(h.first, 'ToolOwnership')
+        self.assertFalse(fs.fds)
+
+
 class LauncherTests(unittest.TestCase):
     def test_rejects_unsafe_roots_and_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,33 +317,6 @@ class LauncherTests(unittest.TestCase):
                             transcript.replace(b'ARX_PASS selected=1 passed=1', b'')):
                     with self.assertRaisesRegex(run.Refusal, 'MissingOracle'):
                         run.terminal(bad)
-
-    def test_tool_ownership_reports_each_predicate_without_weakening(self):
-        for uid, mode, path, unsafe, predicate in (
-            (1001, 0o100755, '/usr/bin/docker', False, 'owner_uid_root'),
-            (0, 0o100775, '/usr/bin/docker', False, 'not_group_or_other_writable'),
-            (0, 0o100755, '/usr/local/bin/docker', False, 'canonical_system_directory'),
-            (0, 0o100755, '/usr/bin/docker', True, 'safe_regular_single_link_path'),
-            (1001, 0o100755, '/private/account-token/docker', False, 'owner_uid_root'),
-        ):
-            metadata = SimpleNamespace(st_uid=uid, st_gid=123, st_mode=mode)
-            records = []
-            with self.subTest(predicate=predicate, path=path), patch.object(run.shutil, 'which', return_value=path), patch.object(run.Path, 'resolve', side_effect=lambda: run.Path(path)), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', return_value=metadata, side_effect=run.Refusal('UnsafePath') if unsafe else None):
-                with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
-                    run.trusted_tool('docker', lambda event, **fields: records.append(dict(event=event, **fields)))
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0], dict(event='tool-refusal', tool='docker',
-                             resolved_path=path if path.startswith('/usr/') else '<outside-system-path>',
-                             uid=uid, gid=123, mode=format(mode & 0o7777, '04o'), predicate=predicate))
-            self.assertNotIn('account-token', json.dumps(records))
-        with patch.object(run.shutil, 'which', return_value='/usr/bin/docker'), patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/docker')), patch.object(run.Path, 'lstat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)), patch.object(run, 'safe', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)):
-            self.assertEqual(run.trusted_tool('docker', lambda *args, **kwargs: self.fail('unexpected refusal')), run.Path('/usr/bin/docker'))
-
-    def test_tool_lookup_ignores_inherited_path_shadow(self):
-        metadata = SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o104755)
-        with patch.dict(run.os.environ, {'PATH': '/private/account-token'}), patch.object(run.shutil, 'which', return_value='/usr/bin/sudo') as lookup, patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/sudo')), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', return_value=metadata):
-            self.assertEqual(run.trusted_tool('sudo', lambda *args, **kwargs: self.fail('unexpected refusal')), run.Path('/usr/bin/sudo'))
-            lookup.assert_called_once_with('sudo', path='/usr/bin:/usr/sbin:/bin:/sbin')
 
     def test_fixed_argv_environment_and_limits(self):
         argv = run.create_argv('arx-' + 'c'*16 + '-founder', 'c'*16, '/fixture', 'founder', IMAGE)

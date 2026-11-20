@@ -45,27 +45,175 @@ def safe(path, parent=None, directory=True):
     return m
 
 
-def trusted_tool(tool, record):
-    resolved = Path(shutil.which(tool, path='/usr/bin:/usr/sbin:/bin:/sbin') or '/missing').resolve()
-    # Only system paths are disclosed verbatim. Unexpected paths may contain
-    # private account names or caller data and are represented by a fixed label.
-    display = resolved.as_posix() if resolved.as_posix().startswith(
-        ('/usr/', '/opt/')) else '<outside-system-path>'
-    m = resolved.lstat()
-    def check(condition, predicate):
+TOOLS = ('docker', 'sudo', 'mkfs.ext4', 'losetup', 'mount', 'umount',
+         'findmnt', 'readelf', 'git', 'mkdir', 'chown', 'python3')
+SUDO_TARGET = '/usr/lib/cargo/bin/sudo'
+SEARCH = '/usr/bin:/usr/sbin:/bin:/sbin'
+
+
+def identity(m):
+    return (m.st_dev, m.st_ino, m.st_mode, m.st_uid, m.st_gid, m.st_nlink)
+
+
+class TrustedTool:
+    """Retained CLOEXEC objects; the filesystem adapter is injectable in pure tests."""
+    def __init__(self, role, record, entry, fs=os):
+        self.role, self.record, self.entry, self.fs = role, record, entry, fs
+        self.objects = []
+        self.path = None
+        self.current = None
+        self.component = '<unapproved-path>'
+        self.reported = False
+
+    def facts(self, m):
+        return dict(uid=None if m is None else m.st_uid,
+                    gid=None if m is None else m.st_gid,
+                    mode=None if m is None else format(stat.S_IMODE(m.st_mode), '04o'),
+                    device=None if m is None else m.st_dev,
+                    inode=None if m is None else m.st_ino,
+                    nlink=None if m is None else m.st_nlink,
+                    file_type=None if m is None else stat.S_IFMT(m.st_mode))
+
+    def check(self, condition, predicate):
         if not condition:
-            record('tool-refusal', tool=tool, resolved_path=display,
-                   uid=m.st_uid, gid=m.st_gid, mode=format(stat.S_IMODE(m.st_mode), '04o'),
-                   predicate=predicate)
+            self.reported = True
+            self.record('tool-refusal', tool=self.role if self.role in TOOLS else '<unknown-role>',
+                        resolved_path=self.path or '<unapproved-path>',
+                        component=self.component, predicate=predicate, **self.facts(self.current))
             raise Refusal('ToolOwnership')
+
+    def opened(self, name, parent=None):
+        self.current = None
+        flags = self.fs.O_PATH | self.fs.O_NOFOLLOW | self.fs.O_CLOEXEC
+        fd = self.fs.open(name, flags, dir_fd=parent)
+        # Retain immediately, even if fstat fails, so all descriptors are closed.
+        self.objects.append((fd, None))
+        self.current = self.fs.fstat(fd)
+        self.objects[-1] = (fd, identity(self.current))
+        return fd
+
+    def walk(self):
+        try:
+            self.check(self.role in TOOLS, 'closed_role')
+            self.check(isinstance(self.entry, str) and self.entry.startswith('/') and
+                       len(self.entry) <= 4096 and '\x00' not in self.entry, 'absolute_bounded_entry')
+            root = self.opened('/')
+            stack = [('', root)]
+            pending = self.entry.split('/')[1:]
+            hops = steps = 0
+            while True:
+                self.check(steps <= 256, 'bounded_components')
+                m = self.current
+                component = '/' + '/'.join(name for name, _ in stack[1:])
+                self.component = component if component in (
+                    '/', '/usr', '/usr/bin', '/usr/sbin', '/bin', '/sbin', '/etc',
+                    '/etc/alternatives', '/usr/lib', '/usr/lib/cargo', '/usr/lib/cargo/bin'
+                ) else '<unapproved-path>'
+                self.check(m.st_uid == 0, 'owner_uid_root')
+                # Symlink 0777 is normal; containing directories govern replacement.
+                if not stat.S_ISLNK(m.st_mode):
+                    self.check(not m.st_mode & 0o022, 'not_group_or_other_writable')
+                if not pending:
+                    self.check(stat.S_ISREG(m.st_mode) and m.st_nlink == 1,
+                               'regular_single_link')
+                    self.check(bool(m.st_mode & stat.S_IXUSR), 'owner_executable')
+                    self.check(self.role != 'sudo' or bool(m.st_mode & stat.S_ISUID), 'sudo_setuid')
+                    resolved = '/' + '/'.join(name for name, _ in stack[1:])
+                    allowed = resolved.startswith(('/usr/bin/', '/usr/sbin/')) or (
+                        self.role == 'sudo' and resolved == SUDO_TARGET)
+                    self.check(allowed, 'canonical_system_directory')
+                    self.path = resolved
+                    self.record('tool-validated', tool=self.role, entry=self.entry if self.entry in
+                                tuple(d + '/' + self.role for d in SEARCH.split(':')) else '<interpreter-entry>',
+                                resolved_path=self.path, predicate='validated',
+                                components=len(self.objects), **self.facts(m))
+                    return self
+                self.check(stat.S_ISDIR(m.st_mode), 'directory_component')
+                self.record('tool-directory', tool=self.role, component=self.component,
+                            predicate='root_nonwritable_directory', **self.facts(m))
+                part = pending.pop(0)
+                steps += 1
+                if part in ('', '.'):
+                    continue
+                if part == '..':
+                    if len(stack) > 1:
+                        stack.pop()
+                    self.current = self.fs.fstat(stack[-1][1])
+                    continue
+                parent = stack[-1][1]
+                fd = self.opened(part, parent)
+                m = self.current
+                if stat.S_ISLNK(m.st_mode):
+                    self.check(m.st_uid == 0, 'owner_uid_root')
+                    hops += 1
+                    self.check(hops <= 40, 'bounded_symlinks')
+                    target = self.fs.readlink(part, dir_fd=parent)
+                    self.check(identity(self.fs.stat(part, dir_fd=parent, follow_symlinks=False)) ==
+                               identity(m), 'stable_symlink')
+                    self.check(len(target) <= 4096 and len(target) > 0, 'bounded_link')
+                    if target.startswith('/'):
+                        stack = [('', root)]
+                    pending = target.split('/') + pending
+                    self.current = self.fs.fstat(stack[-1][1])
+                else:
+                    stack.append((part, fd))
+        except (OSError, ValueError, RuntimeError):
+            self.current = None
+            self.check(False, 'filesystem_error')
+        except Refusal:
+            raise
+        finally:
+            if self.path is None:
+                self.close()
+
+    def recheck(self):
+        try:
+            for fd, before in self.objects:
+                self.current = self.fs.fstat(fd)
+                self.check(identity(self.current) == before, 'stable_open_object')
+            other = TrustedTool(self.role, lambda *a, **k: None, self.entry, self.fs)
+            try:
+                other.walk()
+                self.check(other.path == self.path and
+                           [m for _, m in other.objects] == [m for _, m in self.objects],
+                           'stable_route')
+            except Refusal:
+                if not self.reported:
+                    self.current = other.current
+                    self.check(False, 'stable_route')
+                raise
+            finally:
+                other.close()
+            # Pathname exec is not atomic FD execution. Retained checked objects and
+            # root-owned nonwritable ancestry fence unprivileged replacement. Rechecks
+            # detect drift, not a hostile root/mount administrator (excluded by ADR0037).
+            # This harness must not perform concurrent system package updates.
+            self.record('tool-rechecked', tool=self.role, resolved_path=self.path,
+                        predicate='stable_route_and_objects')
+            return self.path
+        except (OSError, ValueError, RuntimeError):
+            self.current = None
+            self.check(False, 'filesystem_error')
+
+    def close(self):
+        objects, self.objects = self.objects, []
+        for fd, _ in reversed(objects):
+            try:
+                self.fs.close(fd)
+            except OSError:
+                self.current = None
+                self.check(False, 'filesystem_error')
+
+
+def trusted_tool(tool, record, fs=os, entry=None):
+    obj = TrustedTool(tool, record, entry, fs)
     try:
-        m = safe(resolved, directory=False)
-    except Refusal:
-        check(False, 'safe_regular_single_link_path')
-    check(m.st_uid == 0, 'owner_uid_root')
-    check(not m.st_mode & 0o022, 'not_group_or_other_writable')
-    check(resolved.as_posix().startswith(('/usr/bin/', '/usr/sbin/')), 'canonical_system_directory')
-    return resolved
+        obj.check(tool in TOOLS, 'closed_role')
+        if entry is None:
+            obj.entry = shutil.which(tool, path=SEARCH)
+        return obj.walk()
+    except (OSError, ValueError, RuntimeError):
+        obj.check(False, 'filesystem_error')
 
 
 def digest(path):
@@ -196,7 +344,7 @@ class Child:
     def __init__(self, argv, deadline, clock):
         self.clock, self.deadline = clock, deadline
         self.p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, start_new_session=True,
+                                  stderr=subprocess.PIPE, start_new_session=True, shell=False, close_fds=True,
                                   env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'TZ': 'UTC'})
         self.selector = selectors.DefaultSelector()
         for stream in (self.p.stdout, self.p.stderr):
@@ -260,6 +408,7 @@ class Harness:
         self.cleanup_deadline = None
         self.run_id = os.urandom(8).hex()
         self.evidence = 0
+        self.tools = None
 
     def fail(self, error):
         code = str(error) if isinstance(error, Refusal) else type(error).__name__
@@ -277,11 +426,27 @@ class Harness:
         require(self.evidence <= LIMIT, 'EvidenceOverflow')
         print(line, flush=True)
 
+    def bound_argv(self, argv):
+        if self.tools is None:  # Pure lifecycle tests inject processes before qualify().
+            return argv
+        argv = list(argv)
+        role = argv[0]
+        if role in self.tools:
+            argv[0] = self.tools[role].recheck()
+            if role == 'sudo':
+                require(len(argv) >= 3 and argv[1] == '-n' and argv[2] in
+                        ('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'mkdir', 'chown'), 'Arguments')
+                argv[2] = self.tools[argv[2]].recheck()
+        else:
+            # The sole non-tool host executable is the selected, hash-checked probe.
+            require(Path(role).is_absolute(), 'Arguments')
+        return argv
+
     def command(self, argv, phase, seconds=5, cleanup=False, observed=None):
         start = self.clock()
         deadline = min(self.cleanup_deadline or self.budget.start + 150, start + seconds) if cleanup else self.budget.deadline(phase, seconds)
         require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout')
-        child = self.spawn(argv, deadline, self.clock)
+        child = self.spawn(self.bound_argv(argv), deadline, self.clock)
         self.children.append(child)
         failure = None
         try:
@@ -346,7 +511,7 @@ class Harness:
         self.holder_case = dict(node=node, mode=mode, start=start, phase='ready')
         self.holder_reap_start = None
         ready_deadline = self.budget.deadline('ready', 5)
-        self.holder = self.spawn(argv, min(start + 30, self.budget.start + 130), self.clock)
+        self.holder = self.spawn(self.bound_argv(argv), min(start + 30, self.budget.start + 130), self.clock)
         self.children.append(self.holder)
         try:
             while True:
@@ -516,7 +681,14 @@ class Harness:
             if self.first is None:
                 self.fail(error)
         finally:
-            self.cleanup()
+            try:
+                self.cleanup()
+            finally:
+                for tool in (self.tools or {}).values():
+                    try:
+                        tool.close()
+                    except Refusal as error:
+                        self.fail(error)
         self.record('result', first_failure=self.first, secondary=self.secondary,
                     seconds=round(self.clock() - self.budget.start, 3), phases={**self.budget.used, 'cleanup': self.cleanup_seconds})
         return 1 if self.first else 0
@@ -524,9 +696,20 @@ class Harness:
     def qualify(self):
         require(len(sys.argv) == 1 and sys.platform == 'linux' and platform.machine() == 'x86_64' and
                 os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly')
-        for tool in ('docker', 'sudo', 'mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'readelf'):
-            trusted_tool(tool, self.record)
-        self.command([sys.executable, '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
+        self.tools = {}
+        start = self.clock()
+        try:
+            deadline = self.budget.deadline('preflight', 20)
+            for tool in TOOLS:
+                require(self.clock() < deadline, 'PhaseTimeout')
+                self.tools[tool] = trusted_tool(tool, self.record,
+                    entry=sys.executable if tool == 'python3' else None)
+            require(sys.version_info >= (3, 11), 'PythonVersion')
+            self.record('interpreter', version=list(sys.version_info[:3]),
+                        bootstrap='trusted-ci', resolved_path=self.tools['python3'].path)
+        finally:
+            self.budget.used['preflight'] += self.clock() - start
+        self.command(['python3', '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
         require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity')
