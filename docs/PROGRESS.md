@@ -259,8 +259,9 @@ PR188 as the last merge, that is superseded by this summary.
 - **Owner process decisions (2026-11-20):** after the owner asked whether the work
   was circling: (1) trivial check fixes (formatting, whitespace, lint, missing import)
   no longer consume builder attempts; (2) coordinator PROGRESS updates go in docs-only
-  PRs, not inside code PRs; (3) step 5b's one-shot launcher ceremony is replaced by an
-  ordinary CI test of the real Engine start/close (no founding) in PR #202. Earlier
+  PRs, not inside code PRs; (3) step 5b drops the one-shot launcher in favour of an
+  ordinary CI test of the real Engine start/close (no founding). PR #202 still carries
+  the superseded launcher version until its builder pushes the rework. Earlier
   design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. AGENTS.md
   updated in this docs PR.
 - **Owner decisions D3/D4 (2026-11-20):** D4 target-authorized delegation (host B
