@@ -35,9 +35,8 @@ fn bounded(path: &str, max: usize) -> Vec<u8> {
     bytes
 }
 fn field(name: &str) -> Option<String> {
-    std::env::var(name).ok().map(|v| {
+    std::env::var(name).ok().inspect(|v| {
         assert!(v.len() <= 1024 && v.is_ascii());
-        v
     })
 }
 fn public() -> Vec<u8> {
