@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 22:21 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 23:13 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,8 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
+- **Main:** `4f139cd8` (PR214), push CI 44834437714 green. `5393900d` (PR213) push CI
+  44829635662 green. `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
   44822884767 green. `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
   44813492071 green. `9bfaedb5` (PR208) push CI 44809310046 was **red**: Ubuntu Rust
   job 136541460939 failed `issuance_publication::tests::files::publication_wrong_context_and_origin`
@@ -61,7 +62,8 @@ merged, as listed under "Merged this session".
   enrollment through the actual issuer), PR209 `620a5254` (test: publication mutations
   always change the value), PR210 `60ffb68a` (step 8a codec-only: one-paste transfer
   and owner-boundary refusals), PR211 `29e718c6` (docs), PR212 `e342fbf3` (step 8b,
-  retained durable join before replication). Every merge had an independent exact-head Sol
+  retained durable join before replication), PR213 `5393900d` (docs), PR214 `4f139cd8`
+  (step 9, receipt-scoped learner catch-up). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -453,8 +455,41 @@ merged, as listed under "Merged this session".
   unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or
   budget reset." **D8 (owner, 2026-11-20):** same-process clean owned-job reopen only
   for step 9; authenticated cross-process restart history is settled and reviewed at
-  step 13 before any process-restart claim. Sol 6.2/high builder, fresh 3-attempt
-  budget, in progress.
+  step 13 before any process-restart claim. The Sol 6.2/high builder opened PR #214
+  (15 files, ADR 0041 state-derived receipt withdrawal) after 2/3 counted failures (a
+  Linux ambiguous snapshot-trait call; a Windows SQLite I/O error in the poison-fixture
+  setup). The coordinator merged main into the branch (`cfa115aa`, byte-identical
+  patch); hosted run 44831453824 passed and C9
+  `catch_up_campaign::retained_learner_append_snapshot_and_recover` passed on Ubuntu
+  (0.303 s). Review 1 HOLD on two spec P2s (`D:/Temp/arx-pr214-review/review.md`,
+  SHA256 `2a51c4d5…061e`): a Bootstrap learner could dispatch Vote/PreVote below E once Found
+  applied, and strict RecoverJoiner released the new outer lock after a post-acquisition
+  attach refusal. Builder attempt 3/3 fixed both with non-Engine tests
+  `learner_ballots_refuse_bound_founder_below_e_and_dispatch_after_e` and
+  `recover_joiner_attach_refusal_joins_cleanup_and_retains_outer_lock` (head `2cce788e`,
+  report `D:/Temp/arx-m3-step9/report.md` SHA256 `4bac91e5…c9c1`). Hosted run 44833015482 green;
+  C9 passed (0.299 s), 914 tests, no unexpected frozen-path refusal. Review 2 PASS with
+  zero findings (`D:/Temp/arx-pr214-review2/review.md`, SHA256 `36c033c9…ae55`), agent-review
+  status 59522325252. **PR #214 merged** as `4f139cd8`. Engine Sol 3/3 and Opus 0/2
+  unchanged.
+- **D9 (owner, 2026-11-21):** a joined learner reaches the issuer's peer listener
+  through a separately, explicitly configured numeric issuer peer endpoint paired with
+  the original anchor; advertised peer addresses follow the direct LAN/Tailscale
+  source-IP rule. Fixtures supply the endpoint now; step 13 settles the deployment
+  handoff as narrowly scoped private startup routing input with the authenticated
+  anchor as authority. The `arxje1` one-paste format is unchanged.
+- **Step 10 (owner grant, 2026-11-21):** "Authorize the step 10 source fence for strict
+  mTLS self-admission and one guarded membership caller using unchanged Owners and
+  proposal permits, including the explicitly routed, self-admission-only client
+  exception against the exact original anchor for requests made before E with strict
+  issuer-side mTLS for all control requests, and one C10 hosted-Linux case with two
+  retained Engine starts and owned closes, one unchanged Found, two fixture Mints, one
+  actual AnchorQuery/Redeem exchange, five admission requests, two guarded AddNodes
+  calls, one definite stale-tail no-write refusal and one new membership entry. Keep
+  Engine, workers, Owners, stores and deadlines frozen. Stop and preserve the first
+  unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or
+  budget reset." This revises the base plan's step 10 grant with amendment R2. Sol
+  6.2/high builder, fresh 3-attempt budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
