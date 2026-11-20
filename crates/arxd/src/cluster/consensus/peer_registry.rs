@@ -29,6 +29,180 @@ pub(super) fn registry(sm: &SmAdapter) -> Registry {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Lane {
+    Strict,
+    Receipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Phase {
+    Bootstrap,
+    Strict,
+    Refused,
+}
+
+pub(super) struct LearnerGate {
+    store: std::sync::Weak<std::sync::Mutex<super::StateStore>>,
+    identity: Arc<crate::cluster::join_receipt::ExpectedIdentity>,
+    address: std::net::SocketAddr,
+    clock: Arc<dyn super::checked_clock::CheckedClock>,
+    phase: std::sync::Mutex<Phase>,
+    receipt: bool,
+}
+
+impl LearnerGate {
+    pub(super) fn new(
+        sm: &SmAdapter,
+        identity: Arc<crate::cluster::join_receipt::ExpectedIdentity>,
+        address: std::net::SocketAddr,
+        clock: Arc<dyn super::checked_clock::CheckedClock>,
+        receipt: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store: Arc::downgrade(&sm.0),
+            identity,
+            address,
+            clock,
+            phase: std::sync::Mutex::new(if receipt {
+                Phase::Bootstrap
+            } else {
+                Phase::Strict
+            }),
+            receipt,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn has_receipt(&self) -> bool {
+        self.receipt
+    }
+
+    pub(super) fn phase(&self) -> Result<Phase, VerifyRefusal> {
+        self.observe(|_, phase| Ok(phase))
+    }
+
+    fn observe<T>(
+        &self,
+        f: impl FnOnce(&super::StateStore, Phase) -> Result<T, VerifyRefusal>,
+    ) -> Result<T, VerifyRefusal> {
+        let store = self.store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
+        let store = store.try_lock().map_err(|_| VerifyRefusal::Unavailable)?;
+        if store.is_poisoned() || self.clock.sample_ms().is_err() {
+            return Err(VerifyRefusal::Unavailable);
+        }
+        let mut phase = self
+            .phase
+            .try_lock()
+            .map_err(|_| VerifyRefusal::Unavailable)?;
+        let original = self.identity.origin.position();
+        if *phase != Phase::Refused {
+            if let Some(applied) = store.applied().filter(|p| p.index >= original.index) {
+                *phase = if crossed(
+                    &self.identity,
+                    self.address,
+                    applied,
+                    store.membership(),
+                    store.state(),
+                ) {
+                    Phase::Strict
+                } else {
+                    Phase::Refused
+                };
+            } else if *phase == Phase::Strict
+                || store.membership().is_some_and(|(_, membership)| {
+                    !matches_address(&self.identity, self.address, membership)
+                })
+            {
+                *phase = Phase::Refused;
+            }
+        }
+        f(&store, *phase)
+    }
+
+    /// Applied history may pass E between observations. Check any copy of
+    /// that row on the live Append path before it can reach the state machine.
+    pub(super) fn matches_original_append(
+        &self,
+        append: &openraft::raft::AppendEntriesRequest<super::Arx>,
+    ) -> bool {
+        let original = self.identity.origin.position();
+        append
+            .prev_log_id
+            .into_iter()
+            .chain(append.entries.iter().map(|entry| entry.log_id))
+            .map(super::pos)
+            .all(|position| position.index != original.index || position == original)
+    }
+
+    pub(super) fn authorize(
+        &self,
+        cluster: crate::cluster::enrollment::ClusterId,
+        node: crate::cluster::enrollment::NodeId,
+        key: crate::cluster::enrollment::KeyDigest,
+        receipt_method: bool,
+    ) -> Result<Lane, VerifyRefusal> {
+        self.observe(|store, phase| {
+            if phase == Phase::Refused {
+                return Err(VerifyRefusal::Unavailable);
+            }
+            match store.state().authorize_peer(cluster, node, key) {
+                Ok(()) => Ok(Lane::Strict),
+                Err(PeerRefusal::WrongCluster) => Err(VerifyRefusal::WrongCluster),
+                Err(PeerRefusal::KeyMismatch) => Err(VerifyRefusal::KeyMismatch),
+                Err(PeerRefusal::NotMember) => {
+                    use crate::cluster::join_receipt::Origin;
+                    if self.receipt
+                        && receipt_method
+                        && phase == Phase::Bootstrap
+                        && let Origin::Redeem { anchors, .. } = &self.identity.origin
+                        && anchors
+                            .binary_search_by_key(&node.get(), |(id, _)| *id)
+                            .is_ok_and(|i| &anchors[i].1 == key.as_bytes())
+                    {
+                        return Ok(Lane::Receipt);
+                    }
+                    Err(VerifyRefusal::NotMember)
+                }
+            }
+        })
+    }
+}
+
+pub(super) fn crossed(
+    expected: &crate::cluster::join_receipt::ExpectedIdentity,
+    address: std::net::SocketAddr,
+    applied: super::LogPos,
+    membership: Option<&(super::LogPos, super::MembershipBlob)>,
+    state: &crate::cluster::enrollment::EnrollmentState,
+) -> bool {
+    let original = expected.origin.position();
+    if applied.index < original.index
+        || (applied.index == original.index && applied != original)
+        || applied < original
+        || state
+            .authorize_peer(expected.cluster, expected.node, expected.key)
+            .is_err()
+    {
+        return false;
+    }
+    membership
+        .filter(|(p, _)| p.term <= applied.term && (p.index < applied.index || *p == applied))
+        .is_some_and(|(_, membership)| matches_address(expected, address, membership))
+}
+
+fn matches_address(
+    expected: &crate::cluster::join_receipt::ExpectedIdentity,
+    address: std::net::SocketAddr,
+    membership: &super::MembershipBlob,
+) -> bool {
+    super::decode(membership).is_ok_and(|membership| {
+        membership
+            .get_node(&expected.node.get())
+            .is_none_or(|node| node.addr == address.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -116,6 +116,7 @@ struct Resources {
     node: NodeId,
     registry: Registry,
     credentials: Credentials,
+    learner: Option<Arc<peer_registry::LearnerGate>>,
     server: Arc<ServerConfig>,
     dispatch: Arc<dyn AppendDispatch>,
 }
@@ -624,8 +625,23 @@ async fn inbound(
     let expected = request.expected();
     stage(shared, Stage::BeforeDispatch).await;
     before_dispatch(shared, deadline)?;
-    (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
-    before_dispatch(shared, deadline)?;
+    if let Some(learner) = &resources.learner {
+        if let Request::Append(append) = &request
+            && !learner.matches_original_append(append)
+        {
+            return Err(Refusal::Identity);
+        }
+        let receipt_method = matches!(request, Request::Append(_) | Request::Snapshot(..));
+        let _lane = learner
+            .authorize(peer.0, peer.1, peer.2, receipt_method)
+            .map_err(|_| Refusal::Identity)?;
+        before_dispatch(shared, deadline)?;
+        #[cfg(test)]
+        event(shared, Event::LearnerDispatch(_lane));
+    } else {
+        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        before_dispatch(shared, deadline)?;
+    }
     let reply = match request {
         Request::Append(r) => resources.dispatch.append(r).await.map(Reply::Append),
         Request::Ballot(r, pre) => resources
@@ -854,7 +870,7 @@ async fn outbound(
 
 // Hooks are observation/gates around actual I/O, never replacements for TLS or registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Stage {
+pub(super) enum Stage {
     ServerHandshake,
     ServerAuthenticated,
     RequestRead,
@@ -870,7 +886,9 @@ enum Stage {
     SnapshotPartialBody,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Event {
+pub(super) enum Event {
+    #[cfg(test)]
+    LearnerDispatch(peer_registry::Lane),
     Stage(Stage),
     Refused(Refusal),
     Finished(Option<Refusal>),
@@ -1135,8 +1153,26 @@ fn make_resources(
     credentials: Credentials,
     dispatch: Arc<dyn AppendDispatch>,
 ) -> Result<Arc<Resources>, Refusal> {
+    make_resources_for_learner(cluster, node, sm, credentials, dispatch, None)
+}
+
+fn make_resources_for_learner(
+    cluster: ClusterId,
+    node: NodeId,
+    sm: &SmAdapter,
+    credentials: Credentials,
+    dispatch: Arc<dyn AppendDispatch>,
+    learner: Option<Arc<peer_registry::LearnerGate>>,
+) -> Result<Arc<Resources>, Refusal> {
     let registry = peer_registry::registry(sm);
-    let verifier = PeerVerifier::new(credentials.root.clone(), cluster, registry.clone())
+    let inbound: Registry = match &learner {
+        Some(gate) => {
+            let gate = gate.clone();
+            Arc::new(move |cluster, node, key| gate.authorize(cluster, node, key, true).map(|_| ()))
+        }
+        None => registry.clone(),
+    };
+    let verifier = PeerVerifier::new(credentials.root.clone(), cluster, inbound)
         .map_err(|_| Refusal::Tls)?
         .server();
     let server = Arc::new(
@@ -1153,6 +1189,7 @@ fn make_resources(
         node,
         registry,
         credentials,
+        learner,
         server,
         dispatch,
     }))
@@ -1392,6 +1429,49 @@ impl TransportOwner {
         Self::register_listener(&self.shared, &mut state, listener);
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn attach_learner(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        address: SocketAddr,
+        credentials: Credentials,
+        gate: Arc<peer_registry::LearnerGate>,
+    ) -> Result<(), Refusal> {
+        let credentials = self.take_attach_credentials(Some(credentials))?;
+        let resources = make_resources_for_learner(
+            self.shared.cluster,
+            self.shared.node,
+            sm,
+            credentials,
+            dispatch,
+            Some(gate),
+        )?;
+        let listener = std::net::TcpListener::bind(endpoint(&address.to_string())?)
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
+            .and_then(TcpListener::from_std)
+            .map_err(|_| Refusal::Address)?;
+        self.publish(sm, resources, listener)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn factory_for_test(&self) -> PeerFactory {
+        PeerFactory {
+            shared: Arc::downgrade(&self.shared),
+            loopback: false,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn dispatch_observer(&self) -> tokio::sync::mpsc::Receiver<Event> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        *self.shared.hooks.events.lock().unwrap() = Some(tx);
+        rx
+    }
+
     pub(super) fn joined(&self) -> bool {
         self.shared.state.lock().is_ok_and(|s| {
             s.finished

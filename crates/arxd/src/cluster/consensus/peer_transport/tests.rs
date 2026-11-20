@@ -3911,3 +3911,339 @@ async fn rpc_partial_attach_real_bind_failure_releases_temporary_resources() {
     assert!(temporary_released && no_publication && closed.is_ok() && reclaimed(&owner));
     assert_eq!(factory.shared.strong_count(), 1);
 }
+
+fn learner_image(
+    f: &Fixture,
+    original: u64,
+    receipt: bool,
+    sm: &SmAdapter,
+) -> Arc<peer_registry::LearnerGate> {
+    use crate::cluster::join_receipt::{ExpectedIdentity, Origin};
+    peer_registry::LearnerGate::new(
+        sm,
+        Arc::new(ExpectedIdentity {
+            cluster: CLUSTER,
+            node: node(2),
+            key: f.server.digest(),
+            ca: crate::cluster::pki::ca::fingerprint_of(&f.root),
+            origin: Origin::Redeem {
+                term: 1,
+                leader: 1,
+                index: original,
+                anchors: vec![(1, *f.client.digest().as_bytes())],
+            },
+        }),
+        "192.168.0.2:7001".parse().unwrap(),
+        Arc::new(super::super::checked_clock::HostClock::new(0)),
+        receipt,
+    )
+}
+
+async fn listen_learner_for_test(
+    f: &Fixture,
+    sm: &SmAdapter,
+    learner: Arc<peer_registry::LearnerGate>,
+    spy: Arc<RpcSpy>,
+) -> (TransportOwner, SocketAddr) {
+    let creds = Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let resources =
+        make_resources_for_learner(CLUSTER, node(2), sm, creds, spy, Some(learner)).unwrap();
+    let mut owner = TransportOwner::pending_founder(CLUSTER, node(2)).0;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    owner.publish(sm, resources, listener).unwrap();
+    (owner, address)
+}
+
+async fn exchange_learner_for_test(
+    address: SocketAddr,
+    config: Arc<ClientConfig>,
+    frame: &[u8],
+) -> io::Result<Vec<u8>> {
+    timeout(OBSERVE, async {
+        let mut stream = connect(config, address).await?;
+        send_frame(&mut stream, frame, false).await?;
+        let bytes = read_frame(&mut stream).await?;
+        clean_eof(&mut stream).await?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| io::Error::other("learner exchange elapsed"))?
+}
+
+fn add_learner_membership(sm: &SmAdapter) {
+    let membership = Members::new(
+        vec![[1].into_iter().collect()],
+        BTreeMap::from([(1, openraft::BasicNode::new("192.168.0.1:7001"))]),
+    )
+    .unwrap();
+    sm.0.lock()
+        .unwrap()
+        .apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 1,
+            },
+            &StoredEntry::Membership(super::super::encode(&membership).unwrap()),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn learner_refuses_old_matching_image_after_actual_sql_persistence_failure() {
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let scratch = private_temp();
+    let init = Init {
+        cluster: CLUSTER,
+        first_free: node(3),
+    };
+    {
+        let mut store = StateStore::open(scratch.path(), init).unwrap();
+        store.install(&f.sm.0.lock().unwrap().snapshot()).unwrap();
+    }
+    {
+        let db = rusqlite::Connection::open(scratch.path().join("cluster-state.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_learner_write BEFORE UPDATE ON sm BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    }
+    let sm = SmAdapter(Arc::new(Mutex::new(
+        StateStore::open(scratch.path(), init).unwrap(),
+    )));
+    let learner = learner_image(&f, 1, true, &sm);
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Strict));
+    let spy = rpc_spy(false);
+    let (mut owner, address) = listen_learner_for_test(&f, &sm, learner.clone(), spy.clone()).await;
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut rx = events(&owner);
+    let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+    let mut exchange = Box::pin(exchange_learner_for_test(
+        address,
+        f.client_config(&f.client, 2),
+        &frame,
+    ));
+    tokio::select! {
+        result = &mut exchange => panic!("learner exchange finished before gate: {result:?}"),
+        reached = observe(&mut rx, Event::Stage(Stage::BeforeDispatch)) => assert!(reached),
+    }
+    {
+        let mut store = sm.0.try_lock().unwrap();
+        let old = store.snapshot();
+        assert_eq!(
+            store.apply(
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 2
+                },
+                &StoredEntry::Blank
+            ),
+            Err(super::super::StoreError::Sql)
+        );
+        assert!(store.is_poisoned());
+        assert_eq!(old, store.snapshot());
+        assert_eq!(
+            store
+                .state()
+                .authorize_peer(CLUSTER, node(1), f.client.digest()),
+            Ok(())
+        );
+        assert_eq!(
+            store
+                .state()
+                .authorize_peer(CLUSTER, node(2), f.server.digest()),
+            Ok(())
+        );
+    }
+    release(&owner, Stage::BeforeDispatch, &hold);
+    assert!(exchange.await.is_err());
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Identity))).await);
+    assert!(
+        exchange_learner_for_test(address, f.client_config(&f.client, 2), &frame)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    assert!(spy.calls.lock().unwrap().is_empty());
+    assert!(bounded_close(&mut owner).await.is_ok());
+}
+
+#[tokio::test]
+async fn learner_tls_receipt_is_exact_and_scoped_to_append_and_snapshot() {
+    let f = Fixture::new();
+    let dir = private_temp();
+    let sm = SmAdapter(Arc::new(Mutex::new(
+        StateStore::open(
+            dir.path(),
+            Init {
+                cluster: CLUSTER,
+                first_free: node(2),
+            },
+        )
+        .unwrap(),
+    )));
+    let learner = learner_image(&f, 1, true, &sm);
+    let spy = rpc_spy(false);
+    let (mut owner, address) = listen_learner_for_test(&f, &sm, learner.clone(), spy.clone()).await;
+    let mut rx = events(&owner);
+    let config = f.client_config(&f.client, 2);
+    let append = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+    let snapshot =
+        peer_wire::encode_snapshot(route(), heartbeat().vote, &full_snapshot(&f)).unwrap();
+    for frame in [&append, &snapshot] {
+        assert!(
+            exchange_learner_for_test(address, config.clone(), frame)
+                .await
+                .is_ok()
+        );
+        assert!(
+            observe(
+                &mut rx,
+                Event::LearnerDispatch(peer_registry::Lane::Receipt)
+            )
+            .await
+        );
+    }
+    for kind in [
+        peer_wire::Kind::VoteRequest,
+        peer_wire::Kind::PreVoteRequest,
+    ] {
+        let frame = peer_wire::encode_vote(route(), kind, &ballot_request()).unwrap();
+        assert!(
+            exchange_learner_for_test(address, config.clone(), &frame)
+                .await
+                .is_err()
+        );
+        assert!(observe(&mut rx, Event::Finished(Some(Refusal::Identity))).await);
+    }
+    for identity in [
+        Fixture::issue(&f.issuer, CLUSTER, 1, 940, 10000),
+        Fixture::reissue(&f.issuer, [3; 16], 1, &f.client, 940, 10000),
+        Fixture::reissue(&f.issuer, CLUSTER, 3, &f.client, 940, 10000),
+    ] {
+        assert!(
+            exchange_learner_for_test(address, f.client_config(&identity, 2), &append)
+                .await
+                .is_err()
+        );
+        assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    }
+    let mut conflicting = heartbeat();
+    conflicting.prev_log_id = Some(log_id(1, 3, 1));
+    let conflicting = peer_wire::encode_request(route(), &conflicting).unwrap();
+    assert!(
+        exchange_learner_for_test(address, config.clone(), &conflicting)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Identity))).await);
+    let mut wrong_route = route();
+    wrong_route.target = 3;
+    let bad_route = peer_wire::encode_request(wrong_route, &heartbeat()).unwrap();
+    let mut wrong_sender = heartbeat();
+    wrong_sender.vote.leader_id.node_id = 3;
+    let bad_sender = peer_wire::encode_request(route(), &wrong_sender).unwrap();
+    let mut trailing = append;
+    trailing.push(0);
+    for frame in [bad_route, bad_sender, trailing] {
+        assert!(
+            exchange_learner_for_test(address, config.clone(), &frame)
+                .await
+                .is_err()
+        );
+        assert!(observe(&mut rx, Event::Finished(Some(Refusal::Frame))).await);
+    }
+    assert_eq!(spy.calls.lock().unwrap().len(), 2);
+    assert!(bounded_close(&mut owner).await.is_ok());
+    drop(sm);
+    assert_eq!(learner.phase(), Err(verify::VerifyRefusal::Unavailable));
+}
+
+#[tokio::test]
+async fn learner_removed_anchor_valid_leaf_is_denied_after_strict_cutover() {
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let learner = learner_image(&f, 1, true, &f.sm);
+    let spy = rpc_spy(false);
+    let (mut owner, address) =
+        listen_learner_for_test(&f, &f.sm, learner.clone(), spy.clone()).await;
+    let mut rx = events(&owner);
+    let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+    let config = f.client_config(&f.client, 2);
+    assert!(
+        exchange_learner_for_test(address, config.clone(), &frame)
+            .await
+            .is_ok()
+    );
+    assert!(observe(&mut rx, Event::LearnerDispatch(peer_registry::Lane::Strict)).await);
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut exchange = Box::pin(exchange_learner_for_test(address, config.clone(), &frame));
+    tokio::select! {
+        result = &mut exchange => panic!("learner exchange finished before gate: {result:?}"),
+        reached = observe(&mut rx, Event::Stage(Stage::BeforeDispatch)) => assert!(reached),
+    }
+    f.sm.0
+        .lock()
+        .unwrap()
+        .apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 2,
+            },
+            &StoredEntry::Enrollment(Command::Remove {
+                cluster: CLUSTER,
+                node: node(1),
+                proposed_at_ms: 101,
+            }),
+        )
+        .unwrap();
+    release(&owner, Stage::BeforeDispatch, &hold);
+    assert!(exchange.await.is_err());
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Identity))).await);
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Strict));
+    assert!(
+        exchange_learner_for_test(address, config, &frame)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    assert_eq!(spy.calls.lock().unwrap().len(), 1);
+    assert!(bounded_close(&mut owner).await.is_ok());
+}
+
+#[test]
+fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed() {
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let learner = learner_image(&f, 1, true, &f.sm);
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Strict));
+    let store = f.sm.0.lock().unwrap();
+    assert_eq!(learner.phase(), Err(verify::VerifyRefusal::Unavailable));
+    drop(store);
+    assert!(matches!(
+        f.sm.0.lock().unwrap().apply(
+            LogPos {
+                term: 1,
+                leader: 1,
+                index: 2
+            },
+            &StoredEntry::Enrollment(Command::Remove {
+                cluster: CLUSTER,
+                node: node(2),
+                proposed_at_ms: 101
+            }),
+        ),
+        Ok(Some(Outcome::Removed { replay: false }))
+    ));
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Refused));
+    assert_eq!(
+        learner.authorize(CLUSTER, node(1), f.client.digest(), true),
+        Err(verify::VerifyRefusal::Unavailable)
+    );
+}
