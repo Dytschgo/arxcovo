@@ -245,6 +245,8 @@ pub(super) enum BoundAttempt {
 #[derive(Clone, Copy)]
 pub(super) enum BoundIntent {
     Fresh(Init),
+    #[cfg_attr(not(any(test, target_os = "linux")), expect(dead_code))]
+    PublishedJoin(Init),
     UntouchedGenesis(Init),
     Recovery(ClusterId),
     Inspect(ClusterId),
@@ -327,6 +329,15 @@ impl OwnedStores {
             self.state.as_ref().unwrap().bound_pointer(),
         )
     }
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn first_failure_for_learner(&self) -> super::startup_plan::Refusal {
+        use super::startup_plan::Refusal;
+        match self.failure {
+            Some(BoundFailure::Inspection(reason)) => reason,
+            Some(BoundFailure::Layout) => Refusal::Layout,
+            _ => Refusal::Store,
+        }
+    }
     pub(super) fn take_pair(&mut self) -> Result<(StateStore, VoteLogStore), BoundFailure> {
         self.failure.map_or(Ok(()), Err)?;
         if self.state.is_none() || self.log.is_none() {
@@ -372,6 +383,7 @@ impl<'owner> BoundStores<'owner> {
             BoundIntent::Fresh(_) | BoundIntent::UntouchedGenesis(_) => {
                 stores.owner.plan.mode == super::startup_plan::Mode::CreateFounder
             }
+            BoundIntent::PublishedJoin(_) => false,
             BoundIntent::Recovery(_) => stores.owner.plan.mode.recovery(),
             BoundIntent::Inspect(_) => true,
         };
@@ -427,6 +439,7 @@ impl<'owner> BoundStores<'owner> {
             BoundIntent::Fresh(_) | BoundIntent::UntouchedGenesis(_) => {
                 stores.owner.plan.mode == super::startup_plan::Mode::CreateFounder
             }
+            BoundIntent::PublishedJoin(_) => stores.owner.published_baseline().is_ok(),
             BoundIntent::Recovery(_) => stores.owner.plan.mode.recovery(),
             BoundIntent::Inspect(_) => false,
         };
@@ -686,8 +699,15 @@ impl<'owner> BoundStores<'owner> {
     }
     fn construct(&mut self, intent: BoundIntent) -> Result<(), BoundFailure> {
         self.access();
-        let fresh = matches!(intent, BoundIntent::Fresh(_));
-        if fresh {
+        let fresh = matches!(
+            intent,
+            BoundIntent::Fresh(_) | BoundIntent::PublishedJoin(_)
+        );
+        if matches!(intent, BoundIntent::PublishedJoin(_)) {
+            self.owner
+                .published_baseline()
+                .map_err(|_| BoundFailure::Layout)?;
+        } else if fresh {
             self.owner
                 .fresh_baseline()
                 .map_err(|_| BoundFailure::Layout)?;
@@ -701,7 +721,9 @@ impl<'owner> BoundStores<'owner> {
             })?;
         }
         let init = match intent {
-            BoundIntent::Fresh(i) | BoundIntent::UntouchedGenesis(i) => i,
+            BoundIntent::Fresh(i)
+            | BoundIntent::PublishedJoin(i)
+            | BoundIntent::UntouchedGenesis(i) => i,
             BoundIntent::Recovery(cluster) | BoundIntent::Inspect(cluster) => Init {
                 cluster,
                 first_free: std::num::NonZeroU64::new(1).unwrap(),

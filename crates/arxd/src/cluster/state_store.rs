@@ -439,6 +439,9 @@ impl StateStore {
             release,
         })
     }
+    pub(super) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
     pub fn applied(&self) -> Option<LogPos> {
         self.image.applied
     }

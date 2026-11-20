@@ -216,6 +216,7 @@ mod hosted {
     use tokio::time::timeout;
     use x509_parser::{extensions::GeneralName, prelude::*};
 
+    mod catch_up_campaign;
     #[cfg(test)]
     mod durable_join_campaign;
 

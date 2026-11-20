@@ -25,7 +25,7 @@ use std::{
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Status {
+pub(in crate::cluster) enum Status {
     Joining,
     Refused,
     Incomplete,
@@ -37,6 +37,14 @@ pub(super) enum Status {
 struct LiveMember {
     expected: ExpectedIdentity,
     leaf: Vec<u8>,
+}
+
+pub(in crate::cluster) struct PublishedJoin {
+    pub(in crate::cluster) owner: Owner,
+    pub(in crate::cluster) custody: LearnerCustody,
+    pub(in crate::cluster) expected: ExpectedIdentity,
+    pub(in crate::cluster) leaf: Vec<u8>,
+    pub(in crate::cluster) time: Arc<dyn TimeProvider>,
 }
 
 #[derive(Default)]
@@ -52,6 +60,7 @@ struct Job {
     retained: Mutex<Retained>,
     status: watch::Sender<Status>,
     request: RequestId,
+    time: Arc<dyn TimeProvider>,
 }
 
 struct Staged {
@@ -60,16 +69,16 @@ struct Staged {
     csr: Vec<u8>,
 }
 
-pub(super) struct Observer(watch::Receiver<Status>);
+pub(in crate::cluster) struct Observer(watch::Receiver<Status>);
 
 impl Observer {
-    pub(super) async fn terminal(&mut self) -> Status {
+    pub(in crate::cluster) async fn terminal(&mut self) -> Status {
         let status = self.0.wait_for(|s| *s != Status::Joining).await;
         status.map_or(Status::Unconfirmed, |s| *s)
     }
 }
 
-pub(super) struct Destination {
+pub(in crate::cluster) struct Destination {
     pub plan: Plan,
     pub wrap: PathBuf,
     pub staging: PathBuf,
@@ -106,8 +115,36 @@ pub(super) fn start(
     routes: &[LocalRoute],
     time: Arc<dyn TimeProvider>,
 ) -> Result<Observer, Status> {
+    start_retained(destination, paste, routes, time).map(|(_, observer)| observer)
+}
+
+pub(in crate::cluster) struct RetainedJoin(&'static Job);
+
+pub(in crate::cluster) fn start_retained(
+    destination: Destination,
+    paste: &str,
+    routes: &[LocalRoute],
+    time: Arc<dyn TimeProvider>,
+) -> Result<(RetainedJoin, Observer), Status> {
     let intent = Intent::parse(destination, paste, routes, time)?;
-    launch(intent).map(|(_, observer)| observer)
+    launch(intent).map(|(job, observer)| (RetainedJoin(job), observer))
+}
+
+impl RetainedJoin {
+    pub(in crate::cluster) fn consume(self) -> Result<PublishedJoin, Status> {
+        let mut retained = self.0.retained();
+        if *self.0.status.borrow() != Status::Published {
+            return Err(Status::Refused);
+        }
+        let member = retained.live.take().ok_or(Status::Refused)?;
+        Ok(PublishedJoin {
+            expected: member.expected,
+            leaf: member.leaf,
+            owner: retained.owner.take().unwrap(),
+            custody: retained.custody.take().unwrap(),
+            time: self.0.time.clone(),
+        })
+    }
 }
 
 fn launch(intent: Intent) -> Result<(&'static Job, Observer), Status> {
@@ -123,6 +160,7 @@ fn launch(intent: Intent) -> Result<(&'static Job, Observer), Status> {
         retained: Mutex::default(),
         status,
         request,
+        time: intent.time.clone(),
     }));
     tokio::spawn(async move {
         let status = match tokio::spawn(job.run(intent)).await {
