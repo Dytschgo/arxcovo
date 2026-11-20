@@ -1350,5 +1350,137 @@ class A3ProcessTests(unittest.TestCase):
         self.assertAlmostEqual(h.budget.used['preflight'], 21)
 
 
+
+class ScratchUsageTests(unittest.TestCase):
+    def tree(self, root):
+        (root / 'context').mkdir()
+        (root / 'context/arxd-tests').write_bytes(b'public')
+        (root / 'context/Containerfile').write_bytes(b'public-recipe')
+        with (root / 'disk.img').open('wb') as f:
+            f.truncate(64 * run.MIB)
+        (root / 'fs').mkdir()
+
+    def metadata(self, root, mounted=False):
+        original = run.Path.lstat
+        def lstat(path, *args, **kwargs):
+            m = original(path, *args, **kwargs)
+            fields = {key: getattr(m, key) for key in ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_size')}
+            fields['st_blocks'] = 16 if path.name == 'disk.img' else 8
+            if mounted and path == root / 'fs':
+                fields['st_dev'] += 1
+            return SimpleNamespace(**fields)
+        return lstat
+
+    def volume(self, root, fixture_free=80):
+        def statvfs(path):
+            return SimpleNamespace(f_frsize=4096, f_blocks=1000 if path == root else 100,
+                                   f_bfree=400 if path == root else fixture_free)
+        return statvfs
+
+    def test_sparse_allocated_and_logical_context_accounting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            self.tree(root)
+            with patch.object(run.Path, 'lstat', self.metadata(root)):
+                result = run.scratch_usage(root, False, self.volume(root))
+            self.assertEqual(result, dict(allocated_bytes=7*4096, logical_file_bytes=64*run.MIB+19,
+                                         context_bytes=19, files=3, host_volume_used_bytes=600*4096,
+                                         ext4_used_bytes=None))
+            # Allocated blocks, configured image length and global volume use
+            # are deliberately different observations, not substituted totals.
+            self.assertNotEqual(result['allocated_bytes'], result['logical_file_bytes'])
+            self.assertNotEqual(result['allocated_bytes'], result['host_volume_used_bytes'])
+
+    def test_mounted_fixture_measured_without_traversing_private_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            self.tree(root)
+            private = root / 'fs/private-sentinel'
+            private.mkdir()
+            (private / 'private-sentinel').write_bytes(b'private-sentinel')
+            original = run.os.scandir
+            scanned = []
+            def scandir(path):
+                scanned.append(path)
+                self.assertNotEqual(path, root / 'fs')
+                return original(path)
+            with patch.object(run.Path, 'lstat', self.metadata(root, True)), patch.object(run.os, 'scandir', scandir):
+                measured = run.scratch_usage(root, True, self.volume(root))
+            self.assertEqual(measured['ext4_used_bytes'], 20*4096)
+            # The ext4 usage is not added to its already-accounted backing file.
+            self.assertEqual(measured['allocated_bytes'], 6*4096)
+            self.assertEqual(set(scanned), {root, root / 'context'})
+            self.assertNotIn('private-sentinel', json.dumps(measured))
+
+    def test_closed_tree_hardlinks_and_invalid_statvfs_refuse(self):
+        for scenario in ('unknown', 'context-unknown', 'unmounted-data', 'hardlink', 'statvfs', 'mount-device'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                self.tree(root)
+                if scenario == 'unknown':
+                    (root / 'private-sentinel').write_bytes(b'private-sentinel')
+                if scenario == 'context-unknown':
+                    (root / 'context/private-sentinel').write_bytes(b'private-sentinel')
+                if scenario == 'unmounted-data':
+                    (root / 'fs/private-sentinel').mkdir()
+                if scenario == 'hardlink':
+                    os.link(root / 'context/arxd-tests', root.parent / ('alias-' + root.name))
+                try:
+                    vfs = self.volume(root) if scenario != 'statvfs' else lambda p: SimpleNamespace(f_frsize=0, f_blocks=1, f_bfree=2)
+                    with patch.object(run.Path, 'lstat', self.metadata(root)):
+                        with self.assertRaises(run.Refusal):
+                            run.scratch_usage(root, scenario == 'mount-device', vfs)
+                finally:
+                    if scenario == 'hardlink':
+                        (root.parent / ('alias-' + root.name)).unlink()
+
+    def test_record_schema_and_observed_high_water_across_phases(self):
+        clock = Clock()
+        h = run.Harness(clock)
+        h.root = Path('unused')
+        h.scratch = dict(samples=0, peak_allocated_bytes=0, peak_ext4_used_bytes=0)
+        values = [dict(allocated_bytes=8192, logical_file_bytes=0, context_bytes=0, files=0,
+                       host_volume_used_bytes=1000000, ext4_used_bytes=None),
+                  dict(allocated_bytes=16384, logical_file_bytes=64*run.MIB, context_bytes=19, files=3,
+                       host_volume_used_bytes=999000, ext4_used_bytes=8192),
+                  dict(allocated_bytes=12288, logical_file_bytes=64*run.MIB, context_bytes=19, files=3,
+                       host_volume_used_bytes=1001000, ext4_used_bytes=4096)]
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(run, 'scratch_usage', side_effect=values):
+            h.record_scratch('root')
+            h.record_scratch('ready', 'founder')
+            h.record_scratch('pre-cleanup')
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([r['samples'] for r in records], [1, 2, 3])
+        self.assertEqual([r['peak_allocated_bytes'] for r in records], [8192, 16384, 16384])
+        self.assertEqual([r['peak_ext4_used_bytes'] for r in records], [0, 8192, 8192])
+        self.assertEqual(set(records[-1]), {'event', 'checkpoint', 'node', 'allocated_bytes', 'logical_file_bytes',
+                                           'context_bytes', 'files', 'host_volume_used_bytes', 'ext4_used_bytes',
+                                           'samples', 'peak_allocated_bytes', 'peak_ext4_used_bytes'})
+        self.assertEqual(records[-1]['event'], 'scratch-usage')
+        with self.assertRaises(run.Refusal):
+            h.record_scratch('private-sentinel')
+        self.assertNotIn('private-sentinel', output.getvalue())
+
+    def test_measurement_failure_preserves_first_error_and_runs_cleanup(self):
+        for first in (None, 'SourcePin'):
+            h = run.Harness(Clock())
+            h.scratch = dict(samples=0, peak_allocated_bytes=0, peak_ext4_used_bytes=0)
+            h.first = first
+            h.qualify = lambda: h.record_scratch('staged')
+            cleaned = []
+            h.cleanup = lambda: cleaned.append(h.first)
+            output = io.StringIO()
+            with redirect_stdout(output), patch.object(run, 'scratch_usage', side_effect=OSError('private-sentinel')):
+                self.assertEqual(h.run(), 1)
+            self.assertEqual(cleaned, [first or 'ScratchMeasurement'])
+            self.assertEqual(h.first, first or 'ScratchMeasurement')
+            self.assertEqual(h.scratch['samples'], 0)
+            self.assertFalse(any(json.loads(line)['event'] == 'scratch-usage' for line in output.getvalue().splitlines()))
+            self.assertNotIn('private-sentinel', output.getvalue())
+            if first:
+                self.assertIn('ScratchMeasurement', h.secondary)
+
+
 if __name__ == '__main__':
     unittest.main()

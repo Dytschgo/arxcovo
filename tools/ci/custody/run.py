@@ -284,6 +284,65 @@ def digest(path):
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
 
+def scratch_usage(root, mounted, statvfs=None):
+    """Bounded metadata-only accounting; never traverse the private ext4 tree.
+
+    Backing-file blocks already include fixture allocation: ext4 used bytes are
+    reported separately, never added again. Volume usage is not task attribution.
+    """
+    statvfs = statvfs or os.statvfs
+    totals = dict(allocated_bytes=0, logical_file_bytes=0, context_bytes=0, files=0)
+    device = safe(root, subject='scratch-root').st_dev
+
+    def account(path, directory, context=False):
+        m = safe(path, directory=directory, subject='scratch-object')
+        require(m.st_dev == device and isinstance(m.st_blocks, int) and m.st_blocks >= 0,
+                'ScratchMeasurement', 'scratch-object', 'attributed_blocks')
+        totals['allocated_bytes'] += m.st_blocks * 512
+        if not directory:
+            totals['logical_file_bytes'] += m.st_size
+            totals['context_bytes'] += m.st_size if context else 0
+            totals['files'] += 1
+        return identity(m)
+
+    def entries(path, allowed):
+        with os.scandir(path) as scan:
+            for index, entry in enumerate(scan):
+                require(index < len(allowed) and entry.name in allowed,
+                        'ScratchMeasurement', 'scratch-tree', 'closed_bounded_entries')
+                yield path / entry.name
+
+    def usage(path):
+        before = safe(path, subject='scratch-filesystem')
+        v = statvfs(path)
+        require(v.f_frsize > 0 and 0 <= v.f_bfree <= v.f_blocks,
+                'ScratchMeasurement', 'scratch-filesystem', 'valid_statvfs')
+        require(identity(safe(path, subject='scratch-filesystem')) == identity(before),
+                'ScratchMeasurement', 'scratch-filesystem', 'stable_object')
+        return (v.f_blocks - v.f_bfree) * v.f_frsize
+
+    root_identity = account(root, True)
+    for path in entries(root, ('context', 'fs', 'disk.img', 'image.id')):
+        if path.name == 'fs' and mounted:
+            require(safe(path, root, subject='scratch-fixture').st_dev != device,
+                    'ScratchMeasurement', 'scratch-fixture', 'distinct_mounted_filesystem')
+            continue
+        before = account(path, path.name in ('context', 'fs'))
+        if path.name == 'context':
+            for child in entries(path, ('arxd-tests', 'Containerfile')):
+                account(child, False, True)
+        elif path.name == 'fs':
+            for _ in entries(path, ()):
+                pass
+        require(identity(safe(path, directory=path.name in ('context', 'fs'))) == before,
+                'ScratchMeasurement', 'scratch-tree', 'stable_object')
+    require(identity(safe(root)) == root_identity,
+            'ScratchMeasurement', 'scratch-root', 'stable_object')
+    totals['host_volume_used_bytes'] = usage(root)
+    totals['ext4_used_bytes'] = usage(root / 'fs') if mounted else None
+    return totals
+
+
 class BuildInput:
     """Trusted CI input, with retained no-follow object and bounded stable copy.
 
@@ -568,6 +627,30 @@ class Harness:
         self.evidence_exhausted = False
         self.tools = None
         self.case_results = set()
+        self.scratch = None
+
+    def record_scratch(self, checkpoint, node=None):
+        if self.scratch is None:
+            return
+        require(checkpoint in ('root', 'staged', 'image', 'fixture', 'ready', 'probe', 'restart', 'node-removed', 'pre-cleanup') and
+                node in (None, 'founder', 'learner1', 'learner2'),
+                'ScratchMeasurement', 'scratch', 'closed_checkpoint')
+        start = self.clock()
+        try:
+            self.budget.deadline('evidence', 10)
+            try:
+                measured = scratch_usage(self.root, self.mounted)
+            except (OSError, AttributeError, ValueError, RuntimeError) as error:
+                raise Refusal('ScratchMeasurement', 'scratch', 'metadata_error', error_type=type(error).__name__) from None
+            state = self.scratch
+            state['samples'] += 1
+            state['peak_allocated_bytes'] = max(state['peak_allocated_bytes'], measured['allocated_bytes'])
+            if measured['ext4_used_bytes'] is not None:
+                state['peak_ext4_used_bytes'] = max(state['peak_ext4_used_bytes'], measured['ext4_used_bytes'])
+            self.record('scratch-usage', checkpoint=checkpoint, node=node, **measured, **state)
+        finally:
+            self.budget.used['evidence'] += self.clock() - start
+        self.budget.deadline('evidence', 10)
 
     def fail(self, error):
         code = str(error) if isinstance(error, Refusal) else type(error).__name__
@@ -867,6 +950,10 @@ class Harness:
                 self.fail(error)
         finally:
             try:
+                try:
+                    self.record_scratch('pre-cleanup')
+                except Exception as error:
+                    self.fail(error)
                 self.cleanup()
             finally:
                 for tool in (self.tools or {}).values():
@@ -953,18 +1040,22 @@ class Harness:
         safe(self.root, tmp)
         context = self.root / 'context'
         context.mkdir(mode=0o700)
+        self.scratch = dict(samples=0, peak_allocated_bytes=0, peak_ext4_used_bytes=0)
+        self.record_scratch('root')
         source = self.command(['git', 'rev-parse', 'HEAD'], 'preflight').decode().strip()
         require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin', 'qualify', "re.fullmatch('[a-f0-9]{40}', source)")
         # Coordinator must persist adoption before hosted execution.
         note = Path('docs/adr/0037-acceptance-custody.md').read_text()
         require(PINS in note, 'MissingAdoptedPins', 'qualify', 'PINS in note')
         self.discover_and_stage(source, context)
+        self.record_scratch('staged')
         self.command(['docker', 'build', '--platform', 'linux/amd64', '--network', 'none', '--target', 'custody-runtime', '--file', str(context / 'Containerfile'), '--iidfile', str(self.root / 'image.id'), str(context)], 'image', 40)
         self.image = (self.root / 'image.id').read_text().strip()
         require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
         image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
         require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 256*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 256 * MIB)")
         self.record('image', identity=self.image, bytes=image['Size'])
+        self.record_scratch('image')
         self.run_nodes()
 
     def discover_and_stage(self, source, context):
@@ -1044,6 +1135,7 @@ class Harness:
 
     def run_nodes(self):
         self.prepare_fixture()
+        self.record_scratch('fixture')
         founder_context = None
         identities = set()
         for node in ('founder', 'learner1', 'learner2'):
@@ -1071,13 +1163,17 @@ class Harness:
             require(exact_listing(listing), 'ImageABI', 'run_nodes', 'exact_listing(listing)')
             role = 'founder' if node == 'founder' else 'learner'
             public_context, target = self.start_holder(exec_argv(container, 'create-' + role, founder_context), node, 'create-' + role)
+            self.record_scratch('ready', node)
             if node == 'founder':
                 founder_context = public_context
             self.operational(container, 'deny-build', target=target)
             if node == 'founder':
                 self.operational(container, 'same-uid-control', public_context)
+            self.record_scratch('probe', node)
             self.release_and_restart(container, role, public_context)
+            self.record_scratch('restart', node)
             self.remove_node(container)
+            self.record_scratch('node-removed', node)
 
 
 def main():
