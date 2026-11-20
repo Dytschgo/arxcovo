@@ -164,12 +164,28 @@ PR188 as the last merge, that is superseded by this summary.
   fresh 3 attempts; used 0/3, head `ae36438e`; report `D:/Temp/arx-m3-step4a-2/report.md`
   SHA256 `06d7ebdc…1d56`: 48 Windows tests pass (publication 1, PKI 38, receipt 4,
   startup 5); Linux compile and runtime via hosted CI. Exact-head review pending.
-- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route and
-  ancestor checks) implemented and validated on the runner; preflight then refused the
-  uutils multicall `mkdir` (116 links). Amendment A2 (closed role-to-target map, ancestor
-  checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
-  in one run) independently reviewed GO with required changes and committed to the pins.
-  The fourth builder has one attempt left.
+- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route
+  and ancestor checks) and A2 (closed uutils role-to-target map, ancestor checks plus
+  verified `protected_hardlinks=1`, dispatch preserved, all refusals in one run) were
+  each independently reviewed and committed to the pins; the fourth builder then
+  validated all 12 tools on the runner and stopped 3/3 at a discovery `UnsafePath`.
+  A stuck-rule review (`D:/Temp/arx-pr199-discovery-review/review.md`, SHA256
+  `c8428a74…d9`) recommended a finite campaign. **Owner authorization (2026-11-20):**
+  hosted qualification campaign Q1, at most 6 rounds, fixed security semantics, pin
+  changes only via coordinator plus independent review (recorded in the pins). Round 1
+  (`bd7c18a0`) stopped on a candidate `--list` exit 1; amendment A3 (discovery-only
+  completed nonzero listings, exactly one zero-exit exact match) was reviewed
+  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a75`) and adopted
+  verbatim. Round 2 (`40fdbb30`) qualified: all 13 custody cases passed on the hosted
+  runner (founder create/deny/same-UID control/release/restart, both learners), each
+  invocation selected=1/passed=1/failed=0, zero refusals, launcher 9.536 s of a 150 s
+  ceiling, cleanup verified; no image re-pin was needed (the GLIBC 2.39 executable ran
+  in the pinned Ubuntu 24.04 image). Campaign report `D:/Temp/arx-pr199-q1/report.md`
+  SHA256 `9927642c…aa8d6`. Exact-head review of `40fdbb30`
+  (`D:/Temp/arx-pr199-review4/review.md`, SHA256 `0ebec5ea…ff2`): two P2 — this stale
+  record (now corrected) and missing actual scratch high-water bytes required by the
+  pins; the latter is campaign round 3. Counters: four earlier 3b builders 3/3 each;
+  Q1 2/6 rounds; Engine Sol 3/3, Opus 0/2.
 - **Custody 3b harness (this PR):** adopted pins committed as
   [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
   `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
