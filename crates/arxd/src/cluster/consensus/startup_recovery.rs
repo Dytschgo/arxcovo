@@ -366,7 +366,7 @@ pub(super) fn prepare(
     })
 }
 fn inspect_pair(owner: &mut Owner, cluster: ClusterId) -> Result<(StateInspection, LogInspection)> {
-    use crate::cluster::bound_open::{BoundIntent, BoundStores};
+    use crate::cluster::bound_open::{BoundFailure, BoundIntent, BoundStores};
     let mut bound = BoundStores::acquire(owner, BoundIntent::Inspect(cluster));
     bound
         .inspect(|state, state_file, log, log_file| {
@@ -382,7 +382,11 @@ fn inspect_pair(owner: &mut Owner, cluster: ClusterId) -> Result<(StateInspectio
             })();
             result.map_err(|_: Refusal| StoreError::Corrupt)
         })
-        .map_err(|_| Refusal::Store)
+        .map_err(|f| match f {
+            BoundFailure::Inspection(refusal) => refusal,
+            BoundFailure::Layout => Refusal::Layout,
+            _ => Refusal::Store,
+        })
 }
 fn readonly(db: &Connection, file: &File, max_pages: u64, schema: &[(&str, &str)]) -> Result<()> {
     let len = file.metadata().map_err(|_| Refusal::Store)?.len();
@@ -771,7 +775,7 @@ mod tests {
     use crate::cluster::{
         enrollment::{Command, FoundMembers, NodeId},
         join_receipt::{Origin, tests::fixture},
-        startup_plan::tests::Layout,
+        startup_plan::tests::{Layout, guards},
     };
     use std::sync::{
         Arc,
@@ -1644,6 +1648,40 @@ mod tests {
         assert_eq!(l.snapshot(), before);
     }
     #[test]
+    fn inspection_preserves_ownership_and_layout_refusals() {
+        for stem in ["cluster-state", "cluster-log"] {
+            let l = Layout::new();
+            initialized(&l);
+            let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(owner.plan.state.join(format!("{stem}.lock")))
+                .unwrap();
+            lock.try_lock().unwrap();
+            let before = l.snapshot();
+            PROBE_CONNECTIONS.with(|n| n.set(0));
+            assert!(matches!(
+                inspect_pair(&mut owner, [1; 16]),
+                Err(Refusal::Ownership)
+            ));
+            assert_eq!(PROBE_CONNECTIONS.with(|n| n.get()), 0);
+            assert_eq!(l.snapshot(), before);
+        }
+        let l = Layout::new();
+        initialized(&l);
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        l.write("state/cluster-log.sqlite3-wal", b"");
+        let before = l.snapshot();
+        PROBE_CONNECTIONS.with(|n| n.set(0));
+        assert!(matches!(
+            inspect_pair(&mut owner, [1; 16]),
+            Err(Refusal::Layout)
+        ));
+        assert_eq!(PROBE_CONNECTIONS.with(|n| n.get()), 0);
+        assert_eq!(l.snapshot(), before);
+    }
+    #[test]
     fn bound_inspection_accepts_original_zero_sidecars_without_changes() {
         for stem in ["cluster-state", "cluster-log"] {
             for suffix in ["-wal", "-journal"] {
@@ -1694,6 +1732,27 @@ mod tests {
                 result.as_ref().err(),
                 l.snapshot() == before
             );
+            let after = l.snapshot();
+            let removed: Vec<_> = before
+                .iter()
+                .filter(|(n, _)| !after.iter().any(|(m, _)| m == n))
+                .map(|(n, b)| (n, b.len()))
+                .collect();
+            let added: Vec<_> = after
+                .iter()
+                .filter(|(n, _)| !before.iter().any(|(m, _)| m == n))
+                .map(|(n, b)| (n, b.len()))
+                .collect();
+            let changed: Vec<_> = before
+                .iter()
+                .filter_map(|(n, b)| {
+                    after
+                        .iter()
+                        .find(|(m, _)| m == n)
+                        .and_then(|(_, c)| (b != c).then_some((n, b.len(), c.len())))
+                })
+                .collect();
+            println!("removed={removed:?}; added={added:?}; changed={changed:?}");
             if let Ok(prepared) = result {
                 assert!(matches!(
                     prepared.observation,
@@ -1724,6 +1783,12 @@ mod tests {
             "no-state-lock",
             "no-log-lock",
             "no-state-db",
+            "truncated-state",
+            "truncated-log",
+            "sqlite-zero-log",
+            "empty-schema-log",
+            "partial-schema-log",
+            "metadata-type",
             "zero-log",
             "unsupported-log",
             "extra-schema-log",
@@ -1740,6 +1805,32 @@ mod tests {
             match variant {
                 "no-log-lock" => std::fs::remove_file(log.with_extension("lock")).unwrap(),
                 "no-state-db" => std::fs::remove_file(&state).unwrap(),
+                "truncated-state" => l.write("state/cluster-state.sqlite3", b"SQLite format 3\0"),
+                "truncated-log" => l.write("state/cluster-log.sqlite3", b"SQLite format 3\0"),
+                "sqlite-zero-log" => {
+                    std::fs::remove_file(&log).unwrap();
+                    Connection::open(&log)
+                        .unwrap()
+                        .execute_batch("CREATE TABLE unrelated(x); PRAGMA user_version=0;")
+                        .unwrap();
+                }
+                "empty-schema-log" => {
+                    std::fs::remove_file(&log).unwrap();
+                    Connection::open(&log)
+                        .unwrap()
+                        .execute_batch("VACUUM;")
+                        .unwrap();
+                }
+                "partial-schema-log" => Connection::open(&log)
+                    .unwrap()
+                    .execute_batch("DROP TABLE meta;")
+                    .unwrap(),
+                "metadata-type" => {
+                    Connection::open(&log)
+                        .unwrap()
+                        .execute("UPDATE meta SET blob='text'", [])
+                        .unwrap();
+                }
                 "zero-log" => l.write("state/cluster-log.sqlite3", b""),
                 "unsupported-log" => {
                     Connection::open(&log)

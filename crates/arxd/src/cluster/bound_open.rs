@@ -228,6 +228,7 @@ use std::{
 pub(super) enum BoundFailure {
     Intent,
     Layout,
+    Inspection(super::startup_plan::Refusal),
     Unavailable,
     Identity,
     Open(StoreError),
@@ -398,7 +399,7 @@ impl<'owner> BoundStores<'owner> {
             .map_err(BoundFailure::Init)?;
             self.owner
                 .inspect_validate()
-                .map_err(|_| BoundFailure::Layout)?;
+                .map_err(BoundFailure::Inspection)?;
             Ok(value)
         }));
         match result {
@@ -462,14 +463,28 @@ impl<'owner> BoundStores<'owner> {
     fn open(&mut self, kind: StoreKind, fresh: bool, readonly: bool) -> Result<(), BoundFailure> {
         self.access();
         let stem = kind.stem();
-        self.pending.lock = Some(StoreLock(self.original(&format!("{stem}.lock"), fresh)?));
+        self.pending.lock = Some(StoreLock(
+            self.original(&format!("{stem}.lock"), fresh).map_err(|f| {
+                if readonly {
+                    BoundFailure::Inspection(super::startup_plan::Refusal::Ownership)
+                } else {
+                    f
+                }
+            })?,
+        ));
         self.pending
             .lock
             .as_ref()
             .unwrap()
             .0
             .try_lock()
-            .map_err(|_| BoundFailure::Open(StoreError::Io))?;
+            .map_err(|_| {
+                if readonly {
+                    BoundFailure::Inspection(super::startup_plan::Refusal::Ownership)
+                } else {
+                    BoundFailure::Open(StoreError::Io)
+                }
+            })?;
         self.pending.guard = Some(self.original(&format!("{stem}.sqlite3"), fresh)?);
         self.validate_open_layout(readonly)?;
         let path = self.owner.plan.state.join(format!("{stem}.sqlite3"));
@@ -518,11 +533,14 @@ impl<'owner> BoundStores<'owner> {
     }
     fn validate_open_layout(&self, readonly: bool) -> Result<(), BoundFailure> {
         if readonly {
-            self.owner.inspect_validate()
+            self.owner
+                .inspect_validate()
+                .map_err(BoundFailure::Inspection)
         } else {
-            self.owner.bound_validate(&self.staged, true)
+            self.owner
+                .bound_validate(&self.staged, true)
+                .map_err(|_| BoundFailure::Layout)
         }
-        .map_err(|_| BoundFailure::Layout)
     }
     fn require_v2(&self) -> Result<(), BoundFailure> {
         #[cfg(test)]
@@ -548,7 +566,13 @@ impl<'owner> BoundStores<'owner> {
                 .fresh_baseline()
                 .map_err(|_| BoundFailure::Layout)?;
         } else {
-            self.owner.recheck().map_err(|_| BoundFailure::Layout)?;
+            self.owner.recheck().map_err(|f| {
+                if matches!(intent, BoundIntent::Inspect(_)) {
+                    BoundFailure::Inspection(f)
+                } else {
+                    BoundFailure::Layout
+                }
+            })?;
         }
         let init = match intent {
             BoundIntent::Fresh(i) | BoundIntent::UntouchedGenesis(i) => i,
@@ -560,7 +584,7 @@ impl<'owner> BoundStores<'owner> {
         if matches!(intent, BoundIntent::Inspect(_)) {
             self.owner
                 .inspect_validate()
-                .map_err(|_| BoundFailure::Layout)?;
+                .map_err(BoundFailure::Inspection)?;
             self.open(StoreKind::State, false, true)?;
             self.inspection_state = self.pending.bound.take();
             self.open(StoreKind::VoteLog, false, true)?;
@@ -579,7 +603,7 @@ impl<'owner> BoundStores<'owner> {
             }
             self.owner
                 .inspect_validate()
-                .map_err(|_| BoundFailure::Layout)?;
+                .map_err(BoundFailure::Inspection)?;
             return Ok(());
         }
         self.open(StoreKind::State, fresh, false)?;
@@ -932,17 +956,83 @@ pub(super) mod tests {
         for stem in ["cluster-state", "cluster-log"] {
             for suffix in ["-wal", "-journal"] {
                 let l = seeded();
+                let path = stores_path(&l, stem).with_file_name(format!("{stem}.sqlite3{suffix}"));
+                if path.exists() {
+                    fs::remove_file(&path).unwrap();
+                }
+                assert!(!path.exists());
                 let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
-                l.write(&format!("state/{stem}.sqlite3{suffix}"), b"");
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .unwrap();
                 let before = l.snapshot();
                 SQL.with(|n| n.set(0));
                 let stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
-                assert_eq!(stores.status(), Err(BoundFailure::Layout));
+                assert_eq!(
+                    stores.status(),
+                    Err(BoundFailure::Inspection(
+                        super::super::startup_plan::Refusal::Layout
+                    ))
+                );
                 assert_eq!(SQL.with(|n| n.get()), 0);
                 drop(stores);
                 assert_eq!(l.snapshot(), before);
             }
         }
+    }
+    #[test]
+    fn inspection_exact_optional_masks_and_callback_layout_refusal() {
+        for mask in 0..16 {
+            let l = seeded();
+            for (i, name) in [
+                "cluster-state.sqlite3-wal",
+                "cluster-state.sqlite3-journal",
+                "cluster-log.sqlite3-wal",
+                "cluster-log.sqlite3-journal",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let path = l.root.path().join("state").join(name);
+                if path.exists() {
+                    fs::remove_file(&path).unwrap();
+                }
+                if mask & (1 << i) != 0 {
+                    fs::write(&path, b"").unwrap();
+                }
+            }
+            let before = l.snapshot();
+            let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+            let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+            assert_eq!(stores.status(), Ok(()), "mask {mask}");
+            stores.inspect(|_, _, _, _| Ok(())).unwrap();
+            drop(stores);
+            assert_eq!(l.snapshot(), before, "mask {mask}");
+        }
+        let l = seeded();
+        let path = stores_path(&l, "cluster-log").with_file_name("cluster-log.sqlite3-wal");
+        assert!(!path.exists());
+        let mut owner = Owner::acquire(l.plan("create-founder")).unwrap();
+        let mut stores = BoundStores::acquire(&mut owner, BoundIntent::Inspect(init().cluster));
+        assert_eq!(stores.status(), Ok(()));
+        assert_eq!(
+            stores.inspect(|_, _, _, _| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .unwrap();
+                Ok(())
+            }),
+            Err(BoundFailure::Inspection(
+                super::super::startup_plan::Refusal::Layout
+            ))
+        );
+        let before = l.snapshot();
+        drop(stores);
+        assert_eq!(l.snapshot(), before);
     }
     fn stores_path(l: &super::super::startup_plan::tests::Layout, stem: &str) -> PathBuf {
         l.root.path().join(format!("state/{stem}.sqlite3"))
@@ -951,7 +1041,14 @@ pub(super) mod tests {
     fn inspection_sidecar_policy_original_zero_and_exact_layout() {
         for stem in ["cluster-state", "cluster-log"] {
             for suffix in ["-wal", "-journal"] {
-                for change in ["none", "grow", "remove", "pair-grow", "callback-grow"] {
+                for change in [
+                    "none",
+                    "grow",
+                    "remove",
+                    "replace",
+                    "pair-grow",
+                    "callback-grow",
+                ] {
                     let l = seeded();
                     let path =
                         stores_path(&l, stem).with_file_name(format!("{stem}.sqlite3{suffix}"));
@@ -966,15 +1063,30 @@ pub(super) mod tests {
                             .set_len(1)
                             .unwrap();
                     }
-                    if change == "remove" {
+                    if change == "remove" || change == "replace" {
                         #[cfg(windows)]
                         {
+                            let original = l.snapshot();
                             fs::remove_file(&path).unwrap_err();
+                            if change == "replace" {
+                                let replacement = path.with_extension("replacement");
+                                fs::write(&replacement, b"").unwrap();
+                                fs::rename(&replacement, &path).unwrap_err();
+                                fs::remove_file(&replacement).unwrap();
+                            }
+                            assert_eq!(l.snapshot(), original);
+                            assert_eq!(owner.inspect_validate(), Ok(()));
                             continue;
                         }
                         #[cfg(unix)]
                         {
-                            fs::remove_file(&path).unwrap();
+                            if change == "replace" {
+                                let replacement = path.with_extension("replacement");
+                                fs::write(&replacement, b"").unwrap();
+                                fs::rename(&replacement, &path).unwrap();
+                            } else {
+                                fs::remove_file(&path).unwrap();
+                            }
                             assert!(owner.inspect_validate().is_err());
                             continue;
                         }
@@ -990,7 +1102,12 @@ pub(super) mod tests {
                     PAIR_MUTATION.with(|p| *p.borrow_mut() = None);
                     assert_eq!(SQL.with(|n| n.get()), 0);
                     if change == "grow" || change == "pair-grow" {
-                        assert_eq!(stores.status(), Err(BoundFailure::Layout));
+                        assert_eq!(
+                            stores.status(),
+                            Err(BoundFailure::Inspection(
+                                super::super::startup_plan::Refusal::Store
+                            ))
+                        );
                     } else {
                         assert_eq!(stores.status(), Ok(()));
                         let result = stores.inspect(|s, _, l, _| {
@@ -1010,7 +1127,9 @@ pub(super) mod tests {
                         assert_eq!(
                             result,
                             if change == "callback-grow" {
-                                Err(BoundFailure::Layout)
+                                Err(BoundFailure::Inspection(
+                                    super::super::startup_plan::Refusal::Store,
+                                ))
                             } else {
                                 Ok(())
                             }
