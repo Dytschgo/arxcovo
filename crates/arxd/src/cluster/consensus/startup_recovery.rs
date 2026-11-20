@@ -2358,10 +2358,18 @@ mod tests {
                     }
                     let snapshot = hook_l.snapshot();
                     assert_eq!(snapshot, before, "identical entries and bytes after hook");
+                    probe_outer(&owner.plan.state, true);
                     *hook_observation.borrow_mut() = Some((replaced, snapshot));
                 }))
             });
             let reset = ResetPhase;
+            let count = Arc::new(AtomicUsize::new(0));
+            SCHEMA_PROBE.with(|slot| *slot.borrow_mut() = Some(count.clone()));
+            let _reset_probe = ResetProbe;
+            PROBE_CONNECTIONS.with(|n| n.set(0));
+            INTEGRITY_CALLS.with(|n| n.set(0));
+            SCANNED.with(|n| n.set(0));
+            MUTABLE_OPENS.with(|n| n.set(0));
             let result = prepare(l.plan("recover-founder"), Some(&expected), None, false);
             drop(reset);
             let (replaced, after_hook) = observation
@@ -2383,13 +2391,14 @@ mod tests {
                     matches!(result, Err(Refusal::Layout)),
                     "{stage}: identity refusal required"
                 );
-                // before-inspection reaches inspection before the next recheck.
-                let last = if stage == "before-inspection" {
-                    "before-open"
-                } else {
-                    stage
+                // Bound acquisition rechecks original guards before SQLite opens:
+                // a before-inspection replacement refuses at that same stage.
+                let prefix: &[&str] = match stage {
+                    "before-inspection" => &["before-inspection"],
+                    "before-open" => &["before-inspection", "before-open"],
+                    _ => &["before-inspection", "before-open", "before-publication"],
                 };
-                assert_eq!(visits.borrow().last().copied(), Some(last));
+                assert_eq!(visits.borrow().as_slice(), prefix, "{stage}");
                 eprintln!(
                     "stage={stage} actual-replacement=true result=Layout after-hook=after-call"
                 );
@@ -2398,10 +2407,30 @@ mod tests {
                     result.is_ok(),
                     "{stage}: denied mutation preserves valid preparation"
                 );
+                assert_eq!(
+                    visits.borrow().as_slice(),
+                    &["before-inspection", "before-open", "before-publication"]
+                );
                 eprintln!(
                     "stage={stage} actual-replacement=false result=Ok OS-prevention-only after-hook=after-call"
                 );
             }
+            // The enabled schema witness precedes application PRAGMAs; the
+            // healthy/later-stage counts qualify the early zero-query oracle.
+            let inspected = usize::from(!replaced || stage != "before-inspection");
+            assert_eq!(
+                PROBE_CONNECTIONS.with(|n| n.get()),
+                inspected * 2,
+                "{stage}"
+            );
+            assert_eq!(INTEGRITY_CALLS.with(|n| n.get()), inspected * 2, "{stage}");
+            assert_eq!(SCANNED.with(|n| n.get()), inspected, "{stage}");
+            assert_eq!(
+                MUTABLE_OPENS.with(|n| n.get()),
+                usize::from(!replaced || stage == "before-publication"),
+                "{stage}"
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 0, "{stage}: CHECK evaluated");
             drop(result);
             let f = OpenOptions::new()
                 .read(true)
