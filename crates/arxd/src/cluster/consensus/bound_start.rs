@@ -22,12 +22,13 @@ pub(super) enum Status {
     FounderReady,
     #[cfg(target_os = "linux")]
     FounderRefused,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(test, target_os = "linux"))]
     LearnerReady,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(test, target_os = "linux"))]
     LearnerRefused,
     Closing,
     Clean,
+    ClosedAfterLearnerRefusal,
     #[cfg(target_os = "linux")]
     ClosedAfterFounderRefusal,
     Unconfirmed,
@@ -44,6 +45,7 @@ struct State {
     close_dispatched: bool,
     close_failure: Option<ShutdownReport>,
     engine_may_exist: bool,
+    strict_learner_recovery: bool,
     #[cfg(target_os = "linux")]
     founder: Option<founder::Operation>,
     #[cfg(target_os = "linux")]
@@ -99,6 +101,7 @@ impl Job {
                 close_dispatched: false,
                 close_failure: None,
                 engine_may_exist: false,
+                strict_learner_recovery: false,
                 #[cfg(target_os = "linux")]
                 founder: None,
                 #[cfg(target_os = "linux")]
@@ -124,8 +127,14 @@ impl Job {
     }
     fn set(&self, status: Status) {
         let mut s = self.state();
-        if matches!(s.status, Status::Unconfirmed | Status::Clean) {
+        if matches!(
+            s.status,
+            Status::Unconfirmed | Status::Clean | Status::ClosedAfterLearnerRefusal
+        ) {
             return;
+        }
+        if status == Status::Refused && s.strict_learner_recovery {
+            s.refusal.get_or_insert(Refusal::Plan);
         }
         if status == Status::EngineMayExist {
             s.engine_may_exist = true;
@@ -210,6 +219,18 @@ impl Job {
         self.changed.send_replace(Status::Closing);
         true
     }
+    #[cfg(any(test, target_os = "linux"))]
+    fn learner_attach_finished(&self, result: Result<(), Refusal>) {
+        match result {
+            Ok(()) => self.set(Status::LearnerReady),
+            Err(reason) => {
+                self.state().refusal.get_or_insert(reason);
+                self.set(Status::LearnerRefused);
+                drop(self.request_close());
+            }
+        }
+    }
+
     fn finish_close(&self, failure: Option<ShutdownReport>, proven: bool, actual: bool) {
         let mut s = self.state();
         if s.status == Status::Unconfirmed {
@@ -224,8 +245,12 @@ impl Job {
             s.adapters = None;
             s.stores = None;
             s.node = None;
-            s.owner = None;
-            s.status = Status::Clean;
+            if s.strict_learner_recovery && s.refusal.is_some() && s.owner.is_some() {
+                s.status = Status::ClosedAfterLearnerRefusal;
+            } else {
+                s.owner = None;
+                s.status = Status::Clean;
+            }
             #[cfg(target_os = "linux")]
             {
                 s.learner = None;

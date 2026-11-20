@@ -51,8 +51,7 @@ fn init() -> Init {
     }
 }
 
-fn wrong_position_refuses(wrong: LogPos) {
-    let layout = Layout::new();
+fn recovery_fixture(layout: &Layout, applied: LogPos) -> (Plan, StartIntent, ExpectedIdentity) {
     let (record, root, expected) = fixture(2, origin());
     layout.write("credentials/identity.json", &record);
     layout.write("credentials/ca.der", &root);
@@ -64,7 +63,7 @@ fn wrong_position_refuses(wrong: LogPos) {
     let genesis = position(1, 1, 0);
     let entries = [
         (genesis, StoredEntry::Membership(membership(None))),
-        (wrong, found(&expected)),
+        (applied, found(&expected)),
     ];
     {
         let mut sm = StateStore::open(&plan.state, init()).unwrap();
@@ -80,7 +79,6 @@ fn wrong_position_refuses(wrong: LogPos) {
             Ok(())
         );
     }
-    let before = layout.snapshot();
     let start = StartIntent {
         mode: Mode::RecoverJoiner,
         node: expected.node,
@@ -88,6 +86,13 @@ fn wrong_position_refuses(wrong: LogPos) {
         peer: plan.peer.parse().unwrap(),
         enrollment: plan.enrollment.parse().unwrap(),
     };
+    (plan, start, expected)
+}
+
+fn wrong_position_refuses(wrong: LogPos) {
+    let layout = Layout::new();
+    let (plan, start, expected) = recovery_fixture(&layout, wrong);
+    let before = layout.snapshot();
     let mut owner = Owner::acquire(plan).unwrap();
     let (mut stores, clock) =
         startup_recovery::prepare_strict_joiner(&mut owner, &start, &expected);
@@ -201,4 +206,81 @@ fn fresh_join_cannot_construct_stores_without_retained_publication() {
     assert!(ready.is_none());
     assert_eq!(stores.io_counts(), (0, 0));
     assert_eq!(layout.snapshot(), before);
+}
+
+#[tokio::test]
+async fn recover_joiner_attach_refusal_joins_cleanup_and_retains_outer_lock() {
+    let layout = Layout::new();
+    let (plan, intent, expected) = recovery_fixture(&layout, origin().position());
+    let dir = plan.state.clone();
+    let mut owner = Owner::acquire(plan).unwrap();
+    let (stores, clock) = startup_recovery::prepare_strict_joiner(&mut owner, &intent, &expected);
+    assert!(
+        clock.is_some(),
+        "fixture must complete strict recovery preparation"
+    );
+
+    let job = Job::anchor();
+    let observer = job.observe();
+    {
+        let mut state = job.state();
+        state.strict_learner_recovery = true;
+        state.owner = Some(owner);
+        state.stores = Some(stores);
+    }
+    job.set(Status::Prepared);
+    job.transfer().expect("use the actual recovered store pair");
+    let (log_release, sm_release) = {
+        let state = job.state();
+        let (log, sm) = state.adapters.as_ref().unwrap();
+        let log_release = log.0.lock().unwrap().released();
+        let sm_release = sm.0.lock().unwrap().released();
+        (log_release, sm_release)
+    };
+    assert!(!log_release.is_set() && !sm_release.is_set());
+
+    // Force an actual socket bind refusal at the attach boundary. The fixture
+    // supplies the error to the production handler without an Engine dispatch.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = std::net::TcpListener::bind(occupied.local_addr().unwrap());
+    assert!(
+        bind.is_err(),
+        "the reserved listener must refuse a second bind"
+    );
+    job.learner_attach_finished(bind.map(|_| ()).map_err(|_| Refusal::Unavailable));
+    assert_eq!(observer.status(), Status::LearnerRefused);
+    tokio::time::timeout(Duration::from_secs(1), job.close.notified())
+        .await
+        .unwrap();
+    assert!(job.begin_close());
+    let (mut transport, _) =
+        peer_transport::TransportOwner::pending_founder(CLUSTER, expected.node);
+    assert!(transport.close().await.is_ok() && transport.joined());
+    job.finish_close(None, true, false);
+    assert!(log_release.is_set() && sm_release.is_set());
+    assert_eq!(observer.status(), Status::ClosedAfterLearnerRefusal);
+    assert_eq!(job.state().refusal, Some(Refusal::Unavailable));
+    assert!(!job.begin_close(), "owned cleanup was dispatched once");
+
+    for name in ["cluster-state.lock", "cluster-log.lock"] {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(name))
+            .unwrap();
+        lock.try_lock()
+            .expect("cleanup freed the exact store lease");
+    }
+    let outer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("cluster-owner.lock"))
+        .unwrap();
+    assert!(
+        outer.try_lock().is_err(),
+        "post-acquisition attach refusal retained the outer lock"
+    );
+    // Release test-owned resources after witnessing the retained job.
+    drop(job.state().owner.take());
+    outer.try_lock().unwrap();
 }

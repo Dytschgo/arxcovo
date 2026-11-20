@@ -145,7 +145,9 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
     let recovered = matches!(input, Input::Reopen(_));
     let (transport, factory) = TransportOwner::pending_founder(intent.cluster, intent.node);
     let job = Job::anchor();
-    job.state().learner = Some(Operation {
+    let mut state = job.state();
+    state.strict_learner_recovery = recovered;
+    state.learner = Some(Operation {
         input: Some(input),
         transport: Arc::new(tokio::sync::Mutex::new(transport)),
         member: None,
@@ -157,6 +159,7 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         #[cfg(test)]
         fixture,
     });
+    drop(state);
     let (_, observer, supervisor) = drive(
         job,
         None,
@@ -298,14 +301,7 @@ pub(super) async fn attach(job: &Job, address: &SocketAddr) {
             )
         }
     };
-    match result {
-        Ok(()) => job.set(Status::LearnerReady),
-        Err(reason) => {
-            job.state().refusal.get_or_insert(reason);
-            job.set(Status::LearnerRefused);
-            drop(job.request_close());
-        }
-    }
+    job.learner_attach_finished(result);
 }
 
 fn attach_inner(
