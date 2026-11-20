@@ -220,7 +220,7 @@ where
         expected,
         params,
         network,
-        #[cfg(all(test, windows))]
+        #[cfg(test)]
         None,
     );
     (job, observer)
@@ -232,7 +232,7 @@ fn dispatch<N>(
     expected: Option<ExpectedIdentity>,
     params: Params,
     network: N,
-    #[cfg(all(test, windows))] witness: Option<Arc<nominal_observation::Witness>>,
+    #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
 ) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
 where
     N: RaftNetworkFactory<Arx> + Send + 'static,
@@ -240,7 +240,7 @@ where
 {
     let job = Job::anchor();
     let observer = job.observe();
-    #[cfg(all(test, windows))]
+    #[cfg(test)]
     let supervisor_witness = witness.clone();
     let driver = tokio::spawn(async move {
         let node_id = intent.node.get();
@@ -249,19 +249,20 @@ where
         })
         .await;
         if prepared.is_err() {
-            #[cfg(all(test, windows))]
+            #[cfg(test)]
             if let Some(w) = &witness {
                 w.fail("preparation_join");
             }
             job.set(Status::Unconfirmed);
             return;
         }
-        #[cfg(all(test, windows))]
+        #[cfg(test)]
         let original = if let Some(w) = &witness {
-            let result = w.prepared(&job.state());
-            match result {
+            let proof = w.prepared(&job.state());
+            match proof {
                 Ok(pointers) => Some(pointers),
-                Err(()) => {
+                Err(reason) => {
+                    w.fail(reason);
                     job.set(Status::Unconfirmed);
                     return;
                 }
@@ -273,7 +274,7 @@ where
             let config = match params.config() {
                 Ok(c) => Arc::new(c),
                 Err(_) => {
-                    #[cfg(all(test, windows))]
+                    #[cfg(test)]
                     if let Some(w) = &witness {
                         w.fail("config");
                         job.set(Status::Unconfirmed);
@@ -288,31 +289,27 @@ where
                 }
             };
             if job.transfer().is_err() {
-                #[cfg(all(test, windows))]
+                #[cfg(test)]
                 if let Some(w) = &witness {
                     w.fail("transfer");
                 }
                 job.set(Status::Unconfirmed);
                 return;
             }
-            // Ordinary tests cannot continue past this boundary.
-            #[cfg(all(test, not(windows)))]
+            // Only the test-owned witness can pass the test-build stop.
+            #[cfg(test)]
             {
-                let _ = (&config, &network, node_id);
-                job.set(Status::Prepared);
-                return;
-            }
-            #[cfg(all(test, windows))]
-            if let Some(w) = &witness {
-                if w.transferred(&job.state(), original.unwrap()).is_err() {
+                let Some((w, original)) = witness.as_ref().zip(original) else {
+                    job.set(Status::Prepared);
+                    return;
+                };
+                let proof = w.transferred(&job.state(), original);
+                if let Err(reason) = proof {
+                    w.fail(reason);
                     job.set(Status::Unconfirmed);
                     return;
                 }
-            } else {
-                job.set(Status::Prepared);
-                return;
             }
-            #[cfg(any(not(test), windows))]
             {
                 let (ls, sm) = job.state().adapters.as_ref().unwrap().clone();
                 let log_released = ls.0.lock().unwrap().released();
@@ -320,14 +317,10 @@ where
                 let log_weak = Arc::downgrade(&ls.0);
                 let sm_weak = Arc::downgrade(&sm.0);
                 job.set(Status::EngineMayExist);
-                #[cfg(all(test, windows))]
-                let startup_witness = witness.as_ref().unwrap().clone();
                 let startup = tokio::spawn(async move {
-                    let engine = Engine::new(node_id, config, network, ls, sm.clone());
-                    #[cfg(not(test))]
-                    let raft = engine.await.map_err(|_| ())?;
-                    #[cfg(all(test, windows))]
-                    let raft = startup_witness.first_poll(engine).await?;
+                    let raft = Engine::new(node_id, config, network, ls, sm.clone())
+                        .await
+                        .map_err(|_| ())?;
                     let node = ConsensusNode {
                         id: node_id,
                         issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
@@ -349,7 +342,7 @@ where
                 })
                 .await;
                 if !matches!(startup, Ok(Ok(()))) {
-                    #[cfg(all(test, windows))]
+                    #[cfg(test)]
                     if let Some(w) = &witness {
                         w.fail("startup_join");
                     }
@@ -358,20 +351,11 @@ where
                 }
                 job.state().adapters = None; // release startup clones before shutdown
                 job.set(Status::Running);
-                #[cfg(all(test, windows))]
-                if let Some(w) = &witness {
-                    w.stage("running", "1 1");
-                    w.running.notify_one();
-                }
             }
         }
         job.close.notified().await;
         if !job.begin_close() {
             return;
-        }
-        #[cfg(all(test, windows))]
-        if let Some(w) = &witness {
-            w.stage("close_dispatched", "1");
         }
         let node = job.state().node.clone();
         if let Some(node) = node {
@@ -381,85 +365,46 @@ where
                 let mut node = node.lock().await;
                 let actual = node.raft.is_some();
                 let result = node.shutdown().await;
-                #[cfg(all(test, windows))]
-                let detail = (
-                    node.log_released.is_set(),
-                    node.sm_released.is_set(),
-                    node.log_weak.upgrade().is_none(),
-                    node.sm_weak.upgrade().is_none(),
-                    node.owners
-                        .lock()
-                        .is_ok_and(|owners| owners.closed && owners.set.is_empty()),
-                );
-                #[cfg(not(all(test, windows)))]
                 let released = node.log_released.is_set()
                     && node.sm_released.is_set()
                     && node.log_weak.upgrade().is_none()
                     && node.sm_weak.upgrade().is_none();
-                #[cfg(all(test, windows))]
-                let released = detail.0 && detail.1 && detail.2 && detail.3;
+                #[cfg(test)]
+                let owners_drained = node
+                    .owners
+                    .lock()
+                    .is_ok_and(|owners| owners.closed && owners.set.is_empty());
                 (
                     result,
                     actual,
                     released,
-                    #[cfg(all(test, windows))]
-                    detail,
+                    #[cfg(test)]
+                    owners_drained,
                 )
             })
             .await;
             match closed {
                 Ok(closed) => {
-                    #[cfg(all(test, windows))]
-                    let (result, actual, released, detail) = closed;
-                    #[cfg(not(all(test, windows)))]
+                    #[cfg(test)]
+                    let (result, actual, released, owners_drained) = closed;
+                    #[cfg(not(test))]
                     let (result, actual, released) = closed;
-                    #[cfg(all(test, windows))]
-                    let released = if let Some(w) = &witness {
-                        w.stage("close_joined", u8::from(result.is_ok()));
-                        if let Err(e) = &result {
-                            w.orphaned(e.0);
-                            let (log, sm, log_weak, sm_weak, owners) = detail;
-                            w.stage(
-                                "release_observed",
-                                format_args!(
-                                    "{} {} {} {} {}",
-                                    u8::from(log),
-                                    u8::from(sm),
-                                    u8::from(log_weak),
-                                    u8::from(sm_weak),
-                                    u8::from(owners)
-                                ),
-                            );
-                            false
-                        } else if w.check(actual, "missing_engine").is_err() {
-                            false
+                    #[cfg(test)]
+                    if let Some(w) = &witness
+                        && result.is_ok()
+                    {
+                        if actual && released && owners_drained {
+                            w.finish_close(job, actual);
                         } else {
-                            w.stage("engine_joined", "1");
-                            let (log, sm, log_weak, sm_weak, owners) = detail;
-                            w.stage(
-                                "released",
-                                format_args!(
-                                    "{} {} {} {} {}",
-                                    u8::from(log),
-                                    u8::from(sm),
-                                    u8::from(log_weak),
-                                    u8::from(sm_weak),
-                                    u8::from(owners)
-                                ),
-                            );
-                            if w.check(released && owners, "store_release").is_ok() {
-                                w.finish_close(job, actual);
-                                return;
-                            }
-                            false
+                            w.fail("Engine join or store/owner release proof");
+                            job.finish_close(None, false, actual);
                         }
-                    } else {
-                        released
-                    };
+                        return;
+                    }
                     job.finish_close(result.err().map(|e| e.0), released, actual);
                 }
                 Err(_) => {
-                    #[cfg(all(test, windows))]
+                    #[cfg(test)]
                     if let Some(w) = &witness {
                         w.fail("close_join");
                     }
@@ -474,22 +419,18 @@ where
     });
     let supervisor = tokio::spawn(async move {
         if driver.await.is_err() {
-            #[cfg(all(test, windows))]
+            #[cfg(test)]
             if let Some(w) = &supervisor_witness {
                 w.fail("driver_join");
             }
             job.set(Status::Unconfirmed);
         }
-        #[cfg(all(test, windows))]
-        if let Some(w) = &supervisor_witness {
-            w.driver_done();
-        }
     });
     (job, observer, supervisor)
 }
 
-#[cfg(all(test, windows))]
-mod nominal_observation;
+#[cfg(test)]
+mod engine_tests;
 
 #[cfg(test)]
 mod tests;
