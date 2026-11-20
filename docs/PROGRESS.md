@@ -1,19 +1,33 @@
 # Arxcovo progress
 
-## Current state (2026-11-19 21:30 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 19:47 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
-PR188 as the last merge, that is superseded by this summary.
+PR188 as the last merge, that is superseded by this summary. Inside this block,
+entries for named PRs (#196–#204) that say "this PR", "review pending" or "builder
+has N attempts left" are historical checkpoints for those PRs; all of them have
+merged, as listed under "Merged this session".
 
 - **Routing (owner, 2026-11-19):** coordination moved to Claude Opus 5.5/high
-  because the provider rejected every Sol coordinator turn. Sol 6.1 remains the
-  route for engineering and independent reviews; Claude for UI; one independent
-  reviewer per PR; at most two builders and one reviewer; coordinator-only merge.
-  Fallback chain when an agent is blocked or fails: Sol → Opus → Fable →
+  because the provider rejected every Sol coordinator turn. Since 2026-11-20,
+  Sol 6.2/high is the route for engineering, architecture, security and independent
+  reviews; Claude for UI; one independent reviewer per PR; at most two builders and
+  one reviewer; coordinator-only merge.
+  Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
-  must stay independent of the builder. No Sol delegate was blocked this session.
-- **Main:** `99076134` (PR201), push CI 44763436707 attempt 1 green.
+  must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
+- **Main:** `57fc3fc8` (PR207), push CI 44804068081 green. `26704348` (PR206) push
+  CI 44800339696 green. Earlier main
+  `c10fff18` (PR204) push CI 44796954728 was **red**: Ubuntu Rust job 136498866204
+  failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
+  (`Err("receiver reservation")`) binding hard-coded loopback port 43186, inside
+  Linux's ephemeral range; collision likely, exact conflict unconfirmed (the fixture
+  discarded the OS error). Not touched by PR204. No rerun. Repair PR206 (Sol
+  6.2/high, attempt 1/3, test fixture only: OS-assigned ports, all evidence oracles
+  kept; review PASS, status 59504632914) merged as the red-main repair, like PR194.
+  `5f95238c` (PR202) push CI 44795394326 and `cc553586` (PR203) push CI 44791739561
+  were green.
 - **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
   commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
   e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
@@ -28,9 +42,17 @@ PR188 as the last merge, that is superseded by this summary.
   codec and CA loading), PR198 `be197a25` (step 2, bound offline recovery),
   PR200 `e9e44c91` (step 4a, credential publication storage), PR199 `7aec97af`
   (step 3b, hosted distinct-UID custody qualification), PR201 `99076134` (step 5a,
-  retained bound-start ownership). Every merge had an independent exact-head Sol
-  review (6.1, later 6.2), all five required gates green and green main rechecked
-  immediately before a head-guarded squash merge.
+  retained bound-start ownership), PR203 `cc553586` (docs: owner process rules,
+  Sol 6.2 routing, D3/D4), PR202 `5f95238c` (step 5b, ordinary CI test of the real
+  Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
+  enrollment protocol), PR206 `26704348` (test fixture: ephemeral ports for the
+  peer learner tests), PR207 `57fc3fc8` (step 6/4b, founder caller, gated
+  publication and attach). Every merge had an independent exact-head Sol
+  review (6.1, later 6.2), all five required gates green and a head-guarded squash
+  merge; green main was rechecked immediately before each merge except the two red-main repairs:
+  PR194, merged with green PR gates while main at `92003177` was red (its first main
+  push run 44608721122 restored green), and PR206 (main `c10fff18` red; push run
+  44800339696 restored green).
 - **Open failures (cause unknown, traces now on main):** Windows founder
   five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
   PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
@@ -39,8 +61,8 @@ PR188 as the last merge, that is superseded by this summary.
   Opus 0/2 unchanged; e7 family 1/3.
 - **Risk:** Windows Rust job margin under its 12 minute timeout is thin since
   PR194 (10m36s once; later main runs 8m53s, 9m25s, 6m14s, 5m05s).
-- **Next M3 work:** Sol 6.1/high read-only plan
-  `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…a1`): 16 ordered
+- **Earlier M3 slice plan (superseded by steps 6–8 below):** Sol 6.1/high read-only plan
+  `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…1a`): 16 ordered
   one-PR slices to the three-container acceptance. Next: store-only bound SQLite
   store construction (ADR 0035 second slice), no Engine/startup/deadline change.
   Open decisions D1 custody, D2 partial founding, D3 endpoint discovery, D4
@@ -59,7 +81,7 @@ PR188 as the last merge, that is superseded by this summary.
   fresh 3-attempt budget for that scope. The first builder stays recorded 3/3
   exhausted; Engine Sol 3/3 and Opus 0/2 unchanged. Second Sol 6.1/high builder
   used 2/3 (`38f701e5`, `6b0928d4` on rebased `328aa5b4`); report
-  `D:/Temp/arx-bound-store-2/report.md` SHA256 `fff605cd…09ad`. Local Windows
+  `D:/Temp/arx-bound-store-2/report-before-st1.md` SHA256 `fff605cd…09ad`. Local Windows
   NTFS: bound 20, state 17, log 16, startup-plan 3 tests pass; static gate,
   fmt, Clippy, loader and SQLite verifier (33 negative controls) pass. Unix and
   macOS unexercised locally. First exact-head review (head `5e3efef0`,
@@ -113,7 +135,8 @@ PR188 as the last merge, that is superseded by this summary.
   0/0 findings (`D:/Temp/arx-pr196-review2/review.md`, SHA256 `f8ec7520…7819`),
   all five gates green on head `da8da5d9`.
 - **M3 slice 2 (bound offline recovery):** Sol 6.1/high brief
-  `D:/Temp/arx-m3-step2/brief.md` (SHA256 `36b23a40…f96d`). Coordinator
+  `D:/Temp/arx-m3-step2/brief.md` (original brief SHA256 `36b23a40…f96d`, as recorded in
+  `D:/Temp/arx-m3-step2-review/review.md`; the file now holds the revised brief below). Coordinator
   decisions: keep the old inspector's layout entry policy (zero-length WAL
   accepted) instead of tightening it, and keep the merged one-shot
   Inspect/Complete behaviour. Independent brief review pending.
@@ -136,7 +159,7 @@ PR188 as the last merge, that is superseded by this summary.
   then a stale interstage expectation; builder 3/3); each was diagnosed by an
   independent reviewer, the owner authorized further scoped builders (2026-11-20),
   and the final head `ce0fd7f8` passed review (`D:/Temp/arx-pr198-review3/review.md`,
-  SHA256 `b8c6a1a8…2162735`) with full Ubuntu and macOS suites green.
+  SHA256 `b8c6a1a8…7162735`) with full Ubuntu and macOS suites green.
 - **PR #197 merged** as `85eccce8` (custody 3a); main push CI 44717451865 green.
   Review of `b4c66e97` PASS (`D:/Temp/arx-pr197-review2/review.md`, SHA256
   `5d6f7dd1…b4`); crash durability recorded as unqualified.
@@ -162,7 +185,7 @@ PR188 as the last merge, that is superseded by this summary.
   durability as a later 4a-W; trusted restart-history source deferred to before the
   three-container restart test; no power-loss experiments on the owner PC. First builder
   stopped 3/3 at `f3d492d0` (a test expected `sealed-key` instead of `member-key`). Fresh
-  stuck-rule review (`D:/Temp/arx-m3-step4a-stuck/review.md`, SHA256 `c4c9cdcc…e2b6`)
+  stuck-rule review (`D:/Temp/arx-m3-step4a-stuck/review.md`, SHA256 `c4c9cdcc…b2e6`)
   added three P2 findings. **Owner authorization (2026-11-20):** new scoped builder,
   fresh 3 attempts; used 0/3, head `ae36438e`; report `D:/Temp/arx-m3-step4a-2/report.md`
   SHA256 `06d7ebdc…1d56`: 48 Windows tests pass (publication 1, PKI 38, receipt 4,
@@ -178,13 +201,15 @@ PR188 as the last merge, that is superseded by this summary.
   changes only via coordinator plus independent review (recorded in the pins). Round 1
   (`bd7c18a0`) stopped on a candidate `--list` exit 1; amendment A3 (discovery-only
   completed nonzero listings, exactly one zero-exit exact match) was reviewed
-  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a75`) and adopted
+  (`D:/Temp/arx-pr199-a3-review/review.md`, SHA256 `99dc5fbe…a51`) and adopted
   verbatim. Round 2 (`40fdbb30`) qualified: all 13 custody cases passed on the hosted
   runner (founder create/deny/same-UID control/release/restart, both learners), each
   invocation selected=1/passed=1/failed=0, zero refusals, launcher 9.536 s of a 150 s
   ceiling, cleanup verified; no image re-pin was needed (the GLIBC 2.39 executable ran
-  in the pinned Ubuntu 24.04 image). Campaign report `D:/Temp/arx-pr199-q1/report.md`
-  SHA256 `9927642c…aa8d6`. Exact-head review of `40fdbb30`
+  in the pinned Ubuntu 24.04 image). Round-2 campaign report SHA256 `9927642c…aa8d6`
+  (verified in `D:/Temp/arx-pr199-review4/review.md`); the file now at
+  `D:/Temp/arx-pr199-q1/report.md` is the round-3 report cited below and retains the
+  round-2 summary. Exact-head review of `40fdbb30`
   (`D:/Temp/arx-pr199-review4/review.md`, SHA256 `0ebec5ea…ff2`): two P2 — this stale
   record (corrected in a docs commit) and missing actual scratch high-water bytes
   required by the pins. Campaign round 3 (code head `a660231e`) added the measurement
@@ -195,8 +220,8 @@ PR188 as the last merge, that is superseded by this summary.
   (`D:/Temp/arx-pr199-review5/review.md`, SHA256 `64eddd44…a2a`) closed SP4-1 and asked
   for this record to be brought up to date. Counters: four earlier 3b builders 3/3
   each; Q1 3/6 rounds used, stopped on qualification; Engine Sol 3/3, Opus 0/2.
-  The code under review is the round-3 head; later commits on this branch are docs
-  only.
+  At the round-3 review checkpoint, the code head was `a660231e`. The subsequent
+  commits on PR #199 were docs-only.
 - **Custody 3b harness (this PR):** adopted pins committed as
   [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
   `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
@@ -229,7 +254,7 @@ PR188 as the last merge, that is superseded by this summary.
   in one run) independently reviewed GO with required changes and committed to the pins.
   The fourth builder has one attempt left.
 - **M3 step 5a, retained bound-start ownership (PR #201):** crosses the recorded D6
-  hold (Engine fix counters Sol 3/3 and Opus 0/2 exhausted). Sol 6.1/high design
+  hold (Engine Sol 3/3 exhausted and historical Opus 0/2 unchanged under the D6 hold). Sol 6.1/high design
   `D:/Temp/arx-m3-step5/design.md` (SHA256 `a357af50…767f`). **Owner authorization
   (2026-11-20), 5a only:** source-only plumbing (single forward-only bound
   inspection-to-start acquisition, one-time store transfer into unchanged
@@ -263,19 +288,80 @@ PR188 as the last merge, that is superseded by this summary.
   was circling: (1) trivial check fixes (formatting, whitespace, lint, missing import)
   no longer consume builder attempts; (2) coordinator PROGRESS updates go in docs-only
   PRs, not inside code PRs; (3) step 5b drops the one-shot launcher in favour of an
-  ordinary CI test of the real Engine start/close (no founding). PR #202 still carries
-  the superseded launcher version until its builder pushes the rework. Earlier
-  design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. AGENTS.md
-  updated in this docs PR.
+  ordinary CI test of the real Engine start/close (no founding). At the time of the
+  owner decision PR #202 still carried the superseded launcher; the merged version
+  uses the ordinary CI test described below. Earlier
+  design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. PR #203 updated
+  AGENTS.md.
 - **Owner decisions D3/D4 (2026-11-20):** D4 target-authorized delegation (host B
   trusts host A's authenticated assertions only for agents B explicitly grants; single
   use; Unknown when execution or cleanup is unconfirmed; B's standard build identity).
   D3 one LAN or Tailscale address per one-paste code. Plan
   `D:/Temp/arx-m3-steps6to8/plan.md` (SHA256 `00132578…d29d`).
-- **In progress:** PR #202 (step 5b as an ordinary test) and step 7a (closed
-  same-connection enrollment, outside D6; first builder stopped 3/3, stuck-rule review
-  `D:/Temp/arx-m3-step7a-stuck/review.md` SHA256 `790606e7…013a` found test-fixture
-  causes plus a result-sealing P1; owner authorized a new builder).
+- **PR #202 merged** as `5f95238c` (step 5b): ordinary CI test
+  `bound_start_real_engine_start_close` (real bound preparation, one Engine::new,
+  observer detached at the Engine boundary, owned completion, one close through
+  unchanged shutdown with release, weak-ref and lock proofs; no founding). Review 3
+  HOLD on two test findings (`D:/Temp/arx-pr202-review3/review.md`, SHA256
+  `aef66df4…7421`); Sol 6.2 builder fixed both in attempt 1/3 (`7a2448fc`, report
+  `D:/Temp/arx-pr202-fix1/report.md` SHA256 `035977d4…8569`); review 4 PASS
+  (`D:/Temp/arx-pr202-review4/review.md`, SHA256 `90089769…9f6c`). Strict protection
+  required a main refresh: merge commit `3ee98785` with a byte-identical PR patch,
+  re-verified by the same reviewer, agent-review status 59501963396. Step 5 closed for
+  this observed scope; Engine counters Sol 3/3 and Opus 0/2 unchanged.
+- **PR #204 merged** as `c10fff18` (step 7a, outside D6). After the stuck-rule
+  review the owner-authorized builder reached `f5abf8ff`; exact-head review
+  (`D:/Temp/arx-pr204-review/review.md`, SHA256 `990d3cc3…6d74`) held on one spec P2:
+  the client could release Redeem with an unexpected frame already buffered after the
+  valid Anchor. **Provider block (2026-11-20):** the Sol 6.2 fix delegate was refused
+  by the provider ("flagged for possible cybersecurity risk"); no change was made and
+  no attempt consumed. Per the fallback chain an Opus 5.5/high builder took the last
+  attempt (3/3) and added the pending-frame check plus a loopback TLS test
+  (`b8f67643`, report `D:/Temp/arx-m3-step7a-3/report.md` SHA256 `5f8d37f4…5024`).
+  Review 2 (`D:/Temp/arx-pr204-review2/review.md`, SHA256 `10c0eadb…1e5a`) held: Tokio's
+  cooperative budget could make the single poll return Pending without checking the
+  socket. **Owner decision (2026-11-20):** a new scoped Sol 6.2 builder (fresh 3) for
+  exactly an unconstrained poll plus an honest comment; the owner **accepts as
+  inherent** that data still in flight can arrive after the check (the client refuses
+  it at its next read). Builder `11e75b11` passed in attempt 1/3 with a deterministic
+  exhausted-budget test (report `D:/Temp/arx-m3-step7a-4/report.md` SHA256
+  `fb9dc74e…9d22`). Main refresh `b7691e35` (byte-identical patch); review 3 PASS with
+  zero findings (`D:/Temp/arx-pr204-review3/review.md`, SHA256 `1db2d432…b59c`),
+  agent-review status 59502799642. Live issuance, durable join and multi-host paths
+  are **unverified on real hardware**.
+- **Step 6/4b (PR #207):** The plan at `D:/Temp/arx-m3-steps6to8/plan.md` specified
+  the real founder caller, gated credential publication and attach. The hosted Linux
+  observation invoked frozen `found()` and required the plan's explicit owner grant
+  across D6.
+  **Owner grant (2026-11-20):** "Authorize the step 6/4b source fence and the
+  specifically enumerated disposable hosted-Linux observations of retained bound
+  start, one unchanged Found per named fixture, gated credential publication, attach
+  and owned close. Keep Engine, Owners, founder and issuance internals frozen. Stop
+  and preserve the first frozen-path refusal. This grants no repair, diagnostic rerun
+  or Windows founder run." Enumerated: O1 one Linux-only integrated positive test; O2
+  optional up to four Linux-only clock-site tests, each named in the PR. Sol 6.2/high
+  builder, fresh 3-attempt budget: PR #207 `94bbc9e7` (attempt 1/3 was a Linux
+  cross-build invocation error). Hosted CI 44799670866 green on all platforms; O1
+  `bound_start_founder_publishes_attaches_and_closes` ran once on Ubuntu and passed
+  (0.152 s); no O2 tests (clock sites covered without Engine); no frozen-path refusal.
+  Review HOLD on one P2 (`D:/Temp/arx-pr207-review/review.md`, SHA256
+  `e36768c0…afaf`): founder custody compared private roots with the workspace by path
+  prefix only, so a mount alias could put wrapping material in the workspace. Builder
+  attempt 2 (`df6d69a8`, with main merged) compares device and inode against the
+  retained Owner layout before any custody write and adds the Linux test
+  `founder_custody_rejects_open_workspace_alias` (report `D:/Temp/arx-m3-step6/report.md`
+  SHA256 `36b37ba3…4474`; counted failures 1/3). Hosted CI 44802205590 green; O1 passed
+  (0.359 s), alias test passed, no frozen-path refusal. Review 2 PASS with zero findings
+  (`D:/Temp/arx-pr207-review2/review.md`, SHA256 `fbfd1470…5ddc`), agent-review status
+  59506613371. **PR #207 merged** as `57fc3fc8`. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **Step 7b (owner grant, 2026-11-20):** "Authorize the step 7b ingress caller fence
+  and one Linux-only hosted CI test: found one disposable issuer through the reviewed
+  step 6 retained founder pattern (one Found), one fixture Mint, one AnchorQuery and one
+  Redeem through the actual enroll() over the 7a TLS protocol, returning a matching
+  signed leaf and original E, then owned joined close. Do not modify Engine, Owners,
+  found, issue, anchor_query internals or their deadlines. No Windows founding run.
+  Stop and preserve the first founding or issuing refusal; no repair or rerun." Sol
+  6.2/high builder, fresh 3-attempt budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
