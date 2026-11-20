@@ -69,11 +69,13 @@ def inspection():
 
 class Filesystem:
     """Descriptor model: opened objects survive pathname replacement."""
-    O_PATH, O_NOFOLLOW, O_CLOEXEC = 1, 2, 4
+    O_PATH, O_NOFOLLOW, O_CLOEXEC, O_RDONLY = 1, 2, 4, 8
 
     def __init__(self):
         self.nodes, self.fds, self.nextfd = {}, {}, 10
         self.opened = []
+        self.knob = b'1\n'
+        self.add(run.HARDLINKS, 0o100644)
         self.add('/', 0o40755)
         for path in ('/usr', '/usr/bin', '/usr/sbin', '/etc', '/etc/alternatives',
                      '/usr/lib', '/usr/lib/cargo', '/usr/lib/cargo/bin'):
@@ -97,7 +99,7 @@ class Filesystem:
         return name if name.startswith('/') else self.fds[dir_fd][0].rstrip('/') + '/' + name
 
     def open(self, name, flags, dir_fd=None):
-        assert flags == self.O_PATH | self.O_NOFOLLOW | self.O_CLOEXEC
+        assert flags == (self.O_RDONLY if name == run.HARDLINKS else self.O_PATH) | self.O_NOFOLLOW | self.O_CLOEXEC
         path = self.name(name, dir_fd)
         self.opened.append(path)
         if path not in self.nodes:
@@ -105,6 +107,12 @@ class Filesystem:
         self.nextfd += 1
         self.fds[self.nextfd] = (path, self.nodes[path])
         return self.nextfd
+
+    def read(self, fd, size):
+        assert self.fds[fd][0] == run.HARDLINKS and size == 16
+        if isinstance(self.knob, Exception):
+            raise self.knob
+        return self.knob[:size]
 
     def fstat(self, fd):
         return self.fds[fd][1]
@@ -276,6 +284,246 @@ class ToolTests(unittest.TestCase):
             h.tools['sudo'] = self.tool(fs)
         with patch.object(h, 'qualify', side_effect=qualify), redirect_stdout(io.StringIO()):
             self.assertEqual(h.run(), 1)
+        self.assertEqual(h.first, 'ToolOwnership')
+        self.assertFalse(fs.fds)
+
+
+class AmendmentTests(unittest.TestCase):
+    tool = ToolTests.tool
+    refused = ToolTests.refused
+    def multicall(self):
+        fs = Filesystem()
+        fs.add('/usr/lib/cargo/bin/coreutils', 0o40755)
+        for role, path in run.MULTICALL_TARGETS.items():
+            fs.add(path, 0o100755)
+            fs.nodes[path].st_nlink = 116
+            fs.link('/usr/bin/' + role, path)
+        return fs
+
+    def accepted(self, fs, role):
+        return run.trusted_tool(role, lambda *a, **k: None, fs, '/usr/bin/' + role, True)
+
+    def test_exact_map_dispatch_and_link_counts(self):
+        self.assertEqual(run.MULTICALL_TARGETS, {
+            'mkdir': '/usr/lib/cargo/bin/coreutils/mkdir',
+            'chown': '/usr/lib/cargo/bin/coreutils/chown'})
+        for links in (1, 2, 116):
+            fs = self.multicall()
+            h = run.Harness()
+            h.tools = {'sudo': self.tool(fs)}
+            for role, path in run.MULTICALL_TARGETS.items():
+                fs.nodes[path].st_nlink = links
+                h.tools[role] = self.accepted(fs, role)
+            for role, args in (('mkdir', ['-m', '0700', '/fixture/fs/founder-wrap']),
+                               ('chown', ['21001:21001', '/fixture/fs/founder-wrap'])):
+                self.assertEqual(h.bound_argv(['sudo', '-n', role] + args),
+                                 [run.SUDO_TARGET, '-n', run.MULTICALL_TARGETS[role]] + args)
+            for obj in h.tools.values():
+                obj.close()
+            self.assertFalse(fs.fds)
+        for role in ('mount', 'umount'):
+            fs = Filesystem()
+            fs.nodes['/usr/bin/' + role].st_mode |= run.stat.S_ISUID
+            self.tool(fs, role).close()
+
+    def test_multicall_conjunctive_predicates_and_ancestors(self):
+        for role, path in run.MULTICALL_TARGETS.items():
+            for attr, value in (('st_uid', 1), ('st_mode', 0o100775), ('st_mode', 0o100757),
+                                ('st_mode', 0o40755), ('st_mode', 0o100655),
+                                ('st_mode', 0o104755), ('st_mode', 0o102755),
+                                ('st_nlink', 0), ('st_nlink', -1)):
+                fs = self.multicall()
+                setattr(fs.nodes[path], attr, value)
+                with self.subTest(role=role, attr=attr, value=value), self.assertRaises(run.Refusal):
+                    self.accepted(fs, role)
+                self.assertFalse(fs.fds)
+            for ancestor in ('/', '/usr', '/usr/lib', '/usr/lib/cargo',
+                             '/usr/lib/cargo/bin', '/usr/lib/cargo/bin/coreutils', '/usr/bin'):
+                for attr, value in (('st_uid', 1), ('st_mode', 0o40775), ('st_mode', 0o40757)):
+                    fs = self.multicall()
+                    setattr(fs.nodes[ancestor], attr, value)
+                    with self.assertRaises(run.Refusal):
+                        self.accepted(fs, role)
+                    self.assertFalse(fs.fds)
+            fs = self.multicall()
+            fs.nodes['/usr/bin/' + role].st_uid = 1
+            with self.assertRaises(run.Refusal):
+                self.accepted(fs, role)
+            self.assertFalse(fs.fds)
+
+    def test_role_swaps_lookalikes_and_ordinary_multilink_refuse(self):
+        for role in run.TOOLS:
+            for target in (*run.MULTICALL_TARGETS.values(),
+                           '/usr/lib/cargo/bin/coreutils/mkdir-extra',
+                           '/usr/lib/cargo/bin/coreutils2/mkdir',
+                           '/usr/lib/cargo/bin/coreutils/sub/mkdir',
+                           '/usr/lib/cargo/bin/arbitrary'):
+                if run.MULTICALL_TARGETS.get(role) == target:
+                    continue
+                fs = self.multicall()
+                parts = target.split('/')[1:]
+                for i in range(1, len(parts)):
+                    parent = '/' + '/'.join(parts[:i])
+                    if parent not in fs.nodes:
+                        fs.add(parent, 0o40755)
+                if target not in fs.nodes:
+                    fs.add(target, 0o100755)
+                fs.link('/usr/bin/' + role, target)
+                with self.assertRaises(run.Refusal):
+                    self.accepted(fs, role)
+                self.assertFalse(fs.fds)
+        fs = Filesystem()
+        fs.nodes['/usr/bin/git'].st_nlink = 2
+        self.refused(fs, 'git')
+
+    def test_bounded_sysctl_failures_and_redaction(self):
+        for data in (b'1', b'1\n', b'0\n', b'2\n', b'', b'private-sentinel', b'1\n'*20,
+                     b'1 ', b'01', PermissionError('private-sentinel')):
+            fs = Filesystem()
+            fs.knob = data
+            records = []
+            record = lambda event, **facts: records.append(dict(event=event, **facts))
+            if data in (b'1', b'1\n'):
+                run.protected_hardlinks(record, fs)
+            else:
+                with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
+                    run.protected_hardlinks(record, fs)
+            self.assertFalse(fs.fds)
+            self.assertNotIn('private-sentinel', json.dumps(records))
+        for mutation in ('missing', 'symlink', 'owner', 'writable'):
+            fs = Filesystem()
+            if mutation == 'missing':
+                del fs.nodes[run.HARDLINKS]
+            elif mutation == 'symlink':
+                fs.nodes[run.HARDLINKS].st_mode = 0o120777
+            elif mutation == 'owner':
+                fs.nodes[run.HARDLINKS].st_uid = 1
+            else:
+                fs.nodes[run.HARDLINKS].st_mode |= 0o002
+            with self.assertRaises(run.Refusal):
+                run.protected_hardlinks(lambda *a, **k: None, fs)
+            self.assertFalse(fs.fds)
+
+    def test_preuse_sysctl_drift_link_drift_and_route_replacement(self):
+        for mutation in ('zero', 'error', 'links', 'route', 'opened'):
+            fs = self.multicall()
+            obj = self.accepted(fs, 'mkdir')
+            if mutation == 'zero':
+                fs.knob = b'0\n'
+            elif mutation == 'error':
+                fs.knob = PermissionError('private-sentinel')
+            elif mutation == 'links':
+                fs.nodes[obj.path].st_nlink = 2
+            elif mutation == 'opened':
+                fs.nodes[obj.path].st_uid = 1
+            else:
+                fs.link('/usr/bin/mkdir', run.MULTICALL_TARGETS['chown'])
+            with self.assertRaises(run.Refusal):
+                obj.recheck()
+            # Unrelated cleanup remains usable with a refused knob.
+            cleanup = self.tool(fs, 'umount')
+            self.assertEqual(cleanup.recheck(), '/usr/bin/umount')
+            cleanup.close()
+            obj.close()
+            self.assertFalse(fs.fds)
+
+    def test_multicall_unsafe_relative_traversal_and_open_metadata(self):
+        for mutation in ('relative', 'owner', 'symlink-drift'):
+            fs = self.multicall()
+            if mutation == 'relative':
+                fs.add('/usr/bin/unsafe', 0o40777)
+                fs.link('/usr/bin/mkdir', 'unsafe/../../lib/cargo/bin/coreutils/mkdir')
+            elif mutation == 'owner':
+                original = fs.fstat
+                def changed(fd):
+                    m = original(fd)
+                    return SimpleNamespace(**{**vars(m), 'st_uid': 1}) if fs.fds[fd][0] == run.MULTICALL_TARGETS['mkdir'] else m
+                fs.fstat = changed
+            else:
+                original = fs.stat
+                fs.stat = lambda *a, **k: SimpleNamespace(**{**vars(original(*a, **k)), 'st_ino': 9999})
+            with self.assertRaises(run.Refusal):
+                self.accepted(fs, 'mkdir')
+            self.assertFalse(fs.fds)
+
+    def test_success_reaches_pure_suite_and_failure_spawns_nothing(self):
+        for succeeds in (True, False):
+            fs = self.multicall()
+            if not succeeds:
+                fs.nodes['/usr/bin/docker'].st_uid = 1
+            h = run.Harness(spawn=lambda *a: self.fail('spawned'))
+            actual = h.qualify_tools
+            with patch.object(h, 'qualify_tools', side_effect=lambda: actual(fs)), \
+                 patch.object(h, 'command', side_effect=run.Refusal('PureSuiteReached')) as command, \
+                 patch.object(run.shutil, 'which', side_effect=lambda role, **k: '/usr/bin/' + role), \
+                 patch.object(run.sys, 'executable', '/usr/bin/python3'), \
+                 patch.object(run.sys, 'argv', ['run.py']), patch.object(run.sys, 'platform', 'linux'), \
+                 patch.object(run.platform, 'machine', return_value='x86_64'), \
+                 patch.dict(run.os.environ, {'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted'}), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(h.run(), 1)
+            self.assertEqual(command.call_count, int(succeeds))
+            if succeeds:
+                self.assertEqual(command.call_args.args[0][1:5], ['-I', '-B', '-m', 'unittest'])
+            self.assertFalse(fs.fds)
+
+    def batch(self, fs, clock=None):
+        h = run.Harness(clock or run.time.monotonic, spawn=lambda *a: self.fail('spawned'))
+        records = []
+        h.record = lambda event, **facts: records.append(dict(event=event, **facts))
+        with patch.object(run.shutil, 'which', side_effect=lambda role, **k: '/usr/bin/' + role), \
+             patch.object(run.sys, 'executable', '/usr/bin/python3'):
+            try:
+                h.qualify_tools(fs)
+            except run.Refusal:
+                pass
+        return h, records
+
+    def test_batch_multiple_failures_python_sysctl_and_close(self):
+        fs = self.multicall()
+        fs.knob = b'0\n'
+        fs.nodes['/usr/bin/docker'].st_uid = 1
+        fs.nodes['/usr/bin/python3'].st_mode |= 0o020
+        with patch.object(run.sys, 'version_info', (3, 10, 1)):
+            h, records = self.batch(fs)
+        self.assertEqual(h.first, 'ToolOwnership')
+        self.assertIn('PythonVersion', h.secondary)
+        self.assertEqual([r['tool'] for r in records if r['event'] == 'tool-terminal'], list(run.TOOLS))
+        self.assertEqual({r['tool'] for r in records if r['event'] == 'tool-refusal'},
+                         {'docker', 'mkdir', 'chown', 'python3'})
+        self.assertEqual(h.tools, {})
+        self.assertFalse(fs.fds)
+        self.assertLess(len(json.dumps(records)), run.LIMIT)
+
+    def test_batch_success_timeout_and_partial_open_close(self):
+        fs = self.multicall()
+        h, records = self.batch(fs)
+        self.assertIsNone(h.first)
+        self.assertEqual(len(h.tools), 12)
+        for obj in h.tools.values():
+            obj.close()
+        self.assertFalse(fs.fds)
+        clock = Clock()
+        fs = self.multicall()
+        original = fs.open
+        def opened(name, flags, dir_fd=None):
+            fd = original(name, flags, dir_fd)
+            if name == 'docker':
+                clock.now = 21
+            return fd
+        fs.open = opened
+        h, records = self.batch(fs, clock)
+        self.assertEqual(h.first, 'PhaseTimeout')
+        self.assertEqual(sum(r.get('status') == 'not-evaluated' for r in records), 11)
+        self.assertFalse(fs.fds)
+        fs = self.multicall()
+        original = fs.fstat
+        def broken(fd):
+            if fs.fds[fd][0] == '/usr/bin/docker':
+                raise OSError('private-sentinel')
+            return original(fd)
+        fs.fstat = broken
+        h, records = self.batch(fs)
         self.assertEqual(h.first, 'ToolOwnership')
         self.assertFalse(fs.fds)
 

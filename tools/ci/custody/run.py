@@ -48,7 +48,35 @@ def safe(path, parent=None, directory=True):
 TOOLS = ('docker', 'sudo', 'mkfs.ext4', 'losetup', 'mount', 'umount',
          'findmnt', 'readelf', 'git', 'mkdir', 'chown', 'python3')
 SUDO_TARGET = '/usr/lib/cargo/bin/sudo'
+MULTICALL_TARGETS = {'mkdir': '/usr/lib/cargo/bin/coreutils/mkdir',
+                     'chown': '/usr/lib/cargo/bin/coreutils/chown'}
+HARDLINKS = '/proc/sys/fs/protected_hardlinks'
 SEARCH = '/usr/bin:/usr/sbin:/bin:/sbin'
+
+
+def protected_hardlinks(record, fs=os):
+    """Fixed bounded no-follow read in the trusted hosted procfs namespace."""
+    fd = None
+    value = None
+    predicate = 'protected_hardlinks_one'
+    try:
+        fd = fs.open(HARDLINKS, fs.O_RDONLY | fs.O_NOFOLLOW | fs.O_CLOEXEC)
+        m = fs.fstat(fd)
+        require(stat.S_ISREG(m.st_mode) and m.st_uid == 0 and not m.st_mode & 0o022,
+                'ToolOwnership')
+        data = fs.read(fd, 16)
+        value = 1 if data in (b'1', b'1\n') else 0 if data in (b'0', b'0\n') else None
+        require(value == 1 and identity(fs.fstat(fd)) == identity(m), 'ToolOwnership')
+    except (OSError, ValueError, RuntimeError, Refusal):
+        predicate = 'protected_hardlinks_refused'
+    finally:
+        if fd is not None:
+            try:
+                fs.close(fd)
+            except OSError:
+                predicate = 'protected_hardlinks_refused'
+        record('hardlink-policy', predicate=predicate, value=value)
+    require(predicate == 'protected_hardlinks_one', 'ToolOwnership')
 
 
 def identity(m):
@@ -57,13 +85,15 @@ def identity(m):
 
 class TrustedTool:
     """Retained CLOEXEC objects; the filesystem adapter is injectable in pure tests."""
-    def __init__(self, role, record, entry, fs=os):
+    def __init__(self, role, record, entry, fs=os, hardlinks=False):
         self.role, self.record, self.entry, self.fs = role, record, entry, fs
         self.objects = []
         self.path = None
         self.current = None
         self.component = '<unapproved-path>'
         self.reported = False
+        self.hardlinks = hardlinks
+        self.multicall = False
 
     def facts(self, m):
         return dict(uid=None if m is None else m.st_uid,
@@ -114,18 +144,24 @@ class TrustedTool:
                 if not stat.S_ISLNK(m.st_mode):
                     self.check(not m.st_mode & 0o022, 'not_group_or_other_writable')
                 if not pending:
-                    self.check(stat.S_ISREG(m.st_mode) and m.st_nlink == 1,
-                               'regular_single_link')
+                    resolved = '/' + '/'.join(name for name, _ in stack[1:])
+                    self.multicall = resolved == MULTICALL_TARGETS.get(self.role)
+                    self.check(stat.S_ISREG(m.st_mode) and
+                               (m.st_nlink >= 1 if self.multicall else m.st_nlink == 1),
+                               'regular_link_policy')
+                    if self.multicall:
+                        self.check(not m.st_mode & (stat.S_ISUID | stat.S_ISGID), 'multicall_no_setid')
+                        self.check(self.hardlinks, 'protected_hardlinks_one')
                     self.check(bool(m.st_mode & stat.S_IXUSR), 'owner_executable')
                     self.check(self.role != 'sudo' or bool(m.st_mode & stat.S_ISUID), 'sudo_setuid')
-                    resolved = '/' + '/'.join(name for name, _ in stack[1:])
                     allowed = resolved.startswith(('/usr/bin/', '/usr/sbin/')) or (
-                        self.role == 'sudo' and resolved == SUDO_TARGET)
+                        self.role == 'sudo' and resolved == SUDO_TARGET) or self.multicall
                     self.check(allowed, 'canonical_system_directory')
                     self.path = resolved
                     self.record('tool-validated', tool=self.role, entry=self.entry if self.entry in
                                 tuple(d + '/' + self.role for d in SEARCH.split(':')) else '<interpreter-entry>',
                                 resolved_path=self.path, predicate='validated',
+                                policy='exact_multicall' if self.multicall else 'single_link',
                                 components=len(self.objects), **self.facts(m))
                     return self
                 self.check(stat.S_ISDIR(m.st_mode), 'directory_component')
@@ -168,10 +204,12 @@ class TrustedTool:
 
     def recheck(self):
         try:
+            if self.multicall:
+                protected_hardlinks(self.record, self.fs)
             for fd, before in self.objects:
                 self.current = self.fs.fstat(fd)
                 self.check(identity(self.current) == before, 'stable_open_object')
-            other = TrustedTool(self.role, lambda *a, **k: None, self.entry, self.fs)
+            other = TrustedTool(self.role, lambda *a, **k: None, self.entry, self.fs, self.hardlinks)
             try:
                 other.walk()
                 self.check(other.path == self.path and
@@ -197,16 +235,19 @@ class TrustedTool:
 
     def close(self):
         objects, self.objects = self.objects, []
+        failed = False
         for fd, _ in reversed(objects):
             try:
                 self.fs.close(fd)
             except OSError:
-                self.current = None
-                self.check(False, 'filesystem_error')
+                failed = True
+        if failed and not self.reported:
+            self.current = None
+            self.check(False, 'filesystem_error')
 
 
-def trusted_tool(tool, record, fs=os, entry=None):
-    obj = TrustedTool(tool, record, entry, fs)
+def trusted_tool(tool, record, fs=os, entry=None, hardlinks=False):
+    obj = TrustedTool(tool, record, entry, fs, hardlinks)
     try:
         obj.check(tool in TOOLS, 'closed_role')
         if entry is None:
@@ -693,22 +734,63 @@ class Harness:
                     seconds=round(self.clock() - self.budget.start, 3), phases={**self.budget.used, 'cleanup': self.cleanup_seconds})
         return 1 if self.first else 0
 
-    def qualify(self):
-        require(len(sys.argv) == 1 and sys.platform == 'linux' and platform.machine() == 'x86_64' and
-                os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly')
+    def qualify_tools(self, fs=os):
         self.tools = {}
+        batch = {}
+        statuses = []
+        complete = False
         start = self.clock()
         try:
             deadline = self.budget.deadline('preflight', 20)
-            for tool in TOOLS:
+            hardlinks = False
+            try:
                 require(self.clock() < deadline, 'PhaseTimeout')
-                self.tools[tool] = trusted_tool(tool, self.record,
-                    entry=sys.executable if tool == 'python3' else None)
-            require(sys.version_info >= (3, 11), 'PythonVersion')
+                protected_hardlinks(self.record, fs)
+                hardlinks = True
+            except Refusal as error:
+                self.fail(error)
+            for tool in TOOLS:
+                status = 'refused'
+                try:
+                    if self.clock() >= deadline or self.evidence >= LIMIT - 4096:
+                        status = 'not-evaluated'
+                        raise Refusal('PhaseTimeout' if self.clock() >= deadline else 'EvidenceOverflow')
+                    batch[tool] = trusted_tool(tool, self.record, fs,
+                        entry=sys.executable if tool == 'python3' else None, hardlinks=hardlinks)
+                    require(self.clock() < deadline, 'PhaseTimeout')
+                    if tool == 'python3':
+                        require(sys.version_info >= (3, 11), 'PythonVersion')
+                    status = 'validated'
+                except Refusal as error:
+                    self.fail(error)
+                statuses.append(status)
+                self.record('tool-terminal', tool=tool, status=status)
+            if sys.version_info < (3, 11) and self.first != 'PythonVersion':
+                self.fail(Refusal('PythonVersion'))
             self.record('interpreter', version=list(sys.version_info[:3]),
-                        bootstrap='trusted-ci', resolved_path=self.tools['python3'].path)
+                        bootstrap='trusted-ci', version_ok=sys.version_info >= (3, 11),
+                        resolved_path=batch['python3'].path if 'python3' in batch else None)
+            complete = True
         finally:
             self.budget.used['preflight'] += self.clock() - start
+            if self.first is not None or not complete:
+                for obj in batch.values():
+                    try:
+                        obj.close()
+                    except Refusal as error:
+                        self.fail(error)
+            else:
+                self.tools = batch
+        self.record('tool-batch', status='refused' if self.first else 'validated',
+                    required=len(TOOLS), validated=statuses.count('validated'),
+                    refused=statuses.count('refused'), not_evaluated=statuses.count('not-evaluated'),
+                    first_failure=self.first)
+        require(self.first is None, self.first)
+
+    def qualify(self):
+        require(len(sys.argv) == 1 and sys.platform == 'linux' and platform.machine() == 'x86_64' and
+                os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly')
+        self.qualify_tools()
         self.command(['python3', '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
