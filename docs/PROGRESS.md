@@ -24,8 +24,8 @@ PR188 as the last merge, that is superseded by this summary.
   under its unchanged workflow), PR189 `95b4b651` (retained offline startup owner;
   rebuilt as main plus its single source commit), PR193 `05ba5b87` (cfg(test) A8
   lifecycle phase trace), PR195 `fc83838d` (current-state docs), PR196 `c8e6dab7`
-  (M3 step 1, bound SQLite store construction), PR198 `be197a25` (step 2, bound
-  offline recovery), PR197 `85eccce8` (step 3a, custody codec and CA loading),
+  (M3 step 1, bound SQLite store construction), PR197 `85eccce8` (step 3a, custody
+  codec and CA loading), PR198 `be197a25` (step 2, bound offline recovery),
   PR200 `e9e44c91` (step 4a, credential publication storage), PR199 `7aec97af`
   (step 3b, hosted distinct-UID custody qualification), PR201 `99076134` (step 5a,
   retained bound-start ownership). Every merge had an independent exact-head Sol
