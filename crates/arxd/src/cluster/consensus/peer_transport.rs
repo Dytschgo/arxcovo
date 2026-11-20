@@ -87,7 +87,7 @@ impl std::error::Error for Refusal {}
 pub(super) fn rpc_error(reason: Refusal) -> RPCError<Arx> {
     RPCError::Unreachable(Unreachable::new(&reason))
 }
-fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
+pub(super) fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
     if text.len() > 200 {
         return Err(Refusal::Address);
     }
@@ -1222,13 +1222,24 @@ impl TransportOwner {
         node: NodeId,
         credentials: Credentials,
     ) -> (Self, PeerFactory) {
+        Self::pending_stage(cluster, node, Some(credentials))
+    }
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn pending_founder(cluster: ClusterId, node: NodeId) -> (Self, PeerFactory) {
+        Self::pending_stage(cluster, node, None)
+    }
+    fn pending_stage(
+        cluster: ClusterId,
+        node: NodeId,
+        credentials: Option<Credentials>,
+    ) -> (Self, PeerFactory) {
         let (stop, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             cluster,
             node,
             failed: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State {
-                pending: Some(credentials),
+                pending: credentials,
                 attach_attempted: false,
                 closed: false,
                 resources: None,
@@ -1298,6 +1309,9 @@ impl TransportOwner {
         self.publish(sm, resources, listener)
     }
     fn begin_attach(&self) -> Result<Credentials, Refusal> {
+        self.take_attach_credentials(None)
+    }
+    fn take_attach_credentials(&self, late: Option<Credentials>) -> Result<Credentials, Refusal> {
         let mut state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
         if state.closed {
             return Err(Refusal::Closed);
@@ -1306,7 +1320,61 @@ impl TransportOwner {
             return Err(Refusal::NotReady);
         }
         state.attach_attempted = true;
-        state.pending.take().ok_or(Refusal::NotReady)
+        match (state.pending.take(), late) {
+            (Some(credentials), None) | (None, Some(credentials)) => Ok(credentials),
+            _ => Err(Refusal::NotReady),
+        }
+    }
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn attach_founder(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        address: &str,
+        credentials: Credentials,
+    ) -> Result<(), Refusal> {
+        // The caller holds the job's close gate through bind and registration.
+        // There is no await (and therefore no unowned listener) under that gate.
+        let credentials = self.take_attach_credentials(Some(credentials))?;
+        let resources = make_resources(
+            self.shared.cluster,
+            self.shared.node,
+            sm,
+            credentials,
+            dispatch,
+        )?;
+        let listener = std::net::TcpListener::bind(endpoint(address)?)
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
+            .and_then(TcpListener::from_std)
+            .map_err(|_| Refusal::Address)?;
+        self.publish(sm, resources, listener)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn founder_tls_probe(
+        &self,
+    ) -> Result<(Arc<ClientConfig>, impl Future<Output = bool> + use<>), Refusal> {
+        let state = self.shared.state.lock().map_err(|_| Refusal::Unclean)?;
+        let config = state
+            .resources
+            .as_ref()
+            .ok_or(Refusal::NotReady)?
+            .client_config(self.shared.node)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        *self.shared.hooks.events.lock().unwrap() = Some(tx);
+        Ok((config, async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Event::Stage(Stage::ServerAuthenticated) => return true,
+                    Event::Finished(_) | Event::Refused(_) => return false,
+                    _ => {}
+                }
+            }
+            false
+        }))
     }
     fn publish(
         &mut self,
