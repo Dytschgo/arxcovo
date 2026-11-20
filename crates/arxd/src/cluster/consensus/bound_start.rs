@@ -415,28 +415,40 @@ where
                     let (result, actual, released) = closed;
                     #[cfg(all(test, windows))]
                     let released = if let Some(w) = &witness {
+                        w.stage("close_joined", u8::from(result.is_ok()));
                         if let Err(e) = &result {
                             w.orphaned(e.0);
+                            let (log, sm, log_weak, sm_weak, owners) = detail;
+                            w.stage(
+                                "release_observed",
+                                format_args!(
+                                    "{} {} {} {} {}",
+                                    u8::from(log),
+                                    u8::from(sm),
+                                    u8::from(log_weak),
+                                    u8::from(sm_weak),
+                                    u8::from(owners)
+                                ),
+                            );
                             false
                         } else if w.check(actual, "missing_engine").is_err() {
                             false
                         } else {
                             w.stage("engine_joined", "1");
                             let (log, sm, log_weak, sm_weak, owners) = detail;
-                            w.check(released && owners, "store_release").is_ok() && {
-                                w.stage(
-                                    "released",
-                                    format_args!(
-                                        "{} {} {} {} {}",
-                                        u8::from(log),
-                                        u8::from(sm),
-                                        u8::from(log_weak),
-                                        u8::from(sm_weak),
-                                        u8::from(owners)
-                                    ),
-                                );
-                                w.before_disposal(&job.state())
-                            }
+                            w.stage(
+                                "released",
+                                format_args!(
+                                    "{} {} {} {} {}",
+                                    u8::from(log),
+                                    u8::from(sm),
+                                    u8::from(log_weak),
+                                    u8::from(sm_weak),
+                                    u8::from(owners)
+                                ),
+                            );
+                            w.check(released && owners, "store_release").is_ok()
+                                && w.before_disposal(&job.state())
                         }
                     } else {
                         released

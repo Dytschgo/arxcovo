@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
 import stat
 import subprocess
 import sys
 import time
+from threading import Event, Thread
 from contextlib import ExitStack
 from types import ModuleType
 
@@ -45,6 +47,7 @@ PROOFS = {
     "live": ("1 1 1",),
     "close_requested": ("1",),
     "close_dispatched": ("1",),
+    "close_joined": ("1",),
     "engine_joined": ("1",),
     "released": ("1 1 1 1 1",),
     "before_disposal": ("1 1 1",),
@@ -57,8 +60,12 @@ bound_unavailable bound_identity bound_open bound_init bound_unwind open_count
 config transfer transfer_identity owner_identity engine_start handshake
 first_poll_missing observer_count detached running retained_node live peer_client
 missing_engine store_release before_disposal close_join driver_join
-supervisor_join final_state outer_release
+supervisor_join final_state outer_release startup_join test_admission
+fixture_privacy fixture_create fixture_layout fixture_config fixture_plan
 """.split())
+CHECKS = {"detached": 3, "live": 3, "close_joined": 1, "released": 5,
+          "release_observed": 5, "before_disposal": 3, "outer_released": 1}
+CHECK_FAILURE = {"released": "store_release", "outer_released": "outer_release"}
 ORPHANED_FIELDS = (
     "first", "engine", "engine_ms", "owners_done_at_start", "owners_waited",
     "owners_left", "owners_panicked", "last_owner_join_ms", "propose_held",
@@ -97,7 +104,8 @@ def parse_pins(data, trusted):
     need(hex_digest(trusted) and digest(data) == trusted, "pins_digest")
     pins = json.loads(data, object_pairs_hook=unique_object)
     need(isinstance(pins, dict) and set(pins) == {
-        "head", "test", "binary_bytes", "binary_sha256", "python", "python_sha256", "sha256"
+        "head", "test", "binary_bytes", "binary_sha256", "python", "python_sha256",
+        "python_runtime", "sha256",
     }, "pins_schema")
     need(isinstance(pins["head"], str) and re.fullmatch("[0-9a-f]{40}", pins["head"])
          and pins["test"] == CASE and type(pins["binary_bytes"]) is int
@@ -106,6 +114,13 @@ def parse_pins(data, trusted):
          and isinstance(pins["python"], str) and 0 < len(pins["python"]) <= 512
          and isinstance(pins["sha256"], dict) and pins["sha256"].keys() == FILES.keys()
          and all(hex_digest(h) for h in pins["sha256"].values()), "pins_schema")
+    runtime = pins["python_runtime"]
+    need(isinstance(runtime, dict) and 0 < len(runtime) <= 64
+         and all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,95}", name)
+                 and not name.endswith(".") and hex_digest(sha) for name, sha in runtime.items())
+         and len({name.lower() for name in runtime}) == len(runtime)
+         and Path(pins["python"]).name.lower() not in {name.lower() for name in runtime},
+         "pins_schema")
     return pins
 
 
@@ -150,7 +165,7 @@ class Proof:
         self.count = 0
         self.last_us = 0
         self.selected = self.passed = self.failed = 0
-        self.summary = False
+        self.summary = self.summary_seen = False
         self.test_status = None
         self.test_line = False
         self.first = None
@@ -190,7 +205,10 @@ class Proof:
                 self.selected = 1
             else:
                 self.uncertain("malformed_proof")
-        elif line in ("ok", "FAILED") and self.test_line and self.test_status is None:
+        elif line in ("ok", "FAILED"):
+            if not self.test_line or self.test_status is not None or self.summary:
+                self.uncertain("malformed_proof")
+                return
             self.test_status = line
             if line == "FAILED":
                 self.fail("test_failure")
@@ -198,7 +216,9 @@ class Proof:
             self.stage(line.split(" ", 3))
         elif line.startswith("test result:"):
             match = RESULT_LINE.fullmatch(line)
-            if self.summary or not match or self.test_status != match[1]:
+            duplicate, self.summary_seen = self.summary_seen, True
+            if (duplicate or not match or self.test_status != match[1]
+                    or (match[2], match[3]) != (("1", "0") if match[1] == "ok" else ("0", "1"))):
                 self.uncertain("malformed_proof")
                 return
             self.summary = True
@@ -236,6 +256,19 @@ class Proof:
               and stage == tuple(PROOFS)[self.count] and fields in PROOFS[stage]
               and self.first is None):
             self.count += 1
+        elif stage in CHECKS and re.fullmatch(r"[01]( [01]){" + str(CHECKS[stage] - 1) + "}", fields):
+            if stage == "release_observed" and self.orphaned is not None:
+                pass
+            elif (self.count < len(PROOFS) and stage == tuple(PROOFS)[self.count]
+                    and self.first is None and "0" in fields):
+                if stage == "close_joined":
+                    # Preserve the concrete Orphaned report as the first failure.
+                    self.uncertain("close_unproven")
+                else:
+                    self.fail(CHECK_FAILURE.get(stage, stage))
+            else:
+                self.uncertain("malformed_proof")
+                return
         else:
             self.uncertain("malformed_proof")
             return
@@ -249,37 +282,126 @@ class Proof:
             self.uncertain("incomplete_proof")
 
 
-def observe(backend, clock, sleep, start, proof):
+class Cutoff:
+    """A Job custodian independent of creation, pipe I/O and evidence writes."""
+    def __init__(self, backend, clock, deadline):
+        self.backend, self.clock, self.deadline = backend, clock, deadline
+        self.wake = Event()
+        self.natural = False
+        self.expired = False
+        self.failed = False
+        self.worker = Thread(target=self.run, daemon=True)
+        self.worker.start()
+
+    def run(self):
+        while not self.wake.is_set():
+            left = self.deadline - self.clock()
+            if left <= 0:
+                self.expired = True
+                break
+            self.wake.wait(left / 1000)
+        if not self.natural or self.expired:
+            try:
+                self.backend.terminate()
+            except Exception:
+                self.failed = True
+
+    def finish(self, natural, wall):
+        self.natural = natural
+        self.wake.set()
+        self.worker.join(max(0, wall - self.clock()) / 1000)
+        return not self.worker.is_alive() and not self.failed
+
+
+class StageWriter:
+    """Single ordered consumer, with a hard queue cap even if storage stalls."""
+    def __init__(self, path):
+        self.events = Queue(maxsize=64)
+        self.hexdigest = None
+        self.incomplete = False
+        self.worker = Thread(target=self.write, args=(path,), daemon=True)
+        self.worker.start()
+
+    def write(self, path):
+        sha = hashlib.sha256()
+        try:
+            with path.open("xb") as stream:
+                while (event := self.events.get()) is not None:
+                    data = (json.dumps(event) + "\n").encode("ascii")
+                    stream.write(data)
+                    stream.flush()
+                    sha.update(data)
+            self.hexdigest = sha.hexdigest()
+        except Exception:
+            self.incomplete = True
+
+    def emit(self, event):
+        if not self.incomplete:
+            try:
+                self.events.put_nowait(event)
+            except Full:
+                self.incomplete = True
+
+    def finish(self, clock, deadline):
+        try:
+            self.events.put(None, timeout=max(0, deadline - clock()) / 1000)
+            self.worker.join(max(0, deadline - clock()) / 1000)
+        except Full:
+            self.incomplete = True
+        if self.incomplete or self.worker.is_alive():
+            return None
+        return self.hexdigest
+
+
+def observe(backend, clock, sleep, start, proof, custodian=Cutoff):
     """Own one suspended child. Clock values share the outer Windows tick epoch."""
     work, wall = start + 82000, start + 90000
-    process, spawned, code = None, None, None
+    process = cutoff = natural_code = code = None
     member = resumed = sent = eof = natural = zero = reaped = forced = False
+
+    def read():
+        nonlocal eof
+        if not eof and not proof.truncated:
+            data = backend.read(max(1, OUTPUT_CAP + 1 - proof.bytes))
+            eof = data is None
+            if data:
+                proof.feed(data)
+
     try:
         spawned = clock()
         need(spawned < work, "admission_deadline")
         stop = min(work, spawned + 48000)
+        cutoff = custodian(backend, clock, stop)
+
+        def before_stop():
+            need(clock() < stop and not cutoff.expired, "process_deadline")
+
+        before_stop()
         process = backend.create_suspended()
-        need(clock() < stop, "process_deadline")
+        before_stop()
         member = backend.member(process)
         need(member, "job_membership")
-        need(clock() < stop, "process_deadline")
+        before_stop()
         backend.resume(process)
         resumed = True
-        need(clock() < stop, "process_deadline")
-        need(backend.poll(process) is None, "early_exit")
+        before_stop()
+        early_code = backend.poll(process)
+        if early_code is not None and clock() < stop and not cutoff.expired:
+            natural_code = early_code
+        need(early_code is None, "early_exit")
+        before_stop()
         backend.go()
         sent = True
-        while clock() < stop:
-            if not eof:
-                data = backend.read(max(1, OUTPUT_CAP + 1 - proof.bytes))
-                eof = data is None
-                if data:
-                    proof.feed(data)
+        while clock() < stop and not cutoff.expired:
             code = backend.poll(process)
+            if code is not None and clock() < stop and not cutoff.expired and natural_code is None:
+                natural_code = code
+            read()
             if proof.truncated:
                 break
-            if code is not None and eof and backend.active() == 0 and clock() < stop:
-                natural = zero = reaped = True
+            if natural_code is not None and eof and backend.active() == 0:
+                if clock() < stop and not cutoff.expired:
+                    natural = zero = reaped = True
                 break
             sleep(min(0.01, max(0, stop - clock()) / 1000))
         if not natural and not proof.truncated:
@@ -294,36 +416,56 @@ def observe(backend, clock, sleep, start, proof):
     except Exception:
         proof.uncertain("process_io")
     finally:
+        if process is None:
+            process = getattr(backend, "process", None)
+        forced = cutoff is not None and not natural
         try:
-            backend.close_input()
-            if not natural:
-                forced = process is not None
-                backend.terminate()
-                while process is not None and clock() < wall:
-                    if not eof and not proof.truncated:
-                        data = backend.read(max(1, OUTPUT_CAP + 1 - proof.bytes))
-                        eof = data is None
-                        if data:
-                            proof.feed(data)
+            if cutoff is not None and not cutoff.finish(natural, wall):
+                proof.uncertain("job_termination")
+            if cutoff is not None and cutoff.expired:
+                forced = True
+                natural = False
+                proof.uncertain("process_deadline")
+        except (Exception, KeyboardInterrupt):
+            proof.uncertain("job_termination")
+        if natural_code not in (None, 0):
+            proof.fail("child_exit")
+        if not natural:
+            pipe_failed = False
+            while process is not None and clock() < wall:
+                if not pipe_failed:
+                    try:
+                        read()
+                    except (Exception, KeyboardInterrupt):
+                        pipe_failed = True
+                        proof.uncertain("pipe_cleanup")
+                try:
                     code = backend.poll(process)
                     reaped = code is not None
                     zero = backend.active() == 0
-                    if reaped and zero and (eof or proof.truncated):
-                        break
-                    sleep(min(0.01, max(0, wall - clock()) / 1000))
-                if process is not None and not (reaped and zero and eof):
-                    proof.uncertain("incomplete_cleanup")
+                except (Exception, KeyboardInterrupt):
+                    proof.uncertain("reap_io")
+                    break
+                if reaped and zero and (eof or proof.truncated or pipe_failed):
+                    break
+                sleep(min(0.01, max(0, wall - clock()) / 1000))
+            if process is not None and not (reaped and zero and eof):
+                proof.uncertain("incomplete_cleanup")
+        try:
+            backend.close_input()
         except (Exception, KeyboardInterrupt):
-            proof.uncertain("cleanup_io")
-    if code not in (None, 0) and not forced:
-        proof.fail("child_exit")
+            proof.uncertain("stdin_cleanup")
+    if natural_code is not None and proof.test_status is not None:
+        if (natural_code == 0) != (proof.test_status == "ok"):
+            proof.uncertain("exit_status_mismatch")
     if clock() >= wall:
         proof.uncertain("wall_deadline")
     proof.finish()
     return {
         "member": member, "resumed": resumed, "go": sent, "natural": natural,
         "forced": forced, "eof": eof, "reaped": reaped, "zero_active": zero,
-        "exit_code": code, "child_ms": None if process is None else clock() - spawned,
+        "exit_code": code, "natural_exit_code": natural_code,
+        "child_ms": None if process is None else clock() - spawned,
     }
 
 
@@ -337,7 +479,8 @@ class WindowsChild:
 
         self.api = support.WinJobApi()
         self.job = self.api.create()
-        stack.callback(self.api.close, self.job)
+        self.custodian = None
+        stack.callback(self.close_job)
         self.wapi, self.c, self.w = _winapi, c, w
         self.namespace = SimpleNamespace
         self.root, self.env, self.stack = root, env, stack
@@ -345,7 +488,9 @@ class WindowsChild:
         stack.callback(self.close_input)
         stack.callback(self.close, "in_r")
         self.out_r, self.out_w = _winapi.CreatePipe(None, 0)
-        stack.callback(self.close, "out_r")
+        self.pipe = Queue(maxsize=32)
+        self.reader = self.process = None
+        stack.callback(self.close_reader)
         stack.callback(self.close, "out_w")
         os.set_handle_inheritable(self.in_r, True)
         os.set_handle_inheritable(self.out_w, True)
@@ -358,6 +503,15 @@ class WindowsChild:
 
     def close_input(self):
         self.close("in_w")
+
+    def close_job(self):
+        # A stuck termination worker retains this handle until process exit.
+        if self.custodian is None or not self.custodian.worker.is_alive():
+            self.api.close(self.job)
+
+    def close_reader(self):
+        if self.reader is None or not self.reader.is_alive():
+            self.close("out_r")
 
     def create_suspended(self):
         c, w, k = self.c, self.w, self.api.k
@@ -410,12 +564,15 @@ class WindowsChild:
         finally:
             k.DeleteProcThreadAttributeList(attrs)
             if info.process:
+                self.process = self.namespace(_handle=info.process, thread=info.thread)
                 self.stack.callback(self.wapi.CloseHandle, info.process)
             if info.thread:
                 self.stack.callback(self.wapi.CloseHandle, info.thread)
         self.close("in_r")
         self.close("out_w")
-        return self.namespace(_handle=info.process, thread=info.thread)
+        self.reader = Thread(target=self.drain, daemon=True)
+        self.reader.start()
+        return self.process
 
     def member(self, process):
         return self.api.in_job(self.job, process)
@@ -430,20 +587,29 @@ class WindowsChild:
 
     def go(self):
         need(self.wapi.WriteFile(self.in_w, b"G") == (1, 0), "go")
-        self.close_input()
 
-    def read(self, want):
+    def drain(self):
+        left = OUTPUT_CAP + 1
         try:
-            available, _ = self.wapi.PeekNamedPipe(self.out_r)
-            if available:
-                data, error = self.wapi.ReadFile(self.out_r, min(available, want))
-                need(error == 0, "pipe")
-                return data
+            while left:
+                data, error = self.wapi.ReadFile(self.out_r, min(left, 4096))
+                need(error == 0 and data, "pipe")
+                left -= len(data)
+                self.pipe.put(data)
         except OSError as error:
-            if error.winerror in (109, 232):  # broken pipe / no data
-                return None
-            raise
-        return b""
+            self.pipe.put(None if error.winerror in (109, 232) else Refusal("pipe"))
+        except Exception:
+            self.pipe.put(Refusal("pipe"))
+
+    def read(self, _want):
+        # The producer will read at most OUTPUT_CAP + 1 bytes in total.
+        try:
+            data = self.pipe.get_nowait()
+        except Empty:
+            return b""
+        if isinstance(data, Refusal):
+            raise data
+        return data
 
     def terminate(self):
         need(self.api.terminate(self.job), "terminate")
@@ -461,36 +627,69 @@ def checked(path, directory):
     return before
 
 
-def hold_tree(path, stack, held):
+def handle_identity(handle, path, directory):
+    import ctypes as c
+    from ctypes import wintypes as w
+
+    class Info(c.Structure):
+        _fields_ = [("attr", w.DWORD), ("created", w.FILETIME), ("accessed", w.FILETIME),
+                    ("written", w.FILETIME), ("volume", w.DWORD), ("size_high", w.DWORD),
+                    ("size_low", w.DWORD), ("links", w.DWORD), ("index_high", w.DWORD),
+                    ("index_low", w.DWORD)]
+
+    k = c.WinDLL("kernel32", use_last_error=True)
+    k.GetFileInformationByHandle.argtypes = [w.HANDLE, c.POINTER(Info)]
+    k.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]
+    k.GetFinalPathNameByHandleW.restype = w.DWORD
+    info, final = Info(), c.create_unicode_buffer(1024)
+    need(k.GetFileInformationByHandle(handle, c.byref(info))
+         and not info.attr & 0x400 and bool(info.attr & 0x10) == directory
+         and (directory or info.links == 1), "path")
+    size = k.GetFinalPathNameByHandleW(handle, final, len(final), 0)
+    need(0 < size < len(final) and final.value == "\\\\?\\" + str(path), "path")
+    return info.volume, info.index_high, info.index_low
+
+
+def checked_handle(path, directory, stack):
     import _winapi
+
+    checked(path, directory)
+    flags = 0x00200000 | (0x02000000 if directory else 0)
+    share = 3 if directory else 1
+    access = 0x80 if directory else 0x80000000
+    handle = _winapi.CreateFile(str(path), access, share, 0, 3, flags, 0)
+    stack.callback(_winapi.CloseHandle, handle)
+    actual = handle_identity(handle, path, directory)
+    checked(path, directory)
+    other = _winapi.CreateFile(str(path), 0x80, share, 0, 3, flags, 0)
+    try:
+        need(handle_identity(other, path, directory) == actual, "path")
+    finally:
+        _winapi.CloseHandle(other)
+    return handle
+
+
+def hold_tree(path, stack, held):
     if path in held:
         return
     if path != path.parent:
         hold_tree(path.parent, stack, held)
-    checked(path, True)
-    # Read attributes, deny deletion/rename, open the directory object itself.
-    handle = _winapi.CreateFile(str(path), 0x80, 3, 0, 3, 0x02200000, 0)
-    stack.callback(_winapi.CloseHandle, handle)
-    checked(path, True)
+    checked_handle(path, True, stack)
     held.add(path)
 
 
 def stable_input(path, stack, held):
-    import _winapi
     import msvcrt
     hold_tree(path.parent, stack, held)
-    before = checked(path, False)
-    handle = _winapi.CreateFile(str(path), 0x80000000, 1, 0, 3, 0x00200000, 0)
-    try:
+    with ExitStack() as ownership:
+        handle = checked_handle(path, False, ownership)
         fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+        ownership.pop_all()
+    try:
+        return stack.enter_context(os.fdopen(fd, "rb"))
     except BaseException:
-        _winapi.CloseHandle(handle)
+        os.close(fd)
         raise
-    stream = stack.enter_context(os.fdopen(fd, "rb"))
-    after = os.fstat(fd)
-    need((after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
-         and after.st_nlink == 1 and not after.st_file_attributes & 0x400, "path")
-    return stream
 
 
 def system_clock():
@@ -546,15 +745,11 @@ def launch():
         for leaf in set(SCRATCH.values()) | {"bin"}:
             hold_tree(ROOT / leaf, stack, held)
         evidence = ROOT / "evidence"
-        stages = stack.enter_context((evidence / "stages.jsonl").open("xb"))
         result_file = stack.enter_context((evidence / "result.json").open("xb"))
         hashes_file = stack.enter_context((evidence / "hashes.json").open("xb"))
 
-        def emit(event):
-            stages.write((json.dumps(event) + "\n").encode("ascii"))
-            stages.flush()
-
-        proof = Proof(emit)
+        writer = StageWriter(evidence / "stages.jsonl")
+        proof = Proof(writer.emit)
         hashes, process = {}, {}
         try:
             pins_stream = stable_input(ROOT / "pins.json", stack, held)
@@ -565,6 +760,9 @@ def launch():
             need(python.is_absolute() and Path(sys.executable) == python, "interpreter")
             interpreter = stable_input(python, stack, held)
             verify_file(interpreter, 32 * 1024 * 1024, pins["python_sha256"], clock, until)
+            for leaf, sha in pins["python_runtime"].items():
+                runtime = stable_input(python.parent / leaf, stack, held)
+                verify_file(runtime, 64 * 1024 * 1024, sha, clock, until)
             source = None
             for key, (leaf, cap) in FILES.items():
                 stream = stable_input(ROOT / leaf, stack, held)
@@ -580,7 +778,11 @@ def launch():
             child_env = {k: v for k, v in os.environ.items() if k not in CONTROL}
             with ExitStack() as custody:
                 backend = WindowsChild(verified_support(source), ROOT, child_env, custody)
-                process = observe(backend, clock, time.sleep, start, proof)
+                def start_cutoff(backend, clock, deadline):
+                    backend.custodian = Cutoff(backend, clock, deadline)
+                    return backend.custodian
+
+                process = observe(backend, clock, time.sleep, start, proof, start_cutoff)
         except Refusal as error:
             proof.fail(error.args[0])
         except FileExistsError:
@@ -590,6 +792,11 @@ def launch():
         except Exception:
             proof.fail("admission_io")
 
+        stages_digest = writer.finish(clock, start + 88750)
+        if stages_digest is None:
+            proof.uncertain("stage_flush")
+        else:
+            hashes["stages"] = stages_digest
         if clock() >= start + 90000:
             proof.uncertain("wall_deadline")
         if not proof.first and not proof.uncertainty and process.get("natural"):
@@ -607,10 +814,9 @@ def launch():
         result_bytes = (json.dumps(result, sort_keys=True) + "\n").encode("ascii")
         result_file.write(result_bytes)
         result_file.flush()
-        with (evidence / "stages.jsonl").open("rb") as stream:
-            hashes["stages"] = digest(stream.read(64 * 1024))
         hashes["result"] = digest(result_bytes)
         hashes_file.write((json.dumps(hashes, sort_keys=True) + "\n").encode("ascii"))
+        hashes_file.flush()
         return 0 if disposition == "success" else 1
 
 
@@ -621,4 +827,3 @@ if __name__ == "__main__":
         # No traceback, OS paths, or untrusted input on the console.
         print("Step 5b launcher refused or interrupted.", file=sys.stderr)
         sys.exit(1)
-

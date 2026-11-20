@@ -1,6 +1,9 @@
 """Pure D6 controls. Every child, Job and clock is synthetic."""
 import io
 import json
+from pathlib import Path
+from threading import Event
+import time
 import unittest
 
 import observe_bound_start as d6
@@ -110,7 +113,7 @@ class LauncherTests(unittest.TestCase):
     def test_pins_digest_duplicate_keys_and_fixed_inventory(self):
         sample = dict(head="0" * 40, test=d6.CASE, binary_bytes=123,
                       binary_sha256="a" * 64, python=r"D:\qualified\python.exe",
-                      python_sha256="b" * 64,
+                      python_sha256="b" * 64, python_runtime={"python312.zip": "d" * 64},
                       sha256=dict.fromkeys(d6.FILES, "c" * 64))
         raw = json.dumps(sample).encode("ascii")
         self.assertEqual(d6.parse_pins(raw, d6.digest(raw)), sample)
@@ -121,6 +124,8 @@ class LauncherTests(unittest.TestCase):
             json.dumps(dict(sample, test="different")).encode("ascii"),
             json.dumps(dict(sample, binary_bytes=True)).encode("ascii"),
             json.dumps(dict(sample, sha256={})).encode("ascii"),
+            json.dumps(dict(sample, python_runtime={"../python.dll": "d" * 64})).encode("ascii"),
+            json.dumps(dict(sample, python_runtime={"X.dll": "d" * 64, "x.dll": "e" * 64})).encode("ascii"),
         ):
             with self.assertRaisesRegex(d6.Refusal, "pins_schema"):
                 d6.parse_pins(invalid, d6.digest(invalid))
@@ -154,7 +159,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_delayed_launcher_refuses_before_spawn_or_inherits_wall_cutoff(self):
         out, proof, child, _ = self.sample(FakeClock(83000))
-        self.assertEqual(child.events, ["close_input", "terminate"])
+        self.assertEqual(child.events, ["close_input"])
         self.assertFalse(out["go"])
         self.assertEqual(proof.first, "admission_deadline")
         clock = FakeClock(82990)
@@ -222,6 +227,143 @@ class LauncherTests(unittest.TestCase):
                 self.assertTrue(out["natural"])
                 self.assertTrue(proof.uncertainty)
 
+    def test_duplicate_terminal_records_are_contradictory(self):
+        baseline = transcript()
+        status, summary = b"ok\n", baseline.splitlines(keepends=True)[-1]
+        for mutant in (
+            baseline.replace(b"ok\n\n", status + b"FAILED\n\n"),
+            baseline.replace(b"ok\n\n", status + status + b"\n"),
+            baseline + b"FAILED\n",
+            baseline + summary,
+            baseline.replace(b"1 passed; 0 failed", b"1 passed; 1 failed"),
+            baseline.replace(b"running 1 test", b"ok\nrunning 1 test"),
+        ):
+            with self.subTest(mutant=mutant):
+                _, proof, _, _ = self.sample(data=mutant)
+                self.assertIn("malformed_proof", proof.uncertainty)
+
+    def test_natural_exit_and_terminal_status_must_agree(self):
+        child = FakeChild(clock := FakeClock(), data=transcript())
+        child.poll = lambda _: 23 if child.sent else None
+        proof = d6.Proof(lambda _: None)
+        out = d6.observe(child, clock, clock.sleep, 1000, proof)
+        self.assertEqual(out["natural_exit_code"], 23)
+        self.assertEqual(proof.first, "child_exit")
+        self.assertIn("exit_status_mismatch", proof.uncertainty)
+
+    def test_outer_watchdog_arms_before_preflight_and_fences_resume(self):
+        adr = (Path(__file__).resolve().parents[2] /
+               "docs/adr/0039-retained-bound-start-ownership.md").read_text(encoding="utf-8")
+        self.assertLess(adr.index("$custody.Arm($cutoff)"), adr.index("$worker.BeginInvoke()"))
+        start = adr.index("Require(CreateProcess(exe")
+        resume = adr.index("Require(ResumeThread", start)
+        self.assertIn("0x08080404", adr[start:resume])
+        self.assertIn("Require(IsProcessInJob", adr[start:resume])
+        self.assertIn("Require(!Cancelled && Environment.TickCount64 < work)", adr[start:resume])
+
+    def test_natural_nonzero_exit_survives_leaked_eof(self):
+        child = FakeChild(clock := FakeClock(80000), leak=True)
+        initial_poll = child.poll
+        child.poll = lambda process: 23 if child.sent and not child.terminated else initial_poll(process)
+        proof = d6.Proof(lambda _: None)
+        out = d6.observe(child, clock, clock.sleep, 1000, proof)
+        self.assertEqual(proof.first, "child_exit")
+        self.assertEqual(out["natural_exit_code"], 23)
+        self.assertEqual(out["exit_code"], 1)
+        self.assertIn("incomplete_cleanup", proof.uncertainty)
+
+    def test_failed_stdin_close_never_prevents_termination(self):
+        child = FakeChild(clock := FakeClock(82990), exit_after_go=False)
+        def broken_close():
+            raise OSError
+        child.close_input = broken_close
+        proof = d6.Proof(lambda _: None)
+        out = d6.observe(child, clock, clock.sleep, 1000, proof)
+        self.assertTrue(child.terminated and out["reaped"])
+        self.assertIn("stdin_cleanup", proof.uncertainty)
+
+    def test_custodian_terminates_while_pipe_read_is_stalled(self):
+        now = lambda: time.monotonic_ns() // 1_000_000
+        child = FakeChild(FakeClock(), exit_after_go=False)
+        stopped, entered = Event(), Event()
+        original_terminate = child.terminate
+
+        def terminate():
+            original_terminate()
+            stopped.set()
+
+        def blocked_read(_):
+            entered.set()
+            self.assertTrue(stopped.wait(2), "the Job cutoff depended on pipe progress")
+            return None
+
+        child.terminate = terminate
+        child.read = blocked_read
+        proof = d6.Proof(lambda _: None)
+        out = d6.observe(child, now, time.sleep, now() - 81800, proof)
+        self.assertTrue(entered.is_set())
+        self.assertTrue(out["forced"] and out["reaped"] and out["zero_active"])
+        self.assertFalse(out["natural"])
+
+    def test_stalled_stage_writer_cannot_delay_cutoff_or_earn_credit(self):
+        entered, unblock, stopped = Event(), Event(), Event()
+
+        class BlockedStream(io.BytesIO):
+            def flush(self):
+                entered.set()
+                unblock.wait(5)
+
+        class FakePath:
+            def open(self, _):
+                return BlockedStream()
+
+        writer = d6.StageWriter(FakePath())
+        now = lambda: time.monotonic_ns() // 1_000_000
+        child = FakeChild(FakeClock(), data=transcript(), exit_after_go=False)
+        terminate = child.terminate
+
+        def record_stop():
+            terminate()
+            stopped.set()
+
+        child.terminate = record_stop
+        proof = d6.Proof(writer.emit)
+        try:
+            out = d6.observe(child, now, time.sleep, now() - 81800, proof)
+            self.assertTrue(entered.is_set() and stopped.is_set())
+            self.assertTrue(out["forced"] and out["reaped"])
+            self.assertIsNone(writer.finish(now, now()))
+        finally:
+            unblock.set()
+            writer.worker.join(2)
+
+    def test_handle_identity_refuses_changed_directory_and_file(self):
+        # Inject the two native path views and exchange their object identity.
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        for directory in (False, True):
+            with self.subTest(directory=directory), ExitStack() as stack:
+                closed = []
+                handles = iter((1, 2))
+                api = SimpleNamespace(CreateFile=lambda *_: next(handles), CloseHandle=closed.append)
+                with (patch.dict("sys.modules", _winapi=api),
+                      patch.object(d6, "checked"), patch.object(d6, "handle_identity", side_effect=[1, 2])):
+                    with self.assertRaisesRegex(d6.Refusal, "path"):
+                        d6.checked_handle(Path("fixture"), directory, stack)
+                stack.close()
+                self.assertEqual(closed, [2, 1])
+
+    def test_pre_disposal_retains_identity_refusal_and_individual_lock_results(self):
+        nominal = transcript().split(b"before_disposal 1 1 1", 1)[0]
+        for phase, first in ((b"failure owner_identity", "owner_identity"),
+                             (b"before_disposal 1 0 1", "before_disposal")):
+            _, proof, _, stages = self.sample(data=nominal + phase + b"\nFAILED\n")
+            self.assertEqual(proof.first, first)
+            self.assertEqual(stages[-1]["values"], phase.decode().split()[1:])
+            self.assertIn("incomplete_proof", proof.uncertainty)
+
     def test_first_concrete_failure_and_orphaned_report_survive_cleanup(self):
         failure = (f"running 1 test\ntest {d6.CASE} ... ARX5B 1 admitted 1\n"
                    "ARX5B 2 failure before_disposal\n"
@@ -237,4 +379,3 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

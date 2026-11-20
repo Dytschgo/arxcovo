@@ -1,10 +1,6 @@
 //! The D6 one-shot observation. Its capability is constructed only in the ignored case.
 use super::*;
-use crate::cluster::{
-    bound_open::BoundAttempt,
-    enrollment::NodeId,
-    startup_plan::{Mode, tests},
-};
+use crate::cluster::{bound_open::BoundAttempt, enrollment::NodeId, startup_plan::Mode};
 use std::{
     future::{Future, poll_fn},
     io::Write,
@@ -33,7 +29,27 @@ const LOCKS: [&str; 3] = [
     "cluster-state.lock",
     "cluster-log.lock",
 ];
-type GuardIds = Vec<(PathBuf, u64, u64)>;
+type FileId = (u32, u64);
+type GuardIds = [FileId; 3];
+
+fn file_id(file: &std::fs::File) -> Option<FileId> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    (unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } != 0
+        && info.dwFileAttributes & 0x410 == 0
+        && info.nNumberOfLinks == 1)
+        .then_some((
+            info.dwVolumeSerialNumber,
+            u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+        ))
+}
+
+fn original_guards(owner: &Owner) -> Option<GuardIds> {
+    // Recheck every original guard, then get the exact three lock identities
+    // from fallible duplicates of their retained handles.
+    owner.publication_originals().ok()?;
+    let id = |name| file_id(&owner.bound_guard(name).ok()?);
+    Some([id(LOCKS[0])?, id(LOCKS[1])?, id(LOCKS[2])?])
+}
 type Handshake = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 fn go() -> bool {
@@ -86,7 +102,7 @@ unsafe fn read_go(pipe: HANDLE) -> bool {
 pub(super) struct Witness {
     start: Instant,
     state_dir: PathBuf,
-    guards: Mutex<GuardIds>,
+    guards: Mutex<Option<GuardIds>>,
     handshake: Mutex<Option<Handshake>>,
     first_failure: Mutex<bool>,
     pub(super) running: Notify,
@@ -110,13 +126,7 @@ impl Witness {
     }
 
     pub(super) fn stage(&self, name: &str, fields: impl std::fmt::Display) {
-        let mut stdout = std::io::stdout().lock();
-        let _ = writeln!(
-            stdout,
-            "ARX5B {} {name} {fields}",
-            self.start.elapsed().as_micros()
-        );
-        let _ = stdout.flush();
+        stage(self.start, name, fields);
     }
 
     pub(super) fn fail(&self, code: &str) {
@@ -194,7 +204,8 @@ impl Witness {
             .ok_or_else(|| self.fail("preparation"))?;
         let (_, opens) = stores.io_counts();
         self.check(opens == 2, "open_count")?;
-        *self.guards.lock().unwrap() = tests::guards(owner);
+        let guards = original_guards(owner).ok_or_else(|| self.fail("owner_identity"))?;
+        *self.guards.lock().unwrap() = Some(guards);
         self.stage("prepared", "2");
         Ok(stores.pointers())
     }
@@ -219,21 +230,16 @@ impl Witness {
     }
 
     fn same_owner(&self, state: &State) -> Result<(), ()> {
+        let checked = state.owner.as_ref().and_then(original_guards);
         self.check(
-            state
-                .owner
-                .as_ref()
-                .is_some_and(|o| tests::guards(o) == *self.guards.lock().unwrap()),
+            checked.is_some() && checked == *self.guards.lock().unwrap(),
             "owner_identity",
         )
     }
 
-    fn probe(&self, name: &str, held: bool) -> bool {
-        let path = self.state_dir.join(name);
-        let guards = self.guards.lock().unwrap();
-        let Some((_, volume, index)) = guards.iter().find(|(p, _, _)| p == &path) else {
-            return false;
-        };
+    fn probe(&self, index: usize, held: bool) -> bool {
+        let path = self.state_dir.join(LOCKS[index]);
+        let expected = self.guards.lock().unwrap().map(|ids| ids[index]);
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -243,13 +249,7 @@ impl Witness {
         else {
             return false;
         };
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0
-            || info.dwFileAttributes & 0x410 != 0
-            || info.nNumberOfLinks != 1
-            || u64::from(info.dwVolumeSerialNumber) != *volume
-            || (u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow)) != *index
-        {
+        if expected.is_none() || file_id(&file) != expected {
             return false;
         }
         match file.try_lock() {
@@ -261,10 +261,12 @@ impl Witness {
 
     fn locks(&self, state: &State, stage: &str, held: [bool; 3]) -> Result<(), ()> {
         self.same_owner(state)?;
-        let [outer, sm, log] = std::array::from_fn(|i| self.probe(LOCKS[i], held[i]));
-        self.check(outer && sm && log, stage)?;
-        self.stage(stage, "1 1 1");
-        Ok(())
+        let [outer, sm, log] = std::array::from_fn(|i| self.probe(i, held[i]));
+        self.stage(
+            stage,
+            format_args!("{} {} {}", u8::from(outer), u8::from(sm), u8::from(log)),
+        );
+        self.check(outer && sm && log, stage)
     }
 
     pub(super) fn driver_done(&self) {
@@ -325,17 +327,30 @@ impl RaftNetworkFactory<Arx> for QuietNetwork {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "D6: separate owner authorization for one Windows observation on the reviewed head"]
-async fn nominal_real_engine_start_close() {
-    let start = Instant::now();
-    assert!(go(), "D6 observation admission refused");
-    let retained = crate::service::application::tests::private_temp().keep();
+fn stage(start: Instant, name: &str, fields: impl std::fmt::Display) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(
+        stdout,
+        "ARX5B {} {name} {fields}",
+        start.elapsed().as_micros()
+    );
+    let _ = stdout.flush();
+}
+
+fn setup() -> Result<(PathBuf, Plan, StartIntent), &'static str> {
+    let parent = std::env::temp_dir();
+    crate::security::private(&parent).map_err(|_| "fixture_privacy")?;
+    // The parent ACL is already qualified and inheritable. Keep the fresh
+    // directory before any fallible validation or setup below it.
+    let retained = tempfile::tempdir_in(parent)
+        .map_err(|_| "fixture_create")?
+        .keep();
+    crate::security::private(&retained).map_err(|_| "fixture_privacy")?;
     for leaf in ["state", "credentials", "workspace"] {
-        std::fs::create_dir(retained.join(leaf)).unwrap();
+        std::fs::create_dir(retained.join(leaf)).map_err(|_| "fixture_layout")?;
     }
     let config = retained.join("config");
-    std::fs::write(&config, b"{}").unwrap();
+    std::fs::write(&config, b"{}").map_err(|_| "fixture_config")?;
     let plan = Plan::parse(
         &serde_json::to_vec(&serde_json::json!({
             "mode": "create-founder",
@@ -346,16 +361,31 @@ async fn nominal_real_engine_start_close() {
             "peer": "127.0.0.1:7001",
             "enrollment": "127.0.0.1:7002",
         }))
-        .unwrap(),
+        .map_err(|_| "fixture_plan")?,
     )
-    .unwrap();
+    .map_err(|_| "fixture_plan")?;
     let intent = StartIntent {
         mode: Mode::CreateFounder,
         cluster: [1; 16],
-        node: NodeId::new(1).unwrap(),
-        peer: plan.peer.parse().unwrap(),
-        enrollment: plan.enrollment.parse().unwrap(),
+        node: NodeId::new(1).ok_or("fixture_plan")?,
+        peer: plan.peer.parse().map_err(|_| "fixture_plan")?,
+        enrollment: plan.enrollment.parse().map_err(|_| "fixture_plan")?,
     };
+    Ok((retained, plan, intent))
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "D6: separate owner authorization for one Windows observation on the reviewed head"]
+async fn nominal_real_engine_start_close() {
+    let start = Instant::now();
+    if !go() {
+        stage(start, "failure", "test_admission");
+        panic!("D6 observation admission refused");
+    }
+    let (retained, plan, intent) = setup().unwrap_or_else(|code| {
+        stage(start, "failure", code);
+        panic!("D6 fixture setup refused");
+    });
     let (polled, first_poll) = oneshot::channel();
     let (detach, detached) = oneshot::channel();
     let witness = Arc::new(Witness::new(
@@ -437,10 +467,9 @@ async fn nominal_real_engine_start_close() {
             "final_state",
         )
         .unwrap();
-    witness
-        .check(witness.probe(LOCKS[0], false), "outer_release")
-        .unwrap();
-    witness.stage("outer_released", "1");
+    let outer_free = witness.probe(0, false);
+    witness.stage("outer_released", u8::from(outer_free));
+    witness.check(outer_free, "outer_release").unwrap();
     witness
         .check(clients.load(Ordering::SeqCst) == 0, "peer_client")
         .unwrap();
