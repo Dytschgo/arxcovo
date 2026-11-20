@@ -204,7 +204,7 @@ mod linux {
     }
     /// Mechanism validation, never historical acknowledgement or operational recovery.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn check_retained(
+    pub(in crate::cluster) fn check_retained(
         owner: &Owner,
         expected: Option<&ExpectedIdentity>,
         installation: [u8; 16],
@@ -247,7 +247,7 @@ mod linux {
     }
     /// No Published capability escapes this function, only a store-only unit result.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn store(
+    pub(in crate::cluster) fn store(
         owner: &mut Owner,
         expected: Option<&ExpectedIdentity>,
         installation: [u8; 16],
@@ -394,5 +394,8 @@ mod linux {
         finish(owner, result)
     }
 }
+#[cfg(target_os = "linux")]
+pub(super) use linux::{check_retained, store};
+
 #[cfg(test)]
 mod tests;

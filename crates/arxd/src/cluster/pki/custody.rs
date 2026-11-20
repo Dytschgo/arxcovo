@@ -392,6 +392,73 @@ mod linux {
         }
         Ok(copy)
     }
+    /// Installation owner for the fresh-founder role only.
+    pub(in crate::cluster) struct FounderCustody(Custody);
+
+    impl FounderCustody {
+        pub(in crate::cluster) fn create(
+            owner: &crate::cluster::startup_plan::Owner,
+            wrap: &Path,
+            store: &Path,
+        ) -> Result<Self, Error> {
+            if !owner.plan.mode.founder() || owner.plan.mode.recovery() {
+                return Err(Error::Context);
+            }
+            for private in [wrap, store] {
+                for other in [
+                    &owner.plan.credentials,
+                    &owner.plan.state,
+                    &owner.plan.workspace,
+                    &owner.plan.config,
+                ] {
+                    if private.starts_with(other) || other.starts_with(private) {
+                        return Err(Error::Layout);
+                    }
+                }
+            }
+            Custody::create_fresh_installation(wrap, store).map(Self)
+        }
+
+        pub(in crate::cluster) fn seal(
+            &mut self,
+            cluster: ClusterId,
+            now: u64,
+        ) -> Result<(ClusterCa, Vec<u8>), Error> {
+            let ca = self.0.create_founder_ca(cluster, Some(now))?;
+            let (_, csr) = self.0.create_member(cluster, ca.fingerprint(), false)?;
+            Ok((ca, csr))
+        }
+
+        pub(in crate::cluster) fn installation(&self) -> [u8; 16] {
+            self.0.installation
+        }
+
+        pub(in crate::cluster) fn member(&self) -> Result<MemberCopy<'_>, Error> {
+            if self.0.inventory()? != ["ca-key", "custody-lock", "member-key"] {
+                return Err(Error::Layout);
+            }
+            member_copy(&self.0)
+        }
+    }
+
+    impl MemberCopy<'_> {
+        pub(in crate::cluster) fn tls_key(
+            &self,
+            expected: &crate::cluster::join_receipt::ExpectedIdentity,
+            root: &[u8],
+            leaf: &[u8],
+            now: u64,
+        ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
+            if !expected.origin.founder() || expected.node.get() != 1 {
+                return Err(Error::Context);
+            }
+            self.validate_bytes(&self.bytes, expected, root, leaf, Some(now))?;
+            let payload = codec::open(&self.owner.key, self.context, &self.bytes)?;
+            let (key, _) = codec::parts(Kind::Member, &payload.0)?;
+            Ok(rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into())
+        }
+    }
+
     impl Drop for Custody {
         fn drop(&mut self) {
             self.key.fill(0);
@@ -717,10 +784,10 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(in crate::cluster) use linux::MemberCopy;
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use linux::member_copy;
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) use linux::{FounderCustody, MemberCopy};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use tests::publication_fixture;
