@@ -1,5 +1,8 @@
 """Pure fault-driven launcher tests: no Docker, sudo, network or fixture provisioning."""
 import importlib.util
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
@@ -344,6 +347,141 @@ class LauncherTests(unittest.TestCase):
             harness.command(['fixed'], 'probe')
         self.assertEqual(harness.first, 'Cleanup')
         self.assertEqual(harness.secondary, ['RuntimeError'])
+
+    def test_invocation_evidence_has_node_mode_counts_and_duration(self):
+        for node in ('founder', 'learner1', 'learner2'):
+            for mode in ('deny-build', 'same-uid-control', 'release', 'restart-founder', 'restart-learner'):
+                with self.subTest(node=node, mode=mode):
+                    clock = Clock()
+                    child = FakeChild(clock, terminal_at=.03)
+                    # libtest prefixes the first nocapture line with the test name.
+                    child.out.extend(('test ' + run.PROBE + ' ... ARX_FACTS uid=21001 caps=0 nnp=1 core=0\n').encode())
+                    child.out.extend(b'ARX_MOUNT slot=/dev/shm capacity=1048576 used=0\nARX_DENIAL errno=1\n')
+                    harness = run.Harness(clock, lambda *args: child)
+                    harness.nodes[CONTAINER] = node
+                    output = io.StringIO()
+                    with redirect_stdout(output), patch.object(run.time, 'sleep', clock.sleep):
+                        harness.operational(CONTAINER, mode)
+                    records = [json.loads(line) for line in output.getvalue().splitlines()]
+                    self.assertEqual([r['event'] for r in records], ['probe', 'probe', 'probe', 'case'])
+                    self.assertEqual(records[1]['facts'], 'ARX_MOUNT slot=/dev/shm capacity=1048576 used=0')
+                    self.assertEqual(records[2]['facts'], 'ARX_DENIAL errno=1')
+                    record = records[-1]
+                    self.assertEqual((record['node'], record['mode'], record['result']), (node, mode, 'pass'))
+                    self.assertEqual(record['counts'], dict(oracle_selected=1, oracle_passed=1, selected=1,
+                                                          passed=1, failed=0, ignored=0, measured=0,
+                                                          filtered=0, libtest_ok=True))
+                    self.assertAlmostEqual(record['seconds'], .03)
+
+    def test_invocation_evidence_rejects_missing_zero_and_unknown_records(self):
+        failed = GOOD.replace(b'ARX_PASS selected=1 passed=1\n', b'').replace(b'ok. 1 passed; 0 failed;', b'FAILED. 0 passed; 1 failed;')
+        for transcript in (b'', GOOD.replace(b'running 1 test', b'running 0 tests'),
+                           GOOD.replace(b'selected=1', b'selected=0'),
+                           GOOD.replace(b'test result:', b'absent result:'),
+                           GOOD + b'ARX_UNKNOWN private-sentinel\n',
+                           GOOD + b'ARX_PASS selected=1 passed=1\n', failed):
+            with self.subTest(transcript=transcript):
+                clock = Clock()
+                child = FakeChild(clock)
+                child.out.extend(transcript)
+                def finish():
+                    child.reaped = True
+                    return True
+                child.finish = finish
+                harness = run.Harness(clock, lambda *args: child)
+                harness.nodes[CONTAINER] = 'founder'
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    with self.assertRaises(run.Refusal):
+                        harness.operational(CONTAINER, 'deny-build')
+                records = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['result'], 'fail')
+                self.assertNotIn('private-sentinel', output.getvalue())
+                if transcript == failed:
+                    self.assertEqual(records[0]['counts']['passed'], 0)
+                    self.assertEqual(records[0]['counts']['failed'], 1)
+
+    def test_nonzero_command_emits_observed_failure_counts(self):
+        clock = Clock()
+        child = FakeChild(clock)
+        child.out.extend(b'running 1 test\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n')
+        def finish():
+            child.reaped = True
+            raise run.Refusal('CommandExit')
+        child.finish = finish
+        harness = run.Harness(clock, lambda *args: child)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaisesRegex(run.Refusal, 'CommandExit'):
+                harness.operational(CONTAINER, 'deny-build')
+        record = json.loads(output.getvalue())
+        self.assertEqual(record['result'], 'fail')
+        self.assertEqual(record['counts']['selected'], 1)
+        self.assertEqual(record['counts']['passed'], 0)
+        self.assertEqual(record['counts']['failed'], 1)
+        self.assertEqual(harness.first, 'CommandExit')
+
+    def test_holder_and_cleanup_evidence_includes_all_timings(self):
+        for node, role in (('founder', 'founder'), ('learner1', 'learner'), ('learner2', 'learner')):
+            with self.subTest(node=node):
+                clock = Clock()
+                holder = FakeChild(clock, ready_at=.01, terminal_at=.075)
+                release = FakeChild(clock, terminal_at=.035)
+                restart = FakeChild(clock, terminal_at=.095)
+                children = iter((holder, release, restart))
+                harness = run.Harness(clock, lambda *args: next(children))
+                harness.nodes[CONTAINER] = node
+                def qualify():
+                    harness.start_holder(run.exec_argv(CONTAINER, 'create-' + role), node, 'create-' + role)
+                    harness.release_and_restart(CONTAINER, role, 'a'*256)
+                def remove(*args, **kwargs):
+                    clock.sleep(.03)
+                    harness.nodes.clear()
+                output = io.StringIO()
+                with redirect_stdout(output), patch.object(run.time, 'sleep', clock.sleep), patch.object(harness, 'qualify', side_effect=qualify), patch.object(harness, 'remove_node', side_effect=remove):
+                    self.assertEqual(harness.run(), 0)
+                records = [json.loads(line) for line in output.getvalue().splitlines()]
+                ready = next(r for r in records if r['event'] == 'holder-ready')
+                self.assertAlmostEqual(ready['seconds'], .01)
+                cases = [r for r in records if r['event'] == 'case']
+                self.assertEqual([r['mode'] for r in cases], ['release', 'create-' + role, 'restart-' + role])
+                self.assertTrue(all(r['node'] == node and r['result'] == 'pass' for r in cases))
+                self.assertTrue(all(r['counts']['selected'] == r['counts']['passed'] == 1 for r in cases))
+                self.assertAlmostEqual(cases[1]['lifetime_seconds'], .08)
+                self.assertAlmostEqual(cases[1]['reap_seconds'], .04)
+                self.assertNotIn('a'*256, output.getvalue())
+                cleanup = next(r for r in records if r['event'] == 'cleanup')
+                self.assertEqual(cleanup['result'], 'verified')
+                self.assertAlmostEqual(cleanup['seconds'], .03)
+                result = records[-1]
+                self.assertEqual(set(result['phases']), set(run.Budget.CAPS) | {'cleanup'})
+                self.assertAlmostEqual(result['phases']['ready'], .01)
+                self.assertAlmostEqual(result['phases']['restart'], .09)
+                self.assertAlmostEqual(result['phases']['cleanup'], .03)
+                self.assertAlmostEqual(result['seconds'], .13)
+
+    def test_failed_holder_and_cleanup_emit_failure_and_duration(self):
+        clock = Clock()
+        holder = FakeChild(clock, ready_at=6)
+        harness = run.Harness(clock, lambda *args: holder)
+        def qualify():
+            harness.start_holder(['fixed'], 'learner1', 'create-learner')
+        def remove(*args, **kwargs):
+            clock.sleep(.02)
+            raise run.Refusal('UnknownCleanup')
+        harness.nodes[CONTAINER] = 'learner1'
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(run.time, 'sleep', clock.sleep), patch.object(harness, 'qualify', side_effect=qualify), patch.object(harness, 'remove_node', side_effect=remove):
+            self.assertEqual(harness.run(), 1)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        case = next(r for r in records if r['event'] == 'case')
+        self.assertEqual((case['node'], case['mode'], case['result']), ('learner1', 'create-learner', 'fail'))
+        self.assertGreaterEqual(case['lifetime_seconds'], 5)
+        cleanup = next(r for r in records if r['event'] == 'cleanup')
+        self.assertEqual(cleanup['result'], 'unknown')
+        self.assertAlmostEqual(cleanup['seconds'], .02)
+        self.assertEqual(records[-1]['first_failure'], 'ReadyTimeout')
 
     def test_shm_and_runtime_mount_accounting(self):
         self.assertEqual((17+1, 18+64, 256-82), (18, 82, 174))

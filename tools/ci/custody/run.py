@@ -51,10 +51,49 @@ def digest(path):
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
 
+def counts(output):
+    selected = re.findall(rb'^running ([0-9]{1,3}) tests?\r?$', output, re.M)
+    results = re.findall(rb'^test result: (ok|FAILED)\. ([0-9]{1,3}) passed; ([0-9]{1,3}) failed; ([0-9]{1,3}) ignored; ([0-9]{1,3}) measured; ([0-9]{1,3}) filtered out(?:; finished in [0-9.]+s)?\r?$', output, re.M)
+    if len(selected) != 1 or len(results) != 1:
+        return {}
+    status, passed, failed, ignored, measured, filtered = results[0]
+    oracle = re.findall(rb'ARX_PASS selected=([0-9]{1,3}) passed=([0-9]{1,3})(?:\r?\n|$)', output)
+    return dict(oracle_selected=int(oracle[0][0]) if len(oracle) == 1 else None,
+                oracle_passed=int(oracle[0][1]) if len(oracle) == 1 else None,
+                selected=int(selected[0]), passed=int(passed), failed=int(failed),
+                ignored=int(ignored), measured=int(measured), filtered=int(filtered),
+                libtest_ok=status == b'ok')
+
+
+def protocol_records(output):
+    # Never forward arbitrary output (including panic text or public context).
+    records = []
+    for line in output.splitlines():
+        if b'ARX_' not in line:
+            continue
+        prefix, _, record = line.partition(b'ARX_')
+        require(prefix in (b'', ('test ' + PROBE + ' ... ').encode()), 'UnknownRecord')
+        record = b'ARX_' + record
+        require(any(re.fullmatch(pattern, record) for pattern in (
+            rb'ARX_PASS selected=[0-9]{1,3} passed=[0-9]{1,3}',
+            rb'ARX_READY [0-9]{1,7} [0-9]{1,3},[0-9]{1,3},[0-9]{1,3} [a-f0-9]{256}',
+            rb'ARX_FACTS uid=2100[12] caps=0 nnp=1 core=0',
+            rb'ARX_MOUNT slot=/(tmp|workspace|control|dev/shm|dev) capacity=[0-9]{1,10} used=[0-9]{1,10}',
+            rb'ARX_DENIAL errno=[0-9]{1,3}',
+        )), 'UnknownRecord')
+        if record.startswith((b'ARX_FACTS ', b'ARX_MOUNT ', b'ARX_DENIAL ')):
+            records.append(record.decode('ascii'))
+    return records
+
+
 def terminal(output):
+    protocol_records(output)
+    result = counts(output)
     require(output.count(b'ARX_PASS selected=1 passed=1') == 1 and
-            b'1 passed; 0 failed;' in output and b'1 test' in output,
-            'MissingOracle')
+            result == dict(oracle_selected=1, oracle_passed=1, selected=1, passed=1, failed=0, ignored=0, measured=0,
+                           filtered=0, libtest_ok=True), 'MissingOracle')
+    require(len(re.findall(rb'ARX_PASS ', output)) == 1, 'MissingOracle')
+    return result
 
 
 def exact_listing(output):
@@ -187,6 +226,9 @@ class Harness:
         self.children = []
         self.holder = None
         self.releasing = False
+        self.holder_case = None
+        self.holder_reap_start = None
+        self.cleanup_seconds = 0.0
         self.nodes = {}
         self.root = self.loop = self.image = None
         self.mounted = False
@@ -211,7 +253,7 @@ class Harness:
         require(self.evidence <= LIMIT, 'EvidenceOverflow')
         print(line, flush=True)
 
-    def command(self, argv, phase, seconds=5, cleanup=False):
+    def command(self, argv, phase, seconds=5, cleanup=False, observed=None):
         start = self.clock()
         deadline = min(self.cleanup_deadline or self.budget.start + 150, start + seconds) if cleanup else self.budget.deadline(phase, seconds)
         require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout')
@@ -246,19 +288,39 @@ class Harness:
                 if failure is None:
                     raise
             finally:
+                if observed is not None:
+                    observed['output'] = bytes(child.out)
                 if not cleanup:
                     self.budget.used[phase] += self.clock() - start
 
-    def operational(self, container, mode, context=None, target=None, phase='probe', seconds=3):
-        out = self.command(exec_argv(container, mode, context, target), phase, seconds)
-        terminal(out)
-        # Emit only fixed scalar records; libtest panic output may contain private data.
-        for line in out.decode('ascii').splitlines():
-            if re.fullmatch(r'ARX_(FACTS|MOUNT|DENIAL) [a-zA-Z0-9_=/ .-]+', line):
-                self.record('probe', mode=mode, facts=line)
+    def case(self, node, mode, start, phase, output=None, error=None, **timings):
+        require(node in ('founder', 'learner1', 'learner2', 'unassigned') and mode in MODES, 'Arguments')
+        result = counts(output) if output is not None else {}
+        if error is None:
+            result = terminal(output)
+            for facts in protocol_records(output):
+                self.record('probe', node=node, mode=mode, facts=facts)
+        self.record('case', node=node, mode=mode, phase=phase,
+                    result='pass' if error is None else 'fail',
+                    error=None if error is None else type(error).__name__,
+                    counts=result, seconds=round(self.clock() - start, 6), **timings)
 
-    def start_holder(self, argv):
+    def operational(self, container, mode, context=None, target=None, phase='probe', seconds=3):
+        start, out = self.clock(), None
+        observed = {}
+        node = self.nodes.get(container, 'unassigned')
+        try:
+            out = self.command(exec_argv(container, mode, context, target), phase, seconds, observed=observed)
+            terminal(out)
+        except Exception as error:
+            self.case(node, mode, start, phase, out if out is not None else observed.get('output'), error)
+            raise
+        self.case(node, mode, start, phase, out)
+
+    def start_holder(self, argv, node='unassigned', mode='create-founder'):
         start = self.clock()
+        self.holder_case = dict(node=node, mode=mode, start=start, phase='ready')
+        self.holder_reap_start = None
         ready_deadline = self.budget.deadline('ready', 5)
         self.holder = self.spawn(argv, min(start + 30, self.budget.start + 130), self.clock)
         self.children.append(self.holder)
@@ -271,6 +333,7 @@ class Harness:
                 if match:
                     pid, *fds = map(int, match.groups()[:4])
                     require(2 <= pid <= 4194304 and all(3 <= fd <= 127 for fd in fds), 'Protocol')
+                    self.record('holder-ready', node=node, mode=mode, seconds=round(self.clock() - start, 6))
                     return match[5].decode(), (pid, fds)
                 time.sleep(.01)
         finally:
@@ -286,16 +349,25 @@ class Harness:
         finally:
             self.releasing = False
         start = self.clock()
+        self.holder_reap_start = start
         deadline = min(self.budget.deadline('restart', 5), self.holder.deadline)
-        while True:
-            self.check_work()
-            require(self.clock() < deadline, 'HolderTimeout')
-            if self.holder.finish():
-                terminal(bytes(self.holder.out))
-                self.holder = None
-                self.budget.used['restart'] += self.clock() - start
-                return
-            time.sleep(.01)
+        try:
+            while True:
+                self.check_work()
+                require(self.clock() < deadline, 'HolderTimeout')
+                if self.holder.finish():
+                    out = bytes(self.holder.out)
+                    terminal(out)
+                    if self.holder_case:
+                        self.case(**self.holder_case, output=out,
+                                  reap_seconds=round(self.clock() - start, 6),
+                                  lifetime_seconds=round(self.clock() - self.holder_case['start'], 6))
+                        self.holder_case = None
+                    self.holder = None
+                    return
+                time.sleep(.01)
+        finally:
+            self.budget.used['restart'] += self.clock() - start
 
     def release_and_restart(self, container, role, public_context):
         self.release(container)
@@ -342,6 +414,11 @@ class Harness:
                 self.command(['sudo', '-n', 'chown', '21001:21001', path], 'prepare')
 
     def cleanup(self):
+        start = self.clock()
+        cleanup_result, cleanup_error = 'verified', None
+        incomplete_case = self.holder_case
+        incomplete_output = bytes(self.holder.out) if self.holder else None
+        self.holder_case = None
         self.cleanup_deadline = min(self.clock() + 20, self.budget.start + 150)
         try:
             if self.pending_node:
@@ -390,10 +467,9 @@ class Harness:
                     require(path.name in ('disk.img', 'image.id'), 'UnknownCleanup')
                     path.unlink()
                 self.root.rmdir()
-            self.record('cleanup', result='verified')
         except Exception as error:
             self.fail(Refusal('Cleanup' if self.first is None else 'UnknownCleanup'))
-            self.record('cleanup', result='unknown', error=type(error).__name__)
+            cleanup_result, cleanup_error = 'unknown', type(error).__name__
         finally:
             for child in self.children:
                 if not child.reaped:
@@ -401,6 +477,13 @@ class Harness:
                         child.kill()
                     except Exception as error:
                         self.fail(Refusal('UnknownCleanup'))
+                        cleanup_result, cleanup_error = 'unknown', type(error).__name__
+            self.cleanup_seconds = self.clock() - start
+            if incomplete_case:
+                self.case(**incomplete_case, output=incomplete_output, error=Refusal('IncompleteHolder'),
+                          lifetime_seconds=round(start - incomplete_case['start'], 6),
+                          reap_seconds=None if self.holder_reap_start is None else round(start - self.holder_reap_start, 6))
+            self.record('cleanup', result=cleanup_result, error=cleanup_error, seconds=round(self.cleanup_seconds, 6))
 
     def run(self):
         try:
@@ -411,7 +494,7 @@ class Harness:
         finally:
             self.cleanup()
         self.record('result', first_failure=self.first, secondary=self.secondary,
-                    seconds=round(self.clock() - self.budget.start, 3), phases=self.budget.used)
+                    seconds=round(self.clock() - self.budget.start, 3), phases={**self.budget.used, 'cleanup': self.cleanup_seconds})
         return 1 if self.first else 0
 
     def qualify(self):
@@ -490,7 +573,7 @@ class Harness:
             listing = self.command(['docker', 'exec', '--user', '21001:21001', '--workdir', '/', container, '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', '/opt/arx/arxd-tests', '--list', '--exact', PROBE], 'image')
             require(exact_listing(listing), 'ImageABI')
             role = 'founder' if node == 'founder' else 'learner'
-            public_context, target = self.start_holder(exec_argv(container, 'create-' + role, founder_context))
+            public_context, target = self.start_holder(exec_argv(container, 'create-' + role, founder_context), node, 'create-' + role)
             if node == 'founder':
                 founder_context = public_context
             self.operational(container, 'deny-build', target=target)
