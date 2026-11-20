@@ -600,7 +600,10 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(file.try_lock().is_err(), held, "{stem}");
     }
-    pub(super) fn boundary(name: &str, stores: &mut BoundStores<'_>) -> Result<(), BoundFailure> {
+    pub(super) fn boundary(
+        name: &'static str,
+        stores: &mut BoundStores<'_>,
+    ) -> Result<(), BoundFailure> {
         if let Some((point, panic)) = FAULT.with(|f| *f.borrow())
             && point == name
         {
@@ -638,7 +641,8 @@ pub(super) mod tests {
         {
             // The real configure_db PRAGMA batch must refuse synchronous changes
             // in this transaction. Do not manufacture its return value.
-            db.execute_batch("BEGIN")?;
+            db.execute_batch("BEGIN")
+                .expect("PRAGMA failure fixture must begin its transaction");
         }
         Ok(())
     }
@@ -664,7 +668,8 @@ pub(super) mod tests {
             }
             if point == if state { "state-schema" } else { "log-schema" } {
                 // Real initializer CREATE TABLE now fails on this same connection.
-                db.execute_batch("PRAGMA query_only=ON")?;
+                db.execute_batch("PRAGMA query_only=ON")
+                    .expect("schema failure fixture must enable query_only");
             }
         }
         Ok(())
@@ -680,7 +685,7 @@ pub(super) mod tests {
             .unwrap();
         }
     }
-    fn sqlite_open_path(path: &Path) -> PathBuf {
+    pub(super) fn sqlite_open_path(path: &Path) -> PathBuf {
         match FAULT.with(|f| *f.borrow()).map(|(point, _)| point) {
             Some("sqlite-open") => path.with_file_name("absent-sqlite-open.sqlite3"),
             Some("mismatch") => {
