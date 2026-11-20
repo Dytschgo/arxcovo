@@ -310,8 +310,16 @@ pub(super) struct OwnedStores {
     _pending: Pending,
     _staged: Vec<Guard>,
     failure: Option<BoundFailure>,
+    #[cfg(test)]
+    accesses: usize,
+    #[cfg(test)]
+    opens: Vec<usize>,
 }
 impl OwnedStores {
+    #[cfg(test)]
+    pub(super) fn io_counts(&self) -> (usize, usize) {
+        (self.accesses, self.opens.len())
+    }
     #[cfg(test)]
     pub(super) fn pointers(&self) -> (usize, usize) {
         (
@@ -388,6 +396,10 @@ impl<'owner> BoundStores<'owner> {
             _pending: self.pending,
             _staged: self.staged,
             failure: self.failure,
+            #[cfg(test)]
+            accesses: self.accesses,
+            #[cfg(test)]
+            opens: self.opens,
         }
     }
     /// One Begun interval covers readonly inspection and writable acquisition.
@@ -459,6 +471,13 @@ impl<'owner> BoundStores<'owner> {
             }
         };
         (stores.into_owned(), observed)
+    }
+    pub(super) fn validate_owner_for_start(
+        &mut self,
+        validate: impl FnOnce(&Owner) -> Result<(), super::startup_plan::Refusal>,
+    ) -> Result<(), BoundFailure> {
+        self.access();
+        validate(self.owner).map_err(BoundFailure::Inspection)
     }
     pub(super) fn inspect_for_start<T>(
         &mut self,

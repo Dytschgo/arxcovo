@@ -420,8 +420,7 @@ pub(super) fn prepare_bound(
     } else {
         BoundIntent::Fresh(init)
     };
-    // Validate intent/authentication inside the transaction, before any store effects.
-    let validation = (|| {
+    let validate_owner = |owner: &Owner| {
         owner.recheck()?;
         if intent.mode != owner.plan.mode
             || Some(intent.peer) != owner.plan.peer.parse().ok()
@@ -440,13 +439,13 @@ pub(super) fn prepare_bound(
             return Err(Refusal::Identity);
         }
         Ok(())
-    })();
+    };
     let sample = std::cell::Cell::new(None);
     let (stores, inspected) = BoundStores::operational(
         owner,
         bound_intent,
         |stores| {
-            validation.map_err(BoundFailure::Inspection)?;
+            stores.validate_owner_for_start(validate_owner)?;
             if !existing {
                 return Ok(None);
             }
@@ -1565,6 +1564,36 @@ mod tests {
         drop(sm);
         let mut log = VoteLogStore::open(&l.root.path().join("state"), [1; 16]).unwrap();
         log.append(&[(p, entry)]).unwrap();
+    }
+    #[test]
+    fn bound_recovery_reentry_refuses_without_filesystem_access() {
+        use crate::cluster::bound_open::{BoundAttempt, BoundFailure};
+
+        let l = Layout::new();
+        initialized(&l);
+        let expected = identity(&l);
+        found(&l, &expected, 1);
+        let plan = l.plan("recover-founder");
+        let intent = StartIntent {
+            mode: plan.mode,
+            cluster: expected.cluster,
+            node: expected.node,
+            peer: plan.peer.parse().unwrap(),
+            enrollment: plan.enrollment.parse().unwrap(),
+        };
+        let mut owner = Owner::acquire(plan).unwrap();
+        let (stores, observation) = prepare_bound(&mut owner, &intent, Some(&expected));
+        assert!(matches!(observation, Some(Observation::Recovered { .. })));
+        let (accesses, opens) = stores.io_counts();
+        assert!(accesses > 0);
+        assert_eq!(opens, 4);
+        assert_eq!(owner.bound_attempt, BoundAttempt::Complete);
+
+        let (mut retry, observation) = prepare_bound(&mut owner, &intent, Some(&expected));
+        assert!(observation.is_none());
+        assert!(matches!(retry.take_pair(), Err(BoundFailure::Unavailable)));
+        assert_eq!(retry.io_counts(), (0, 0));
+        assert_eq!(owner.bound_attempt, BoundAttempt::Complete);
     }
     #[test]
     fn joiner_recovery_uses_redeem_and_excludes_own_anchor() {

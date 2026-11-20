@@ -169,20 +169,33 @@ fn terminal_inspect_and_partial_transfer_refuse() {
 async fn detached_observer_retains_paused_real_preparation() {
     let l = Layout::new();
     let job = Job::anchor();
-    let entered = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
-    *job.gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+    let (entered, paused) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    *job.gate.lock().unwrap() = Some(PreparationPause {
+        entered,
+        release: released,
+    });
     let observer = job.observe();
     let plan = l.plan("create-founder");
     let i = intent(&l, "create-founder");
     let worker = tokio::task::spawn_blocking(move || job.prepare(plan, &i, None));
-    entered.wait();
-    drop(observer);
-    for name in ["cluster-owner", "cluster-state", "cluster-log"] {
-        lock(&l, name, true);
-    }
-    release.wait();
+    let paused = tokio::time::timeout(Duration::from_secs(10), paused).await;
+    // Keep the worker paused while probing the locks, then join even if a probe panics.
+    let probes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        paused
+            .expect("timed out waiting for the preparation pause")
+            .expect("preparation returned before reaching the pause");
+        drop(observer);
+        for name in ["cluster-owner", "cluster-state", "cluster-log"] {
+            lock(&l, name, true);
+        }
+    }));
+    drop(release);
     worker.await.unwrap();
+    if let Err(failure) = probes {
+        dispose(job);
+        std::panic::resume_unwind(failure);
+    }
     assert_eq!(job.observe().status(), Status::Prepared);
     assert_eq!(
         job.with_retained_owner::<()>(|_| panic!("pre-Engine loan")),

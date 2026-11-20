@@ -33,12 +33,17 @@ struct State {
     close_failure: Option<ShutdownReport>,
     engine_may_exist: bool,
 }
+#[cfg(test)]
+struct PreparationPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
 pub(super) struct Job {
     state: Mutex<State>,
     changed: watch::Sender<Status>,
     close: Notify,
     #[cfg(test)]
-    gate: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    gate: Mutex<Option<PreparationPause>>,
 }
 pub(super) struct Observer(watch::Receiver<Status>);
 impl Observer {
@@ -104,6 +109,8 @@ impl Job {
         self.observe()
     }
     fn prepare(&self, plan: Plan, intent: &StartIntent, expected: Option<&ExpectedIdentity>) {
+        #[cfg(test)]
+        let gate = self.gate.lock().unwrap().take();
         let mut s = self.state();
         if s.status != Status::Preparing || s.owner.is_some() {
             return;
@@ -130,9 +137,11 @@ impl Job {
         self.changed.send_replace(s.status);
         drop(s);
         #[cfg(test)]
-        if let Some((entered, release)) = self.gate.lock().unwrap().as_ref() {
-            entered.wait();
-            release.wait();
+        if let Some(gate) = gate
+            && gate.entered.send(()).is_ok()
+        {
+            // Dropping the last sender also releases a paused worker.
+            let _ = gate.release.recv();
         }
     }
     fn transfer(&self) -> Result<(), ()> {
@@ -234,7 +243,7 @@ where
                 return;
             }
             // Test execution is structurally stopped before Engine; releasing a
-            // test barrier cannot cause a background Engine continuation.
+            // test pause cannot cause a background Engine continuation.
             #[cfg(test)]
             {
                 let _ = (&config, &network, node_id);
