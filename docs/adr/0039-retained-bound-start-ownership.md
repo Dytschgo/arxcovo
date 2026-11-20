@@ -53,3 +53,181 @@ inventory. First hosted CI costs are pending; no rerun-to-green is authorized.
 Engine Sol 3/3 exhausted; historical Opus 0/2 unchanged. New-source budget is
 separate. Runtime step 5b, publication composition and hardware acceptance remain
 open. Native/multi-host paths are **unverified on real hardware**.
+
+## Step 5b source authorization amendment (2026-11-20)
+
+The owner granted a source-only extension to 5a for one ignored Windows library
+case and its fixed launcher. “Running the observation is a SEPARATE owner
+decision later on the exact reviewed head.” The sole witness constructor call
+follows an exact argv check and bounded pipe read inside that case. The witness
+can pass only its own job through the test-build stop. The production driver
+awaits the same Engine call directly. An ordinary test still returns at
+Prepared. Existing CI selection and quarantine apply as before.
+
+The build and independent exact-head review are routed to separate Sol 6.2/high
+agents under the November 20 assignment. The coordinator owns review,
+required checks and merge. Sol Engine 3/3 remains exhausted and historical
+Opus 0/2 remains recorded. Step 5b stays open and **unverified on real hardware**.
+Sources are the design digest
+0263040725758c661cf821ad0c29cbd4eb9baec7428952bd8c2860afdf78cd52 and independent
+design review digest
+49ff208d8e988e7b9b08cd5cef4e4d20dbfdbc7bb2288502563493f6e8987460.
+
+### Qualified entry for a later owner-authorized run
+
+The coordinator stages the exact reviewed source, the checked test executable at
+`bin/arxd-step5b.exe`, and the provenance files in the fixed observation root.
+`source-manifest.json` covers the immutable source tree at the reviewed commit.
+`loader.json` records the qualified toolchain, Windows loader, and absolute
+CPython installation and its runtime dependencies. Stage `pins.json` with keys
+`head`, `test`, `binary_bytes`, `binary_sha256`, `python` (native absolute
+interpreter path), `python_sha256` and `sha256`. The latter maps `launcher`,
+`support`, `manifest`, `loader`, `lockfile`, `driver` and `case` to the hashes for
+the fixed paths in the launcher. The coordinator verifies the source, loader and
+binary qualification and records the trusted pins digest and interpreter path
+with the owner grant. All observation inputs and directories must already be
+private and staged, with the fixture ACL precondition satisfied under `tmp`.
+Qualification includes the shell runtime and supports Windows PowerShell 7 on
+.NET through version 10, where `Environment.TickCount64` uses the same Win32
+clock as the launcher. See the
+[clock compatibility record](https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/11/environment-tickcount-windows-behavior).
+
+Use this block only with that separate one-shot grant. Fill the two values from
+the grant before entry. The two exclusive files mark entry and launcher
+admission. A refusal at any point spends the authorization. Verified read
+handles inhibit writes and replacement through use. CPython runs with isolated
+imports, site initialization disabled and an explicit environment.
+
+```powershell
+& {
+    $entry = [Environment]::TickCount64
+    $ErrorActionPreference = 'Stop'
+    $root = 'D:\Temp\arx-m3-step5b\observation'
+    $qualifiedPython = '<qualified absolute interpreter from the grant>'
+    $trustedDigest = '<trusted pins SHA256 from the grant>'
+    $files = [Collections.Generic.List[IO.FileStream]]::new()
+    $process = $null
+    try {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $allowed = @($sid, 'S-1-5-18', 'S-1-5-32-544')
+        function Assert-Path([string]$path, [bool]$directory) {
+            if (![IO.Path]::IsPathFullyQualified($path) -or
+                [IO.Path]::GetFullPath($path) -ne $path) { throw 'Path' }
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.FullName -ne $path -or $item.PSIsContainer -ne $directory -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                (!$directory -and $item.LinkType)) { throw 'Path' }
+            if ($path -eq $root -or $path.StartsWith("$root\", 'OrdinalIgnoreCase')) {
+                $acl = Get-Acl -LiteralPath $path
+                $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+                if (!$acl.AreAccessRulesCanonical -or $rules.Count -eq 0) { throw 'ACL' }
+                foreach ($rule in $rules) {
+                    if ($rule.AccessControlType -eq 'Allow' -and
+                        $rule.IdentityReference.Value -notin $allowed) { throw 'ACL' }
+                }
+            }
+            $parent = [IO.Path]::GetDirectoryName($path)
+            if ($parent) { Assert-Path $parent $true }
+        }
+        function Hold-Input([string]$path, [long]$cap) {
+            Assert-Path $path $false
+            $stream = [IO.File]::Open($path, 'Open', 'Read', 'Read')
+            $files.Add($stream)
+            Assert-Path $path $false
+            if ($stream.Length -le 0 -or $stream.Length -gt $cap) { throw 'Size' }
+            return $stream
+        }
+        function Get-Digest([IO.Stream]$stream) {
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        }
+
+        Assert-Path $root $true
+        [IO.File]::Open("$root\entry-claimed", 'CreateNew', 'Write', 'None').Dispose()
+        if ([Environment]::Version.Major -gt 10 -or $trustedDigest -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Qualification'
+        }
+        foreach ($name in [Environment]::GetEnvironmentVariables().Keys) {
+            if ($name -match '^(LD_|DYLD_|LIBSQLITE3_|SQLITE3_|ARX_STEP5B_)') { throw 'Overrides' }
+        }
+
+        $pinsStream = Hold-Input "$root\pins.json" 16384
+        if ((Get-Digest $pinsStream) -cne $trustedDigest) { throw 'Provenance' }
+        $pinsStream.Position = 0
+        $bytes = [byte[]]::new([int]$pinsStream.Length)
+        $pinsStream.ReadExactly($bytes, 0, $bytes.Length)
+        $pins = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable -Depth 8
+        if ($pins.python -cne $qualifiedPython) { throw 'Interpreter' }
+        $pythonStream = Hold-Input $qualifiedPython 32MB
+        if ((Get-Digest $pythonStream) -cne $pins.python_sha256) { throw 'Interpreter' }
+        $launcher = "$root\source\tools\ci\observe_bound_start.py"
+        $support = "$root\source\tools\ci\windows_diag_sample.py"
+        $launcherStream = Hold-Input $launcher 128KB
+        $supportStream = Hold-Input $support 128KB
+        if ((Get-Digest $launcherStream) -cne $pins.sha256.launcher -or
+            (Get-Digest $supportStream) -cne $pins.sha256.support) { throw 'Source' }
+
+        $scratch = @{
+            TMP = 'tmp'; TEMP = 'tmp'; CARGO_TARGET_DIR = 'target'; CARGO_HOME = 'cargo-home'
+            RUSTUP_HOME = 'rustup-home'; ARX_OBSERVER_ROOT = 'evidence'
+        }
+        foreach ($leaf in $scratch.Values) { Assert-Path "$root\$leaf" $true }
+        foreach ($file in 'source-manifest.json','loader.json','source\Cargo.lock',
+            'bin\arxd-step5b.exe','source\crates\arxd\src\cluster\consensus\bound_start.rs',
+            'source\crates\arxd\src\cluster\consensus\bound_start\nominal_observation.rs') {
+            Assert-Path "$root\$file" $false
+        }
+        $windows = [IO.Directory]::GetParent([Environment]::SystemDirectory).FullName
+        $launch = [Diagnostics.ProcessStartInfo]::new($qualifiedPython)
+        $launch.UseShellExecute = $false
+        $launch.CreateNoWindow = $true
+        $launch.WorkingDirectory = $root
+        $launch.RedirectStandardInput = $true
+        $launch.RedirectStandardOutput = $true
+        $launch.RedirectStandardError = $true
+        $launch.Environment.Clear()
+        foreach ($key in $scratch.Keys) { $launch.Environment[$key] = "$root\$($scratch[$key])" }
+        $launch.Environment['SYSTEMROOT'] = $windows
+        $launch.Environment['WINDIR'] = $windows
+        $launch.Environment['ARX_SCRATCH_ROOT'] = $root
+        $launch.Environment['CARGO_NET_OFFLINE'] = 'true'
+        $launch.Environment['CARGO_PROFILE_DEV_DEBUG'] = '0'
+        $launch.Environment['ARX_STEP5B_ENTRY_MS'] = [string]$entry
+        $launch.Environment['ARX_STEP5B_PINS_SHA256'] = $trustedDigest
+        foreach ($arg in '-I', '-S', '-B', $launcher) { $launch.ArgumentList.Add($arg) }
+
+        if ([Environment]::TickCount64 -ge $entry + 82000) { throw 'Admission deadline' }
+        $process = [Diagnostics.Process]::Start($launch)
+        $process.StandardInput.Close()
+        do {
+            $remaining = $entry + 90000 - [Environment]::TickCount64
+            if ($remaining -le 0) { throw 'Wall deadline' }
+            $exited = $process.WaitForExit([int][Math]::Min(250, $remaining))
+        } until ($exited)
+        if ([Environment]::TickCount64 -ge $entry + 90000 -or $process.ExitCode -ne 0) {
+            throw 'Observation incomplete'
+        }
+    } catch {
+        if ($process) {
+            try { if (!$process.HasExited) { $process.Kill() } } catch {}
+        }
+        throw 'D6 entry refused or incomplete. Preserve evidence and stop.'
+    } finally {
+        if ($process) { $process.Dispose() }
+        foreach ($file in $files) { $file.Dispose() }
+    }
+}
+```
+
+The launcher uses the shared absolute tick from shell entry, including
+interpreter startup and admission. Test work stops by the earlier of entry plus
+82 seconds and the spawn attempt plus 48 seconds. The last eight seconds of the
+90-second wall budget are reserved for containment, drain, reap and evidence.
+The named executable is created suspended, with an explicit pipe-handle list
+and atomically assigned to the unnamed kill-on-close Job through
+`PROC_THREAD_ATTRIBUTE_JOB_LIST`. The launcher verifies membership before resume
+and writes one stdin byte before closing the writer. This keeps custody across
+interruption during process creation. The outer wait targets only the launcher
+and a forced stop is uncertainty. A complete result requires an unforced exit,
+pipe EOF, zero active members, ordered witness phases and successful in-process
+release. See [the Windows process attribute contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
