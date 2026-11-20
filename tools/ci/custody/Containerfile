@@ -1,0 +1,5 @@
+FROM --platform=linux/amd64 docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a AS custody-runtime
+COPY --chown=0:0 --chmod=0555 arxd-tests /opt/arx/arxd-tests
+USER 21001:21001
+WORKDIR /
+ENTRYPOINT ["/usr/bin/env","-i","PATH=/usr/bin:/bin","LANG=C","TZ=UTC","ARX_CUSTODY_HOSTED_MODE=hold","/opt/arx/arxd-tests","--exact","cluster::pki::custody::hosted_probe::hosted_custody_probe","--nocapture","--test-threads=1"]
