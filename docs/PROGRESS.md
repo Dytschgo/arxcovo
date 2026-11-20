@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 23:13 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 23:48 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,8 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `4f139cd8` (PR214), push CI 44834437714 green. `5393900d` (PR213) push CI
+- **Main:** `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
+  44836270187 green. `4f139cd8` (PR214), push CI 44834437714 green. `5393900d` (PR213) push CI
   44829635662 green. `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
   44822884767 green. `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
   44813492071 green. `9bfaedb5` (PR208) push CI 44809310046 was **red**: Ubuntu Rust
@@ -63,7 +64,8 @@ merged, as listed under "Merged this session".
   always change the value), PR210 `60ffb68a` (step 8a codec-only: one-paste transfer
   and owner-boundary refusals), PR211 `29e718c6` (docs), PR212 `e342fbf3` (step 8b,
   retained durable join before replication), PR213 `5393900d` (docs), PR214 `4f139cd8`
-  (step 9, receipt-scoped learner catch-up). Every merge had an independent exact-head Sol
+  (step 9, receipt-scoped learner catch-up), PR215 `2d97a26e` (docs), PR216 `2e1375ed`
+  (step 10, authenticated learner self-admission). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -488,8 +490,36 @@ merged, as listed under "Merged this session".
   calls, one definite stale-tail no-write refusal and one new membership entry. Keep
   Engine, workers, Owners, stores and deadlines frozen. Stop and preserve the first
   unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or
-  budget reset." This revises the base plan's step 10 grant with amendment R2. Sol
-  6.2/high builder, fresh 3-attempt budget, in progress.
+  budget reset." This revises the base plan's step 10 grant with amendment R2. The
+  Sol 6.2/high builder opened PR #216 (13 files, ADR 0042 explicit learner admission
+  route) with 0/3 counted failures (report `D:/Temp/arx-m3-step10/report.md` SHA256
+  `c34fee65…ee33`). The coordinator merged main into the branch (`7549b224`, byte-identical
+  patch). Hosted run 44837325785 green; C10
+  `admission_campaign::retained_learner_self_admits_once` passed on Ubuntu (0.136 s),
+  925 tests, no unexpected frozen-path refusal; Rust job wall times Windows 8m13s, macOS
+  5m25s, Ubuntu 3m24s. Review PASS (`D:/Temp/arx-pr216-review/review.md`, SHA256 `c289876f…56f5`)
+  with two nonblocking P3 follow-ups: the assumed-peer test passes without the
+  front-door identity check because its fixture has no retained node (the check is
+  present in production), and the client can return Unknown for a known-unsent request
+  if the transport closes after TLS and before sending. agent-review status 59524311084.
+  **PR #216 merged** as `2e1375ed`. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **D10 (owner, 2026-11-21):** the initial joint transition uses two guarded public
+  `append_membership` calls (exact joint configuration, then flatten) under one
+  leader-local intent, with independently re-observed exact joint recovery; the
+  departure from the older chained `change_membership_if` recipe is recorded in an ADR.
+  Step 11 covers interruption and reconciliation on the established leader and a
+  deterministic lost-leader refusal; a real leadership change during the joint state is
+  not part of step 11.
+- **Step 11 (owner grant, 2026-11-21):** "Authorize the step 11 source fence for
+  leader-internal promotion and exact joint reconciliation through unchanged membership
+  APIs and Owners, plus one cluster-private, read-only exact-key lookup for a known node
+  ID in cluster/enrollment/registry.rs, and one C11 hosted-Linux case with three retained
+  Engine starts and owned closes, one unchanged Found, two fixture Mints, two actual
+  AnchorQuery/Redeem exchanges, two AddNodes calls, one guarded joint append and one
+  guarded flatten. Keep Engine, workers, Owners, stores and deadlines frozen. Stop and
+  preserve the first unexpected frozen-path refusal, with no repair, diagnostic rerun,
+  Windows run or budget reset." This revises the base plan's step 11 grant with
+  amendment R3. Sol 6.2/high builder, fresh 3-attempt budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
