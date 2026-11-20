@@ -5,6 +5,7 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +14,7 @@ run = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(run)
 IMAGE = 'sha256:' + 'a' * 64
 CONTAINER = 'b' * 64
-GOOD = b'running 1 test\nARX_PASS selected=1 passed=1\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+GOOD = b'running 1 test\nARX_PASS selected=1 passed=1\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 829 filtered out; finished in 0.01s\n'
 READY = b'ARX_READY 42 3,4,5 ' + b'a' * 256 + b'\n'
 
 
@@ -91,6 +92,39 @@ class LauncherTests(unittest.TestCase):
         for candidates in ([], [candidate, candidate], [('x', b'other: test', 1, 1)], [('x', listing, 1, 2)]):
             with self.assertRaises(run.Refusal):
                 run.choose(candidates)
+
+    def test_exact_operational_probe_accepts_real_filtered_counts(self):
+        for filtered in (0, 1, 829):
+            transcript = (f"running 1 test\ntest {run.PROBE} ... ARX_PASS selected=1 passed=1\n"
+                          f"ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; {filtered} filtered out; finished in 0.01s\n").encode()
+            with self.subTest(filtered=filtered):
+                self.assertEqual(run.terminal(transcript)['filtered'], filtered)
+                for bad in (transcript.replace(b'running 1 test', b'running 0 tests'),
+                            transcript.replace(b'ok. 1 passed; 0 failed', b'FAILED. 0 passed; 1 failed'),
+                            transcript.replace(b'ARX_PASS selected=1 passed=1', b'')):
+                    with self.assertRaisesRegex(run.Refusal, 'MissingOracle'):
+                        run.terminal(bad)
+
+    def test_tool_ownership_reports_each_predicate_without_weakening(self):
+        for uid, mode, path, unsafe, predicate in (
+            (1001, 0o100755, '/usr/bin/docker', False, 'owner_uid_root'),
+            (0, 0o100775, '/usr/bin/docker', False, 'not_group_or_other_writable'),
+            (0, 0o100755, '/usr/local/bin/docker', False, 'canonical_system_directory'),
+            (0, 0o100755, '/usr/bin/docker', True, 'safe_regular_single_link_path'),
+            (1001, 0o100755, '/private/account-token/docker', False, 'owner_uid_root'),
+        ):
+            metadata = SimpleNamespace(st_uid=uid, st_gid=123, st_mode=mode)
+            records = []
+            with self.subTest(predicate=predicate, path=path), patch.object(run.shutil, 'which', return_value=path), patch.object(run.Path, 'resolve', side_effect=lambda: run.Path(path)), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', side_effect=run.Refusal('UnsafePath') if unsafe else None):
+                with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
+                    run.trusted_tool('docker', lambda event, **fields: records.append(dict(event=event, **fields)))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0], dict(event='tool-refusal', tool='docker',
+                             resolved_path=path if path.startswith('/usr/') else '<outside-system-path>',
+                             uid=uid, gid=123, mode=format(mode & 0o7777, '04o'), predicate=predicate))
+            self.assertNotIn('account-token', json.dumps(records))
+        with patch.object(run.shutil, 'which', return_value='/usr/bin/docker'), patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/docker')), patch.object(run.Path, 'lstat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)), patch.object(run, 'safe'):
+            self.assertEqual(run.trusted_tool('docker', lambda *args, **kwargs: self.fail('unexpected refusal')), run.Path('/usr/bin/docker'))
 
     def test_fixed_argv_environment_and_limits(self):
         argv = run.create_argv('arx-' + 'c'*16 + '-founder', 'c'*16, '/fixture', 'founder', IMAGE)
@@ -370,7 +404,7 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual((record['node'], record['mode'], record['result']), (node, mode, 'pass'))
                     self.assertEqual(record['counts'], dict(oracle_selected=1, oracle_passed=1, selected=1,
                                                           passed=1, failed=0, ignored=0, measured=0,
-                                                          filtered=0, libtest_ok=True))
+                                                          filtered=829, libtest_ok=True))
                     self.assertAlmostEqual(record['seconds'], .03)
 
     def test_invocation_evidence_rejects_missing_zero_and_unknown_records(self):

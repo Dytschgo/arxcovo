@@ -45,6 +45,30 @@ def safe(path, parent=None, directory=True):
     return m
 
 
+
+def trusted_tool(tool, record):
+    resolved = Path(shutil.which(tool) or '/missing').resolve()
+    # Only system paths are disclosed verbatim. Unexpected paths may contain
+    # private account names or caller data and are represented by a fixed label.
+    display = resolved.as_posix() if resolved.as_posix().startswith(
+        ('/usr/bin/', '/usr/sbin/', '/usr/local/bin/', '/usr/local/sbin/')) else '<outside-system-path>'
+    m = resolved.lstat()
+    def check(condition, predicate):
+        if not condition:
+            record('tool-refusal', tool=tool, resolved_path=display,
+                   uid=m.st_uid, gid=m.st_gid, mode=format(stat.S_IMODE(m.st_mode), '04o'),
+                   predicate=predicate)
+            raise Refusal('ToolOwnership')
+    try:
+        safe(resolved, directory=False)
+    except Refusal:
+        check(False, 'safe_regular_single_link_path')
+    check(m.st_uid == 0, 'owner_uid_root')
+    check(not m.st_mode & 0o022, 'not_group_or_other_writable')
+    check(resolved.as_posix().startswith(('/usr/bin/', '/usr/sbin/')), 'canonical_system_directory')
+    return resolved
+
+
 def digest(path):
     safe(path, directory=False)
     with open(path, 'rb') as f:
@@ -90,8 +114,9 @@ def terminal(output):
     protocol_records(output)
     result = counts(output)
     require(output.count(b'ARX_PASS selected=1 passed=1') == 1 and
-            result == dict(oracle_selected=1, oracle_passed=1, selected=1, passed=1, failed=0, ignored=0, measured=0,
-                           filtered=0, libtest_ok=True), 'MissingOracle')
+            all(result.get(key) == value for key, value in
+                dict(oracle_selected=1, oracle_passed=1, selected=1, passed=1, failed=0,
+                     ignored=0, measured=0, libtest_ok=True).items()), 'MissingOracle')
     require(len(re.findall(rb'ARX_PASS ', output)) == 1, 'MissingOracle')
     return result
 
@@ -501,9 +526,7 @@ class Harness:
         require(len(sys.argv) == 1 and sys.platform == 'linux' and platform.machine() == 'x86_64' and
                 os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly')
         for tool in ('docker', 'sudo', 'mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'readelf'):
-            resolved = Path(shutil.which(tool) or '/missing').resolve()
-            m = safe(resolved, directory=False)
-            require(m.st_uid == 0 and not m.st_mode & 0o022 and str(resolved).startswith(('/usr/bin/', '/usr/sbin/')), 'ToolOwnership')
+            trusted_tool(tool, self.record)
         self.command([sys.executable, '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
