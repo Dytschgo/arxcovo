@@ -242,6 +242,20 @@ PR188 as the last merge, that is superseded by this summary.
   pass (bound_start 9, bound_open 30, startup_recovery 23, startup_plan 5); static gate,
   fmt, Clippy, loader and SQLite controls pass. consensus.rs changes only by one module
   declaration; no frozen function touched. Exact-head review pending.
+- **Owner routing update (2026-11-20):** delegated engineering and review work now
+  runs on GPT-6.2 Sol at high effort ("use sol 6.2 high should be better"). The
+  coordinator stays on Claude Opus 5.5 high. If a 6.2 delegate is blocked, record it
+  and follow the fallback chain; counters are not reset.
+- **PR #199 merged** as `7aec97af` (custody 3b): campaign Q1 qualified in 3/6 rounds;
+  final docs-delta review PASS (`D:/Temp/arx-pr199-review6/review.md`, SHA256
+  `69ca0586…cf0`), all five gates green on head `435db1ba`, 13/13 custody cases.
+- **PR #201 runner recovery:** first CI 44755436039 had both macOS jobs cancelled with
+  zero steps, no assigned runner (runner_id 0) and the explicit annotation "The job
+  was not acquired by Runner of type hosted even after multiple attempts" (macOS
+  arm64 capacity notices). Standing pre-start recovery rule applied: request 1/4 at
+  14:55 UTC re-ran only the failed/cancelled jobs and dependent gates on the unchanged
+  head. The branch was then rebased onto main `7aec97af` (PROGRESS conflict resolved
+  by keeping both entries), so its CI and exact-head review restart on the new head.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
