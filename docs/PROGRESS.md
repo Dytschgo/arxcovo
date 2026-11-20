@@ -114,6 +114,35 @@ PR188 as the last merge, that is superseded by this summary.
   decisions: keep the old inspector's layout entry policy (zero-length WAL
   accepted) instead of tightening it, and keep the merged one-shot
   Inspect/Complete behaviour. Independent brief review pending.
+- **M3 slice 2, bound offline recovery (this PR):** Sol 6.1/high brief
+  `D:/Temp/arx-m3-step2/brief.md` (SHA256 `16f003e1…ab50`) after an independent
+  review requiring two clarifications. Coordinator decisions: keep the old
+  inspector's layout entry policy (zero-length WAL accepted) through
+  `Owner::inspect_validate`; keep one-shot Inspect/Complete. First Sol 6.1/high
+  builder stopped 3/3 at `26810029` (missing test import). Fresh stuck-rule review
+  (`D:/Temp/arx-m3-step2-stuck/review.md`, SHA256 `082c1059…9d04`): HOLD; ST1
+  import, ST2 false test precondition, SP1 collapsed refusal categories
+  (regression), SP2 missing five-name entry check, SP3 incomplete evidence; the
+  earlier two-connection failure was a test-oracle error. **Owner authorization
+  (2026-11-20):** new scoped builder for exactly those findings, fresh 3-attempt
+  budget. Second builder used 0/3, head `e202cc33`; report
+  `D:/Temp/arx-m3-step2-build2/report.md` SHA256 `85fe3e2c…cf3c`: recovery 23,
+  bound 29, startup-plan 4 pass; Clippy, fmt, static gate, loader 8 and SQLite
+  verifier 33 negative controls pass. Windows replacement/removal evidence is
+  sharing-denial prevention; Linux/macOS via hosted CI. Exact-head review pending.
+- **PR #197 merged** as `85eccce8` (custody 3a); main push CI 44717451865 green.
+  Review of `b4c66e97` PASS (`D:/Temp/arx-pr197-review2/review.md`, SHA256
+  `5d6f7dd1…b4`); crash durability recorded as unqualified.
+- **Custody 3b pins:** Sol 6.1/high proposal `D:/Temp/arx-custody-3b/pins.md`;
+  independent review GO with required changes (`D:/Temp/arx-custody-3b-review/review.md`,
+  SHA256 `e771b2e4…3f48`): separate create readiness from lifetime, account for
+  Docker's 64 MiB /dev/shm. Revised (SHA256 `28f882cb…e167`, `--shm-size 1m`,
+  readiness and 30 s lifetime deadlines). Coordinator adopted: digest-pinned
+  linux/amd64 base image, daemon/build UIDs 21001/21002, 1 CPU/256 MiB/64 PIDs/
+  128 FDs per node, 150 s step deadline with 20 s cleanup reserve, hosted-only
+  64 MiB loop-mounted ext4 fixture (sudo on the GitHub-hosted runner only, never
+  the owner PC; stop if unavailable), a two-line module declaration exception, and
+  one Linux-only CI step in the existing Rust worker.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
