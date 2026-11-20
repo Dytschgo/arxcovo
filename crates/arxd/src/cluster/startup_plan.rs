@@ -478,6 +478,24 @@ impl Owner {
         }
         self.recheck()
     }
+    /// Accept only the original fresh Join owner and its empty lock-only state.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn validate_fresh_join(&self) -> Result<()> {
+        self.recheck()?;
+        if self.plan.mode != Mode::Join || self.entries != ["cluster-owner.lock"] {
+            return Err(Refusal::Provenance);
+        }
+        let path = self.plan.state.join("cluster-owner.lock");
+        let guard = self
+            .guards
+            .iter()
+            .find(|guard| guard.path == path)
+            .ok_or(Refusal::Ownership)?;
+        if guard.id != object(&self.lock)? || !guard.read_at(0)?.is_empty() {
+            return Err(Refusal::Ownership);
+        }
+        Ok(())
+    }
     pub(super) fn fresh_baseline(&self) -> Result<()> {
         self.recheck()?;
         if self.entries != ["cluster-owner.lock"] || self.plan.mode != Mode::CreateFounder {

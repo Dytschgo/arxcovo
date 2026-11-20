@@ -163,10 +163,22 @@ pub(in crate::cluster) enum ExchangeError {
     PossibleEffect,
 }
 
-/// Bounded protocol data from a completed authenticated exchange.
+// Constructed only by the consuming client after the Result and clean end.
 pub(in crate::cluster) struct Completed {
     voters: BoundVoters,
     reply: Reply,
+    #[cfg(target_os = "linux")]
+    binding: JoinBinding,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+pub(in crate::cluster) struct JoinBinding {
+    pub cluster: ClusterId,
+    pub code: crate::cluster::enrollment::CodeId,
+    pub root: [u8; 32],
+    pub request: RequestId,
+    pub csr: [u8; 32],
 }
 
 impl Completed {
@@ -177,22 +189,87 @@ impl Completed {
     pub(in crate::cluster) fn reply(&self) -> &Reply {
         &self.reply
     }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::cluster) fn for_join(self, expected: &JoinBinding) -> Result<Self, Refused> {
+        if &self.binding != expected {
+            return Err(Refused);
+        }
+        Ok(self)
+    }
 }
 
-/// A single checked operation using the caller's original code. The socket, TLS
-/// state and plaintext never escape this function, including on failure.
-pub(in crate::cluster) async fn exchange(
+/// Sole client continuation. It owns the socket and cannot be cloned or resumed.
+pub(in crate::cluster) struct AnchoredClient {
+    socket: tokio_rustls::client::TlsStream<QuotaSocket>,
+    code: JoinCode,
+    voters: BoundVoters,
+    challenge: [u8; 16],
+    deadline: Instant,
+}
+
+impl AnchoredClient {
+    pub(in crate::cluster) async fn redeem(
+        self,
+        request: RequestId,
+        csr: &[u8],
+    ) -> Result<Completed, ExchangeError> {
+        let Self {
+            mut socket,
+            code,
+            voters,
+            challenge,
+            deadline,
+        } = self;
+        let frame = session::redeem_frame(&code, request, challenge, csr)
+            .map_err(|_| ExchangeError::Refused)?;
+        if Instant::now() >= deadline {
+            return Err(ExchangeError::Refused);
+        }
+        session::nothing_pending(&mut socket)
+            .await
+            .map_err(|_| ExchangeError::Refused)?;
+        if Instant::now() >= deadline {
+            return Err(ExchangeError::Refused);
+        }
+
+        // From the first attempted write onward, errors may hide an issuer effect.
+        timeout_at(deadline, async {
+            socket.write_all(&frame).await.map_err(|_| Refused)?;
+            socket.shutdown().await.map_err(|_| Refused)?;
+            let reply = session::receive_result(&mut socket).await?;
+            if Instant::now() >= deadline {
+                return Err(Refused);
+            }
+            Ok(Completed {
+                voters,
+                reply,
+                #[cfg(target_os = "linux")]
+                binding: JoinBinding {
+                    cluster: code.cluster(),
+                    code: code.code_id(),
+                    root: code.ca_fingerprint(),
+                    request,
+                    csr: Sha256::digest(csr).into(),
+                },
+            })
+        })
+        .await
+        .map_err(|_| ExchangeError::PossibleEffect)?
+        .map_err(|_| ExchangeError::PossibleEffect)
+    }
+}
+
+pub(in crate::cluster) async fn anchor(
     address: SocketAddr,
     code: &JoinCode,
     root: &[u8],
     time: Arc<dyn TimeProvider>,
-    request: RequestId,
-    csr: &[u8],
     limits: SocketLimits,
-) -> Result<Completed, ExchangeError> {
+) -> Result<AnchoredClient, ExchangeError> {
     let deadline = Instant::now() + SOCKET_BUDGET;
     let config = client_config(code, root, time).map_err(|_| ExchangeError::Refused)?;
-    let (mut socket, voters, redeem) = timeout_at(deadline, async {
+    timeout_at(deadline, async {
         let tcp = TcpStream::connect(address).await.map_err(|_| Refused)?;
         tcp.set_nodelay(true).map_err(|_| Refused)?;
         let mut socket = TlsConnector::from(Arc::new(config))
@@ -212,34 +289,37 @@ pub(in crate::cluster) async fn exchange(
         socket.flush().await.map_err(|_| Refused)?;
         let (challenge, voters) = session::receive_anchor(&mut socket).await?;
         check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
-        // The Anchor reply must end its phase: no extra or out-of-order frame.
         session::nothing_pending(&mut socket).await?;
-        Ok((
-            socket,
-            voters,
-            session::redeem_frame(code, request, challenge, csr)?,
-        ))
-    })
-    .await
-    .map_err(|_| ExchangeError::Refused)?
-    .map_err(|_: Refused| ExchangeError::Refused)?;
-    if Instant::now() >= deadline {
-        return Err(ExchangeError::Refused);
-    }
-
-    // From the first attempted write onward, errors may hide an issuer effect.
-    timeout_at(deadline, async {
-        socket.write_all(&redeem).await.map_err(|_| Refused)?;
-        socket.shutdown().await.map_err(|_| Refused)?;
-        let reply = session::receive_result(&mut socket).await?;
         if Instant::now() >= deadline {
             return Err(Refused);
         }
-        Ok(Completed { voters, reply })
+        Ok(AnchoredClient {
+            socket,
+            code: code.clone(),
+            voters,
+            challenge,
+            deadline,
+        })
     })
     .await
-    .map_err(|_| ExchangeError::PossibleEffect)?
-    .map_err(|_| ExchangeError::PossibleEffect)
+    .map_err(|_| ExchangeError::Refused)?
+    .map_err(|_: Refused| ExchangeError::Refused)
+}
+
+/// Compatibility entry for the existing closed-exchange callers.
+pub(in crate::cluster) async fn exchange(
+    address: SocketAddr,
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+    request: RequestId,
+    csr: &[u8],
+    limits: SocketLimits,
+) -> Result<Completed, ExchangeError> {
+    anchor(address, code, root, time, limits)
+        .await?
+        .redeem(request, csr)
+        .await
 }
 
 // Preserve the in-memory probe for the existing frozen test callers.

@@ -399,3 +399,8 @@ pub(super) use linux::{check_retained, store};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) fn refuse_storage_at(owner: &mut Owner, operation: &'static str) {
+    owner.publication.fault = Some((operation, false));
+}
