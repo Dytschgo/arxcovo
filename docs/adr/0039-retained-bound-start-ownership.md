@@ -42,8 +42,9 @@ availability/memory for retention and supports repeated observation.
 
 Ordinary tests exercise real production preparation/transfer, SQLite failures,
 unwind, real locks, cross-process probes, synchronization and the outer close
-policy. The cfg(test) driver boundary returns before the Engine block on every
-platform; releasing test barriers cannot continue into Engine. Policy tests are
+policy. The cfg(test) driver boundary returns before Engine unless the job carries the
+private step 5b test witness. Releasing the existing test barriers cannot
+continue into Engine. Policy tests are
 not Engine acceptance. No service activation, Found, issuance, transport,
 publication, Engine/shutdown/Owners repair, tuning or workflow change.
 
@@ -53,3 +54,30 @@ inventory. First hosted CI costs are pending; no rerun-to-green is authorized.
 Engine Sol 3/3 exhausted; historical Opus 0/2 unchanged. New-source budget is
 separate. Runtime step 5b, publication composition and hardware acceptance remain
 open. Native/multi-host paths are **unverified on real hardware**.
+
+## Step 5b ordinary CI test amendment (2026-11-20)
+
+The owner replaced the one-shot observation with an ordinary cross-platform
+library test in the default CI selection. The test
+bound_start_real_engine_start_close is the sole caller of the private witness
+constructor. The witness applies to its own job. The other tests and production
+callers keep their respective paths through the same driver.
+
+The test uses a fresh private fixture and the original outer Owner and SQLite
+connections. It runs the shared Engine constructor once on an uninitialized
+node with a counted in-memory network. A test-only gate holds the startup
+worker at EngineMayExist until the test drops its observer. The test waits for
+the job's startup completion signal with no observer, recovers the retained node
+and requests close once through the existing shutdown path. It checks the joined
+startup and close workers, Engine shutdown and store release proofs. The two
+store locks must be free while the outer lock is still held, then the outer lock
+must be acquirable after deliberate disposal. The ten-second timeout bounds the
+cooperative async wait. A blocking worker can outlive that wait and delay runtime
+teardown. The CI job timeout is the outer bound. The production five-second
+shutdown deadline remains in force.
+
+The fixture does not run Found, Raft initialization, proposals, signing,
+publication or listeners. Existing CI workflow and quarantine guards are
+unchanged. Independent review and required checks still apply. Historical
+Engine repair counters remain Sol 3/3 and Opus 0/2. Service and multi-host paths
+remain **unverified on real hardware**.

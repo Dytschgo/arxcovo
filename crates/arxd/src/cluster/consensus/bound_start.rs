@@ -44,6 +44,8 @@ pub(super) struct Job {
     close: Notify,
     #[cfg(test)]
     gate: Mutex<Option<PreparationPause>>,
+    #[cfg(test)]
+    startup_finished: Notify,
 }
 pub(super) struct Observer(watch::Receiver<Status>);
 impl Observer {
@@ -80,6 +82,8 @@ impl Job {
             close: Notify::new(),
             #[cfg(test)]
             gate: Mutex::new(None),
+            #[cfg(test)]
+            startup_finished: Notify::new(),
         }))
     }
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -96,6 +100,10 @@ impl Job {
         }
         s.status = status;
         self.changed.send_replace(status);
+        #[cfg(test)]
+        if matches!(status, Status::Running | Status::Unconfirmed) {
+            self.startup_finished.notify_one();
+        }
     }
     pub(super) fn observe(&self) -> Observer {
         Observer(self.changed.subscribe())
@@ -214,8 +222,34 @@ where
     N: RaftNetworkFactory<Arx> + Send + 'static,
     N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
 {
+    let (job, observer, _) = dispatch(
+        plan,
+        intent,
+        expected,
+        params,
+        network,
+        #[cfg(test)]
+        None,
+    );
+    (job, observer)
+}
+
+fn dispatch<N>(
+    plan: Plan,
+    intent: StartIntent,
+    expected: Option<ExpectedIdentity>,
+    params: Params,
+    network: N,
+    #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
+) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
+where
+    N: RaftNetworkFactory<Arx> + Send + 'static,
+    N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
+{
     let job = Job::anchor();
     let observer = job.observe();
+    #[cfg(test)]
+    let supervisor_witness = witness.clone();
     let driver = tokio::spawn(async move {
         let node_id = intent.node.get();
         let prepared = tokio::task::spawn_blocking(move || {
@@ -223,13 +257,37 @@ where
         })
         .await;
         if prepared.is_err() {
+            #[cfg(test)]
+            if let Some(w) = &witness {
+                w.fail("preparation_join");
+            }
             job.set(Status::Unconfirmed);
             return;
         }
+        #[cfg(test)]
+        let original = if let Some(w) = &witness {
+            let proof = w.prepared(&job.state());
+            match proof {
+                Ok(pointers) => Some(pointers),
+                Err(reason) => {
+                    w.fail(reason);
+                    job.set(Status::Unconfirmed);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if job.state().status == Status::Prepared {
             let config = match params.config() {
                 Ok(c) => Arc::new(c),
                 Err(_) => {
+                    #[cfg(test)]
+                    if let Some(w) = &witness {
+                        w.fail("config");
+                        job.set(Status::Unconfirmed);
+                        return;
+                    }
                     job.set(Status::Refused);
                     job.close.notified().await;
                     if job.begin_close() {
@@ -239,18 +297,28 @@ where
                 }
             };
             if job.transfer().is_err() {
+                #[cfg(test)]
+                if let Some(w) = &witness {
+                    w.fail("transfer");
+                }
                 job.set(Status::Unconfirmed);
                 return;
             }
-            // Test execution is structurally stopped before Engine; releasing a
-            // test pause cannot cause a background Engine continuation.
+            // Only the test-owned witness can pass the test-build stop.
             #[cfg(test)]
-            {
-                let _ = (&config, &network, node_id);
-                job.set(Status::Prepared);
-                return;
-            }
-            #[cfg(not(test))]
+            let startup_release = {
+                let Some((w, original)) = witness.as_ref().zip(original) else {
+                    job.set(Status::Prepared);
+                    return;
+                };
+                let proof = w.transferred(&job.state(), original);
+                if let Err(reason) = proof {
+                    w.fail(reason);
+                    job.set(Status::Unconfirmed);
+                    return;
+                }
+                w.take_startup_release()
+            };
             {
                 let (ls, sm) = job.state().adapters.as_ref().unwrap().clone();
                 let log_released = ls.0.lock().unwrap().released();
@@ -259,6 +327,9 @@ where
                 let sm_weak = Arc::downgrade(&sm.0);
                 job.set(Status::EngineMayExist);
                 let startup = tokio::spawn(async move {
+                    // Hold the published boundary until the test drops its observer.
+                    #[cfg(test)]
+                    startup_release.await.map_err(|_| ())?;
                     let raft = Engine::new(node_id, config, network, ls, sm.clone())
                         .await
                         .map_err(|_| ())?;
@@ -266,6 +337,8 @@ where
                         id: node_id,
                         issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
                         read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
+                        #[cfg(test)]
+                        read_blocking: Arc::default(),
                         raft: Some(raft),
                         sm: Some(sm),
                         log_released,
@@ -281,6 +354,10 @@ where
                 })
                 .await;
                 if !matches!(startup, Ok(Ok(()))) {
+                    #[cfg(test)]
+                    if let Some(w) = &witness {
+                        w.fail("startup_join");
+                    }
                     job.set(Status::Unconfirmed);
                     return;
                 }
@@ -304,14 +381,47 @@ where
                     && node.sm_released.is_set()
                     && node.log_weak.upgrade().is_none()
                     && node.sm_weak.upgrade().is_none();
-                (result, actual, released)
+                #[cfg(test)]
+                let owners_drained = node
+                    .owners
+                    .lock()
+                    .is_ok_and(|owners| owners.closed && owners.set.is_empty());
+                (
+                    result,
+                    actual,
+                    released,
+                    #[cfg(test)]
+                    owners_drained,
+                )
             })
             .await;
             match closed {
-                Ok((result, actual, released)) => {
+                Ok(closed) => {
+                    #[cfg(test)]
+                    let (result, actual, released, owners_drained) = closed;
+                    #[cfg(not(test))]
+                    let (result, actual, released) = closed;
+                    #[cfg(test)]
+                    if let Some(w) = &witness
+                        && result.is_ok()
+                    {
+                        if actual && released && owners_drained {
+                            w.finish_close(job, actual);
+                        } else {
+                            w.fail("Engine join or store/owner release proof");
+                            job.finish_close(None, false, actual);
+                        }
+                        return;
+                    }
                     job.finish_close(result.err().map(|e| e.0), released, actual);
                 }
-                Err(_) => job.finish_close(None, false, false),
+                Err(_) => {
+                    #[cfg(test)]
+                    if let Some(w) = &witness {
+                        w.fail("close_join");
+                    }
+                    job.finish_close(None, false, false);
+                }
             }
         } else {
             // Only a proven pre-Engine refusal is disposable. No absent-node
@@ -319,13 +429,20 @@ where
             job.finish_close(None, true, false);
         }
     });
-    tokio::spawn(async move {
+    let supervisor = tokio::spawn(async move {
         if driver.await.is_err() {
+            #[cfg(test)]
+            if let Some(w) = &supervisor_witness {
+                w.fail("driver_join");
+            }
             job.set(Status::Unconfirmed);
         }
     });
-    (job, observer)
+    (job, observer, supervisor)
 }
+
+#[cfg(test)]
+mod engine_tests;
 
 #[cfg(test)]
 mod tests;
