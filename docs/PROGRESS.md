@@ -219,7 +219,7 @@ PR188 as the last merge, that is superseded by this summary.
   budget first makes the preflight report the failing tool and rule (sanitized),
   fixes the parser, then fixes the ownership cause only within a safe rule, and
   stops and reports if the hosted runner cannot qualify.
-- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route and
+- **Custody 3b (#199) update (historical; superseded by the later #199 entries and the merge below):** amendment A1 (exact sudo-rs target with full route and
   ancestor checks) implemented and validated on the runner; preflight then refused the
   uutils multicall `mkdir` (116 links). Amendment A2 (closed role-to-target map, ancestor
   checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
