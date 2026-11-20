@@ -256,34 +256,6 @@ PR188 as the last merge, that is superseded by this summary.
   14:55 UTC re-ran only the failed/cancelled jobs and dependent gates on the unchanged
   head. The branch was then rebased onto main `7aec97af` (PROGRESS conflict resolved
   by keeping both entries), so its CI and exact-head review restart on the new head.
-- **PR #201 merged** as `99076134` (step 5a). Final Sol 6.2/high review PASS
-  (`D:/Temp/arx-pr201-review3/review.md`, SHA256 `a557cdaf…f9`): 13 founder tests on
-  each platform, hosted suites 862/858/810. Step 5a builder budget 3/3 used across two
-  builders; the final attempt passed.
-- **M3 step 5b observation harness (this PR):** design `D:/Temp/arx-m3-step5b/design.md`
-  (SHA256 `02630407…cd52`); independent review HOLD (`D:/Temp/arx-m3-step5b-review/review.md`,
-  SHA256 `49ff208d…7460`): the harness needs its own authority, plus absolute deadlines
-  and closing the Job custody gap. **Owner authorization (2026-11-20):** source-only
-  build of one ignored Windows test plus a one-shot launcher; the test-only Engine
-  exception can be armed only by that test; CI and default selection never run it;
-  no Engine run while building or reviewing. First Sol 6.2/high builder stopped 3/3
-  (WIP `183a4ff4`); stuck-rule review (`D:/Temp/arx-m3-step5b-stuck/review.md`, SHA256
-  `4b6b8592…d803`) confirmed four launcher findings. **Owner authorization
-  (2026-11-20):** new builder, fresh 3 attempts, used 0/3, head `caf0e278`; report
-  `D:/Temp/arx-m3-step5b-build2/report.md` SHA256 `60df01b0…144`: independent Job
-  watchdog (armed before preflight, 89.75 s), natural exit preserved, guard refusals
-  recorded as Unconfirmed, contradictory terminal output rejected; 68 non-Engine tests,
-  21 launcher tests, static 151/3 skipped, fmt, Clippy, loader and SQLite verifier pass.
-  The observation case is listed as ignored (853 -> 854 total, 36 -> 37 ignored), and
-  default Cargo and nextest skip it. It has never run. Running it once is a separate
-  owner decision on the exact reviewed head.
-- **Owner decisions (2026-11-20):** D4 target-authorized delegation (host B trusts A's
-  authenticated assertions only for agents B explicitly grants; single-use admission;
-  Unknown when execution or cleanup cannot be confirmed; B's standard build identity);
-  D3 one LAN or Tailscale address per one-paste code (new code if unreachable). Steps
-  6-8 plan `D:/Temp/arx-m3-steps6to8/plan.md` (SHA256 `00132578…d29d`); step 7a (closed
-  same-connection enrollment, outside D6) is being built in worktree
-  `D:/ArxcovoData/wt/step7a`.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
