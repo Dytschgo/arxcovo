@@ -1,21 +1,30 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 20:00 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 19:01 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
-PR188 as the last merge, that is superseded by this summary.
+PR188 as the last merge, that is superseded by this summary. Inside this block,
+entries for named PRs (#196–#204) that say "this PR", "review pending" or "builder
+has N attempts left" are historical checkpoints for those PRs; all of them have
+merged, as listed under "Merged this session".
 
 - **Routing (owner, 2026-11-19):** coordination moved to Claude Opus 5.5/high
-  because the provider rejected every Sol coordinator turn. Sol 6.1 remains the
-  route for engineering and independent reviews; Claude for UI; one independent
-  reviewer per PR; at most two builders and one reviewer; coordinator-only merge.
-  Fallback chain when an agent is blocked or fails: Sol → Opus → Fable →
+  because the provider rejected every Sol coordinator turn. Since 2026-11-20,
+  Sol 6.2/high is the route for engineering, architecture, security and independent
+  reviews; Claude for UI; one independent reviewer per PR; at most two builders and
+  one reviewer; coordinator-only merge.
+  Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `c10fff18` (PR204), push CI 44796954728 running at this update.
-  Previous main `5f95238c` (PR202) push CI 44795394326 green; `cc553586` (PR203)
-  green.
+- **Main:** `c10fff18` (PR204), push CI 44796954728 **red**: Ubuntu Rust job
+  136498866204 failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
+  (`Err("receiver reservation")`). The fixture binds hard-coded loopback ports
+  43181–43188, inside Linux's ephemeral range; a concurrent bind is the likely cause
+  (unconfirmed). Not touched by PR204. No rerun; a test-fixture-only repair PR
+  (ephemeral ports, Sol 6.2/high, fresh 3) is in progress, and merges wait for green
+  main. Previous main `5f95238c` (PR202) push CI 44795394326 green; `cc553586`
+  (PR203) push CI 44791739561 green.
 - **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
   commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
   e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
@@ -34,8 +43,10 @@ PR188 as the last merge, that is superseded by this summary.
   Sol 6.2 routing, D3/D4), PR202 `5f95238c` (step 5b, ordinary CI test of the real
   Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
   enrollment protocol). Every merge had an independent exact-head Sol
-  review (6.1, later 6.2), all five required gates green and green main rechecked
-  immediately before a head-guarded squash merge.
+  review (6.1, later 6.2), all five required gates green and a head-guarded squash
+  merge; green main was rechecked immediately before each merge except PR194, the
+  mitigation merged with green PR gates while main at `92003177` was red (its first
+  main push run 44608721122 restored green).
 - **Open failures (cause unknown, traces now on main):** Windows founder
   five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
   PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
@@ -234,7 +245,7 @@ PR188 as the last merge, that is superseded by this summary.
   in one run) independently reviewed GO with required changes and committed to the pins.
   The fourth builder has one attempt left.
 - **M3 step 5a, retained bound-start ownership (PR #201):** crosses the recorded D6
-  hold (Engine fix counters Sol 3/3 and Opus 0/2 exhausted). Sol 6.1/high design
+  hold (Engine Sol 3/3 exhausted and historical Opus 0/2 unchanged under the D6 hold). Sol 6.1/high design
   `D:/Temp/arx-m3-step5/design.md` (SHA256 `a357af50…767f`). **Owner authorization
   (2026-11-20), 5a only:** source-only plumbing (single forward-only bound
   inspection-to-start acquisition, one-time store transfer into unchanged
@@ -268,8 +279,9 @@ PR188 as the last merge, that is superseded by this summary.
   was circling: (1) trivial check fixes (formatting, whitespace, lint, missing import)
   no longer consume builder attempts; (2) coordinator PROGRESS updates go in docs-only
   PRs, not inside code PRs; (3) step 5b drops the one-shot launcher in favour of an
-  ordinary CI test of the real Engine start/close (no founding). PR #202 still carries
-  the superseded launcher version until its builder pushes the rework. Earlier
+  ordinary CI test of the real Engine start/close (no founding). At the time of the
+  owner decision PR #202 still carried the superseded launcher; the merged version
+  uses the ordinary CI test described below. Earlier
   design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. AGENTS.md
   updated in this docs PR.
 - **Owner decisions D3/D4 (2026-11-20):** D4 target-authorized delegation (host B
@@ -310,8 +322,15 @@ PR188 as the last merge, that is superseded by this summary.
   are **unverified on real hardware**.
 - **Next M3 work:** per `D:/Temp/arx-m3-steps6to8/plan.md`, step 6/4b (real founder
   caller, gated credential publication and attach) is next. It invokes frozen
-  `found()` on hosted Linux and so needs the plan's explicit owner grant across D6
-  before any build starts.
+  `found()` on hosted Linux and so needs the plan's explicit owner grant across D6.
+  **Owner grant (2026-11-20):** "Authorize the step 6/4b source fence and the
+  specifically enumerated disposable hosted-Linux observations of retained bound
+  start, one unchanged Found per named fixture, gated credential publication, attach
+  and owned close. Keep Engine, Owners, founder and issuance internals frozen. Stop
+  and preserve the first frozen-path refusal. This grants no repair, diagnostic rerun
+  or Windows founder run." Enumerated: O1 one Linux-only integrated positive test; O2
+  optional up to four Linux-only clock-site tests, each named in the PR. Sol 6.2/high
+  builder, fresh 3-attempt budget, in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
