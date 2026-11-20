@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 19:47 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 21:29 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,8 +17,15 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `57fc3fc8` (PR207), push CI 44804068081 green. `26704348` (PR206) push
-  CI 44800339696 green. Earlier main
+- **Main:** `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
+  44813492071 green. `9bfaedb5` (PR208) push CI 44809310046 was **red**: Ubuntu Rust
+  job 136541460939 failed `issuance_publication::tests::files::publication_wrong_context_and_origin`
+  (tests.rs:500). Its negative-mutation loop wrote a fixed byte 99 into random
+  key/CA/cluster/anchor bytes, a no-op when the byte already was 99 (about 1/256 per
+  field); the test came with PR200, not PR208. No rerun. Repair PR209 (Sol 6.2/high,
+  0/3 counted, test-only) merged as the third red-main repair.
+  `57fc3fc8` (PR207) push CI 44804068081 and `26704348` (PR206) push CI 44800339696
+  green. Earlier main
   `c10fff18` (PR204) push CI 44796954728 was **red**: Ubuntu Rust job 136498866204
   failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
   (`Err("receiver reservation")`) binding hard-coded loopback port 43186, inside
@@ -47,12 +54,16 @@ merged, as listed under "Merged this session".
   Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
   enrollment protocol), PR206 `26704348` (test fixture: ephemeral ports for the
   peer learner tests), PR207 `57fc3fc8` (step 6/4b, founder caller, gated
-  publication and attach). Every merge had an independent exact-head Sol
+  publication and attach), PR205 `2fde0f0b` (docs), PR208 `9bfaedb5` (step 7b,
+  enrollment through the actual issuer), PR209 `620a5254` (test: publication mutations
+  always change the value), PR210 `60ffb68a` (step 8a codec-only: one-paste transfer
+  and owner-boundary refusals). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
-  merge; green main was rechecked immediately before each merge except the two red-main repairs:
+  merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
-  push run 44608721122 restored green), and PR206 (main `c10fff18` red; push run
-  44800339696 restored green).
+  push run 44608721122 restored green), PR206 (main `c10fff18` red; push run
+  44800339696 restored green) and PR209 (main `9bfaedb5` red; push run 44813492071
+  restored green).
 - **Open failures (cause unknown, traces now on main):** Windows founder
   five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
   PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
@@ -360,8 +371,45 @@ merged, as listed under "Merged this session".
   Redeem through the actual enroll() over the 7a TLS protocol, returning a matching
   signed leaf and original E, then owned joined close. Do not modify Engine, Owners,
   found, issue, anchor_query internals or their deadlines. No Windows founding run.
-  Stop and preserve the first founding or issuing refusal; no repair or rerun." Sol
-  6.2/high builder, fresh 3-attempt budget, in progress.
+  Stop and preserve the first founding or issuing refusal; no repair or rerun." The
+  Sol 6.2/high builder stopped at the source fence: frozen `enroll()` needs a
+  `RedeemProof`, whose only constructor hashes the join secret the server never
+  receives. **Coordinator fence amendment A1 (2026-11-20):** one enrollment-scoped
+  `RedeemProof` constructor from the 32 wire proof bytes in `enrollment/code.rs`,
+  called only by `session.rs` on the authorized Redeem continuation; nothing else in
+  that file. Attempt ruling: the missing Linux archive tool counted; the fence stop did
+  not (the builder stopped as instructed), so 1/3 counted. **PR #208 merged** as
+  `9bfaedb5`: P1 `retained_issuer_serves_actual_enrollment_and_joins_before_shutdown`
+  passed on hosted Ubuntu in 0.155 s (run 44806479565, job 136531705196); final report
+  `D:/Temp/arx-m3-step7b/report.md` SHA256 `0b6abf57…e907`; main refresh `77e3ce58` with a
+  byte-identical patch; review PASS (`D:/Temp/arx-pr208-review/review.md`, SHA256
+  `bd153675…36e6`) with one P3 follow-up (on a frozen-path refusal the P1 fixture can exit
+  before observing owned close); agent-review status 59509477670.
+- **Step 8a (owner grant, 2026-11-20):** one Linux-only hosted test (one Found, one
+  owner Mint over an authenticated owner-local channel, agent and build-user denial),
+  or, if no such channel to the retained job exists, only the transfer codec and
+  owner-boundary refusal tests with the live route deferred to step 13. The builder
+  found no such channel (the Windows OwnerGuard and Unix root gate reach only the
+  service manager and configuration; the daemon's local listener authenticates MCP
+  agents) and shipped the fallback. **PR #210 merged** as `60ffb68a`: `arxje1`
+  one-paste format (one LAN or Tailscale address per D3, original CA bytes, `arxj2`
+  credential), owner-boundary refusals and ADR 0040; no Engine test; 1/3 counted
+  (report `D:/Temp/arx-m3-step8a/report.md` SHA256 `584e46ee…4be2`); main refresh `f931cf94`,
+  byte-identical; review PASS (`D:/Temp/arx-pr210-review/review.md`, SHA256 `02b92a44…f7be`),
+  agent-review status 59512495956. Step 13 follow-ups: an authenticated owner-local
+  channel to the retained job, a positive owner Mint and build-user denial.
+- **PR #209 (red-main repair):** report `D:/Temp/arx-fixmut/report.md` SHA256 `4129b0ba…2916`;
+  review PASS (`D:/Temp/arx-pr209-review/review.md`, SHA256 `d364ed10…3f6b`); agent-review
+  status 59511689538.
+- **Step 8b (owner grant, 2026-11-20):** "Authorize one enumerated hosted-Linux 8b
+  durable-join campaign over the reviewed 7b issuer on a named retained fixture: one
+  founder setup (one Found), a fixture Mint in place of the deferred 8a owner Mint, a
+  genuine same-connection join, and the listed reuse and lost-reply observations. The
+  new host runs no Engine. Permit only the named Mint, AnchorQuery and Redeem
+  invocations on the issuer. Do not modify Engine, Owners, found, issue, anchor_query
+  internals or their deadlines. No Windows founding run. Preserve the first frozen-path
+  refusal, with no repair, re-run or budget reset." Sol 6.2/high builder, fresh
+  3-attempt budget, in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
