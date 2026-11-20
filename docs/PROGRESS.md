@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-19 21:30 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 20:00 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -12,8 +12,10 @@ PR188 as the last merge, that is superseded by this summary.
   reviewer per PR; at most two builders and one reviewer; coordinator-only merge.
   Fallback chain when an agent is blocked or fails: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
-  must stay independent of the builder. No Sol delegate was blocked this session.
-- **Main:** `99076134` (PR201), push CI 44763436707 attempt 1 green.
+  must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
+- **Main:** `c10fff18` (PR204), push CI 44796954728 running at this update.
+  Previous main `5f95238c` (PR202) push CI 44795394326 green; `cc553586` (PR203)
+  green.
 - **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
   commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
   e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
@@ -28,7 +30,10 @@ PR188 as the last merge, that is superseded by this summary.
   codec and CA loading), PR198 `be197a25` (step 2, bound offline recovery),
   PR200 `e9e44c91` (step 4a, credential publication storage), PR199 `7aec97af`
   (step 3b, hosted distinct-UID custody qualification), PR201 `99076134` (step 5a,
-  retained bound-start ownership). Every merge had an independent exact-head Sol
+  retained bound-start ownership), PR203 `cc553586` (docs: owner process rules,
+  Sol 6.2 routing, D3/D4), PR202 `5f95238c` (step 5b, ordinary CI test of the real
+  Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
+  enrollment protocol). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and green main rechecked
   immediately before a head-guarded squash merge.
 - **Open failures (cause unknown, traces now on main):** Windows founder
@@ -39,7 +44,7 @@ PR188 as the last merge, that is superseded by this summary.
   Opus 0/2 unchanged; e7 family 1/3.
 - **Risk:** Windows Rust job margin under its 12 minute timeout is thin since
   PR194 (10m36s once; later main runs 8m53s, 9m25s, 6m14s, 5m05s).
-- **Next M3 work:** Sol 6.1/high read-only plan
+- **Earlier M3 slice plan (superseded by steps 6–8 below):** Sol 6.1/high read-only plan
   `D:/Temp/arx-m3-next-slice/plan.md` (SHA256 `4111c9ca…a1`): 16 ordered
   one-PR slices to the three-container acceptance. Next: store-only bound SQLite
   store construction (ADR 0035 second slice), no Engine/startup/deadline change.
@@ -272,10 +277,41 @@ PR188 as the last merge, that is superseded by this summary.
   use; Unknown when execution or cleanup is unconfirmed; B's standard build identity).
   D3 one LAN or Tailscale address per one-paste code. Plan
   `D:/Temp/arx-m3-steps6to8/plan.md` (SHA256 `00132578…d29d`).
-- **In progress:** PR #202 (step 5b as an ordinary test) and step 7a (closed
-  same-connection enrollment, outside D6; first builder stopped 3/3, stuck-rule review
-  `D:/Temp/arx-m3-step7a-stuck/review.md` SHA256 `790606e7…013a` found test-fixture
-  causes plus a result-sealing P1; owner authorized a new builder).
+- **PR #202 merged** as `5f95238c` (step 5b): ordinary CI test
+  `bound_start_real_engine_start_close` (real bound preparation, one Engine::new,
+  observer detached at the Engine boundary, owned completion, one close through
+  unchanged shutdown with release, weak-ref and lock proofs; no founding). Review 3
+  HOLD on two test findings (`D:/Temp/arx-pr202-review3/review.md`, SHA256
+  `aef66df4…7421`); Sol 6.2 builder fixed both in attempt 1/3 (`7a2448fc`, report
+  `D:/Temp/arx-pr202-fix1/report.md` SHA256 `035977d4…8569`); review 4 PASS
+  (`D:/Temp/arx-pr202-review4/review.md`, SHA256 `90089769…9f6c`). Strict protection
+  required a main refresh: merge commit `3ee98785` with a byte-identical PR patch,
+  re-verified by the same reviewer, agent-review status 59501963396. Step 5 closed for
+  this observed scope; Engine counters Sol 3/3 and Opus 0/2 unchanged.
+- **PR #204 merged** as `c10fff18` (step 7a, outside D6). After the stuck-rule
+  review the owner-authorized builder reached `f5abf8ff`; exact-head review
+  (`D:/Temp/arx-pr204-review/review.md`, SHA256 `990d3cc3…9d74`) held on one spec P2:
+  the client could release Redeem with an unexpected frame already buffered after the
+  valid Anchor. **Provider block (2026-11-20):** the Sol 6.2 fix delegate was refused
+  by the provider ("flagged for possible cybersecurity risk"); no change was made and
+  no attempt consumed. Per the fallback chain an Opus 5.5/high builder took the last
+  attempt (3/3) and added the pending-frame check plus a loopback TLS test
+  (`b8f67643`, report `D:/Temp/arx-m3-step7a-3/report.md` SHA256 `5f8d37f4…5024`).
+  Review 2 (`D:/Temp/arx-pr204-review2/review.md`, SHA256 `10c0eadb…1e5a`) held: Tokio's
+  cooperative budget could make the single poll return Pending without checking the
+  socket. **Owner decision (2026-11-20):** a new scoped Sol 6.2 builder (fresh 3) for
+  exactly an unconstrained poll plus an honest comment; the owner **accepts as
+  inherent** that data still in flight can arrive after the check (the client refuses
+  it at its next read). Builder `11e75b11` passed in attempt 1/3 with a deterministic
+  exhausted-budget test (report `D:/Temp/arx-m3-step7a-4/report.md` SHA256
+  `fb9dc74e…2d22`). Main refresh `b7691e35` (byte-identical patch); review 3 PASS with
+  zero findings (`D:/Temp/arx-pr204-review3/review.md`, SHA256 `1db2d432…b59c`),
+  agent-review status 59502799642. Live issuance, durable join and multi-host paths
+  are **unverified on real hardware**.
+- **Next M3 work:** per `D:/Temp/arx-m3-steps6to8/plan.md`, step 6/4b (real founder
+  caller, gated credential publication and attach) is next. It invokes frozen
+  `found()` on hosted Linux and so needs the plan's explicit owner grant across D6
+  before any build starts.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
