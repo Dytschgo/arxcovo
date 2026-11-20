@@ -153,7 +153,9 @@ impl ClusterCa {
         Self {
             issuer: Issuer::new(params, key),
             cert_der,
-            not_before_s: nb,
+            // Preserve the legacy upper-only policy for this test-only issuer.
+            // Production generate/load retain the certificate's actual lower bound.
+            not_before_s: i64::MIN,
             not_after_s: nb + validity_s,
             signs: std::sync::atomic::AtomicUsize::new(0),
             conversion_attempts: std::sync::atomic::AtomicUsize::new(0),
