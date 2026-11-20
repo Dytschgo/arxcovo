@@ -329,9 +329,10 @@ merged, as listed under "Merged this session".
   zero findings (`D:/Temp/arx-pr204-review3/review.md`, SHA256 `1db2d432…b59c`),
   agent-review status 59502799642. Live issuance, durable join and multi-host paths
   are **unverified on real hardware**.
-- **Next M3 work:** per `D:/Temp/arx-m3-steps6to8/plan.md`, step 6/4b (real founder
-  caller, gated credential publication and attach) is next. It invokes frozen
-  `found()` on hosted Linux and so needs the plan's explicit owner grant across D6.
+- **Step 6/4b (PR #207):** The plan at `D:/Temp/arx-m3-steps6to8/plan.md` specified
+  the real founder caller, gated credential publication and attach. The hosted Linux
+  observation invoked frozen `found()` and required the plan's explicit owner grant
+  across D6.
   **Owner grant (2026-11-20):** "Authorize the step 6/4b source fence and the
   specifically enumerated disposable hosted-Linux observations of retained bound
   start, one unchanged Found per named fixture, gated credential publication, attach
