@@ -486,6 +486,333 @@ mod files {
         assert!(Custody::create_fresh_installation(&a, &b).is_err());
         assert!(Custody::create_fresh_installation(&a, &a).is_err());
     }
+    // All fixtures use disposable synthetic credentials and ordinary private roots.
+    fn populated() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        [u8; 16],
+    ) {
+        let (t, a, b) = roots();
+        let mut owner = Custody::create_fresh_installation(&a, &b).unwrap();
+        let ca = owner.create_founder_ca([1; 16], Some(NOW)).unwrap();
+        owner
+            .create_member([1; 16], ca.fingerprint(), false)
+            .unwrap();
+        let id = codec::installation(&fs::read(a.join("install-context")).unwrap()).unwrap();
+        drop(owner);
+        assert!(Custody::open_existing(&a, &b, id).is_ok());
+        (t, a, b, id)
+    }
+    const SLOTS: [(bool, &str); 5] = [
+        (true, "install-context"),
+        (true, "seal-key"),
+        (false, "custody-lock"),
+        (false, "ca-key"),
+        (false, "member-key"),
+    ];
+    #[test]
+    fn nonregular_objects_at_every_checked_file_refuse_without_repair() {
+        use std::os::unix::{ffi::OsStrExt, net::UnixListener};
+        for (wrap, name) in SLOTS {
+            for kind in 0..3 {
+                let (_t, a, b, id) = populated();
+                let path = if wrap { &a } else { &b }.join(name);
+                let saved = fs::read(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                let socket = match kind {
+                    0 => {
+                        fs::create_dir(&path).unwrap();
+                        None
+                    }
+                    1 => {
+                        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        // SAFETY: valid NUL-terminated disposable fixture path.
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                        None
+                    }
+                    _ => Some(UnixListener::bind(&path).unwrap()),
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                let before = fs::symlink_metadata(&path).unwrap();
+                assert!(Custody::open_existing(&a, &b, id).is_err(), "{name}/{kind}");
+                assert!(Custody::create_fresh_installation(&a, &b).is_err());
+                use std::os::unix::fs::MetadataExt;
+                let after = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((before.ino(), before.mode()), (after.ino(), after.mode()));
+                drop(socket);
+                if kind == 0 {
+                    fs::remove_dir(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+                fs::write(&path, saved).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(Custody::open_existing(&a, &b, id).is_ok());
+            }
+        }
+    }
+    #[test]
+    fn hardlinks_and_permissions_at_every_checked_file_refuse() {
+        for (wrap, name) in SLOTS {
+            let (t, a, b, id) = populated();
+            let path = if wrap { &a } else { &b }.join(name);
+            let before = fs::read(&path).unwrap();
+            // Outside either inventory: refusal must come from file metadata.
+            let alias = t.path().join("alias");
+            fs::hard_link(&path, &alias).unwrap();
+            assert_eq!(
+                Custody::open_existing(&a, &b, id).err(),
+                Some(Error::Ownership)
+            );
+            fs::remove_file(alias).unwrap();
+            assert!(Custody::open_existing(&a, &b, id).is_ok());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(
+                Custody::open_existing(&a, &b, id).err(),
+                Some(Error::Ownership)
+            );
+            assert!(fs::read(&path).unwrap() == before, "artifact changed");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(Custody::open_existing(&a, &b, id).is_ok());
+        }
+    }
+    #[test]
+    fn unsafe_ancestor_symlink_permissions_and_replacement_refuse() {
+        for wrap in [true, false] {
+            let (t, a, b, id) = populated();
+            let root = if wrap { &a } else { &b };
+            let parent = t.path().join("ancestor");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let nested = parent.join("root");
+            fs::rename(root, &nested).unwrap();
+            let (a, b) = if wrap {
+                (nested.clone(), b)
+            } else {
+                (a, nested.clone())
+            };
+            assert!(Custody::open_existing(&a, &b, id).is_ok());
+            for mode in [0o720, 0o702] {
+                fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+                assert_eq!(
+                    Custody::open_existing(&a, &b, id).err(),
+                    Some(Error::Ownership)
+                );
+            }
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let old = t.path().join("old-ancestor");
+            fs::rename(&parent, &old).unwrap();
+            symlink(&old, &parent).unwrap();
+            assert_eq!(
+                Custody::open_existing(&a, &b, id).err(),
+                Some(Error::Layout)
+            );
+            fs::remove_file(&parent).unwrap();
+            fs::rename(&old, &parent).unwrap();
+            let mut owner = Custody::open_existing(&a, &b, id).unwrap();
+            fs::rename(&parent, &old).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::create_dir(&nested).unwrap();
+            for p in [&parent, &nested] {
+                fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for entry in fs::read_dir(old.join("root")).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(entry.path(), nested.join(entry.file_name())).unwrap();
+            }
+            // Both namespaces contain valid bytes; retained descriptor identity detects replacement.
+            assert_eq!(
+                owner.create_member([1; 16], [3; 32], false).err(),
+                Some(Error::Ownership)
+            );
+            assert_eq!(
+                owner.create_founder_ca([1; 16], None).err(),
+                Some(Error::Ownership)
+            );
+            drop(owner);
+            fs::remove_dir_all(&parent).unwrap();
+            fs::rename(old, parent).unwrap();
+            assert!(Custody::open_existing(&a, &b, id).is_ok());
+        }
+    }
+    #[test]
+    #[ignore = "requires chown capability on disposable fixtures; ordinary hosted runner cannot qualify foreign ownership"]
+    fn foreign_owned_ancestor_refuses_with_privileged_fixture_capability() {
+        use std::os::unix::ffi::OsStrExt;
+        let (t, a, b, id) = populated();
+        let parent = t.path().join("ancestor");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o711)).unwrap();
+        let nested = parent.join("wrap");
+        fs::rename(&a, &nested).unwrap();
+        assert!(Custody::open_existing(&nested, &b, id).is_ok());
+        let path = std::ffi::CString::new(parent.as_os_str().as_bytes()).unwrap();
+        // SAFETY: geteuid takes no pointers; chown receives a valid fixture path.
+        let uid = unsafe { libc::geteuid() };
+        let foreign = if uid == 65534 { 65533 } else { 65534 };
+        assert_eq!(unsafe { libc::chown(path.as_ptr(), foreign, !0) }, 0);
+        let refused = Custody::open_existing(&nested, &b, id).err();
+        // Restore the fixture before asserting, so cleanup retains its original access.
+        assert_eq!(unsafe { libc::chown(path.as_ptr(), uid, !0) }, 0);
+        assert_eq!(refused, Some(Error::Ownership));
+        assert!(Custody::open_existing(&nested, &b, id).is_ok());
+    }
+    #[test]
+    fn overlapping_roots_refuse_before_creating_artifacts() {
+        let (_t, a, _b) = roots();
+        let nested = a.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        for (wrap, store) in [(&a, &a), (&a, &nested), (&nested, &a)] {
+            assert_eq!(
+                Custody::create_fresh_installation(wrap, store).err(),
+                Some(Error::Layout)
+            );
+            assert_eq!(
+                Custody::open_existing(wrap, store, [0; 16]).err(),
+                Some(Error::Layout)
+            );
+        }
+        assert_eq!(fs::read_dir(&a).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&nested).unwrap().count(), 0);
+    }
+    #[test]
+    fn retained_lock_replacement_refuses_identical_bytes() {
+        let (_t, a, b, id) = populated();
+        let mut owner = Custody::open_existing(&a, &b, id).unwrap();
+        let lock = b.join("custody-lock");
+        let saved = b.with_extension("lock");
+        fs::rename(&lock, &saved).unwrap();
+        fs::write(&lock, []).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            owner.create_member([1; 16], [3; 32], false).err(),
+            Some(Error::Ownership)
+        );
+        drop(owner);
+        fs::remove_file(&lock).unwrap();
+        fs::rename(saved, lock).unwrap();
+        assert!(Custody::open_existing(&a, &b, id).is_ok());
+    }
+    #[test]
+    fn fresh_installation_create_collision_is_sticky_and_never_overwritten() {
+        use super::super::linux::INSTALLATION_HOOK;
+        for name in ["install-context", "seal-key"] {
+            let (_t, a, b) = roots();
+            let wrap = a.clone();
+            INSTALLATION_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |owner, failed, _, _| {
+                    if !failed {
+                        fs::write(wrap.join(name), b"collision").unwrap();
+                        fs::set_permissions(wrap.join(name), fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                    } else {
+                        assert_eq!(
+                            owner.create_founder_ca([0; 16], None).err(),
+                            Some(Error::Layout)
+                        );
+                        assert_eq!(
+                            owner.create_member([0; 16], [0; 32], false).err(),
+                            Some(Error::Layout)
+                        );
+                    }
+                }));
+            });
+            let result = Custody::create_fresh_installation(&a, &b);
+            INSTALLATION_HOOK.with_borrow_mut(|hook| *hook = None);
+            assert_eq!(result.err(), Some(Error::Layout));
+            let context = fs::read(a.join("install-context")).unwrap();
+            let key = fs::read(a.join("seal-key")).ok();
+            let id = codec::installation(&context).unwrap_or([0; 16]);
+            assert!(Custody::open_existing(&a, &b, id).is_err());
+            assert!(Custody::create_fresh_installation(&a, &b).is_err());
+            assert_eq!(fs::read(a.join(name)).unwrap(), b"collision");
+            assert!(
+                fs::read(a.join("install-context")).unwrap() == context,
+                "context changed"
+            );
+            assert!(
+                fs::read(a.join("seal-key")).ok() == key,
+                "wrapping artifact changed"
+            );
+        }
+    }
+    #[test]
+    fn fresh_installation_faults_preserve_artifacts_and_first_error() {
+        use super::super::linux::INSTALLATION_HOOK;
+        use std::{cell::Cell, rc::Rc};
+        for step in 1..=10 {
+            let (_t, a, b) = roots();
+            let failed = Rc::new(Cell::new(false));
+            let observed = failed.clone();
+            let wrap = a.clone();
+            let store = b.clone();
+            INSTALLATION_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |owner, failure, id, key| {
+                    if !failure {
+                        owner.fail_at = Some(step);
+                        return;
+                    }
+                    observed.set(true);
+                    assert_eq!(owner.effects, step);
+                    let context = codec::install(id);
+                    for (name, bytes, offset) in [
+                        ("install-context", context.as_slice(), 0),
+                        ("seal-key", key.as_slice(), 5),
+                    ] {
+                        let progress = step.saturating_sub(offset);
+                        let expected = match progress {
+                            0 | 1 => None,
+                            2 => Some(&bytes[..0]),
+                            3 => Some(&bytes[..bytes.len() / 2]),
+                            _ => Some(bytes),
+                        };
+                        assert!(
+                            fs::read(wrap.join(name)).ok().as_deref() == expected,
+                            "unexpected installation artifact"
+                        );
+                    }
+                    // Deliberately invalid inputs would yield other errors absent stickiness.
+                    owner.fail_at = None;
+                    assert_eq!(
+                        owner.create_founder_ca([0; 16], None).err(),
+                        Some(Error::Unavailable)
+                    );
+                    assert_eq!(
+                        owner.create_member([0; 16], [0; 32], false).err(),
+                        Some(Error::Unavailable)
+                    );
+                    assert_eq!(owner.effects, step);
+                    assert!(!store.join("ca-key").exists());
+                    assert!(!store.join("member-key").exists());
+                }));
+            });
+            let result = Custody::create_fresh_installation(&a, &b);
+            INSTALLATION_HOOK.with_borrow_mut(|hook| *hook = None);
+            assert_eq!(result.err(), Some(Error::Unavailable));
+            assert!(failed.get());
+            let context = fs::read(a.join("install-context")).ok();
+            let key = fs::read(a.join("seal-key")).ok();
+            let id = context
+                .as_deref()
+                .and_then(|v| codec::installation(v).ok())
+                .unwrap_or([0; 16]);
+            // At final file/directory sync seams the complete layout is readable, but
+            // successful initialization was never returned (durability was not established).
+            assert_eq!(Custody::open_existing(&a, &b, id).is_ok(), step >= 9);
+            assert!(Custody::create_fresh_installation(&a, &b).is_err());
+            assert!(
+                fs::read(a.join("install-context")).ok() == context,
+                "context changed"
+            );
+            assert!(
+                fs::read(a.join("seal-key")).ok() == key,
+                "wrapping artifact changed"
+            );
+            assert_eq!(fs::read(b.join("custody-lock")).unwrap(), Vec::<u8>::new());
+        }
+    }
     #[test]
     fn lock_child_probe() {
         let Some(root) = std::env::var_os("ARX_CUSTODY_LOCK_PROBE") else {

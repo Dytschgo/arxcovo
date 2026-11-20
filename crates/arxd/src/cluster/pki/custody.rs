@@ -293,6 +293,13 @@ mod linux {
             self.key.fill(0);
         }
     }
+    #[cfg(test)]
+    pub(super) type InstallationHook = Box<dyn FnMut(&mut Custody, bool, [u8; 16], [u8; 32])>;
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static INSTALLATION_HOOK: std::cell::RefCell<Option<InstallationHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
     impl Custody {
         fn roots(wrap: &Path, store: &Path) -> Result<(Root, Root), Error> {
             let a = Root::open(wrap)?;
@@ -352,6 +359,12 @@ mod linux {
             getrandom::fill(&mut id).map_err(|_| Error::Unavailable)?;
             getrandom::fill(&mut key).map_err(|_| Error::Unavailable)?;
             let mut owner = Self::owner(wrap, store, lock, id, key);
+            #[cfg(test)]
+            INSTALLATION_HOOK.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook(&mut owner, false, id, key);
+                }
+            });
             let result = (|| {
                 owner.write(true, "install-context", &codec::install(id))?;
                 let secret = codec::Secret(key.to_vec());
@@ -359,6 +372,12 @@ mod linux {
             })();
             if let Err(e) = result {
                 owner.failure = Some(e);
+                #[cfg(test)]
+                INSTALLATION_HOOK.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook {
+                        hook(&mut owner, true, id, key);
+                    }
+                });
                 return Err(e);
             }
             Ok(owner)
