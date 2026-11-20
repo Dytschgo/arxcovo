@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 19:23 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 19:47 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,8 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `26704348` (PR206), push CI 44800339696 green. Previous main
+- **Main:** `57fc3fc8` (PR207), push CI 44804068081 green. `26704348` (PR206) push
+  CI 44800339696 green. Earlier main
   `c10fff18` (PR204) push CI 44796954728 was **red**: Ubuntu Rust job 136498866204
   failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
   (`Err("receiver reservation")`) binding hard-coded loopback port 43186, inside
@@ -45,7 +46,8 @@ merged, as listed under "Merged this session".
   Sol 6.2 routing, D3/D4), PR202 `5f95238c` (step 5b, ordinary CI test of the real
   Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
   enrollment protocol), PR206 `26704348` (test fixture: ephemeral ports for the
-  peer learner tests). Every merge had an independent exact-head Sol
+  peer learner tests), PR207 `57fc3fc8` (step 6/4b, founder caller, gated
+  publication and attach). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the two red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -344,7 +346,21 @@ merged, as listed under "Merged this session".
   Review HOLD on one P2 (`D:/Temp/arx-pr207-review/review.md`, SHA256
   `e36768c0…afaf`): founder custody compared private roots with the workspace by path
   prefix only, so a mount alias could put wrapping material in the workspace. Builder
-  attempt 2/3 in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
+  attempt 2 (`df6d69a8`, with main merged) compares device and inode against the
+  retained Owner layout before any custody write and adds the Linux test
+  `founder_custody_rejects_open_workspace_alias` (report `D:/Temp/arx-m3-step6/report.md`
+  SHA256 `36b37ba3…4474`; counted failures 1/3). Hosted CI 44802205590 green; O1 passed
+  (0.359 s), alias test passed, no frozen-path refusal. Review 2 PASS with zero findings
+  (`D:/Temp/arx-pr207-review2/review.md`, SHA256 `fbfd1470…5ddc`), agent-review status
+  59506613371. **PR #207 merged** as `57fc3fc8`. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **Step 7b (owner grant, 2026-11-20):** "Authorize the step 7b ingress caller fence
+  and one Linux-only hosted CI test: found one disposable issuer through the reviewed
+  step 6 retained founder pattern (one Found), one fixture Mint, one AnchorQuery and one
+  Redeem through the actual enroll() over the 7a TLS protocol, returning a matching
+  signed leaf and original E, then owned joined close. Do not modify Engine, Owners,
+  found, issue, anchor_query internals or their deadlines. No Windows founding run.
+  Stop and preserve the first founding or issuing refusal; no repair or rerun." Sol
+  6.2/high builder, fresh 3-attempt budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
