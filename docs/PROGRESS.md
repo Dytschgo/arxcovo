@@ -256,6 +256,22 @@ PR188 as the last merge, that is superseded by this summary.
   14:55 UTC re-ran only the failed/cancelled jobs and dependent gates on the unchanged
   head. The branch was then rebased onto main `7aec97af` (PROGRESS conflict resolved
   by keeping both entries), so its CI and exact-head review restart on the new head.
+- **Owner process decisions (2026-11-20):** after the owner asked whether the work
+  was circling: (1) trivial check fixes (formatting, whitespace, lint, missing import)
+  no longer consume builder attempts; (2) coordinator PROGRESS updates go in docs-only
+  PRs, not inside code PRs; (3) step 5b's one-shot launcher ceremony is replaced by an
+  ordinary CI test of the real Engine start/close (no founding) in PR #202. Earlier
+  design: D:/Temp/arx-m3-step5b/design.md. Delegates run on Sol 6.2 high. AGENTS.md
+  updated in this docs PR.
+- **Owner decisions D3/D4 (2026-11-20):** D4 target-authorized delegation (host B
+  trusts host A's authenticated assertions only for agents B explicitly grants; single
+  use; Unknown when execution or cleanup is unconfirmed; B's standard build identity).
+  D3 one LAN or Tailscale address per one-paste code. Plan
+  `D:/Temp/arx-m3-steps6to8/plan.md` (SHA256 `00132578…d29d`).
+- **In progress:** PR #202 (step 5b as an ordinary test) and step 7a (closed
+  same-connection enrollment, outside D6; first builder stopped 3/3, stuck-rule review
+  `D:/Temp/arx-m3-step7a-stuck/review.md` SHA256 `790606e7…013a` found test-fixture
+  causes plus a result-sealing P1; owner authorized a new builder).
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
