@@ -121,6 +121,25 @@ pub(super) fn basename(s: &str) -> bool {
         )
 }
 impl PublicIdentity {
+    /// Public consistency assembly only; confers no issuance or restart authority.
+    pub(super) fn assemble(
+        expected: &ExpectedIdentity,
+        leaf: &[u8],
+    ) -> Result<Vec<u8>, InvalidIdentity> {
+        let record = Self {
+            version: 1,
+            cluster: expected.cluster,
+            node: expected.node.get(),
+            key: *expected.key.as_bytes(),
+            ca: expected.ca,
+            origin: expected.origin.clone(),
+            leaf: leaf.to_vec(),
+            artifact: "member-key".into(),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|_| InvalidIdentity)?;
+        Self::decode(&bytes)?;
+        Ok(bytes)
+    }
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, InvalidIdentity> {
         if bytes.len() > 8192 {
             return Err(InvalidIdentity);
@@ -135,6 +154,9 @@ impl PublicIdentity {
             return Err(InvalidIdentity);
         }
         Ok(record)
+    }
+    pub(super) fn leaf(&self) -> &[u8] {
+        &self.leaf
     }
     pub(super) fn artifact(&self) -> &str {
         &self.artifact
@@ -186,6 +208,23 @@ pub(in crate::cluster) mod tests {
     use rcgen::{
         CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
     };
+    #[test]
+    fn non_authorizing_assembly_preserves_v1_and_bounds() {
+        let (bytes, _, expected) = fixture(
+            1,
+            Origin::Found {
+                term: 1,
+                leader: 1,
+                index: 2,
+            },
+        );
+        let record = PublicIdentity::decode(&bytes).unwrap();
+        let encoded = PublicIdentity::assemble(&expected, record.leaf()).unwrap();
+        assert_eq!(PublicIdentity::decode(&encoded).unwrap(), record);
+        assert!(PublicIdentity::assemble(&expected, &[]).is_err());
+        assert!(PublicIdentity::assemble(&expected, &[255; 4096]).is_err());
+        assert!(PublicIdentity::assemble(&expected, &[1; 4097]).is_err());
+    }
     pub(in crate::cluster) fn fixture(
         node: u64,
         origin: Origin,

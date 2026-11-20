@@ -1,6 +1,7 @@
 mod bound_open;
 pub mod consensus;
 pub mod enrollment;
+mod issuance_publication;
 mod join_receipt;
 pub mod log_store;
 pub(crate) mod membership;
