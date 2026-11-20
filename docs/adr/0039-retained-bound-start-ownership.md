@@ -65,13 +65,16 @@ callers keep their respective paths through the same driver.
 
 The test uses a fresh private fixture and the original outer Owner and SQLite
 connections. It runs the shared Engine constructor once on an uninitialized
-node with a counted in-memory network, waits for the joined startup worker,
-drops its observer and recovers the retained node through the job. It requests
-close once through the existing shutdown path. It checks the joined close,
-Engine shutdown and store release proofs. The two store locks must be free
-while the outer lock is still held, then the outer lock must be acquirable after
-deliberate disposal. The test waits on notifications and bounds its wait at ten
-seconds. The production five-second shutdown deadline remains in force.
+node with a counted in-memory network. A test-only gate holds the startup
+worker at EngineMayExist until the test drops its observer. The test waits for
+the job's startup completion signal with no observer, recovers the retained node
+and requests close once through the existing shutdown path. It checks the joined
+startup and close workers, Engine shutdown and store release proofs. The two
+store locks must be free while the outer lock is still held, then the outer lock
+must be acquirable after deliberate disposal. The ten-second timeout bounds the
+cooperative async wait. A blocking worker can outlive that wait and delay runtime
+teardown. The CI job timeout is the outer bound. The production five-second
+shutdown deadline remains in force.
 
 The fixture does not run Found, Raft initialization, proposals, signing,
 publication or listeners. Existing CI workflow and quarantine guards are

@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use tokio::sync::oneshot;
 
 const LOCKS: [&str; 3] = [
     "cluster-owner.lock",
@@ -126,14 +127,20 @@ impl GuardProof {
 pub(super) struct Witness {
     guards: GuardProof,
     failure: Mutex<Option<&'static str>>,
+    startup_release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl Witness {
-    fn new(state_dir: PathBuf) -> Self {
+    fn new(state_dir: PathBuf, startup_release: oneshot::Receiver<()>) -> Self {
         Self {
             guards: GuardProof::new(state_dir),
             failure: Mutex::default(),
+            startup_release: Mutex::new(Some(startup_release)),
         }
+    }
+
+    pub(super) fn take_startup_release(&self) -> oneshot::Receiver<()> {
+        self.startup_release.lock().unwrap().take().unwrap()
     }
 
     pub(super) fn fail(&self, reason: &'static str) {
@@ -211,7 +218,8 @@ fn fresh(layout: &Layout) -> (Plan, StartIntent) {
 async fn bound_start_real_engine_start_close() {
     let layout = Layout::new();
     let (plan, intent) = fresh(&layout);
-    let witness = Arc::new(Witness::new(plan.state.clone()));
+    let (release_startup, startup_release) = oneshot::channel();
+    let witness = Arc::new(Witness::new(plan.state.clone(), startup_release));
     let clients = Arc::new(AtomicUsize::new(0));
     let network = QuietNetwork {
         factory: mem_net::Factory {
@@ -230,13 +238,12 @@ async fn bound_start_real_engine_start_close() {
     );
 
     let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-        // Running is published only after the startup worker joined successfully.
         let live = async {
             loop {
                 match observer.status() {
-                    Status::Running => break,
-                    Status::Preparing | Status::Prepared | Status::EngineMayExist => {}
-                    _ => return Err("startup worker did not join successfully"),
+                    Status::EngineMayExist => break,
+                    Status::Preparing | Status::Prepared => {}
+                    _ => return Err("startup did not reach the Engine boundary"),
                 }
                 observer
                     .changed()
@@ -244,8 +251,17 @@ async fn bound_start_real_engine_start_close() {
                     .ok_or("startup observation closed")?;
             }
             drop(observer);
+            if job.changed.receiver_count() != 0 {
+                return Err("observer remained attached at the Engine boundary");
+            }
+            release_startup.send(()).map_err(|_| "startup release")?;
+            // The job signals completion after publishing its state and joining the worker.
+            job.startup_finished.notified().await;
             let node = {
                 let state = job.state();
+                if state.status != Status::Running {
+                    return Err("startup worker did not join successfully");
+                }
                 if state.adapters.is_some() || job.changed.receiver_count() != 0 {
                     return Err("startup retained an adapter clone or observer");
                 }
@@ -266,12 +282,13 @@ async fn bound_start_real_engine_start_close() {
         live?;
         Ok::<_, &'static str>(())
     })
-    .await;
+    .await
+    .expect("bound start/close exceeded its 10-second cooperative wait");
 
     let state = job.state();
     assert_eq!(
         (outcome, state.status),
-        (Ok(Ok(())), Status::Clean),
+        (Ok(()), Status::Clean),
         "bound start/close failed: {:?}; shutdown: {:?}",
         *witness.failure.lock().unwrap(),
         state.close_failure,

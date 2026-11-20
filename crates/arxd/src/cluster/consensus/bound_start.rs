@@ -44,6 +44,8 @@ pub(super) struct Job {
     close: Notify,
     #[cfg(test)]
     gate: Mutex<Option<PreparationPause>>,
+    #[cfg(test)]
+    startup_finished: Notify,
 }
 pub(super) struct Observer(watch::Receiver<Status>);
 impl Observer {
@@ -80,6 +82,8 @@ impl Job {
             close: Notify::new(),
             #[cfg(test)]
             gate: Mutex::new(None),
+            #[cfg(test)]
+            startup_finished: Notify::new(),
         }))
     }
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -96,6 +100,10 @@ impl Job {
         }
         s.status = status;
         self.changed.send_replace(status);
+        #[cfg(test)]
+        if matches!(status, Status::Running | Status::Unconfirmed) {
+            self.startup_finished.notify_one();
+        }
     }
     pub(super) fn observe(&self) -> Observer {
         Observer(self.changed.subscribe())
@@ -298,7 +306,7 @@ where
             }
             // Only the test-owned witness can pass the test-build stop.
             #[cfg(test)]
-            {
+            let startup_release = {
                 let Some((w, original)) = witness.as_ref().zip(original) else {
                     job.set(Status::Prepared);
                     return;
@@ -309,7 +317,8 @@ where
                     job.set(Status::Unconfirmed);
                     return;
                 }
-            }
+                w.take_startup_release()
+            };
             {
                 let (ls, sm) = job.state().adapters.as_ref().unwrap().clone();
                 let log_released = ls.0.lock().unwrap().released();
@@ -318,6 +327,9 @@ where
                 let sm_weak = Arc::downgrade(&sm.0);
                 job.set(Status::EngineMayExist);
                 let startup = tokio::spawn(async move {
+                    // Hold the published boundary until the test drops its observer.
+                    #[cfg(test)]
+                    startup_release.await.map_err(|_| ())?;
                     let raft = Engine::new(node_id, config, network, ls, sm.clone())
                         .await
                         .map_err(|_| ())?;
