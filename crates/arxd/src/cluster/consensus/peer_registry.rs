@@ -120,6 +120,39 @@ impl LearnerGate {
         f(&store, *phase)
     }
 
+    pub(super) fn admission_progress(
+        &self,
+    ) -> Result<(Phase, Option<super::LogPos>), VerifyRefusal> {
+        self.observe(|store, phase| Ok((phase, store.applied())))
+    }
+
+    pub(super) fn admission_anchor(
+        &self,
+    ) -> Result<(crate::cluster::enrollment::NodeId, &[u8; 32]), VerifyRefusal> {
+        use crate::cluster::{enrollment::NodeId, join_receipt::Origin};
+        let Origin::Redeem { anchors, .. } = &self.identity.origin else {
+            return Err(VerifyRefusal::NotMember);
+        };
+        let leader = self.identity.origin.position().leader;
+        let node = NodeId::new(leader).ok_or(VerifyRefusal::NotMember)?;
+        let i = anchors
+            .binary_search_by_key(&leader, |(id, _)| *id)
+            .map_err(|_| VerifyRefusal::NotMember)?;
+        Ok((node, &anchors[i].1))
+    }
+
+    pub(super) fn authorize_admission_anchor(
+        &self,
+        cluster: crate::cluster::enrollment::ClusterId,
+        node: crate::cluster::enrollment::NodeId,
+        key: crate::cluster::enrollment::KeyDigest,
+    ) -> Result<(), VerifyRefusal> {
+        if cluster != self.identity.cluster || self.admission_anchor()? != (node, key.as_bytes()) {
+            return Err(VerifyRefusal::NotMember);
+        }
+        self.authorize(cluster, node, key, true).map(|_| ())
+    }
+
     /// Applied history may pass E between observations. Check any copy of
     /// that row on the live Append path before it can reach the state machine.
     pub(super) fn matches_original_append(

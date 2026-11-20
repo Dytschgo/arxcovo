@@ -1,5 +1,9 @@
 //! Private one-exchange Append transport. No factory, engine or service startup wiring.
-use super::{Arx, Id, SmAdapter, peer_registry, peer_rpc_wire as peer_wire};
+use super::{
+    Arx, Id, SmAdapter,
+    learner_admission::{self, Controller, Reply as AdmissionReply},
+    peer_control_wire as control, peer_registry, peer_rpc_wire as peer_wire,
+};
 use crate::cluster::{
     enrollment::{ClusterId, NodeId},
     pki::verify::{self, AuthenticatedPeer, PeerVerifier, Registry},
@@ -122,13 +126,25 @@ struct Resources {
 }
 impl Resources {
     fn client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
-        let verifier = PeerVerifier::new(
-            self.credentials.root.clone(),
-            self.cluster,
-            self.registry.clone(),
+        self.client_with_registry(target, self.registry.clone())
+    }
+
+    fn admission_client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
+        let gate = self.learner.as_ref().ok_or(Refusal::Identity)?.clone();
+        self.client_with_registry(
+            target,
+            Arc::new(move |cluster, node, key| gate.authorize_admission_anchor(cluster, node, key)),
         )
-        .map_err(|_| Refusal::Tls)?
-        .client(target);
+    }
+
+    fn client_with_registry(
+        &self,
+        target: NodeId,
+        registry: Registry,
+    ) -> Result<Arc<ClientConfig>, Refusal> {
+        let verifier = PeerVerifier::new(self.credentials.root.clone(), self.cluster, registry)
+            .map_err(|_| Refusal::Tls)?
+            .client(target);
         verify::client_config(
             verifier,
             self.credentials.leaf.clone(),
@@ -144,6 +160,7 @@ struct State {
     attach_attempted: bool,
     closed: bool,
     resources: Option<Arc<Resources>>,
+    admission: Option<Arc<Controller>>,
     keeper: Option<SmAdapter>,
     tasks: JoinSet<()>,
     // <=32 task results plus the single accept-loop result during close.
@@ -243,6 +260,7 @@ impl TransportOwner {
                     attach_attempted: true,
                     closed: false,
                     resources: Some(resources),
+                    admission: None,
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -577,7 +595,7 @@ async fn read_frame<S: AsyncRead + Unpin>(
         .map_err(|_| Refusal::Frame)?;
     Ok(frame)
 }
-async fn clean_end<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(), Refusal> {
+pub(super) async fn clean_end<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(), Refusal> {
     let mut extra = [0; 1];
     match stream.read(&mut extra).await {
         Ok(0) => Ok(()),
@@ -596,14 +614,17 @@ async fn inbound(
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
 ) -> Result<(), Refusal> {
+    let source = socket.peer_addr();
     stage(shared, Stage::ServerHandshake).await;
     before_dispatch(shared, deadline)?;
     let mut stream = TlsAcceptor::from(resources.server.clone())
         .accept_with(socket, |c| c.set_buffer_limit(Some(SEND_BUFFER)))
         .await
         .map_err(|_| Refusal::Tls)?;
-    let peer = AuthenticatedPeer::from_server(stream.get_ref().1)
-        .and_then(|peer| peer.authenticated_identity())
+    let authenticated =
+        AuthenticatedPeer::from_server(stream.get_ref().1).map_err(|_| Refusal::Identity)?;
+    let peer = authenticated
+        .authenticated_identity()
         .map_err(|_| Refusal::Identity)?;
     drop(handshake);
     stage(shared, Stage::ServerAuthenticated).await;
@@ -616,7 +637,46 @@ async fn inbound(
         source: peer.1.get(),
         target: resources.node.get(),
     };
-    let frame = read_frame(&mut stream, route, None).await?;
+    let mut magic = [0; 4];
+    stream
+        .read_exact(&mut magic)
+        .await
+        .map_err(|_| Refusal::Frame)?;
+    if magic == control::MAGIC {
+        let address =
+            control::read_request(&mut stream, route, source.map_err(|_| Refusal::Address)?)
+                .await?;
+        // Learner bootstrap has no control authority, even for the original anchor.
+        if resources.learner.is_some() {
+            return Err(Refusal::Identity);
+        }
+        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        before_dispatch(shared, deadline)?;
+        let controller = shared
+            .state
+            .lock()
+            .map_err(|_| Refusal::Closed)?
+            .admission
+            .clone()
+            .ok_or(Refusal::NotReady)?;
+        let reply = controller.admit(authenticated, address, deadline).await;
+        #[cfg(test)]
+        if matches!(reply, AdmissionReply::Applied(..))
+            && controller
+                .hooks
+                .suppress_success
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            *controller.hooks.lost_reply.lock().unwrap() = Some(reply);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Refusal::Deadline);
+        }
+        let frame = control::reply(reverse(route), reply);
+        return send_frame(&mut stream, &frame).await;
+    }
+    let frame = read_frame(&mut magic.as_slice().chain(&mut stream), route, None).await?;
     stage(shared, Stage::RequestRead).await;
     before_dispatch(shared, deadline)?;
     clean_end(&mut stream).await?;
@@ -1210,6 +1270,19 @@ pub(super) struct PeerFactory {
     loopback: bool,
 }
 impl PeerFactory {
+    pub(super) fn install_admission(&self, controller: Arc<Controller>) -> Result<(), Refusal> {
+        let shared = self.shared.upgrade().ok_or(Refusal::Closed)?;
+        let mut state = shared.state.lock().map_err(|_| Refusal::Closed)?;
+        if state.closed
+            || state.admission.is_some()
+            || state.resources.as_ref().is_none_or(|r| r.learner.is_some())
+        {
+            return Err(Refusal::NotReady);
+        }
+        state.admission = Some(controller);
+        Ok(())
+    }
+
     fn client(&self, target: u64, node: &openraft::BasicNode) -> AppendClient {
         AppendClient {
             shared: self.shared.clone(),
@@ -1280,6 +1353,7 @@ impl TransportOwner {
                 attach_attempted: false,
                 closed: false,
                 resources: None,
+                admission: None,
                 keeper: None,
                 tasks: JoinSet::new(),
                 join_errors: Vec::new(),
@@ -1531,4 +1605,159 @@ impl TransportOwner {
             .failed
             .store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+fn reverse(route: peer_wire::Route) -> peer_wire::Route {
+    peer_wire::Route {
+        cluster: route.cluster,
+        source: route.target,
+        target: route.source,
+    }
+}
+
+pub(super) struct AdmissionClient {
+    shared: Weak<Shared>,
+    issuer: SocketAddr,
+    advertised: SocketAddr,
+}
+
+impl TransportOwner {
+    pub(super) fn admission_client(
+        &self,
+        issuer: SocketAddr,
+        advertised: SocketAddr,
+    ) -> Result<AdmissionClient, Refusal> {
+        if endpoint(&issuer.to_string())? != issuer
+            || endpoint(&advertised.to_string())? != advertised
+            || !control::qualified(issuer)
+            || !control::qualified(advertised)
+        {
+            return Err(Refusal::Address);
+        }
+        let state = self.shared.state.lock().map_err(|_| Refusal::Closed)?;
+        if state.closed
+            || state.accept.is_none()
+            || state
+                .resources
+                .as_ref()
+                .and_then(|r| r.learner.as_ref())
+                .is_none()
+        {
+            return Err(Refusal::NotReady);
+        }
+        Ok(AdmissionClient {
+            shared: Arc::downgrade(&self.shared),
+            issuer,
+            advertised,
+        })
+    }
+}
+
+pub(super) struct AdmissionResponse {
+    reply: oneshot::Receiver<Result<Result<AdmissionReply, Refusal>, tokio::time::error::Elapsed>>,
+    deadline: Instant,
+    sent: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AdmissionResponse {
+    pub(super) async fn reply(self) -> AdmissionReply {
+        match timeout_at(self.deadline, self.reply).await {
+            Ok(Ok(Ok(Ok(reply)))) if Instant::now() < self.deadline => reply,
+            _ if self.sent.load(std::sync::atomic::Ordering::SeqCst) => AdmissionReply::Unknown,
+            _ => AdmissionReply::Refused,
+        }
+    }
+}
+
+impl AdmissionClient {
+    pub(super) fn request(&self) -> Option<AdmissionResponse> {
+        self.exchange(self.advertised)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn conflicting_address(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
+        self.exchange(advertised)
+    }
+
+    fn exchange(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
+        use std::sync::atomic::AtomicBool;
+        let deadline = Instant::now() + learner_admission::BUDGET;
+        let shared = self.shared.upgrade()?;
+        let (tx, rx) = oneshot::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        let mut join_errors = Vec::new();
+        {
+            let mut state = shared.state.lock().ok()?;
+            let admission = shared.admission(&mut state);
+            if !state.closed {
+                join_errors.append(&mut state.join_errors);
+            }
+            let admission = admission.ok()?;
+            let shared = shared.clone();
+            let issuer = self.issuer;
+            let sent = sent.clone();
+            state.tasks.spawn(async move {
+                let reply = timeout_at(
+                    deadline,
+                    outbound_admission(&shared, admission, issuer, advertised, deadline, &sent),
+                )
+                .await;
+                let _ = tx.send(reply);
+            });
+        }
+        drop(join_errors);
+        Some(AdmissionResponse {
+            reply: rx,
+            deadline,
+            sent,
+        })
+    }
+}
+
+async fn outbound_admission(
+    shared: &Shared,
+    admission: Admission,
+    issuer: SocketAddr,
+    advertised: SocketAddr,
+    deadline: Instant,
+    sent: &std::sync::atomic::AtomicBool,
+) -> Result<AdmissionReply, Refusal> {
+    let Admission {
+        resources,
+        connection: _connection,
+        handshake,
+    } = admission;
+    before_dispatch(shared, deadline)?;
+    let gate = resources.learner.as_ref().ok_or(Refusal::Identity)?.clone();
+    let target = gate.admission_anchor().map_err(|_| Refusal::Identity)?.0;
+    let config = resources.admission_client_config(target)?;
+    let socket = TcpStream::connect(issuer).await.map_err(|_| Refusal::Tls)?;
+    let mut stream = TlsConnector::from(config)
+        .connect_with(
+            ServerName::try_from(verify::SERVER_NAME).map_err(|_| Refusal::Tls)?,
+            socket,
+            |c| c.set_buffer_limit(Some(SEND_BUFFER)),
+        )
+        .await
+        .map_err(|_| Refusal::Tls)?;
+    let peer = AuthenticatedPeer::from_client(stream.get_ref().1)
+        .and_then(|peer| peer.authenticated_identity())
+        .map_err(|_| Refusal::Identity)?;
+    drop(handshake);
+    let route = peer_wire::Route {
+        cluster: resources.cluster,
+        source: resources.node.get(),
+        target: target.get(),
+    };
+    gate.authorize_admission_anchor(peer.0, peer.1, peer.2)
+        .map_err(|_| Refusal::Identity)?;
+    sent.store(true, std::sync::atomic::Ordering::SeqCst);
+    before_dispatch(shared, deadline)?;
+    send_frame(&mut stream, &control::request(route, advertised)).await?;
+    let reply = control::read_reply(&mut stream, reverse(route), advertised).await?;
+    clean_end(&mut stream).await?;
+    gate.authorize_admission_anchor(peer.0, peer.1, peer.2)
+        .map_err(|_| Refusal::Identity)?;
+    before_dispatch(shared, deadline)?;
+    Ok(reply)
 }

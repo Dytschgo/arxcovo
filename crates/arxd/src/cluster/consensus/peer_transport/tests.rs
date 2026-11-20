@@ -4375,3 +4375,253 @@ async fn learner_ballots_refuse_bound_founder_below_e_and_dispatch_after_e() {
     assert_eq!(spy.calls.lock().unwrap().as_slice(), &ballots);
     assert!(bounded_close(&mut owner).await.is_ok());
 }
+
+#[tokio::test]
+async fn admission_wire_requires_exact_route_method_source_and_end() {
+    let advertised = "192.168.6.2:7001".parse().unwrap();
+    let source = "192.168.6.2:43210".parse().unwrap();
+    let original = control::request(route(), advertised);
+    assert_eq!(&original[..4], b"ARXC");
+    assert_eq!(
+        control::read_request(&mut &original[4..], route(), source).await,
+        Ok(advertised)
+    );
+    for (index, replacement) in [(4, 2), (5, 2), (6, 2), (29, 3), (37, 3), (38, 1)] {
+        let mut malformed = original.clone();
+        malformed[index] = replacement;
+        assert_eq!(
+            control::read_request(&mut &malformed[4..], route(), source).await,
+            Err(Refusal::Frame)
+        );
+    }
+    let mut trailing = original.clone();
+    trailing.push(0);
+    assert_eq!(
+        control::read_request(&mut &trailing[4..], route(), source).await,
+        Err(Refusal::Frame)
+    );
+    assert_eq!(
+        control::read_request(
+            &mut &original[4..],
+            route(),
+            "192.168.6.3:5151".parse().unwrap()
+        )
+        .await,
+        Err(Refusal::Address)
+    );
+    for invalid in [
+        "192.0.2.1:7001",
+        "127.0.0.1:7001",
+        "[::ffff:192.168.6.2]:7001",
+        "192.168.6.2:0",
+    ] {
+        let addr = invalid.parse().unwrap();
+        let frame = control::request(route(), addr);
+        assert_eq!(
+            control::read_request(&mut &frame[4..], route(), addr).await,
+            Err(Refusal::Address)
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_disconnect_after_request_has_unknown_disposition() {
+    use std::sync::atomic::AtomicBool;
+    for (attempted, expected) in [
+        (false, AdmissionReply::Refused),
+        (true, AdmissionReply::Unknown),
+    ] {
+        let (tx, reply) = oneshot::channel();
+        let response = AdmissionResponse {
+            reply,
+            deadline: Instant::now() + learner_admission::BUDGET,
+            sent: Arc::new(AtomicBool::new(attempted)),
+        };
+        drop(tx);
+        assert_eq!(response.reply().await, expected);
+    }
+}
+
+#[tokio::test]
+async fn admission_wire_reply_rejects_address_substitution() {
+    let address = "[fd7a:115c:a1e0::2]:7001".parse().unwrap();
+    let position = LogPos {
+        term: 2,
+        leader: 1,
+        index: 9,
+    };
+    for answer in [
+        AdmissionReply::Applied(position, address),
+        AdmissionReply::Revoked(position, address),
+    ] {
+        let frame = control::reply(reverse(), answer);
+        assert_eq!(
+            control::read_reply(&mut frame.as_slice(), reverse(), address).await,
+            Ok(answer)
+        );
+        assert_eq!(
+            control::read_reply(&mut frame.as_slice(), route(), address).await,
+            Err(Refusal::Frame)
+        );
+        let mut other: SocketAddr = address;
+        other.set_port(7002);
+        assert_eq!(
+            control::read_reply(&mut frame.as_slice(), reverse(), other).await,
+            Err(Refusal::Frame)
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_tls_refuses_claimed_sender_address_and_revoked_client() {
+    let f = Fixture::new();
+    let spy = rpc_spy(false);
+    let mut owner = f.owner(2, spy.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    owner.listen_on(listener).unwrap();
+    let mut rx = events(&owner);
+    let config = f.client_config(&f.client, 2);
+    let advertised = "192.168.10.2:7001".parse().unwrap();
+    let mut wrong_sender = route();
+    wrong_sender.source = 6;
+
+    for (frame, reason) in [
+        (control::request(wrong_sender, advertised), Refusal::Frame),
+        (control::request(route(), advertised), Refusal::Address),
+    ] {
+        assert!(
+            exchange_learner_for_test(address, config.clone(), &frame)
+                .await
+                .is_err()
+        );
+        assert!(observe(&mut rx, Event::Stage(Stage::ServerAuthenticated)).await);
+        assert!(observe(&mut rx, Event::Finished(Some(reason))).await);
+    }
+
+    assert!(f.remove(1));
+    assert!(
+        exchange_learner_for_test(address, config, &control::request(route(), advertised))
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    assert!(spy.calls.lock().unwrap().is_empty());
+    assert!(bounded_close(&mut owner).await.is_ok());
+}
+
+#[tokio::test]
+async fn admission_tls_original_anchor_is_exact_and_withdraws_at_cutover() {
+    let f = Fixture::new();
+    let dir = private_temp();
+    let sm = SmAdapter(Arc::new(Mutex::new(
+        StateStore::open(
+            dir.path(),
+            Init {
+                cluster: CLUSTER,
+                first_free: node(3),
+            },
+        )
+        .unwrap(),
+    )));
+    let learner = learner_image(&f, 1, true, &sm);
+    let resources = make_resources_for_learner(
+        CLUSTER,
+        node(2),
+        &sm,
+        Credentials {
+            root: f.root.clone(),
+            leaf: f.server.cert.clone(),
+            key: f.server.private_key(),
+            time: Arc::new(pki::FixedTime(1001)),
+        },
+        rpc_spy(false),
+        Some(learner.clone()),
+    )
+    .unwrap();
+    let ordinary = resources.client_config(node(1)).unwrap();
+    let admission = resources.admission_client_config(node(1)).unwrap();
+    let mut original = f.owner(1, rpc_spy(false));
+    let mut substitute = f.owner_with(
+        1,
+        &Fixture::issue(&f.issuer, CLUSTER, 1, 940, 10000),
+        rpc_spy(false),
+    );
+    let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (address, wrong) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    original.listen_on(a).unwrap();
+    substitute.listen_on(b).unwrap();
+
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Bootstrap));
+    assert!(connect(ordinary.clone(), address).await.is_err());
+    assert!(connect(admission.clone(), wrong).await.is_err());
+    // Complete the authenticated exchange so both halves finish TLS before
+    // observing the intentionally refused direct-route body on loopback.
+    let frame = control::request(reverse(), "192.168.10.2:7001".parse().unwrap());
+    let mut rx = events(&original);
+    assert!(
+        exchange_learner_for_test(address, admission.clone(), &frame)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Address))).await);
+
+    assert!(matches!(
+        sm.0.lock()
+            .unwrap()
+            .apply(
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 0
+                },
+                &StoredEntry::Enrollment(Command::Found {
+                    cluster: CLUSTER,
+                    members: FoundMembers::new([
+                        (node(1), f.client.digest()),
+                        (node(2), f.server.digest())
+                    ])
+                    .unwrap(),
+                    proposed_at_ms: 100,
+                }),
+            )
+            .unwrap(),
+        Some(Outcome::Founded { replay: false })
+    ));
+    add_learner_membership(&sm);
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Strict));
+    assert!(
+        exchange_learner_for_test(address, admission.clone(), &frame)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Address))).await);
+    assert!(
+        exchange_learner_for_test(address, ordinary, &frame)
+            .await
+            .is_err()
+    );
+    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Address))).await);
+    assert!(matches!(
+        sm.0.lock()
+            .unwrap()
+            .apply(
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 2
+                },
+                &StoredEntry::Enrollment(Command::Remove {
+                    cluster: CLUSTER,
+                    node: node(1),
+                    proposed_at_ms: 101
+                }),
+            )
+            .unwrap(),
+        Some(Outcome::Removed { replay: false })
+    ));
+    assert!(connect(admission, address).await.is_err());
+    assert!(bounded_close(&mut original).await.is_ok());
+    assert!(bounded_close(&mut substitute).await.is_ok());
+}
