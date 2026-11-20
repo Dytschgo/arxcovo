@@ -44,6 +44,10 @@ struct State {
     founder: Option<founder::Operation>,
     #[cfg(target_os = "linux")]
     founder_failure: Option<founder::Error>,
+    #[cfg(target_os = "linux")]
+    issuer: Option<Arc<enrollment_ingress::ReadyIssuer>>,
+    #[cfg(target_os = "linux")]
+    ingress: Option<crate::cluster::enrollment::session::ListenerOwner>,
 }
 #[cfg(test)]
 struct PreparationPause {
@@ -93,6 +97,10 @@ impl Job {
                 founder: None,
                 #[cfg(target_os = "linux")]
                 founder_failure: None,
+                #[cfg(target_os = "linux")]
+                issuer: None,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             }),
             changed,
             close: Notify::new(),
@@ -128,6 +136,10 @@ impl Job {
         let mut s = self.state();
         if !s.close_requested {
             s.close_requested = true;
+            #[cfg(target_os = "linux")]
+            if let Some(ingress) = &s.ingress {
+                ingress.stop();
+            }
             self.close.notify_one();
         }
         self.observe()
@@ -208,6 +220,7 @@ impl Job {
             s.status = Status::Clean;
             #[cfg(target_os = "linux")]
             {
+                s.issuer = None;
                 s.founder = None;
                 if s.founder_failure.is_some() {
                     s.status = Status::ClosedAfterFounderRefusal;
@@ -446,7 +459,7 @@ where
             return;
         }
         #[cfg(target_os = "linux")]
-        if !founder::close_transport(job).await {
+        if !enrollment_ingress::close(job).await || !founder::close_transport(job).await {
             job.finish_close(None, false, false);
             return;
         }
@@ -524,6 +537,9 @@ where
 
 #[cfg(test)]
 mod engine_tests;
+
+#[cfg(target_os = "linux")]
+mod enrollment_ingress;
 
 #[cfg(any(test, target_os = "linux"))]
 pub(super) mod founder;

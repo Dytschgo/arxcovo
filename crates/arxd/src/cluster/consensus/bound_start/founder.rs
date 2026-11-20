@@ -107,9 +107,19 @@ pub(super) mod linux {
         fixture: Option<HostedFixture>,
     }
 
+    #[cfg(test)]
+    impl Operation {
+        pub(in crate::cluster::consensus::bound_start) fn transport_for_test(
+            &self,
+        ) -> &tokio::sync::Mutex<TransportOwner> {
+            &self.transport
+        }
+    }
+
     pub(in crate::cluster::consensus::bound_start) struct Prepared {
         cluster: ClusterId,
         address: String,
+        enrollment: std::net::SocketAddr,
         clock: Arc<HostClock>,
         ca: ClusterCa,
         csr: Vec<u8>,
@@ -139,9 +149,11 @@ pub(super) mod linux {
         }
     }
 
-    // Only the hosted fixture in the child test module can construct this.
+    // Only the retained founder and enrollment hosted fixtures construct this.
     #[cfg(test)]
-    pub(in crate::cluster::consensus::bound_start) struct HostedFixture(());
+    pub(in crate::cluster::consensus::bound_start) struct HostedFixture(
+        pub(in crate::cluster::consensus::bound_start) (),
+    );
 
     pub(in crate::cluster::consensus::bound_start) fn dispatch_founder(
         plan: Plan,
@@ -245,6 +257,7 @@ pub(super) mod linux {
         Ok(Prepared {
             cluster: intent.cluster,
             address,
+            enrollment: intent.enrollment,
             clock,
             ca,
             csr,
@@ -332,12 +345,18 @@ pub(super) mod linux {
                 return Err(Error::Eligibility);
             }
             let mut transport = transport.lock().await;
-            let state = job.state();
+            let mut state = job.state();
             if state.close_requested || state.status != Status::Founding {
                 return Err(Error::Closing);
             }
             let sm = node.sm.as_ref().ok_or(Error::Eligibility)?;
             let raft = node.raft.clone().ok_or(Error::Eligibility)?;
+            let enrollment = Credentials {
+                root: credentials.root.clone(),
+                leaf: credentials.leaf.clone(),
+                key: credentials.key.clone_key(),
+                time: credentials.time.clone(),
+            };
             transport
                 .attach_founder(
                     sm,
@@ -345,7 +364,16 @@ pub(super) mod linux {
                     &self.address,
                     credentials,
                 )
-                .map_err(Error::Attach)
+                .map_err(Error::Attach)?;
+            state.issuer = Some(Arc::new(enrollment_ingress::ReadyIssuer::new(
+                self.enrollment,
+                self.cluster,
+                self.ca,
+                self.clock,
+                self.key,
+                enrollment,
+            )));
+            Ok(())
         }
     }
 
