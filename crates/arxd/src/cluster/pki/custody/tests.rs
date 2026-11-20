@@ -426,10 +426,10 @@ mod files {
             let id = codec::installation(&fs::read(a.join("install-context")).unwrap()).unwrap();
             drop(owner);
             let recovered = Custody::open_existing(&a, &b, id);
-            if let Some(bytes) = &before {
-                if bytes.len() < 138 {
-                    assert!(recovered.is_err());
-                }
+            if let Some(bytes) = &before
+                && bytes.len() < 138
+            {
+                assert!(recovered.is_err());
             }
             assert_eq!(before, fs::read(b.join("ca-key")).ok());
         }
