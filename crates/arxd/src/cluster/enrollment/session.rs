@@ -86,6 +86,22 @@ async fn clean_end(reader: &mut (impl AsyncRead + Unpin)) -> Result<(), Refused>
     }
 }
 
+/// Refuse if anything beyond the consumed frame is already readable: buffered
+/// plaintext, a later record already received, close or error. One poll only;
+/// `Pending` proves nothing further has arrived yet, so the phase boundary holds.
+pub(in crate::cluster) async fn nothing_pending(
+    reader: &mut (impl AsyncRead + Unpin),
+) -> Result<(), Refused> {
+    std::future::poll_fn(|cx| {
+        let mut byte = [0];
+        match Pin::new(&mut *reader).poll_read(cx, &mut ReadBuf::new(&mut byte)) {
+            Poll::Pending => Poll::Ready(Ok(())),
+            Poll::Ready(_) => Poll::Ready(Err(Refused)),
+        }
+    })
+    .await
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Query {
     cluster: ClusterId,

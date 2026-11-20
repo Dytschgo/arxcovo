@@ -212,6 +212,8 @@ pub(in crate::cluster) async fn exchange(
         socket.flush().await.map_err(|_| Refused)?;
         let (challenge, voters) = session::receive_anchor(&mut socket).await?;
         check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
+        // The Anchor reply must end its phase: no extra or out-of-order frame.
+        session::nothing_pending(&mut socket).await?;
         Ok((
             socket,
             voters,

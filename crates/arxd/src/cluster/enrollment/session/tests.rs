@@ -583,6 +583,49 @@ async fn client_refuses_wrong_identity_and_wrong_method_with_zero_proof() {
 }
 
 #[tokio::test]
+async fn client_refuses_frame_buffered_after_anchor_without_releasing_redeem() {
+    within(async {
+        let f = fixture();
+        let csr = signed_csr(false);
+        let anchor = anchor_wire(&f.list);
+        // One extra frame per run: a duplicate Anchor, then a wrong-kind Result.
+        for extra in [anchor.clone(), result_wire()] {
+            let query = query_wire(&f.code);
+            // A single write puts both frames in one TLS record, so the extra
+            // plaintext is decrypted alongside the Anchor the client consumes.
+            let message = [anchor.as_slice(), &extra].concat();
+            let observed = Arc::new(AtomicUsize::new(usize::MAX));
+            let peer = observed.clone();
+            let (addr, done) = raw_server(test_server_config(&f), move |mut tls| async move {
+                let mut bytes = [0; 40];
+                tls.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, query.as_slice());
+                tls.write_all(&message).await.unwrap();
+                tls.flush().await.unwrap();
+                let mut seen = Vec::new();
+                read_plaintext(&mut tls, &mut seen).await;
+                peer.store(seen.len(), SeqCst);
+            })
+            .await;
+            let result = exchange(
+                addr,
+                &f.code,
+                &f.root,
+                Arc::new(ProbeTime),
+                REQUEST,
+                &csr,
+                SocketLimits::default(),
+            )
+            .await;
+            done.await.unwrap();
+            assert!(matches!(result, Err(ExchangeError::Refused)));
+            assert_eq!(observed.load(SeqCst), 0, "Redeem released past extra frame");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn client_accepts_only_the_exact_result_and_authenticated_end() {
     within(async {
         let f = fixture();
