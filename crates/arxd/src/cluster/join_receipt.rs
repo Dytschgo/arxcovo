@@ -327,6 +327,14 @@ pub(in crate::cluster) mod tests {
             assert_eq!(serde_json::to_vec(&expected).unwrap(), bytes);
         }
     }
+    pub(in crate::cluster) fn different_key(key: KeyDigest) -> KeyDigest {
+        [b"wrong-key", b"other-key"]
+            .into_iter()
+            .map(|bytes| KeyDigest::of_spki(bytes).unwrap())
+            .find(|other| *other != key)
+            .unwrap()
+    }
+
     #[test]
     fn public_roles_crypto_and_trusted_history() {
         for (n, origin) in [
@@ -355,10 +363,10 @@ pub(in crate::cluster) mod tests {
             assert!(record.verify(&expected, &root, now()).is_err());
             expected.cluster = [1; 16];
             let key = expected.key;
-            expected.key = KeyDigest::of_spki(b"wrong-key").unwrap();
+            expected.key = different_key(key);
             assert!(record.verify(&expected, &root, now()).is_err());
             expected.key = key;
-            expected.ca = [0; 32];
+            expected.ca[0] ^= 1;
             assert!(record.verify(&expected, &root, now()).is_err());
             expected.ca = record.ca;
             if n == 2 {

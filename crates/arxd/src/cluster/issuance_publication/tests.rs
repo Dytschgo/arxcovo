@@ -479,23 +479,39 @@ mod files {
                 .verify(&valid, &root, rustls::pki_types::UnixTime::now())
                 .unwrap();
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let original = serde_json::to_vec(&value).unwrap();
             value["origin"]["role"] =
                 serde_json::json!(if node == 1 { "joiner" } else { "founder" });
-            assert!(PublicIdentity::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+            let altered = serde_json::to_vec(&value).unwrap();
+            assert_ne!(altered, original, "role for node {node}");
+            assert!(PublicIdentity::decode(&altered).is_err());
         }
         let bytes = PublicIdentity::assemble(&expected, &leaf).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let original_bytes = serde_json::to_vec(&original).unwrap();
         for field in [
             "cluster", "node", "key", "ca", "term", "leader", "index", "role", "anchors",
         ] {
-            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let mut value = original.clone();
             match field {
-                "cluster" | "key" | "ca" => value[field][0] = serde_json::json!(99),
-                "node" => value[field] = serde_json::json!(expected.node.get() + 1),
-                "role" => value["origin"]["role"] = serde_json::json!("founder"),
-                "anchors" => value["origin"]["anchors"][0][1][0] = serde_json::json!(99),
-                _ => value["origin"][field] = serde_json::json!(99),
+                "cluster" | "key" | "ca" => {
+                    let byte = &mut value[field][0];
+                    *byte = (byte.as_u64().unwrap() ^ 1).into();
+                }
+                "node" => value[field] = (expected.node.get() + 1).into(),
+                "role" => value["origin"]["role"] = "founder".into(),
+                "anchors" => {
+                    let byte = &mut value["origin"]["anchors"][0][1][0];
+                    *byte = (byte.as_u64().unwrap() ^ 1).into();
+                }
+                "term" | "leader" | "index" => {
+                    let number = &mut value["origin"][field];
+                    *number = (number.as_u64().unwrap() + 1).into();
+                }
+                _ => unreachable!(),
             }
             let altered = serde_json::to_vec(&value).unwrap();
+            assert_ne!(altered, original_bytes, "{field}");
             if let Ok(record) = PublicIdentity::decode(&altered) {
                 assert!(
                     record
@@ -506,7 +522,8 @@ mod files {
                                 std::time::Duration::from_secs(1000)
                             )
                         )
-                        .is_err()
+                        .is_err(),
+                    "{field}"
                 );
             }
             // Unchanged AEAD/key remains valid despite edited public history.
@@ -515,8 +532,8 @@ mod files {
                 .unwrap();
         }
         use crate::cluster::{
-            enrollment::{KeyDigest, NodeId},
-            join_receipt::ExpectedIdentity,
+            enrollment::NodeId,
+            join_receipt::{ExpectedIdentity, tests::different_key},
         };
         for field in [
             "cluster", "node", "key", "root", "role", "term", "leader", "index", "anchors", "leaf",
@@ -535,8 +552,8 @@ mod files {
             let mut wrong_leaf = leaf.clone();
             match field {
                 "cluster" => bad.cluster[0] ^= 1,
-                "node" => bad.node = NodeId::new(55).unwrap(),
-                "key" => bad.key = KeyDigest::of_spki(b"different public key").unwrap(),
+                "node" => bad.node = NodeId::new(expected.node.get() + 1).unwrap(),
+                "key" => bad.key = different_key(expected.key),
                 "root" => wrong_root[0] ^= 1,
                 "role" => {
                     bad.origin = Origin::Found {
