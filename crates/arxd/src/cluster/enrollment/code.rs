@@ -46,6 +46,13 @@ impl fmt::Debug for JoinCode {
     }
 }
 impl RedeemProof {
+    /// Wraps a client-supplied bearer proof. The existing enroll() path reduces
+    /// this proof to a verifier and checks it against the committed Mint verifier.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn from_wire(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub(in crate::cluster) fn bytes(&self) -> &[u8; 32] {
         &self.0
     }

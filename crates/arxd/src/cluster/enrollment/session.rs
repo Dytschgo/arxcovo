@@ -1,4 +1,4 @@
-//! Closed enrollment wire and listener custody. This slice has no live backend.
+//! Closed enrollment wire and listener custody.
 use super::{BoundVoters, ClusterId, CodeId, JoinAnchor, NodeId, RequestId};
 use crate::cluster::{pki::preproof::Refused, state_store::LogPos};
 use rustls::{
@@ -104,7 +104,7 @@ pub(in crate::cluster) async fn nothing_pending(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Query {
+pub(in crate::cluster) struct Query {
     cluster: ClusterId,
     code: CodeId,
 }
@@ -117,11 +117,15 @@ impl Query {
         }
     }
 
-    fn frame(self) -> Vec<u8> {
+    pub(in crate::cluster) fn body(self) -> [u8; 32] {
         let mut body = [0; 32];
         body[..16].copy_from_slice(&self.cluster);
         body[16..].copy_from_slice(&self.code);
-        frame(Kind::Query, &body)
+        body
+    }
+
+    fn frame(self) -> Vec<u8> {
+        frame(Kind::Query, &self.body())
     }
 }
 
@@ -168,12 +172,30 @@ impl Continuation {
     }
 }
 
-struct Redeem {
+pub(in crate::cluster) struct Redeem {
     request: RequestId,
     query: Query,
     anchor: JoinAnchor,
     proof: [u8; 32],
     csr: Vec<u8>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl Redeem {
+    pub(in crate::cluster) fn into_issuer(
+        self,
+    ) -> (crate::cluster::consensus::issue::RedeemInput, Vec<u8>) {
+        (
+            crate::cluster::consensus::issue::RedeemInput {
+                cluster: self.query.cluster,
+                request: self.request,
+                code: self.query.code,
+                proof: super::RedeemProof::from_wire(self.proof),
+                anchor: self.anchor,
+            },
+            self.csr,
+        )
+    }
 }
 
 pub(in crate::cluster) fn redeem_frame(
@@ -204,6 +226,20 @@ pub(in crate::cluster) struct Reply {
 }
 
 impl Reply {
+    #[cfg(target_os = "linux")]
+    pub(in crate::cluster) fn issued(issued: crate::cluster::consensus::issue::IssuedLeaf) -> Self {
+        Self {
+            node: issued.node,
+            original: issued.identity_commit,
+            leaf: issued.der,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::cluster) fn parts(&self) -> (NodeId, LogPos, &[u8]) {
+        (self.node, self.original, &self.leaf)
+    }
+
     fn decode(body: &[u8]) -> Result<Self, Refused> {
         if body[0] != 0 || body.len() == 1 {
             return Err(Refused);
@@ -410,7 +446,7 @@ fn server_config(
 
 /// Both operations must finish within their admitted budget. The owner joins even
 /// if a backend violates that contract, because expiry cannot prove cancellation.
-trait Backend: Send + Sync + 'static {
+pub(in crate::cluster) trait Backend: Send + Sync + 'static {
     fn anchor(
         &self,
         query: Query,
@@ -465,26 +501,26 @@ impl Control {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Close {
+pub(in crate::cluster) enum Close {
     Joined,
     Unconfirmed,
 }
 
-struct ListenerOwner {
+pub(in crate::cluster) struct ListenerOwner {
     control: Arc<Control>,
     supervisor: JoinHandle<Close>,
     outcome: Option<Close>,
 }
 
 impl ListenerOwner {
-    fn start(
+    pub(in crate::cluster) fn start(
         listener: TcpListener,
         leaf: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
         time: Arc<dyn TimeProvider>,
         backend: impl Backend,
     ) -> Result<Self, Refused> {
-        let config = server_config(leaf, key, time)?;
+        let config = server_config(leaf, key, time.clone())?;
         let control = Arc::new(Control {
             admission: Mutex::new(()),
             closing: watch::channel(false).0,
@@ -494,6 +530,7 @@ impl ListenerOwner {
         let supervisor = tokio::spawn(supervise(
             listener,
             TlsAcceptor::from(Arc::new(config)),
+            time,
             Arc::new(backend),
             control.clone(),
         ));
@@ -504,8 +541,12 @@ impl ListenerOwner {
         })
     }
 
-    async fn close(&mut self, observation: Duration) -> Close {
+    pub(in crate::cluster) fn stop(&self) {
         self.control.stop();
+    }
+
+    pub(in crate::cluster) async fn close(&mut self, observation: Duration) -> Close {
+        self.stop();
         if let Some(outcome) = self.outcome {
             return outcome;
         }
@@ -530,6 +571,7 @@ impl Drop for ListenerOwner {
 async fn supervise(
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    time: Arc<dyn TimeProvider>,
     backend: Arc<impl Backend>,
     control: Arc<Control>,
 ) -> Close {
@@ -555,10 +597,11 @@ async fn supervise(
                 let Ok(session) = control.sessions.clone().try_acquire_owned() else { continue };
                 let Ok(handshake) = control.handshakes.clone().try_acquire_owned() else { continue };
                 let acceptor = acceptor.clone();
+                let time = time.clone();
                 let backend = backend.clone();
                 let control = control.clone();
                 connections.spawn(async move {
-                    let result = serve(tcp, acceptor, backend, control, handshake, deadline).await;
+                    let result = serve(tcp, (acceptor, time), backend, control, handshake, deadline).await;
                     (result, session)
                 });
             }
@@ -631,13 +674,15 @@ async fn send_terminal(
 
 async fn serve(
     tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    (acceptor, time): (TlsAcceptor, Arc<dyn TimeProvider>),
     backend: Arc<impl Backend>,
     control: Arc<Control>,
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
 ) -> Result<(), SessionError> {
     let socket = before_work(&control, deadline, async {
+        // A full server-only handshake may not consult rustls's TimeProvider.
+        time.current_time().ok_or(Refused)?;
         tcp.set_nodelay(true).map_err(|_| Refused)?;
         acceptor
             .accept(QuotaSocket::new(tcp, SocketLimits::default(), deadline))
@@ -700,3 +745,169 @@ async fn serve(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checked_time_tests {
+    use super::*;
+    use crate::cluster::pki::{
+        preproof,
+        preproof_tests::{ProbeTime, fixture},
+        verify::SERVER_NAME,
+    };
+    use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct UnavailableTime(AtomicBool);
+
+    impl TimeProvider for UnavailableTime {
+        fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
+            self.0.store(true, Ordering::Relaxed);
+            None
+        }
+    }
+
+    struct NoDispatch;
+
+    impl Backend for NoDispatch {
+        async fn anchor(&self, _: Query, _: Instant) -> Result<BoundVoters, Refused> {
+            panic!("unavailable TLS time reached AnchorQuery");
+        }
+
+        async fn redeem(&self, _: Redeem, _: Instant) -> Result<Reply, Refused> {
+            panic!("unavailable TLS time reached Redeem");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_server_time_refuses_before_tls_dispatch() {
+        let fixture = fixture();
+        let time = Arc::new(UnavailableTime::default());
+        let config = preproof::test_config(&fixture.code, &fixture.root, Arc::new(ProbeTime));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut owner = ListenerOwner::start(
+            listener,
+            fixture.good.into(),
+            PrivatePkcs8KeyDer::from(fixture.good_key.serialize_der()).into(),
+            time.clone(),
+            NoDispatch,
+        )
+        .unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let refusal = timeout(
+            Duration::from_secs(2),
+            tls.connect(ServerName::try_from(SERVER_NAME).unwrap(), tcp),
+        )
+        .await
+        .expect("TLS refusal watchdog");
+        assert!(refusal.is_err());
+        assert!(time.0.load(Ordering::Relaxed));
+        assert_eq!(owner.close(Duration::from_secs(2)).await, Close::Joined);
+    }
+}
+
+#[cfg(test)]
+mod wire_proof_tests {
+    use super::*;
+    use crate::cluster::{
+        enrollment::{
+            Command, EnrollmentState, FoundMembers, JoinCode, KeyDigest, Outcome, Reject,
+        },
+        membership::Membership,
+    };
+
+    #[test]
+    fn wrong_wire_proof_is_refused_by_existing_redeem_reduction_and_apply() {
+        let cluster = [1; 16];
+        let founder = NodeId::new(1).unwrap();
+        let learner = NodeId::new(2).unwrap();
+        let membership = Membership::new(vec![[1].into()], [(1, "fixture".into())].into()).unwrap();
+        let position = |index| LogPos {
+            term: 1,
+            leader: 1,
+            index,
+        };
+        let mut state = EnrollmentState::new(cluster, learner);
+        // Seed only the pure apply model. This test starts no consensus node.
+        assert_eq!(
+            state.apply(
+                &Command::Found {
+                    cluster,
+                    members: FoundMembers::new([(
+                        founder,
+                        KeyDigest::of_spki(b"founder").unwrap()
+                    )])
+                    .unwrap(),
+                    proposed_at_ms: 1,
+                },
+                position(0),
+                Some(&membership),
+            ),
+            Outcome::Founded { replay: false },
+        );
+        let code = JoinCode::generate(
+            cluster,
+            [2; 32],
+            state.voter_anchor(&membership).unwrap(),
+            |bytes| {
+                bytes.fill(42);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.apply(
+                &Command::Mint {
+                    cluster,
+                    actor: [3; 16],
+                    request: [4; 16],
+                    code: code.code_id(),
+                    verifier: code.verifier(),
+                    proposed_at_ms: 2,
+                },
+                position(1),
+                Some(&membership),
+            ),
+            Outcome::Minted { replay: false, .. }
+        ));
+
+        let challenge = [6; 16];
+        let csr = [1u8]; // Opaque here. Production enroll() parses and verifies the CSR.
+        let valid = redeem_frame(&code, [5; 16], challenge, &csr).unwrap();
+        let mut wrong = valid.clone();
+        wrong[HEADER + 96] ^= 1;
+        let reduced = |frame: Vec<u8>| {
+            let (input, _) = Continuation {
+                query: Query {
+                    cluster,
+                    code: code.code_id(),
+                },
+                anchor: code.anchor(),
+                challenge,
+            }
+            .accept(frame[HEADER..].to_vec())
+            .unwrap()
+            .into_issuer();
+            // The same reduction used by enroll() before it proposes Redeem.
+            Command::redeem(
+                input.cluster,
+                input.request,
+                input.code,
+                &input.proof,
+                KeyDigest::of_spki(b"learner").unwrap(),
+                input.anchor,
+                3,
+            )
+        };
+        assert_eq!(
+            state.apply(&reduced(wrong), position(2), Some(&membership)),
+            Outcome::Rejected(Reject::BadProof),
+        );
+        assert!(matches!(
+            state.apply(&reduced(valid), position(3), Some(&membership)),
+            Outcome::Enrolled(grant) if grant.node() == learner && !grant.replay()
+        ));
+    }
+}
