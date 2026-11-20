@@ -59,7 +59,19 @@ PR188 as the last merge, that is superseded by this summary.
   `D:/Temp/arx-bound-store-2/report.md` SHA256 `fff605cd…09ad`. Local Windows
   NTFS: bound 20, state 17, log 16, startup-plan 3 tests pass; static gate,
   fmt, Clippy, loader and SQLite verifier (33 negative controls) pass. Unix and
-  macOS unexercised locally. Independent exact-head review and hosted CI pending.
+  macOS unexercised locally. First exact-head review (head `5e3efef0`,
+  `D:/Temp/arx-pr196-review/review.md`, SHA256 `aa6f3797…8d05`): SP1–SP4 closed,
+  agent-review failure on ST1 (failure cases fired before their named operations;
+  missing actual open/PRAGMA/staging/mismatch boundary tests). Second builder's last
+  attempt (`fdad3190`) failed Clippy (E0603, E0521): 3/3 exhausted. Fresh stuck-rule
+  review (`D:/Temp/arx-pr196-st1-review/review.md`, SHA256 `4267a0a7…c618`) found
+  two test-only compile corrections. **Owner authorization (2026-11-20):** finish ST1
+  only from `fdad3190` with a fresh 3-attempt budget. Third Sol 6.1/high builder used
+  1/3 (formatting), head `ac1c3b32`; report `D:/Temp/arx-bound-store-3/report.md`
+  SHA256 `21b3f89f…4c71`: bound 24, state 17, log 16, startup-plan 3 pass, all ten
+  error/unwind cases plus actual-open, PRAGMA/schema, staging-refusal and
+  constructor-mismatch boundaries; fmt, Clippy, static gate pass. Unix/macOS runtime
+  via hosted CI. Fresh exact-head review pending.
 - **M3 slice 3, custody (decision D1):** Sol 6.1/high contract
   `D:/Temp/arx-m3-custody-d1/contract.md`; independent review GO with required
   changes (`D:/Temp/arx-m3-custody-d1-review/review.md`, SHA256 `4a3ac971…7cfe`;
