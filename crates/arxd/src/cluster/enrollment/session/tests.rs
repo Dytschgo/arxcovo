@@ -8,13 +8,14 @@ use crate::cluster::{
         verify::SERVER_NAME,
     },
 };
-use rcgen::{CertificateParams, CustomExtension, KeyPair, PKCS_ED25519};
+use rcgen::{CertificateParams, KeyPair, PKCS_ED25519, SanType};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTls};
 
 const WATCHDOG: Duration = Duration::from_secs(2);
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(5);
 const REQUEST: RequestId = [17; 16];
 
 async fn within<T>(future: impl Future<Output = T>) -> T {
@@ -138,12 +139,10 @@ fn signed_csr(maximum: bool) -> Vec<u8> {
     let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
     let encode = |padding| {
         let mut params = CertificateParams::default();
+        let uri = format!("https://example.invalid/{}", "a".repeat(padding));
         params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                &[1, 3, 6, 1, 4, 1, 55555, 1],
-                vec![0; padding],
-            ));
+            .subject_alt_names
+            .push(SanType::URI(uri.try_into().unwrap()));
         params.serialize_request(&key).unwrap().der().to_vec()
     };
     let csr = if maximum {
@@ -269,6 +268,15 @@ async fn assert_released(owner: &ListenerOwner) {
     }
 }
 
+async fn assert_listener_refused(addr: std::net::SocketAddr) {
+    // Windows can take about two seconds to report a closed-port refusal.
+    let error = timeout(REFUSAL_DEADLINE, TcpStream::connect(addr))
+        .await
+        .expect("closed listener connection deadline")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+}
+
 #[tokio::test]
 async fn one_connection_retains_canonical_list_and_dispatches_max_csr_once() {
     within(async {
@@ -299,11 +307,11 @@ async fn one_connection_retains_canonical_list_and_dispatches_max_csr_once() {
         )
         .await
         .unwrap();
-        assert_eq!(completed.voters.encode(), f.list);
+        assert_eq!(completed.voters().encode(), f.list);
         let expected = reply();
-        assert_eq!(completed.reply.node, expected.node);
-        assert_eq!(completed.reply.original, expected.original);
-        assert_eq!(completed.reply.leaf, expected.leaf);
+        assert_eq!(completed.reply().node, expected.node);
+        assert_eq!(completed.reply().original, expected.original);
+        assert_eq!(completed.reply().leaf, expected.leaf);
         assert_eq!(owner.close(WATCHDOG).await, Close::Joined);
         assert_eq!(observed.anchors.load(SeqCst), 1);
         let reading = observed.redeems.lock().unwrap();
@@ -639,11 +647,62 @@ async fn client_accepts_only_the_exact_result_and_authenticated_end() {
             .await;
             done.await.unwrap();
             if accepted {
-                assert_eq!(result.unwrap().reply.original, reply().original);
+                assert_eq!(result.unwrap().reply().original, reply().original);
             } else {
                 assert!(matches!(result, Err(ExchangeError::PossibleEffect)));
             }
         }
+
+        let gate = Gate::new();
+        let mut backend = synthetic(&f);
+        backend.redeem_work = Some(gate.clone());
+        let observed = backend.observation.clone();
+        let (mut owner, destination) = start(&f, backend).await;
+        let (relay, addr) = listener().await;
+        let disconnect_on_admission = async {
+            let (mut client, _) = relay.accept().await.unwrap();
+            let mut server = TcpStream::connect(destination).await.unwrap();
+            client.set_nodelay(true).unwrap();
+            server.set_nodelay(true).unwrap();
+            // Forward opaque TLS until Redeem is admitted. Dropping the relay
+            // sockets while work is held prevents any Result from arriving.
+            tokio::select! {
+                admitted = gate.arrived.acquire() => admitted.unwrap().forget(),
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {
+                    panic!("relay closed before Redeem admission");
+                }
+            }
+        };
+        let client = exchange(
+            addr,
+            &f.code,
+            &f.root,
+            Arc::new(ProbeTime),
+            REQUEST,
+            &csr,
+            SocketLimits::default(),
+        );
+        let (result, ()) = tokio::join!(client, disconnect_on_admission);
+        assert!(matches!(result, Err(ExchangeError::PossibleEffect)));
+        let retry = relay.accept();
+        tokio::pin!(retry);
+        assert!(
+            futures_util::poll!(retry).is_pending(),
+            "enrollment reconnected"
+        );
+        assert_eq!(gate.resource.available_permits(), 0);
+
+        gate.release.add_permits(1);
+        assert_eq!(owner.close(WATCHDOG).await, Close::Joined);
+        assert_eq!(gate.resource.available_permits(), 1);
+        assert_released(&owner).await;
+        assert_eq!(observed.anchors.load(SeqCst), 1);
+        let requests = observed.redeems.lock().unwrap();
+        let [request] = &requests[..] else {
+            panic!("expected exactly one admitted Redeem");
+        };
+        assert_eq!(request.request, REQUEST);
+        assert!(request.csr == csr);
     })
     .await;
 }
@@ -842,7 +901,7 @@ async fn ciphertext_caps_count_cumulative_reads_and_writes_on_real_sockets() {
 
 #[tokio::test]
 async fn saturation_refuses_without_queue_and_joins_release_capacity() {
-    within(async {
+    let addr = within(async {
         let f = fixture();
         let (mut owner, addr) = start(&f, synthetic(&f)).await;
         let held_handshakes = [
@@ -875,9 +934,10 @@ async fn saturation_refuses_without_queue_and_joins_release_capacity() {
         held_sessions.push(raw_connect(&connector, addr).await);
         assert_eq!(owner.close(WATCHDOG).await, Close::Joined);
         assert_released(&owner).await;
-        assert!(TcpStream::connect(addr).await.is_err());
+        addr
     })
     .await;
+    assert_listener_refused(addr).await;
 }
 
 #[tokio::test]
@@ -944,7 +1004,7 @@ async fn close_and_socket_expiry_retain_each_admitted_operation() {
 
 #[tokio::test]
 async fn successful_close_joins_idle_connections_and_releases_listener() {
-    within(async {
+    let addr = within(async {
         let f = fixture();
         let backend = synthetic(&f);
         let observed = backend.observation.clone();
@@ -953,11 +1013,12 @@ async fn successful_close_joins_idle_connections_and_releases_listener() {
         assert_eq!(owner.close(WATCHDOG).await, Close::Joined);
         assert_no_reply(&mut tls).await;
         assert_released(&owner).await;
-        assert!(TcpStream::connect(addr).await.is_err());
         assert_eq!(observed.anchors.load(SeqCst), 0);
         assert!(observed.redeems.lock().unwrap().is_empty());
+        addr
     })
     .await;
+    assert_listener_refused(addr).await;
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{Instant, timeout, timeout_at},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::{TlsAcceptor, client::TlsStream as ClientTls, server::TlsStream};
 
 const SESSIONS: usize = 8;
 const HANDSHAKES: usize = 2;
@@ -180,7 +180,7 @@ pub(in crate::cluster) fn redeem_frame(
 }
 
 #[derive(PartialEq, Eq)]
-struct Reply {
+pub(in crate::cluster) struct Reply {
     node: NodeId,
     original: LogPos,
     leaf: Vec<u8>,
@@ -229,20 +229,13 @@ impl Reply {
     }
 }
 
-/// Protocol data only. The original voter list comes from the authenticated exchange.
-pub(in crate::cluster) struct Completed {
-    voters: BoundVoters,
-    reply: Reply,
-}
-
 pub(in crate::cluster) async fn receive_result(
-    reader: &mut (impl AsyncRead + Unpin),
-    voters: BoundVoters,
-) -> Result<Completed, Refused> {
-    let body = read_frame(reader, Kind::Result).await?;
+    socket: &mut ClientTls<QuotaSocket>,
+) -> Result<Reply, Refused> {
+    let body = read_frame(socket, Kind::Result).await?;
     let reply = Reply::decode(&body)?;
-    clean_end(reader).await?;
-    Ok(Completed { voters, reply })
+    clean_end(socket).await?;
+    Ok(reply)
 }
 
 fn field<const N: usize>(body: &[u8], offset: usize) -> [u8; N] {

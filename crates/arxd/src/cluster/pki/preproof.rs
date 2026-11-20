@@ -2,7 +2,7 @@
 use super::verify::{SERVER_NAME, peer_identity};
 use crate::cluster::enrollment::{
     BoundVoters, ClusterId, JoinAnchor, JoinCode, RequestId,
-    session::{self, Completed, QuotaSocket, SOCKET_BUDGET, SocketLimits},
+    session::{self, QuotaSocket, Reply, SOCKET_BUDGET, SocketLimits},
 };
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error, HandshakeKind, RootCertStore, SignatureScheme,
@@ -163,6 +163,22 @@ pub(in crate::cluster) enum ExchangeError {
     PossibleEffect,
 }
 
+/// Bounded protocol data from a completed authenticated exchange.
+pub(in crate::cluster) struct Completed {
+    voters: BoundVoters,
+    reply: Reply,
+}
+
+impl Completed {
+    pub(in crate::cluster) fn voters(&self) -> &BoundVoters {
+        &self.voters
+    }
+
+    pub(in crate::cluster) fn reply(&self) -> &Reply {
+        &self.reply
+    }
+}
+
 /// A single checked operation using the caller's original code. The socket, TLS
 /// state and plaintext never escape this function, including on failure.
 pub(in crate::cluster) async fn exchange(
@@ -213,11 +229,11 @@ pub(in crate::cluster) async fn exchange(
     timeout_at(deadline, async {
         socket.write_all(&redeem).await.map_err(|_| Refused)?;
         socket.shutdown().await.map_err(|_| Refused)?;
-        let completed = session::receive_result(&mut socket, voters).await?;
+        let reply = session::receive_result(&mut socket).await?;
         if Instant::now() >= deadline {
             return Err(Refused);
         }
-        Ok(completed)
+        Ok(Completed { voters, reply })
     })
     .await
     .map_err(|_| ExchangeError::PossibleEffect)?
