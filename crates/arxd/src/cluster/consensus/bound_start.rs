@@ -22,6 +22,10 @@ pub(super) enum Status {
     FounderReady,
     #[cfg(target_os = "linux")]
     FounderRefused,
+    #[cfg(target_os = "linux")]
+    LearnerReady,
+    #[cfg(target_os = "linux")]
+    LearnerRefused,
     Closing,
     Clean,
     #[cfg(target_os = "linux")]
@@ -48,6 +52,8 @@ struct State {
     issuer: Option<Arc<enrollment_ingress::ReadyIssuer>>,
     #[cfg(target_os = "linux")]
     ingress: Option<crate::cluster::enrollment::session::ListenerOwner>,
+    #[cfg(target_os = "linux")]
+    learner: Option<learner::Operation>,
 }
 #[cfg(test)]
 struct PreparationPause {
@@ -101,6 +107,8 @@ impl Job {
                 issuer: None,
                 #[cfg(target_os = "linux")]
                 ingress: None,
+                #[cfg(target_os = "linux")]
+                learner: None,
             }),
             changed,
             close: Notify::new(),
@@ -220,6 +228,7 @@ impl Job {
             s.status = Status::Clean;
             #[cfg(target_os = "linux")]
             {
+                s.learner = None;
                 s.issuer = None;
                 s.founder = None;
                 if s.founder_failure.is_some() {
@@ -318,13 +327,45 @@ where
     N: RaftNetworkFactory<Arx> + Send + 'static,
     N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
 {
+    drive(
+        job,
+        Some(plan),
+        intent,
+        expected,
+        params,
+        network,
+        #[cfg(test)]
+        witness,
+    )
+}
+
+fn drive<N>(
+    job: &'static Job,
+    plan: Option<Plan>,
+    intent: StartIntent,
+    expected: Option<ExpectedIdentity>,
+    params: Params,
+    network: N,
+    #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
+) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
+where
+    N: RaftNetworkFactory<Arx> + Send + 'static,
+    N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
+{
     let observer = job.observe();
     #[cfg(test)]
     let supervisor_witness = witness.clone();
     let driver = tokio::spawn(async move {
         let node_id = intent.node.get();
+        #[cfg(target_os = "linux")]
+        let intent_after_start = intent.peer;
         let prepared = tokio::task::spawn_blocking(move || {
-            job.prepare(plan, &intent, expected.as_ref());
+            if let Some(plan) = plan {
+                job.prepare(plan, &intent, expected.as_ref());
+            } else {
+                #[cfg(target_os = "linux")]
+                learner::prepare(job, &intent);
+            }
             #[cfg(target_os = "linux")]
             founder::prepare(job, &intent)
         })
@@ -390,7 +431,7 @@ where
             } else {
                 // The Linux founder entry requires its own fixture capability.
                 #[cfg(target_os = "linux")]
-                let allowed = founder::linux::hosted_fixture(job);
+                let allowed = founder::linux::hosted_fixture(job) || learner::hosted_fixture(job);
                 #[cfg(not(target_os = "linux"))]
                 let allowed = false;
                 if !allowed {
@@ -452,6 +493,8 @@ where
                         Err(reason) => founder::refuse(job, reason),
                     }
                 }
+                #[cfg(target_os = "linux")]
+                learner::attach(job, &intent_after_start).await;
             }
         }
         job.close.notified().await;
@@ -459,7 +502,10 @@ where
             return;
         }
         #[cfg(target_os = "linux")]
-        if !enrollment_ingress::close(job).await || !founder::close_transport(job).await {
+        if !enrollment_ingress::close(job).await
+            || !founder::close_transport(job).await
+            || !learner::close_transport(job).await
+        {
             job.finish_close(None, false, false);
             return;
         }
@@ -543,6 +589,12 @@ mod enrollment_ingress;
 
 #[cfg(any(test, target_os = "linux"))]
 pub(super) mod founder;
+
+#[cfg(target_os = "linux")]
+mod learner;
+
+#[cfg(test)]
+mod learner_tests;
 
 #[cfg(test)]
 mod tests;

@@ -69,6 +69,18 @@ fn endpoint(s: &str) -> Result<SocketAddr> {
     Ok(a)
 }
 impl Plan {
+    #[cfg(target_os = "linux")]
+    pub(super) fn recover_joiner(&self) -> Self {
+        Self {
+            mode: Mode::RecoverJoiner,
+            config: self.config.clone(),
+            state: self.state.clone(),
+            credentials: self.credentials.clone(),
+            workspace: self.workspace.clone(),
+            peer: self.peer.clone(),
+            enrollment: self.enrollment.clone(),
+        }
+    }
     pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > 16384 {
             return Err(Refusal::Plan);
@@ -237,9 +249,63 @@ pub(super) struct Owner {
     // The real OS lock remains held until this object is dropped.
     lock: File,
     entries: Vec<String>,
+    published_join: bool,
     pub(super) publication: super::issuance_publication::Attempt,
     pub(super) bound_attempt: super::bound_open::BoundAttempt,
 }
+/// Holds independent identity references, never the locked Owner descriptor.
+#[cfg(target_os = "linux")]
+pub(super) struct ReopenObjects(Vec<Guard>);
+
+#[cfg(target_os = "linux")]
+impl Owner {
+    pub(super) fn pin_reopen_objects(&self) -> Result<ReopenObjects> {
+        self.recheck()?;
+        if !self.published_join || !self.has_stores() {
+            return Err(Refusal::Provenance);
+        }
+        let core = self
+            .guards
+            .iter()
+            .filter(|guard| {
+                !guard
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with("-journal")
+                            || name.ends_with("-wal")
+                            || name.ends_with("-shm")
+                    })
+            })
+            .map(|guard| {
+                let directory = guard.file.metadata().map_err(|_| Refusal::Layout)?.is_dir();
+                let pin = Guard::open(&guard.path, directory, false)?;
+                if pin.id != guard.id {
+                    return Err(Refusal::Ownership);
+                }
+                Ok(pin)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReopenObjects(core))
+    }
+
+    pub(super) fn verify_reopen_objects(&self, pinned: &ReopenObjects) -> Result<()> {
+        self.recheck()?;
+        for guard in &pinned.0 {
+            guard.recheck()?;
+            if !self
+                .guards
+                .iter()
+                .any(|g| g.path == guard.path && g.id == guard.id)
+            {
+                return Err(Refusal::Ownership);
+            }
+        }
+        Ok(())
+    }
+}
+
 const STATE: &[&str] = &[
     "cluster-owner.lock",
     "cluster-state.lock",
@@ -380,6 +446,7 @@ impl Owner {
             guards,
             lock,
             entries,
+            published_join: false,
             publication: Default::default(),
             bound_attempt: super::bound_open::BoundAttempt::Ready,
         };
@@ -419,7 +486,13 @@ impl Owner {
             .map_err(|_| Refusal::Layout)?
             .take(4)
             .count();
-        if count != if self.plan.mode.recovery() { 3 } else { 0 } {
+        if count
+            != if self.plan.mode.recovery() || self.published_join {
+                3
+            } else {
+                0
+            }
+        {
             return Err(Refusal::Layout);
         }
         Ok(())
@@ -496,6 +569,40 @@ impl Owner {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn stage_published_join(&mut self) -> Result<()> {
+        if self.plan.mode != Mode::Join
+            || self.published_join
+            || self.entries != ["cluster-owner.lock"]
+        {
+            return Err(Refusal::Provenance);
+        }
+        for name in ["ca.der", "identity.json", "member-key"] {
+            self.read(name, 16384)?;
+        }
+        let lock = self
+            .guards
+            .iter()
+            .find(|guard| guard.path == self.plan.state.join("cluster-owner.lock"))
+            .ok_or(Refusal::Ownership)?;
+        if lock.id != object(&self.lock)? || !lock.read_at(0)?.is_empty() {
+            return Err(Refusal::Ownership);
+        }
+        self.published_join = true;
+        self.recheck()
+    }
+
+    pub(super) fn published_baseline(&self) -> Result<()> {
+        self.recheck()?;
+        if !self.published_join
+            || self.plan.mode != Mode::Join
+            || self.entries != ["cluster-owner.lock"]
+        {
+            return Err(Refusal::Provenance);
+        }
+        Ok(())
+    }
+
     pub(super) fn fresh_baseline(&self) -> Result<()> {
         self.recheck()?;
         if self.entries != ["cluster-owner.lock"] || self.plan.mode != Mode::CreateFounder {
@@ -675,7 +782,11 @@ impl Owner {
             .map_err(|_| Refusal::Layout)?
             .take(4)
             .count()
-            != if self.plan.mode.recovery() { 3 } else { 0 }
+            != if self.plan.mode.recovery() || self.published_join {
+                3
+            } else {
+                0
+            }
         {
             return Err(Refusal::Layout);
         }

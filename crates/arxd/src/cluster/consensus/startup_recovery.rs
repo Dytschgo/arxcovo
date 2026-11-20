@@ -528,6 +528,131 @@ pub(super) fn prepare_bound(
     });
     (stores, observation)
 }
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_published_join(
+    owner: &mut Owner,
+    intent: &StartIntent,
+) -> (crate::cluster::bound_open::OwnedStores, Option<()>) {
+    use crate::cluster::bound_open::{BoundFailure, BoundIntent, BoundStores};
+    BoundStores::operational(
+        owner,
+        BoundIntent::PublishedJoin(Init {
+            cluster: intent.cluster,
+            first_free: NodeId::new(2).unwrap(),
+        }),
+        |stores| {
+            stores.validate_owner_for_start(|owner| {
+                check_learner_intent(owner, intent, Mode::Join)?;
+                owner.published_baseline()
+            })
+        },
+        |(), state, log| preflight(log, state).map_err(BoundFailure::Init),
+    )
+}
+
+fn check_learner_intent(owner: &Owner, intent: &StartIntent, mode: Mode) -> Result<()> {
+    if owner.plan.mode != mode
+        || intent.mode != mode
+        || intent.node.get() < 2
+        || super::peer_transport::endpoint(&owner.plan.peer).ok() != Some(intent.peer)
+        || super::peer_transport::endpoint(&owner.plan.enrollment).ok() != Some(intent.enrollment)
+    {
+        return Err(Refusal::Plan);
+    }
+    owner.recheck()
+}
+
+// D8 completion authority is checked by the dedicated caller under its original
+// acquired Owner. This arm handles history on the retained read-only and live pair.
+pub(super) fn prepare_strict_joiner(
+    owner: &mut Owner,
+    intent: &StartIntent,
+    expected: &ExpectedIdentity,
+) -> (crate::cluster::bound_open::OwnedStores, Option<HostClock>) {
+    use super::peer_registry::crossed;
+    use crate::cluster::bound_open::{BoundFailure, BoundIntent, BoundStores};
+    let sample = std::cell::Cell::new(None);
+    let (stores, inspected) = BoundStores::operational(
+        owner,
+        BoundIntent::Recovery(expected.cluster),
+        |stores| {
+            stores.validate_owner_for_start(|owner| {
+                check_learner_intent(owner, intent, Mode::RecoverJoiner)?;
+                if expected.origin.founder()
+                    || intent.node != expected.node
+                    || intent.cluster != expected.cluster
+                {
+                    return Err(Refusal::Identity);
+                }
+                authenticate(owner, expected)
+            })?;
+            let pair = stores.inspect_for_start(expected.cluster, |s, sf, l, lf| {
+                inspect_connections(s, sf, l, lf, expected.cluster).map_err(|_| StoreError::Corrupt)
+            })?;
+            let (state, log) = &pair;
+            let original = expected.origin.position();
+            let image = snapshot_state(&state.snapshot).map_err(BoundFailure::Init)?;
+            if !state.applied.is_some_and(|applied| {
+                crossed(
+                    expected,
+                    intent.peer,
+                    applied,
+                    state.membership.as_ref(),
+                    &image,
+                )
+            }) || log
+                .rows
+                .iter()
+                .chain(log.purged.iter())
+                .any(|p| p.index == original.index && *p != original)
+            {
+                return Err(BoundFailure::Inspection(Refusal::Identity));
+            }
+            HostClock::new(image.committed_ms())
+                .sample_ms()
+                .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?;
+            Ok(pair)
+        },
+        |(read, inspected_log), state, log| {
+            preflight(log, state).map_err(BoundFailure::Init)?;
+            let original = expected.origin.position();
+            let live = log.log_state().map_err(BoundFailure::Init)?;
+            let rows = log
+                .entries(0, i64::MAX as u64 + 1, MAX_LIVE)
+                .map_err(BoundFailure::Init)?;
+            if state.is_poisoned()
+                || state.snapshot() != read.snapshot
+                || live.last != inspected_log.last
+                || live.purged != inspected_log.purged
+                || !rows.iter().map(|(p, _)| p).eq(&inspected_log.rows)
+                || !state.applied().is_some_and(|applied| {
+                    crossed(
+                        expected,
+                        intent.peer,
+                        applied,
+                        state.membership(),
+                        state.state(),
+                    )
+                })
+                || rows
+                    .iter()
+                    .map(|(p, _)| p)
+                    .chain(live.purged.iter())
+                    .any(|p| p.index == original.index && *p != original)
+            {
+                return Err(BoundFailure::Inspection(Refusal::Identity));
+            }
+            let clock = HostClock::new(state.state().committed_ms());
+            clock
+                .sample_ms()
+                .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?;
+            sample.set(Some(clock));
+            Ok(())
+        },
+    );
+    (stores, inspected.and_then(|_| sample.into_inner()))
+}
+
 fn readonly(db: &Connection, file: &File, max_pages: u64, schema: &[(&str, &str)]) -> Result<()> {
     let len = file.metadata().map_err(|_| Refusal::Store)?.len();
     if len < 4096 || len > max_pages * 4096 {

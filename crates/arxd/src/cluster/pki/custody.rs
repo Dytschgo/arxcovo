@@ -512,6 +512,51 @@ mod linux {
         bytes: Vec<u8>,
     }
 
+    pub(in crate::cluster) struct LearnerReopen {
+        installation: [u8; 16],
+        wrap: PathBuf,
+        store: PathBuf,
+        originals: [File; 6],
+    }
+
+    impl LearnerReopen {
+        fn objects(wrap: &Root, store: &Root) -> Result<[File; 6], Error> {
+            Ok([
+                wrap.dir.try_clone().map_err(|_| Error::Unavailable)?,
+                store.dir.try_clone().map_err(|_| Error::Unavailable)?,
+                wrap.file("install-context", false)?,
+                wrap.file("seal-key", false)?,
+                store.file("custody-lock", false)?,
+                store.file("member-key", false)?,
+            ])
+        }
+
+        pub(in crate::cluster) fn open(self) -> Result<LearnerCustody, Error> {
+            let custody = Custody::open_existing(&self.wrap, &self.store, self.installation)?;
+            if custody.inventory()? != ["custody-lock", "member-key"] {
+                return Err(Error::Layout);
+            }
+            let objects = Self::objects(&custody.wrap, &custody.store)?;
+            for (old, new) in self.originals.iter().zip(objects) {
+                if !same(
+                    &old.metadata().map_err(|_| Error::Layout)?,
+                    &new.metadata().map_err(|_| Error::Layout)?,
+                ) {
+                    return Err(Error::Ownership);
+                }
+            }
+            let source = custody.store.file("member-key", false)?;
+            let bytes = custody.store.read("member-key", 16384)?;
+            let (context, _) = codec::frame(&bytes)?;
+            let key =
+                MemberKey::from_payload(context, &codec::open(&custody.key, context, &bytes)?.0)?;
+            Ok(LearnerCustody {
+                custody,
+                sealed: Some(SealedLearner { key, source, bytes }),
+            })
+        }
+    }
+
     impl LearnerCustody {
         pub(in crate::cluster) fn create(
             owner: &crate::cluster::startup_plan::Owner,
@@ -538,6 +583,16 @@ mod linux {
             Ok(Self {
                 custody: Custody::create_fresh_in_roots(wrap, store)?,
                 sealed: None,
+            })
+        }
+
+        pub(in crate::cluster) fn pin_reopen(&self) -> Result<LearnerReopen, Error> {
+            self.member()?;
+            Ok(LearnerReopen {
+                installation: self.installation(),
+                wrap: self.custody.wrap.path.clone(),
+                store: self.custody.store.path.clone(),
+                originals: LearnerReopen::objects(&self.custody.wrap, &self.custody.store)?,
             })
         }
 
@@ -621,6 +676,27 @@ mod linux {
             now: u64,
         ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
             if !expected.origin.founder() || expected.node.get() != 1 {
+                return Err(Error::Context);
+            }
+            self.validate_bytes(&self.bytes, expected, root, leaf, Some(now))?;
+            let payload = codec::open(&self.owner.key, self.context, &self.bytes)?;
+            let (key, _) = codec::parts(Kind::Member, &payload.0)?;
+            Ok(rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into())
+        }
+    }
+
+    impl MemberCopy<'_> {
+        pub(in crate::cluster) fn learner_tls_key(
+            &self,
+            expected: &crate::cluster::join_receipt::ExpectedIdentity,
+            root: &[u8],
+            leaf: &[u8],
+            now: u64,
+        ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
+            if expected.origin.founder()
+                || expected.node.get() < 2
+                || self.owner.inventory()? != ["custody-lock", "member-key"]
+            {
                 return Err(Error::Context);
             }
             self.validate_bytes(&self.bytes, expected, root, leaf, Some(now))?;
@@ -1025,7 +1101,7 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use linux::member_copy;
 #[cfg(target_os = "linux")]
-pub(in crate::cluster) use linux::{FounderCustody, LearnerCustody, MemberCopy};
+pub(in crate::cluster) use linux::{FounderCustody, LearnerCustody, LearnerReopen, MemberCopy};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use tests::publication_fixture;
