@@ -1146,3 +1146,97 @@ async fn late_redeem_and_close_before_clean_end_do_not_admit_dispatch() {
         within(assert_released(&owner)).await;
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_verified_continuation_sends_no_redeem_bytes() {
+    within(async {
+        let f = fixture();
+        let query = query_wire(&f.code);
+        let anchor = anchor_wire(&f.list);
+        let (addr, peer) = raw_server(test_server_config(&f), move |mut tls| async move {
+            let mut observed = [0; 40];
+            tls.read_exact(&mut observed).await.unwrap();
+            assert_eq!(observed, query.as_slice());
+            tls.write_all(&anchor).await.unwrap();
+            tls.flush().await.unwrap();
+            let read = tls.read(&mut [0]).await;
+            match read {
+                Ok(n) => assert_eq!(n, 0, "Redeem plaintext was sent"),
+                Err(e) => assert!(matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                )),
+            }
+        })
+        .await;
+        let continuation = crate::cluster::pki::preproof::anchor(
+            addr,
+            &f.code,
+            &f.root,
+            Arc::new(ProbeTime),
+            SocketLimits::default(),
+        )
+        .await
+        .unwrap();
+        drop(continuation);
+        peer.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verified_continuation_completes_one_synthetic_redeem() {
+    within(async {
+        let f = fixture();
+        let backend = synthetic(&f);
+        let observed = backend.observation.clone();
+        let (mut server, address) = start(&f, backend).await;
+        let continuation = crate::cluster::pki::preproof::anchor(
+            address,
+            &f.code,
+            &f.root,
+            Arc::new(ProbeTime),
+            SocketLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.anchors.load(SeqCst), 1);
+        assert!(observed.redeems.lock().unwrap().is_empty());
+        let csr = signed_csr(false);
+        let result = continuation.redeem(REQUEST, &csr).await.unwrap();
+        assert_eq!(result.voters().encode(), f.list);
+        assert!(result.reply() == &reply());
+        assert_eq!(server.close(WATCHDOG).await, Close::Joined);
+        let requests = observed.redeems.lock().unwrap();
+        let [request] = &requests[..] else {
+            panic!("expected one Redeem")
+        };
+        assert_eq!(request.request, REQUEST);
+        assert!(request.csr == csr);
+    })
+    .await;
+}
+
+#[test]
+fn fresh_join_owner_requires_the_original_lock_only_state() {
+    use crate::cluster::startup_plan::{Owner, Refusal, tests::Layout};
+
+    let layout = Layout::new();
+    let owner = Owner::acquire(layout.plan("join")).unwrap();
+    owner.validate_fresh_join().unwrap();
+    layout.write("state/cluster-log.lock", b"");
+    assert_eq!(owner.validate_fresh_join(), Err(Refusal::Layout));
+
+    let occupied = Layout::new();
+    for name in [
+        "cluster-owner.lock",
+        "cluster-state.lock",
+        "cluster-log.lock",
+        "cluster-state.sqlite3",
+        "cluster-log.sqlite3",
+    ] {
+        occupied.write(&format!("state/{name}"), b"");
+    }
+    let owner = Owner::acquire(occupied.plan("join")).unwrap();
+    assert_eq!(owner.validate_fresh_join(), Err(Refusal::Provenance));
+}
