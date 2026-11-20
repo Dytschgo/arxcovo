@@ -218,7 +218,9 @@ pub(in crate::cluster) mod tests {
                 index: 2,
             },
         );
-        let record = PublicIdentity::decode(&bytes).unwrap();
+        let mut record = PublicIdentity::decode(&bytes).unwrap();
+        assert_eq!(record.artifact(), "sealed-key");
+        record.artifact = "member-key".into();
         let encoded = PublicIdentity::assemble(&expected, record.leaf()).unwrap();
         assert_eq!(PublicIdentity::decode(&encoded).unwrap(), record);
         assert!(PublicIdentity::assemble(&expected, &[]).is_err());

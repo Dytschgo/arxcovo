@@ -220,6 +220,9 @@ mod linux {
         let key = layout(owner.read("member-key", 16384))?;
         let bytes = layout(owner.read("identity.json", 8192))?;
         let record = PublicIdentity::decode(&bytes).map_err(|_| Error::Context)?;
+        if record.artifact() != "member-key" {
+            return Err(Error::Context);
+        }
         let time = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_millis(
             now.ok_or(Error::Context)?,
         ));

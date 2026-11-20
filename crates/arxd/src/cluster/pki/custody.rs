@@ -716,7 +716,9 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(in crate::cluster) use linux::{MemberCopy, member_copy};
+pub(in crate::cluster) use linux::MemberCopy;
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) use linux::member_copy;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use tests::publication_fixture;
