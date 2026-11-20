@@ -16,8 +16,16 @@ pub(super) enum Status {
     Refused,
     EngineMayExist,
     Running,
+    #[cfg(target_os = "linux")]
+    Founding,
+    #[cfg(target_os = "linux")]
+    FounderReady,
+    #[cfg(target_os = "linux")]
+    FounderRefused,
     Closing,
     Clean,
+    #[cfg(target_os = "linux")]
+    ClosedAfterFounderRefusal,
     Unconfirmed,
 }
 struct State {
@@ -32,6 +40,10 @@ struct State {
     close_dispatched: bool,
     close_failure: Option<ShutdownReport>,
     engine_may_exist: bool,
+    #[cfg(target_os = "linux")]
+    founder: Option<founder::Operation>,
+    #[cfg(target_os = "linux")]
+    founder_failure: Option<founder::Error>,
 }
 #[cfg(test)]
 struct PreparationPause {
@@ -77,6 +89,10 @@ impl Job {
                 close_dispatched: false,
                 close_failure: None,
                 engine_may_exist: false,
+                #[cfg(target_os = "linux")]
+                founder: None,
+                #[cfg(target_os = "linux")]
+                founder_failure: None,
             }),
             changed,
             close: Notify::new(),
@@ -190,12 +206,17 @@ impl Job {
             s.node = None;
             s.owner = None;
             s.status = Status::Clean;
+            #[cfg(target_os = "linux")]
+            {
+                s.founder = None;
+                if s.founder_failure.is_some() {
+                    s.status = Status::ClosedAfterFounderRefusal;
+                }
+            }
         }
         self.changed.send_replace(s.status);
     }
-    // Module-private composition loan, never a generic caller capability.
-    // Future publication composition must live here and retain this phase/lock
-    // guard; this slice performs no reservation or publication.
+    // Module-private loan, never a generic caller capability.
     fn with_retained_owner<T>(
         &self,
         compose: impl FnOnce(&mut Owner) -> Result<T, Refusal>,
@@ -234,6 +255,19 @@ where
     (job, observer)
 }
 
+/// Starts a fresh founder under the original retained job and its close gate.
+#[cfg(all(not(test), target_os = "linux"))]
+pub(super) fn start_founder(
+    plan: Plan,
+    intent: StartIntent,
+    params: Params,
+    wrap: std::path::PathBuf,
+    store: std::path::PathBuf,
+) -> Result<(&'static Job, Observer), founder::Error> {
+    let (job, observer, _) = founder::linux::dispatch_founder(plan, intent, params, wrap, store)?;
+    Ok((job, observer))
+}
+
 fn dispatch<N>(
     plan: Plan,
     intent: StartIntent,
@@ -246,7 +280,31 @@ where
     N: RaftNetworkFactory<Arx> + Send + 'static,
     N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
 {
-    let job = Job::anchor();
+    dispatch_on(
+        Job::anchor(),
+        plan,
+        intent,
+        expected,
+        params,
+        network,
+        #[cfg(test)]
+        witness,
+    )
+}
+
+fn dispatch_on<N>(
+    job: &'static Job,
+    plan: Plan,
+    intent: StartIntent,
+    expected: Option<ExpectedIdentity>,
+    params: Params,
+    network: N,
+    #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
+) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
+where
+    N: RaftNetworkFactory<Arx> + Send + 'static,
+    N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
+{
     let observer = job.observe();
     #[cfg(test)]
     let supervisor_witness = witness.clone();
@@ -254,16 +312,18 @@ where
         let node_id = intent.node.get();
         let prepared = tokio::task::spawn_blocking(move || {
             job.prepare(plan, &intent, expected.as_ref());
+            #[cfg(target_os = "linux")]
+            founder::prepare(job, &intent)
         })
         .await;
-        if prepared.is_err() {
+        let Ok(_prepared) = prepared else {
             #[cfg(test)]
             if let Some(w) = &witness {
                 w.fail("preparation_join");
             }
             job.set(Status::Unconfirmed);
             return;
-        }
+        };
         #[cfg(test)]
         let original = if let Some(w) = &witness {
             let proof = w.prepared(&job.state());
@@ -306,18 +366,25 @@ where
             }
             // Only the test-owned witness can pass the test-build stop.
             #[cfg(test)]
-            let startup_release = {
-                let Some((w, original)) = witness.as_ref().zip(original) else {
-                    job.set(Status::Prepared);
-                    return;
-                };
+            let startup_release = if let Some((w, original)) = witness.as_ref().zip(original) {
                 let proof = w.transferred(&job.state(), original);
                 if let Err(reason) = proof {
                     w.fail(reason);
                     job.set(Status::Unconfirmed);
                     return;
                 }
-                w.take_startup_release()
+                Some(w.take_startup_release())
+            } else {
+                // The Linux founder entry requires its own fixture capability.
+                #[cfg(target_os = "linux")]
+                let allowed = founder::linux::hosted_fixture(job);
+                #[cfg(not(target_os = "linux"))]
+                let allowed = false;
+                if !allowed {
+                    job.set(Status::Prepared);
+                    return;
+                }
+                None
             };
             {
                 let (ls, sm) = job.state().adapters.as_ref().unwrap().clone();
@@ -329,7 +396,9 @@ where
                 let startup = tokio::spawn(async move {
                     // Hold the published boundary until the test drops its observer.
                     #[cfg(test)]
-                    startup_release.await.map_err(|_| ())?;
+                    if let Some(release) = startup_release {
+                        release.await.map_err(|_| ())?;
+                    }
                     let raft = Engine::new(node_id, config, network, ls, sm.clone())
                         .await
                         .map_err(|_| ())?;
@@ -363,10 +432,22 @@ where
                 }
                 job.state().adapters = None; // release startup clones before shutdown
                 job.set(Status::Running);
+                #[cfg(target_os = "linux")]
+                if let Some(prepared) = _prepared {
+                    match prepared.run(job).await {
+                        Ok(()) => job.set(Status::FounderReady),
+                        Err(reason) => founder::refuse(job, reason),
+                    }
+                }
             }
         }
         job.close.notified().await;
         if !job.begin_close() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if !founder::close_transport(job).await {
+            job.finish_close(None, false, false);
             return;
         }
         let node = job.state().node.clone();
@@ -443,6 +524,9 @@ where
 
 #[cfg(test)]
 mod engine_tests;
+
+#[cfg(any(test, target_os = "linux"))]
+pub(super) mod founder;
 
 #[cfg(test)]
 mod tests;
