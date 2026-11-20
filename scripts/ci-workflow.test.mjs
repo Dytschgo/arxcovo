@@ -138,6 +138,10 @@ test('Rust retains every native, Python and package validation with exact comman
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo nextest run --workspace --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+    `name: Hosted distinct-UID custody qualification
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python3 -I -B tools/ci/custody/run.py`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
