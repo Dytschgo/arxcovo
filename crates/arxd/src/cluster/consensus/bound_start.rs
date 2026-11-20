@@ -55,6 +55,8 @@ struct State {
     #[cfg(target_os = "linux")]
     ingress: Option<crate::cluster::enrollment::session::ListenerOwner>,
     #[cfg(target_os = "linux")]
+    admission: Option<Arc<learner_admission::Controller>>,
+    #[cfg(target_os = "linux")]
     learner: Option<learner::Operation>,
 }
 #[cfg(test)]
@@ -111,6 +113,8 @@ impl Job {
                 #[cfg(target_os = "linux")]
                 ingress: None,
                 #[cfg(target_os = "linux")]
+                admission: None,
+                #[cfg(target_os = "linux")]
                 learner: None,
             }),
             changed,
@@ -157,10 +161,28 @@ impl Job {
             if let Some(ingress) = &s.ingress {
                 ingress.stop();
             }
+            #[cfg(target_os = "linux")]
+            if let Some(admission) = &s.admission {
+                admission.stop();
+            }
             self.close.notify_one();
         }
         self.observe()
     }
+    #[cfg(target_os = "linux")]
+    fn install_learner_admission(&self, network: &peer_transport::PeerFactory) {
+        let mut state = self.state();
+        if state.close_requested || state.status != Status::Founding {
+            return;
+        }
+        if let Some(node) = &state.node {
+            let controller = learner_admission::Controller::new(node);
+            if network.install_admission(controller.clone()).is_ok() {
+                state.admission = Some(controller);
+            }
+        }
+    }
+
     fn prepare(&self, plan: Plan, intent: &StartIntent, expected: Option<&ExpectedIdentity>) {
         #[cfg(test)]
         let gate = self.gate.lock().unwrap().take();
@@ -255,6 +277,7 @@ impl Job {
             {
                 s.learner = None;
                 s.issuer = None;
+                s.admission = None;
                 s.founder = None;
                 if s.founder_failure.is_some() {
                     s.status = Status::ClosedAfterFounderRefusal;
@@ -327,43 +350,44 @@ where
     N: RaftNetworkFactory<Arx> + Send + 'static,
     N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
 {
-    dispatch_on(
+    drive(
         Job::anchor(),
-        plan,
+        Some(plan),
         intent,
         expected,
         params,
         network,
+        #[cfg(target_os = "linux")]
+        None,
         #[cfg(test)]
         witness,
     )
 }
 
-fn dispatch_on<N>(
+#[cfg(target_os = "linux")]
+fn dispatch_on(
     job: &'static Job,
     plan: Plan,
     intent: StartIntent,
     expected: Option<ExpectedIdentity>,
     params: Params,
-    network: N,
+    network: peer_transport::PeerFactory,
     #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
-) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
-where
-    N: RaftNetworkFactory<Arx> + Send + 'static,
-    N::Network: NetSnapshot<Arx, SnapshotData = Vec<u8>>,
-{
+) -> (&'static Job, Observer, tokio::task::JoinHandle<()>) {
     drive(
         job,
         Some(plan),
         intent,
         expected,
         params,
-        network,
+        network.clone(),
+        Some(network),
         #[cfg(test)]
         witness,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Linux-only retained peer admission binding.
 fn drive<N>(
     job: &'static Job,
     plan: Option<Plan>,
@@ -371,6 +395,7 @@ fn drive<N>(
     expected: Option<ExpectedIdentity>,
     params: Params,
     network: N,
+    #[cfg(target_os = "linux")] issuer_network: Option<peer_transport::PeerFactory>,
     #[cfg(test)] witness: Option<Arc<engine_tests::Witness>>,
 ) -> (&'static Job, Observer, tokio::task::JoinHandle<()>)
 where
@@ -514,7 +539,12 @@ where
                 #[cfg(target_os = "linux")]
                 if let Some(prepared) = _prepared {
                     match prepared.run(job).await {
-                        Ok(()) => job.set(Status::FounderReady),
+                        Ok(()) => {
+                            if let Some(network) = issuer_network {
+                                job.install_learner_admission(&network);
+                            }
+                            job.set(Status::FounderReady);
+                        }
                         Err(reason) => founder::refuse(job, reason),
                     }
                 }

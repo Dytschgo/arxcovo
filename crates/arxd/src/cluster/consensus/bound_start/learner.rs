@@ -10,7 +10,7 @@ use crate::cluster::{
 use checked_clock::{CheckedClock, HostClock};
 use peer_network::EngineDispatch;
 use peer_registry::{LearnerGate, Phase};
-use peer_transport::{Credentials, TransportOwner};
+use peer_transport::{AdmissionClient, Credentials, TransportOwner};
 use rustls::{pki_types::UnixTime, time_provider::TimeProvider};
 use std::net::SocketAddr;
 
@@ -22,6 +22,8 @@ pub(super) struct Operation {
     credentials: Option<Credentials>,
     clock: Option<Arc<HostClock>>,
     gate: Option<Arc<LearnerGate>>,
+    advertised: Option<SocketAddr>,
+    admission: Option<AdmissionClient>,
     recovered: bool,
     #[cfg(test)]
     fixture: Option<HostedCatchUp>,
@@ -155,6 +157,8 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         credentials: None,
         clock: None,
         gate: None,
+        advertised: None,
+        admission: None,
         recovered,
         #[cfg(test)]
         fixture,
@@ -167,6 +171,7 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         None,
         params,
         factory,
+        None,
         #[cfg(test)]
         None,
     );
@@ -339,6 +344,7 @@ fn attach_inner(
         )
         .map_err(|_| Refusal::Unavailable)?;
     op.gate = Some(gate);
+    op.advertised = Some(address);
     Ok(())
 }
 
@@ -352,6 +358,70 @@ pub(super) async fn close_transport(job: &Job) -> bool {
 }
 
 impl Run {
+    pub(super) fn set_admission_route(&self, issuer: SocketAddr) -> Result<(), Refusal> {
+        let mut state = self.job.state();
+        if state.status != Status::LearnerReady || state.close_requested {
+            return Err(Refusal::Ownership);
+        }
+        let op = state.learner.as_mut().ok_or(Refusal::Ownership)?;
+        if op.admission.is_some() {
+            return Err(Refusal::Plan);
+        }
+        let advertised = op.advertised.ok_or(Refusal::Plan)?;
+        let transport = op.transport.try_lock().map_err(|_| Refusal::Unavailable)?;
+        op.admission = Some(
+            transport
+                .admission_client(issuer, advertised)
+                .map_err(|_| Refusal::Plan)?,
+        );
+        Ok(())
+    }
+
+    pub(super) async fn admit(&self) -> learner_admission::Reply {
+        let result = {
+            let state = self.job.state();
+            if state.status != Status::LearnerReady || state.close_requested {
+                return learner_admission::Reply::Refused;
+            }
+            state
+                .learner
+                .as_ref()
+                .and_then(|op| op.admission.as_ref())
+                .and_then(|client| client.request())
+        };
+        match result {
+            Some(result) => result.reply().await,
+            None => learner_admission::Reply::Refused,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn conflicting_admission(
+        &self,
+        address: SocketAddr,
+    ) -> learner_admission::Reply {
+        let result = {
+            let state = self.job.state();
+            if state.status != Status::LearnerReady || state.close_requested {
+                return learner_admission::Reply::Refused;
+            }
+            state
+                .learner
+                .as_ref()
+                .and_then(|op| op.admission.as_ref())
+                .and_then(|client| client.conflicting_address(address))
+        };
+        match result {
+            Some(result) => result.reply().await,
+            None => learner_admission::Reply::Refused,
+        }
+    }
+
+    pub(super) fn admission_progress(&self) -> Option<(Phase, Option<LogPos>)> {
+        let gate = self.job.state().learner.as_ref()?.gate.as_ref()?.clone();
+        gate.admission_progress().ok()
+    }
+
     pub(super) fn phase(&self) -> Option<Phase> {
         self.job
             .state()
