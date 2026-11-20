@@ -626,6 +626,52 @@ async fn client_refuses_frame_buffered_after_anchor_without_releasing_redeem() {
 }
 
 #[tokio::test]
+async fn client_probe_refuses_separate_tls_record_with_exhausted_coop_budget() {
+    tokio::spawn(within(async {
+        use tokio::task::coop::{consume_budget, has_budget_remaining};
+
+        let f = fixture();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let connector = raw_client(&f);
+        let acceptor = TlsAcceptor::from(Arc::new(test_server_config(&f)));
+        let (client, server) = tokio::join!(
+            connector.connect(ServerName::try_from(SERVER_NAME).unwrap(), client_io),
+            acceptor.accept(server_io),
+        );
+        let mut client = client.unwrap();
+        let mut server = server.unwrap();
+
+        let anchor = anchor_wire(&f.list);
+        server.write_all(&anchor).await.unwrap();
+        server.flush().await.unwrap();
+        assert!(receive_anchor(&mut client).await.is_ok());
+
+        // Queue a separate record below TLS without depending on TCP delivery.
+        server.write_all(&anchor).await.unwrap();
+        server.flush().await.unwrap();
+        while has_budget_remaining() {
+            consume_budget().await;
+        }
+
+        // A normal read yields even though the complete record is queued.
+        std::future::poll_fn(|cx| {
+            let mut byte = [0];
+            assert!(
+                Pin::new(&mut client)
+                    .poll_read(cx, &mut ReadBuf::new(&mut byte))
+                    .is_pending()
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(matches!(nothing_pending(&mut client).await, Err(Refused)));
+        assert!(!has_budget_remaining());
+    }))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn client_accepts_only_the_exact_result_and_authenticated_end() {
     within(async {
         let f = fixture();
