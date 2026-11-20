@@ -1,6 +1,7 @@
 """Pure fault-driven launcher tests: no Docker, sudo, network or fixture provisioning."""
 import importlib.util
 import io
+import os
 import json
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -889,7 +890,9 @@ class LauncherTests(unittest.TestCase):
         with redirect_stdout(output):
             with self.assertRaisesRegex(run.Refusal, 'CommandExit'):
                 harness.operational(CONTAINER, 'deny-build')
-        record = json.loads(output.getvalue())
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[0]['event'], 'command-refusal')
+        record = records[-1]
         self.assertEqual(record['result'], 'fail')
         self.assertEqual(record['counts']['selected'], 1)
         self.assertEqual(record['counts']['passed'], 0)
@@ -969,6 +972,187 @@ class LauncherTests(unittest.TestCase):
         data['Mounts'].append({'Type': 'volume', 'Destination': '/owner', 'Source': '/private'})
         with self.assertRaisesRegex(run.Refusal, 'MountOwnership'):
             run.inspect_node(data, 'c'*16, IMAGE, roots)
+
+
+
+
+class DiscoveryIntegrationTests(unittest.TestCase):
+    def setup_tree(self, root):
+        deps = root / 'target/debug/deps'
+        deps.mkdir(parents=True)
+        binary = deps / 'arxd-test'
+        binary.write_bytes(b'\x7fELFpublic-test')
+        binary.chmod(0o755)
+        context = root / 'context'
+        context.mkdir()
+        blobs = {}
+        for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
+                         'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            blobs[relative] = ('public-source-' + relative).encode()
+            path.write_bytes(blobs[relative])
+        return deps, binary, context, blobs
+
+    def exercise(self, root, context, blobs, hook=None):
+        h = run.Harness()
+        calls, records = [], []
+        h.record = lambda event, **facts: records.append(dict(event=event, **facts))
+        def command(argv, phase, *args, **kwargs):
+            calls.append(argv)
+            if hook:
+                hook(argv)
+            if argv[0] == 'git':
+                return blobs[argv[2].split(':', 1)[1]]
+            if argv[0] == 'readelf':
+                return b'/lib64/ld-linux-x86-64.so.2 NEEDED GLIBC_2.38'
+            if argv[1:] == ['--list', '--exact', run.PROBE]:
+                return (run.PROBE + ': test\n1 test, 0 benchmarks\n').encode()
+            self.fail('unexpected downstream acquisition')
+        h.command = command
+        token = run.DIAGNOSTIC.set(h.record)
+        try:
+            with patch.object(run.Path, 'cwd', return_value=root), patch.dict(run.os.environ, {'CARGO_TARGET_DIR': str(root / 'target')}):
+                h.discover_and_stage('a'*40, context)
+        finally:
+            run.DIAGNOSTIC.reset(token)
+            self.last_records, self.last_calls = records, calls
+        return records
+
+    def test_real_discovery_multilink_source_absolute_git_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            deps, binary, context, blobs = self.setup_tree(root)
+            os.link(binary, root / 'binary-alias')
+            recipe = root / 'tools/ci/custody/Containerfile'
+            os.link(recipe, root / 'recipe-alias')
+            records = self.exercise(root, context, blobs)
+            self.assertEqual((context / 'arxd-tests').read_bytes(), binary.read_bytes())
+            self.assertEqual(records[-1]['event'], 'inputs')
+            self.assertEqual(set(records[-1]['hashes']), set(blobs))
+            self.assertEqual(records[-2]['required_glibc'], ['GLIBC_2.38'])
+            run.safe(context / 'arxd-tests', directory=False)
+            with self.assertRaises(run.Refusal):
+                run.safe(binary, directory=False)
+
+    def test_discovery_pin_drift_refuses_before_readelf_or_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            _, _, context, blobs = self.setup_tree(root)
+            blobs['tools/ci/custody/Containerfile'] = b'private-sentinel'
+            with self.assertRaisesRegex(run.Refusal, 'SourcePin'):
+                self.exercise(root, context, blobs)
+            self.assertFalse(any(c[0] in ('docker', 'readelf') for c in self.last_calls))
+            self.assertNotIn('private-sentinel', json.dumps(self.last_records))
+            self.assertEqual(self.last_records[-1]['predicate'], 'immutable_git_blob')
+
+    def test_discovery_aggregates_unsafe_candidates_without_acquisition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            deps, binary, context, blobs = self.setup_tree(root)
+            binary.unlink()
+            binary.mkdir()
+            (deps / 'arxd-second').mkdir()
+            with self.assertRaisesRegex(run.Refusal, 'UnsafePath'):
+                self.exercise(root, context, blobs)
+            refusals = [r for r in self.last_records if r['event'] == 'refusal']
+            self.assertEqual(len(refusals), 2)
+            self.assertEqual({r['subject'] for r in refusals}, {'candidate-0', 'candidate-1'})
+            self.assertEqual(self.last_calls, [])
+            self.assertEqual(list(context.iterdir()), [])
+
+    def test_retained_input_detects_same_bytes_inode_and_hash_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            path = root / 'input'
+            path.write_bytes(b'public-original')
+            with run.BuildInput(path, root, 'binary', lambda *a, **k: None) as obj:
+                original = run.safe
+                def replaced(*a, **k):
+                    m = original(*a, **k)
+                    fields = {key: getattr(m, key) for key in ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')}
+                    fields['st_ino'] += 1
+                    return SimpleNamespace(**fields)
+                with patch.object(run, 'safe', side_effect=replaced):
+                    with self.assertRaisesRegex(run.Refusal, 'StagingIdentity'):
+                        obj.stage(root / 'staged')
+                self.assertFalse((root / 'staged').exists())
+                path.write_bytes(b'public-modified')
+                with self.assertRaisesRegex(run.Refusal, 'StagingIdentity|StagingHash'):
+                    obj.stage(root / 'staged')
+
+    def test_safe_predicate_records_redact_routes(self):
+        records = []
+        token = run.DIAGNOSTIC.set(lambda event, **facts: records.append(dict(event=event, **facts)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                path = root / 'private-sentinel'
+                path.write_bytes(b'private-sentinel')
+                for value, parent, directory, predicate in (
+                    (Path('private-sentinel'), None, True, 'absolute_bounded_path'),
+                    (root / '..' / root.name, None, True, 'canonical_spelling'),
+                    (root, root, True, 'strict_descendant'),
+                    (path, None, True, 'directory_type'),
+                    (root, None, False, 'regular_type')):
+                    with self.assertRaises(run.Refusal):
+                        run.safe(value, parent, directory)
+                    self.assertEqual(records[-1]['predicate'], predicate)
+                with patch.object(run.Path, 'is_symlink', return_value=True):
+                    with self.assertRaises(run.Refusal):
+                        run.safe(path, directory=False)
+                self.assertEqual(records[-1]['predicate'], 'no_symlink_component')
+                os.link(path, root / 'alias')
+                with self.assertRaises(run.Refusal):
+                    run.safe(path, directory=False)
+                self.assertEqual(records[-1]['predicate'], 'single_link')
+        finally:
+            run.DIAGNOSTIC.reset(token)
+        self.assertNotIn('private-sentinel', json.dumps(records))
+
+    def test_discovery_zero_duplicate_nonelf_and_count_bounds(self):
+        for scenario in ('zero', 'duplicate', 'nonelf', 'count'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                deps, binary, context, blobs = self.setup_tree(root)
+                expected = 'ProbeSelection'
+                if scenario == 'zero':
+                    binary.unlink()
+                elif scenario == 'nonelf':
+                    binary.write_bytes(b'not ELF')
+                elif scenario == 'duplicate':
+                    second = deps / 'arxd-second'
+                    second.write_bytes(binary.read_bytes())
+                    second.chmod(0o755)
+                else:
+                    for i in range(16):
+                        p = deps / ('arxd-extra' + str(i))
+                        p.write_bytes(b'not ELF')
+                        p.chmod(0o755)
+                    expected = 'CandidateBounds'
+                with self.assertRaisesRegex(run.Refusal, expected):
+                    self.exercise(root, context, blobs)
+                self.assertFalse(any(c[0] in ('docker', 'readelf') for c in self.last_calls))
+                self.assertEqual(list(context.iterdir()), [])
+
+    def test_staging_copy_drift_and_staged_alias_refuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            path = root / 'input'
+            path.write_bytes(b'public-original')
+            with run.BuildInput(path, root, 'binary', lambda *a, **k: None) as obj:
+                original = obj.hash
+                def changed(output=None):
+                    result = original(output)
+                    if output is not None:
+                        path.write_bytes(b'public-modified')
+                    return result
+                with patch.object(obj, 'hash', side_effect=changed):
+                    with self.assertRaisesRegex(run.Refusal, 'StagingIdentity|StagingHash'):
+                        obj.stage(root / 'staged')
+            os.link(root / 'staged', root / 'alias')
+            with self.assertRaisesRegex(run.Refusal, 'UnsafePath'):
+                run.digest(root / 'staged')
 
 
 if __name__ == '__main__':

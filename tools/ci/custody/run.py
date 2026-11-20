@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextvars import ContextVar
+from contextlib import ExitStack
 
 PROBE = 'cluster::pki::custody::hosted_probe::hosted_custody_probe'
 BASE = 'docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a'
@@ -23,25 +25,35 @@ MODES = {'create-founder', 'create-learner', 'deny-build', 'same-uid-control', '
 LIMIT = 1024 * 1024
 
 
+DIAGNOSTIC = ContextVar('custody_diagnostic', default=None)
+
+
 class Refusal(Exception):
-    pass
+    def __init__(self, code, subject=None, predicate=None, **facts):
+        super().__init__(code)
+        sink = DIAGNOSTIC.get()
+        if sink is not None and code != 'EvidenceOverflow':
+            sink('refusal', code=code, subject=subject or sys._getframe(1).f_code.co_name,
+                 predicate=predicate or code, **facts)
 
 
-def require(condition, code):
+def require(condition, code, subject='launcher', predicate='required_condition', **facts):
     if not condition:
-        raise Refusal(code)
+        raise Refusal(code, subject, predicate, **facts)
 
 
-def safe(path, parent=None, directory=True):
+def safe(path, parent=None, directory=True, *, input_file=False, subject='filesystem'):
     path = Path(path)
-    require(path.is_absolute() and len(str(path)) <= 4096, 'UnsafePath')
+    require(path.is_absolute() and len(str(path)) <= 4096, 'UnsafePath', subject, 'absolute_bounded_path')
     for p in [path, *path.parents]:
-        require(not p.is_symlink(), 'UnsafePath')
-    require(path.resolve() == path, 'UnsafePath')
+        require(not p.is_symlink(), 'UnsafePath', subject, 'no_symlink_component')
+    require(path.resolve() == path, 'UnsafePath', subject, 'canonical_spelling')
     if parent:
-        require(path.is_relative_to(parent) and path != parent, 'UnsafePath')
+        require(path.is_relative_to(parent) and path != parent, 'UnsafePath', subject, 'strict_descendant')
     m = path.lstat()
-    require(stat.S_ISDIR(m.st_mode) if directory else stat.S_ISREG(m.st_mode) and m.st_nlink == 1, 'UnsafePath')
+    require(stat.S_ISDIR(m.st_mode) if directory else stat.S_ISREG(m.st_mode), 'UnsafePath', subject, 'directory_type' if directory else 'regular_type')
+    if not directory:
+        require(m.st_nlink >= 1 if input_file else m.st_nlink == 1, 'UnsafePath', subject, 'input_link_policy' if input_file else 'single_link', nlink=m.st_nlink)
     return m
 
 
@@ -63,10 +75,10 @@ def protected_hardlinks(record, fs=os):
         fd = fs.open(HARDLINKS, fs.O_RDONLY | fs.O_NOFOLLOW | fs.O_CLOEXEC)
         m = fs.fstat(fd)
         require(stat.S_ISREG(m.st_mode) and m.st_uid == 0 and not m.st_mode & 0o022,
-                'ToolOwnership')
+                'ToolOwnership', 'protected_hardlinks', 'stat.S_ISREG(m.st_mode) and m.st_uid == 0 and (not m.st_mode & 18)')
         data = fs.read(fd, 16)
         value = 1 if data in (b'1', b'1\n') else 0 if data in (b'0', b'0\n') else None
-        require(value == 1 and identity(fs.fstat(fd)) == identity(m), 'ToolOwnership')
+        require(value == 1 and identity(fs.fstat(fd)) == identity(m), 'ToolOwnership', 'protected_hardlinks', 'value == 1 and identity(fs.fstat(fd)) == identity(m)')
     except (OSError, ValueError, RuntimeError, Refusal):
         predicate = 'protected_hardlinks_refused'
     finally:
@@ -76,7 +88,7 @@ def protected_hardlinks(record, fs=os):
             except OSError:
                 predicate = 'protected_hardlinks_refused'
         record('hardlink-policy', predicate=predicate, value=value)
-    require(predicate == 'protected_hardlinks_one', 'ToolOwnership')
+    require(predicate == 'protected_hardlinks_one', 'ToolOwnership', 'protected_hardlinks', "predicate == 'protected_hardlinks_one'")
 
 
 def identity(m):
@@ -263,6 +275,74 @@ def digest(path):
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
 
+class BuildInput:
+    """Trusted CI input, with retained no-follow object and bounded stable copy.
+
+    Runner ownership and existing aliases are permitted for this role only.
+    Pathname and descriptor identity, metadata and bytes must remain unchanged.
+    """
+    def __init__(self, path, parent, subject, record):
+        self.path, self.parent, self.subject, self.record = path, parent, subject, record
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            m = safe(self.path, self.parent, False, input_file=True, subject=self.subject)
+            self.record('input-object', subject=self.subject, uid=m.st_uid, gid=m.st_gid,
+                        mode=stat.S_IMODE(m.st_mode), device=m.st_dev, inode=m.st_ino,
+                        nlink=m.st_nlink, file_type=stat.S_IFMT(m.st_mode), size=m.st_size)
+            require(m.st_size <= 128*MIB, 'CandidateBounds', self.subject, 'size_128_mib')
+            self.fd = os.open(self.path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) |
+                              getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0))
+            self.metadata = identity(m), m.st_size, m.st_mtime_ns, m.st_ctime_ns
+            opened = os.fstat(self.fd)
+            self.open_metadata = identity(opened), opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
+            # Windows lstat ctime is birth time, while fstat can expose change
+            # time. Retain both snapshots; object identity/size/mtime must agree.
+            require(self.open_metadata[:3] == self.metadata[:3], 'StagingIdentity',
+                    self.subject, 'opened_same_object')
+            self.sha = self.hash()
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def check(self):
+        for m, before in ((safe(self.path, self.parent, False, input_file=True, subject=self.subject), self.metadata),
+                          (os.fstat(self.fd), self.open_metadata)):
+            require((identity(m), m.st_size, m.st_mtime_ns, m.st_ctime_ns) == before,
+                    'StagingIdentity', self.subject, 'same_open_and_route_object')
+
+    def hash(self, output=None):
+        self.check()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        h, size = hashlib.sha256(), 0
+        while data := os.read(self.fd, MIB):
+            size += len(data)
+            require(size <= 128*MIB, 'CandidateBounds', self.subject, 'bounded_read')
+            h.update(data)
+            if output is not None:
+                output.write(data)
+        self.check()
+        require(size == self.metadata[1], 'StagingIdentity', self.subject, 'exact_size')
+        return h.hexdigest()
+
+    def verify(self):
+        require(self.hash() == self.sha, 'StagingHash', self.subject, 'stable_input_hash')
+
+    def stage(self, destination):
+        self.verify()
+        with open(destination, 'xb') as out:
+            copied = self.hash(out)
+        self.verify()
+        require(copied == self.sha == digest(destination), 'StagingHash', self.subject, 'staged_hash')
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
 def counts(output):
     selected = re.findall(rb'^running ([0-9]{1,3}) tests?\r?$', output, re.M)
     results = re.findall(rb'^test result: (ok|FAILED)\. ([0-9]{1,3}) passed; ([0-9]{1,3}) failed; ([0-9]{1,3}) ignored; ([0-9]{1,3}) measured; ([0-9]{1,3}) filtered out(?:; finished in [0-9.]+s)?\r?$', output, re.M)
@@ -284,7 +364,7 @@ def protocol_records(output):
         if b'ARX_' not in line:
             continue
         prefix, _, record = line.partition(b'ARX_')
-        require(prefix in (b'', ('test ' + PROBE + ' ... ').encode()), 'UnknownRecord')
+        require(prefix in (b'', ('test ' + PROBE + ' ... ').encode()), 'UnknownRecord', 'protocol_records', "prefix in (b'', ('test ' + PROBE + ' ... ').encode())")
         record = b'ARX_' + record
         require(any(re.fullmatch(pattern, record) for pattern in (
             rb'ARX_PASS selected=[0-9]{1,3} passed=[0-9]{1,3}',
@@ -292,7 +372,7 @@ def protocol_records(output):
             rb'ARX_FACTS uid=2100[12] caps=0 nnp=1 core=0',
             rb'ARX_MOUNT slot=/(tmp|workspace|control|dev/shm|dev) capacity=[0-9]{1,10} used=[0-9]{1,10}',
             rb'ARX_DENIAL errno=[0-9]{1,3}',
-        )), 'UnknownRecord')
+        )), 'UnknownRecord', 'protocol_records', "any((re.fullmatch(pattern, record) for pattern in (b'ARX_PASS selected=[0-9]{1,3} passed=[0-9]{1,3}', b'ARX_READY [0-9]{1,7} [0-9]{1,3},[0-9]{1,3},[0-9]{1,3} [a-f0-9]{256}', b'ARX_FACTS uid=2100[12] caps=0 nnp=1 core=0', b'ARX_MOUNT slot=/(tmp|workspace|con...")
         if record.startswith((b'ARX_FACTS ', b'ARX_MOUNT ', b'ARX_DENIAL ')):
             records.append(record.decode('ascii'))
     return records
@@ -304,8 +384,8 @@ def terminal(output):
     require(output.count(b'ARX_PASS selected=1 passed=1') == 1 and
             all(result.get(key) == value for key, value in
                 dict(oracle_selected=1, oracle_passed=1, selected=1, passed=1, failed=0,
-                     ignored=0, measured=0, libtest_ok=True).items()), 'MissingOracle')
-    require(len(re.findall(rb'ARX_PASS ', output)) == 1, 'MissingOracle')
+                     ignored=0, measured=0, libtest_ok=True).items()), 'MissingOracle', 'terminal', "output.count(b'ARX_PASS selected=1 passed=1') == 1 and all((result.get(key) == value for key, value in dict(oracle_selected=1, oracle_passed=1, selected=1, passed=1, failed=0, ignored=0, measured=0, libtest_ok=True).items()))")
+    require(len(re.findall(rb'ARX_PASS ', output)) == 1, 'MissingOracle', 'terminal', "len(re.findall(b'ARX_PASS ', output)) == 1")
     return result
 
 
@@ -316,14 +396,14 @@ def exact_listing(output):
 
 def choose(candidates):
     matches = [p for p, listing, before, after in candidates if exact_listing(listing) and before == after]
-    require(len(matches) == 1 and all(before == after for _, _, before, after in candidates), 'ProbeSelection')
+    require(len(matches) == 1 and all(before == after for _, _, before, after in candidates), 'ProbeSelection', 'choose', 'len(matches) == 1 and all((before == after for _, _, before, after in candidates))')
     return matches[0]
 
 
 def create_argv(name, run_id, root, node, image):
     require(re.fullmatch(r'arx-[a-f0-9]{16}-(founder|learner1|learner2)', name) and
             node in ('founder', 'learner1', 'learner2') and re.fullmatch(r'[a-f0-9]{16}', run_id) and
-            re.fullmatch(r'sha256:[a-f0-9]{64}', image), 'Arguments')
+            re.fullmatch(r'sha256:[a-f0-9]{64}', image), 'Arguments', 'create_argv', "re.fullmatch('arx-[a-f0-9]{16}-(founder|learner1|learner2)', name) and node in ('founder', 'learner1', 'learner2') and re.fullmatch('[a-f0-9]{16}', run_id) and re.fullmatch('sha256:[a-f0-9]{64}', image)")
     return ['docker', 'create', '--name', name, '--label', f'arxcovo.custody.run={run_id}',
             '--platform', 'linux/amd64', '--user', '21001:21001', '--workdir', '/', '--read-only',
             '--network', 'none', '--ipc', 'private', '--shm-size', '1m', '--cap-drop', 'ALL',
@@ -338,31 +418,31 @@ def create_argv(name, run_id, root, node, image):
 
 
 def exec_argv(container, mode, context=None, target=None):
-    require(mode in MODES and re.fullmatch(r'[a-f0-9]{64}', container), 'Arguments')
+    require(mode in MODES and re.fullmatch(r'[a-f0-9]{64}', container), 'Arguments', 'exec_argv', "mode in MODES and re.fullmatch('[a-f0-9]{64}', container)")
     uid = '21002:21002' if mode == 'deny-build' else '21001:21001'
     argv = ['docker', 'exec', '--user', uid, '--workdir', '/', container, '/usr/bin/env', '-i',
             'PATH=/usr/bin:/bin', 'LANG=C', 'TZ=UTC', 'ARX_CUSTODY_HOSTED_MODE=' + mode]
     if context is not None:
-        require(re.fullmatch(r'[a-f0-9]{256}', context), 'Protocol')
+        require(re.fullmatch(r'[a-f0-9]{256}', context), 'Protocol', 'exec_argv', "re.fullmatch('[a-f0-9]{256}', context)")
         argv += ['ARX_CUSTODY_PUBLIC_CONTEXT=' + context]
     if target is not None:
         pid, fds = target
-        require(2 <= pid <= 4194304 and len(fds) == 3 and all(3 <= f <= 127 for f in fds), 'Protocol')
+        require(2 <= pid <= 4194304 and len(fds) == 3 and all(3 <= f <= 127 for f in fds), 'Protocol', 'exec_argv', '2 <= pid <= 4194304 and len(fds) == 3 and all((3 <= f <= 127 for f in fds))')
         argv += [f'ARX_CUSTODY_TARGET_PID={pid}', 'ARX_CUSTODY_TARGET_FDS=' + ','.join(map(str, fds))]
     return argv + ['/opt/arx/arxd-tests', '--exact', PROBE, '--nocapture', '--test-threads=1']
 
 
 def inspect_node(data, run_id, image, roots):
-    require(data['Config']['Labels'].get('arxcovo.custody.run') == run_id and data['Image'] == image, 'UnknownCleanup')
+    require(data['Config']['Labels'].get('arxcovo.custody.run') == run_id and data['Image'] == image, 'UnknownCleanup', 'inspect_node', "data['Config']['Labels'].get('arxcovo.custody.run') == run_id and data['Image'] == image")
     h = data['HostConfig']
     require(h['ShmSize'] == MIB and h['IpcMode'] == 'private' and h['Memory'] == 256*MIB and
             h['MemorySwap'] == 256*MIB and h['PidsLimit'] == 64 and h['NanoCpus'] == 1_000_000_000 and
-            h['ReadonlyRootfs'] and h['NetworkMode'] == 'none' and h['CapDrop'] == ['ALL'], 'Limits')
+            h['ReadonlyRootfs'] and h['NetworkMode'] == 'none' and h['CapDrop'] == ['ALL'], 'Limits', 'inspect_node', "h['ShmSize'] == MIB and h['IpcMode'] == 'private' and (h['Memory'] == 256 * MIB) and (h['MemorySwap'] == 256 * MIB) and (h['PidsLimit'] == 64) and (h['NanoCpus'] == 1000000000) and h['ReadonlyRootfs'] and (h['NetworkMode'] == 'none') and (h['CapDrop'] == ['...")
     binds = {m['Destination']: m['Source'] for m in data['Mounts'] if m['Type'] == 'bind'}
-    require(binds == roots, 'MountOwnership')
-    require(all(m['Type'] in ('bind', 'tmpfs') for m in data['Mounts']), 'MountOwnership')
-    require({m['Destination'] for m in data['Mounts'] if m['Type'] == 'tmpfs'} <= {'/tmp', '/workspace', '/control'}, 'MountOwnership')
-    require(17 + 1 == 18 and 18 + 64 == 82 and 256 - 82 == 174, 'Accounting')
+    require(binds == roots, 'MountOwnership', 'inspect_node', 'binds == roots')
+    require(all(m['Type'] in ('bind', 'tmpfs') for m in data['Mounts']), 'MountOwnership', 'inspect_node', "all((m['Type'] in ('bind', 'tmpfs') for m in data['Mounts']))")
+    require({m['Destination'] for m in data['Mounts'] if m['Type'] == 'tmpfs'} <= {'/tmp', '/workspace', '/control'}, 'MountOwnership', 'inspect_node', "{m['Destination'] for m in data['Mounts'] if m['Type'] == 'tmpfs'} <= {'/tmp', '/workspace', '/control'}")
+    require(17 + 1 == 18 and 18 + 64 == 82 and 256 - 82 == 174, 'Accounting', 'inspect_node', '17 + 1 == 18 and 18 + 64 == 82 and (256 - 82 == 174)')
 
 
 class Budget:
@@ -375,9 +455,9 @@ class Budget:
 
     def deadline(self, phase, maximum):
         now = self.clock()
-        require(now < self.start + 130, 'WorkTimeout')
+        require(now < self.start + 130, 'WorkTimeout', 'deadline', 'now < self.start + 130')
         left = self.CAPS[phase] - self.used[phase]
-        require(left > 0, 'PhaseTimeout')
+        require(left > 0, 'PhaseTimeout', 'deadline', 'left > 0')
         return min(now + maximum, now + left, self.start + 130)
 
 
@@ -398,7 +478,7 @@ class Child:
         for key, _ in self.selector.select(0):
             data = os.read(key.fileobj.fileno(), 4096)
             if data:
-                require(len(self.out) + len(data) <= 65536, 'PipeOverflow')
+                require(len(self.out) + len(data) <= 65536, 'PipeOverflow', 'pump', 'len(self.out) + len(data) <= 65536')
                 self.out.extend(data)
             else:
                 self.selector.unregister(key.fileobj)
@@ -406,8 +486,8 @@ class Child:
 
     def alive(self):
         self.pump()
-        require(self.clock() < self.deadline, 'HolderTimeout')
-        require(self.p.poll() is None, 'HolderExit')
+        require(self.clock() < self.deadline, 'HolderTimeout', 'alive', 'self.clock() < self.deadline')
+        require(self.p.poll() is None, 'HolderExit', 'alive', 'self.p.poll() is None')
 
     def finish(self):
         self.pump()
@@ -416,7 +496,7 @@ class Child:
         self.p.wait(timeout=0)
         self.reaped = True
         self.selector.close()
-        require(self.p.returncode == 0, 'CommandExit')
+        require(self.p.returncode == 0, 'CommandExit', 'finish', 'self.p.returncode == 0')
         return True
 
     def kill(self):
@@ -450,21 +530,24 @@ class Harness:
         self.run_id = os.urandom(8).hex()
         self.evidence = 0
         self.tools = None
+        self.case_results = set()
 
     def fail(self, error):
         code = str(error) if isinstance(error, Refusal) else type(error).__name__
+        if not isinstance(error, Refusal):
+            self.record('refusal', code=code, subject='launcher', predicate='operation_exception')
         if self.first is None:
             self.first = code
         else:
             self.secondary.append(code)
 
     def check_work(self):
-        require(self.clock() < self.budget.start + 130, 'WorkTimeout')
+        require(self.clock() < self.budget.start + 130, 'WorkTimeout', 'check_work', 'self.clock() < self.budget.start + 130')
 
     def record(self, event, **facts):
         line = json.dumps({'event': event, **facts}, sort_keys=True)
         self.evidence += len(line)
-        require(self.evidence <= LIMIT, 'EvidenceOverflow')
+        require(self.evidence <= LIMIT, 'EvidenceOverflow', 'record', 'self.evidence <= LIMIT')
         print(line, flush=True)
 
     def bound_argv(self, argv):
@@ -476,17 +559,17 @@ class Harness:
             argv[0] = self.tools[role].recheck()
             if role == 'sudo':
                 require(len(argv) >= 3 and argv[1] == '-n' and argv[2] in
-                        ('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'mkdir', 'chown'), 'Arguments')
+                        ('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'mkdir', 'chown'), 'Arguments', 'bound_argv', "len(argv) >= 3 and argv[1] == '-n' and (argv[2] in ('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt', 'mkdir', 'chown'))")
                 argv[2] = self.tools[argv[2]].recheck()
         else:
             # The sole non-tool host executable is the selected, hash-checked probe.
-            require(Path(role).is_absolute(), 'Arguments')
+            require(Path(role).is_absolute(), 'Arguments', 'bound_argv', 'Path(role).is_absolute()')
         return argv
 
     def command(self, argv, phase, seconds=5, cleanup=False, observed=None):
         start = self.clock()
         deadline = min(self.cleanup_deadline or self.budget.start + 150, start + seconds) if cleanup else self.budget.deadline(phase, seconds)
-        require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout')
+        require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout', 'command', 'start < deadline')
         child = self.spawn(self.bound_argv(argv), deadline, self.clock)
         self.children.append(child)
         failure = None
@@ -496,15 +579,21 @@ class Harness:
                     self.check_work()
                     if self.releasing:
                         self.holder.pump()
-                        require(self.clock() < self.holder.deadline, 'HolderTimeout')
+                        require(self.clock() < self.holder.deadline, 'HolderTimeout', 'command', 'self.clock() < self.holder.deadline')
                     else:
                         self.holder.alive()
-                require(self.clock() < deadline, 'CommandTimeout')
+                require(self.clock() < deadline, 'CommandTimeout', 'command', 'self.clock() < deadline')
                 if child.finish():
                     return bytes(child.out)
                 time.sleep(.01)
         except Exception as error:
             failure = error
+            self.record('command-refusal', phase=phase, operation=argv[0] if argv[0] in TOOLS else 'candidate-list',
+                        predicate=str(error) if isinstance(error, Refusal) else type(error).__name__,
+                        returncode=child.p.returncode if hasattr(child, 'p') else None,
+                        seconds=round(self.clock() - start, 6),
+                        missing_glibc=sorted(set(v.decode('ascii') for v in re.findall(
+                            rb"(GLIBC_[0-9]+\.[0-9]+)[^\r\n]{0,16}not found", bytes(child.out)))))
             self.fail(error)
             raise
         finally:
@@ -524,7 +613,8 @@ class Harness:
                     self.budget.used[phase] += self.clock() - start
 
     def case(self, node, mode, start, phase, output=None, error=None, **timings):
-        require(node in ('founder', 'learner1', 'learner2', 'unassigned') and mode in MODES, 'Arguments')
+        self.case_results.add((node, mode))
+        require(node in ('founder', 'learner1', 'learner2', 'unassigned') and mode in MODES, 'Arguments', 'case', "node in ('founder', 'learner1', 'learner2', 'unassigned') and mode in MODES")
         result = counts(output) if output is not None else {}
         if error is None:
             result = terminal(output)
@@ -557,12 +647,12 @@ class Harness:
         try:
             while True:
                 self.check_work()
-                require(self.clock() < ready_deadline, 'ReadyTimeout')
+                require(self.clock() < ready_deadline, 'ReadyTimeout', 'start_holder', 'self.clock() < ready_deadline')
                 self.holder.alive()
                 match = re.search(rb'^ARX_READY ([0-9]+) ([0-9]+),([0-9]+),([0-9]+) ([a-f0-9]{256})\r?$', self.holder.out, re.M)
                 if match:
                     pid, *fds = map(int, match.groups()[:4])
-                    require(2 <= pid <= 4194304 and all(3 <= fd <= 127 for fd in fds), 'Protocol')
+                    require(2 <= pid <= 4194304 and all(3 <= fd <= 127 for fd in fds), 'Protocol', 'start_holder', '2 <= pid <= 4194304 and all((3 <= fd <= 127 for fd in fds))')
                     self.record('holder-ready', node=node, mode=mode, seconds=round(self.clock() - start, 6))
                     return match[5].decode(), (pid, fds)
                 time.sleep(.01)
@@ -584,7 +674,7 @@ class Harness:
         try:
             while True:
                 self.check_work()
-                require(self.clock() < deadline, 'HolderTimeout')
+                require(self.clock() < deadline, 'HolderTimeout', 'release', 'self.clock() < deadline')
                 if self.holder.finish():
                     out = bytes(self.holder.out)
                     terminal(out)
@@ -606,7 +696,7 @@ class Harness:
     def inspection(self, container, cleanup=False):
         out = self.command(['docker', 'inspect', container], 'evidence', cleanup=cleanup)
         data = json.loads(out)
-        require(len(data) == 1 and data[0]['Id'] == container, 'UnknownCleanup')
+        require(len(data) == 1 and data[0]['Id'] == container, 'UnknownCleanup', 'inspection', "len(data) == 1 and data[0]['Id'] == container")
         return data[0]
 
     def remove_node(self, container, cleanup=False):
@@ -618,11 +708,11 @@ class Harness:
 
     def verify_loop(self, cleanup=False):
         data = json.loads(self.command(['sudo', '-n', 'losetup', '--json', '--list', '--output', 'NAME,BACK-FILE,MAJ:MIN', self.loop], 'prepare', cleanup=cleanup))['loopdevices']
-        require(len(data) == 1 and data[0]['name'] == self.loop and data[0]['back-file'] == str(self.root / 'disk.img'), 'UnknownCleanup')
+        require(len(data) == 1 and data[0]['name'] == self.loop and data[0]['back-file'] == str(self.root / 'disk.img'), 'UnknownCleanup', 'verify_loop', "len(data) == 1 and data[0]['name'] == self.loop and (data[0]['back-file'] == str(self.root / 'disk.img'))")
         safe(self.root / 'disk.img', self.root, False)
         if self.mounted:
             mounted = json.loads(self.command(['findmnt', '--json', '--mountpoint', str(self.root / 'fs'), '--output', 'SOURCE,TARGET,FSTYPE,MAJ:MIN'], 'prepare', cleanup=cleanup))['filesystems']
-            require(len(mounted) == 1 and mounted[0]['source'] == self.loop and mounted[0]['target'] == str(self.root / 'fs') and mounted[0]['fstype'] == 'ext4' and mounted[0]['maj:min'] == data[0]['maj:min'], 'UnknownCleanup')
+            require(len(mounted) == 1 and mounted[0]['source'] == self.loop and mounted[0]['target'] == str(self.root / 'fs') and mounted[0]['fstype'] == 'ext4' and mounted[0]['maj:min'] == data[0]['maj:min'], 'UnknownCleanup', 'verify_loop', "len(mounted) == 1 and mounted[0]['source'] == self.loop and (mounted[0]['target'] == str(self.root / 'fs')) and (mounted[0]['fstype'] == 'ext4') and (mounted[0]['maj:min'] == data[0]['maj:min'])")
 
     def prepare_fixture(self):
         self.root.joinpath('fs').mkdir(mode=0o700)
@@ -631,7 +721,7 @@ class Harness:
             f.truncate(64*MIB)
         self.command(['sudo', '-n', 'mkfs.ext4', '-q', '-F', '-m', '0', '-E', 'lazy_itable_init=0,lazy_journal_init=0', str(self.root / 'disk.img')], 'prepare')
         self.loop = self.command(['sudo', '-n', 'losetup', '--find', '--show', '--nooverlap', str(self.root / 'disk.img')], 'prepare').decode().strip()
-        require(re.fullmatch(r'/dev/loop[0-9]{1,4}', self.loop), 'UnknownCleanup')
+        require(re.fullmatch(r'/dev/loop[0-9]{1,4}', self.loop), 'UnknownCleanup', 'prepare_fixture', "re.fullmatch('/dev/loop[0-9]{1,4}', self.loop)")
         self.verify_loop()
         # Mark before effect: a timed-out mount must still be attributed during cleanup.
         self.mounted = True
@@ -655,9 +745,9 @@ class Harness:
                 name, node = self.pending_node
                 out = self.command(['docker', 'container', 'ls', '--all', '--no-trunc', '--filter', 'name=^/' + name + '$', '--format', '{{.ID}}'], 'prepare', cleanup=True)
                 ids = out.decode().splitlines()
-                require(len(ids) <= 1, 'UnknownCleanup')
+                require(len(ids) <= 1, 'UnknownCleanup', 'cleanup', 'len(ids) <= 1')
                 if ids:
-                    require(re.fullmatch(r'[a-f0-9]{64}', ids[0]), 'UnknownCleanup')
+                    require(re.fullmatch(r'[a-f0-9]{64}', ids[0]), 'UnknownCleanup', 'cleanup', "re.fullmatch('[a-f0-9]{64}', ids[0])")
                     self.nodes[ids[0]] = node
                 self.pending_node = None
             for container in list(self.nodes):
@@ -669,10 +759,10 @@ class Harness:
             if self.root and not self.loop and (self.root / 'disk.img').exists():
                 out = self.command(['sudo', '-n', 'losetup', '--json', '--associated', str(self.root / 'disk.img'), '--output', 'NAME,BACK-FILE,MAJ:MIN'], 'prepare', cleanup=True)
                 loops = json.loads(out)['loopdevices']
-                require(len(loops) <= 1, 'UnknownCleanup')
+                require(len(loops) <= 1, 'UnknownCleanup', 'cleanup', 'len(loops) <= 1')
                 if loops:
                     self.loop = loops[0]['name']
-                    require(re.fullmatch(r'/dev/loop[0-9]{1,4}', self.loop), 'UnknownCleanup')
+                    require(re.fullmatch(r'/dev/loop[0-9]{1,4}', self.loop), 'UnknownCleanup', 'cleanup', "re.fullmatch('/dev/loop[0-9]{1,4}', self.loop)")
             if self.loop:
                 self.verify_loop(cleanup=True)
                 if self.mounted:
@@ -689,12 +779,12 @@ class Harness:
                         safe(directory, self.root)
                         for path in directory.iterdir():
                             safe(path, directory, False)
-                            require(path.name in ('Containerfile', 'arxd-tests'), 'UnknownCleanup')
+                            require(path.name in ('Containerfile', 'arxd-tests'), 'UnknownCleanup', 'cleanup', "path.name in ('Containerfile', 'arxd-tests')")
                             path.unlink()
                         directory.rmdir()
                 for path in self.root.iterdir():
                     safe(path, self.root, False)
-                    require(path.name in ('disk.img', 'image.id'), 'UnknownCleanup')
+                    require(path.name in ('disk.img', 'image.id'), 'UnknownCleanup', 'cleanup', "path.name in ('disk.img', 'image.id')")
                     path.unlink()
                 self.root.rmdir()
         except Exception as error:
@@ -716,6 +806,7 @@ class Harness:
             self.record('cleanup', result=cleanup_result, error=cleanup_error, seconds=round(self.cleanup_seconds, 6))
 
     def run(self):
+        token = DIAGNOSTIC.set(self.record)
         try:
             self.qualify()
         except Exception as error:
@@ -730,6 +821,15 @@ class Harness:
                         tool.close()
                     except Refusal as error:
                         self.fail(error)
+        DIAGNOSTIC.reset(token)
+        for node in ('founder', 'learner1', 'learner2'):
+            role = 'founder' if node == 'founder' else 'learner'
+            modes = ['create-' + role, 'deny-build', 'release', 'restart-' + role]
+            if node == 'founder':
+                modes.append('same-uid-control')
+            for mode in modes:
+                if (node, mode) not in self.case_results:
+                    self.record('not-run', node=node, mode=mode, reason='upstream-refusal')
         self.record('result', first_failure=self.first, secondary=self.secondary,
                     seconds=round(self.clock() - self.budget.start, 3), phases={**self.budget.used, 'cleanup': self.cleanup_seconds})
         return 1 if self.first else 0
@@ -744,7 +844,7 @@ class Harness:
             deadline = self.budget.deadline('preflight', 20)
             hardlinks = False
             try:
-                require(self.clock() < deadline, 'PhaseTimeout')
+                require(self.clock() < deadline, 'PhaseTimeout', 'qualify_tools', 'self.clock() < deadline')
                 protected_hardlinks(self.record, fs)
                 hardlinks = True
             except Refusal as error:
@@ -757,9 +857,9 @@ class Harness:
                         raise Refusal('PhaseTimeout' if self.clock() >= deadline else 'EvidenceOverflow')
                     batch[tool] = trusted_tool(tool, self.record, fs,
                         entry=sys.executable if tool == 'python3' else None, hardlinks=hardlinks)
-                    require(self.clock() < deadline, 'PhaseTimeout')
+                    require(self.clock() < deadline, 'PhaseTimeout', 'qualify_tools', 'self.clock() < deadline')
                     if tool == 'python3':
-                        require(sys.version_info >= (3, 11), 'PythonVersion')
+                        require(sys.version_info >= (3, 11), 'PythonVersion', 'qualify_tools', 'sys.version_info >= (3, 11)')
                     status = 'validated'
                 except Refusal as error:
                     self.fail(error)
@@ -785,80 +885,116 @@ class Harness:
                     required=len(TOOLS), validated=statuses.count('validated'),
                     refused=statuses.count('refused'), not_evaluated=statuses.count('not-evaluated'),
                     first_failure=self.first)
-        require(self.first is None, self.first)
+        require(self.first is None, self.first, 'qualify_tools', 'self.first is None')
 
     def qualify(self):
         require(len(sys.argv) == 1 and sys.platform == 'linux' and platform.machine() == 'x86_64' and
-                os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly')
+                os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'HostedOnly', 'qualify', "len(sys.argv) == 1 and sys.platform == 'linux' and (platform.machine() == 'x86_64') and (os.environ.get('GITHUB_ACTIONS') == 'true') and (os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted')")
         self.qualify_tools()
         self.command(['python3', '-I', '-B', '-m', 'unittest', 'discover', '-s', str(Path(__file__).parent), '-p', 'test_run.py'], 'preflight', 20)
         tmp = Path(os.environ['RUNNER_TEMP'])
         safe(tmp)
-        require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity')
+        require(shutil.disk_usage(tmp).free >= 1024*MIB, 'DiskCapacity', 'qualify', 'shutil.disk_usage(tmp).free >= 1024 * MIB')
         self.root = Path(tempfile.mkdtemp(prefix='arx-custody-', dir=tmp))
         os.chmod(self.root, 0o700)
         safe(self.root, tmp)
         context = self.root / 'context'
         context.mkdir(mode=0o700)
         source = self.command(['git', 'rev-parse', 'HEAD'], 'preflight').decode().strip()
-        require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin')
+        require(re.fullmatch(r'[a-f0-9]{40}', source), 'SourcePin', 'qualify', "re.fullmatch('[a-f0-9]{40}', source)")
         # Coordinator must persist adoption before hosted execution.
         note = Path('docs/adr/0037-acceptance-custody.md').read_text()
-        require(PINS in note, 'MissingAdoptedPins')
+        require(PINS in note, 'MissingAdoptedPins', 'qualify', 'PINS in note')
+        self.discover_and_stage(source, context)
+        self.command(['docker', 'build', '--platform', 'linux/amd64', '--network', 'none', '--target', 'custody-runtime', '--file', str(context / 'Containerfile'), '--iidfile', str(self.root / 'image.id'), str(context)], 'image', 40)
+        self.image = (self.root / 'image.id').read_text().strip()
+        require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity', 'qualify', "re.fullmatch('sha256:[a-f0-9]{64}', self.image)")
+        image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
+        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 256*MIB, 'ImageIdentity', 'qualify', "image['Id'] == self.image and image['Architecture'] == 'amd64' and (image['Os'] == 'linux') and (image['Size'] <= 256 * MIB)")
+        self.record('image', identity=self.image, bytes=image['Size'])
+        self.run_nodes()
+
+    def discover_and_stage(self, source, context):
+        checkout = Path.cwd()
+        safe(checkout, subject='checkout')
         target = Path(os.environ['CARGO_TARGET_DIR'])
         if not target.is_absolute():
             target = Path.cwd() / target
         deps = target / 'debug' / 'deps'
-        safe(deps)
+        safe(deps, subject='deps')
         candidates = []
-        for path in deps.iterdir():
-            if not path.name.startswith('arxd-') or not os.access(path, os.X_OK):
-                continue
-            safe(path, deps, False)
-            require(path.stat().st_size <= 128*MIB and len(candidates) < 16, 'CandidateBounds')
-            with open(path, 'rb') as f:
-                if f.read(4) != b'\x7fELF':
+        failed = None
+        with ExitStack() as stack:
+            objects = {}
+            for path in deps.iterdir():
+                if not path.name.startswith('arxd-') or not os.access(path, os.X_OK):
                     continue
-            before = (path.stat().st_dev, path.stat().st_ino, digest(path))
-            listing = self.command([str(path), '--list', '--exact', PROBE], 'preflight', 2)
-            after = (path.stat().st_dev, path.stat().st_ino, digest(path))
-            candidates.append((path, listing, before, after))
-        selected = choose(candidates)
-        before = digest(selected)
-        shutil.copyfile(selected, context / 'arxd-tests')
-        require(digest(selected) == before == digest(context / 'arxd-tests'), 'StagingHash')
-        containerfile = Path(__file__).parent.resolve() / 'Containerfile'
-        shutil.copyfile(containerfile, context / 'Containerfile')
-        require(digest(containerfile) == digest(context / 'Containerfile'), 'StagingHash')
-        require(sum(p.stat().st_size for p in context.iterdir()) <= 129*MIB, 'ContextCapacity')
-        elf = self.command(['readelf', '--program-headers', '--dynamic', str(context / 'arxd-tests')], 'preflight')
-        require(b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf, 'ElfABI')
-        inputs = {str(p): digest(p) for p in (containerfile, Path(__file__).resolve(), Path('crates/arxd/src/cluster/pki/custody/hosted_probe.rs'), Path('.github/workflows/ci.yml'))}
-        self.record('inputs', source=source, hashes=inputs, executable=before, pins=PINS)
-        self.command(['docker', 'build', '--platform', 'linux/amd64', '--network', 'none', '--target', 'custody-runtime', '--file', str(context / 'Containerfile'), '--iidfile', str(self.root / 'image.id'), str(context)], 'image', 40)
-        self.image = (self.root / 'image.id').read_text().strip()
-        require(re.fullmatch(r'sha256:[a-f0-9]{64}', self.image), 'ImageIdentity')
-        image = json.loads(self.command(['docker', 'image', 'inspect', self.image], 'image'))[0]
-        require(image['Id'] == self.image and image['Architecture'] == 'amd64' and image['Os'] == 'linux' and image['Size'] <= 256*MIB, 'ImageIdentity')
-        self.record('image', identity=self.image, bytes=image['Size'], executable=before)
+                require(len(objects) < 16, 'CandidateBounds', 'candidate-set', 'count_16')
+                subject = 'candidate-' + str(len(objects))
+                objects[path] = None
+                try:
+                    obj = stack.enter_context(BuildInput(path, deps, subject, self.record))
+                    objects[path] = obj
+                    os.lseek(obj.fd, 0, os.SEEK_SET)
+                    if os.read(obj.fd, 4) != b'\x7fELF':
+                        continue
+                    listing = self.command([str(path), '--list', '--exact', PROBE], 'preflight', 2)
+                    obj.verify()
+                    candidates.append((path, listing, obj.sha, obj.sha))
+                except (Refusal, OSError) as error:
+                    if failed is None:
+                        failed = error
+                    if not isinstance(error, Refusal):
+                        self.record('refusal', subject=subject, predicate='input_filesystem_error', code=type(error).__name__)
+            if failed is not None:
+                raise failed
+            selected = objects[choose(candidates)]
+            selected.stage(context / 'arxd-tests')
+            inputs = {}
+            for relative in ('tools/ci/custody/Containerfile', 'tools/ci/custody/run.py',
+                             'crates/arxd/src/cluster/pki/custody/hosted_probe.rs', '.github/workflows/ci.yml'):
+                with BuildInput(checkout / relative, checkout, relative, self.record) as obj:
+                    blob = self.command(['git', 'show', source + ':' + relative], 'preflight')
+                    require(hashlib.sha256(blob).hexdigest() == obj.sha, 'SourcePin', relative, 'immutable_git_blob')
+                    if relative.endswith('/Containerfile'):
+                        obj.stage(context / 'Containerfile')
+                    obj.verify()
+                    inputs[relative] = obj.sha
+            selected.verify()
+            require(sum(p.stat().st_size for p in context.iterdir()) <= 129*MIB, 'ContextCapacity', 'discover_and_stage', 'sum((p.stat().st_size for p in context.iterdir())) <= 129 * MIB')
+            elf = self.command(['readelf', '--program-headers', '--dynamic', '--version-info', str(context / 'arxd-tests')], 'preflight')
+            require(b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf, 'ElfABI', 'discover_and_stage', "b'/lib64/ld-linux-x86-64.so.2' in elf and b'NEEDED' in elf")
+            versions = sorted(set(v.decode('ascii') for v in re.findall(rb'GLIBC_[0-9]+\.[0-9]+', elf)))
+            self.record('elf-abi', required_glibc=versions)
+            self.record('inputs', source=source, hashes=inputs, executable=selected.sha, pins=PINS)
+
+    def run_nodes(self):
         self.prepare_fixture()
         founder_context = None
         identities = set()
         for node in ('founder', 'learner1', 'learner2'):
             for slot in ('wrap', 'store'):
                 m = (self.root / 'fs' / f'{node}-{slot}').stat()
-                require((m.st_dev, m.st_ino) not in identities and m.st_uid == 21001 and stat.S_IMODE(m.st_mode) == 0o700, 'MountOwnership')
+                require((m.st_dev, m.st_ino) not in identities and m.st_uid == 21001 and stat.S_IMODE(m.st_mode) == 0o700, 'MountOwnership', 'run_nodes', '(m.st_dev, m.st_ino) not in identities and m.st_uid == 21001 and (stat.S_IMODE(m.st_mode) == 448)')
                 identities.add((m.st_dev, m.st_ino))
             name = f'arx-{self.run_id}-{node}'
             self.pending_node = (name, node)
             container = self.command(create_argv(name, self.run_id, self.root, node, self.image), 'prepare').decode().strip()
-            require(re.fullmatch(r'[a-f0-9]{64}', container), 'UnknownCleanup')
+            require(re.fullmatch(r'[a-f0-9]{64}', container), 'UnknownCleanup', 'run_nodes', "re.fullmatch('[a-f0-9]{64}', container)")
             self.nodes[container] = node
             self.pending_node = None
             inspect_node(self.inspection(container), self.run_id, self.image, {f'/{s}': str(self.root / 'fs' / f'{node}-{s}') for s in ('wrap', 'store')})
             self.command(['docker', 'start', container], 'prepare')
-            listing = self.command(['docker', 'exec', '--user', '21001:21001', '--workdir', '/', container, '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', '/opt/arx/arxd-tests', '--list', '--exact', PROBE], 'image')
-            require(exact_listing(listing), 'ImageABI')
+            try:
+                listing = self.command(['docker', 'exec', '--user', '21001:21001', '--workdir', '/', container, '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', '/opt/arx/arxd-tests', '--list', '--exact', PROBE], 'image')
+            except Refusal:
+                # PID1 may itself fail in the loader before exec is possible.
+                # This fixed pre-key diagnostic never forwards container text.
+                logs = self.command(['docker', 'logs', container], 'image')
+                self.record('image-loader', missing_glibc=sorted(set(v.decode('ascii') for v in re.findall(
+                    rb"(GLIBC_[0-9]+\.[0-9]+)[^\r\n]{0,16}not found", logs))))
+                raise
+            require(exact_listing(listing), 'ImageABI', 'run_nodes', 'exact_listing(listing)')
             role = 'founder' if node == 'founder' else 'learner'
             public_context, target = self.start_holder(exec_argv(container, 'create-' + role, founder_context), node, 'create-' + role)
             if node == 'founder':
