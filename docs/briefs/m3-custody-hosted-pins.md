@@ -188,3 +188,31 @@ Adopted policy, sudo role only:
   substituting the binary; this is not atomic execution of the checked descriptor.
 - All other adopted values (image digest, UIDs, caps, deadlines, fixture, CI step) are
   unchanged.
+
+## Amendment A2: exact uutils multicall targets (coordinator, 2026-11-20)
+
+Hosted evidence (head `c0679c7a`): with A1 in place sudo validates; preflight then refuses
+`mkdir`, whose route through `/usr/lib/cargo/bin` (all ancestors uid 0, mode 0755) ends at
+a regular root-owned 0755 file with 116 hard links (`regular_single_link`). The runner is
+Ubuntu 26.04 with rust-coreutils (uutils) as the default core utilities. Independent review
+`D:/Temp/arx-pr199-a2-review/review.md` (SHA256 `0d8a19fa…2677`): GO with required changes.
+
+Adopted policy:
+- A closed role-to-exact-target map for the coreutils roles the harness invokes (mkdir,
+  chown, and any other fixed role listed explicitly in run.py). No category detector,
+  basename bypass or prefix broadening; other roles and files stay refused.
+- The multi-link exception is integrity assurance, not single-link proof: the route
+  (canonical entry and every symlink hop) and the target pass every A1 ancestor check; the
+  target is a regular root-owned file, not group/other-writable, with no setuid/setgid;
+  `/proc/sys/fs/protected_hardlinks` reads exactly 1 at preflight (unreadable or 0 refuses).
+  All other predicates stay conjunctive.
+- Multicall dispatch is preserved: each role executes through its own validated entry name
+  so the utility function is selected correctly; never one generic path without the
+  function argument.
+- Preflight evaluates every required tool and the sysctl, reports every refusal in one run
+  with sanitized records, closes everything it opened, keeps the time limits and the first
+  failure, and still fails closed.
+- Python receives no A2 allowance; validate `sys.executable` under the existing rules and
+  require Python >= 3.11.
+- Hosted qualification (pins sections 4, 6 and 8) stays open until real cases run. All
+  other adopted values are unchanged.
