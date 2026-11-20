@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 pub(super) mod ca;
 pub(super) mod csr;
-mod custody;
+pub(super) mod custody;
 #[cfg(test)]
 mod tests;
 use super::enrollment::{ClusterId, NodeId};
@@ -39,10 +39,3 @@ pub(super) use tls_tests::*;
 pub(super) mod preproof;
 #[cfg(test)]
 pub(super) mod preproof_tests;
-
-#[cfg(target_os = "linux")]
-pub(super) use custody::MemberCopy;
-#[cfg(all(test, target_os = "linux"))]
-pub(super) use custody::member_copy;
-#[cfg(all(test, target_os = "linux"))]
-pub(super) use custody::publication_fixture;

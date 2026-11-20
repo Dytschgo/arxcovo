@@ -67,7 +67,7 @@ mod linux {
     use super::*;
     use crate::cluster::{
         join_receipt::{ExpectedIdentity, PublicIdentity},
-        pki::MemberCopy,
+        pki::custody::MemberCopy,
     };
     use std::{
         fs::{self, File},

@@ -18,7 +18,7 @@ mod files {
     use super::*;
     use crate::cluster::{
         join_receipt::{Origin, PublicIdentity},
-        pki,
+        pki::custody,
     };
     use std::{
         fs,
@@ -95,8 +95,8 @@ mod files {
     #[test]
     fn publication_linux_real_file_roundtrip() {
         let l = setup();
-        let (custody, install, root, leaf, expected) = pki::publication_fixture(l.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+        let (custody, install, root, leaf, expected) = custody::publication_fixture(l.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         let mut owner = Owner::acquire(l.plan("join")).unwrap();
         let originals = crate::cluster::startup_plan::tests::guards(&owner);
         reserve(&mut owner).unwrap();
@@ -160,8 +160,8 @@ mod files {
     #[test]
     fn publication_retained_artifact_must_match() {
         let l = setup();
-        let (custody, install, root, leaf, expected) = pki::publication_fixture(l.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+        let (custody, install, root, leaf, expected) = custody::publication_fixture(l.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         let mut owner = Owner::acquire(l.plan("join")).unwrap();
         reserve(&mut owner).unwrap();
         linux::store(
@@ -207,8 +207,8 @@ mod files {
     fn publication_durable_boundaries() {
         let fixture = setup();
         let (custody, install, root, leaf, expected) =
-            pki::publication_fixture(fixture.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+            custody::publication_fixture(fixture.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         for (step, point) in POINTS.iter().enumerate() {
             for unwind in [false, true] {
                 let l = setup();
@@ -345,8 +345,8 @@ mod files {
     fn publication_restart_partial_and_missing_history() {
         let fixture = setup();
         let (custody, install, root, leaf, expected) =
-            pki::publication_fixture(fixture.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+            custody::publication_fixture(fixture.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         for fault in [None, Some("member-partial-write"), Some("temp-full-write")] {
             let l = setup();
             let mut owner = Owner::acquire(l.plan("join")).unwrap();
@@ -460,8 +460,8 @@ mod files {
     #[test]
     fn publication_wrong_context_and_origin() {
         let l = setup();
-        let (custody, install, root, leaf, expected) = pki::publication_fixture(l.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+        let (custody, install, root, leaf, expected) = custody::publication_fixture(l.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         for (node, origin) in [
             (
                 1,
@@ -617,8 +617,8 @@ mod files {
     fn publication_original_owner_collision_and_unsafe_objects() {
         let fixture = setup();
         let (custody, install, root, leaf, expected) =
-            pki::publication_fixture(fixture.root.path());
-        let member = pki::member_copy(&custody).unwrap();
+            custody::publication_fixture(fixture.root.path());
+        let member = custody::member_copy(&custody).unwrap();
         for destination in ["ca.der", "member-key", ".identity-publish"] {
             let l = setup();
             let mut owner = Owner::acquire(l.plan("join")).unwrap();
