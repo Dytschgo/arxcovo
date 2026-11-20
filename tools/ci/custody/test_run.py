@@ -115,7 +115,7 @@ class LauncherTests(unittest.TestCase):
         ):
             metadata = SimpleNamespace(st_uid=uid, st_gid=123, st_mode=mode)
             records = []
-            with self.subTest(predicate=predicate, path=path), patch.object(run.shutil, 'which', return_value=path), patch.object(run.Path, 'resolve', side_effect=lambda: run.Path(path)), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', side_effect=run.Refusal('UnsafePath') if unsafe else None):
+            with self.subTest(predicate=predicate, path=path), patch.object(run.shutil, 'which', return_value=path), patch.object(run.Path, 'resolve', side_effect=lambda: run.Path(path)), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', return_value=metadata, side_effect=run.Refusal('UnsafePath') if unsafe else None):
                 with self.assertRaisesRegex(run.Refusal, 'ToolOwnership'):
                     run.trusted_tool('docker', lambda event, **fields: records.append(dict(event=event, **fields)))
             self.assertEqual(len(records), 1)
@@ -123,8 +123,14 @@ class LauncherTests(unittest.TestCase):
                              resolved_path=path if path.startswith('/usr/') else '<outside-system-path>',
                              uid=uid, gid=123, mode=format(mode & 0o7777, '04o'), predicate=predicate))
             self.assertNotIn('account-token', json.dumps(records))
-        with patch.object(run.shutil, 'which', return_value='/usr/bin/docker'), patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/docker')), patch.object(run.Path, 'lstat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)), patch.object(run, 'safe'):
+        with patch.object(run.shutil, 'which', return_value='/usr/bin/docker'), patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/docker')), patch.object(run.Path, 'lstat', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)), patch.object(run, 'safe', return_value=SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o100755)):
             self.assertEqual(run.trusted_tool('docker', lambda *args, **kwargs: self.fail('unexpected refusal')), run.Path('/usr/bin/docker'))
+
+    def test_tool_lookup_ignores_inherited_path_shadow(self):
+        metadata = SimpleNamespace(st_uid=0, st_gid=0, st_mode=0o104755)
+        with patch.dict(run.os.environ, {'PATH': '/private/account-token'}), patch.object(run.shutil, 'which', return_value='/usr/bin/sudo') as lookup, patch.object(run.Path, 'resolve', return_value=run.Path('/usr/bin/sudo')), patch.object(run.Path, 'lstat', return_value=metadata), patch.object(run, 'safe', return_value=metadata):
+            self.assertEqual(run.trusted_tool('sudo', lambda *args, **kwargs: self.fail('unexpected refusal')), run.Path('/usr/bin/sudo'))
+            lookup.assert_called_once_with('sudo', path='/usr/bin:/usr/sbin:/bin:/sbin')
 
     def test_fixed_argv_environment_and_limits(self):
         argv = run.create_argv('arx-' + 'c'*16 + '-founder', 'c'*16, '/fixture', 'founder', IMAGE)

@@ -45,13 +45,12 @@ def safe(path, parent=None, directory=True):
     return m
 
 
-
 def trusted_tool(tool, record):
-    resolved = Path(shutil.which(tool) or '/missing').resolve()
+    resolved = Path(shutil.which(tool, path='/usr/bin:/usr/sbin:/bin:/sbin') or '/missing').resolve()
     # Only system paths are disclosed verbatim. Unexpected paths may contain
     # private account names or caller data and are represented by a fixed label.
     display = resolved.as_posix() if resolved.as_posix().startswith(
-        ('/usr/bin/', '/usr/sbin/', '/usr/local/bin/', '/usr/local/sbin/')) else '<outside-system-path>'
+        ('/usr/', '/opt/')) else '<outside-system-path>'
     m = resolved.lstat()
     def check(condition, predicate):
         if not condition:
@@ -60,7 +59,7 @@ def trusted_tool(tool, record):
                    predicate=predicate)
             raise Refusal('ToolOwnership')
     try:
-        safe(resolved, directory=False)
+        m = safe(resolved, directory=False)
     except Refusal:
         check(False, 'safe_regular_single_link_path')
     check(m.st_uid == 0, 'owner_uid_root')
