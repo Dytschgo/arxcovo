@@ -461,3 +461,6 @@ impl OwnerOps for NativeOps {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cluster_enrollment;

@@ -3,6 +3,8 @@ mod anchor;
 pub(in crate::cluster) use anchor::BoundVoters;
 mod code;
 mod registry;
+#[allow(dead_code)] // Owner paste and locally qualified routes are wired in later steps.
+pub(super) mod transfer;
 // Compiled for 7a verification. A live backend is a separate integration.
 #[allow(dead_code)]
 pub(super) mod session;
