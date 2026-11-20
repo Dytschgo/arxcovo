@@ -114,7 +114,7 @@ PR188 as the last merge, that is superseded by this summary.
   decisions: keep the old inspector's layout entry policy (zero-length WAL
   accepted) instead of tightening it, and keep the merged one-shot
   Inspect/Complete behaviour. Independent brief review pending.
-- **M3 slice 2, bound offline recovery (this PR):** Sol 6.1/high brief
+- **M3 slice 2, bound offline recovery (PR #198, merged as `be197a25`):** Sol 6.1/high brief
   `D:/Temp/arx-m3-step2/brief.md` (SHA256 `16f003e1…ab50`) after an independent
   review requiring two clarifications. Coordinator decisions: keep the old
   inspector's layout entry policy (zero-length WAL accepted) through
@@ -129,7 +129,11 @@ PR188 as the last merge, that is superseded by this summary.
   `D:/Temp/arx-m3-step2-build2/report.md` SHA256 `85fe3e2c…cf3c`: recovery 23,
   bound 29, startup-plan 4 pass; Clippy, fmt, static gate, loader 8 and SQLite
   verifier 33 negative controls pass. Windows replacement/removal evidence is
-  sharing-denial prevention; Linux/macOS via hosted CI. Exact-head review pending.
+  sharing-denial prevention. Hosted Unix then failed twice (private fixture modes,
+  then a stale interstage expectation; builder 3/3); each was diagnosed by an
+  independent reviewer, the owner authorized further scoped builders (2026-11-20),
+  and the final head `ce0fd7f8` passed review (`D:/Temp/arx-pr198-review3/review.md`,
+  SHA256 `b8c6a1a8…2162735`) with full Ubuntu and macOS suites green.
 - **PR #197 merged** as `85eccce8` (custody 3a); main push CI 44717451865 green.
   Review of `b4c66e97` PASS (`D:/Temp/arx-pr197-review2/review.md`, SHA256
   `5d6f7dd1…b4`); crash durability recorded as unqualified.
@@ -166,6 +170,31 @@ PR188 as the last merge, that is superseded by this summary.
   checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
   in one run) independently reviewed GO with required changes and committed to the pins.
   The fourth builder has one attempt left.
+- **Custody 3b harness (this PR):** adopted pins committed as
+  [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
+  `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
+  SHA256 `e771b2e4…3f48`, both required changes folded in). Sol 6.1/high builder
+  `2cfb9f23` used 2/3; report `D:/Temp/arx-custody-3b-build/report.md` SHA256
+  `f732f8ef…5fd4`: 10 new launcher tests, existing Python gates, fmt, Windows
+  Clippy and 38 PKI tests pass locally. One Linux-only CI step added after the
+  workspace tests in the existing Rust worker; no other workflow change. The Linux
+  probe compile and the hosted qualification run are verified only by this PR's
+  hosted CI, whose first run is measured against the 12 minute worker timeout and
+  ADR 0031 budget.
+  First hosted CI failed (workflow pin test and a Linux type error; builder 3/3).
+  Independent diagnosis (`D:/Temp/arx-pr199-review/review.md`, SHA256
+  `85ddbc92…eb6`); **owner authorization (2026-11-20):** new scoped builder, fresh
+  3 attempts. It fixed all five findings, then hosted Clippy `manual_inspect` and
+  the review's SP-new2 per-case evidence requirement (folded in as a pins
+  requirement); builder 3/3 after the third hosted run. That run is the first real
+  harness execution: Linux lint and all 833 tests passed (Ubuntu job 223 s), but
+  the launcher stopped at preflight with `ToolOwnership` after 0.001 s, so no
+  isolation case ran; the review (`D:/Temp/arx-pr199-review3/review.md`, SHA256
+  `e4739b5d…34f9`) also found the result parser wrongly requires zero filtered
+  tests. **Owner authorization (2026-11-20):** a new builder with a fresh 3-attempt
+  budget first makes the preflight report the failing tool and rule (sanitized),
+  fixes the parser, then fixes the ownership cause only within a safe rule, and
+  stops and reports if the hosted runner cannot qualify.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
