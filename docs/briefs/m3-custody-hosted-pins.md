@@ -216,3 +216,33 @@ Adopted policy:
   require Python >= 3.11.
 - Hosted qualification (pins sections 4, 6 and 8) stays open until real cases run. All
   other adopted values are unchanged.
+
+## Hosted qualification campaign Q1 (owner-authorized 2026-11-20)
+
+Context: four builders exhausted their budgets, each hosted run revealing one more premise
+of the GitHub-hosted Ubuntu 26.04 runner (sudo-rs, uutils multicall, build-output link
+count, relative digest paths). Independent review `D:/Temp/arx-pr199-discovery-review/review.md`
+(SHA256 `c8428a74…d9`) recommended one finite campaign instead of one authorization per
+premise. The owner authorized it on 2026-11-20.
+
+- Allowance: one new Sol 6.1/high builder, at most 6 changed-head normal hosted CI rounds
+  on PR #199. Campaign round numbers are separate from, and do not erase, the recorded
+  exhausted counters of the four earlier 3b builders and the Engine counters.
+- Each round implements and tests every currently supported finding first, then runs one
+  normal exact-head CI, reports every safely reachable refusal with a sanitized
+  object/predicate record and every dependent NOT RUN path, and preserves logs and hashes.
+- Security semantics are fixed: A1, A2 and every existing predicate stay; phase ceilings
+  (150 s launcher, 130 s work, 40 s image, 15 s preparation, etc.), the 12 minute worker
+  timeout and the ADR 0031 budget are unchanged. No fallback, prefix broadening or waived
+  check.
+- Policy separation is allowed where the pins already distinguish it: system tools keep
+  A1/A2 rules; CI build outputs (the compiled test executable and source inputs) need
+  regular, non-symlink, stable inode and hash identity through staging, not root ownership
+  or a single link; staged fixture objects keep the existing safe() predicates.
+- Any change to an adopted pin value (for example re-pinning the container base image to
+  match the runner's glibc/ABI, UID mapping, or the runner recipe) requires coordinator
+  approval plus an independent review before implementation, and is recorded here as a
+  further amendment.
+- Stop conditions: the harness passes every adopted case (then normal exact-head review
+  and merge), a step would require weakening a check, a pin change is needed and not yet
+  approved, or round 6 ends without qualification. On stop, report evidence and options.
