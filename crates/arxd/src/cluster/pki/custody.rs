@@ -167,6 +167,12 @@ mod linux {
     }
     impl Root {
         fn open(path: &Path) -> Result<Self, Error> {
+            Self::open_checked(path, |_, _| Ok(()))
+        }
+        fn open_checked(
+            path: &Path,
+            mut check: impl FnMut(&fs::Metadata, bool) -> Result<(), Error>,
+        ) -> Result<Self, Error> {
             if !path.is_absolute()
                 || path.components().count() > 64
                 || path.as_os_str().len() > 4096
@@ -174,7 +180,8 @@ mod linux {
                 return Err(Error::Layout);
             }
             let mut dir = File::open("/").map_err(|_| Error::Layout)?;
-            for component in path.components().skip(1) {
+            let mut components = path.components().skip(1).peekable();
+            while let Some(component) = components.next() {
                 let Component::Normal(name) = component else {
                     return Err(Error::Layout);
                 };
@@ -194,6 +201,7 @@ mod linux {
                 // SAFETY: successful openat transferred a new descriptor.
                 dir = unsafe { File::from_raw_fd(fd) };
                 let m = dir.metadata().map_err(|_| Error::Layout)?;
+                check(&m, components.peek().is_none())?;
                 // Ancestors may be root owned; writable shared ancestors require sticky protection.
                 if (m.uid() != 0 && m.uid() != unsafe { libc::geteuid() })
                     || (m.mode() & 0o022 != 0 && !(m.uid() == 0 && m.mode() & 0o1000 != 0))
@@ -392,6 +400,53 @@ mod linux {
         }
         Ok(copy)
     }
+    struct FounderLayout {
+        roots: Vec<fs::Metadata>,
+        ancestors: Vec<fs::Metadata>,
+    }
+
+    impl FounderLayout {
+        fn checked(owner: &crate::cluster::startup_plan::Owner) -> Result<Self, Error> {
+            let metadata = |path: &Path| -> Result<fs::Metadata, Error> {
+                // An absolute path selects this exact guard from the original
+                // Owner. The loan rechecks the current name against its descriptor.
+                owner
+                    .bound_guard(path.to_str().ok_or(Error::Layout)?)
+                    .map_err(|_| Error::Layout)?
+                    .metadata()
+                    .map_err(|_| Error::Layout)
+            };
+            let mut layout = Self {
+                roots: Vec::new(),
+                ancestors: Vec::new(),
+            };
+            for path in [
+                &owner.plan.credentials,
+                &owner.plan.state,
+                &owner.plan.workspace,
+                &owner.plan.config,
+            ] {
+                layout.roots.push(metadata(path)?);
+                for ancestor in path.ancestors().skip(1) {
+                    layout.ancestors.push(metadata(ancestor)?);
+                }
+            }
+            Ok(layout)
+        }
+
+        fn check(&self, private: &fs::Metadata, leaf: bool) -> Result<(), Error> {
+            // Shared ancestors are expected. Reject a private leaf that
+            // aliases a checked ancestor, or any private component that
+            // aliases a checked root.
+            if self.roots.iter().any(|root| same(root, private))
+                || (leaf && self.ancestors.iter().any(|parent| same(parent, private)))
+            {
+                return Err(Error::Layout);
+            }
+            Ok(())
+        }
+    }
+
     /// Installation owner for the fresh-founder role only.
     pub(in crate::cluster) struct FounderCustody(Custody);
 
@@ -416,7 +471,11 @@ mod linux {
                     }
                 }
             }
-            Custody::create_fresh_installation(wrap, store).map(Self)
+            let layout = FounderLayout::checked(owner)?;
+            let wrap = Root::open_checked(wrap, |m, leaf| layout.check(m, leaf))?;
+            let store = Root::open_checked(store, |m, leaf| layout.check(m, leaf))?;
+            Custody::check_roots(&wrap, &store)?;
+            Custody::create_fresh_in_roots(wrap, store).map(Self)
         }
 
         pub(in crate::cluster) fn seal(
@@ -475,8 +534,12 @@ mod linux {
         fn roots(wrap: &Path, store: &Path) -> Result<(Root, Root), Error> {
             let a = Root::open(wrap)?;
             let b = Root::open(store)?;
-            if wrap.starts_with(store)
-                || store.starts_with(wrap)
+            Self::check_roots(&a, &b)?;
+            Ok((a, b))
+        }
+        fn check_roots(a: &Root, b: &Root) -> Result<(), Error> {
+            if a.path.starts_with(&b.path)
+                || b.path.starts_with(&a.path)
                 || same(
                     &a.dir.metadata().map_err(|_| Error::Layout)?,
                     &b.dir.metadata().map_err(|_| Error::Layout)?,
@@ -484,7 +547,7 @@ mod linux {
             {
                 return Err(Error::Layout);
             }
-            Ok((a, b))
+            Ok(())
         }
         fn acquire(store: &Root, create: bool) -> Result<File, Error> {
             if create {
@@ -521,6 +584,9 @@ mod linux {
         }
         pub(super) fn create_fresh_installation(wrap: &Path, store: &Path) -> Result<Self, Error> {
             let (wrap, store) = Self::roots(wrap, store)?;
+            Self::create_fresh_in_roots(wrap, store)
+        }
+        fn create_fresh_in_roots(wrap: Root, store: Root) -> Result<Self, Error> {
             if !wrap.entries(2)?.is_empty() || !store.entries(3)?.is_empty() {
                 return Err(Error::Layout);
             }
@@ -781,6 +847,54 @@ mod linux {
             let bytes = self.store.read("member-key", 16384)?;
             MemberKey::from_payload(expected, &codec::open(&self.key, expected, &bytes)?.0)
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn founder_custody_rejects_open_workspace_alias() {
+        use crate::cluster::startup_plan::{Owner, tests::Layout};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = Layout::new();
+        let owner = Owner::acquire(fixture.plan("create-founder")).unwrap();
+        let alias = fixture.root.path().join("different-name");
+        let store = fixture.root.path().join("custody");
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&owner.plan.workspace, &alias).unwrap();
+
+        let checked = FounderLayout::checked(&owner).unwrap();
+        // Follow the symlink only in this fixture to obtain a second descriptor
+        // to the workspace inode. Exercise the same comparison used after
+        // openat on a differently mounted name.
+        let aliased = File::open(&alias).unwrap().metadata().unwrap();
+        assert_eq!(checked.check(&aliased, true), Err(Error::Layout));
+        assert_eq!(checked.check(&aliased, false), Err(Error::Layout));
+
+        let parent = File::open(fixture.root.path()).unwrap().metadata().unwrap();
+        assert_eq!(checked.check(&parent, true), Err(Error::Layout));
+        assert_eq!(checked.check(&parent, false), Ok(()));
+        assert_eq!(
+            checked.check(&Root::open(&store).unwrap().dir.metadata().unwrap(), true),
+            Ok(())
+        );
+
+        // The entry point also rejects the symlink itself without custody writes.
+        assert!(matches!(
+            FounderCustody::create(&owner, &alias, &store),
+            Err(Error::Layout)
+        ));
+        assert!(matches!(
+            FounderCustody::create(&owner, &store, &alias),
+            Err(Error::Layout)
+        ));
+        assert!(
+            fs::read_dir(&owner.plan.workspace)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(fs::read_dir(&store).unwrap().next().is_none());
     }
 }
 
