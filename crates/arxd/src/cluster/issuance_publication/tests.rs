@@ -64,17 +64,14 @@ mod files {
         }
         l
     }
-    fn probe(owner: &Owner, locked: bool) {
+    fn probe(path: &std::path::Path, locked: bool) {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "cluster::issuance_publication::tests::files::publication_lock_probe",
                 "--nocapture",
             ])
-            .env(
-                "ARX_PUBLICATION_PROBE",
-                owner.plan.state.join("cluster-owner.lock"),
-            )
+            .env("ARX_PUBLICATION_PROBE", path)
             .env("ARX_PUBLICATION_LOCKED", if locked { "yes" } else { "no" })
             .status()
             .unwrap();
@@ -136,13 +133,15 @@ mod files {
         );
         assert_eq!(owner.publication.trace, POINTS);
         member.prove_possession();
-        probe(&owner, true);
+        probe(&owner.plan.state.join("cluster-owner.lock"), true);
         let trace = owner.publication.trace.clone();
         assert_eq!(reserve(&mut owner), Err(Error::Completed));
         assert_eq!(owner.publication.trace, trace);
+        let lock_path = owner.plan.state.join("cluster-owner.lock");
         drop(owner);
+        probe(&lock_path, false);
         let recovered = Owner::acquire(l.plan("recover-joiner")).unwrap();
-        probe(&recovered, true);
+        probe(&recovered.plan.state.join("cluster-owner.lock"), true);
         linux::check_retained(
             &recovered,
             Some(&expected),
@@ -159,15 +158,64 @@ mod files {
         assert_eq!(recovered.read("member-key", 16384).unwrap(), member.bytes());
     }
     #[test]
+    fn publication_retained_artifact_must_match() {
+        let l = setup();
+        let (custody, install, root, leaf, expected) = pki::publication_fixture(l.root.path());
+        let member = pki::member_copy(&custody).unwrap();
+        let mut owner = Owner::acquire(l.plan("join")).unwrap();
+        reserve(&mut owner).unwrap();
+        linux::store(
+            &mut owner,
+            Some(&expected),
+            install,
+            &root,
+            &leaf,
+            &member,
+            Some(1_000_000),
+        )
+        .unwrap();
+        drop(owner);
+        for artifact in ["member-key", "sealed-key", "member-key"] {
+            let path = l.root.path().join("credentials/identity.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["artifact"] = serde_json::json!(artifact);
+            l.write(
+                "credentials/identity.json",
+                &serde_json::to_vec(&value).unwrap(),
+            );
+            let before = l.snapshot();
+            let recovered = Owner::acquire(l.plan("recover-joiner")).unwrap();
+            assert_eq!(
+                linux::check_retained(
+                    &recovered,
+                    Some(&expected),
+                    install,
+                    &member,
+                    Some(1_000_000)
+                ),
+                if artifact == "member-key" {
+                    Ok(())
+                } else {
+                    Err(Error::Context)
+                }
+            );
+            assert_eq!(l.snapshot(), before);
+        }
+    }
+    #[test]
     fn publication_durable_boundaries() {
         let fixture = setup();
         let (custody, install, root, leaf, expected) =
             pki::publication_fixture(fixture.root.path());
         let member = pki::member_copy(&custody).unwrap();
-        for point in POINTS {
+        for (step, point) in POINTS.iter().enumerate() {
             for unwind in [false, true] {
                 let l = setup();
                 let mut owner = Owner::acquire(l.plan("join")).unwrap();
+                let original_guards = crate::cluster::startup_plan::tests::guards(&owner);
+                let original_snapshot = l.snapshot();
+                let encoded = PublicIdentity::assemble(&expected, &leaf).unwrap();
                 owner.publication.fault = Some((point, unwind));
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     reserve(&mut owner)?;
@@ -186,7 +234,66 @@ mod files {
                 } else {
                     assert_eq!(result.unwrap(), Err(Error::Unconfirmed));
                 }
+                assert_eq!(owner.publication.trace, POINTS[..=step]);
+                assert_eq!(
+                    crate::cluster::startup_plan::tests::guards(&owner),
+                    original_guards
+                );
+                let done = |n: usize| step > n || (step == n && unwind);
+                let replaced = done(19);
+                let mut expected_files: Vec<(&str, &[u8])> = Vec::new();
+                if done(0) {
+                    expected_files.push(("identity.json", if replaced { &encoded } else { &[] }));
+                }
+                for (name, bytes, create, partial, full) in [
+                    ("ca.der", root.as_slice(), 3, 4, 5),
+                    ("member-key", member.bytes(), 8, 9, 10),
+                    (".identity-publish", encoded.as_slice(), 13, 14, 15),
+                ] {
+                    if done(create) && !(name == ".identity-publish" && replaced) {
+                        // Partial-write faults are observed after the real first write.
+                        let len = if done(full) {
+                            bytes.len()
+                        } else if step >= partial {
+                            bytes.len() / 2
+                        } else {
+                            0
+                        };
+                        expected_files.push((name, &bytes[..len]));
+                    }
+                }
+                expected_files.sort_by_key(|(name, _)| *name);
+                let objects = crate::cluster::startup_plan::tests::objects(&owner.plan.credentials);
+                assert_eq!(objects.len(), expected_files.len());
+                for (object, (name, bytes)) in objects.iter().zip(&expected_files) {
+                    assert_eq!(object.0, *name);
+                    assert!(object.3);
+                    assert_eq!(object.4, bytes.len() as u64);
+                    assert_eq!(fs::read(owner.plan.credentials.join(name)).unwrap(), *bytes);
+                    // Retained descriptor and path must identify the same actual created object.
+                    let guard = owner
+                        .publication
+                        .files
+                        .iter()
+                        .find(|g| {
+                            use std::os::unix::fs::MetadataExt;
+                            let m = g.file().metadata().unwrap();
+                            m.dev() == object.1 && m.ino() == object.2
+                        })
+                        .unwrap();
+                    guard.recheck().unwrap();
+                }
                 let before = l.snapshot();
+                assert_eq!(
+                    before
+                        .iter()
+                        .filter(|(n, _)| n.starts_with("state/"))
+                        .collect::<Vec<_>>(),
+                    original_snapshot
+                        .iter()
+                        .filter(|(n, _)| n.starts_with("state/"))
+                        .collect::<Vec<_>>()
+                );
                 let trace = owner.publication.trace.clone();
                 assert_eq!(reserve(&mut owner), Err(Error::Unconfirmed));
                 assert_eq!(
@@ -206,21 +313,29 @@ mod files {
                 if *point != "reservation-create" || unwind {
                     assert!(!owner.publication.files.is_empty());
                 }
-                probe(&owner, true);
+                probe(&owner.plan.state.join("cluster-owner.lock"), true);
                 drop(owner);
                 let before = l.snapshot();
                 if *point != "reservation-create" || unwind {
                     assert!(Owner::acquire(l.plan("join")).is_err());
                 }
-                if let Ok(recovered) = Owner::acquire(l.plan("recover-joiner")) {
-                    let bytes = recovered.read("identity.json", 8192).unwrap();
-                    // Generic acquisition is only an inventory check.
-                    let complete = PublicIdentity::decode(&bytes).is_ok();
-                    assert_eq!(
-                        complete,
-                        (POINTS.iter().position(|p| p == point).unwrap() > 19
-                            || (*point == "atomic-replace" && unwind))
+                let recovery = Owner::acquire(l.plan("recover-joiner"));
+                // Exactly three safe names only after member create and before temp create,
+                // or after atomic replacement. Acquisition is inventory-only.
+                let inventory_complete = (done(8) && !done(13)) || replaced;
+                assert_eq!(recovery.is_ok(), inventory_complete);
+                if let Ok(recovered) = recovery {
+                    let result = linux::check_retained(
+                        &recovered,
+                        Some(&expected),
+                        install,
+                        &member,
+                        Some(1_000_000),
                     );
+                    assert_eq!(result.is_ok(), replaced);
+                    if replaced {
+                        member.prove_possession();
+                    }
                 }
                 assert_eq!(l.snapshot(), before);
             }
@@ -347,6 +462,27 @@ mod files {
         let l = setup();
         let (custody, install, root, leaf, expected) = pki::publication_fixture(l.root.path());
         let member = pki::member_copy(&custody).unwrap();
+        for (node, origin) in [
+            (
+                1,
+                Origin::Found {
+                    term: 2,
+                    leader: 1,
+                    index: 3,
+                },
+            ),
+            (2, expected.origin.clone()),
+        ] {
+            let (bytes, root, valid) = crate::cluster::join_receipt::tests::fixture(node, origin);
+            let record = PublicIdentity::decode(&bytes).unwrap();
+            record
+                .verify(&valid, &root, rustls::pki_types::UnixTime::now())
+                .unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["origin"]["role"] =
+                serde_json::json!(if node == 1 { "joiner" } else { "founder" });
+            assert!(PublicIdentity::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
         let bytes = PublicIdentity::assemble(&expected, &leaf).unwrap();
         for field in [
             "cluster", "node", "key", "ca", "term", "leader", "index", "role", "anchors",
@@ -354,11 +490,9 @@ mod files {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             match field {
                 "cluster" | "key" | "ca" => value[field][0] = serde_json::json!(99),
-                "node" => value[field] = serde_json::json!(2),
-                "role" | "anchors" => {
-                    value["origin"] = serde_json::json!({"role":"joiner","term":2,"leader":1,"index":3,"anchors":[[1,vec![0;32]]]});
-                    value["node"] = serde_json::json!(2);
-                }
+                "node" => value[field] = serde_json::json!(expected.node.get() + 1),
+                "role" => value["origin"]["role"] = serde_json::json!("founder"),
+                "anchors" => value["origin"]["anchors"][0][1][0] = serde_json::json!(99),
                 _ => value["origin"][field] = serde_json::json!(99),
             }
             let altered = serde_json::to_vec(&value).unwrap();
@@ -405,7 +539,6 @@ mod files {
                 "key" => bad.key = KeyDigest::of_spki(b"different public key").unwrap(),
                 "root" => wrong_root[0] ^= 1,
                 "role" => {
-                    bad.node = NodeId::new(1).unwrap();
                     bad.origin = Origin::Found {
                         term: 2,
                         leader: 1,
@@ -539,7 +672,65 @@ mod files {
                 _ => unreachable!(),
             }
             assert!(reserve(&mut owner).is_err());
-            probe(&owner, true);
+            probe(&owner.plan.state.join("cluster-owner.lock"), true);
+        }
+        for reserved in [false, true] {
+            for name in ["credentials", "state", "ancestor"] {
+                let l = setup();
+                let mut owner = Owner::acquire(l.plan("join")).unwrap();
+                if reserved {
+                    reserve(&mut owner).unwrap();
+                }
+                if name == "ancestor" {
+                    let old = l.root.path().join("retired-tree");
+                    fs::create_dir(&old).unwrap();
+                    for child in ["credentials", "state", "workspace", "config"] {
+                        fs::rename(l.root.path().join(child), old.join(child)).unwrap();
+                    }
+                    // Replace the common ancestor using a nested disposable fixture.
+                    let moved = l.root.path().with_extension("retired");
+                    fs::rename(l.root.path(), &moved).unwrap();
+                    fs::create_dir(l.root.path()).unwrap();
+                    fs::set_permissions(l.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+                    for child in ["credentials", "state", "workspace", "config"] {
+                        fs::rename(
+                            moved.join("retired-tree").join(child),
+                            l.root.path().join(child),
+                        )
+                        .unwrap();
+                    }
+                    // Keep the retired ancestor alive until after refusal; dispose by TempDir.
+                    fs::rename(&moved, l.root.path().join("retired-ancestor")).unwrap();
+                } else {
+                    let path = l.root.path().join(name);
+                    fs::rename(&path, l.root.path().join(format!("retired-{name}"))).unwrap();
+                    fs::create_dir(&path).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let before = l.snapshot();
+                let result = if reserved {
+                    linux::store(
+                        &mut owner,
+                        Some(&expected),
+                        install,
+                        &root,
+                        &leaf,
+                        &member,
+                        Some(1_000_000),
+                    )
+                } else {
+                    reserve(&mut owner)
+                };
+                assert_eq!(result, Err(Error::Layout));
+                assert_eq!(l.snapshot(), before);
+                assert!(
+                    owner
+                        .publication
+                        .trace
+                        .iter()
+                        .all(|p| p.starts_with("reservation-"))
+                );
+            }
         }
         // Same bytes in a different original staging object must still refuse.
         let path = fixture.root.path().join("custody/member-key");

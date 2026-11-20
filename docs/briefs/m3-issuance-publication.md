@@ -8,6 +8,7 @@ only, never issuance authority. Synthetic crypto fixtures are not Found evidence
 Exact tests assigned before execution (prefix cluster::issuance_publication::tests):
 - files::publication_linux_real_file_roundtrip (Linux)
 - files::publication_durable_boundaries (Linux; 24 adapters x error/unwind)
+- files::publication_retained_artifact_must_match (Linux)
 - files::publication_restart_partial_and_missing_history (Linux)
 - files::publication_wrong_context_and_origin (Linux)
 - files::publication_original_owner_collision_and_unsafe_objects (Linux)
@@ -52,3 +53,32 @@ passed. PKI 38 listed but not run. Linux six test entries remain uncompiled and
 unexecuted locally. Branch is WIP, not acceptance-ready. Coordinator must route
 the evidence to a fresh independent Sol reviewer; this does not grant a fourth
 builder attempt or reset any historical counters.
+
+## Scoped stuck-review follow-up (2026-11-20)
+
+The owner authorized a separate Sol 6.1/high builder with a fresh three-failure
+budget for ST1/ST2/SP1/SP2 from the stuck review. The original builder remains
+3/3 exhausted; Engine Sol 3/3 and historical Opus 0/2 are unchanged.
+
+ST1 now adjusts only the assembly test's expected artifact to member-key after
+asserting the shared fixture remains sealed-key. ST2 gates both facade layers'
+member_copy imports to Linux tests, retaining production MemberCopy visibility.
+SP1 requires member-key in retained fixed-layout validation; the new completed,
+reopened test changes only the artifact field with healthy controls.
+
+SP2 adds isolated role/anchor edits with valid-role controls, exact per-boundary
+trace/inventory/byte-prefix/descriptor identity witnesses and original guard/state
+controls, explicit reopen outcomes and full retained validation of complete
+tuples, root/ancestor substitution before and after reservation, and an independent
+process release probe after owner drop. These Linux oracles are source-reviewed,
+not locally compiled or executed.
+
+This follow-up passed Windows static gate (28 vendor members/four patched hashes,
+33 negative controls), fmt, locked/offline all-target check and Clippy -D warnings,
+and 48 affected tests: publication 1, PKI 38, receipt 4, startup plan 5. No failed
+verification rounds consumed the new budget. The earlier STOP above records the
+original builder's historical outcome, not an additional attempt by that builder.
+Seven Linux publication test entries now await qualified compile/runtime evidence.
+Exact commands and counts are in D:/Temp/arx-m3-step4a-2/report.md.
+Independent exact-head review, hosted checks/costs and all prior acceptance gaps
+remain pending. Step 4 and M3 remain unchecked.
