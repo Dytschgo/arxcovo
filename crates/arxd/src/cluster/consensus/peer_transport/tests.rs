@@ -2474,21 +2474,22 @@ async fn learner_once(case: u8) -> Result<(), &'static str> {
                 .map_err(|_| "fixture release observer")?
                 .released(),
         );
-        let port = 43181 + u16::from(case) * 2;
-        let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|_| "address")?;
-        let ra: SocketAddr = format!("127.0.0.1:{}", port + 1)
-            .parse()
-            .map_err(|_| "address")?;
-        let sl = TcpListener::bind(sa)
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+        let sl = TcpListener::bind(loopback)
             .await
             .map_err(|_| "sender reservation")?;
         reservations += 1;
-        let rl = TcpListener::bind(ra)
+        let rl = TcpListener::bind(loopback)
             .await
             .map_err(|_| "receiver reservation")?;
         reservations += 1;
-        if sl.local_addr().map_err(|_| "sender address")? != sa
-            || rl.local_addr().map_err(|_| "receiver address")? != ra
+        let sa = sl.local_addr().map_err(|_| "sender address")?;
+        let ra = rl.local_addr().map_err(|_| "receiver address")?;
+        if sa.ip() != loopback.ip()
+            || ra.ip() != loopback.ip()
+            || sa.port() == 0
+            || ra.port() == 0
+            || sa == ra
         {
             return Err("reservation identity");
         }
