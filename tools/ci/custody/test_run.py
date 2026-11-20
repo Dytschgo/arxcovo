@@ -34,6 +34,9 @@ class FakeChild:
         self.reaped = False
         self.killed = False
 
+    def pump(self):
+        pass
+
     def alive(self):
         run.require(self.clock() < self.deadline, 'HolderTimeout')
         run.require(self.clock() < self.terminal_at, 'HolderExit')
@@ -166,16 +169,6 @@ class LauncherTests(unittest.TestCase):
             clock.now = 7
             holder.alive()
             self.assertFalse(holder.reaped)
-            events = []
-            def release(*args, **kwargs):
-                events.append('release')
-                holder.terminal_at = clock() + .1
-            with patch.object(harness, 'operational', side_effect=release):
-                harness.release(CONTAINER)
-            self.assertTrue(holder.reaped)
-            self.assertIsNone(harness.holder)
-            events += ['reaped', 'restart']
-            self.assertEqual(events, ['release', 'reaped', 'restart'])
         for start, ready_at, expected in ((0, 6, 'ReadyTimeout'), (0, 1, 'HolderTimeout'), (129, 131, 'WorkTimeout')):
             clock = Clock()
             harness = run.Harness(clock)
@@ -205,6 +198,152 @@ class LauncherTests(unittest.TestCase):
             self.assertTrue(holder.killed)
             self.assertEqual(events, ['remove-container'])
             self.assertEqual(harness.first, expected)
+
+    def release_fixture(self, holder_at, release_at, holder_output=GOOD, release_output=GOOD):
+        clock = Clock()
+        events = []
+
+        class Process(FakeChild):
+            def __init__(self, name, at, output):
+                super().__init__(clock, terminal_at=at)
+                self.name, self.output = name, output
+
+            def finish(self):
+                if self.reaped:
+                    return True
+                if clock() < self.terminal_at:
+                    return False
+                self.out.extend(self.output)
+                self.reaped = True
+                events.append(self.name + '-reaped')
+                return True
+
+            def kill(self):
+                events.append(self.name + '-killed')
+                super().kill()
+
+        holder = Process('holder', holder_at, holder_output)
+        release = Process('release', release_at, release_output)
+        restart = Process('restart', 0, GOOD)
+
+        def spawn(argv, deadline, _clock):
+            mode = next(v for v in argv if v.startswith('ARX_CUSTODY_HOSTED_MODE='))
+            name = mode.split('=')[1]
+            events.append(name + '-spawn')
+            if name == 'release':
+                return release
+            self.assertTrue(holder.reaped)
+            self.assertIsNone(harness.holder)
+            return restart
+
+        harness = run.Harness(clock, spawn)
+        harness.holder = holder
+        harness.children.append(holder)
+        return harness, clock, events, holder, release
+
+    def test_release_restart_accepts_both_completion_orders(self):
+        for holder_at, release_at in ((.02, .05), (.05, .02)):
+            with self.subTest(holder_at=holder_at):
+                harness, clock, events, holder, release = self.release_fixture(holder_at, release_at)
+                with patch.object(run.time, 'sleep', clock.sleep):
+                    harness.release_and_restart(CONTAINER, 'founder', 'a'*256)
+                self.assertEqual(events, ['release-spawn', 'release-reaped', 'holder-reaped',
+                                          'restart-founder-spawn', 'restart-reaped'])
+                self.assertTrue(holder.reaped and release.reaped)
+                self.assertFalse(harness.releasing)
+                self.assertIsNone(harness.first)
+
+    def test_release_restart_rejects_premature_holder_exit(self):
+        harness, clock, events, holder, _ = self.release_fixture(0, .05)
+        with self.assertRaisesRegex(run.Refusal, 'HolderExit'):
+            harness.release_and_restart(CONTAINER, 'founder', 'a'*256)
+        self.assertEqual(events, [])
+        # Ordinary probe waits must still monitor holder liveness.
+        holder.terminal_at = .02
+        with patch.object(run.time, 'sleep', clock.sleep):
+            with self.assertRaisesRegex(run.Refusal, 'HolderExit'):
+                harness.command(['ARX_CUSTODY_HOSTED_MODE=release'], 'probe')
+        self.assertEqual(harness.first, 'HolderExit')
+        self.assertIn('release-killed', events)
+
+    def test_release_restart_terminal_failure_forbids_restart(self):
+        for holder_output, release_output in ((b'', GOOD), (GOOD, b'')):
+            with self.subTest(holder_output=holder_output):
+                harness, clock, events, _, _ = self.release_fixture(.02, .05, holder_output, release_output)
+                with patch.object(run.time, 'sleep', clock.sleep):
+                    with self.assertRaisesRegex(run.Refusal, 'MissingOracle'):
+                        harness.release_and_restart(CONTAINER, 'founder', 'a'*256)
+                self.assertFalse(any('restart' in event for event in events))
+                self.assertFalse(harness.releasing)
+
+    def test_release_restart_deadlines_force_cleanup(self):
+        for kind in ('holder', 'work', 'command', 'terminal'):
+            with self.subTest(kind=kind):
+                harness, clock, events, holder, release = self.release_fixture(1000, 1000)
+                expected = 'CommandTimeout'
+                if kind == 'holder':
+                    holder.deadline = .02
+                    expected = 'HolderTimeout'
+                elif kind == 'work':
+                    clock.now = 129.98
+                    holder.deadline = 150
+                    expected = 'WorkTimeout'
+                elif kind == 'terminal':
+                    release.terminal_at = .02
+                    holder.deadline = .05
+                    expected = 'HolderTimeout'
+                harness.nodes[CONTAINER] = 'founder'
+
+                def remove(*args, **kwargs):
+                    events.append('container-removed')
+                    harness.nodes.clear()
+
+                with patch.object(run.time, 'sleep', clock.sleep), patch.object(harness, 'remove_node', side_effect=remove):
+                    with patch.object(harness, 'qualify', side_effect=lambda: harness.release_and_restart(CONTAINER, 'founder', 'a'*256)):
+                        self.assertEqual(harness.run(), 1)
+                self.assertEqual(harness.first, expected)
+                self.assertTrue(holder.killed)
+                self.assertLess(events.index('container-removed'), events.index('holder-killed'))
+                self.assertFalse(any('restart' in event for event in events))
+                self.assertLess(clock(), 150)
+
+    def test_command_latches_failure_before_kill_and_preserves_exception(self):
+        for cause in ('timeout', 'probe', 'holder'):
+            with self.subTest(cause=cause):
+                clock = Clock()
+                child = FakeChild(clock)
+                harness = run.Harness(clock, lambda *args: child)
+                original = run.Refusal('ProbeFailure')
+                expected = {'timeout': 'CommandTimeout', 'probe': 'ProbeFailure', 'holder': 'HolderExit'}[cause]
+                if cause == 'probe':
+                    child.finish = lambda: (_ for _ in ()).throw(original)
+                if cause == 'holder':
+                    harness.holder = FakeChild(clock, terminal_at=0)
+
+                def kill():
+                    self.assertEqual(harness.first, expected)
+                    raise RuntimeError('synthetic teardown failure')
+
+                child.kill = kill
+                with patch.object(run.time, 'sleep', clock.sleep):
+                    with self.assertRaisesRegex(run.Refusal, expected) as caught:
+                        harness.command(['fixed'], 'probe', seconds=.02)
+                if cause == 'probe':
+                    self.assertIs(caught.exception, original)
+                self.assertEqual(harness.first, expected)
+                self.assertEqual(harness.secondary, ['RuntimeError'])
+
+    def test_successful_command_failed_teardown_fails_as_cleanup(self):
+        clock = Clock()
+        child = FakeChild(clock)
+        harness = run.Harness(clock, lambda *args: child)
+        # Command has completed, but its resources still require teardown.
+        child.finish = lambda: True
+        child.kill = lambda: (_ for _ in ()).throw(RuntimeError('synthetic teardown failure'))
+        with self.assertRaises(RuntimeError):
+            harness.command(['fixed'], 'probe')
+        self.assertEqual(harness.first, 'Cleanup')
+        self.assertEqual(harness.secondary, ['RuntimeError'])
 
     def test_shm_and_runtime_mount_accounting(self):
         self.assertEqual((17+1, 18+64, 256-82), (18, 82, 174))

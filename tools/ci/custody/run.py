@@ -186,6 +186,7 @@ class Harness:
         self.secondary = []
         self.children = []
         self.holder = None
+        self.releasing = False
         self.nodes = {}
         self.root = self.loop = self.image = None
         self.mounted = False
@@ -216,20 +217,37 @@ class Harness:
         require(start < deadline, 'CleanupTimeout' if cleanup else 'WorkTimeout')
         child = self.spawn(argv, deadline, self.clock)
         self.children.append(child)
+        failure = None
         try:
             while True:
                 if not cleanup and self.holder:
                     self.check_work()
-                    self.holder.alive()
+                    if self.releasing:
+                        self.holder.pump()
+                        require(self.clock() < self.holder.deadline, 'HolderTimeout')
+                    else:
+                        self.holder.alive()
                 require(self.clock() < deadline, 'CommandTimeout')
                 if child.finish():
                     return bytes(child.out)
                 time.sleep(.01)
+        except Exception as error:
+            failure = error
+            self.fail(error)
+            raise
         finally:
-            if not child.reaped:
-                child.kill()
-            if not cleanup:
-                self.budget.used[phase] += self.clock() - start
+            try:
+                if not child.reaped:
+                    child.kill()
+            except Exception as error:
+                if self.first is None:
+                    self.fail(Refusal('Cleanup'))
+                self.fail(error)
+                if failure is None:
+                    raise
+            finally:
+                if not cleanup:
+                    self.budget.used[phase] += self.clock() - start
 
     def operational(self, container, mode, context=None, target=None, phase='probe', seconds=3):
         out = self.command(exec_argv(container, mode, context, target), phase, seconds)
@@ -259,7 +277,14 @@ class Harness:
             self.budget.used['ready'] += self.clock() - start
 
     def release(self, container):
-        self.operational(container, 'release', phase='restart')
+        # A holder exit is legal only after deliberate release starts.
+        self.check_work()
+        self.holder.alive()
+        self.releasing = True
+        try:
+            self.operational(container, 'release', phase='restart')
+        finally:
+            self.releasing = False
         start = self.clock()
         deadline = min(self.budget.deadline('restart', 5), self.holder.deadline)
         while True:
@@ -271,6 +296,10 @@ class Harness:
                 self.budget.used['restart'] += self.clock() - start
                 return
             time.sleep(.01)
+
+    def release_and_restart(self, container, role, public_context):
+        self.release(container)
+        self.operational(container, 'restart-' + role, public_context, phase='restart', seconds=5)
 
     def inspection(self, container, cleanup=False):
         out = self.command(['docker', 'inspect', container], 'evidence', cleanup=cleanup)
@@ -377,7 +406,8 @@ class Harness:
         try:
             self.qualify()
         except Exception as error:
-            self.fail(error)
+            if self.first is None:
+                self.fail(error)
         finally:
             self.cleanup()
         self.record('result', first_failure=self.first, secondary=self.secondary,
@@ -466,8 +496,7 @@ class Harness:
             self.operational(container, 'deny-build', target=target)
             if node == 'founder':
                 self.operational(container, 'same-uid-control', public_context)
-            self.release(container)
-            self.operational(container, 'restart-' + role, public_context, phase='restart', seconds=5)
+            self.release_and_restart(container, role, public_context)
             self.remove_node(container)
 
 
