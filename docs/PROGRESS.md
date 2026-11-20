@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 19:01 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 19:23 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,14 +17,16 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `c10fff18` (PR204), push CI 44796954728 **red**: Ubuntu Rust job
-  136498866204 failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
-  (`Err("receiver reservation")`). The fixture binds hard-coded loopback ports
-  43181–43188, inside Linux's ephemeral range; a concurrent bind is the likely cause
-  (unconfirmed). Not touched by PR204. No rerun; a test-fixture-only repair PR
-  (ephemeral ports, Sol 6.2/high, fresh 3) is in progress, and merges wait for green
-  main. Previous main `5f95238c` (PR202) push CI 44795394326 green; `cc553586`
-  (PR203) push CI 44791739561 green.
+- **Main:** `26704348` (PR206), push CI 44800339696 green. Previous main
+  `c10fff18` (PR204) push CI 44796954728 was **red**: Ubuntu Rust job 136498866204
+  failed `peer_transport::tests::rpc_learner_a_once` in fixture setup
+  (`Err("receiver reservation")`) binding hard-coded loopback port 43186, inside
+  Linux's ephemeral range; collision likely, exact conflict unconfirmed (the fixture
+  discarded the OS error). Not touched by PR204. No rerun. Repair PR206 (Sol
+  6.2/high, attempt 1/3, test fixture only: OS-assigned ports, all evidence oracles
+  kept; review PASS, status 59504632914) merged as the red-main repair, like PR194.
+  `5f95238c` (PR202) push CI 44795394326 and `cc553586` (PR203) push CI 44791739561
+  were green.
 - **Merged this session, in order:** PR192 `92003177` (cfg(test) founder
   commit/apply/reply trace), PR194 `76a8bc68` (Windows-only nextest group capping
   e6/e7/executor service tests at two; ADR 0036; e7-family mitigation, fix
@@ -42,11 +44,13 @@ merged, as listed under "Merged this session".
   retained bound-start ownership), PR203 `cc553586` (docs: owner process rules,
   Sol 6.2 routing, D3/D4), PR202 `5f95238c` (step 5b, ordinary CI test of the real
   Engine start/close), PR204 `c10fff18` (step 7a, closed same-connection
-  enrollment protocol). Every merge had an independent exact-head Sol
+  enrollment protocol), PR206 `26704348` (test fixture: ephemeral ports for the
+  peer learner tests). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
-  merge; green main was rechecked immediately before each merge except PR194, the
-  mitigation merged with green PR gates while main at `92003177` was red (its first
-  main push run 44608721122 restored green).
+  merge; green main was rechecked immediately before each merge except the two red-main repairs:
+  PR194, merged with green PR gates while main at `92003177` was red (its first main
+  push run 44608721122 restored green), and PR206 (main `c10fff18` red; push run
+  44800339696 restored green).
 - **Open failures (cause unknown, traces now on main):** Windows founder
   five-second deadline refusals (last seen PR191 CI 44591771802; clean since in
   PR192/PR189 runs). Windows e7 service timeouts (main CI 44599348252 A8;
@@ -330,7 +334,14 @@ merged, as listed under "Merged this session".
   and preserve the first frozen-path refusal. This grants no repair, diagnostic rerun
   or Windows founder run." Enumerated: O1 one Linux-only integrated positive test; O2
   optional up to four Linux-only clock-site tests, each named in the PR. Sol 6.2/high
-  builder, fresh 3-attempt budget, in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
+  builder, fresh 3-attempt budget: PR #207 `94bbc9e7` (attempt 1/3 was a Linux
+  cross-build invocation error). Hosted CI 44799670866 green on all platforms; O1
+  `bound_start_founder_publishes_attaches_and_closes` ran once on Ubuntu and passed
+  (0.152 s); no O2 tests (clock sites covered without Engine); no frozen-path refusal.
+  Review HOLD on one P2 (`D:/Temp/arx-pr207-review/review.md`, SHA256
+  `e36768c0…afaf`): founder custody compared private roots with the workspace by path
+  prefix only, so a mount alias could put wrapping material in the workspace. Builder
+  attempt 2/3 in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
