@@ -2,12 +2,13 @@ use super::{csr::ProvenCsr, node_uri};
 use crate::cluster::consensus::issue::{IssueError, LeafSubject};
 use rcgen::{
     CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, SanType, SerialNumber,
+    KeyUsagePurpose, PublicKeyData, SanType, SerialNumber,
 };
 use time::OffsetDateTime;
 pub struct ClusterCa {
     issuer: Issuer<'static, KeyPair>,
     cert_der: Vec<u8>,
+    not_before_s: i64,
     not_after_s: i64,
     #[cfg(test)]
     pub(crate) signs: std::sync::atomic::AtomicUsize,
@@ -15,6 +16,118 @@ pub struct ClusterCa {
     conversion_attempts: std::sync::atomic::AtomicUsize,
 }
 impl ClusterCa {
+    pub(super) fn generate(now_ms: u64) -> Result<(Self, Vec<u8>), super::custody::Error> {
+        use super::custody::Error;
+        if now_ms > crate::cluster::enrollment::MAX_TIME_MS {
+            return Err(Error::Clock);
+        }
+        let t = i64::try_from(now_ms / 1000).map_err(|_| Error::Clock)?;
+        let nb = t.checked_sub(120).ok_or(Error::Clock)?;
+        let na = t.checked_add(31_536_000).ok_or(Error::Clock)?;
+        let mut params = CertificateParams::default();
+        params.not_before = OffsetDateTime::from_unix_timestamp(nb).map_err(|_| Error::Clock)?;
+        params.not_after = OffsetDateTime::from_unix_timestamp(na).map_err(|_| Error::Clock)?;
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Arxcovo cluster CA");
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .map_err(|_| Error::Unavailable)?;
+        let der = params
+            .self_signed(&key)
+            .map_err(|_| Error::Unavailable)?
+            .der()
+            .to_vec();
+        let private = key.serialize_der();
+        let ca = Self::load(
+            &private,
+            &der,
+            fingerprint_of(&der),
+            fingerprint_of(&key.subject_public_key_info()),
+            now_ms,
+        )?;
+        Ok((ca, private))
+    }
+    pub(super) fn spki_digest(&self) -> Result<[u8; 32], super::custody::Error> {
+        Ok(fingerprint_of(&self.issuer.key().subject_public_key_info()))
+    }
+    pub(super) fn load(
+        key: &[u8],
+        der: &[u8],
+        root: [u8; 32],
+        spki: [u8; 32],
+        now_ms: u64,
+    ) -> Result<Self, super::custody::Error> {
+        use super::custody::Error;
+        use x509_parser::prelude::*;
+        if now_ms > crate::cluster::enrollment::MAX_TIME_MS {
+            return Err(Error::Clock);
+        }
+        if der.is_empty() || der.len() > 4096 || fingerprint_of(der) != root {
+            return Err(Error::Context);
+        }
+        let (rest, cert) = X509Certificate::from_der(der).map_err(|_| Error::Corrupt)?;
+        let bc = cert
+            .basic_constraints()
+            .map_err(|_| Error::Corrupt)?
+            .ok_or(Error::Corrupt)?;
+        let ku = cert
+            .key_usage()
+            .map_err(|_| Error::Corrupt)?
+            .ok_or(Error::Corrupt)?;
+        let alg = &cert.public_key().algorithm;
+        if !rest.is_empty()
+            || cert.subject() != cert.issuer()
+            || !bc.value.ca
+            || bc.value.path_len_constraint != Some(0)
+            || ku.value.flags != 0x60
+            || cert.signature_algorithm.algorithm.to_id_string() != "1.2.840.10045.4.3.2"
+            || cert.signature_algorithm.parameters.is_some()
+            || cert.tbs_certificate.signature != cert.signature_algorithm
+            || alg.algorithm.to_id_string() != "1.2.840.10045.2.1"
+            || alg
+                .parameters
+                .as_ref()
+                .and_then(|p| p.as_oid().ok())
+                .is_none_or(|o| o.to_id_string() != "1.2.840.10045.3.1.7")
+            || cert
+                .subject_alternative_name()
+                .map_err(|_| Error::Corrupt)?
+                .is_some()
+        {
+            return Err(Error::Corrupt);
+        }
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            &cert.public_key().subject_public_key.data,
+        )
+        .verify(cert.tbs_certificate.as_ref(), &cert.signature_value.data)
+        .map_err(|_| Error::Corrupt)?;
+        let key = super::custody::parse_key(key)?;
+        if key.subject_public_key_info() != cert.public_key().raw
+            || fingerprint_of(cert.public_key().raw) != spki
+        {
+            return Err(Error::KeyMismatch);
+        }
+        let not_before_s = cert.validity().not_before.timestamp();
+        let not_after_s = cert.validity().not_after.timestamp();
+        let ca = Self {
+            issuer: Issuer::from_ca_cert_der(&der.into(), key).map_err(|_| Error::Corrupt)?,
+            cert_der: der.to_vec(),
+            not_before_s,
+            not_after_s,
+            #[cfg(test)]
+            signs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            conversion_attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        if !ca.leaf_fits(now_ms) {
+            return Err(Error::CaExpiring);
+        }
+        Ok(ca)
+    }
     #[cfg(test)]
     pub fn ephemeral(cluster: crate::cluster::enrollment::ClusterId, now_ms: u64) -> Self {
         Self::ephemeral_with_validity(cluster, now_ms, 31 * 86400)
@@ -40,6 +153,7 @@ impl ClusterCa {
         Self {
             issuer: Issuer::new(params, key),
             cert_der,
+            not_before_s: nb,
             not_after_s: nb + validity_s,
             signs: std::sync::atomic::AtomicUsize::new(0),
             conversion_attempts: std::sync::atomic::AtomicUsize::new(0),
@@ -54,7 +168,8 @@ impl ClusterCa {
         Ok((nb, na))
     }
     pub fn leaf_fits(&self, now_ms: u64) -> bool {
-        Self::leaf_validity(now_ms).is_ok_and(|(_, na)| na <= self.not_after_s)
+        Self::leaf_validity(now_ms)
+            .is_ok_and(|(nb, na)| nb >= self.not_before_s && na <= self.not_after_s)
     }
     pub fn fingerprint(&self) -> crate::cluster::enrollment::CaFingerprint {
         fingerprint_of(&self.cert_der)

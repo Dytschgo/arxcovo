@@ -1,7 +1,8 @@
-//! Bounded proof of possession and test-only certificate issuance; no transport.
+//! Bounded proof of possession, certificate issuance and private acceptance custody.
 #![allow(dead_code)]
 pub(super) mod ca;
 pub(super) mod csr;
+mod custody;
 #[cfg(test)]
 mod tests;
 use super::enrollment::{ClusterId, NodeId};

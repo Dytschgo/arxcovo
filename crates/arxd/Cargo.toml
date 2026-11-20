@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ring = "=0.17.14"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }
