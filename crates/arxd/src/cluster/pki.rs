@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 pub(super) mod ca;
 pub(super) mod csr;
-mod custody;
+pub(super) mod custody;
 #[cfg(test)]
 mod tests;
 use super::enrollment::{ClusterId, NodeId};

@@ -143,6 +143,29 @@ PR188 as the last merge, that is superseded by this summary.
   64 MiB loop-mounted ext4 fixture (sudo on the GitHub-hosted runner only, never
   the owner PC; stop if unavailable), a two-line module declaration exception, and
   one Linux-only CI step in the existing Rust worker.
+- **M3 step 4a, credential publication storage (this PR):** Sol 6.1/high design
+  `D:/Temp/arx-m3-step4/design.md` (SHA256 `7bae5123…a701ee`); independent review GO with
+  required changes and a builder brief (`D:/Temp/arx-m3-step4-review/review.md`, SHA256
+  `3156f2c8…dd0a`). Coordinator decisions: adopt D2 (incomplete founding is terminal:
+  durable zero-length identity reservation before issuer entry, IncompleteIssuance or
+  Unconfirmed status, no retry, salvage, reset, rebind or orphan deletion); split step 4
+  into 4a storage (this PR, outside Engine/founder/consensus), 4b founder publication
+  (with steps 5/6, D6 boundary, owner authority needed before crossing) and 4c join
+  publication (with steps 7/8); Linux-first with explicit non-Linux refusal, Windows
+  durability as a later 4a-W; trusted restart-history source deferred to before the
+  three-container restart test; no power-loss experiments on the owner PC. First builder
+  stopped 3/3 at `f3d492d0` (a test expected `sealed-key` instead of `member-key`). Fresh
+  stuck-rule review (`D:/Temp/arx-m3-step4a-stuck/review.md`, SHA256 `c4c9cdcc…e2b6`)
+  added three P2 findings. **Owner authorization (2026-11-20):** new scoped builder,
+  fresh 3 attempts; used 0/3, head `ae36438e`; report `D:/Temp/arx-m3-step4a-2/report.md`
+  SHA256 `06d7ebdc…1d56`: 48 Windows tests pass (publication 1, PKI 38, receipt 4,
+  startup 5); Linux compile and runtime via hosted CI. Exact-head review pending.
+- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route and
+  ancestor checks) implemented and validated on the runner; preflight then refused the
+  uutils multicall `mkdir` (116 links). Amendment A2 (closed role-to-target map, ancestor
+  checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
+  in one run) independently reviewed GO with required changes and committed to the pins.
+  The fourth builder has one attempt left.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths

@@ -856,3 +856,49 @@ mod files {
         assert!(Custody::open_existing(&a, &b, id).is_ok());
     }
 }
+
+/// Mechanism-only synthetic issuer fixture. Never actual Found/Redeem provenance.
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) fn publication_fixture(
+    base: &std::path::Path,
+) -> (
+    super::linux::Custody,
+    [u8; 16],
+    Vec<u8>,
+    Vec<u8>,
+    crate::cluster::join_receipt::ExpectedIdentity,
+) {
+    use crate::cluster::{
+        enrollment::KeyDigest,
+        join_receipt::{ExpectedIdentity, Origin},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let wrap = base.join("wrap");
+    let store = base.join("custody");
+    for p in [&wrap, &store] {
+        fs::create_dir(p).unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut owner = super::linux::Custody::create_fresh_installation(&wrap, &store).unwrap();
+    let ca = owner.create_founder_ca([1; 16], Some(NOW)).unwrap();
+    let (member, csr) = owner
+        .create_member([1; 16], ca.fingerprint(), false)
+        .unwrap();
+    let csr = ProvenCsr::parse(&csr).unwrap();
+    let ticket = crate::cluster::consensus::issue::test_ticket(csr.digest());
+    let leaf = ca.sign_leaf(&ticket, &csr, NOW).unwrap();
+    let expected = ExpectedIdentity {
+        cluster: [1; 16],
+        node: ticket.node(),
+        key: KeyDigest::of_spki(&member.key.subject_public_key_info()).unwrap(),
+        ca: ca.fingerprint(),
+        origin: Origin::Redeem {
+            term: 2,
+            leader: 1,
+            index: 3,
+            anchors: vec![(1, [7; 32])],
+        },
+    };
+    let install = member.context.install;
+    (owner, install, ca.cert_der().to_vec(), leaf, expected)
+}

@@ -5,7 +5,6 @@
 use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
-    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -158,6 +157,51 @@ impl Guard {
         self.recheck()?;
         self.file.try_clone().map_err(|_| Refusal::Unavailable)
     }
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+    pub(super) fn created(path: PathBuf, file: File) -> Result<Self> {
+        let id = object(&file)?;
+        let guard = Self { path, file, id };
+        guard.recheck()?;
+        crate::security::private(&guard.path).map_err(|_| Refusal::Layout)?;
+        Ok(guard)
+    }
+    pub(super) fn rename_to(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+    pub(super) fn read_at(&self, max: u64) -> Result<Vec<u8>> {
+        let len = self.file.metadata().map_err(|_| Refusal::Layout)?.len();
+        if len > max {
+            return Err(Refusal::Identity);
+        }
+        let mut bytes = vec![0; len as usize];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file
+                .read_exact_at(&mut bytes, 0)
+                .map_err(|_| Refusal::Layout)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let n = self
+                    .file
+                    .seek_read(&mut bytes[offset..], offset as u64)
+                    .map_err(|_| Refusal::Layout)?;
+                if n == 0 {
+                    return Err(Refusal::Layout);
+                }
+                offset += n;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        return Err(Refusal::Unavailable);
+        Ok(bytes)
+    }
     fn open(path: &Path, directory: bool, private: bool) -> Result<Self> {
         crate::config::checked_path(path).map_err(|_| Refusal::Layout)?;
         if private {
@@ -175,7 +219,7 @@ impl Guard {
             id,
         })
     }
-    fn recheck(&self) -> Result<()> {
+    pub(super) fn recheck(&self) -> Result<()> {
         let other = Self::open(
             &self.path,
             self.file.metadata().map_err(|_| Refusal::Layout)?.is_dir(),
@@ -193,6 +237,7 @@ pub(super) struct Owner {
     // The real OS lock remains held until this object is dropped.
     lock: File,
     entries: Vec<String>,
+    pub(super) publication: super::issuance_publication::Attempt,
     pub(super) bound_attempt: super::bound_open::BoundAttempt,
 }
 const STATE: &[&str] = &[
@@ -335,6 +380,7 @@ impl Owner {
             guards,
             lock,
             entries,
+            publication: Default::default(),
             bound_attempt: super::bound_open::BoundAttempt::Ready,
         };
         owner.recheck()?;
@@ -377,6 +423,29 @@ impl Owner {
             return Err(Refusal::Layout);
         }
         Ok(())
+    }
+    /// Original identities only; live store ownership composition remains deferred.
+    pub(super) fn publication_originals(&self) -> Result<()> {
+        for g in &self.guards {
+            g.recheck()?;
+        }
+        for p in [&self.plan.credentials, &self.plan.state, &self.plan.config] {
+            crate::security::private(p).map_err(|_| Refusal::Layout)?;
+        }
+        Ok(())
+    }
+    pub(super) fn publication_directory(&self) -> Result<File> {
+        self.guards
+            .iter()
+            .find(|g| g.path == self.plan.credentials)
+            .ok_or(Refusal::Layout)?
+            .bound_duplicate()
+    }
+    pub(super) fn publication_capacity(&mut self) {
+        self.guards.reserve(3);
+    }
+    pub(super) fn publication_install(&mut self, delta: &mut Vec<Guard>) {
+        self.guards.append(delta);
     }
     pub(super) fn inspect_validate(&self) -> Result<()> {
         self.recheck()?;
@@ -632,15 +701,8 @@ impl Owner {
             .find(|g| g.path == path)
             .ok_or(Refusal::Identity)?;
         g.recheck()?;
-        let mut file = g.file.try_clone().map_err(|_| Refusal::Layout)?;
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(max + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Refusal::Layout)?;
-        if bytes.len() as u64 > max {
-            return Err(Refusal::Identity);
-        }
+        let bytes = g.read_at(max)?;
+        g.recheck()?;
         Ok(bytes)
     }
 }
@@ -781,6 +843,27 @@ pub(in crate::cluster) mod tests {
             all.sort();
             all
         }
+    }
+    #[test]
+    fn retained_reads_have_independent_offsets() {
+        let l = Layout::new();
+        // Inventory-only fixture; these are not claimed as valid SQLite stores.
+        for name in [
+            "cluster-owner.lock",
+            "cluster-state.lock",
+            "cluster-log.lock",
+            "cluster-state.sqlite3",
+            "cluster-log.sqlite3",
+        ] {
+            l.write(&format!("state/{name}"), b"");
+        }
+        l.write("credentials/identity.json", b"receipt");
+        l.write("credentials/ca.der", b"root");
+        l.write("credentials/member-key", b"sealed");
+        let owner = Owner::acquire(l.plan("recover-joiner")).unwrap();
+        assert_eq!(owner.read("identity.json", 16).unwrap(), b"receipt");
+        assert_eq!(owner.read("identity.json", 16).unwrap(), b"receipt");
+        assert!(owner.read("identity.json", 2).is_err());
     }
     #[test]
     fn strict_plan_and_endpoints() {

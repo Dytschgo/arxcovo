@@ -9,7 +9,7 @@ mod codec;
 mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Error {
+pub(in crate::cluster) enum Error {
     Unqualified,
     Layout,
     Ownership,
@@ -276,7 +276,7 @@ mod linux {
             Ok(names)
         }
     }
-    pub(super) struct Custody {
+    pub(in crate::cluster) struct Custody {
         wrap: Root,
         store: Root,
         lock: File,
@@ -287,6 +287,108 @@ mod linux {
         pub(super) fail_at: Option<usize>,
         #[cfg(test)]
         pub(super) effects: usize,
+    }
+    /// Retains the original staging object and custody lock by borrowing its owner.
+    pub(in crate::cluster) struct MemberCopy<'a> {
+        owner: &'a Custody,
+        source: File,
+        bytes: Vec<u8>,
+        context: Context,
+    }
+    impl MemberCopy<'_> {
+        #[cfg(test)]
+        pub(in crate::cluster) fn prove_possession(&self) {
+            use ring::signature::{
+                ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _,
+                UnparsedPublicKey,
+            };
+            let payload = codec::open(&self.owner.key, self.context, &self.bytes).unwrap();
+            let (key, _) = codec::parts(Kind::Member, &payload.0).unwrap();
+            let rng = ring::rand::SystemRandom::new();
+            let signer =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key, &rng).unwrap();
+            let sig = signer.sign(&rng, b"publication possession").unwrap();
+            UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, signer.public_key().as_ref())
+                .verify(b"publication possession", sig.as_ref())
+                .unwrap();
+        }
+        pub(in crate::cluster) fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub(in crate::cluster) fn validate(
+            &self,
+            expected: &crate::cluster::join_receipt::ExpectedIdentity,
+            installation: [u8; 16],
+            root: &[u8],
+            leaf: &[u8],
+            now: Option<u64>,
+            destination: &Path,
+            state: &Path,
+            workspace: &Path,
+        ) -> Result<(), Error> {
+            for private in [&self.owner.wrap.path, &self.owner.store.path] {
+                for other in [destination, state, workspace] {
+                    if private.starts_with(other) || other.starts_with(private) {
+                        return Err(Error::Layout);
+                    }
+                }
+            }
+            self.owner.common_context(expected.cluster, expected.ca)?;
+            let current = self.owner.store.file("member-key", false)?;
+            if !same(
+                &self.source.metadata().map_err(|_| Error::Layout)?,
+                &current.metadata().map_err(|_| Error::Layout)?,
+            ) || self.owner.store.read("member-key", 16384)? != self.bytes
+                || self.context.install != installation
+                || self.context.cluster != expected.cluster
+                || self.context.root != expected.ca
+                || self.context.spki != *expected.key.as_bytes()
+            {
+                return Err(Error::Context);
+            }
+            self.validate_bytes(&self.bytes, expected, root, leaf, now)
+        }
+        pub(in crate::cluster) fn validate_bytes(
+            &self,
+            bytes: &[u8],
+            expected: &crate::cluster::join_receipt::ExpectedIdentity,
+            root: &[u8],
+            leaf: &[u8],
+            now: Option<u64>,
+        ) -> Result<(), Error> {
+            if bytes != self.bytes {
+                return Err(Error::Corrupt);
+            }
+            let member = MemberKey::from_payload(
+                self.context,
+                &codec::open(&self.owner.key, self.context, bytes)?.0,
+            )?;
+            member.check_leaf(expected.node, root, leaf, now)
+        }
+    }
+    pub(in crate::cluster) fn member_copy(owner: &Custody) -> Result<MemberCopy<'_>, Error> {
+        owner.inventory()?;
+        let source = owner.store.file("member-key", false)?;
+        let bytes = owner.store.read("member-key", 16384)?;
+        let (context, _) = codec::frame(&bytes)?;
+        if context.kind != Kind::Member {
+            return Err(Error::Context);
+        }
+        let copy = MemberCopy {
+            owner,
+            source,
+            bytes,
+            context,
+        };
+        let current = owner.store.file("member-key", false)?;
+        if !same(
+            &copy.source.metadata().map_err(|_| Error::Layout)?,
+            &current.metadata().map_err(|_| Error::Layout)?,
+        ) {
+            return Err(Error::Ownership);
+        }
+        Ok(copy)
     }
     impl Drop for Custody {
         fn drop(&mut self) {
@@ -612,3 +714,11 @@ mod linux {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) use linux::MemberCopy;
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) use linux::member_copy;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) use tests::publication_fixture;
