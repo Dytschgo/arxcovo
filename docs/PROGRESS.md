@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 21:29 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-20 22:21 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,8 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
+- **Main:** `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
+  44822884767 green. `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
   44813492071 green. `9bfaedb5` (PR208) push CI 44809310046 was **red**: Ubuntu Rust
   job 136541460939 failed `issuance_publication::tests::files::publication_wrong_context_and_origin`
   (tests.rs:500). Its negative-mutation loop wrote a fixed byte 99 into the
@@ -59,7 +60,8 @@ merged, as listed under "Merged this session".
   publication and attach), PR205 `2fde0f0b` (docs), PR208 `9bfaedb5` (step 7b,
   enrollment through the actual issuer), PR209 `620a5254` (test: publication mutations
   always change the value), PR210 `60ffb68a` (step 8a codec-only: one-paste transfer
-  and owner-boundary refusals). Every merge had an independent exact-head Sol
+  and owner-boundary refusals), PR211 `29e718c6` (docs), PR212 `e342fbf3` (step 8b,
+  retained durable join before replication). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -410,8 +412,49 @@ merged, as listed under "Merged this session".
   new host runs no Engine. Permit only the named Mint, AnchorQuery and Redeem
   invocations on the issuer. Do not modify Engine, Owners, found, issue, anchor_query
   internals or their deadlines. No Windows founding run. Preserve the first frozen-path
-  refusal, with no repair, re-run or budget reset." Sol 6.2/high builder, fresh
-  3-attempt budget, in progress. Engine Sol 3/3 and Opus 0/2 unchanged.
+  refusal, with no repair, re-run or budget reset." The Sol 6.2/high builder first
+  stopped at the source fence (0/3): the reviewed 7a client sent Redeem right after the
+  anchor check, the retained issuer was private to frozen `bound_start`, and J3 would
+  need a second Mint. **Coordinator amendments (2026-11-20):** A2, a one-shot verified
+  client continuation in `pki/preproof.rs` (`exchange` becomes a wrapper; the
+  pending-frame check runs immediately before Redeem; dropping the handle sends no
+  Redeem); A3, a `cfg(test)`-only issuer driver inside `bound_start` with no production
+  change and the O1/P1 bodies unchanged; J3 decision, no second Mint, so the lost reply
+  runs non-Engine against the 7a synthetic backend and real-issuer lost-reply
+  allocation stays uncovered. **PR #212 merged** as `e342fbf3`, builder 0/3 counted
+  (report `D:/Temp/arx-m3-step8b/report.md` SHA256 `fac47e56…07d2`). The coordinator merged main
+  into the branch (`891c8165`, byte-identical patch) and cancelled the superseded run
+  44822992515 on `29b11aed` before it finished; no observation is credited from it.
+  Hosted run 44823213669: J1+J2 `retained_issuer_durable_join_and_consumed_code_refusals`
+  passed (0.151 s; both J2 refusals expected) and J3
+  `lost_reply_retains_reservation_and_original_lock_without_resubmission` passed
+  (0.037 s); no unexpected frozen-path refusal. Review PASS with zero findings
+  (`D:/Temp/arx-pr212-review/review.md`, SHA256 `c670a285…5dad`), agent-review status
+  59517346234. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **Steps 9–12 plan:** Sol 6.2/high design `D:/Temp/arx-m3-steps9to12/plan.md` (SHA256
+  `cae3098f…4b2d`): order 9 catch-up → 10 self-admission → 11 promotion → 12 CA transfer, one PR
+  each, all four crossing D6; new owner decisions D8 (learner restart trust), D9
+  (issuer peer endpoint for self-admission), D10 (exact initial joint transition) and
+  D11 (CA channel and receiver custody). Independent design review GO WITH REQUIRED
+  CHANGES (`D:/Temp/arx-m3-steps9to12-review/review.md`, SHA256 `3173b156…29c6`); the coordinator
+  adopted its blockers B1–B2 and required changes R1–R3 verbatim in
+  `D:/Temp/arx-m3-steps9to12/plan-amendments.md` (SHA256 `d374550b…21da`), with a revised step 9
+  grant.
+- **Step 9 (owner grant, 2026-11-20):** "Authorize the step 9 source fence for the new
+  retained published-learner start and strict RecoverJoiner caller, plus one
+  cluster-private, side-effect-free StateStore health accessor in cluster/state_store.rs
+  that reads only the existing poison latch, and one C9 hosted-Linux case with four
+  retained Engine starts and owned closes, one unchanged Found, two fixture Mints, two
+  actual AnchorQuery/Redeem exchanges, two data-bearing Appends plus one strict
+  heartbeat, one issuer snapshot trigger, one image retrieval and one full-snapshot
+  transfer, and zero membership mutations after Found initialization. Keep existing
+  startup and shutdown sequencing, Engine, Owners, store write paths and internals,
+  founder and issuance internals and deadlines frozen. Stop and preserve the first
+  unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or
+  budget reset." **D8 (owner, 2026-11-20):** same-process clean owned-job reopen only
+  for step 9; authenticated cross-process restart history is settled and reviewed at
+  step 13 before any process-restart claim. Sol 6.2/high builder, fresh 3-attempt
+  budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
