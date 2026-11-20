@@ -219,6 +219,29 @@ PR188 as the last merge, that is superseded by this summary.
   budget first makes the preflight report the failing tool and rule (sanitized),
   fixes the parser, then fixes the ownership cause only within a safe rule, and
   stops and reports if the hosted runner cannot qualify.
+- **Custody 3b (#199) update:** amendment A1 (exact sudo-rs target with full route and
+  ancestor checks) implemented and validated on the runner; preflight then refused the
+  uutils multicall `mkdir` (116 links). Amendment A2 (closed role-to-target map, ancestor
+  checks plus verified `protected_hardlinks=1`, dispatch preserved, all refusals reported
+  in one run) independently reviewed GO with required changes and committed to the pins.
+  The fourth builder has one attempt left.
+- **M3 step 5a, retained bound-start ownership (PR #201):** crosses the recorded D6
+  hold (Engine fix counters Sol 3/3 and Opus 0/2 exhausted). Sol 6.1/high design
+  `D:/Temp/arx-m3-step5/design.md` (SHA256 `a357af50…767f`). **Owner authorization
+  (2026-11-20), 5a only:** source-only plumbing (single forward-only bound
+  inspection-to-start acquisition, one-time store transfer into unchanged
+  adapters/Engine, real retained outer job/observer contract; terminal Inspect/Complete
+  preserved; no Owner reset); local execution limited to non-Engine tests plus static
+  checks; no local real-Engine run, no Engine or founder repair; any fix budget covers
+  only the new source; step 5b (one nominal Engine start/close observation) is a
+  separate later request. Independent design review GO with required changes
+  (`D:/Temp/arx-m3-step5-review/review.md`, SHA256 `00845c86…b81`: close stays
+  process-owned after observer cancellation, shutdown runs once, failed/uncertain
+  results preserved). Sol 6.1/high builder used 2/3 on the new source, head
+  `4f728e49`; report `D:/Temp/arx-m3-step5a/report.md` SHA256 `b3ae8423…d70`: 67 tests
+  pass (bound_start 9, bound_open 30, startup_recovery 23, startup_plan 5); static gate,
+  fmt, Clippy, loader and SQLite controls pass. consensus.rs changes only by one module
+  declaration; no frozen function touched. Exact-head review pending.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
