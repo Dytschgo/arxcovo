@@ -4247,3 +4247,131 @@ fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed()
         Err(verify::VerifyRefusal::Unavailable)
     );
 }
+
+#[tokio::test]
+async fn learner_ballots_refuse_bound_founder_below_e_and_dispatch_after_e() {
+    use crate::cluster::{
+        enrollment::{BoundVoters, JoinCode},
+        membership::Membership as WireMembership,
+    };
+
+    let f = Fixture::new();
+    let dir = private_temp();
+    let mut store = StateStore::open(
+        dir.path(),
+        Init {
+            cluster: CLUSTER,
+            first_free: node(2),
+        },
+    )
+    .unwrap();
+    let pos = |index| LogPos {
+        term: 1,
+        leader: 1,
+        index,
+    };
+    let members = Members::new(
+        vec![[1].into_iter().collect()],
+        BTreeMap::from([(1, openraft::BasicNode::new("192.168.0.1:7001"))]),
+    )
+    .unwrap();
+    let membership = super::super::encode(&members).unwrap();
+    let voters = WireMembership::decode(membership.bytes()).unwrap();
+    store
+        .apply(pos(0), &StoredEntry::Membership(membership))
+        .unwrap();
+    assert!(matches!(
+        store.apply(
+            pos(1),
+            &StoredEntry::Enrollment(Command::Found {
+                cluster: CLUSTER,
+                members: FoundMembers::new([(node(1), f.client.digest())]).unwrap(),
+                proposed_at_ms: 100,
+            })
+        ),
+        Ok(Some(Outcome::Founded { replay: false }))
+    ));
+    let anchor = BoundVoters::observe(store.state(), &voters)
+        .unwrap()
+        .anchor(CLUSTER);
+    let code = JoinCode::generate(CLUSTER, [4; 32], anchor, getrandom::fill).unwrap();
+    assert!(matches!(
+        store.apply(
+            pos(2),
+            &StoredEntry::Enrollment(Command::Mint {
+                cluster: CLUSTER,
+                actor: [3; 16],
+                request: [4; 16],
+                code: code.code_id(),
+                verifier: code.verifier(),
+                proposed_at_ms: 101,
+            })
+        ),
+        Ok(Some(Outcome::Minted { replay: false, .. }))
+    ));
+    assert_eq!(store.applied(), Some(pos(2)));
+    assert_eq!(
+        store
+            .state()
+            .authorize_peer(CLUSTER, node(1), f.client.digest()),
+        Ok(())
+    );
+    assert_eq!(
+        store
+            .state()
+            .authorize_peer(CLUSTER, node(2), f.server.digest()),
+        Err(crate::cluster::enrollment::PeerRefusal::NotMember)
+    );
+
+    let sm = SmAdapter(Arc::new(Mutex::new(store)));
+    let learner = learner_image(&f, 3, true, &sm);
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Bootstrap));
+    let spy = rpc_spy(false);
+    let (mut owner, address) = listen_learner_for_test(&f, &sm, learner.clone(), spy.clone()).await;
+    let mut rx = events(&owner);
+    let config = f.client_config(&f.client, 2);
+    let ballots = [
+        peer_wire::Kind::VoteRequest,
+        peer_wire::Kind::PreVoteRequest,
+    ]
+    .map(|kind| peer_wire::encode_vote(route(), kind, &ballot_request()).unwrap());
+    for frame in &ballots {
+        assert!(
+            exchange_learner_for_test(address, config.clone(), frame)
+                .await
+                .is_err()
+        );
+        assert!(observe(&mut rx, Event::Stage(Stage::ServerAuthenticated)).await);
+        assert!(observe(&mut rx, Event::Finished(Some(Refusal::Identity))).await);
+    }
+    assert!(spy.calls.lock().unwrap().is_empty());
+
+    {
+        let mut store = sm.0.lock().unwrap();
+        let redeem = Command::redeem(
+            CLUSTER,
+            [5; 16],
+            code.code_id(),
+            &code.proof(),
+            f.server.digest(),
+            anchor,
+            102,
+        );
+        assert!(matches!(
+            store.apply(pos(3), &StoredEntry::Enrollment(redeem)),
+            Ok(Some(Outcome::Enrolled(_)))
+        ));
+        store.apply(pos(4), &StoredEntry::Blank).unwrap();
+    }
+    assert_eq!(learner.phase(), Ok(peer_registry::Phase::Strict));
+    for frame in &ballots {
+        assert!(
+            exchange_learner_for_test(address, config.clone(), frame)
+                .await
+                .is_ok()
+        );
+        assert!(observe(&mut rx, Event::LearnerDispatch(peer_registry::Lane::Strict)).await);
+    }
+    assert_eq!(spy.calls.lock().unwrap().as_slice(), &ballots);
+    assert!(bounded_close(&mut owner).await.is_ok());
+}

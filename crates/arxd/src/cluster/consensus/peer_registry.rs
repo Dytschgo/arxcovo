@@ -140,10 +140,10 @@ impl LearnerGate {
         cluster: crate::cluster::enrollment::ClusterId,
         node: crate::cluster::enrollment::NodeId,
         key: crate::cluster::enrollment::KeyDigest,
-        receipt_method: bool,
+        bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
         self.observe(|store, phase| {
-            if phase == Phase::Refused {
+            if phase == Phase::Refused || (phase == Phase::Bootstrap && !bootstrap_allowed) {
                 return Err(VerifyRefusal::Unavailable);
             }
             match store.state().authorize_peer(cluster, node, key) {
@@ -153,7 +153,6 @@ impl LearnerGate {
                 Err(PeerRefusal::NotMember) => {
                     use crate::cluster::join_receipt::Origin;
                     if self.receipt
-                        && receipt_method
                         && phase == Phase::Bootstrap
                         && let Origin::Redeem { anchors, .. } = &self.identity.origin
                         && anchors

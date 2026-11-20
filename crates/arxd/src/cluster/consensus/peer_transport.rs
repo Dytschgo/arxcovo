@@ -631,9 +631,9 @@ async fn inbound(
         {
             return Err(Refusal::Identity);
         }
-        let receipt_method = matches!(request, Request::Append(_) | Request::Snapshot(..));
+        let bootstrap_allowed = matches!(request, Request::Append(_) | Request::Snapshot(..));
         let _lane = learner
-            .authorize(peer.0, peer.1, peer.2, receipt_method)
+            .authorize(peer.0, peer.1, peer.2, bootstrap_allowed)
             .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
         #[cfg(test)]
