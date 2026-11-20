@@ -183,9 +183,17 @@ PR188 as the last merge, that is superseded by this summary.
   in the pinned Ubuntu 24.04 image). Campaign report `D:/Temp/arx-pr199-q1/report.md`
   SHA256 `9927642c…aa8d6`. Exact-head review of `40fdbb30`
   (`D:/Temp/arx-pr199-review4/review.md`, SHA256 `0ebec5ea…ff2`): two P2 — this stale
-  record (now corrected) and missing actual scratch high-water bytes required by the
-  pins; the latter is campaign round 3. Counters: four earlier 3b builders 3/3 each;
-  Q1 2/6 rounds; Engine Sol 3/3, Opus 0/2.
+  record (corrected in a docs commit) and missing actual scratch high-water bytes
+  required by the pins. Campaign round 3 (code head `a660231e`) added the measurement
+  and requalified: all 13 cases passed again, zero refusals, launcher 8.828 s, cleanup
+  verified; task-scratch high-water 84,717,568 bytes, ext4 49,152 -> 90,112 bytes
+  peak, context 84,499,396 bytes, Docker image Size 50,089,568 bytes; updated report
+  `D:/Temp/arx-pr199-q1/report.md` SHA256 `443cf8e8…f7c8`. The review of `a660231e`
+  (`D:/Temp/arx-pr199-review5/review.md`, SHA256 `64eddd44…a2a`) closed SP4-1 and asked
+  for this record to be brought up to date. Counters: four earlier 3b builders 3/3
+  each; Q1 3/6 rounds used, stopped on qualification; Engine Sol 3/3, Opus 0/2.
+  The code under review is the round-3 head; later commits on this branch are docs
+  only.
 - **Custody 3b harness (this PR):** adopted pins committed as
   [m3-custody-hosted-pins](briefs/m3-custody-hosted-pins.md) (source SHA256
   `28f882cb…e167`; independent review `D:/Temp/arx-custody-3b-review/review.md`,
