@@ -184,6 +184,8 @@ test('Rust retains every native, Python and package validation with exact comman
         if: runner.os == 'Linux'
         timeout-minutes: 2
         shell: bash
+        env:
+          ARX_EXEC_QUALIFICATION_MODE: preflight-only
         run: python3 -I -B tools/ci/m3-containers/executor-probe.py`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
@@ -252,7 +254,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
 
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {
   assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
-  assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 1);
+  assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 2);
   assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR']);
   for (const path of ['../Cargo.toml', '../.cargo/config', '../.cargo/config.toml']) {
     const url = new URL(path, import.meta.url);

@@ -30,6 +30,79 @@ class ExecutorProbeTests(unittest.TestCase):
             self.assertIn(option, argv)
         self.assertNotIn("--property=ProtectControlGroups=yes", argv)
 
+    def test_fixture_roles_provision_and_verify_locked_resolver_compatible_accounts(self):
+        for name, uid in probe.ROLES:
+            with self.subTest(uid=uid):
+                self.assertEqual(probe.useradd_argv(name, uid), [
+                    "/usr/sbin/useradd", "--uid", str(uid), "--gid", name, "--no-create-home",
+                    "--no-log-init", "--home-dir", "/nonexistent", "--shell", "/bin/sh",
+                    "--password", "!", "--expiredate", "1970-01-02", name,
+                ])
+                user = SimpleNamespace(pw_uid=uid, pw_gid=uid, pw_shell="/bin/sh",
+                                       pw_dir="/nonexistent")
+                record = f"{name}:!:1:::::1:"
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(probe, "pwd", SimpleNamespace(getpwnam=lambda _: user), create=True))
+                    stack.enter_context(patch.object(probe, "grp", SimpleNamespace(
+                        getgrnam=lambda _: SimpleNamespace(gr_gid=uid),
+                    ), create=True))
+                    groups = stack.enter_context(patch.object(probe.os, "getgrouplist", return_value=[uid], create=True))
+                    shadow = stack.enter_context(patch.object(probe, "read", return_value=record))
+                    stack.enter_context(patch.object(probe.os.path, "lexists", return_value=False))
+                    emit = stack.enter_context(patch.object(probe, "emit"))
+                    probe.role(name, uid, report=True)
+                    emit.assert_called_once_with(
+                        "fixture-account", role="daemon" if uid == probe.DAEMON else "build",
+                        uid=uid, gid=uid, identity_matches=True, shell_matches=True,
+                        password_locked=True, login_disabled=True, home_absent=True,
+                        groups_match=True,
+                    )
+                    for mismatch in (record.replace(":!:", ":!redacted-fixture:"),
+                                     record.replace("::1:", "::2:")):
+                        shadow.return_value = mismatch
+                        with self.assertRaisesRegex(probe.Refusal, "role-changed"):
+                            probe.role(name, uid)
+                    shadow.return_value = record
+                    groups.return_value = [uid, uid + 1]
+                    with self.assertRaisesRegex(probe.Refusal, "role-changed"):
+                        probe.role(name, uid)
+                    groups.return_value = [uid]
+                    user.pw_shell = "/usr/sbin/nologin"
+                    with self.assertRaisesRegex(probe.Refusal, "role-changed"):
+                        probe.role(name, uid)
+
+    def test_only_allowlisted_broker_records_reach_the_log(self):
+        allowed = [f"ARX_EXEC_REFUSED {code}" for code in (
+            "arguments", "identity", "binary", "settings-read", "settings-decode", "layout",
+            "policy-account", "owner-policy", "runner-construction", "startup-recheck",
+            "build-account", "runtime", "signals", "membership", "hierarchy-writable-view",
+            "pre-existing-runs", "hierarchy-setup", "hierarchy-pin", "bind", "drain",
+        )] + ["ARX_EXEC_SETUP ready", "ARX_EXEC_DRAIN confirmed"]
+        unexpected = [
+            "ARX_EXEC_REFUSED free-form-error", "ARX_EXEC_REFUSED settings-read /private/path",
+            "ARX_EXEC_REFUSED configuration",
+        ]
+        with patch.object(probe, "command", return_value="\n".join(allowed)) as command:
+            self.assertEqual(probe.journal(Path("/fixture"), 0), allowed)
+            self.assertIn("--lines=24", command.call_args.args[0])
+            command.return_value = "\n".join([allowed[-1], *unexpected])
+            self.assertEqual(probe.journal(Path("/fixture"), 0), [allowed[-1]])
+
+    def test_fixture_metadata_emits_only_fixed_roles_and_numeric_facts(self):
+        root = Path("/fixture")
+        settings = root / "broker/settings.json"
+        with patch.object(Path, "lstat", lambda path: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600 if path == settings else stat.S_IFDIR | 0o710,
+            st_uid=0, st_gid=0, st_size=127,
+        )), patch.object(probe, "emit") as emit:
+            probe.fixture_metadata(root)
+        self.assertEqual([call.kwargs["role"] for call in emit.call_args_list],
+                         ["run-root", "broker-dir", "settings", "binary", "control-dir", "daemon-root"])
+        self.assertEqual(emit.call_args_list[2].kwargs, {
+            "role": "settings", "type": "file", "uid": 0, "gid": 0, "mode": "0600",
+            "size_bytes": 127, "startup_path_matches": True,
+        })
+
     def test_observer_ack_is_synced_before_atomic_publication(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -69,7 +142,7 @@ class ExecutorProbeTests(unittest.TestCase):
             with self.subTest(field=field), patch.object(probe, "stage_tree") as stage:
                 receipt = {key: value for key, value in RECEIPT.items() if key != field}
                 with self.assertRaisesRegex(probe.Refusal, "provenance"):
-                    probe.qualify(Path("unused"), Path("unused"), None, 0, receipt)
+                    probe.qualify(Path("unused"), Path("unused"), None, 0, receipt, mode="preflight-only")
                 stage.assert_not_called()
 
     def test_cgroup_setup_requires_each_control_and_group_observation(self):
@@ -177,7 +250,7 @@ class ExecutorProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.Refusal, "access-permitted"):
             probe.denied(lambda: None)
 
-    def exercise(self, failing=None, cleanup_error=False):
+    def exercise(self, failing=None, cleanup_error=False, *, mode="build"):
         log = []
         out = io.StringIO()
 
@@ -210,7 +283,8 @@ class ExecutorProbeTests(unittest.TestCase):
             "properties": lambda _d: {"LoadState": "not-found"},
             "read": lambda *_a, **_k: "systemd",
             "command": command,
-            "role": lambda *_: None,
+            "role": lambda *_a, **_k: None,
+            "fixture_metadata": lambda _root: None,
             "stage_tree": record("stage"),
             "start": record("start"),
             "wait_ready": record("ready", 20),
@@ -225,7 +299,7 @@ class ExecutorProbeTests(unittest.TestCase):
                 stack.enter_context(patch.object(probe, name, value))
             stack.enter_context(patch.object(probe.os, "uname", return_value=type("Uname", (), {"release": "6.17.0"})(), create=True))
             stack.enter_context(redirect_stdout(out))
-            result = probe.qualify(Path(scratch) / "owned", Path(scratch), None, 0, RECEIPT)
+            result = probe.qualify(Path(scratch) / "owned", Path(scratch), None, 0, RECEIPT, mode=mode)
         records = [probe.json.loads(line.removeprefix("A10 ")) for line in out.getvalue().splitlines()]
         return result, log, records
 
@@ -263,6 +337,23 @@ class ExecutorProbeTests(unittest.TestCase):
         self.assertEqual(records[-1]["dispatch_attempts"], 1)
         for field, value in RECEIPT.items():
             self.assertEqual(records[-1][field], value)
+
+    def test_green_preflight_only_confirms_drain_and_submits_zero_builds(self):
+        code, calls, records = self.exercise(mode="preflight-only")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["stage", "start", "ready", "identity", "peer", "stop"])
+        preflight = next(record for record in records if record["event"] == "preflight")
+        self.assertEqual(preflight["drain"], "confirmed")
+        self.assertEqual(preflight["runner_dispatches"], 0)
+        self.assertEqual(records[-1]["dispatch_attempts"], 0)
+        self.assertEqual(records[-1]["consensus_invocations"], 0)
+        self.assertEqual(records[-1]["cleanup"], "confirmed")
+
+    def test_unknown_mode_refuses_before_staging(self):
+        with patch.object(probe, "stage_tree") as stage:
+            with self.assertRaisesRegex(probe.Refusal, "qualification-mode"):
+                probe.qualify(Path("unused"), Path("unused"), None, 0, RECEIPT, mode="")
+            stage.assert_not_called()
 
     def test_preflight_failures_submit_no_build(self):
         for stage in ("stage", "start", "ready", "identity", "peer", "stop"):

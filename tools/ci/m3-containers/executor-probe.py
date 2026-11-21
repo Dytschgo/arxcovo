@@ -39,6 +39,17 @@ UNIT = CGROUP / "system.slice" / UNIT_NAME
 RUNS = UNIT / "runs"
 ROLES = (("arx-a10-daemon", 21071), ("arx-a10-build", 21072))
 DAEMON, BUILD = (uid for _, uid in ROLES)
+FIXTURE_SHELL = "/bin/sh"
+FIXTURE_HOME = "/nonexistent"
+MODE_ENV = "ARX_EXEC_QUALIFICATION_MODE"
+MODES = {"preflight-only", "build"}
+BROKER_REFUSALS = (
+    "arguments", "identity", "binary", "settings-read", "settings-decode", "layout",
+    "policy-account", "owner-policy", "runner-construction", "startup-recheck",
+    "build-account", "runtime", "signals", "membership", "hierarchy-writable-view",
+    "pre-existing-runs", "hierarchy-setup", "hierarchy-pin", "bind", "drain",
+)
+BROKER_RECORD = r"^ARX_EXEC_(SETUP ready|DRAIN confirmed|REFUSED (" + "|".join(BROKER_REFUSALS) + r"))$"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "TZ": "UTC"}
 SELECTOR = "service::cluster_build_executor::tests::hosted_standard_build"
 BUILD_PASS = "ARX_EXEC_BUILD dispatches=1 migration=1 limits=1 identity=1 denial=1 workspace=1 terminal=1 cleanup=1"
@@ -152,11 +163,31 @@ def role_unused(name, uid):
     return True
 
 
-def role(name, uid):
+def useradd_argv(name, uid):
+    # Direct setpriv execution needs a resolver-compatible shell. Disable
+    # authentication with a password lock and an expired account.
+    return ["/usr/sbin/useradd", "--uid", str(uid), "--gid", name, "--no-create-home",
+            "--no-log-init", "--home-dir", FIXTURE_HOME, "--shell", FIXTURE_SHELL,
+            "--password", "!", "--expiredate", "1970-01-02", name]
+
+
+def role(name, uid, *, report=False):
     user, group = pwd.getpwnam(name), grp.getgrnam(name)
-    require((user.pw_uid, user.pw_gid, group.gr_gid) == (uid, uid, uid)
-            and user.pw_shell == "/usr/sbin/nologin"
-            and os.getgrouplist(name, uid) == [uid], "role-changed")
+    shadow = [line.split(":") for line in read(Path("/etc/shadow"), 1024 * 1024).splitlines()
+              if line.partition(":")[0] == name]
+    local_shadow = len(shadow) == 1 and len(shadow[0]) == 9
+    facts = {
+        "identity_matches": (user.pw_uid, user.pw_gid) == (uid, uid),
+        "shell_matches": user.pw_shell == FIXTURE_SHELL,
+        "password_locked": local_shadow and shadow[0][1] == "!",
+        "login_disabled": local_shadow and shadow[0][7] == "1",
+        "home_absent": user.pw_dir == FIXTURE_HOME and not os.path.lexists(FIXTURE_HOME),
+        "groups_match": group.gr_gid == uid and os.getgrouplist(name, uid) == [uid],
+    }
+    if report:
+        emit("fixture-account", role="daemon" if uid == DAEMON else "build",
+             uid=user.pw_uid, gid=user.pw_gid, **facts)
+    require(all(facts.values()), "role-changed")
 
 
 def start_argv(root):
@@ -223,11 +254,9 @@ def journal(root, deadline):
     result = command([
         "/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
         "--lines=24", f"_SYSTEMD_UNIT={UNIT_NAME}", f"SYSLOG_IDENTIFIER={root.name}",
-        "--grep=^ARX_EXEC_(SETUP ready|DRAIN confirmed|REFUSED [a-z-]{1,32})$",
+        f"--grep={BROKER_RECORD}",
     ], deadline, "journal")
-    return [line for line in result.splitlines() if re.fullmatch(
-        r"ARX_EXEC_(SETUP ready|DRAIN confirmed|REFUSED [a-z-]{1,32})", line
-    )]
+    return [line for line in result.splitlines()[-24:] if re.fullmatch(BROKER_RECORD, line)]
 
 
 def control_mode(path, owner_permission):
@@ -529,8 +558,8 @@ def observe_child(root, process, deadline, broker_pid):
     raise Refusal("leaf-timeout")
 
 
-def stage_tree(root, stage, copy, deadline):
-    for filename in ("arxd", "libtest", "cargo-real"):
+def stage_tree(root, stage, copy, deadline, mode):
+    for filename in (("arxd", "libtest", "cargo-real") if mode == "build" else ("arxd",)):
         copy(stage / filename, root / filename, deadline)
         (root / filename).chmod(0o755)
     (root / "broker").mkdir(mode=0o700)
@@ -573,6 +602,26 @@ def stage_tree(root, stage, copy, deadline):
     settings = root / "broker/settings.json"
     settings.write_text(json.dumps(policy), encoding="ascii")
     settings.chmod(0o600)
+
+
+def fixture_metadata(root):
+    argv = start_argv(root)
+    for role_name, path in (
+        ("run-root", root), ("broker-dir", root / "broker"),
+        ("settings", root / "broker/settings.json"), ("binary", root / "arxd"),
+        ("control-dir", root / "control"), ("daemon-root", root / "daemon"),
+    ):
+        metadata = path.lstat()
+        kind = {stat.S_IFDIR: "directory", stat.S_IFREG: "file"}.get(
+            stat.S_IFMT(metadata.st_mode), "other"
+        )
+        facts = {}
+        if role_name == "settings":
+            facts = {"size_bytes": metadata.st_size, "startup_path_matches": argv[-1] == path}
+        if role_name == "binary":
+            facts = {"startup_path_matches": argv[-3] == path}
+        emit("fixture-object", role=role_name, type=kind, uid=metadata.st_uid, gid=metadata.st_gid,
+             mode=f"{stat.S_IMODE(metadata.st_mode):04o}", **facts)
 
 
 def start(root, deadline):
@@ -634,10 +683,11 @@ def prove_build(root, pid, deadline):
     print(BUILD_PASS, flush=True)
 
 
-def qualify(root, stage, copy, deadline, receipt):
+def qualify(root, stage, copy, deadline, receipt, *, mode):
     """Track the first refusal independently of cleanup and dispatch count."""
     receipt = provenance(tuple(receipt.get(field, "") for field in PROVENANCE_FIELDS))
-    emit("provenance", **receipt)
+    require(mode in MODES, "qualification-mode")
+    emit("provenance", mode=mode, **receipt)
     phase, owned, created, state, stop_expected = "stage", [], False, False, 0
     close_requested = []
     first, cleanup, identity_probes, daemon_probe_attempts, dispatch_attempts = None, "not-started", 0, 0, 0
@@ -666,10 +716,10 @@ def qualify(root, stage, copy, deadline, receipt):
         for name, uid in ROLES:
             owned.append((name, uid))
             command(["/usr/sbin/groupadd", "--gid", str(uid), name], deadline, "group-create")
-            command(["/usr/sbin/useradd", "--uid", str(uid), "--gid", name, "--no-create-home",
-                     "--no-log-init", "--shell", "/usr/sbin/nologin", name], deadline, "user-create")
-            role(name, uid)
-        stage_tree(root, stage, copy, deadline)
+            command(useradd_argv(name, uid), deadline, "user-create")
+            role(name, uid, report=True)
+        stage_tree(root, stage, copy, deadline, mode)
+        fixture_metadata(root)
         phase = "preflight-setup"
         state = True
         start(root, deadline)
@@ -693,14 +743,15 @@ def qualify(root, stage, copy, deadline, receipt):
         close_requested.clear()
         emit("preflight", setup="ready", drain="confirmed", identity_probes=identity_probes,
              daemon_identity_probes=daemon_probe_attempts, runner_dispatches=0, consensus_invocations=0)
-        phase = "build-setup"
-        state = True
-        start(root, deadline)
-        pid = wait_ready(root, deadline)
-        stop_expected = 2
-        phase = "single-build"
-        dispatch_attempts = 1
-        prove_build(root, pid, deadline)
+        if mode == "build":
+            phase = "build-setup"
+            state = True
+            start(root, deadline)
+            pid = wait_ready(root, deadline)
+            stop_expected = 2
+            phase = "single-build"
+            dispatch_attempts = 1
+            prove_build(root, pid, deadline)
     except (Refusal, OSError, subprocess.SubprocessError, UnicodeError, ValueError, KeyError) as error:
         first = str(error) if isinstance(error, Refusal) else type(error).__name__
         emit("first", phase=phase, category=first)
@@ -731,7 +782,7 @@ def qualify(root, stage, copy, deadline, receipt):
             cleanup = str(error) if isinstance(error, Refusal) else type(error).__name__
         emit("result", first=first, cleanup=cleanup, identity_probes=identity_probes,
              daemon_identity_probes=daemon_probe_attempts, dispatch_attempts=dispatch_attempts,
-             consensus_invocations=0, **receipt)
+             consensus_invocations=0, mode=mode, **receipt)
     return int(first is not None or cleanup != "confirmed")
 
 
@@ -745,7 +796,8 @@ def privileged(stage, values):
             and stat.S_ISDIR(m.st_mode) and stat.S_IMODE(m.st_mode) == 0o700
             and ID.fullmatch(owner) and m.st_uid == int(owner), "staging-ownership")
     precedent = runpy.run_path(str(ROOT / "tools/ci/m3-c13/run.py"))
-    return qualify(root, stage, precedent["stage_binary"], time.monotonic() + TOTAL - CLEANUP, receipt)
+    return qualify(root, stage, precedent["stage_binary"], time.monotonic() + TOTAL - CLEANUP,
+                   receipt, mode=os.environ.get(MODE_ENV, ""))
 
 
 def main():
@@ -760,6 +812,8 @@ def main():
     if len(sys.argv) == 9 and sys.argv[1] == "--staged":
         return privileged(Path(sys.argv[2]), sys.argv[3:])
     require(len(sys.argv) == 1 and os.geteuid() != 0, "arguments")
+    mode = os.environ.get(MODE_ENV, "")
+    require(mode in MODES, "qualification-mode")
     values = [os.environ.get(name, "") for name in (
         "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "ImageOS", "ImageVersion", "GITHUB_JOB"
     )]
@@ -776,19 +830,22 @@ def main():
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
     require(target == ROOT / "target", "cargo-target")
     profile = target / "debug"
-    libtest = precedent["select"](profile / "deps", "arxd-", SELECTOR, start_time + 12)
-    cargo = shutil.which("rustup")
-    require(cargo is not None, "rustup")
-    path = command([cargo, "which", "cargo"], start_time + 12, "cargo-path", env=os.environ).strip()
+    binaries = [("arxd", profile / "arxd")]
+    if mode == "build":
+        libtest = precedent["select"](profile / "deps", "arxd-", SELECTOR, start_time + 12)
+        cargo = shutil.which("rustup")
+        require(cargo is not None, "rustup")
+        path = command([cargo, "which", "cargo"], start_time + 12, "cargo-path", env=os.environ).strip()
+        binaries.extend((("libtest", libtest), ("cargo-real", Path(path))))
     with tempfile.TemporaryDirectory(prefix="arx-a10-", dir="/tmp") as directory:
         stage = Path(directory)
-        for name, source in (("arxd", profile / "arxd"), ("libtest", libtest), ("cargo-real", Path(path))):
+        for name, source in binaries:
             precedent["stage_binary"](source, stage / name, start_time + 18)
         facts = [f"{name}={os.environ[name]}" for name in (
             "CI", "GITHUB_ACTIONS", "RUNNER_OS", "RUNNER_ENVIRONMENT", "GITHUB_REPOSITORY"
         )]
         return subprocess.run(
-            ["/usr/bin/sudo", "-n", "/usr/bin/env", *facts, "/usr/bin/python3", "-I", "-B",
+            ["/usr/bin/sudo", "-n", "/usr/bin/env", *facts, f"{MODE_ENV}={mode}", "/usr/bin/python3", "-I", "-B",
              Path(__file__).resolve(), "--staged", stage, *values],
             env=ENV, stdin=subprocess.DEVNULL, timeout=TOTAL + 3, check=False,
         ).returncode

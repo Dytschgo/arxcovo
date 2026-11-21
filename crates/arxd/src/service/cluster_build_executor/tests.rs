@@ -19,6 +19,42 @@ fn request() -> Request {
 }
 
 #[test]
+fn broker_refusal_categories_are_fixed() {
+    use BrokerRefusal::*;
+    for (reason, expected) in [
+        (Arguments, "arguments"),
+        (Identity, "identity"),
+        (Binary, "binary"),
+        (SettingsRead, "settings-read"),
+        (SettingsDecode, "settings-decode"),
+        (Layout, "layout"),
+        (PolicyAccount, "policy-account"),
+        (OwnerPolicy, "owner-policy"),
+        (RunnerConstruction, "runner-construction"),
+        (StartupRecheck, "startup-recheck"),
+        (BuildAccount, "build-account"),
+        (Runtime, "runtime"),
+        (Signals, "signals"),
+        (Membership, "membership"),
+        (HierarchyWritableView, "hierarchy-writable-view"),
+        (PreExistingRuns, "pre-existing-runs"),
+        (HierarchySetup, "hierarchy-setup"),
+        (HierarchyPin, "hierarchy-pin"),
+        (Bind, "bind"),
+        (Drain, "drain"),
+    ] {
+        assert_eq!(reason.category(), expected);
+    }
+    assert!(matches!(
+        Policy::open(
+            Path::new("untrusted-relative-settings"),
+            Path::new("/unused")
+        ),
+        Err(SettingsRead)
+    ));
+}
+
+#[test]
 fn wire_bounds_and_shape() {
     assert!(frame_len((MAX_FRAME as u32 + 1).to_be_bytes()).is_err());
     assert!(frame_len([0; 4]).is_err());
@@ -317,9 +353,9 @@ fn root_refuses_unqualified_runner_profile() {
     let result = crate::service::unix_bridge::broker(
         ("/unopened-binary".into(), "/unopened-root".into()),
         &config,
-        Box::new(|| panic!("unqualified membership reached configuration check")),
+        || panic!("unqualified membership reached configuration check"),
     );
-    assert!(matches!(result, Err("membership")));
+    assert!(matches!(result, Err(BrokerRefusal::Membership)));
 }
 
 #[tokio::test]

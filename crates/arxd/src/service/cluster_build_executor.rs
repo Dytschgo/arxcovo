@@ -45,6 +45,60 @@ const MAX_CONNECTIONS: usize = 8;
 const SOCKET: &str = "executor.sock";
 const CANCEL: u8 = 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BrokerRefusal {
+    Arguments,
+    Identity,
+    Binary,
+    SettingsRead,
+    SettingsDecode,
+    Layout,
+    PolicyAccount,
+    OwnerPolicy,
+    RunnerConstruction,
+    StartupRecheck,
+    BuildAccount,
+    Runtime,
+    Signals,
+    Membership,
+    HierarchyWritableView,
+    PreExistingRuns,
+    HierarchySetup,
+    HierarchyPin,
+    Bind,
+    Drain,
+}
+
+// Startup logs a fixed category. Live requests keep their original refusal token.
+pub(super) type PolicyCheck = Result<(), (BrokerRefusal, Unavailable)>;
+
+impl BrokerRefusal {
+    fn category(self) -> &'static str {
+        match self {
+            Self::Arguments => "arguments",
+            Self::Identity => "identity",
+            Self::Binary => "binary",
+            Self::SettingsRead => "settings-read",
+            Self::SettingsDecode => "settings-decode",
+            Self::Layout => "layout",
+            Self::PolicyAccount => "policy-account",
+            Self::OwnerPolicy => "owner-policy",
+            Self::RunnerConstruction => "runner-construction",
+            Self::StartupRecheck => "startup-recheck",
+            Self::BuildAccount => "build-account",
+            Self::Runtime => "runtime",
+            Self::Signals => "signals",
+            Self::Membership => "membership",
+            Self::HierarchyWritableView => "hierarchy-writable-view",
+            Self::PreExistingRuns => "pre-existing-runs",
+            Self::HierarchySetup => "hierarchy-setup",
+            Self::HierarchyPin => "hierarchy-pin",
+            Self::Bind => "bind",
+            Self::Drain => "drain",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Pin {
@@ -149,19 +203,23 @@ fn overlap(a: &Path, b: &Path) -> bool {
 }
 
 impl Policy {
-    fn open(configuration_path: &Path, binary: &Path) -> io::Result<Self> {
-        let content = configuration(configuration_path)?;
-        let owner: OwnerSettings = serde_json::from_slice(&content).map_err(|_| bad())?;
-        let layout = Layout::system().map_err(|_| bad())?;
+    fn open(configuration_path: &Path, binary: &Path) -> Result<Self, BrokerRefusal> {
+        let content = configuration(configuration_path).map_err(|_| BrokerRefusal::SettingsRead)?;
+        let owner: OwnerSettings =
+            serde_json::from_slice(&content).map_err(|_| BrokerRefusal::SettingsDecode)?;
+        let layout = Layout::system().map_err(|_| BrokerRefusal::Layout)?;
         let service = ServiceConfig::parse_inventory(
-            &serde_json::to_vec(&owner.service).map_err(|_| bad())?,
+            &serde_json::to_vec(&owner.service).map_err(|_| BrokerRefusal::SettingsDecode)?,
             &layout,
             &NativeResolver,
         )
-        .map_err(|_| bad())?;
+        .map_err(|_| BrokerRefusal::PolicyAccount)?;
         let pin = Pin {
-            uid: service.build_identity().parse().map_err(|_| bad())?,
-            gid: service.build_gid().ok_or_else(bad)?,
+            uid: service
+                .build_identity()
+                .parse()
+                .map_err(|_| BrokerRefusal::OwnerPolicy)?,
+            gid: service.build_gid().ok_or(BrokerRefusal::OwnerPolicy)?,
             slots: service.limits().0,
         };
         if service.rights() != Rights::Standard
@@ -174,19 +232,21 @@ impl Policy {
             || service.client_identity() != owner.daemon_uid.to_string()
             || !(1..=8).contains(&owner.daemon_roots.len())
         {
-            return Err(bad());
+            return Err(BrokerRefusal::OwnerPolicy);
         }
 
-        let private = configuration_path.parent().ok_or_else(bad)?;
-        let private_meta = protected_directory(private)?;
+        let private = configuration_path
+            .parent()
+            .ok_or(BrokerRefusal::OwnerPolicy)?;
+        let private_meta = protected_directory(private).map_err(|_| BrokerRefusal::OwnerPolicy)?;
         if private_meta.mode() & 0o7777 != 0o700 {
-            return Err(bad());
+            return Err(BrokerRefusal::OwnerPolicy);
         }
-        let base = private.parent().ok_or_else(bad)?;
+        let base = private.parent().ok_or(BrokerRefusal::OwnerPolicy)?;
         let control = base.join("control");
-        let control_meta = protected_directory(&control)?;
+        let control_meta = protected_directory(&control).map_err(|_| BrokerRefusal::OwnerPolicy)?;
         if control_meta.mode() & 0o7777 != 0o710 || control_meta.gid() != owner.daemon_gid {
-            return Err(bad());
+            return Err(BrokerRefusal::OwnerPolicy);
         }
         let workspace = Path::new(service.workspace());
         if !canonical_path(workspace)
@@ -194,11 +254,13 @@ impl Policy {
             || overlap(workspace, &control)
             || binary.starts_with(private)
         {
-            return Err(bad());
+            return Err(BrokerRefusal::OwnerPolicy);
         }
-        let binary_meta = owner_file(binary, false)?.metadata()?;
+        let binary_meta = owner_file(binary, false)
+            .and_then(|file| file.metadata())
+            .map_err(|_| BrokerRefusal::OwnerPolicy)?;
         if binary_meta.mode() & 0o111 != 0o111 {
-            return Err(bad());
+            return Err(BrokerRefusal::OwnerPolicy);
         }
         let mut objects = vec![
             (private.to_owned(), Fingerprint::from(private_meta)),
@@ -210,16 +272,17 @@ impl Policy {
                 || overlap(&dir, workspace)
                 || objects.iter().any(|(path, _)| overlap(path, &dir))
             {
-                return Err(bad());
+                return Err(BrokerRefusal::OwnerPolicy);
             }
-            ancestry(dir.parent().ok_or_else(bad)?)?;
-            let metadata = fs::symlink_metadata(&dir)?;
+            ancestry(dir.parent().ok_or(BrokerRefusal::OwnerPolicy)?)
+                .map_err(|_| BrokerRefusal::OwnerPolicy)?;
+            let metadata = fs::symlink_metadata(&dir).map_err(|_| BrokerRefusal::OwnerPolicy)?;
             if !metadata.is_dir()
                 || metadata.uid() != owner.daemon_uid
                 || metadata.gid() != owner.daemon_gid
                 || metadata.mode() & 0o7777 != 0o700
             {
-                return Err(bad());
+                return Err(BrokerRefusal::OwnerPolicy);
             }
             objects.push((dir, metadata.into()));
         }
@@ -234,18 +297,19 @@ impl Policy {
         })
     }
 
-    fn check(&self) -> Result<(), Unavailable> {
+    fn check(&self) -> PolicyCheck {
         let stable = self.objects.iter().all(|(path, expected)| {
             path.parent().is_some_and(|p| ancestry(p).is_ok())
                 && fs::symlink_metadata(path).is_ok_and(|m| Fingerprint::from(m) == *expected)
         });
         if !stable || !configuration(&self.configuration).is_ok_and(|c| c == self.content) {
-            return Err(Unavailable::PreflightFailed);
+            return Err((BrokerRefusal::StartupRecheck, Unavailable::PreflightFailed));
         }
-        self.service.execution_preflight(
-            &Layout::system().map_err(|_| Unavailable::PreflightFailed)?,
-            &NativeResolver,
-        )
+        let layout =
+            Layout::system().map_err(|_| (BrokerRefusal::Layout, Unavailable::PreflightFailed))?;
+        self.service
+            .execution_preflight(&layout, &NativeResolver)
+            .map_err(|unavailable| (BrokerRefusal::BuildAccount, unavailable))
     }
 }
 
@@ -771,26 +835,26 @@ impl Drop for Endpoint {
     }
 }
 
-async fn broker(policy: Arc<Policy>, binary: PathBuf) -> Result<(), &'static str> {
+async fn broker(policy: Arc<Policy>, binary: PathBuf) -> Result<(), BrokerRefusal> {
     let stop = super::Shutdown::default();
     tokio::spawn(
         super::unix::Signals::install()
-            .map_err(|_| "signals")?
+            .map_err(|_| BrokerRefusal::Signals)?
             .forward(stop.clone()),
     );
     let root = policy
         .configuration
         .parent()
-        .ok_or("configuration")?
+        .ok_or(BrokerRefusal::OwnerPolicy)?
         .to_owned();
     let check_policy = policy.clone();
     let bridge = Arc::new(super::unix_bridge::broker(
         (binary, root),
         &policy.service,
-        Box::new(move || check_policy.check()),
+        move || check_policy.check(),
     )?);
     let (endpoint, listener) =
-        Endpoint::bind(&policy.socket, policy.daemon.1).map_err(|_| "bind")?;
+        Endpoint::bind(&policy.socket, policy.daemon.1).map_err(|_| BrokerRefusal::Bind)?;
     println!("ARX_EXEC_SETUP ready");
     let mut work = JoinSet::new();
     let capacity = Arc::new(Semaphore::new(usize::from(policy.pin.slots)));
@@ -825,7 +889,7 @@ async fn broker(policy: Arc<Policy>, binary: PathBuf) -> Result<(), &'static str
     }
     let drained = super::unix_bridge::drained(&bridge);
     if failed || !drained || !removed {
-        return Err("drain");
+        return Err(BrokerRefusal::Drain);
     }
     println!("ARX_EXEC_DRAIN confirmed");
     Ok(())
@@ -837,7 +901,7 @@ pub(super) fn entry(args: &[OsString]) -> Option<i32> {
     }
     let result = (|| {
         let [_, configuration] = args else {
-            return Err("arguments");
+            return Err(BrokerRefusal::Arguments);
         };
         // SAFETY: identity getters take no pointers.
         if unsafe {
@@ -849,21 +913,20 @@ pub(super) fn entry(args: &[OsString]) -> Option<i32> {
             )
         } != (0, 0, 0, 0)
         {
-            return Err("identity");
+            return Err(BrokerRefusal::Identity);
         }
-        let binary = std::env::current_exe().map_err(|_| "binary")?;
-        let policy =
-            Arc::new(Policy::open(Path::new(configuration), &binary).map_err(|_| "configuration")?);
+        let binary = std::env::current_exe().map_err(|_| BrokerRefusal::Binary)?;
+        let policy = Arc::new(Policy::open(Path::new(configuration), &binary)?);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|_| "runtime")?
+            .map_err(|_| BrokerRefusal::Runtime)?
             .block_on(broker(policy, binary))
     })();
     Some(match result {
         Ok(()) => 0,
         Err(reason) => {
-            eprintln!("ARX_EXEC_REFUSED {reason}");
+            eprintln!("ARX_EXEC_REFUSED {}", reason.category());
             1
         }
     })

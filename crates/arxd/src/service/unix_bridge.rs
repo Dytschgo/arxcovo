@@ -17,6 +17,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use super::cluster_build_executor::{BrokerRefusal, PolicyCheck};
 #[cfg(test)]
 use crate::exec::hierarchy::locate;
 
@@ -28,8 +30,8 @@ use readiness::{Cause, Readiness};
 pub(super) fn broker(
     paths: (PathBuf, PathBuf),
     config: &ServiceConfig,
-    check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
-) -> Result<UnixBridge, &'static str> {
+    check: impl Fn() -> PolicyCheck + Send + Sync + 'static,
+) -> Result<UnixBridge, BrokerRefusal> {
     use crate::exec::hierarchy::{
         linux::LinuxFs,
         parse,
@@ -45,12 +47,12 @@ pub(super) fn broker(
         }
     }
     let fs = LinuxFs::system();
-    let proc = fs.proc_cgroup().map_err(|_| "membership")?;
+    let proc = fs.proc_cgroup().map_err(|_| BrokerRefusal::Membership)?;
     let location = parse::locate(&proc.bytes)
         .filter(|_| proc.magic == PROC_MAGIC)
-        .ok_or("membership")?;
+        .ok_or(BrokerRefusal::Membership)?;
     let readiness = Readiness::pending();
-    let layout = Layout::system().map_err(|_| "layout")?;
+    let layout = Layout::system().map_err(|_| BrokerRefusal::Layout)?;
     let mut bridge = UnixBridge::with_paths(
         (paths.0, vec![paths.1]),
         &layout,
@@ -61,19 +63,22 @@ pub(super) fn broker(
                 .map(|runner| Box::new(runner) as Box<dyn RunnerPort>)
                 .map_err(|_| Unavailable::PreflightFailed)
         },
-        check,
+        Box::new(|| Err(Unavailable::PreflightFailed)),
         readiness.clone(),
     );
-    bridge.runner.as_ref().map_err(|_| "configuration")?;
-    (bridge.check)().map_err(|_| "configuration")?;
+    bridge
+        .runner
+        .as_ref()
+        .map_err(|_| BrokerRefusal::RunnerConstruction)?;
+    check().map_err(|(category, _)| category)?;
     // Refuse pre-existing residue before setup's janitor can change it.
     let runs = location.runs();
     if !runs.parent().is_some_and(cgroup_mounts) {
-        return Err("hierarchy-writable-view");
+        return Err(BrokerRefusal::HierarchyWritableView);
     }
     match runs.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return Err("pre-existing-runs"),
+        _ => return Err(BrokerRefusal::PreExistingRuns),
     }
     match setup::setup(
         &fs,
@@ -84,16 +89,15 @@ pub(super) fn broker(
         SetupOutcome::Ready(_) => readiness.set_ready(),
         SetupOutcome::Unavailable(failure) => {
             readiness.fail(failure.into());
-            return Err("hierarchy-setup");
+            return Err(BrokerRefusal::HierarchySetup);
         }
     }
     if !cgroup_mounts(&runs) {
-        return Err("hierarchy-writable-view");
+        return Err(BrokerRefusal::HierarchyWritableView);
     }
-    let chain = cgroup_chain(&runs).ok_or("hierarchy-pin")?;
-    let config_check = bridge.check;
+    let chain = cgroup_chain(&runs).ok_or(BrokerRefusal::HierarchyPin)?;
     bridge.check = Box::new(move || {
-        config_check()?;
+        check().map_err(|(_, unavailable)| unavailable)?;
         if !cgroup_mounts(&runs) || cgroup_chain(&runs).as_ref() != Some(&chain) {
             return Err(Unavailable::MechanismUnavailable);
         }
