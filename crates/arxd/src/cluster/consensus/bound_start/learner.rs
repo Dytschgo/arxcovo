@@ -8,6 +8,7 @@ use crate::cluster::{
     startup_plan::{Mode, ReopenObjects},
 };
 use checked_clock::{CheckedClock, HostClock};
+use membership_observation::{IssuerMembership, IssuerProof};
 use peer_network::EngineDispatch;
 use peer_registry::{LearnerGate, Phase};
 use peer_transport::{AdmissionClient, Credentials, TransportOwner};
@@ -25,6 +26,8 @@ pub(super) struct Operation {
     advertised: Option<SocketAddr>,
     admission: Option<AdmissionClient>,
     issuer_membership: Option<LogPos>,
+    #[cfg(test)]
+    issuer_sample: Option<membership_observation::Sample>,
     recovered: bool,
     #[cfg(test)]
     fixture: Option<HostedCatchUp>,
@@ -161,6 +164,8 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         advertised: None,
         admission: None,
         issuer_membership: None,
+        #[cfg(test)]
+        issuer_sample: None,
         recovered,
         #[cfg(test)]
         fixture,
@@ -554,32 +559,13 @@ impl Job {
     ) -> Result<super::issuer_transfer::Offer, peer_transport::Refusal> {
         let refused = peer_transport::Refusal::Identity;
         let state = self.state();
-        let (node, local, original, root, _) = voter_context(&state).ok_or(refused)?;
-        if claim.cluster
-            != state
-                .learner
-                .as_ref()
-                .unwrap()
-                .member
-                .as_ref()
-                .unwrap()
-                .expected
-                .cluster
-            || claim.root != root
-        {
-            return Err(refused);
-        }
+        let (node, local, ..) = voter_context(&state).ok_or(refused)?;
+        let op = state.learner.as_ref().ok_or(refused)?;
+        let expected = &op.member.as_ref().ok_or(refused)?.expected;
         let node = node.try_lock().map_err(|_| peer_transport::Refusal::Busy)?;
-        let offer = node
-            .verify_issuer_offer(claim, sender)
+        let membership = op.issuer_membership_view(&node);
+        let (offer, _proof) = receiver_proof(&membership, expected, local.address, claim, sender)
             .map_err(|_| refused)?;
-        if offer.receiver_address != local.address
-            || claim.receiver != (local.node, *local.key.as_bytes())
-            || claim.membership.index <= original.index
-            || claim.membership.term < original.term
-        {
-            return Err(refused);
-        }
         Ok(offer)
     }
 
@@ -589,21 +575,36 @@ impl Job {
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
         channel: (&[u8; 32], &[u8], Vec<u8>),
     ) -> Result<(), peer_transport::Refusal> {
+        use crate::cluster::pki::custody::Error;
         self.check_issuer_transfer(claim, sender)?;
         let refused = peer_transport::Refusal::Identity;
+        let node = self.state().node.clone().ok_or(refused)?;
+        let node = node.try_lock().map_err(|_| peer_transport::Refusal::Busy)?;
         let mut state = self.state();
         if state.close_requested {
             return Err(peer_transport::Refusal::Closed);
         }
-        let node = state.node.clone().ok_or(refused)?;
         let State { owner, learner, .. } = &mut *state;
         let owner = owner.as_ref().ok_or(refused)?;
         let op = learner.as_mut().ok_or(refused)?;
+        let membership = op.issuer_membership_view(&node);
+        let address = op.advertised.ok_or(refused)?;
         let gate = op.gate.as_ref().ok_or(refused)?;
         let member = op.member.as_mut().ok_or(refused)?;
         let clock = op.clock.as_ref().ok_or(refused)?;
         let tls = member.credentials(owner, clock).map_err(|_| refused)?;
         let now = clock.sample_ms().map_err(|_| refused)?;
+        let expected = &member.expected;
+        let prove = || {
+            // This gate acquires the store itself. Run it before taking the
+            // guard that binds the exact offer to each custody operation.
+            if gate.phase() != Ok(Phase::Strict) {
+                return Err(Error::Ownership);
+            }
+            receiver_proof(&membership, expected, address, claim, sender)
+                .map(|(_, proof)| proof)
+                .map_err(|_| Error::Ownership)
+        };
         member
             .custody
             .receive_voter_ca(
@@ -612,35 +613,32 @@ impl Job {
                 tls.root.as_ref(),
                 now,
                 channel,
-                || {
-                    use crate::cluster::pki::custody::Error;
-                    let node = node.try_lock().map_err(|_| Error::Unavailable)?;
-                    if gate.phase() != Ok(Phase::Strict) {
-                        return Err(Error::Ownership);
-                    }
-                    node.verify_issuer_offer(claim, sender)
-                        .map_err(|_| Error::Ownership)?;
-                    Ok(())
-                },
+                (prove, || op.issuer_membership = Some(claim.membership)),
             )
-            .map_err(|_| refused)?;
-        op.issuer_membership = Some(claim.membership);
-        Ok(())
+            .map_err(|_| refused)
     }
 
     pub(super) async fn activate_promoted_issuer(&'static self) -> Result<(), Refusal> {
-        let (node, local, _, _, clock) = voter_context(&self.state()).ok_or(Refusal::Identity)?;
+        let (node, ..) = voter_context(&self.state()).ok_or(Refusal::Identity)?;
         let node = node.try_lock().map_err(|_| Refusal::Ownership)?;
         // The unchanged quorum read establishes leadership before publishing readiness.
         let (epoch, ()) = node
             .fresh_read(|_| Ok(()))
             .await
             .map_err(|_| Refusal::Unavailable)?;
+        self.publish_promoted_issuer(&node, epoch)
+    }
+
+    fn publish_promoted_issuer(
+        &self,
+        node: &ConsensusNode,
+        epoch: LeaderId,
+    ) -> Result<(), Refusal> {
+        let mut state = self.state();
+        let (_, local, clock) = voter_context(&state).ok_or(Refusal::Identity)?;
         if epoch.node_id != local.node.get() {
             return Err(Refusal::Identity);
         }
-        let mut state = self.state();
-        let (ca, tls, installed_at) = load_promoted(&state, &node, true)?;
         let owner = state.owner.as_ref().ok_or(Refusal::Ownership)?;
         let endpoint =
             peer_transport::endpoint(&owner.plan.enrollment).map_err(|_| Refusal::Identity)?;
@@ -656,6 +654,7 @@ impl Job {
             .unwrap()
             .expected
             .cluster;
+        let (ca, tls, installed_at, _proof) = load_promoted(&state, node, Some(epoch))?;
         state.issuer = Some(Arc::new(enrollment_ingress::ReadyIssuer::promoted(
             endpoint,
             cluster,
@@ -669,11 +668,43 @@ impl Job {
     }
 }
 
+impl Operation {
+    fn issuer_membership_view<'a>(&self, node: &'a ConsensusNode) -> IssuerMembership<'a> {
+        let membership = node.issuer_membership();
+        #[cfg(test)]
+        let membership = membership.with_sample(self.issuer_sample.clone());
+        membership
+    }
+}
+
+fn receiver_proof<'a>(
+    membership: &IssuerMembership<'a>,
+    expected: &ExpectedIdentity,
+    address: SocketAddr,
+    claim: super::issuer_transfer::Claim,
+    sender: crate::cluster::pki::verify::AuthenticatedPeer,
+) -> Result<(super::issuer_transfer::Offer, IssuerProof<'a>), Refusal> {
+    let original = expected.origin.position();
+    if claim.cluster != expected.cluster
+        || claim.root != expected.ca
+        || claim.receiver != (expected.node, *expected.key.as_bytes())
+        || claim.membership.index <= original.index
+        || claim.membership.term < original.term
+    {
+        return Err(Refusal::Identity);
+    }
+    let (offer, proof) = membership
+        .offer_proof(claim, sender)
+        .map_err(|_| Refusal::Identity)?;
+    if offer.receiver_address != address || !proof.covers_member(expected, address) {
+        return Err(Refusal::Identity);
+    }
+    Ok((offer, proof))
+}
+
 type VoterContext = (
     Arc<tokio::sync::Mutex<ConsensusNode>>,
     super::issuer_transfer::Voter,
-    LogPos,
-    [u8; 32],
     Arc<HostClock>,
 );
 
@@ -693,34 +724,46 @@ fn voter_context(state: &State) -> Option<VoterContext> {
             key: member.expected.key,
             address: op.advertised?,
         },
-        member.expected.origin.position(),
-        member.expected.ca,
         op.clock.clone()?,
     ))
 }
 
-fn load_promoted(
+fn load_promoted<'a>(
     state: &State,
-    node: &ConsensusNode,
-    require_leader: bool,
-) -> Result<(crate::cluster::pki::ca::ClusterCa, Credentials, LogPos), Refusal> {
-    let (_, local, _, _, clock) = voter_context(state).ok_or(Refusal::Identity)?;
+    node: &'a ConsensusNode,
+    epoch: Option<LeaderId>,
+) -> Result<
+    (
+        crate::cluster::pki::ca::ClusterCa,
+        Credentials,
+        LogPos,
+        IssuerProof<'a>,
+    ),
+    Refusal,
+> {
+    use crate::cluster::pki::custody::Error;
+    let (_, local, clock) = voter_context(state).ok_or(Refusal::Identity)?;
     let op = state.learner.as_ref().ok_or(Refusal::Identity)?;
     let installed_at = op.issuer_membership.ok_or(Refusal::Identity)?;
     let member = op.member.as_ref().ok_or(Refusal::Identity)?;
     let cluster = member.expected.cluster;
-    node.issuer_voter(cluster, local, installed_at, require_leader)
-        .map_err(|_| Refusal::Identity)?;
     let owner = state.owner.as_ref().ok_or(Refusal::Ownership)?;
     let tls = member.credentials(owner, &clock)?;
     let now = clock.sample_ms().map_err(|_| Refusal::Clock)?;
-    let ca = member
+    let membership = op.issuer_membership_view(node);
+    let (ca, proof) = member
         .custody
-        .load_voter_ca(cluster, tls.root.as_ref(), now)
+        .load_voter_ca(cluster, tls.root.as_ref(), now, || {
+            let proof = membership
+                .voter_proof(cluster, local, installed_at, epoch.is_some(), epoch)
+                .map_err(|_| Error::Ownership)?;
+            if !proof.covers_member(&member.expected, local.address) {
+                return Err(Error::Ownership);
+            }
+            Ok(proof)
+        })
         .map_err(|_| Refusal::Identity)?;
-    node.issuer_voter(cluster, local, installed_at, require_leader)
-        .map_err(|_| Refusal::Identity)?;
-    Ok((ca, tls, installed_at))
+    Ok((ca, tls, installed_at, proof))
 }
 
 #[cfg(test)]
@@ -729,7 +772,121 @@ impl Run {
         let state = self.job.state();
         let (node, ..) = voter_context(&state).ok_or(Refusal::Identity)?;
         let node = node.try_lock().map_err(|_| Refusal::Ownership)?;
-        let (ca, _, _) = load_promoted(&state, &node, false)?;
+        let (ca, _, _, _proof) = load_promoted(&state, &node, None)?;
         Ok(ca.cert_der().to_vec())
+    }
+}
+
+#[cfg(test)]
+impl Job {
+    pub(in crate::cluster::consensus) fn issuer_receiver_fixture(
+        published: PublishedJoin,
+        sm: &SmAdapter,
+        sample: membership_observation::Sample,
+        clock: Arc<HostClock>,
+    ) -> (&'static Self, Credentials, Arc<LearnerGate>) {
+        let PublishedJoin {
+            mut owner,
+            custody,
+            expected,
+            leaf,
+            time,
+        } = published;
+        let expected = Arc::new(expected);
+        let address = owner.plan.peer.parse().unwrap();
+        let gate = LearnerGate::new(sm, expected.clone(), address, clock.clone(), false);
+        owner.stage_published_join().unwrap();
+        let member = Member {
+            expected,
+            leaf,
+            custody,
+        };
+        let credentials = member.credentials(&owner, &clock).unwrap();
+        let (transport, _) =
+            TransportOwner::pending_founder(member.expected.cluster, member.expected.node);
+        let node = ConsensusNode {
+            id: member.expected.node.get(),
+            read_permits: Arc::new(Semaphore::new(READ_PERMITS)),
+            issue_permits: Arc::new(Semaphore::new(issue::MAX_ISSUING)),
+            read_blocking: Arc::default(),
+            raft: None,
+            sm: Some(sm.clone()),
+            log_released: crate::cluster::state_store::release_pair().1,
+            sm_released: sm.0.lock().unwrap().released(),
+            log_weak: Weak::new(),
+            sm_weak: Arc::downgrade(&sm.0),
+            permits: Arc::new(Semaphore::new(64)),
+            owners: Mutex::default(),
+        };
+        let job = Self::anchor();
+        let mut state = job.state();
+        state.owner = Some(owner);
+        state.node = Some(Arc::new(tokio::sync::Mutex::new(node)));
+        state.learner = Some(Operation {
+            input: None,
+            transport: Arc::new(tokio::sync::Mutex::new(transport)),
+            member: Some(member),
+            local_time: Some(time),
+            credentials: None,
+            clock: Some(clock),
+            gate: Some(gate.clone()),
+            advertised: Some(address),
+            admission: None,
+            issuer_membership: None,
+            issuer_sample: Some(sample),
+            recovered: false,
+            fixture: None,
+        });
+        state.status = Status::LearnerReady;
+        (job, credentials, gate)
+    }
+
+    pub(in crate::cluster::consensus) fn assert_fixture_custody(
+        &self,
+        root: &[u8],
+        confirmed_at: Option<LogPos>,
+        survivor: (membership_observation::Sample, LeaderId),
+    ) {
+        let node = {
+            let mut state = self.state();
+            let op = state.learner.as_mut().unwrap();
+            assert_eq!(op.issuer_membership, confirmed_at);
+            let member = op.member.as_ref().unwrap();
+            assert_eq!(
+                member.custody.voter_custody_state(),
+                (confirmed_at.is_some(), false)
+            );
+            let now = op.clock.as_ref().unwrap().sample_ms().unwrap();
+            let load = member
+                .custody
+                .load_voter_ca(member.expected.cluster, root, now, || Ok(()));
+            if confirmed_at.is_some() {
+                assert_eq!(load.unwrap().0.cert_der(), root);
+            } else {
+                assert!(matches!(
+                    load,
+                    Err(crate::cluster::pki::custody::Error::Ownership)
+                ));
+            }
+            op.issuer_sample = Some(survivor.0);
+            state.node.clone().unwrap()
+        };
+        let live = node.try_lock().unwrap();
+        assert_eq!(
+            load_promoted(&self.state(), &live, None).is_ok(),
+            confirmed_at.is_some()
+        );
+        // Exercise the production readiness transition after a synthetic quorum epoch.
+        assert_eq!(
+            self.publish_promoted_issuer(&live, survivor.1).is_ok(),
+            confirmed_at.is_some()
+        );
+        assert_eq!(self.state().issuer.is_some(), confirmed_at.is_some());
+
+        let mut state = self.state();
+        state.issuer.take();
+        state.learner.take();
+        state.node.take();
+        state.owner.take();
     }
 }

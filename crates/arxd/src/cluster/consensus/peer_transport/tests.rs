@@ -4998,4 +4998,314 @@ mod issuer_refusals {
         assert!(fs::read(&fixture.receiver.file).unwrap() == envelope);
         fixture.close().await;
     }
+
+    #[cfg(target_os = "linux")]
+    mod production_receiver {
+        use super::*;
+        use crate::cluster::{
+            consensus::{
+                BasicNode,
+                bound_start::Job,
+                checked_clock::{CheckedClock, HostClock},
+                encode,
+                membership_observation::Sample,
+            },
+            enrollment::durable_join::PublishedJoin,
+            issuance_publication as publication,
+            join_receipt::{ExpectedIdentity, Origin},
+            pki::{ca::ClusterCa, csr::ProvenCsr, custody::LearnerCustody},
+            startup_plan::{Owner, tests::Layout},
+        };
+        use custody::ReceiveStage::{self, *};
+        use std::{net::UdpSocket, os::unix::fs::PermissionsExt, sync::TryLockError};
+
+        const ORIGINAL: LogPos = LogPos {
+            term: 1,
+            leader: 1,
+            index: 1,
+        };
+        const PROMOTED: LogPos = LogPos {
+            term: 1,
+            leader: 1,
+            index: 2,
+        };
+
+        fn promoted_store(
+            folder: &std::path::Path,
+            bindings: [(NodeId, KeyDigest); 3],
+            address: SocketAddr,
+        ) -> (SmAdapter, Members) {
+            let mut store = StateStore::open(
+                folder,
+                Init {
+                    cluster: CLUSTER,
+                    first_free: node(5),
+                },
+            )
+            .unwrap();
+            let seed = StoredEntry::Enrollment(Command::Found {
+                cluster: CLUSTER,
+                members: FoundMembers::new(bindings).unwrap(),
+                proposed_at_ms: 100,
+            });
+            assert!(matches!(
+                store.apply(
+                    LogPos {
+                        index: 0,
+                        ..ORIGINAL
+                    },
+                    &seed
+                ),
+                Ok(Some(Outcome::Founded { replay: false }))
+            ));
+            store.apply(ORIGINAL, &StoredEntry::Blank).unwrap();
+            let voters = bindings.map(|(node, _)| node.get());
+            let members = Members::new(
+                vec![voters.into()],
+                voters
+                    .map(|node| (node, BasicNode::new(address.to_string())))
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap();
+            store
+                .apply(
+                    PROMOTED,
+                    &StoredEntry::Membership(encode(&members).unwrap()),
+                )
+                .unwrap();
+            (SmAdapter(Arc::new(Mutex::new(store))), members)
+        }
+
+        async fn run(stop: Option<ReceiveStage>, expected_stages: &[ReceiveStage]) {
+            let route = UdpSocket::bind("0.0.0.0:0").unwrap();
+            route.connect("192.0.2.1:9").unwrap(); // Select a local interface without sending data.
+            let ip = route.local_addr().unwrap().ip();
+            let listener = TcpListener::bind((ip, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(control::qualified(address));
+
+            let receiver = Layout::new();
+            let mut plan = receiver.plan("join");
+            plan.peer = address.to_string();
+            plan.enrollment = SocketAddr::new(ip, 7002).to_string();
+            let mut owner = Owner::acquire(plan).unwrap();
+            let [wrap, staging] = ["wrap", "staging"].map(|name| {
+                let path = receiver.root.path().join(name);
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            });
+            let clock = Arc::new(HostClock::new(0));
+            let now = clock.sample_ms().unwrap();
+            let ca = ClusterCa::ephemeral(CLUSTER, now);
+            let root = ca.cert_der();
+            let issuer = Issuer::from_ca_cert_der(
+                &CertificateDer::from(root),
+                KeyPair::try_from(custody::Wipe(ca.private_marker()).0.as_slice()).unwrap(),
+            )
+            .unwrap();
+            let seconds = (now / 1000) as i64;
+            let client = Fixture::issue(&issuer, CLUSTER, 1, seconds - 60, seconds + 3600);
+            let mut learner = LearnerCustody::create(&owner, &wrap, &staging).unwrap();
+            let csr = ProvenCsr::parse(&learner.seal(CLUSTER, ca.fingerprint()).unwrap()).unwrap();
+            let ticket = crate::cluster::consensus::issue::test_ticket(csr.digest());
+            let target = ticket.node();
+            let leaf = ca.sign_leaf(&ticket, &csr, now).unwrap();
+            let expected = ExpectedIdentity {
+                cluster: CLUSTER,
+                node: target,
+                key: csr.digest(),
+                ca: ca.fingerprint(),
+                origin: Origin::Redeem {
+                    term: ORIGINAL.term,
+                    leader: ORIGINAL.leader,
+                    index: ORIGINAL.index,
+                    anchors: vec![(1, *client.digest().as_bytes())],
+                },
+            };
+            publication::reserve(&mut owner).unwrap();
+            publication::store(
+                &mut owner,
+                Some(&expected),
+                learner.installation(),
+                root,
+                &leaf,
+                &learner.member().unwrap(),
+                Some(now),
+            )
+            .unwrap();
+            let applied = private_temp();
+            let (sm, members) = promoted_store(
+                applied.path(),
+                [
+                    (node(1), client.digest()),
+                    (node(3), KeyDigest::of_spki(&[3]).unwrap()),
+                    (target, csr.digest()),
+                ],
+                address,
+            );
+            let epoch = log_id(2, 1, PROMOTED.index + 1).leader_id;
+            let sample = Sample::issuer_fixture(epoch, id(PROMOTED), members.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let envelope = receiver.root.path().join("voter-custody/ca-key");
+            learner.observe_voter_receive({
+                let sm = sm.clone();
+                let events = events.clone();
+                let envelope = envelope.clone();
+                move |stage| {
+                    events.lock().unwrap().push(stage);
+                    if matches!(stage, ChannelOpen | ReadbackOpen | Confirmed) {
+                        assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
+                        return;
+                    }
+                    let mut store =
+                        sm.0.try_lock()
+                            .expect("apply can proceed at a disk boundary");
+                    assert_eq!(envelope.is_file(), stage == BeforeReadback);
+                    if Some(stage) == stop {
+                        assert!(matches!(
+                            store.apply(
+                                LogPos {
+                                    term: 2,
+                                    index: PROMOTED.index + 1,
+                                    ..PROMOTED
+                                },
+                                &StoredEntry::Enrollment(Command::Remove {
+                                    cluster: CLUSTER,
+                                    node: target,
+                                    proposed_at_ms: 101,
+                                }),
+                            ),
+                            Ok(Some(Outcome::Removed { replay: false }))
+                        ));
+                    }
+                }
+            });
+            let (job, credentials, gate) = Job::issuer_receiver_fixture(
+                PublishedJoin {
+                    owner,
+                    custody: learner,
+                    expected,
+                    leaf,
+                    time: Arc::new(pki::FixedTime(seconds as u64)),
+                },
+                &sm,
+                sample,
+                clock,
+            );
+            let claim = Claim {
+                cluster: CLUSTER,
+                root: ca.fingerprint(),
+                sender: (node(1), *client.digest().as_bytes()),
+                receiver: (target, *csr.digest().as_bytes()),
+                membership: PROMOTED,
+                epoch,
+            };
+            let client_config = verify::client_config(
+                verify::PeerVerifier::new(
+                    credentials.root.clone(),
+                    CLUSTER,
+                    peer_registry::registry(&sm),
+                )
+                .unwrap()
+                .client(target),
+                client.cert.clone(),
+                client.private_key(),
+                credentials.time.clone(),
+            )
+            .unwrap();
+            let dispatch = Spy::exact(None);
+            let (mut transport, _) = TransportOwner::pending_founder(CLUSTER, target);
+            let resources = make_resources_for_learner(
+                CLUSTER,
+                target,
+                &sm,
+                credentials,
+                dispatch.clone(),
+                Some(gate),
+            )
+            .unwrap();
+            transport.publish(&sm, resources, listener).unwrap();
+            transport.receive_issuer_transfer(job).unwrap();
+
+            let mut stream = timeout(OBSERVE, connect(Arc::new(client_config), address))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stream.get_ref().1.handshake_kind(),
+                Some(rustls::HandshakeKind::Full)
+            );
+            assert_eq!(
+                stream.get_ref().1.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            wire::hello(&mut stream, claim).await.unwrap();
+            let challenge = timeout(OBSERVE, wire::read_challenge(&mut stream))
+                .await
+                .unwrap()
+                .unwrap();
+            let transcript = claim.transcript(&challenge);
+            let mut key = Wipe([0; 32]);
+            stream
+                .get_ref()
+                .1
+                .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
+                .unwrap();
+            let sealed = custody::fixture_seal(&key.0, &transcript, root, issuer.key()).unwrap();
+            wire::sealed(&mut stream, &sealed).await.unwrap();
+            let ack = timeout(OBSERVE, wire::read_acknowledgement(&mut stream, &challenge))
+                .await
+                .unwrap();
+            assert_eq!(ack.is_ok(), stop.is_none());
+            drop(stream);
+            transport.close().await.unwrap();
+            assert_eq!(dispatch.count(), 0);
+            assert_eq!(*events.lock().unwrap(), expected_stages);
+            assert_eq!(envelope.exists(), stop != Some(BeforeUnwrap));
+            assert_eq!(
+                envelope.with_file_name("reservation").exists(),
+                stop != Some(BeforeUnwrap)
+            );
+            let survivor = log_id(3, target.get(), PROMOTED.index + 2).leader_id;
+            job.assert_fixture_custody(
+                root,
+                stop.is_none().then_some(PROMOTED),
+                (
+                    Sample::issuer_fixture(survivor, id(PROMOTED), members),
+                    survivor,
+                ),
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn applied_revocation_before_channel_open_refuses_production_receiver() {
+            run(Some(BeforeUnwrap), &[BeforeUnwrap]).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn applied_revocation_before_readback_refuses_production_receiver() {
+            run(
+                Some(BeforeReadback),
+                &[BeforeUnwrap, ChannelOpen, BeforeReadback],
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn production_receiver_holds_apply_guard_through_confirmation() {
+            run(
+                None,
+                &[
+                    BeforeUnwrap,
+                    ChannelOpen,
+                    BeforeReadback,
+                    ReadbackOpen,
+                    Confirmed,
+                ],
+            )
+            .await;
+        }
+    }
 }

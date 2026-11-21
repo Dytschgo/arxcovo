@@ -96,12 +96,14 @@ mod installation {
                 &self.root,
                 now,
                 (key, &CONTEXT, self.sealed.clone()),
-                || Ok(()),
+                (|| Ok(()), || {}),
             )
         }
 
         fn load(&self) -> Result<ClusterCa, Error> {
-            self.learner.load_voter_ca(CLUSTER, &self.root, NOW)
+            self.learner
+                .load_voter_ca(CLUSTER, &self.root, NOW, || Ok(()))
+                .map(|(ca, ())| ca)
         }
     }
 
@@ -163,22 +165,30 @@ mod installation {
     #[test]
     fn refused_fresh_proof_keeps_real_durable_voter_custody_terminal() {
         let mut f = Fixture::new();
+        let mut first = true;
         let result = f.learner.receive_voter_ca(
             &f.owner,
             CLUSTER,
             &f.root,
             NOW,
             (&CHANNEL, &CONTEXT, f.sealed.clone()),
-            || {
-                assert!(
-                    f.receiver
-                        .root
-                        .path()
-                        .join("voter-custody/ca-key")
-                        .is_file()
-                );
-                Err(Error::Ownership)
-            },
+            (
+                || {
+                    if first {
+                        first = false;
+                        return Ok(());
+                    }
+                    assert!(
+                        f.receiver
+                            .root
+                            .path()
+                            .join("voter-custody/ca-key")
+                            .is_file()
+                    );
+                    Err(Error::Ownership)
+                },
+                || {},
+            ),
         );
         assert_eq!(result, Err(Error::Ownership));
         assert!(f.load().is_err());

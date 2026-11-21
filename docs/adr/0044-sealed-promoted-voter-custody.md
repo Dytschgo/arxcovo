@@ -25,28 +25,35 @@ learner staging directory. The learner member inventory and original
 installation locks stay in place. After validating the original DER and
 key at checked time, the receiver seals them under its ADR 0037 context.
 Create-new directory and reservation, checked handles, file and directory
-sync, and authenticated readback precede a fresh local membership proof.
-The proof checks the post-E gate, actual sender, full epoch, membership ID
-and current member bindings before the completion latch can succeed.
-An unavailable or refused proof after the write terminally spends the
-latch. The file can remain durable without becoming loadable or
-activatable in that process. Acknowledgement still checks eligibility
-after install. A lost acknowledgement gives the sender Unknown and
-leaves the admitted transfer slot spent. The receiver keeps its
-confirmed installation when the membership proof succeeded.
+sync, and a checked ciphertext readback precede the completion proof.
+The receiver holds the applied-store guard through channel unwrap, CA
+validation and sealing under the local installation key. It releases the
+guard for create, write, sync and ciphertext inspection. It then obtains
+a second proof and keeps that guard through authenticated readback and
+both confirmation updates. Each proof covers the post-E gate, actual
+sender, full epoch, membership ID and current member bindings. A refused
+proof spends the attempt. Any durable bytes remain without authority
+to load or activate custody. No applied-store guard spans disk I/O or
+an await. Acknowledgement still checks eligibility after install. A lost
+acknowledgement gives the sender Unknown and leaves the admitted
+transfer slot spent. The receiver keeps its confirmed installation when
+the membership proof succeeded.
 
 The transfer validates the root, leaf-validity window and matching P-256
 key on borrowed DER, with an optimizer-resistant wipe for temporary
 plaintext and exporter buffers. Validation and readback create no
 rcgen signer. Ring parses the borrowed PKCS#8 into its internal P-256
-representation. The library's internal key representation and erasure
-are outside this buffer guarantee. The frozen ClusterCa loader runs
+representation and retains an internal AEAD key representation. These
+library key representations and their erasure are outside this buffer
+guarantee. The frozen ClusterCa loader runs
 at actual authorized load and rcgen retains the DER copy needed by
 that signer, as anticipated in ADR 0037. A received envelope or
 terminal refusal cannot materialize a signer.
 
 A promoted voter needs the original loaded CA and the eligible local
-leadership view to activate the retained enrollment endpoint. It uses
+leadership view to activate the retained enrollment endpoint. The applied
+proof protects signer materialization and readiness publication, using the
+full leader epoch from the fresh quorum read for activation. It uses
 the existing clock, AnchorQuery and Redeem path. Under the local trust
 model, revocation refuses future issuer admission. The original issuer
 extends CA trust to the two promoted daemons, and revocation cannot
