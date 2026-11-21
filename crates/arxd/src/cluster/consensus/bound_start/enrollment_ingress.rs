@@ -9,7 +9,7 @@ use crate::cluster::{
 };
 use crate::service::cluster_owner::TIME_EVIDENCE_LEN;
 use anchor_query::AnchorQueryError;
-use checked_clock::{CheckedClock, ClockError, HostClock, checkpoint_lock};
+use checked_clock::{CheckedClock, ClockError, HostClock};
 use issue::found::FOUNDER;
 use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
@@ -19,7 +19,6 @@ use std::{
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
     sync::{Mutex, OnceLock},
-    time::{Duration as StdDuration, Instant as StdInstant},
 };
 use tokio::{net::TcpListener, sync::MutexGuard};
 
@@ -263,8 +262,7 @@ impl CheckedClock for QueryClock<'_> {
 
 impl Job {
     pub(super) fn time_evidence(&self) -> [u8; TIME_EVIDENCE_LEN] {
-        let deadline = StdInstant::now() + StdDuration::from_millis(5);
-        let Some(state) = checkpoint_lock(&self.state, deadline) else {
+        let Ok(state) = self.state.try_lock() else {
             return ExchangeCounts::absent_time_evidence();
         };
         let exchange = state.exchange.clone();
@@ -272,7 +270,7 @@ impl Job {
         drop(state);
         // A checkpoint uses the retained clock without taking the node's
         // admission lock. The campaign serializes it with client exchanges.
-        let sample = issuer.map(|issuer| issuer.clock.sample_checkpoint(deadline));
+        let sample = issuer.map(|issuer| issuer.clock.sample_checkpoint());
         exchange.time_evidence(sample)
     }
 }

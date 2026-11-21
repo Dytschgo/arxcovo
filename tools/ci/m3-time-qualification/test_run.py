@@ -1,8 +1,13 @@
 import contextlib
 import io
+import os
 from pathlib import Path
+import sqlite3
+import stat
 import struct
 import subprocess
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +51,96 @@ class QualificationTests(unittest.TestCase):
         self.assertIn('"event": "additional-failure"', stream.getvalue())
         self.assertNotIn("redacted", stream.getvalue())
 
+    def test_sudo_failure_writes_one_sanitized_record(self):
+        c13 = Mock(HOSTED_ENV={})
+        c13.stage_binary.return_value = "a" * 64
+        for result, error in (
+            (subprocess.CompletedProcess([], 1), "privileged-launch"),
+            (FileNotFoundError("private detail"), "FileNotFoundError"),
+            (subprocess.TimeoutExpired("private detail", 1), "timeout"),
+            (subprocess.CompletedProcess([], run.PRIVILEGED_FAILURE), None),
+        ):
+            with self.subTest(error=error), \
+                    patch.dict(run.os.environ, {"CARGO_TARGET_DIR": str(run.ROOT / "target")}), \
+                    patch.object(run, "c13_tools", return_value=c13), \
+                    patch.object(run, "qualified_source", return_value=("head", "image", "run")), \
+                    patch.object(run.tempfile, "TemporaryDirectory"), \
+                    patch.object(Path, "resolve", return_value=run.ROOT / "target"), \
+                    patch.object(run.subprocess, "run") as invoke, patch.object(run, "emit") as emit:
+                if isinstance(result, Exception):
+                    invoke.side_effect = result
+                else:
+                    invoke.return_value = result
+                self.assertFalse(run.launch())
+                invoke.assert_called_once()
+            records = [call for call in emit.call_args_list if call.args[0] == "first-failure"]
+            self.assertEqual(len(records), int(error is not None))
+            if error is not None:
+                self.assertEqual(records[0].kwargs, {"stage": "sudo", "category": error})
+
+    def test_privileged_validation_failure_writes_first_failure(self):
+        with patch.object(run, "privileged", side_effect=OSError("private detail")), \
+                patch.object(run, "emit") as emit:
+            result = run.main(["--staged", "/tmp/arx-d5-abcdefgh", "a" * 64, "123"])
+        self.assertEqual(result, run.PRIVILEGED_FAILURE)
+        emit.assert_called_once_with("first-failure", stage="privileged-entry", category="OSError")
+        with patch.object(run, "emit") as emit:
+            self.assertEqual(run.main(["--staged", "private detail"]), run.PRIVILEGED_FAILURE)
+        emit.assert_called_once_with("first-failure", stage="privileged-entry", category="staging-pin")
+
+    def test_protected_fixture_requires_root_owned_nonwritable_ancestors(self):
+        path = Path(tempfile.gettempdir()).resolve() / "var/lib/arx-d5-fixture-abcdefgh"
+        protected = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        with patch.object(Path, "lstat", return_value=protected):
+            self.assertIs(run.protected_directory(path), protected)
+        for metadata in (
+            SimpleNamespace(st_mode=stat.S_IFLNK | 0o755, st_uid=0),
+            SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0),
+            SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=1),
+        ):
+            with self.subTest(metadata=metadata), \
+                    patch.object(Path, "lstat", autospec=True,
+                                 side_effect=lambda candidate: metadata if candidate == path.parent else protected):
+                with self.assertRaisesRegex(run.Failure, "fixture-ancestry"):
+                    run.protected_directory(path)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor and journal locking")
+    def test_database_read_stays_with_open_descriptor_after_path_swap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            path = root / "cluster-state.sqlite3"
+            replacement = root / "replacement.sqlite3"
+            for candidate, value in ((path, 7), (replacement, 42)):
+                with contextlib.closing(sqlite3.connect(candidate)) as db:
+                    db.execute("CREATE TABLE witness(value)")
+                    db.execute("INSERT INTO witness VALUES (?)", (value,))
+                    db.commit()
+                candidate.chmod(0o600)
+            (root / (path.name + "-journal")).touch(mode=0o600)
+            original_open = os.open
+
+            def swap_after_open(name, flags, **kwargs):
+                fd = original_open(name, flags, **kwargs)
+                if name == path.name:
+                    try:
+                        self.assertTrue(flags & os.O_NOFOLLOW)
+                        path.rename(root / "opened.sqlite3")
+                        replacement.rename(path)
+                    except BaseException:
+                        os.close(fd)
+                        raise
+                return fd
+
+            with patch.object(run, "DAEMON", os.getuid()), patch.object(run.os, "open", side_effect=swap_after_open):
+                with run.database(path) as db:
+                    self.assertEqual(db.execute("SELECT value FROM witness").fetchone(), (7,))
+            journal = root / (path.name + "-journal")
+            journal.write_bytes(b"hot")
+            with patch.object(run, "DAEMON", os.getuid()), self.assertRaisesRegex(run.Failure, "database-sidecar"):
+                with run.database(path):
+                    self.fail("read uncommitted database")
+
     def test_wait_refuses_when_dwell_reserve_is_unavailable(self):
         with patch.object(run.time, "monotonic_ns", return_value=0), \
                 patch.object(run.time, "monotonic", return_value=0):
@@ -76,31 +171,52 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(sample=sample), self.assertRaises(run.Failure):
                 run.utc_bounds(*sample)
 
-    def test_reference_uses_fixed_tls_requests_and_bounds_trace(self):
+    def test_reference_uses_fixed_requests_with_tls_hostname_verification(self):
         context = Mock()
-        connection = Mock()
-        response = connection.getresponse.return_value
-        response.getheaders.return_value = [("Date", "Sat, 21 Nov 2026 12:00:00 GMT")]
+        raw, tls = Mock(), Mock()
+        raw.__enter__ = Mock(return_value=raw)
+        raw.__exit__ = Mock(return_value=False)
+        tls.__enter__ = Mock(return_value=tls)
+        tls.__exit__ = Mock(return_value=False)
+        context.wrap_socket.return_value = tls
+        utc = b"Date: Sat, 21 Nov 2026 12:00:00 GMT\r\n"
         with patch.object(run.ssl, "create_default_context", return_value=context), \
-                patch.object(run.http.client, "HTTPSConnection", return_value=connection) as https:
-            response.status = 204
+                patch.object(run.socket, "create_connection", return_value=raw) as connect:
+            tls.makefile.return_value = io.BytesIO(b"HTTP/1.1 204 No Content\r\n" + utc + b"\r\n")
             self.assertEqual(run.reference_request(0), 1_795_262_400_000)
-            https.assert_called_once_with("www.google.com", timeout=3, context=context)
-            self.assertEqual(connection.request.call_args.args, ("HEAD", "/generate_204"))
-            response.read.assert_not_called()
-            https.reset_mock()
-            response.status, response.length = 200, 0
-            response.read.return_value = b"ip=ignored\nloc=ignored\nts=1795262400.125\n"
-            self.assertEqual(run.reference_request(1), 1_795_262_400_000)
-            https.assert_called_once_with("1.1.1.1", timeout=3, context=context)
-            connection.request.assert_called_with(
-                "GET", "/cdn-cgi/trace", headers={
-                    "User-Agent": "Time check", "Cache-Control": "no-cache, no-store",
-                    "Connection": "close"})
-            response.read.assert_called_once_with(1024)
-            response.length = 1
-            with self.assertRaisesRegex(run.Failure, "utc-trace-bound"):
-                run.reference_request(1)
+            connect.assert_called_once_with(("www.google.com", 443), timeout=3)
+            context.wrap_socket.assert_called_once_with(raw, server_hostname="www.google.com")
+            self.assertTrue(tls.sendall.call_args.args[0].startswith(b"HEAD /generate_204 HTTP/1.1\r\n"))
+            connect.reset_mock()
+            context.wrap_socket.reset_mock()
+            body = b"ip=ignored\nloc=ignored\nts=1795262400.125\n"
+            tls.makefile.return_value = io.BytesIO(b"HTTP/1.1 200 OK\r\n" + utc +
+                f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            self.assertEqual(run.reference_request(1), 1_795_262_400_125)
+            connect.assert_called_once_with(("1.1.1.1", 443), timeout=3)
+            context.wrap_socket.assert_called_once_with(raw, server_hostname="1.1.1.1")
+            tls.sendall.assert_called_with(
+                b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: Time check\r\n"
+                b"Cache-Control: no-cache, no-store\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n")
+
+    def test_trace_http_rejects_ambiguous_status_headers_and_body(self):
+        good_status = b"HTTP/1.1 200 OK\r\n"
+        date = b"Date: Sat, 21 Nov 2026 12:00:00 GMT\r\n"
+        ts_line = b"ts=1795262400.125\n"
+        length = f"Content-Length: {len(ts_line)}\r\n".encode()
+        for status, headers, body, error in (
+            (b"HTTP/1.1 200 OK\n", date + length, ts_line, "utc-http-status"),
+            (b"HTTP/1.1 200 Fine\r\n", date + length, ts_line, "utc-http-status"),
+            (good_status, date + length + b"Content-Length: 32\r\n", ts_line, "utc-http-framing"),
+            (good_status, date + length + length, ts_line, "utc-http-framing"),
+            (good_status, date + length + b"Transfer-Encoding: chunked\r\n", ts_line, "utc-http-framing"),
+            (good_status, date, ts_line, "utc-http-framing"),
+            (good_status, date + date + length, ts_line, "utc-missing-or-ambiguous"),
+            (good_status, date + b"Content-Length: 1025\r\n", ts_line, "utc-trace-bound"),
+            (good_status, date + length, ts_line[:-1], "utc-trace-bound"),
+        ):
+            with self.subTest(status=status, headers=headers), self.assertRaisesRegex(run.Failure, error):
+                run.reference_response(io.BytesIO(status + headers + b"\r\n" + body), good_status)
 
     def test_trace_requires_a_single_timestamp_within_two_seconds(self):
         run.trace_agreement(b"ts=1795262402\n", 1_795_262_400_000)
@@ -117,9 +233,20 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(run.origin_agreement(timestamp, timestamp + 5000), 5000)
         founder = Mock()
         founder.evidence.return_value.checkpoint_ms = timestamp
-        with patch.object(run, "reference_at", side_effect=[timestamp, timestamp + 5001]), \
+        trace = run.trace_agreement(b"ts=1795262407\n", timestamp + 5000)
+        with patch.object(run, "reference_at", side_effect=[timestamp, trace]), \
                 patch.object(run, "emit"):
             with self.assertRaisesRegex(run.Failure, "utc-origin-mismatch"):
+                run.utc_witness(founder, "mock-stage", 5)
+
+    def test_local_bracket_checks_trace_even_when_cloudflare_date_fits(self):
+        checked = 1_795_262_400_000
+        run.utc_bounds(checked, checked, checked + 28_000)
+        trace = run.trace_agreement(b"ts=1795262428.001\n", checked + 28_000)
+        founder = Mock()
+        founder.evidence.return_value.checkpoint_ms = checked
+        with patch.object(run, "reference_at", side_effect=[checked, trace]), patch.object(run, "emit"):
+            with self.assertRaisesRegex(run.Failure, "utc-outside-premise"):
                 run.utc_witness(founder, "mock-stage", 5)
 
     def test_preflight_failure_stops_before_telemetry_without_retry(self):
@@ -146,20 +273,22 @@ class QualificationTests(unittest.TestCase):
 
     def test_reference_rejects_redirect_without_retry(self):
         context = Mock()
-        connection = Mock()
-        connection.getresponse.return_value.status = 302
+        raw, tls = Mock(), Mock()
+        raw.__enter__ = Mock(return_value=raw)
+        raw.__exit__ = Mock(return_value=False)
+        tls.__enter__ = Mock(return_value=tls)
+        tls.__exit__ = Mock(return_value=False)
+        context.wrap_socket.return_value = tls
+        tls.makefile.return_value = io.BytesIO(b"HTTP/1.1 302 Found\r\n\r\n")
         with patch.object(run.ssl, "create_default_context", return_value=context), \
-                patch.object(run.http.client, "HTTPSConnection", return_value=connection) as https:
+                patch.object(run.socket, "create_connection", return_value=raw) as connect:
             with self.assertRaisesRegex(run.Failure, "utc-source"):
                 run.reference_request(2)
-            https.assert_not_called()
+            connect.assert_not_called()
             with self.assertRaisesRegex(run.Failure, "utc-http-status"):
                 run.reference_request(1)
-        https.assert_called_once_with("1.1.1.1", timeout=3, context=context)
-        connection.request.assert_called_once_with(
-            "GET", "/cdn-cgi/trace", headers={
-                "User-Agent": "Time check", "Cache-Control": "no-cache, no-store", "Connection": "close"})
-        connection.close.assert_called_once()
+        connect.assert_called_once_with(("1.1.1.1", 443), timeout=3)
+        tls.sendall.assert_called_once()
 
     def test_witness_stops_after_failed_origin_without_replacement(self):
         founder = Mock()

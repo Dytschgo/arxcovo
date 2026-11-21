@@ -165,18 +165,20 @@ bytes are version, ordinal, outcome, Query sample status and checkpoint
 sample status. Two big-endian 64-bit timestamp fields follow, then the
 32-byte digest. Sample statuses are absent, accepted and failed. Outcome
 codes are absent, accepted, policy refusal, busy and unavailable, in that
-order. An absent or failed sample has zero in its timestamp field. The
-request takes a checked checkpoint with the same retained issuer clock
-without taking the node's admission lock. The Job state and checked clock
-share one 5 ms wait budget for transient mutex contention on this request.
-Poison and checked sampling failures withhold the checkpoint. The harness
-serializes these samples with client exchanges because they share the
-checked clock. Existing tag-4 status, public enrollment framing, TTL,
-clock policy, proposal and worker code, and all enrollment deadlines stay
-unchanged.
+order. An absent or failed sample has zero in its timestamp field.
+Production samples publish a generation-tagged copy of the clock
+validation state to a separate slot. Publication uses a try-lock and
+contention cannot fail a production sample. The checkpoint takes one
+fresh raw bracket on the retained clock's elapsed anchor and validates
+it against that copy. Busy or stale publication, a changing generation,
+poison or validation failure withholds evidence. The checkpoint holds
+neither the production clock mutex nor the node admission lock and
+writes no clock state. It cannot advance the clock or latch a failure.
 
-The harness reads the fixture's bounded SQLite snapshots and retained log
-using the C13 observation pattern. It correlates the acknowledged Mint to its
+The harness copies each bounded SQLite image from one verified no-follow
+descriptor while holding SQLite's shared rollback-journal lock range.
+It requires an absent or empty rollback journal and opens the copy only
+in memory. It correlates the acknowledged Mint to its
 original full log position and committed expiry, then brackets the late
 Query with equal applied views. Those views must show the same full applied
 and membership positions, enrollment floor, pending record and allocation
@@ -197,18 +199,22 @@ The coordinator approved one verified HTTPS HEAD to
 `https://1.1.1.1/cdn-cgi/trace` per checkpoint. The client validates each
 certificate against its host name or IP address. It reads at most 1024
 bytes of the trace response, using only its `ts=` field and the Date
-header. Both must be present and agree within 2 s. The two origins' Dates
-must agree within 5 s. Every request uses a generic User-Agent and sends
+header. Both must be present and agree within 2 s. The Google Date and
+Cloudflare millisecond timestamp must agree within 5 s. The client
+requires exact HTTP/1.1 status lines, a single Date per response and one
+unambiguous Content-Length for the trace. Transfer-Encoding is refused.
+Every request uses a generic User-Agent and sends
 no repository, owner or personal data, cookies, credentials or query
 parameters. The client follows no redirects and performs no retries.
 Both origins see ordinary HTTPS connection metadata, including the
 runner's public egress IP.
 
-Each Date needs a bounded, unambiguous fresh response. An Age header or an
+Each reference needs a bounded, unambiguous fresh response. An Age header or an
 indication of caching fails the check. Within each before/after bracket
 from the retained issuer's checked clock, the complete offset range must
-fit ±30 s after adding ±1 s for Date resolution and the approved ±1 s
-source accuracy. Each origin passes separately. The five checkpoints cover
+fit ±30 s. Both the Google Date and the millisecond trace timestamp use
+the conservative allowance of ±1 s for Date resolution and ±1 s for
+source accuracy. The five checkpoints cover
 the initial Mint and Query, both sides of the dwell, the late refusal and
 the fresh positive. The qualification artifacts contain relative clock
 readings and reference offset bounds. A shared three-second W1b preflight

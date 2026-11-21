@@ -21,8 +21,10 @@ cleanup reserve. Only the one attributed foreground process gets SIGINT.
 Unknown close or ownership preserves the fixture for runner teardown. The
 first failure remains primary if cleanup fails.
 
-The fixture runs the Linux binary with distinct disposable owner, daemon,
-agent and build UIDs on the qualified default-route address. The owner's
+The privileged fixture is staged in a verified root-owned directory
+under `/var/lib`. Its ancestors allow no group or other writes. The fixture
+runs the Linux binary with distinct disposable owner, daemon, agent and
+build UIDs on the qualified default-route address. The owner's
 private socket supplies the two Mints. The fixture client opens real TLS
 sessions against the original CA and exact retained founder leaf. The
 initial Query verifies its anchor and drops the continuation. The late
@@ -53,7 +55,8 @@ margin and monotonic elapsed. The final owner status and bounded retained
 inventory support partial-effect accounting on failure. The artifact
 contains no paste, code identifiers, proof, CSR, credentials, addresses or
 raw output from the founder. An incomplete witness earns no qualification.
-The grant authorizes a single dispatch.
+Early sudo and privileged-entry failures record a bounded, redacted
+failure category. The grant authorizes a single dispatch.
 
 ## UTC witness and restart
 
@@ -65,10 +68,13 @@ no cookies, credentials, query parameters, repository data, or owner
 identifiers. There are no redirects or retries. The origins receive routine
 HTTPS connection metadata, including the runner's public egress IP. The
 Cloudflare body is bounded to 1024 bytes. The harness reads only `ts=` from
-that body and requires it to agree with the Date header within 2 s. The two
-origins' Dates must agree within 5 s. A missing, cached, ambiguous, failed
-or over-budget sample ends the qualification. Each Date must fit the ±30 s
-premise within the local checked bracket after ±1 s for resolution and ±1 s
+that body and requires it to agree with the Date header within 2 s.
+Google's Date and Cloudflare's millisecond timestamp must agree within
+5 s. Each response must have the exact HTTP/1.1 status line and one Date.
+The trace requires one Content-Length and the client refuses transfer
+encoding. A missing, cached, ambiguous, failed or over-budget sample ends
+the qualification. Both reference values must fit the ±30 s premise
+within the local checked bracket, using ±1 s for resolution and ±1 s for
 assumed source accuracy.
 
 Both sources and their agreement must pass a shared three-second preflight

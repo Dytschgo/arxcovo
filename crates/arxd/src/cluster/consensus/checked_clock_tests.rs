@@ -439,34 +439,68 @@ mod test_source {
 }
 #[cfg(target_os = "linux")]
 #[test]
-fn checkpoint_waits_for_contention_and_refuses_poison_and_clock_failure() {
+fn checkpoint_leaves_retained_state_and_publication_identical() {
     let clock = HostClock::new(0);
-    let guard = clock.state.lock().unwrap();
+    assert_eq!(clock.observe_with(|| Ok(pair(100, 10, 0))), Ok(100));
+    let before = *clock.state.lock().unwrap();
+    let published = *clock.checkpoint.published.lock().unwrap();
+    assert_eq!(clock.checkpoint_with(|| Ok(pair(101, 11, 0))), Ok(101));
     assert_eq!(
-        clock.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
-        Err(ClockError::Unavailable)
+        clock.checkpoint_with(|| Ok(pair(99, 12, 0))),
+        Err(ClockError::Rollback)
     );
+    assert_eq!(*clock.state.lock().unwrap(), before);
+    assert_eq!(*clock.checkpoint.published.lock().unwrap(), published);
+    assert_eq!(clock.checkpoint.generation.load(SeqCst), published.0);
+    assert_eq!(clock.observe_with(|| Ok(pair(102, 12, 0))), Ok(102));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_checkpoint_cannot_deny_a_production_sample() {
+    use std::sync::Barrier;
+
+    let clock = HostClock::new(0);
+    assert_eq!(clock.observe_with(|| Ok(pair(100, 10, 0))), Ok(100));
+    let entered = Barrier::new(2);
+    let resume = Barrier::new(2);
     std::thread::scope(|scope| {
-        let checkpoint =
-            scope.spawn(|| clock.sample_checkpoint(Instant::now() + Duration::from_secs(1)));
-        drop(guard);
-        assert!(checkpoint.join().unwrap().is_ok());
+        let checkpoint = scope.spawn(|| {
+            clock.checkpoint_with(|| {
+                entered.wait();
+                resume.wait();
+                Ok(pair(101, 11, 0))
+            })
+        });
+        entered.wait();
+        let sample = clock.observe_with(|| Ok(pair(102, 12, 0)));
+        resume.wait();
+        assert_eq!(sample, Ok(102));
+        assert_eq!(checkpoint.join().unwrap(), Err(ClockError::Unavailable));
     });
 
-    let failed = HostClock::new(MAX_TIME_MS + 1);
-    assert_eq!(
-        failed.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
-        Err(ClockError::InvalidTime)
-    );
+    let publication = clock.checkpoint.published.lock().unwrap();
+    assert_eq!(clock.observe_with(|| Ok(pair(103, 13, 0))), Ok(103));
+    assert_eq!(clock.sample_checkpoint(), Err(ClockError::Unavailable));
+    drop(publication);
+    assert_eq!(clock.sample_checkpoint(), Err(ClockError::Unavailable));
+    assert_eq!(clock.observe_with(|| Ok(pair(104, 14, 0))), Ok(104));
+    assert_eq!(clock.checkpoint_with(|| Ok(pair(105, 15, 0))), Ok(105));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_poison_and_latched_failure_withhold_checkpoint() {
+    let clock = HostClock::new(0);
     assert!(
-        std::panic::catch_unwind(|| {
-            let _guard = clock.state.lock().unwrap();
-            panic!("poison checkpoint state");
-        })
-        .is_err()
+        std::panic::catch_unwind(|| clock.observe_with(|| panic!("poison production state")))
+            .is_err()
     );
+    assert_eq!(clock.sample_checkpoint(), Err(ClockError::Unavailable));
+    let clock = HostClock::new(0);
     assert_eq!(
-        clock.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
-        Err(ClockError::Unavailable)
+        clock.observe_with(|| Err(ClockError::Anomaly)),
+        Err(ClockError::Anomaly)
     );
+    assert_eq!(clock.sample_checkpoint(), Err(ClockError::Anomaly));
 }

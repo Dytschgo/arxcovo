@@ -2,7 +2,6 @@
 import contextlib
 import email.utils
 import hashlib
-import http.client
 import importlib.util
 import json
 import os
@@ -33,10 +32,17 @@ TOTAL = 1030
 CLEANUP = 25
 FINAL = 55
 ORIGINS = (
-    ("www.google.com", "HEAD", "/generate_204", 204),
-    ("1.1.1.1", "GET", "/cdn-cgi/trace", 200),
+    ("www.google.com", "HEAD", "/generate_204", b"HTTP/1.1 204 No Content\r\n"),
+    ("1.1.1.1", "GET", "/cdn-cgi/trace", b"HTTP/1.1 200 OK\r\n"),
 )
 TRACE_LIMIT = 1024
+HTTP_HEADER_LIMIT = 8192
+FIXTURE_PARENT = Path("/var/lib")
+FIXTURE_NAME = r"arx-d5-fixture-[a-z0-9_]{8}"
+DATABASE_LIMIT = 2048 * 4096
+# SQLite's POSIX rollback-journal locking range: pending byte then shared bytes.
+SQLITE_PENDING = 0x40000000
+PRIVILEGED_FAILURE = 20
 DOMAIN = b"arxcovo-d5-query-v1\0"
 
 
@@ -96,11 +102,46 @@ def bounded_file(path, cap):
     return data
 
 
+def database_snapshot(path):
+    import fcntl
+
+    with contextlib.ExitStack() as owned:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        owned.callback(os.close, directory)
+        parent = os.fstat(directory)
+        require(parent.st_uid == DAEMON and stat.S_IMODE(parent.st_mode) == 0o700, "database-parent")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        source = owned.enter_context(os.fdopen(fd, "rb"))
+        before = os.fstat(source.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                and before.st_uid == DAEMON and stat.S_IMODE(before.st_mode) == 0o600
+                and 100 <= before.st_size <= DATABASE_LIMIT, "database-file")
+        # Hold the pending and shared ranges while copying. A writer that
+        # already holds either conflicting lock makes this observation fail.
+        fcntl.lockf(source, fcntl.LOCK_SH | fcntl.LOCK_NB, 512, SQLITE_PENDING)
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                sidecar = os.stat(path.name + suffix, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            require(suffix == "-journal" and stat.S_ISREG(sidecar.st_mode)
+                    and sidecar.st_uid == DAEMON and sidecar.st_nlink == 1
+                    and sidecar.st_size == 0, "database-sidecar")
+        data = source.read(DATABASE_LIMIT + 1)
+        after = os.fstat(source.fileno())
+        require(len(data) == before.st_size == after.st_size
+                and before.st_mtime_ns == after.st_mtime_ns
+                and data[:16] == b"SQLite format 3\0" and data[18:20] == b"\x01\x01",
+                "database-snapshot")
+        return data
+
+
 @contextlib.contextmanager
 def database(path):
-    regular(path)
-    # Fixed fixture namespace, root-owned parent and a single attributed writer.
-    with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.2)) as db:
+    data = database_snapshot(path)
+    with contextlib.closing(sqlite3.connect(":memory:")) as db:
+        db.deserialize(data)
+        db.execute("PRAGMA trusted_schema=OFF")
         db.execute("PRAGMA query_only=ON")
         yield db
 
@@ -334,6 +375,7 @@ def trace_agreement(body, date_ms):
             "utc-trace-timestamp")
     trace_ms = Decimal(matches[0].decode("ascii")) * 1000
     require(abs(trace_ms - date_ms) <= 2000, "utc-trace-date-mismatch")
+    return int(trace_ms)
 
 
 def origin_agreement(first, second):
@@ -345,31 +387,52 @@ def origin_agreement(first, second):
 def utc_bounds(before, after, reference):
     require(type(reference) is int and 0 < reference <= MAX_TIME
             and 0 < before <= after <= MAX_TIME and after - before <= 6000, "utc-bracket")
-    # Date resolution +/-1 s and coordinator-approved source accuracy +/-1 s.
+    # Conservatively apply Date resolution and source accuracy (each +/-1 s)
+    # to both references, including the millisecond trace timestamp.
     low, high = before - (reference + 2000), after - (reference - 2000)
     require(low >= -SKEW and high <= SKEW, "utc-outside-premise")
     return low, high
 
 
+def reference_response(response, expected):
+    require(response.readline(64) == expected, "utc-http-status")
+    headers, budget = [], HTTP_HEADER_LIMIT
+    while True:
+        line = response.readline(budget + 1)
+        budget -= len(line)
+        require(budget >= 0 and len(headers) <= 48, "utc-header-bound")
+        if line == b"\r\n":
+            break
+        match = re.fullmatch(rb"([!#$%&'*+.^_\x60|~0-9A-Za-z-]+):([\t -~]*)\r\n", line)
+        require(match, "utc-http-header")
+        headers.append((match[1].decode("ascii").lower(), match[2].decode("ascii").strip()))
+    require(not any(key == "transfer-encoding" for key, _ in headers), "utc-http-framing")
+    lengths = [value for key, value in headers if key == "content-length"]
+    date_ms = date_evidence(headers)
+    if expected == ORIGINS[0][3]:
+        require(lengths in ([], ["0"]), "utc-http-framing")
+        return date_ms
+    require(len(lengths) == 1 and re.fullmatch(r"[1-9][0-9]{0,3}", lengths[0]),
+            "utc-http-framing")
+    size = int(lengths[0])
+    require(size <= TRACE_LIMIT, "utc-trace-bound")
+    body = response.read(size)
+    require(len(body) == size, "utc-trace-bound")
+    return trace_agreement(body, date_ms)
+
+
 def reference_request(index):
     require(index in (0, 1), "utc-source")
     host, method, path, expected = ORIGINS[index]
-    connection = http.client.HTTPSConnection(host, timeout=3, context=ssl.create_default_context())
-    try:
-        connection.request(method, path, headers={"User-Agent": "Time check",
-                                                 "Cache-Control": "no-cache, no-store",
-                                                 "Connection": "close"})
-        response = connection.getresponse()
-        require(response.status == expected, "utc-http-status")
-        date_ms = date_evidence(response.getheaders())
-        if method == "GET":
-            body = response.read(TRACE_LIMIT)
-            require(response.length in (None, 0)
-                    and (len(body) < TRACE_LIMIT or response.isclosed()), "utc-trace-bound")
-            trace_agreement(body, date_ms)
-        return date_ms
-    finally:
-        connection.close()
+    context = ssl.create_default_context()
+    request = (f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n"
+               "User-Agent: Time check\r\nCache-Control: no-cache, no-store\r\n"
+               "Accept-Encoding: identity\r\nConnection: close\r\n\r\n").encode("ascii")
+    with socket.create_connection((host, 443), timeout=3) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            tls.sendall(request)
+            with tls.makefile("rb") as response:
+                return reference_response(response, expected)
 
 
 
@@ -837,6 +900,15 @@ def retained_effects(founder):
     }
 
 
+def protected_directory(directory):
+    require(directory.is_absolute() and ".." not in directory.parts, "fixture-ancestry")
+    for part in (*reversed(directory.parents), directory):
+        metadata = part.lstat()
+        require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == 0
+                and not metadata.st_mode & 0o022, "fixture-ancestry")
+    return metadata
+
+
 def privileged(stage, expected_sha, deadline):
     import shutil
     c13 = c13_tools()
@@ -851,12 +923,15 @@ def privileged(stage, expected_sha, deadline):
     work_deadline = cleanup_deadline - CLEANUP
     setup_deadline = min(work_deadline, time.monotonic() + 20)
     roles, fixture, founder = [], None, None
+    fixture_id = None
     first, clean = None, False
     progress = dict(phase="setup", engine_starts=None, found=None, owner_mint_requests=0,
                     client_queries=0, committed_mints=None, enrollment_proposals=None, allocations=None)
     try:
+        protected_directory(FIXTURE_PARENT)
         provision(c13, roles, setup_deadline)
-        fixture = Path(tempfile.mkdtemp(prefix="arx-d5-fixture-", dir="/tmp"))
+        fixture = Path(tempfile.mkdtemp(prefix="arx-d5-fixture-", dir=FIXTURE_PARENT))
+        fixture_id = protected_directory(fixture)
         c13.stage_tree(fixture)
         # The installed owner UID may be unable to traverse the checkout.
         owner_helper = fixture / "tools/owner/run.py"
@@ -901,7 +976,10 @@ def privileged(stage, expected_sha, deadline):
                     require(c13.remove_role(kind, name, uid, deadline) == "removed", "role-disposition")
                 if fixture is not None:
                     remaining(deadline, 6)
-                    require(fixture.parent == Path("/tmp") and stat.S_ISDIR(fixture.lstat().st_mode),
+                    current = protected_directory(fixture)
+                    require(fixture.parent == FIXTURE_PARENT and re.fullmatch(FIXTURE_NAME, fixture.name)
+                            and fixture_id is not None
+                            and (current.st_dev, current.st_ino) == (fixture_id.st_dev, fixture_id.st_ino),
                             "fixture-disposition")
                     shutil.rmtree(fixture)
                     fixture = None
@@ -957,18 +1035,26 @@ def launch():
         sha = c13.stage_binary(target / "debug/arxd", stage / "arxd", deadline - TOTAL + 10)
         emit("build", sha256=sha)
         facts = [f"{key}={value}" for key, value in c13.HOSTED_ENV.items()]
-        result = subprocess.run(
-            ["/usr/bin/sudo", "-n", "/usr/bin/env", *facts, "/usr/bin/python3", "-I", "-B",
-             str(SCRIPT), "--staged", str(stage), sha, str(int((deadline - 3) * 1_000_000))],
-            env=ENV, stdin=subprocess.DEVNULL, timeout=remaining(deadline, TOTAL),
-        )
-    return result.returncode == 0
+        try:
+            result = subprocess.run(
+                ["/usr/bin/sudo", "-n", "/usr/bin/env", *facts, "/usr/bin/python3", "-I", "-B",
+                 str(SCRIPT), "--staged", str(stage), sha, str(int((deadline - 3) * 1_000_000))],
+                env=ENV, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=remaining(deadline, TOTAL),
+            )
+        except (OSError, TimeoutError, subprocess.TimeoutExpired) as error:
+            remember(None, "sudo", error)
+            return False
+        # The privileged entry uses this exit only after emitting its failure.
+        if result.returncode not in (0, PRIVILEGED_FAILURE):
+            remember(None, "sudo", Failure("privileged-launch"))
+        return result.returncode == 0
 
 
 def main(args):
     if len(args) == 4 and args[0] == "--owner":
         _, path, pid, tag = args
-        require(re.fullmatch(r"/tmp/arx-d5-fixture-[a-z0-9_]{8}/a/control/owner\.sock", path)
+        require(re.fullmatch(rf"{FIXTURE_PARENT}/{FIXTURE_NAME}/a/control/owner\.sock", path)
                 and re.fullmatch("[1-9][0-9]{0,9}", pid)
                 and tag in ("1", "4", "5") and os.geteuid() == OWNER, "owner-helper")
         try:
@@ -981,10 +1067,14 @@ def main(args):
         require(args[1] in ("0", "1") and sys.platform == "linux", "reference-helper")
         print(reference_request(int(args[1])))
         return 0
-    if len(args) == 4 and args[0] == "--staged":
-        require(re.fullmatch(r"[a-f0-9]{64}", args[2]) and re.fullmatch(r"[0-9]{1,20}", args[3]),
-                "staging-pin")
-        return 0 if privileged(Path(args[1]), args[2], int(args[3]) / 1_000_000) else 1
+    if args and args[0] == "--staged":
+        try:
+            require(len(args) == 4 and re.fullmatch(r"[a-f0-9]{64}", args[2])
+                    and re.fullmatch(r"[0-9]{1,20}", args[3]), "staging-pin")
+            return 0 if privileged(Path(args[1]), args[2], int(args[3]) / 1_000_000) else PRIVILEGED_FAILURE
+        except Exception as error:
+            remember(None, "privileged-entry", error)
+            return PRIVILEGED_FAILURE
     if args == ["--preflight"]:
         head, image, run = qualified_source(c13_tools(), time.monotonic() + 3)
         emit("preflight", head=head, image=image, run=run, attempt=1, job="qualification")
@@ -999,6 +1089,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
     except Exception as failure:
-        if not sys.argv[1:] or sys.argv[1] in ("--staged", "--preflight"):
+        if not sys.argv[1:] or sys.argv[1] == "--preflight":
             remember(None, "launcher", failure)
         sys.exit(1)

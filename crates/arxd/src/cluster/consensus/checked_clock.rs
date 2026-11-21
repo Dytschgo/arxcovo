@@ -1,8 +1,10 @@
 //! Conditional on trusted host UTC within SKEW_MS at every sensitive sample.
 //! Local anomaly detection does not qualify UTC, restart, or suspend behavior.
 use crate::cluster::enrollment::{MAX_TIME_MS, SKEW_MS};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::{
-    sync::{Mutex, MutexGuard},
+    sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -74,11 +76,18 @@ fn validate(value: Observation) -> Result<(), ClockError> {
     Ok(())
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct State {
     baseline: Option<Observation>,
     last: Option<Observation>,
     failure: Option<ClockError>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct Checkpoint {
+    generation: AtomicU64,
+    published: Mutex<(u64, State)>,
 }
 
 /// No store ownership or startup wiring: construction requires the recovered
@@ -87,18 +96,26 @@ pub(super) struct HostClock {
     anchor: Instant,
     recovered_floor: u64,
     state: Mutex<State>,
+    #[cfg(target_os = "linux")]
+    checkpoint: Box<Checkpoint>,
     // Boxed so test builds keep the inline layout within existing size lints.
     #[cfg(all(test, target_os = "linux"))]
     test_source: Box<Mutex<TestShift>>,
 }
 impl HostClock {
     pub(super) fn new(recovered_floor: u64) -> Self {
+        let state = State {
+            failure: (recovered_floor > MAX_TIME_MS).then_some(ClockError::InvalidTime),
+            ..State::default()
+        };
         Self {
             anchor: Instant::now(),
             recovered_floor,
-            state: Mutex::new(State {
-                failure: (recovered_floor > MAX_TIME_MS).then_some(ClockError::InvalidTime),
-                ..State::default()
+            state: Mutex::new(state),
+            #[cfg(target_os = "linux")]
+            checkpoint: Box::new(Checkpoint {
+                published: Mutex::new((0, state)),
+                ..Checkpoint::default()
             }),
             #[cfg(all(test, target_os = "linux"))]
             test_source: Box::default(),
@@ -111,72 +128,100 @@ impl HostClock {
     ) -> Result<u64, ClockError> {
         // Serialize before touching either raw clock. Contention is transient;
         // poison is permanently unavailable. Neither waits or collects a pair.
-        let state = self.state.try_lock().map_err(|_| ClockError::Unavailable)?;
-        self.observe_locked(state, sample)
-    }
-
-    fn observe_locked(
-        &self,
-        mut state: MutexGuard<'_, State>,
-        sample: impl FnOnce() -> Result<Observation, ClockError>,
-    ) -> Result<u64, ClockError> {
+        let mut state = self.state.try_lock().map_err(|_| ClockError::Unavailable)?;
         if let Some(error) = state.failure {
             return Err(error);
         }
-        let result = (|| {
-            let current = sample()?;
-            validate(current)?;
-            if let Some(last) = state.last {
-                if current.wall_ms < last.wall_ms {
-                    return Err(ClockError::Rollback);
-                }
-                if current.elapsed_ms < last.elapsed_ms {
-                    return Err(ClockError::Anomaly);
-                }
-            }
-            if let Some(base) = state.baseline {
-                let wall_delta = i128::from(current.wall_ms) - i128::from(base.wall_ms);
-                let elapsed_delta = i128::from(current.elapsed_ms) - i128::from(base.elapsed_ms);
-                let envelope = 2 * i128::from(SKEW_MS)
-                    + i128::from(base.bracket_ms)
-                    + i128::from(current.bracket_ms)
-                    + 2;
-                if (wall_delta - elapsed_delta).abs() > envelope {
-                    return Err(ClockError::Anomaly);
-                }
-            } else {
-                if current
-                    .wall_ms
-                    .checked_add(SKEW_MS)
-                    .ok_or(ClockError::InvalidTime)?
-                    < self.recovered_floor
-                {
-                    return Err(ClockError::Behind);
-                }
+        #[cfg(target_os = "linux")]
+        let generation = self
+            .checkpoint
+            .generation
+            .fetch_add(1, SeqCst)
+            .wrapping_add(1);
+        let result = sample().and_then(|current| {
+            self.validate_sample(&state, current)?;
+            if state.baseline.is_none() {
                 state.baseline = Some(current);
             }
             state.last = Some(current);
             Ok(current.wall_ms)
-        })();
+        });
         if let Err(error) = result {
             state.failure = Some(error);
+        }
+        // A busy publication slot only costs evidence. The old generation
+        // will be rejected, including if sampling panics before publication.
+        #[cfg(target_os = "linux")]
+        if let Ok(mut published) = self.checkpoint.published.try_lock() {
+            *published = (generation, *state);
         }
         result
     }
 
-    #[cfg(target_os = "linux")]
-    pub(super) fn sample_checkpoint(&self, deadline: Instant) -> Result<u64, ClockError> {
-        let state = checkpoint_lock(&self.state, deadline).ok_or(ClockError::Unavailable)?;
-        self.observe_locked(state, || self.raw_sample())
+    fn validate_sample(&self, state: &State, current: Observation) -> Result<(), ClockError> {
+        validate(current)?;
+        if let Some(last) = state.last {
+            if current.wall_ms < last.wall_ms {
+                return Err(ClockError::Rollback);
+            }
+            if current.elapsed_ms < last.elapsed_ms {
+                return Err(ClockError::Anomaly);
+            }
+        }
+        if let Some(base) = state.baseline {
+            let wall_delta = i128::from(current.wall_ms) - i128::from(base.wall_ms);
+            let elapsed_delta = i128::from(current.elapsed_ms) - i128::from(base.elapsed_ms);
+            let envelope = 2 * i128::from(SKEW_MS)
+                + i128::from(base.bracket_ms)
+                + i128::from(current.bracket_ms)
+                + 2;
+            if (wall_delta - elapsed_delta).abs() > envelope {
+                return Err(ClockError::Anomaly);
+            }
+        } else if current
+            .wall_ms
+            .checked_add(SKEW_MS)
+            .ok_or(ClockError::InvalidTime)?
+            < self.recovered_floor
+        {
+            return Err(ClockError::Behind);
+        }
+        Ok(())
     }
 
-    fn raw_sample(&self) -> Result<Observation, ClockError> {
-        // One read per sample keeps the test pair coherent across the bracket.
-        #[cfg(all(test, target_os = "linux"))]
-        let shift = *self
-            .test_source
-            .lock()
+    #[cfg(target_os = "linux")]
+    pub(super) fn sample_checkpoint(&self) -> Result<u64, ClockError> {
+        self.checkpoint_with(|| {
+            let (wall, before, after) = self.raw_pair()?;
+            observation(wall, before, after)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn checkpoint_with(
+        &self,
+        sample: impl FnOnce() -> Result<Observation, ClockError>,
+    ) -> Result<u64, ClockError> {
+        let (generation, state) = *self
+            .checkpoint
+            .published
+            .try_lock()
             .map_err(|_| ClockError::Unavailable)?;
+        if self.checkpoint.generation.load(SeqCst) != generation {
+            return Err(ClockError::Unavailable);
+        }
+        if let Some(error) = state.failure {
+            return Err(error);
+        }
+        let current = sample()?;
+        self.validate_sample(&state, current)?;
+        if self.checkpoint.generation.load(SeqCst) != generation {
+            return Err(ClockError::Unavailable);
+        }
+        Ok(current.wall_ms)
+    }
+
+    fn raw_pair(&self) -> Result<(SystemTime, Duration, Duration), ClockError> {
         let before = Instant::now()
             .checked_duration_since(self.anchor)
             .ok_or(ClockError::Anomaly)?;
@@ -184,31 +229,23 @@ impl HostClock {
         let after = Instant::now()
             .checked_duration_since(self.anchor)
             .ok_or(ClockError::Anomaly)?;
-        #[cfg(all(test, target_os = "linux"))]
-        let (wall, before, after) = shift.apply(wall, before, after)?;
-        observation(wall, before, after)
+        Ok((wall, before, after))
     }
 }
 impl CheckedClock for HostClock {
     fn sample_ms(&self) -> Result<u64, ClockError> {
-        self.observe_with(|| self.raw_sample())
-    }
-}
-
-/// Wait only for contention. A poisoned lock never yields a checkpoint.
-#[cfg(target_os = "linux")]
-pub(super) fn checkpoint_lock<T>(mutex: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
-    loop {
-        match mutex.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(_)) => return None,
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        std::thread::sleep(remaining.min(Duration::from_millis(1)));
-        if Instant::now() >= deadline {
-            return None;
-        }
+        self.observe_with(|| {
+            // One read per sample keeps the test pair coherent across the bracket.
+            #[cfg(all(test, target_os = "linux"))]
+            let shift = *self
+                .test_source
+                .lock()
+                .map_err(|_| ClockError::Unavailable)?;
+            let (wall, before, after) = self.raw_pair()?;
+            #[cfg(all(test, target_os = "linux"))]
+            let (wall, before, after) = shift.apply(wall, before, after)?;
+            observation(wall, before, after)
+        })
     }
 }
 
