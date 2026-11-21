@@ -406,6 +406,52 @@ pub(super) mod delegated {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn endpoint_controls(root: &Path) {
+        use crate::local::Acceptor;
+        let profile = Profile {
+            owner_uid: 0,
+            daemon_uid: 1001,
+            agent_group: 1003,
+        };
+        let path = root.join("mcp/socket");
+        assert_eq!(unsafe { libc::geteuid() }, profile.daemon_uid);
+        assert!(group_member(1003, 1003));
+        assert!(!group_member(1001, 1003));
+        assert!(!path.exists());
+        let mut endpoint = AgentListener::bind(path.clone(), profile.clone(), vec![1003]).unwrap();
+        let _wrong_uid = UnixStream::connect(&path).await.unwrap();
+        assert!(endpoint.accept().await.unwrap().is_none());
+
+        // The listening daemon can reach the socket by DAC as its owner; it
+        // is still refused by the group check even with its UID on the list.
+        endpoint.allowed = vec![1001];
+        let _non_member = UnixStream::connect(&path).await.unwrap();
+        assert!(endpoint.accept().await.unwrap().is_none());
+        endpoint.allowed = vec![1003];
+        std::fs::write(root.join("mcp/agent-ready"), b"1").unwrap();
+        let user = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.accept())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.peer_cred().unwrap().uid(), 1003);
+
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(Bound::read(&path, &profile).is_ok());
+        assert!(!endpoint.bound.same(&path, &profile));
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
+
+        let other = root.join("other/socket");
+        let new = AgentListener::bind(other.clone(), profile.clone(), vec![1003]).unwrap();
+        assert!(new.bound.same(&other, &profile));
+        assert!(!endpoint.bound.same(&other, &profile));
+        assert!(AgentListener::bind(root.join("link/socket"), profile, vec![1003]).is_err());
+    }
+
     pub(in crate::local) fn validate(config: &ClientConfig, profile: &Profile) -> Result<()> {
         if config.expected_server_identity != profile.daemon_uid.to_string() {
             return Err(bad());

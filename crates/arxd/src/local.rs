@@ -58,6 +58,8 @@ pub struct LoadedClient {
     delegated: Option<platform::delegated::Profile>,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use platform::delegated::endpoint_controls;
 #[cfg(target_os = "linux")]
 pub(crate) use platform::delegated::{AgentListener, Profile, group_member};
 
@@ -323,7 +325,10 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (sdk_read, sdk_write) = tokio::io::split(sdk);
     let (pump_read, pump_write) = tokio::io::split(pump);
     #[cfg(target_os = "linux")]
-    let close = profile.build.as_ref().map(|_| CloseDelegated(crate::service::Shutdown::default()));
+    let close = profile
+        .build
+        .as_ref()
+        .map(|_| CloseDelegated(crate::service::Shutdown::default()));
     let protocol = async {
         let transport =
             AsyncRwTransport::new_server(sdk_read, sdk_write).with_max_line_length(FRAME_LIMIT);

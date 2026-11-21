@@ -252,6 +252,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
     '    timeout-minutes: 12',
     '        timeout-minutes: 3',
     '        timeout-minutes: 2',
+    '        timeout-minutes: 2',
     '    timeout-minutes: 12',
     '    timeout-minutes: 12',
   ]);

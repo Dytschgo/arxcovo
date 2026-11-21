@@ -166,3 +166,298 @@ fn single_claim_refuses_mutation_wrong_scope_and_expiry() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn commit_racing_shutdown_has_one_terminal_row_and_no_escaped_run() {
+    let (_root, activity, execution, backend, _release) = fixture(false);
+    let reserve = execution.reserve_build().ok().unwrap();
+    let (committed, recorded) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let owned_activity = activity.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        Execution::dispatch_build(
+            reserve,
+            owned_activity,
+            command(),
+            move |activity| {
+                let id = activity.start_delegated_build([8; 32], [9; 32], None)?;
+                committed.send(id).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(id)
+            },
+            |_, _| panic!("a worker entered the prepared broker after shutdown"),
+        )
+    });
+    let id = tokio::time::timeout(Duration::from_secs(5), recorded)
+        .await
+        .unwrap()
+        .unwrap();
+    execution.shutdown();
+    release.send(()).unwrap();
+    let (dispatched_id, status) = worker.await.unwrap().ok().unwrap();
+    assert_eq!(dispatched_id, id);
+    assert!(status.await.is_err());
+    execution.drain().await.unwrap();
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+    let result = activity
+        .delegated_build([8; 32], [9; 32], false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.activity_id, id);
+    assert_eq!(result.outcome, Outcome::Refused);
+    assert!(
+        activity
+            .start_delegated_build([8; 32], [9; 32], None)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_worker_has_no_delegated_listener() {
+    super::super::cluster_runtime::confirm_build_opt_out().await;
+}
+
+#[tokio::test]
+#[ignore = "non-root QEMU protected UID fixture"]
+async fn protected_agent_endpoint_checks_kernel_identity_group_and_pins() {
+    let root = std::path::Path::new("/d4-fixture");
+    super::super::cluster_build_executor::workspace_controls(root);
+    crate::local::endpoint_controls(root).await;
+}
+
+struct Applied {
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+impl Authority for Applied {
+    fn identity(&self) -> Option<([u8; 16], NodeId)> {
+        Some(([8; 16], node(2)))
+    }
+    fn binding(&self, cluster: [u8; 16], id: NodeId) -> Option<[u8; 32]> {
+        if cluster != [8; 16] || id == node(1) && self.revoked.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some([id.get() as u8; 32])
+    }
+    fn client(&self, _: NodeId) -> Option<Arc<rustls::ClientConfig>> {
+        None
+    }
+    fn server(&self) -> Option<Arc<rustls::ServerConfig>> {
+        None
+    }
+}
+
+fn node(value: u64) -> NodeId {
+    NodeId::new(value).unwrap()
+}
+
+fn descriptor(workspace: &str) -> Descriptor {
+    let request = command();
+    Descriptor {
+        workspace: workspace.into(),
+        tool: request.tool.unwrap(),
+        args: request.args,
+        timeout_s: request.timeout_s,
+        output_bytes: request.output_bytes,
+    }
+}
+
+async fn ask(
+    service: &BuildService,
+    authority: &Arc<Applied>,
+    source: u64,
+    query: Query,
+) -> Response {
+    let key = [source as u8; 32];
+    service
+        .handle(
+            authority.clone(),
+            Identity {
+                cluster: [8; 16],
+                node: node(source),
+                key,
+            },
+            Envelope {
+                version: VERSION,
+                cluster: [8; 16],
+                source: node(source),
+                target: node(2),
+                agent: "fixture".into(),
+                query,
+            },
+        )
+        .await
+}
+
+fn spend(operation: Operation, lease: Secret, workspace: &str) -> Query {
+    Query::Spend {
+        operation,
+        lease,
+        descriptor: descriptor(workspace),
+    }
+}
+
+#[tokio::test]
+async fn broker_busy_drain_and_revocation_refuse_before_activity() {
+    use super::super::cluster_build_executor::refusal_fixture;
+    let (temp, activity, execution, backend, _) = fixture(false);
+    let (broker, capacity, task) = refusal_fixture(temp.path(), "/usr".into());
+    let applied = Arc::new(Applied {
+        revoked: false.into(),
+    });
+    let policy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let current = policy.clone();
+    let service = BuildService {
+        activity,
+        execution: Some(execution.clone()),
+        broker: Some(broker),
+        grants: vec![
+            Grant {
+                source: node(1),
+                key: [1; 32],
+                agent: "fixture".into(),
+                commands: vec![descriptor("bin")],
+            },
+            Grant {
+                source: node(3),
+                key: [3; 32],
+                agent: "fixture".into(),
+                commands: vec![descriptor("lib")],
+            },
+        ],
+        routes: BTreeMap::new(),
+        agents: BTreeMap::new(),
+        authority: RwLock::new(None),
+        policy_current: Arc::new(move || current.load(Ordering::SeqCst)),
+        leases: Leases::default(),
+        stop: Shutdown::default(),
+    };
+    let grant = |slot| Query::Grant(descriptor(slot));
+    assert!(matches!(
+        ask(&service, &applied, 3, grant("lib")).await,
+        Response::Granted { .. }
+    ));
+    assert!(matches!(
+        ask(&service, &applied, 1, grant("lib")).await,
+        Response::Refused
+    ));
+    let Response::Granted { operation, lease } = ask(&service, &applied, 1, grant("bin")).await
+    else {
+        panic!("B-local slot failed its no-spawn check")
+    };
+    assert!(matches!(
+        ask(&service, &applied, 1, spend(operation, lease, "lib")).await,
+        Response::Refused
+    ));
+    policy.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        ask(&service, &applied, 1, spend(operation, lease, "bin")).await,
+        Response::Refused
+    ));
+    policy.store(true, Ordering::SeqCst);
+    applied.revoked.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        ask(&service, &applied, 1, spend(operation, lease, "bin")).await,
+        Response::Refused
+    ));
+    applied.revoked.store(false, Ordering::SeqCst);
+    let held = capacity.clone().try_acquire_owned().unwrap();
+    assert!(matches!(
+        ask(&service, &applied, 1, spend(operation, lease, "bin")).await,
+        Response::Refused
+    ));
+    assert!(matches!(
+        ask(&service, &applied, 1, Query::Status { operation }).await,
+        Response::Refused
+    ));
+    drop(held);
+
+    let Response::Granted { operation, lease } = ask(&service, &applied, 1, grant("bin")).await
+    else {
+        panic!("mirror capacity did not reopen")
+    };
+    capacity.close();
+    assert!(matches!(
+        ask(&service, &applied, 1, spend(operation, lease, "bin")).await,
+        Response::Refused
+    ));
+    assert!(matches!(
+        ask(&service, &applied, 1, Query::Status { operation }).await,
+        Response::Refused
+    ));
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+    let db = rusqlite::Connection::open(temp.path().join("activity.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row::<u64, _, _>("SELECT count(*) FROM activity", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    execution.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_http_inventory_cannot_submit_an_explicit_target() {
+    use rmcp::{
+        ServiceExt,
+        model::CallToolRequestParams,
+        transport::{
+            StreamableHttpClientTransport,
+            streamable_http_client::StreamableHttpClientTransportConfig,
+        },
+    };
+    let (root, activity, _, backend, _) = fixture(false);
+    let token = "a".repeat(64);
+    let config = Arc::new(crate::config::Config {
+        agents: vec![crate::config::Agent {
+            principal: "fixture".into(),
+            token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
+        }],
+        state_dir: root.path().into(),
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = crate::http::router(config, address, activity);
+    let stop = Shutdown::default();
+    let closed = stop.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move { closed.cancelled().await })
+            .await
+            .unwrap();
+    });
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
+            .auth_header(token),
+    );
+    let client = tokio::time::timeout(Duration::from_secs(5), ().serve(transport))
+        .await
+        .unwrap()
+        .unwrap();
+    let tools = client.list_tools(None).await.unwrap();
+    assert!(
+        tools
+            .tools
+            .iter()
+            .all(|t| t.name != "delegated_build_status")
+    );
+    let arguments = json!({"target":2,"workspace":"bin","tool":"cargo","args":["--version"]});
+    let request = CallToolRequestParams::new("run_command")
+        .with_arguments(arguments.as_object().unwrap().clone());
+    assert!(client.call_tool(request).await.is_err());
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+    let db = rusqlite::Connection::open(root.path().join("activity.sqlite3")).unwrap();
+    assert_eq!(
+        db.query_row::<u64, _, _>("SELECT count(*) FROM delegated_build", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+    let _ = client.cancel().await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}

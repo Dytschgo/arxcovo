@@ -19,18 +19,17 @@ fn descriptor_cannot_name_a_host_path_or_unbounded_command() {
 
 use super::{Authority, IO_BUDGET, accept, call};
 use crate::cluster::{
-    enrollment::{ClusterId, KeyDigest, NodeId},
+    enrollment::{ClusterId, Command, FoundMembers, KeyDigest, NodeId},
+    membership::Membership,
     pki::{node_uri, verify},
+    state_store::{Entry, Init, LogPos, MembershipBlob, StateStore},
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
     KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 struct Peer {
     node: NodeId,
@@ -38,22 +37,17 @@ struct Peer {
     leaf: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     bindings: [[u8; 32]; 2],
-    revoked: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<StateStore>>,
 }
 
 impl Peer {
     fn verifier(&self) -> verify::PeerVerifier {
-        let bindings = self.bindings;
-        let revoked = self.revoked.clone();
+        let snapshot = self.snapshot.clone();
         verify::PeerVerifier::new(
             self.root.clone(),
             [4; 16],
             Arc::new(move |cluster, node, key| {
-                let allowed = cluster == [4; 16]
-                    && (1..=2).contains(&node.get())
-                    && !(node.get() == 2 && revoked.load(Ordering::Acquire))
-                    && bindings[node.get() as usize - 1] == *key.as_bytes();
-                allowed
+                (super::applied_binding(&snapshot.lock().unwrap(), cluster, node) == Some(key))
                     .then_some(())
                     .ok_or(verify::VerifyRefusal::NotMember)
             }),
@@ -67,13 +61,8 @@ impl Authority for Peer {
         Some(([4; 16], self.node))
     }
     fn binding(&self, cluster: ClusterId, node: NodeId) -> Option<[u8; 32]> {
-        if cluster != [4; 16]
-            || !(1..=2).contains(&node.get())
-            || (node.get() == 2 && self.revoked.load(Ordering::Acquire))
-        {
-            return None;
-        }
-        Some(self.bindings[node.get() as usize - 1])
+        super::applied_binding(&self.snapshot.lock().unwrap(), cluster, node)
+            .map(|key| *key.as_bytes())
     }
     fn client(&self, target: NodeId) -> Option<Arc<rustls::ClientConfig>> {
         let mut config = verify::client_config(
@@ -99,7 +88,33 @@ impl Authority for Peer {
     }
 }
 
-fn peers() -> [Peer; 2] {
+fn pos(index: u64) -> LogPos {
+    LogPos {
+        index,
+        term: 1,
+        leader: 1,
+    }
+}
+
+fn membership(joint: bool) -> MembershipBlob {
+    let voters = if joint {
+        vec![[1].into(), [1, 2].into()]
+    } else {
+        vec![[1].into()]
+    };
+    MembershipBlob::new(
+        Membership::new(
+            voters,
+            [(1, "127.0.0.1:42001".into()), (2, "127.0.0.1:42002".into())].into(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn peers(root_dir: &std::path::Path) -> [Peer; 2] {
     let authority = KeyPair::generate().unwrap();
     let mut ca = CertificateParams::default();
     ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -112,7 +127,36 @@ fn peers() -> [Peer; 2] {
             .unwrap()
             .as_bytes()
     });
-    let revoked = Arc::new(AtomicBool::new(false));
+    let mut snapshot = StateStore::open(
+        root_dir,
+        Init {
+            cluster: [4; 16],
+            first_free: NodeId::new(3).unwrap(),
+        },
+    )
+    .unwrap();
+    // Synthetic state-machine entries. No retained job, Found operation or Engine.
+    snapshot
+        .apply(
+            pos(0),
+            &Entry::Enrollment(Command::Found {
+                cluster: [4; 16],
+                members: FoundMembers::new(keys.iter().enumerate().map(|(i, k)| {
+                    (
+                        NodeId::new(i as u64 + 1).unwrap(),
+                        KeyDigest::of_spki(&k.subject_public_key_info()).unwrap(),
+                    )
+                }))
+                .unwrap(),
+                proposed_at_ms: 1,
+            }),
+        )
+        .unwrap();
+    assert!(super::applied_binding(&snapshot, [4; 16], NodeId::new(2).unwrap()).is_none());
+    snapshot
+        .apply(pos(1), &Entry::Membership(membership(false)))
+        .unwrap();
+    let snapshot = Arc::new(Mutex::new(snapshot));
     let mut ids = 1..=2;
     keys.map(|key| {
         let node = NodeId::new(ids.next().unwrap()).unwrap();
@@ -131,14 +175,17 @@ fn peers() -> [Peer; 2] {
             leaf: certificate.der().clone(),
             key: PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
             bindings,
-            revoked: revoked.clone(),
+            snapshot: snapshot.clone(),
         }
     })
 }
 
 #[tokio::test]
 async fn actual_mutual_tls_checks_peer_identity_and_status_scope() {
-    let [source, target] = peers();
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let [source, target] = peers(dir.path());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let request = || Envelope {
@@ -179,7 +226,27 @@ async fn actual_mutual_tls_checks_peer_identity_and_status_scope() {
             .await
             .is_none()
     );
-    source.revoked.store(true, Ordering::Release);
+    {
+        let mut applied = source.snapshot.lock().unwrap();
+        applied
+            .apply(pos(2), &Entry::Membership(membership(true)))
+            .unwrap();
+        assert!(super::applied_binding(&applied, [4; 16], source.node).is_none());
+        applied
+            .apply(pos(3), &Entry::Membership(membership(false)))
+            .unwrap();
+        assert!(super::applied_binding(&applied, [4; 16], target.node).is_some());
+        applied
+            .apply(
+                pos(4),
+                &Entry::Enrollment(Command::Remove {
+                    cluster: [4; 16],
+                    node: target.node,
+                    proposed_at_ms: 2,
+                }),
+            )
+            .unwrap();
+    }
     assert!(
         call(&source, address, source.bindings[1], request(), IO_BUDGET)
             .await

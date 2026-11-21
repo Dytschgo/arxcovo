@@ -287,17 +287,7 @@ impl BuildPeer {
         let sm = state.keeper.clone()?;
         drop(state);
         let store = build_lock(&sm.0)?;
-        let (position, membership) = store.membership()?;
-        let applied = store.applied()?;
-        let members = crate::cluster::membership::Membership::decode(membership.bytes()).ok()?;
-        if store.is_poisoned()
-            || (applied != *position && applied.index <= position.index)
-            || members.configs().len() != 1
-            || !members.nodes().contains_key(&node.get())
-        {
-            return None;
-        }
-        store.state().bound_key(cluster, node).ok()
+        crate::cluster::delegated_build::applied_binding(&store, cluster, node)
     }
 
     pub(super) fn binding(&self, cluster: ClusterId, node: NodeId) -> Option<[u8; 32]> {

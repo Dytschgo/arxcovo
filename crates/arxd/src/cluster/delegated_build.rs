@@ -11,6 +11,24 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 mod tests;
 pub(crate) mod wire;
 
+pub(in crate::cluster) fn applied_binding(
+    store: &super::state_store::StateStore,
+    cluster: ClusterId,
+    node: NodeId,
+) -> Option<super::enrollment::KeyDigest> {
+    let (position, membership) = store.membership()?;
+    let applied = store.applied()?;
+    let members = super::membership::Membership::decode(membership.bytes()).ok()?;
+    if store.is_poisoned()
+        || (applied != *position && applied.index <= position.index)
+        || members.configs().len() != 1
+        || !members.nodes().contains_key(&node.get())
+    {
+        return None;
+    }
+    store.state().bound_key(cluster, node).ok()
+}
+
 pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
 const PROTOCOL: &[u8] = b"arxcovo-build/1";
 

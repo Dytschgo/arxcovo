@@ -562,6 +562,22 @@ struct BuildRuntime {
 }
 
 impl BuildRuntime {
+    async fn configured(
+        settings: Option<cluster_build::Settings>,
+        roles: &cluster_owner::Roles,
+        execution: Option<Arc<super::executor::Execution>>,
+        broker: Option<super::cluster_build_executor::BuildBroker>,
+        policy: (PathBuf, ConfigStamp),
+        stop: Shutdown,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(settings) = settings else {
+            return Ok(None);
+        };
+        Self::bind(settings, roles, execution, broker, policy, stop)
+            .await
+            .map(Some)
+    }
+
     async fn bind(
         settings: cluster_build::Settings,
         roles: &cluster_owner::Roles,
@@ -1133,21 +1149,16 @@ async fn process(
         }
         None => (None, None),
     };
-    let build = match checked.delegated_build.take() {
-        Some(settings) => Some(
-            BuildRuntime::bind(
-                settings,
-                &checked.roles,
-                executor.clone(),
-                broker,
-                (checked.installation.config.clone(), checked.stamp),
-                stop.clone(),
-            )
-            .await
-            .map_err(|_| ())?,
-        ),
-        None => None,
-    };
+    let build = BuildRuntime::configured(
+        checked.delegated_build.take(),
+        &checked.roles,
+        executor.clone(),
+        broker,
+        (checked.installation.config.clone(), checked.stamp),
+        stop.clone(),
+    )
+    .await
+    .map_err(|_| ())?;
     let signal_fence = fence.clone();
     let signal_stop = tokio::spawn(async move {
         saw_signal.cancelled().await;
@@ -1166,6 +1177,28 @@ async fn process(
     signal_stop.abort();
     forwarding.abort();
     result
+}
+
+#[cfg(test)]
+pub(super) async fn confirm_build_opt_out() {
+    let roles = cluster_owner::Roles {
+        owner: 0,
+        daemon: 0,
+        agent: 0,
+        build: 0,
+        group: 0,
+    };
+    let disabled = BuildRuntime::configured(
+        None,
+        &roles,
+        None,
+        None,
+        (PathBuf::new(), ConfigStamp([0; 32])),
+        Shutdown::default(),
+    )
+    .await
+    .unwrap();
+    assert!(disabled.is_none());
 }
 
 struct ParentControl {
