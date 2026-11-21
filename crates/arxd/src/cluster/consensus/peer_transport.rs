@@ -381,6 +381,11 @@ impl TransportOwner {
                     Err(reason) => {
                         drop(state);
                         drop(join_errors);
+                        #[cfg(all(test, target_os = "linux"))]
+                        GatedCallTrace::server_event(
+                            trace.as_deref().map(|trace| (trace, _peer)),
+                            Event::Refused(reason),
+                        );
                         event(&shared, Event::Refused(reason));
                         continue;
                     }
@@ -409,6 +414,10 @@ impl TransportOwner {
                     #[cfg(all(test, target_os = "linux"))]
                     if let Some(trace) = &trace {
                         trace.inbound(_peer, "finished", trace_refusal(result.as_ref().err()));
+                        GatedCallTrace::server_event(
+                            Some((trace, _peer)),
+                            Event::Finished(result.as_ref().err().copied()),
+                        );
                     }
                     event(&task_shared, Event::Finished(result.err()));
                 });
@@ -658,6 +667,8 @@ async fn inbound(
     #[cfg(all(test, target_os = "linux"))] trace: Option<(&GatedCallTrace, SocketAddr)>,
 ) -> Result<(), Refusal> {
     let source = socket.peer_addr();
+    #[cfg(all(test, target_os = "linux"))]
+    GatedCallTrace::server_event(trace, Event::Stage(Stage::ServerHandshake));
     stage(shared, Stage::ServerHandshake).await;
     before_dispatch(shared, deadline)?;
     #[cfg(all(test, target_os = "linux"))]
@@ -703,6 +714,8 @@ async fn inbound(
     }
     authorized.map_err(|_| Refusal::Tls)?;
     drop(handshake);
+    #[cfg(all(test, target_os = "linux"))]
+    GatedCallTrace::server_event(trace, Event::Stage(Stage::ServerAuthenticated));
     stage(shared, Stage::ServerAuthenticated).await;
     before_dispatch(shared, deadline)?;
     if peer.0 != resources.cluster {
@@ -769,6 +782,8 @@ async fn inbound(
         return send_frame(&mut stream, &frame).await;
     }
     let frame = read_frame(&mut magic.as_slice().chain(&mut stream), route, None).await?;
+    #[cfg(all(test, target_os = "linux"))]
+    GatedCallTrace::server_event(trace, Event::Stage(Stage::RequestRead));
     stage(shared, Stage::RequestRead).await;
     before_dispatch(shared, deadline)?;
     clean_end(&mut stream).await?;
@@ -776,13 +791,11 @@ async fn inbound(
     request.shape(resources.cluster, peer.1)?;
     let expected = request.expected();
     #[cfg(all(test, target_os = "linux"))]
-    if let Some(observe) = shared.hooks.gated_dispatch.lock().unwrap().take() {
-        let _ = observe.send(source.ok());
-    }
-    #[cfg(all(test, target_os = "linux"))]
     if let Some((trace, peer)) = trace {
         trace.inbound(peer, "before dispatch", None);
     }
+    #[cfg(all(test, target_os = "linux"))]
+    GatedCallTrace::server_event(trace, Event::Stage(Stage::BeforeDispatch));
     stage(shared, Stage::BeforeDispatch).await;
     before_dispatch(shared, deadline)?;
     if let Some(learner) = &resources.learner {
@@ -808,6 +821,8 @@ async fn inbound(
         }
         let _lane = authorized.map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
+        #[cfg(all(test, target_os = "linux"))]
+        GatedCallTrace::server_event(trace, Event::LearnerDispatch(_lane));
         #[cfg(test)]
         event(shared, Event::LearnerDispatch(_lane));
     } else {
@@ -839,6 +854,8 @@ async fn inbound(
         source: route.target,
         target: route.source,
     })?;
+    #[cfg(all(test, target_os = "linux"))]
+    GatedCallTrace::server_event(trace, Event::Stage(Stage::BeforeReply));
     stage(shared, Stage::BeforeReply).await;
     if Instant::now() >= deadline {
         return Err(Refusal::Deadline);
@@ -1003,7 +1020,7 @@ async fn outbound(
         if let Ok(socket) = &socket
             && let Ok(address) = socket.local_addr()
         {
-            let _ = trace.source.set(address);
+            trace.set_source(address);
         }
         trace.caller(
             "connect",
@@ -1177,12 +1194,78 @@ pub(super) struct GatedCallTrace {
     source: std::sync::OnceLock<SocketAddr>,
     caller: Mutex<Vec<TimedStage>>,
     inbound: Mutex<Vec<(SocketAddr, TimedStage)>>,
+    server_events: Mutex<GatedServerEvents>,
+    server_changed: tokio::sync::Notify,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+const GATED_EVENT_LIMIT: usize = 8 * CONNECTIONS;
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+struct GatedServerEvents {
+    candidates: Vec<(SocketAddr, Instant, Event)>,
+    unrelated: Vec<(Duration, Event)>,
+    candidates_overflowed: bool,
+    unrelated_omitted: usize,
 }
 #[cfg(all(test, target_os = "linux"))]
 type TimedStage = (Duration, &'static str, Option<String>);
 
 #[cfg(all(test, target_os = "linux"))]
 impl GatedCallTrace {
+    fn set_source(&self, source: SocketAddr) {
+        let _ = self.source.set(source);
+        self.server_changed.notify_one();
+    }
+
+    fn server_event(trace: Option<(&Self, SocketAddr)>, event: Event) {
+        let Some((trace, peer)) = trace else { return };
+        let Some(entry) = trace.entry.get() else {
+            return;
+        };
+        let at = Instant::now();
+        let mut events = trace.server_events.lock().unwrap();
+        if trace.source.get().is_some_and(|source| *source != peer) {
+            if events.unrelated.len() < GATED_EVENT_LIMIT {
+                events.unrelated.push((at.duration_since(*entry), event));
+            } else {
+                events.unrelated_omitted = events.unrelated_omitted.saturating_add(1);
+            }
+            return;
+        }
+        if events.candidates.len() < GATED_EVENT_LIMIT {
+            events.candidates.push((peer, at, event));
+        } else {
+            events.candidates_overflowed = true;
+        }
+        drop(events);
+        trace.server_changed.notify_one();
+    }
+
+    // The accept task may report stages before the caller publishes its endpoint.
+    // Keep those candidates until a single reader can correlate them.
+    pub(super) async fn next_server_event(
+        &self,
+        cursor: &mut usize,
+    ) -> Result<(SocketAddr, Instant, Event), &'static str> {
+        loop {
+            if let Some(source) = self.source.get() {
+                let events = self.server_events.lock().unwrap();
+                if events.candidates_overflowed {
+                    return Err("gated transport observation overflowed");
+                }
+                for &(peer, at, event) in &events.candidates[*cursor..] {
+                    *cursor += 1;
+                    if peer == *source {
+                        return Ok((peer, at, event));
+                    }
+                }
+            }
+            self.server_changed.notified().await;
+        }
+    }
+
     pub(super) fn caller(&self, stage: &'static str, error: Option<String>) {
         if let Some(entry) = self.entry.get() {
             self.caller
@@ -1215,10 +1298,24 @@ impl GatedCallTrace {
             .filter(|(peer, _)| Some(peer) == self.source.get())
             .map(|(_, stage)| stage.clone())
             .collect::<Vec<_>>();
+        let events = self.server_events.lock().unwrap();
+        let mut unrelated = Vec::new();
+        if let (Some(source), Some(entry)) = (self.source.get(), self.entry.get()) {
+            unrelated.extend(
+                events
+                    .candidates
+                    .iter()
+                    .filter(|(peer, _, _)| peer != source)
+                    .map(|(_, at, event)| (at.duration_since(*entry), *event)),
+            );
+        }
+        unrelated.extend_from_slice(&events.unrelated);
         (
             self.soft_ttl.get().copied(),
             self.caller.lock().unwrap().clone(),
             inbound,
+            unrelated,
+            events.unrelated_omitted,
         )
     }
 }
@@ -1270,8 +1367,6 @@ struct TestHooks {
     drop_issuer_ack: std::sync::atomic::AtomicBool,
     events: Mutex<Option<tokio::sync::mpsc::Sender<Event>>>,
     gates: Mutex<std::collections::BTreeMap<Stage, Arc<Semaphore>>>,
-    #[cfg(all(test, target_os = "linux"))]
-    gated_dispatch: Mutex<Option<oneshot::Sender<Option<SocketAddr>>>>,
     #[cfg(all(test, target_os = "linux"))]
     gated_caller: Mutex<Option<GatedCaller>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -1918,21 +2013,6 @@ impl TransportOwner {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         *self.shared.hooks.events.lock().unwrap() = Some(tx);
         rx
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(super) fn observe_gated_dispatch(&self) -> oneshot::Receiver<Option<SocketAddr>> {
-        let (sender, receiver) = oneshot::channel();
-        assert!(
-            self.shared
-                .hooks
-                .gated_dispatch
-                .lock()
-                .unwrap()
-                .replace(sender)
-                .is_none()
-        );
-        receiver
     }
 
     #[cfg(all(test, target_os = "linux"))]

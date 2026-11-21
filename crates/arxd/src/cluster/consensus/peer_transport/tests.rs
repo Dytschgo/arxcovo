@@ -3969,6 +3969,79 @@ async fn listen_learner_for_test(
     (owner, address)
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() {
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let learner = learner_image(&f, 1, true, &f.sm);
+    let spy = rpc_spy(false);
+    let (mut owner, address) = listen_learner_for_test(&f, &f.sm, learner, spy.clone()).await;
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut shared_events = events(&owner);
+    let trace = Arc::new(GatedCallTrace::default());
+    trace.entry.set(Instant::now()).unwrap();
+    owner.observe_gated_inbound(&trace);
+
+    let exchange = timeout(OBSERVE, async {
+        let mut stream = connect(f.client_config(&f.client, 2), address)
+            .await
+            .unwrap();
+        let source = stream.get_ref().0.local_addr().unwrap();
+        let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+        send_frame(&mut stream, &frame, false).await.unwrap();
+        assert!(observe(&mut shared_events, Event::Stage(Stage::BeforeDispatch)).await);
+
+        // The accept task can publish stages before connect reports the source.
+        trace.set_source(source);
+        let mut cursor = 0;
+        for expected in [
+            Stage::ServerHandshake,
+            Stage::ServerAuthenticated,
+            Stage::RequestRead,
+            Stage::BeforeDispatch,
+        ] {
+            let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+            assert_eq!((peer, event), (source, Event::Stage(expected)));
+        }
+
+        // The second socket stays in TLS while the selected call is gated.
+        let unrelated = TcpStream::connect(address).await.unwrap();
+        assert_ne!(unrelated.local_addr().unwrap(), source);
+        assert_eq!(
+            shared_events.recv().await,
+            Some(Event::Stage(Stage::ServerHandshake))
+        );
+        assert!(spy.calls.lock().unwrap().is_empty());
+        release(&owner, Stage::BeforeDispatch, &hold);
+
+        let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+        assert_eq!(peer, source);
+        assert!(matches!(event, Event::LearnerDispatch(_)));
+        for expected in [Event::Stage(Stage::BeforeReply), Event::Finished(None)] {
+            let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+            assert_eq!((peer, event), (source, expected));
+        }
+        assert!(
+            trace
+                .server_events
+                .lock()
+                .unwrap()
+                .unrelated
+                .iter()
+                .any(|(_, event)| *event == Event::Stage(Stage::ServerHandshake))
+        );
+        read_frame(&mut stream).await.unwrap();
+        clean_eof(&mut stream).await.unwrap();
+        drop(unrelated);
+        frame
+    })
+    .await;
+    release(&owner, Stage::BeforeDispatch, &hold);
+    assert!(bounded_close(&mut owner).await.is_ok());
+    assert_eq!(spy.calls.lock().unwrap().as_slice(), &[exchange.unwrap()]);
+}
+
 async fn exchange_learner_for_test(
     address: SocketAddr,
     config: Arc<ClientConfig>,
