@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
@@ -25,18 +27,49 @@ test('CI runs unconditional Rust and UI matrices in parallel behind the existing
 });
 
 test('required gates accept only both successful matrices, including failed, cancelled, skipped and missing results', () => {
-  // Exercise the actual workflow command, including its exit status, rather
-  // than reimplementing the boolean decision in the test.
   const actualGate = jobs.verify.match(/^ {8}run: (.+)$/m)?.[1];
   assert.equal(actualGate, gate);
+  const cases = [];
   for (const rust of ['success', 'failure', 'cancelled', 'skipped', '']) {
     for (const ui of ['success', 'failure', 'cancelled', 'skipped', '']) {
       const command = actualGate.replace('${{ needs.rust.result }}', rust).replace('${{ needs.ui.result }}', ui);
-      const result = spawnSync('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', timeout: 10_000 });
-      assert.ifError(result.error);
-      assert.equal(result.signal, null);
-      assert.equal(result.status, rust === 'success' && ui === 'success' ? 0 : 1, `rust=${rust}, ui=${ui}: ${result.stderr}`);
+      cases.push({ rust, ui, command });
     }
+  }
+
+  const directory = mkdtempSync(join(tmpdir(), 'arxcovo-workflow-gate-'));
+  const gatePath = join(directory, 'gate.ps1');
+  try {
+    // A script file lets each gate use exit without ending the batch process.
+    const batch = `
+      $ErrorActionPreference = 'Stop'
+      $commands = ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd())
+      $statuses = foreach ($command in $commands) {
+        [IO.File]::WriteAllText($env:ARXCOVO_TEST_GATE, $command)
+        $LASTEXITCODE = 0
+        & $env:ARXCOVO_TEST_GATE
+        $LASTEXITCODE
+      }
+      ConvertTo-Json -InputObject @($statuses) -Compress
+    `;
+    const timeout = 60_000;
+    const result = spawnSync('pwsh', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', batch], {
+      encoding: 'utf8',
+      env: { ...process.env, ARXCOVO_TEST_GATE: gatePath },
+      input: JSON.stringify(cases.map(({ command }) => command)),
+      timeout,
+    });
+    assert.ok(!result.error, `PowerShell gate batch failed (timeout ${timeout} ms): ${result.error}`);
+    assert.equal(result.signal, null, result.stderr);
+    assert.equal(result.status, 0, result.stderr);
+    const statuses = JSON.parse(result.stdout);
+    assert.equal(statuses.length, cases.length);
+    for (const [index, { rust, ui }] of cases.entries()) {
+      assert.equal(statuses[index], rust === 'success' && ui === 'success' ? 0 : 1, `rust=${rust}, ui=${ui}: ${result.stderr}`);
+    }
+  } finally {
+    rmSync(gatePath, { force: true });
+    rmdirSync(directory);
   }
 });
 
