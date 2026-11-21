@@ -450,7 +450,16 @@ def recover_lost(root, connect, deadline, first):
     with checking("rpc"):
         with connect("fixture", deadline) as status:
             listed = status.call("delegated_build_status", {"target":2})
-        expect(listed == {"operations":[operation, first[0]]}, "forwarded-correlation")
+    with checking("forwarded-list"):
+        # A can commit the lost result while the list RPC is in flight.
+        terminal_source = [source[0], (*source[1][:2], "succeeded")]
+        after_list = admissions(root, "a", True)
+        expect(after_list in (source, terminal_source), "forwarded-source-correlation")
+        expect(listed == {"operations":[operation]}
+               or (listed == {"operations":[]} and after_list == terminal_source),
+               "forwarded-correlation")
+
+    with checking("rpc"):
         arguments = {"target":2,"operation_id":operation}
         with connect("foreign", deadline) as outsider:
             negative_control(outsider, "delegated_build_status", arguments, "foreign-status")
@@ -467,6 +476,7 @@ def recover_lost(root, connect, deadline, first):
         expect(admissions(root, "b", False) == before, "status-repeated-execution")
         if outcome(result) == "succeeded":
             expect(result.get("operation_id") == operation, "status-correlation")
+            expect(admissions(root, "a", True) == terminal_source, "status-source-terminal")
     return result
 
 
@@ -1240,53 +1250,124 @@ assert sockets.call_count == 2
                     with self.assertRaisesRegex(Fault, "artifact"):
                         build(root, "ordinary", end, Mock(return_value=client), 42, helper)
 
-        def test_lost_oracle_checks_one_spend_and_pending_source_before_status(self):
-            first, second = "a" * 64, "b" * 64
-            for failure in (None, "prior-spend", "source-applied", "status-repeats"):
-                with self.subTest(failure=failure):
-                    spent = [(first.upper(), 10, "succeeded"), (second.upper(), 11, "succeeded")]
-                    if failure == "prior-spend":
-                        spent.append((second.upper(), 12, "succeeded"))
-                    source = [(first.upper(), 20, "succeeded"),
-                              (second.upper(), 21, "succeeded" if failure == "source-applied" else "started")]
-                    events = []
+        ordinary_operation, lost_operation = "a" * 64, "b" * 64
+        spent = [(ordinary_operation.upper(), 10, "succeeded"), (lost_operation.upper(), 11, "succeeded")]
+        pending_source = [(ordinary_operation.upper(), 20, "succeeded"), (lost_operation.upper(), 21, "started")]
+        completed_source = [pending_source[0], (lost_operation.upper(), 21, "succeeded")]
+        pending_list = {"operations":[lost_operation]}
+        scoped_result = {"operation_id":lost_operation, "outcome":"succeeded"}
+        read_source, read_target = ("a", True), ("b", False)
+        list_call = ("fixture", {"target":2})
+        by_id = ("fixture", {"target":2,"operation_id":lost_operation})
+        foreign_by_id = ("foreign", by_id[1])
 
-                    def admitted(_root, node, forwarded):
-                        events.append((node, forwarded))
-                        return list(source if forwarded else spent)
+        def check_lost_script(self, script, fault=None):
+            remaining = iter(script)
 
-                    @contextmanager
-                    def connect(principal, _deadline):
-                        client = Mock()
+            def reply(request):
+                step = next(remaining, None)
+                self.assertIsNotNone(step, f"unexpected request: {request}")
+                expected, value = step
+                self.assertEqual(request, expected)
+                if isinstance(value, Fault):
+                    raise value
+                return value
 
-                        def status(tool, args):
-                            self.assertEqual(tool, "delegated_build_status")
-                            events.append(principal)
-                            if "operation_id" not in args:
-                                self.assertEqual(events[:3], [("b", False), ("a", True), "fixture"])
-                                return {"operations":[second, first]}
-                            self.assertEqual(args["operation_id"], second)
-                            if principal == "foreign":
-                                return {"outcome":"refused"}
-                            if failure == "status-repeats":
-                                spent.append((second.upper(), 12, "succeeded"))
-                            return {"operation_id":second, "outcome":"succeeded"}
+            def admitted(_root, node, forwarded):
+                return reply((node, forwarded))
 
-                        client.call.side_effect = status
-                        yield client
+            @contextmanager
+            def connect(principal, _deadline):
+                def status(tool, args):
+                    self.assertEqual(tool, "delegated_build_status")
+                    return reply((principal, args))
 
-                    with patch.dict(recover_lost.__globals__, {"admissions":admitted}):
-                        end = time.monotonic() + 5
-                        if failure:
-                            with self.assertRaisesRegex(Fault, "terminal"):
-                                recover_lost(Path("fixture"), connect, end, (first, 10))
-                            if failure != "status-repeats":
-                                self.assertNotIn("fixture", events)
-                        else:
-                            self.assertEqual(recover_lost(Path("fixture"), connect, end, (first, 10)),
-                                             {"operation_id":second, "outcome":"succeeded"})
-                            self.assertEqual(events, [("b", False), ("a", True), "fixture", "foreign",
-                                                      "fixture", ("b", False)])
+                yield SimpleNamespace(call=status)
+
+            with patch.dict(recover_lost.__globals__, {"admissions":admitted}), \
+                 patch.object(time, "monotonic", return_value=0):
+                def recover():
+                    return recover_lost(Path("fixture"), connect, 5, (self.ordinary_operation, 10))
+
+                if fault:
+                    with self.assertRaises(Fault) as caught:
+                        recover()
+                    self.assertEqual((caught.exception.checkpoint, caught.exception.category), fault)
+                else:
+                    self.assertEqual(recover(), self.scoped_result)
+            self.assertIsNone(next(remaining, None), "recovery stopped before the script completed")
+
+        def test_lost_oracle_recovers_pending_source_and_list_time_completion(self):
+            for after_list, listed in ((self.pending_source, self.pending_list),
+                                       (self.completed_source, self.pending_list),
+                                       (self.completed_source, {"operations":[]})):
+                with self.subTest(after_list=after_list, listed=listed):
+                    self.check_lost_script([
+                        (self.read_target, self.spent), (self.read_source, self.pending_source),
+                        (self.list_call, listed), (self.read_source, after_list),
+                        (self.foreign_by_id, {"outcome":"refused"}), (self.by_id, self.scoped_result),
+                        (self.read_target, self.spent), (self.read_source, self.completed_source),
+                    ])
+
+        def test_lost_oracle_rejects_invalid_forwarded_lists_before_status(self):
+            invalid_lists = (
+                {"operations":[self.lost_operation, self.ordinary_operation]},
+                {"operations":[self.lost_operation, self.lost_operation]},
+                {"operations":["c" * 64]},
+                {"operations":self.lost_operation},
+                {"operations":[self.lost_operation], "extra":True},
+                {}, {"outcome":"unknown"}, {"outcome":"refused"}, {"operations":[]},
+            )
+            ordinary, lost = self.pending_source
+            invalid_sources = (
+                [ordinary], [ordinary, lost, ("C" * 64, 22, "started")], [lost, ordinary],
+                [("C" * 64, 20, "succeeded"), lost], [(ordinary[0], 22, "succeeded"), lost],
+                [ordinary, ("C" * 64, 21, "started")], [ordinary, (lost[0], 22, "started")],
+                [(*ordinary[:2], "started"), lost], [ordinary, (*lost[:2], "interrupted")],
+            )
+            cases = [(listed, self.pending_source) for listed in invalid_lists]
+            cases.extend((self.pending_list, source) for source in invalid_sources)
+            for listed, after_list in cases:
+                with self.subTest(listed=listed, after_list=after_list):
+                    self.check_lost_script([
+                        (self.read_target, self.spent), (self.read_source, self.pending_source),
+                        (self.list_call, listed), (self.read_source, after_list),
+                    ], ("forwarded-list", "invalid"))
+
+        def test_lost_oracle_preserves_forwarded_list_wire_faults(self):
+            for category in ("malformed", "eof", "rpc-error", "timeout"):
+                with self.subTest(category=category):
+                    self.check_lost_script([
+                        (self.read_target, self.spent), (self.read_source, self.pending_source),
+                        (self.list_call, Fault("rpc", category)),
+                    ], ("rpc", category))
+
+        def test_lost_oracle_rejects_precompleted_source_and_invalid_status_evidence(self):
+            extra = self.spent + [(self.lost_operation.upper(), 12, "succeeded")]
+            changed = [self.spent[0], (self.lost_operation.upper(), 12, "succeeded")]
+            before_list = [(self.read_target, self.spent), (self.read_source, self.pending_source),
+                           (self.list_call, self.pending_list), (self.read_source, self.pending_source)]
+            after_foreign = before_list + [(self.foreign_by_id, {"outcome":"refused"})]
+            after_status = after_foreign + [(self.by_id, self.scoped_result)]
+            cases = (
+                ("prior-spend", [(self.read_target, extra)], ("terminal", "invalid")),
+                ("precompleted-source", [(self.read_target, self.spent), (self.read_source, self.completed_source)],
+                 ("terminal", "invalid")),
+                ("foreign-success", before_list + [(self.foreign_by_id, self.scoped_result)],
+                 ("foreign-status", "succeeded")),
+                ("extra-b", after_status + [(self.read_target, extra)], ("terminal", "invalid")),
+                ("changed-b", after_status + [(self.read_target, changed)], ("terminal", "invalid")),
+                ("wrong-status-id", after_foreign + [(self.by_id, dict(self.scoped_result,
+                    operation_id=self.ordinary_operation)), (self.read_target, self.spent)], ("terminal", "invalid")),
+                ("missing-a-terminal", after_status + [(self.read_target, self.spent),
+                    (self.read_source, self.pending_source)], ("terminal", "invalid")),
+                ("changed-a-terminal", after_status + [(self.read_target, self.spent),
+                    (self.read_source, [self.completed_source[0], (self.lost_operation.upper(), 22, "succeeded")])],
+                 ("terminal", "invalid")),
+            )
+            for name, script, fault in cases:
+                with self.subTest(name=name):
+                    self.check_lost_script(script, fault)
 
         def test_frozen_tag_kinds_and_admission_sequence(self):
             tags = frozen_kinds(workspace)
