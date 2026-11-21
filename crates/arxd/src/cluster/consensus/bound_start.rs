@@ -9,10 +9,32 @@ use crate::cluster::{
 use startup_recovery::{Observation, StartIntent};
 use tokio::sync::{Notify, watch};
 
-#[cfg(target_os = "linux")]
-pub(in crate::cluster) use super::{
-    checked_clock::CheckedClock, startup_recovery::RecoveryComplete,
-};
+pub(crate) mod activation {
+    #[cfg(target_os = "linux")]
+    pub(in crate::cluster) use super::super::{
+        checked_clock::CheckedClock, startup_recovery::RecoveryComplete,
+    };
+    #[cfg(target_os = "linux")]
+    pub(crate) use super::runtime::{
+        Admission, Error, InheritedListeners, Installation, Intent, Route, Running, peer_endpoint,
+    };
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) use super::runtime::refused_founder_for_test;
+
+    pub(crate) fn entry(args: &[std::ffi::OsString]) -> Option<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::service::cluster_runtime::entry(args)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            args.first()
+                .filter(|arg| *arg == "--cluster-config" || *arg == "cluster-service-worker")
+                .map(|_| crate::service::ExitCode::Config as i32)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Status {
@@ -52,6 +74,10 @@ struct State {
     process_owned: bool,
     #[cfg(target_os = "linux")]
     exchange: Arc<enrollment_ingress::ExchangeCounts>,
+    #[cfg(target_os = "linux")]
+    inherited: Option<runtime::InheritedListeners>,
+    #[cfg(target_os = "linux")]
+    join_evidence: runtime::JoinEvidence,
     close_dispatched: bool,
     close_failure: Option<ShutdownReport>,
     engine_may_exist: bool,
@@ -125,6 +151,10 @@ impl Job {
                 process_owned: false,
                 #[cfg(target_os = "linux")]
                 exchange: Arc::default(),
+                #[cfg(target_os = "linux")]
+                inherited: None,
+                #[cfg(target_os = "linux")]
+                join_evidence: runtime::JoinEvidence::default(),
                 close_dispatched: false,
                 close_failure: None,
                 engine_may_exist: false,
@@ -360,6 +390,7 @@ impl Job {
                 s.founder = None;
                 s.founder_recovered = None;
                 s.founder_recovered_issuer = None;
+                s.inherited = None;
                 if s.founder_failure.is_some() {
                     s.status = Status::ClosedAfterFounderRefusal;
                 }

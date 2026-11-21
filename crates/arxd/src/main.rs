@@ -2,7 +2,6 @@ use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    #[cfg(target_os = "linux")]
     if let Some(code) = arxd::service::cluster_entry(&args) {
         std::process::exit(code);
     }

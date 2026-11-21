@@ -430,11 +430,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
     async fn finish_after_drain(&mut self, drained: bool) -> Result<(), ExitCode> {
         #[cfg(target_os = "linux")]
         if let Some(cluster) = self.cluster.as_mut() {
-            if drained {
-                return cluster.finish().await;
-            }
-            cluster.abandon().await;
-            return Err(ExitCode::Store);
+            return cluster.finish_after_drain(drained).await;
         }
         let _ = drained;
         Ok(())

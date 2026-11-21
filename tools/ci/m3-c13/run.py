@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import selectors
 import stat
 import subprocess
 import sys
@@ -23,10 +23,18 @@ OWNER = 21901
 ARTIFACT = re.compile(r"(?:arxd|m3_activation_linux)-[a-f0-9]{16}")
 ROOT = Path(__file__).resolve().parents[3]
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
-CAMPAIGN_TIMEOUT = 126  # 102 s work + 17 s joined cleanup + process margin.
+TOTAL = 174
+ROOT_TEARDOWN = 14
+OUTER_MARGIN = 6
+CAMPAIGN_TIMEOUT = 124  # 102 s work + 17 s joined cleanup + process margin.
 OUTPUT_LIMIT = 32_768
 CLEANUP = re.compile(
-    r"C13 cleanup spawned=([0-6]) signaled=([0-6]) reaped=([0-6]) clean=([0-6]) helper_unknown=([01])"
+    r"C13 cleanup spawned=([0-6]) signaled=([0-6]) reaped=([0-6]) clean=([0-6]) "
+    r"helpers=(\d{1,4}) helpers_reaped=(\d{1,4}) helper_unknown=([01])"
+)
+FIRST = re.compile(
+    r"C13 first phase=(preflight|founder|join|promotion-transfer|recovery|survivor|publication|close) "
+    r"category=(assertion|spawn|helper-reap|listener|daemon-refused|terminal-io|pipe-io)"
 )
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
 
@@ -45,7 +53,7 @@ def checked_file(path):
     return path
 
 
-def select(deps, prefix, name):
+def select(deps, prefix, name, deadline):
     matches = []
     from itertools import islice
     entries = sorted(islice(deps.iterdir(), 4097))
@@ -57,19 +65,26 @@ def select(deps, prefix, name):
         checked_file(path)
         with open_artifact(path) as artifact:
             executable = f"/proc/{os.getpid()}/fd/{artifact.fileno()}"
-            code, listing = bounded_run([executable, "--list", "--exact", name],
-                                        env=ENV, timeout=3)
-        if code == 0 and exact_listing(listing, name):
+            code, capture = bounded_run([executable, "--list", "--exact", name],
+                                        env=ENV, timeout=remaining(deadline, 3))
+        if code == 0 and not capture.truncated and exact_listing(capture.text(), name):
             matches.append(path)
     if len(matches) != 1:
         raise ValueError("selector inventory")
     return matches[0]
 
 
-def command(arguments):
+def remaining(deadline, limit):
+    available = deadline - time.monotonic()
+    if available <= 0:
+        raise TimeoutError("phase budget elapsed")
+    return min(limit, available)
+
+
+def command(arguments, deadline, limit=3):
     subprocess.run(arguments, stdin=subprocess.DEVNULL, env=ENV,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=8, check=True)
+                   timeout=remaining(deadline, limit), check=True)
 
 
 def unused(name, id_):
@@ -118,52 +133,112 @@ def open_artifact(source):
     return file
 
 
-def stage_binary(source, destination):
+def stage_binary(source, destination, deadline):
     with open_artifact(source) as input_file, destination.open("xb") as output:
         before = os.fstat(input_file.fileno())
-        digest = hashlib.file_digest(input_file, "sha256").hexdigest()
-        input_file.seek(0)
-        remaining = before.st_size
-        while remaining:
-            block = input_file.read(min(remaining, 1024**2))
+        digest = hashlib.sha256()
+        unread = before.st_size
+        while unread:
+            remaining(deadline, TOTAL)
+            block = input_file.read(min(unread, 1024**2))
             if not block:
                 raise ValueError("artifact truncated")
             output.write(block)
-            remaining -= len(block)
+            digest.update(block)
+            unread -= len(block)
         after = os.fstat(input_file.fileno())
         if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
             raise ValueError("artifact changed during stage")
+    readback = hashlib.sha256()
     with destination.open("rb") as output:
-        if hashlib.file_digest(output, "sha256").hexdigest() != digest:
-            raise ValueError("artifact changed during stage")
+        for block in iter(lambda: output.read(1024**2), b""):
+            remaining(deadline, TOTAL)
+            readback.update(block)
+    if readback.digest() != digest.digest():
+        raise ValueError("artifact changed during stage")
     destination.chmod(0o755)
-    return digest
+    return digest.hexdigest()
+
+
+class Capture:
+    def __init__(self):
+        self.bulk = bytearray()
+        self.truncated = False
+        self.first = None
+        self._line = b""
+
+    def feed(self, data):
+        room = OUTPUT_LIMIT - len(self.bulk)
+        self.bulk.extend(data[:room])
+        self.truncated |= len(data) > room
+        if self.first is not None:
+            return
+        # Track one candidate independently of the retained bulk prefix.
+        # Every allowed record fits in 96 bytes, including a Windows CR.
+        *lines, tail = data.split(b"\n")
+        for line in lines:
+            if self._line is not None and len(self._line) + len(line) <= 96:
+                record = (self._line + line).decode("ascii", errors="replace").removesuffix("\r")
+                if FIRST.fullmatch(record):
+                    self.first = record
+                    return
+            self._line = b""
+        if self._line is not None:
+            self._line = self._line + tail if len(self._line) + len(tail) <= 96 else None
+
+    def text(self):
+        return self.bulk.decode("utf-8", errors="replace")
 
 
 def bounded_run(args, *, env, timeout):
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(args, env=env, stdin=subprocess.DEVNULL,
-                                stdout=output, stderr=subprocess.DEVNULL,
-                                check=False, timeout=timeout)
-        output.seek(0)
-        data = output.read(OUTPUT_LIMIT + 1)
-    if len(data) > OUTPUT_LIMIT:
-        raise ValueError("bounded subprocess output")
-    return result.returncode, data.decode("utf-8", errors="strict")
+    import fcntl
+
+    capture = Capture()
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process, selectors.DefaultSelector() as sel:
+        fd = process.stdout.fileno()
+        os.set_blocking(fd, False)
+        sel.register(fd, selectors.EVENT_READ)
+        try:
+            while sel.select(remaining(deadline, timeout)):
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                capture.feed(data)
+            code = process.wait(timeout=remaining(deadline, timeout))
+        except (TimeoutError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+            code = None
+            # Retain already-written records even at the deadline. Bound this
+            # drain to one pipe capacity in case a descendant kept stdout.
+            pending = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+            while pending:
+                try:
+                    data = os.read(fd, min(pending, 4096))
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                capture.feed(data)
+                pending -= len(data)
+    return code, capture
 
 
 def cleanup_observed(lines):
     records = [m.groups() for line in lines if (m := CLEANUP.fullmatch(line))]
     if len(records) != 1:
         return False
-    spawned, signaled, reaped, clean, helper_unknown = records[0]
-    return spawned == signaled == reaped == clean and helper_unknown == "0"
+    spawned, signaled, reaped, clean, helpers, helpers_reaped, helper_unknown = records[0]
+    return (spawned == signaled == reaped == clean and helpers == helpers_reaped
+            and helper_unknown == "0")
 
 
-def primary_ip():
+def primary_ip(deadline):
     run = subprocess.run(["/usr/sbin/ip", "-j", "-4", "addr", "show", "scope", "global"],
                          env=ENV, capture_output=True, stdin=subprocess.DEVNULL,
-                         check=True, timeout=4)
+                         check=True, timeout=remaining(deadline, 4))
     if len(run.stdout) > 32_768:
         raise ValueError("bounded interface inventory")
     private = tuple(map(ipaddress.ip_network, ("10.0.0.0/8", "172.16.0.0/12",
@@ -183,7 +258,7 @@ def qualify_runner():
         raise ValueError("hosted Linux only")
 
 
-def privileged(stage):
+def privileged(stage, deadline):
     qualify_runner()
     if os.geteuid() != 0:
         raise ValueError("runner staging identity")
@@ -194,61 +269,110 @@ def privileged(stage):
         raise ValueError("staging ownership")
     if not all(unused(name, id_) for name, id_ in ROLES):
         raise ValueError("role collision")
-    groups, users = [], []
+    deadline = min(deadline, time.monotonic() + TOTAL - OUTER_MARGIN)
+    setup = deadline - ROOT_TEARDOWN - CAMPAIGN_TIMEOUT
+    roles = []
     root = None
     may_remove = True
-    cleanup = True
+    successful = False
+    first = None
     start = time.monotonic()
+    phase = "staging"
     try:
         for name, id_ in ROLES:
-            command(["/usr/sbin/groupadd", "--gid", str(id_), name])
-            groups.append(name)
+            # Track before dispatch so a timeout with a partial effect can
+            # still be reconciled against the fixed account identity.
+            roles.append(("group", name, id_))
+            command(["/usr/sbin/groupadd", "--gid", str(id_), name], setup)
+            roles.append(("user", name, id_))
             command(["/usr/sbin/useradd", "--uid", str(id_), "--gid", name, "--no-create-home",
-                     "--no-log-init", "--shell", "/usr/sbin/nologin", name])
-            users.append(name)
+                     "--no-log-init", "--shell", "/usr/sbin/nologin", name], setup)
         root = Path(tempfile.mkdtemp(prefix="arx-c13-fixture-", dir="/tmp"))
         stage_tree(root)
         for name in ("arxd", "arxd-publication", "campaign"):
-            stage_binary(stage / name, root / name)
+            stage_binary(stage / name, root / name, setup)
         environment = {**ENV, "ARX_C13_HOSTED": "1", "ARX_C13_BASE": str(root),
-                       "ARX_C13_IP": primary_ip()}
+                       "ARX_C13_IP": primary_ip(setup)}
+        phase = "campaign"
         test_start = time.monotonic()
-        # A subprocess timeout cannot run its owned cleanup. Hold everything
-        # unless bounded and independently observed disposition is available.
+        timeout = remaining(deadline - ROOT_TEARDOWN, CAMPAIGN_TIMEOUT)
+        if timeout < CAMPAIGN_TIMEOUT - 1:
+            raise TimeoutError("campaign cleanup reserve unavailable")
         may_remove = False
-        code, output = bounded_run([root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
-                                   env=environment, timeout=CAMPAIGN_TIMEOUT)
-        lines = output.splitlines()
-        may_remove = cleanup_observed(lines)
-        print(f"C13 seconds={time.monotonic()-test_start:.3f} result={code}", flush=True)
+        code, capture = bounded_run([root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
+                                    env=environment, timeout=timeout)
+        lines = capture.text().splitlines()
+        first = capture.first
+        may_remove = code is not None and not capture.truncated and cleanup_observed(lines)
+        print(f"C13 seconds={time.monotonic()-test_start:.3f} result={'timeout' if code is None else code}",
+              flush=True)
         for line in lines:
             if (line == PIN or CLEANUP.fullmatch(line) or re.fullmatch(
                     r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
                 print(line, flush=True)
-        if code != 0 or lines.count(PIN) != 1 or not may_remove:
-            raise ValueError("C13 first execution refused")
+        successful = code == 0 and lines.count(PIN) == 1 and may_remove and first is None
+        if not successful and first is None:
+            first = f"C13 first phase=campaign category={'timeout' if code is None else 'unconfirmed'}"
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        first = first or f"C13 first phase={phase} category={type(error).__name__}"
     finally:
+        if first is not None:
+            print(first, flush=True)
+        removed, retained, unknown = 0, 0, 0
         if may_remove:
-            if root is not None:
-                shutil.rmtree(root, ignore_errors=False)
-            for tool, names in (("userdel", users), ("groupdel", groups)):
-                for name in reversed(names):
-                    try:
-                        command([f"/usr/sbin/{tool}", name])
-                    except (OSError, subprocess.SubprocessError):
-                        cleanup = False
+            for kind, name, id_ in reversed(roles):
+                result = remove_role(kind, name, id_, deadline)
+                removed += result == "removed"
+                retained += result == "retained"
+                unknown += result == "unknown"
         else:
-            cleanup = False
-        print(f"C13 worker stage seconds={time.monotonic()-start:.3f} cleanup={'joined' if cleanup else 'unknown'}",
-              flush=True)
-    if not cleanup:
-        raise ValueError("C13 role cleanup unconfirmed")
+            # Never remove a role while a process disposition is unconfirmed.
+            retained = len(roles)
+        fixture = "absent" if root is None else "retained"
+        if root is not None and may_remove and retained == unknown == 0:
+            try:
+                command(["/usr/bin/python3", "-I", "-B", "-c",
+                         "import shutil,sys; shutil.rmtree(sys.argv[1])", root], deadline)
+                fixture = "removed"
+            except (OSError, subprocess.SubprocessError):
+                fixture = "unknown"
+        print(f"C13 teardown fixture={fixture} roles_removed={removed} "
+              f"roles_retained={retained} roles_unknown={unknown} "
+              f"seconds={time.monotonic()-start:.3f}", flush=True)
+    if not successful or retained or unknown or fixture not in ("removed", "absent"):
+        raise ValueError("C13 execution or teardown unconfirmed")
+
+
+def role_identity(kind, name):
+    import grp
+    import pwd
+    try:
+        if kind == "user":
+            return pwd.getpwnam(name).pw_uid
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return None
+
+
+def remove_role(kind, name, id_, deadline):
+    try:
+        current = role_identity(kind, name)
+        if current is None:
+            return "removed"
+        if current == id_:
+            command([f"/usr/sbin/{kind}del", name], deadline, limit=1.25)
+        return "removed" if role_identity(kind, name) is None else "retained"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def main():
+    start = time.monotonic()
     qualify_runner()
-    if len(sys.argv) == 3 and sys.argv[1] == "--staged":
-        return privileged(sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] == "--staged":
+        if not re.fullmatch(r"[0-9]{1,20}", sys.argv[3]):
+            raise ValueError("staging deadline")
+        return privileged(sys.argv[2], int(sys.argv[3]) / 1_000_000)
     if len(sys.argv) != 1 or os.geteuid() == 0 or Path.cwd().resolve() != ROOT:
         raise ValueError("launcher entry")
     tests = unittest.defaultTestLoader.discover(str(Path(__file__).parent), pattern="test_run.py")
@@ -258,19 +382,22 @@ def main():
     if target != ROOT / "target":
         raise ValueError("unexpected cargo target")
     profile = target / "debug"
-    start = time.monotonic()
+    deadline = start + TOTAL
+    root_deadline = deadline - OUTER_MARGIN
+    setup = root_deadline - ROOT_TEARDOWN - CAMPAIGN_TIMEOUT
     with tempfile.TemporaryDirectory(prefix="arx-c13-", dir="/tmp") as directory:
         stage = Path(directory)
         artifacts = (("arxd", profile / "arxd"),
-                     ("arxd-publication", select(profile / "deps", "arxd-", PROBE)),
-                     ("campaign", select(profile / "deps", "m3_activation_linux-", SELECTOR)))
+                     ("arxd-publication", select(profile / "deps", "arxd-", PROBE, setup)),
+                     ("campaign", select(profile / "deps", "m3_activation_linux-", SELECTOR, setup)))
         for name, actual in artifacts:
-            digest = stage_binary(actual, stage / name)
+            digest = stage_binary(actual, stage / name, setup)
             print(f"C13 artifact {name} sha256={digest}", flush=True)
         authorization = "GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS"
         subprocess.run(["/usr/bin/sudo", "-n", "--preserve-env=" + authorization,
                         "/usr/bin/python3", "-I", "-B", Path(__file__).resolve(),
-                        "--staged", stage], stdin=subprocess.DEVNULL, check=True, timeout=170)
+                        "--staged", stage, str(int(root_deadline * 1_000_000))],
+                       stdin=subprocess.DEVNULL, check=True, timeout=remaining(deadline - 2, TOTAL))
     print(f"C13 launcher seconds={time.monotonic()-start:.3f}", flush=True)
 
 

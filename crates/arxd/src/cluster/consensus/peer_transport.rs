@@ -96,6 +96,29 @@ impl std::error::Error for Refusal {}
 pub(super) fn rpc_error(reason: Refusal) -> RPCError<Arx> {
     RPCError::Unreachable(Unreachable::new(&reason))
 }
+#[cfg(any(test, target_os = "linux"))]
+fn activation_listener(
+    address: SocketAddr,
+    inherited: Option<std::net::TcpListener>,
+) -> Result<TcpListener, Refusal> {
+    let listener = match inherited {
+        Some(listener) => {
+            #[cfg(target_os = "linux")]
+            crate::service::cluster_runtime::listen_inherited(&listener)
+                .map_err(|_| Refusal::Address)?;
+            listener
+        }
+        None => std::net::TcpListener::bind(address).map_err(|_| Refusal::Address)?,
+    };
+    if listener.local_addr().ok() != Some(address) {
+        return Err(Refusal::Address);
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| Refusal::Address)?;
+    TcpListener::from_std(listener).map_err(|_| Refusal::Address)
+}
+
 pub(super) fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
     if text.len() > 200 {
         return Err(Refusal::Address);
@@ -1905,13 +1928,25 @@ impl TransportOwner {
             _ => Err(Refusal::NotReady),
         }
     }
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn attach_founder(
         &mut self,
         sm: &SmAdapter,
         dispatch: Arc<dyn AppendDispatch>,
         address: &str,
         credentials: Credentials,
+    ) -> Result<(), Refusal> {
+        self.attach_founder_on(sm, dispatch, address, credentials, None)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn attach_founder_on(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        address: &str,
+        credentials: Credentials,
+        inherited: Option<std::net::TcpListener>,
     ) -> Result<(), Refusal> {
         // The caller holds the job's close gate through bind and registration.
         // There is no await (and therefore no unowned listener) under that gate.
@@ -1923,13 +1958,7 @@ impl TransportOwner {
             credentials,
             dispatch,
         )?;
-        let listener = std::net::TcpListener::bind(endpoint(address)?)
-            .and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                Ok(listener)
-            })
-            .and_then(TcpListener::from_std)
-            .map_err(|_| Refusal::Address)?;
+        let listener = activation_listener(endpoint(address)?, inherited)?;
         self.publish(sm, resources, listener)
     }
 
@@ -1980,6 +2009,7 @@ impl TransportOwner {
         address: SocketAddr,
         credentials: Credentials,
         gate: Arc<peer_registry::LearnerGate>,
+        inherited: Option<std::net::TcpListener>,
     ) -> Result<(), Refusal> {
         let credentials = self.take_attach_credentials(Some(credentials))?;
         let resources = make_resources_for_learner(
@@ -1990,13 +2020,7 @@ impl TransportOwner {
             dispatch,
             Some(gate),
         )?;
-        let listener = std::net::TcpListener::bind(endpoint(&address.to_string())?)
-            .and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                Ok(listener)
-            })
-            .and_then(TcpListener::from_std)
-            .map_err(|_| Refusal::Address)?;
+        let listener = activation_listener(endpoint(&address.to_string())?, inherited)?;
         self.publish(sm, resources, listener)
     }
 
@@ -2548,8 +2572,16 @@ mod issuer_channel {
             self.disposition.load(Ordering::SeqCst) == UNSPENT
         }
 
-        fn reserved(&self) -> bool {
-            self.disposition.load(Ordering::SeqCst) == RESERVED
+        fn refuse_or_unknown(&self) -> Outcome {
+            match self.disposition.compare_exchange(
+                CHECKING,
+                UNSPENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Err(RESERVED) => Outcome::Unknown,
+                _ => Outcome::Refused,
+            }
         }
     }
 
@@ -2595,8 +2627,7 @@ mod issuer_channel {
         pub(in crate::cluster::consensus) async fn outcome(self) -> Outcome {
             match timeout_at(self.deadline, self.reply).await {
                 Ok(Ok(Ok(()))) if Instant::now() < self.deadline => Outcome::Installed,
-                _ if self.attempt.reserved() => Outcome::Unknown,
-                _ => Outcome::Refused,
+                _ => self.attempt.refuse_or_unknown(),
             }
         }
     }
@@ -2605,27 +2636,56 @@ mod issuer_channel {
     #[tokio::test]
     async fn c13_challenge_refusal_is_unspent_and_reserved_failure_is_terminal() {
         let check = ChallengeCheck::new();
-        let state = check.0.clone();
+        let (complete, reply) = oneshot::channel();
+        let outcome = Transfer {
+            reply,
+            attempt: check.0.clone(),
+            deadline: Instant::now(),
+        };
         let mut built = 0;
-        // The transport returns before it can call build_once on a failed check.
-        drop(check);
-        assert!(state.available());
-        assert!(!state.reserved());
-        assert_eq!(built, 0);
-
-        let check = ChallengeCheck::new();
-        let state = check.0.clone();
+        // Hold the sender at the reservation boundary while the caller expires.
+        assert_eq!(outcome.outcome().await, Outcome::Refused);
+        assert!(check.0.available());
         assert_eq!(
             check
                 .build_once(async {
                     built += 1;
-                    Err::<(), _>(Refusal::Tls)
+                    Ok(())
                 })
                 .await,
-            Err(Refusal::Tls),
+            Err(Refusal::Identity),
         );
+        drop(complete);
+        assert_eq!(built, 0);
+
+        let check = ChallengeCheck::new();
+        let state = check.0.clone();
+        let (_complete, reply) = oneshot::channel();
+        let outcome = Transfer {
+            reply,
+            attempt: state.clone(),
+            deadline: Instant::now(),
+        };
+        // The sender wins reservation before the caller observes its deadline.
+        let (started, entered) = oneshot::channel();
+        let build = async {
+            check
+                .build_once(async {
+                    built += 1;
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<(), Refusal>>().await
+                })
+                .await
+        };
+        {
+            tokio::pin!(build);
+            tokio::select! {
+                _ = &mut build => panic!("package construction must be retained"),
+                result = entered => result.unwrap(),
+            }
+            assert_eq!(outcome.outcome().await, Outcome::Unknown);
+        }
         assert!(!state.available());
-        assert!(state.reserved());
         assert_eq!(built, 1);
     }
 

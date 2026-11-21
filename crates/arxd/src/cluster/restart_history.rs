@@ -3,7 +3,7 @@
 #![allow(dead_code)] // The owner-local runtime consumes this lane in step 13d.
 
 use super::{
-    consensus::bound_start::{CheckedClock, RecoveryComplete},
+    consensus::activation::{CheckedClock, RecoveryComplete},
     enrollment::{ClusterId, KeyDigest, NodeId},
     join_receipt::{ExpectedIdentity, Origin, PublicIdentity},
     pki::custody::{
@@ -528,6 +528,14 @@ impl Live {
             self.issuance.digest,
             self.strict.as_ref().ok_or(Refusal::Provenance)?.digest,
         ])
+    }
+}
+
+impl Fresh {
+    pub(super) fn confirm_learner_without_ca(&self) -> Result<()> {
+        custody(self.roots.recheck())?;
+        inventory(&self.roots, &["issuance"])?;
+        custody(self.roots.voter_absent())
     }
 }
 

@@ -1,7 +1,7 @@
 //! Linux ownership of the cluster worker and owner-local endpoint.
 use super::{Shutdown, cluster_owner};
-use crate::cluster::consensus::bound_start::runtime::{
-    self as activation, Admission, Installation, Intent, Route, Running,
+use crate::cluster::consensus::activation::{
+    self as activation, Admission, InheritedListeners, Installation, Intent, Route, Running,
 };
 use std::{
     fs::OpenOptions,
@@ -357,6 +357,9 @@ impl Lifecycle {
         fence: Arc<Admission>,
     ) -> anyhow::Result<Self> {
         let checked = Settings::checked(path, intent)?;
+        if !fence.check_addresses(checked.installation.peer, checked.installation.enrollment) {
+            return Err(refusal());
+        }
         let endpoint = cluster_owner::Server::bind(checked.socket, checked.roles)
             .map_err(|_| anyhow::anyhow!("cluster-owner-bind"))?;
         let (status, receiver) = watch::channel(Status::Starting);
@@ -443,8 +446,9 @@ impl Lifecycle {
                 let receiver = receiver.clone();
                 let fence = fence.clone();
                 move || {
-                    let [anchors, redeems] = fence.exchanges();
-                    [receiver.borrow().code(), anchors, redeems]
+                    let mut evidence = fence.evidence();
+                    evidence[0] = receiver.borrow().code();
+                    evidence
                 }
             },
             stop.clone(),
@@ -485,7 +489,7 @@ impl Lifecycle {
             self.control.close(CLOSE),
             tokio::time::timeout(CLOSE, &mut self.supervisor),
         );
-        self.joined = self.control.joined() && observer.is_ok();
+        self.joined = owner.is_ok() && matches!(observer, Ok(Ok(())));
         (owner.is_ok() && matches!(observer, Ok(Ok(()))))
             .then_some(())
             .ok_or(())
@@ -576,8 +580,12 @@ pub fn entry(args: &[std::ffi::OsString]) -> Option<i32> {
     if !worker && mode != "--cluster-config" {
         return None;
     }
-    let [config, flag, intent] = rest else {
-        return Some(super::ExitCode::Usage as i32);
+    let (config, flag, intent, inherit) = match rest {
+        [config, flag, intent] => (config, flag, intent, false),
+        [config, flag, intent, opt] if !worker && opt == "--inherit-listeners" => {
+            (config, flag, intent, true)
+        }
+        _ => return Some(super::ExitCode::Usage as i32),
     };
     if flag != "--cluster-intent" {
         return Some(super::ExitCode::Usage as i32);
@@ -585,12 +593,16 @@ pub fn entry(args: &[std::ffi::OsString]) -> Option<i32> {
     let Some(intent) = intent.to_str().and_then(Intent::parse) else {
         return Some(super::ExitCode::Config as i32);
     };
+    let inherited = match inherit.then(|| inherited_listeners(intent)).transpose() {
+        Ok(listeners) => listeners,
+        Err(()) => return Some(super::ExitCode::Config as i32),
+    };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|_| ())
         .and_then(|runtime| {
-            let result = runtime.block_on(process(Path::new(config), intent, worker));
+            let result = runtime.block_on(process(Path::new(config), intent, worker, inherited));
             runtime.shutdown_background();
             result
         });
@@ -605,6 +617,134 @@ pub fn entry(args: &[std::ffi::OsString]) -> Option<i32> {
 }
 
 const CONTROL_FD: std::os::fd::RawFd = 3;
+const PEER_FD: std::os::fd::RawFd = 3;
+const ENROLLMENT_FD: std::os::fd::RawFd = 4;
+
+fn listener_option(fd: std::os::fd::RawFd, name: libc::c_int) -> Option<libc::c_int> {
+    let mut value = 0;
+    let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: valid initialized output storage for an integer socket option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            name,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of_val(&value)).then_some(value)
+}
+
+fn qualify_listener(
+    fd: std::os::fd::RawFd,
+    expected: Option<std::net::SocketAddr>,
+    listening: bool,
+) -> Result<(), ()> {
+    if listener_option(fd, libc::SO_TYPE) != Some(libc::SOCK_STREAM)
+        || listener_option(fd, libc::SO_PROTOCOL) != Some(libc::IPPROTO_TCP)
+        || listener_option(fd, libc::SO_ACCEPTCONN) != Some(i32::from(listening))
+        || (!listening && !unconnected(fd))
+    {
+        return Err(());
+    }
+    let domain = listener_option(fd, libc::SO_DOMAIN);
+    match expected {
+        Some(address) => {
+            let family = if address.is_ipv4() {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            };
+            (domain == Some(family)).then_some(()).ok_or(())
+        }
+        None => matches!(domain, Some(libc::AF_INET | libc::AF_INET6))
+            .then_some(())
+            .ok_or(()),
+    }
+}
+
+fn unconnected(fd: std::os::fd::RawFd) -> bool {
+    // A non-listening connected TCP socket cannot serve as a reservation.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+    // SAFETY: peer and len are writable, correctly sized output storage.
+    let rc = unsafe {
+        libc::getpeername(
+            fd,
+            (&mut peer as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN)
+}
+
+pub(crate) fn validate_listener(
+    listener: &std::net::TcpListener,
+    address: std::net::SocketAddr,
+    listening: bool,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    qualify_listener(listener.as_raw_fd(), Some(address), listening).map_err(|_| refusal())?;
+    if listener.local_addr().ok() != Some(address) {
+        return Err(refusal());
+    }
+    Ok(())
+}
+
+/// Called only at the retained peer or issuer listener registration boundary.
+pub(crate) fn listen_inherited(listener: &std::net::TcpListener) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = listener.as_raw_fd();
+    // SAFETY: fd is a live, checked TCP socket owned by the retained caller.
+    if listener_option(fd, libc::SO_ACCEPTCONN) == Some(0) && unsafe { libc::listen(fd, 128) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn inherited_listeners(intent: Intent) -> Result<InheritedListeners, ()> {
+    use std::os::fd::FromRawFd;
+    let listening = intent != Intent::Join;
+    // Before starting any worker threads, check the exec-time FD whitelist.
+    // read_dir transiently owns its own scan descriptor. That descriptor is
+    // closed before checking whether any additional descriptors remain open.
+    let descriptors = std::fs::read_dir("/proc/self/fd")
+        .map_err(|_| ())?
+        .take(10)
+        .map(|entry| {
+            entry
+                .map_err(|_| ())?
+                .file_name()
+                .to_str()
+                .ok_or(())?
+                .parse::<i32>()
+                .map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if descriptors.len() >= 10
+        || descriptors.iter().any(|&fd| {
+            // SAFETY: fcntl only queries the scalar descriptor.
+            fd > ENROLLMENT_FD && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0
+        })
+    {
+        return Err(());
+    }
+    for fd in [PEER_FD, ENROLLMENT_FD] {
+        qualify_listener(fd, None, listening)?;
+        // SAFETY: qualification proved a live TCP descriptor passed to this process.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(());
+        }
+    }
+    // SAFETY: exec passed distinct owned descriptors at the two fixed positions.
+    Ok(InheritedListeners {
+        peer: Some(unsafe { std::net::TcpListener::from_raw_fd(PEER_FD) }),
+        enrollment: Some(unsafe { std::net::TcpListener::from_raw_fd(ENROLLMENT_FD) }),
+        listening,
+    })
+}
 const READY: u8 = b'R';
 const STOP: u8 = b'S';
 const JOINED: u8 = b'J';
@@ -635,10 +775,15 @@ fn worker_control() -> Result<tokio::net::UnixStream, ()> {
     Ok(stream)
 }
 
-async fn process(path: &Path, intent: Intent, worker: bool) -> Result<(), ()> {
+async fn process(
+    path: &Path,
+    intent: Intent,
+    worker: bool,
+    inherited: Option<InheritedListeners>,
+) -> Result<(), ()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let fence = Arc::new(Admission::default());
+    let fence = Arc::new(Admission::with_listeners(inherited));
     let stop = fence.signal();
     let signals = super::unix::Signals::install().map_err(|_| ())?;
     let saw_signal = Shutdown::default();
@@ -687,8 +832,8 @@ async fn process(path: &Path, intent: Intent, worker: bool) -> Result<(), ()> {
     }
     let joined = lifecycle.quiesce().await;
     result = result.and(joined);
-    let mut parent_drained = writer.is_none();
-    if lifecycle.joined
+    let mut parent_drained = writer.is_none() && joined.is_ok();
+    if joined.is_ok()
         && let (Some(stream), Some(reader)) = (&mut writer, &mut parent_stop)
     {
         let disposition = async {
@@ -763,6 +908,7 @@ pub(super) struct Child {
     process: std::process::Child,
     control: tokio::net::UnixStream,
     stopping: bool,
+    joined: bool,
     reaped: Option<std::process::ExitStatus>,
 }
 
@@ -874,6 +1020,7 @@ impl Child {
             process,
             control,
             stopping: false,
+            joined: false,
             reaped: None,
         })
     }
@@ -903,7 +1050,7 @@ impl Child {
     pub(super) async fn quiesce(&mut self) -> Result<(), super::ExitCode> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         if self.stopping {
-            return Ok(());
+            return self.joined.then_some(()).ok_or(super::ExitCode::Endpoint);
         }
         self.stopping = true;
         self.control
@@ -913,7 +1060,10 @@ impl Child {
         loop {
             match self.control.read_u8().await {
                 Ok(READY) => continue,
-                Ok(JOINED) => return Ok(()),
+                Ok(JOINED) => {
+                    self.joined = true;
+                    return Ok(());
+                }
                 _ => return Err(super::ExitCode::Endpoint),
             }
         }
@@ -922,7 +1072,7 @@ impl Child {
     pub(super) async fn finish(&mut self) -> Result<(), super::ExitCode> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let closed = tokio::time::timeout(CLOSE, async {
-            self.stopping
+            self.joined
                 && self.control.write_u8(CLOSE_NOW).await.is_ok()
                 && matches!(self.control.read_u8().await, Ok(CLOSED))
         })
@@ -934,7 +1084,18 @@ impl Child {
             .then_some(())
             .ok_or(super::ExitCode::Store)
     }
-    pub(super) async fn abandon(&mut self) {
+    pub(super) async fn finish_after_drain(
+        &mut self,
+        drained: bool,
+    ) -> Result<(), super::ExitCode> {
+        if drained {
+            return self.finish().await;
+        }
+        self.abandon().await;
+        Err(super::ExitCode::Store)
+    }
+
+    async fn abandon(&mut self) {
         use tokio::io::AsyncWriteExt;
         let _ = self.control.shutdown().await;
         self.observe_reap().await;

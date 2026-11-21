@@ -120,12 +120,28 @@ impl TimeProvider for FreshTime {
     }
 }
 
+/// The two checked foreground sockets are used only by this installation.
+/// Fresh Join owns bound sockets that have not entered the listen state.
+pub(crate) struct InheritedListeners {
+    pub(crate) peer: Option<std::net::TcpListener>,
+    pub(crate) enrollment: Option<std::net::TcpListener>,
+    pub(crate) listening: bool,
+}
+
+#[derive(Default)]
+pub(super) struct JoinEvidence {
+    pub(super) without_ca: bool,
+    pub(super) requests: u8,
+    pub(super) applied: Option<LogPos>,
+}
+
 /// One install per process. Register before launching a retained worker so a
 /// stop observed during startup also fences its first admission.
 #[derive(Default)]
 pub(crate) struct Admission {
     stop: crate::service::Shutdown,
     job: std::sync::Mutex<Option<&'static Job>>,
+    inherited: std::sync::Mutex<Option<InheritedListeners>>,
 }
 
 impl Admission {
@@ -133,11 +149,39 @@ impl Admission {
         self.stop.clone()
     }
 
-    pub(crate) fn exchanges(&self) -> [u8; 2] {
-        self.job
-            .lock()
-            .unwrap()
-            .map_or([0; 2], |job| job.state().exchange.observe())
+    pub(crate) fn with_listeners(inherited: Option<InheritedListeners>) -> Self {
+        Self {
+            inherited: std::sync::Mutex::new(inherited),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn check_addresses(&self, peer: SocketAddr, enrollment: SocketAddr) -> bool {
+        use crate::service::cluster_runtime::validate_listener;
+        self.inherited.lock().unwrap().as_ref().is_none_or(|pair| {
+            pair.peer
+                .as_ref()
+                .is_some_and(|listener| validate_listener(listener, peer, pair.listening).is_ok())
+                && pair.enrollment.as_ref().is_some_and(|listener| {
+                    validate_listener(listener, enrollment, pair.listening).is_ok()
+                })
+        })
+    }
+
+    pub(crate) fn evidence(&self) -> [u8; 29] {
+        let mut bytes = [0; 29];
+        if let Some(job) = *self.job.lock().unwrap() {
+            let state = job.state();
+            bytes[1..3].copy_from_slice(&state.exchange.observe());
+            bytes[3] = state.join_evidence.requests;
+            bytes[4] = u8::from(state.join_evidence.without_ca);
+            if let Some(pos) = state.join_evidence.applied {
+                bytes[5..13].copy_from_slice(&pos.term.to_be_bytes());
+                bytes[13..21].copy_from_slice(&pos.leader.to_be_bytes());
+                bytes[21..29].copy_from_slice(&pos.index.to_be_bytes());
+            }
+        }
+        bytes
     }
 
     pub(crate) fn stop(&self) {
@@ -153,6 +197,7 @@ impl Admission {
         assert!(registered.replace(job).is_none());
         let mut state = job.state();
         state.process_owned = true;
+        state.inherited = self.inherited.lock().unwrap().take();
         if self.stop.is_cancelled() {
             Job::stop_admission(&mut state);
         }
@@ -518,3 +563,23 @@ async fn publish(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn refused_founder_for_test(
+    fence: &Admission,
+) -> (Running, tokio::sync::oneshot::Receiver<()>) {
+    let job = Job::anchor();
+    fence.register(job);
+    founder::refuse(
+        job,
+        founder::Error::Attach(peer_transport::Refusal::Address),
+    );
+    let (closed, observed) = tokio::sync::oneshot::channel();
+    let supervisor = tokio::spawn(async move {
+        job.close.notified().await;
+        assert!(job.begin_close());
+        job.finish_close(None, true, false);
+        closed.send(()).unwrap();
+    });
+    (Running::founder(job, Some(supervisor), false), observed)
+}

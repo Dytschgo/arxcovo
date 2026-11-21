@@ -39,6 +39,26 @@ service resources, then tells the child to close the retained cluster
 job. The root parent checks the final worker result and observes
 actual child exit. Missing or nonclean outcomes are failures.
 
+Foreground can explicitly adopt TCP descriptors 3 and 4. It checks the
+exec-time descriptor inventory, socket type, protocol, family, listen state
+and exact configured address before binding owner control. It marks both
+descriptors close-on-exec. Fresh Join requires bound, unconnected sockets with
+listening disabled, so only the pending owner endpoint is reachable until
+publication. The retained transport starts the peer listener after publication
+and before self-admission. Enrollment starts its listener only at the existing
+issuer readiness gate. Founder and recovery handoffs require listening sockets.
+Native service retains its single private control descriptor. Ordinary address
+binding remains the default.
+
+C13 needs the exact persisted peer and enrollment addresses through all
+three restarts and the founder's explicit D9 route before Join. That uses
+fixed addresses in the private installation rather than replacing them
+when a port-zero bind completes. The launcher holds the eight initial
+reservations simultaneously. Bound, non-listening successors keep the
+same binding across restart without accepting traffic from the original
+listener. Close evidence checks kernel listen state separately from lock
+release and actual reap.
+
 ## Evidence boundary
 
 C13 uses the non-test Linux arxd executable from the existing CI

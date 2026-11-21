@@ -172,11 +172,12 @@ impl Host {
         )
         .await;
         let drain_returned = drained.is_ok();
+        let drain_succeeded = matches!(drained, Ok(Ok(())));
         retain(&mut result, drained.unwrap_or(Err(ExitCode::Store)));
         retain(
             &mut result,
             pending(
-                app.finish_after_drain(drain_returned),
+                app.finish_after_drain(drain_succeeded),
                 &deadline,
                 reporter,
                 State::Stopping,
@@ -257,5 +258,6 @@ pub(crate) mod cluster_owner;
 #[cfg(target_os = "linux")]
 pub(crate) mod cluster_runtime;
 
-#[cfg(target_os = "linux")]
-pub use cluster_runtime::entry as cluster_entry;
+pub fn cluster_entry(args: &[std::ffi::OsString]) -> Option<i32> {
+    crate::cluster::consensus::activation::entry(args)
+}

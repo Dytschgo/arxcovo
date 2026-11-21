@@ -424,14 +424,16 @@ pub(super) mod linux {
             .founder_recovered_issuer
             .take()
             .ok_or(Error::Preparation)?;
+        let listener = state.inherited.as_mut().and_then(|pair| pair.peer.take());
         transport
-            .attach_founder(
+            .attach_founder_on(
                 node.sm.as_ref().ok_or(Error::Eligibility)?,
                 Arc::new(EngineDispatch {
                     raft: node.raft.clone().ok_or(Error::Eligibility)?,
                 }),
                 &address.to_string(),
                 issuer.peer_credentials(),
+                listener,
             )
             .map_err(Error::Attach)?;
         state.issuer = Some(Arc::new(issuer));
@@ -447,9 +449,15 @@ pub(super) mod linux {
     }
 
     pub(in super::super) fn refuse(job: &Job, reason: Error) {
-        job.state().founder_failure.get_or_insert(reason);
+        let process_owned = {
+            let mut state = job.state();
+            state.founder_failure.get_or_insert(reason);
+            state.process_owned
+        };
         job.set(Status::FounderRefused);
-        drop(job.request_close());
+        if !process_owned {
+            drop(job.request_close());
+        }
     }
 
     pub(in super::super) fn prepare(job: &Job, intent: &StartIntent) -> Option<Prepared> {
@@ -616,12 +624,14 @@ pub(super) mod linux {
                 key: credentials.key.clone_key(),
                 time: credentials.time.clone(),
             };
+            let listener = state.inherited.as_mut().and_then(|pair| pair.peer.take());
             transport
-                .attach_founder(
+                .attach_founder_on(
                     sm,
                     Arc::new(EngineDispatch { raft }),
                     &self.address,
                     credentials,
+                    listener,
                 )
                 .map_err(Error::Attach)?;
             state.issuer = Some(Arc::new(enrollment_ingress::ReadyIssuer::new(

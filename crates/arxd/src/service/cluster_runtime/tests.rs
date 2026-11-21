@@ -64,6 +64,9 @@ with socket.socket(fileno=3) as control:
             control.sendall(b'R')
         assert control.recv(1) == b'S'
         control.sendall(b'J')
+        if behavior == 'drain-refuse':
+            assert control.recv(1) == b''
+            sys.exit(43)
         assert control.recv(1) == b'C'
         if behavior == 'no-close':
             sys.exit(42)
@@ -142,4 +145,126 @@ async fn supervisor_does_not_accept_close_frame_as_readiness() {
     assert!(child.wait_ready().await.is_err());
     assert!(child.exited().await.is_err());
     assert_eq!(child.reaped.unwrap().code(), Some(41));
+}
+
+#[tokio::test]
+async fn foreground_founder_attach_refusal_waits_for_admitted_owner_task() {
+    let fence = Arc::new(Admission::default());
+    let (running, mut cluster_closed) = activation::refused_founder_for_test(&fence);
+    let (finish_owner, owner_work) = tokio::sync::oneshot::channel();
+    let (admitted, admission) = tokio::sync::oneshot::channel();
+    let owner = tokio::spawn(async move {
+        admitted.send(()).unwrap();
+        owner_work.await.unwrap();
+        Ok(())
+    });
+    admission.await.unwrap();
+    let (_status, receiver) = watch::channel(Status::Refused);
+    let mut lifecycle = Lifecycle {
+        work: Arc::new(Mutex::new(Work {
+            waiting: None,
+            running: Some(running),
+            first: Some(activation::Error::Listener),
+        })),
+        fence: fence.clone(),
+        joined: false,
+        status: receiver,
+        control: cluster_owner::Control::observe_task(owner),
+        supervisor: tokio::spawn(async {}),
+    };
+    let closing = tokio::spawn(async move {
+        lifecycle.quiesce().await.unwrap();
+        lifecycle.close().await
+    });
+    fence.signal().cancelled().await;
+    assert!(matches!(
+        cluster_closed.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    finish_owner.send(()).unwrap();
+    cluster_closed.await.unwrap();
+    assert_eq!(closing.await.unwrap(), Err(()));
+}
+
+#[test]
+fn inherited_listener_refuses_wrong_address_and_non_listening_descriptors() {
+    use std::os::fd::AsRawFd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    assert!(validate_listener(&listener, address, true).is_ok());
+    assert!(validate_listener(&listener, "127.0.0.1:0".parse().unwrap(), true).is_err());
+    assert!(
+        qualify_listener(listener.as_raw_fd(), Some("[::1]:0".parse().unwrap()), true).is_err()
+    );
+    let unbound = tokio::net::TcpSocket::new_v4().unwrap();
+    assert!(qualify_listener(unbound.as_raw_fd(), None, true).is_err());
+    let root = tempfile::tempdir().unwrap();
+    let unix = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
+    assert!(qualify_listener(unix.as_raw_fd(), None, true).is_err());
+}
+
+struct FailingDrain(Child);
+
+impl crate::service::Application for FailingDrain {
+    async fn load_config(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    async fn verify_layout(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    async fn open_store(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    async fn service_start(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    async fn bind(&mut self, _: Shutdown) -> Result<(), super::super::ExitCode> {
+        self.0.wait_ready().await?;
+        // Enter production cleanup without keeping an ordinary endpoint alive.
+        Err(super::super::ExitCode::Endpoint)
+    }
+    async fn preflight(&mut self) {}
+    fn start_discovery(&mut self) {}
+    async fn serve(&mut self) -> Result<(), super::super::ExitCode> {
+        unreachable!()
+    }
+    fn stop_accepting(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    async fn drain(&mut self) -> Result<(), super::super::ExitCode> {
+        self.0.quiesce().await?;
+        Err(super::super::ExitCode::Store)
+    }
+    async fn finish_after_drain(&mut self, drained: bool) -> Result<(), super::super::ExitCode> {
+        self.0.finish_after_drain(drained).await
+    }
+    async fn service_stop(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+    fn release(&mut self) -> Result<(), super::super::ExitCode> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn service_drain_error_denies_close_now_and_still_reaps_child() {
+    use crate::service::{ExitCode, Host, Reporter, State};
+    use std::os::unix::fs::PermissionsExt;
+    struct Silent;
+    impl Reporter for Silent {
+        fn report(&mut self, _: State, _: ExitCode) -> Result<(), ExitCode> {
+            Ok(())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.path().join("lock");
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let mut application = FailingDrain(supervisor_worker(root.path(), "drain-refuse"));
+    assert_eq!(
+        Host::run(&mut application, Shutdown::default(), &mut Silent).await,
+        ExitCode::Endpoint
+    );
+    assert_eq!(application.0.reaped.unwrap().code(), Some(43));
 }

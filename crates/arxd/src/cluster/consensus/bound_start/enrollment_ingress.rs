@@ -310,13 +310,27 @@ impl Job {
         {
             return Err(Refused);
         }
+        let inherited = state
+            .inherited
+            .as_mut()
+            .and_then(|pair| pair.enrollment.take());
         let ready = state.issuer.as_ref().ok_or(Refused)?;
         let node = state.node.as_ref().ok_or(Refused)?;
         {
             let live = node.try_lock().map_err(|_| Refused)?;
             ready.available(&live)?;
         }
-        let listener = std::net::TcpListener::bind(ready.endpoint).map_err(|_| Refused)?;
+        let listener = match inherited {
+            Some(listener) => {
+                crate::service::cluster_runtime::listen_inherited(&listener)
+                    .map_err(|_| Refused)?;
+                listener
+            }
+            None => std::net::TcpListener::bind(ready.endpoint).map_err(|_| Refused)?,
+        };
+        if listener.local_addr().ok() != Some(ready.endpoint) {
+            return Err(Refused);
+        }
         listener.set_nonblocking(true).map_err(|_| Refused)?;
         let listener = TcpListener::from_std(listener).map_err(|_| Refused)?;
         let serving = ServingListener::capture(&listener, ready.endpoint);

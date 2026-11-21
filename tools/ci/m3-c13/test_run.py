@@ -41,10 +41,39 @@ class LauncherTests(unittest.TestCase):
 
 
     def test_fixture_cleanup_requires_all_owned_children_observed(self):
-        good = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helper_unknown=0"
+        good = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helpers=18 helpers_reaped=18 helper_unknown=0"
         self.assertTrue(RUN.cleanup_observed([good]))
         for lines in (
             [], [good, good], [good.replace("clean=6", "clean=5")],
-            [good.replace("reaped=6", "reaped=5")], [good.replace("unknown=0", "unknown=1")],
+            [good.replace("reaped=6", "reaped=5")], [good.replace("helpers_reaped=18", "helpers_reaped=17")], [good.replace("unknown=0", "unknown=1")],
         ):
             self.assertFalse(RUN.cleanup_observed(lines))
+
+
+    def test_teardown_reserve_and_redacted_first_failure(self):
+        with patch.object(RUN.time, "monotonic", return_value=100):
+            self.assertEqual(RUN.remaining(103, 9), 3)
+            with self.assertRaises(TimeoutError):
+                RUN.remaining(100, 9)
+    def test_first_record_survives_truncation_and_chunk_boundaries(self):
+        first = b"C13 first phase=join category=pipe-io"
+        next_record = b"C13 first phase=close category=assertion"
+        for oversized_prefix in (b"", b"x" * (RUN.OUTPUT_LIMIT + 20)):
+            with self.subTest(truncated_before_record=bool(oversized_prefix)):
+                capture = RUN.Capture()
+                capture.feed(oversized_prefix)
+                capture.feed(b"suffix\nC13 first phase=/tmp category=secret\n" + first[:15])
+                capture.feed(first[15:] + b"\n" + next_record + b"\n")
+                capture.feed(b"x" * RUN.OUTPUT_LIMIT)
+                self.assertEqual(capture.first, first.decode("ascii"))
+                self.assertTrue(capture.truncated)
+                self.assertEqual(len(capture.bulk), RUN.OUTPUT_LIMIT)
+
+    def test_partial_and_oversized_lines_do_not_produce_records(self):
+        capture = RUN.Capture()
+        first = b"C13 first phase=join category=pipe-io"
+        capture.feed(b"x" * 97)
+        capture.feed(first + b"\n" + first)
+        self.assertIsNone(capture.first)
+        capture.feed(b"\n")
+        self.assertEqual(capture.first, first.decode("ascii"))

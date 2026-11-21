@@ -316,14 +316,14 @@ impl Server {
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
     {
-        self.start_with_status(dispatch, || [0; 3])
+        self.start_with_status(dispatch, || [0; 29])
     }
 
     pub(crate) fn start_with_status<F, Work, S>(self, dispatch: F, status: S) -> Control
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
-        S: Fn() -> [u8; 3] + Clone + Send + 'static,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
     {
         self.start_with_stop(dispatch, status, Shutdown::default())
     }
@@ -337,7 +337,7 @@ impl Server {
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
-        S: Fn() -> [u8; 3] + Clone + Send + 'static,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
     {
         let requested = stop.clone();
         let supervisor = tokio::spawn(async move { self.serve(requested, dispatch, status).await });
@@ -352,7 +352,7 @@ impl Server {
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
-        S: Fn() -> [u8; 3] + Clone + Send + 'static,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
     {
         let mut work = JoinSet::new();
         let mut outcome = Ok(());
@@ -414,8 +414,13 @@ impl Control {
         self.stop.cancel();
     }
 
-    pub(crate) fn joined(&self) -> bool {
-        self.outcome.is_some()
+    #[cfg(test)]
+    pub(crate) fn observe_task(supervisor: tokio::task::JoinHandle<Result<(), Failure>>) -> Self {
+        Self {
+            stop: Shutdown::default(),
+            supervisor,
+            outcome: None,
+        }
     }
 
     pub(crate) async fn close(&mut self, observation: Duration) -> Result<(), Failure> {
@@ -452,7 +457,7 @@ where
     F: FnOnce(Operator, Request) -> Work,
     Work: Future<Output = Reply>,
 {
-    connection_with_status(stream, uid, stop, dispatch, || [0; 3]).await;
+    connection_with_status(stream, uid, stop, dispatch, || [0; 29]).await;
 }
 
 async fn connection_with_status<F, Work, S>(
@@ -464,7 +469,7 @@ async fn connection_with_status<F, Work, S>(
 ) where
     F: FnOnce(Operator, Request) -> Work,
     Work: Future<Output = Reply>,
-    S: FnOnce() -> [u8; 3],
+    S: FnOnce() -> [u8; 29],
 {
     let request = tokio::select! {
         biased;

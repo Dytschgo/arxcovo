@@ -319,7 +319,15 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
             }
             let member = op.member.as_ref().unwrap();
             owner.stage_published_join()?;
+            // Credentials checks the exact learner custody inventory, including
+            // the absence of any CA material in the member store.
             op.credentials = Some(member.credentials(owner, &clock)?);
+            if state.process_owned
+                && let Some((slot, _)) = member.history.as_deref()
+            {
+                slot.confirm_learner_without_ca()?;
+                state.join_evidence.without_ca = true;
+            }
             let (stores, ready) = startup_recovery::prepare_published_join(owner, intent);
             let failure = stores.first_failure_for_learner();
             state.stores = Some(stores);
@@ -408,11 +416,13 @@ pub(super) async fn attach(job: &'static Job, address: &SocketAddr) {
         if state.close_requested {
             Err(Refusal::Ownership)
         } else {
+            let listener = state.inherited.as_mut().and_then(|pair| pair.peer.take());
             attach_inner(
                 state.learner.as_mut().unwrap(),
                 &node,
                 &mut transport,
                 *address,
+                listener,
             )
         }
     };
@@ -439,6 +449,7 @@ fn attach_inner(
     node: &ConsensusNode,
     transport: &mut TransportOwner,
     address: SocketAddr,
+    listener: Option<std::net::TcpListener>,
 ) -> Result<(), Refusal> {
     let sm = node.sm.as_ref().ok_or(Refusal::Store)?;
     let raft = node.raft.clone().ok_or(Refusal::Store)?;
@@ -466,6 +477,7 @@ fn attach_inner(
             address,
             credentials,
             gate.clone(),
+            listener,
         )
         .map_err(|_| Refusal::Unavailable)?;
     op.gate = Some(gate);
@@ -524,20 +536,31 @@ impl Run {
 
     pub(super) async fn admit(&self) -> learner_admission::Reply {
         let result = {
-            let state = self.job.state();
+            let mut state = self.job.state();
             if state.status != Status::LearnerReady || state.close_requested {
                 return learner_admission::Reply::Refused;
             }
-            state
+            let request = state
                 .learner
                 .as_ref()
                 .and_then(|op| op.admission.as_ref())
-                .and_then(|client| client.request())
+                .and_then(|client| client.request());
+            if request.is_some() && state.process_owned {
+                state.join_evidence.requests = state.join_evidence.requests.saturating_add(1);
+            }
+            request
         };
-        match result {
-            Some(result) => result.reply().await,
-            None => learner_admission::Reply::Refused,
+        let Some(result) = result else {
+            return learner_admission::Reply::Refused;
+        };
+        let reply = result.reply().await;
+        if let learner_admission::Reply::Applied(position, _) = reply {
+            let mut state = self.job.state();
+            if state.process_owned {
+                state.join_evidence.applied = Some(position);
+            }
         }
+        reply
     }
 
     #[cfg(test)]
