@@ -143,7 +143,7 @@ fn check_voters(
     cluster: ClusterId,
     anchor: JoinAnchor,
     voters: &BoundVoters,
-) -> Result<(), Refused> {
+) -> Result<super::verify::Identity, Refused> {
     if voters.anchor(cluster) != anchor {
         return Err(Refused);
     }
@@ -154,7 +154,7 @@ fn check_voters(
     if identity.cluster != cluster || !voters.contains(identity.node, identity.key) {
         return Err(Refused);
     }
-    Ok(())
+    Ok(identity)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +169,8 @@ pub(in crate::cluster) struct Completed {
     reply: Reply,
     #[cfg(target_os = "linux")]
     binding: JoinBinding,
+    #[cfg(target_os = "linux")]
+    peer: super::verify::Identity,
 }
 
 #[cfg(target_os = "linux")]
@@ -191,6 +193,16 @@ impl Completed {
     }
 
     #[cfg(target_os = "linux")]
+    pub(in crate::cluster) fn peer(
+        &self,
+    ) -> (
+        crate::cluster::enrollment::NodeId,
+        crate::cluster::enrollment::KeyDigest,
+    ) {
+        (self.peer.node, self.peer.key)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(in crate::cluster) fn for_join(self, expected: &JoinBinding) -> Result<Self, Refused> {
         if &self.binding != expected {
             return Err(Refused);
@@ -205,6 +217,8 @@ pub(in crate::cluster) struct AnchoredClient {
     code: JoinCode,
     voters: BoundVoters,
     challenge: [u8; 16],
+    #[cfg(target_os = "linux")]
+    peer: super::verify::Identity,
     deadline: Instant,
 }
 
@@ -219,6 +233,8 @@ impl AnchoredClient {
             code,
             voters,
             challenge,
+            #[cfg(target_os = "linux")]
+            peer,
             deadline,
         } = self;
         let frame = session::redeem_frame(&code, request, challenge, csr)
@@ -244,6 +260,8 @@ impl AnchoredClient {
             Ok(Completed {
                 voters,
                 reply,
+                #[cfg(target_os = "linux")]
+                peer,
                 #[cfg(target_os = "linux")]
                 binding: JoinBinding {
                     cluster: code.cluster(),
@@ -288,7 +306,7 @@ pub(in crate::cluster) async fn anchor(
             .map_err(|_| Refused)?;
         socket.flush().await.map_err(|_| Refused)?;
         let (challenge, voters) = session::receive_anchor(&mut socket).await?;
-        check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
+        let _peer = check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
         session::nothing_pending(&mut socket).await?;
         if Instant::now() >= deadline {
             return Err(Refused);
@@ -298,6 +316,8 @@ pub(in crate::cluster) async fn anchor(
             code: code.clone(),
             voters,
             challenge,
+            #[cfg(target_os = "linux")]
+            peer: _peer,
             deadline,
         })
     })

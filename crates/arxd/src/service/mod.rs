@@ -237,3 +237,6 @@ mod owner_scm_windows;
 pub mod owner_install_windows;
 
 mod unix_bridge;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod cluster_owner;

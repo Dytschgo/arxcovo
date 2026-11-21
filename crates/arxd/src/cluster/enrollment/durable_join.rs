@@ -14,6 +14,7 @@ use crate::cluster::{
         custody::LearnerCustody,
         preproof::{self, Completed, JoinBinding},
     },
+    restart_history::{Fresh, Live, Slot},
     startup_plan::{Mode, Owner, Plan},
 };
 use rustls::time_provider::TimeProvider;
@@ -54,6 +55,8 @@ struct Retained {
     #[cfg(test)]
     original_csr: Vec<u8>,
     live: Option<LiveMember>,
+    history: Option<Fresh>,
+    history_live: Option<Live>,
 }
 
 struct Job {
@@ -87,6 +90,7 @@ pub(in crate::cluster) struct Destination {
 struct Intent {
     destination: Destination,
     transfer: Transfer,
+    slot: Option<Slot>,
     time: Arc<dyn TimeProvider>,
 }
 
@@ -104,6 +108,7 @@ impl Intent {
         Ok(Self {
             destination,
             transfer,
+            slot: None,
             time,
         })
     }
@@ -130,20 +135,77 @@ pub(in crate::cluster) fn start_retained(
     launch(intent).map(|(job, observer)| (RetainedJoin(job), observer))
 }
 
+pub(in crate::cluster) struct HistoryJoin(RetainedJoin);
+
+pub(in crate::cluster) fn start_history_join(
+    destination: Destination,
+    slot: Slot,
+    paste: &str,
+    routes: &[LocalRoute],
+    time: Arc<dyn TimeProvider>,
+) -> Result<(HistoryJoin, Observer), Status> {
+    let Destination {
+        plan,
+        wrap,
+        staging,
+    } = destination;
+    let destination = Destination {
+        plan: plan.with_history_intent(Mode::Join),
+        wrap,
+        staging,
+    };
+    let mut intent = Intent::parse(destination, paste, routes, time)?;
+    intent.slot = Some(slot);
+    launch(intent).map(|(job, observer)| (HistoryJoin(RetainedJoin(job)), observer))
+}
+
+impl HistoryJoin {
+    pub(in crate::cluster) fn consume(self) -> Result<(PublishedJoin, Fresh, Live), Status> {
+        let RetainedJoin(job) = self.0;
+        let mut retained = job.retained();
+        if *job.status.borrow() != Status::Published {
+            return Err(Status::Refused);
+        }
+        let history = retained.history.take().ok_or(Status::Refused)?;
+        let live = retained.history_live.take().ok_or(Status::Refused)?;
+        Ok((job.consume(&mut retained)?, history, live))
+    }
+}
+
+pub(in crate::cluster) struct JoinPublication<'a> {
+    verified: &'a Completed,
+    expected: &'a ExpectedIdentity,
+}
+
+impl JoinPublication<'_> {
+    pub(in crate::cluster) fn expected(&self) -> &ExpectedIdentity {
+        self.expected
+    }
+
+    pub(in crate::cluster) fn leaf(&self) -> &[u8] {
+        self.verified.reply().parts().2
+    }
+
+    pub(in crate::cluster) fn peer(
+        &self,
+    ) -> (
+        crate::cluster::enrollment::NodeId,
+        crate::cluster::enrollment::KeyDigest,
+    ) {
+        self.verified.peer()
+    }
+}
+
 impl RetainedJoin {
     pub(in crate::cluster) fn consume(self) -> Result<PublishedJoin, Status> {
         let mut retained = self.0.retained();
         if *self.0.status.borrow() != Status::Published {
             return Err(Status::Refused);
         }
-        let member = retained.live.take().ok_or(Status::Refused)?;
-        Ok(PublishedJoin {
-            expected: member.expected,
-            leaf: member.leaf,
-            owner: retained.owner.take().unwrap(),
-            custody: retained.custody.take().unwrap(),
-            time: self.0.time.clone(),
-        })
+        if retained.history.is_some() {
+            return Err(Status::Refused);
+        }
+        self.0.consume(&mut retained)
     }
 }
 
@@ -174,6 +236,17 @@ fn launch(intent: Intent) -> Result<(&'static Job, Observer), Status> {
 }
 
 impl Job {
+    fn consume(&self, retained: &mut Retained) -> Result<PublishedJoin, Status> {
+        let member = retained.live.take().ok_or(Status::Refused)?;
+        Ok(PublishedJoin {
+            expected: member.expected,
+            leaf: member.leaf,
+            owner: retained.owner.take().unwrap(),
+            custody: retained.custody.take().unwrap(),
+            time: self.time.clone(),
+        })
+    }
+
     fn retained(&self) -> std::sync::MutexGuard<'_, Retained> {
         self.retained.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -189,6 +262,16 @@ impl Job {
                 .unwrap()
                 .validate_fresh_join()
                 .map_err(|_| Status::Refused)?;
+            if let Some(slot) = intent.slot {
+                retained.history = Some(
+                    slot.check_fresh(
+                        retained.owner.as_ref().unwrap(),
+                        &intent.destination.wrap,
+                        &intent.destination.staging,
+                    )
+                    .map_err(|_| Status::Refused)?,
+                );
+            }
         }
         let Transfer {
             endpoint,
@@ -228,7 +311,12 @@ impl Job {
         code: &crate::cluster::enrollment::JoinCode,
     ) -> Result<Staged, Status> {
         let mut retained = self.retained();
-        let Retained { owner, custody, .. } = &mut *retained;
+        let Retained {
+            owner,
+            custody,
+            history,
+            ..
+        } = &mut *retained;
         let owner = owner.as_mut().unwrap();
         let cluster = code.cluster();
         let root = code.ca_fingerprint();
@@ -243,6 +331,11 @@ impl Job {
             .unwrap()
             .member()
             .map_err(|_| Status::Refused)?;
+        if let Some(history) = history {
+            history
+                .bind(custody.as_ref().unwrap().history_auth())
+                .map_err(|_| Status::Refused)?;
+        }
         let key = ProvenCsr::parse(&csr)
             .map_err(|_| Status::Refused)?
             .digest();
@@ -311,12 +404,13 @@ impl Job {
                 anchors,
             },
         };
-        self.store_member(expected, root, leaf, now)
+        self.store_member(expected, &completed, root, leaf, now)
     }
 
     fn store_member(
         &self,
         expected: ExpectedIdentity,
+        verified: &Completed,
         root: &[u8],
         leaf: &[u8],
         now: u64,
@@ -326,6 +420,8 @@ impl Job {
             owner,
             custody,
             live,
+            history,
+            history_live,
             ..
         } = &mut *retained;
         let owner = owner.as_mut().unwrap();
@@ -352,6 +448,17 @@ impl Job {
             Some(now),
         )
         .map_err(publication_failure)?;
+        if let Some(history) = history {
+            let proof = JoinPublication {
+                verified,
+                expected: &expected,
+            };
+            *history_live = Some(
+                history
+                    .learner(owner, custody, &proof)
+                    .map_err(|_| Status::Unconfirmed)?,
+            );
+        }
         *live = Some(LiveMember {
             expected,
             leaf: leaf.to_vec(),

@@ -461,6 +461,282 @@ mod linux {
         }
     }
 
+    /// A history installation uses independently configured roots. Keep these
+    /// descriptors checked before granting the lane access to custody.
+    pub(in crate::cluster) struct HistoryRoots {
+        history: Root,
+        wrap: Root,
+        store: Root,
+        voter: PathBuf,
+        recovery_lock: Option<File>,
+    }
+
+    impl HistoryRoots {
+        pub(in crate::cluster) fn check(
+            owner: &crate::cluster::startup_plan::Owner,
+            history: &Path,
+            wrap: &Path,
+            store: &Path,
+        ) -> Result<Self, Error> {
+            let voter = store.parent().ok_or(Error::Layout)?.join("voter-custody");
+            let paths = [history, wrap, store, voter.as_path()];
+            for (i, path) in paths.iter().enumerate() {
+                for other in paths[i + 1..].iter().copied().chain([
+                    owner.plan.state.as_path(),
+                    owner.plan.credentials.as_path(),
+                    owner.plan.config.as_path(),
+                    owner.plan.workspace.as_path(),
+                ]) {
+                    if path.starts_with(other) || other.starts_with(path) {
+                        return Err(Error::Layout);
+                    }
+                }
+            }
+            let mut layout = FounderLayout::checked(owner)?;
+            let mut roots = Vec::new();
+            for path in &paths[..3] {
+                let root = Root::open_checked(path, |m, leaf| layout.check(m, leaf))?;
+                layout
+                    .roots
+                    .push(root.dir.metadata().map_err(|_| Error::Layout)?);
+                for ancestor in path.ancestors().skip(1) {
+                    // Root::open_checked already verified these components.
+                    layout
+                        .ancestors
+                        .push(fs::symlink_metadata(ancestor).map_err(|_| Error::Layout)?);
+                }
+                roots.push(root);
+            }
+            if voter.try_exists().map_err(|_| Error::Layout)? {
+                Root::open_checked(&voter, |m, leaf| layout.check(m, leaf))?;
+            } else if !matches!(fs::symlink_metadata(&voter), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(Error::Layout);
+            }
+            let mut roots = roots.into_iter();
+            Ok(Self {
+                history: roots.next().unwrap(),
+                wrap: roots.next().unwrap(),
+                store: roots.next().unwrap(),
+                voter,
+                recovery_lock: None,
+            })
+        }
+
+        pub(in crate::cluster) fn voter_absent(&self) -> Result<(), Error> {
+            match fs::symlink_metadata(&self.voter) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(Error::Layout),
+            }
+        }
+
+        pub(in crate::cluster) fn directory(&self) -> &File {
+            &self.history.dir
+        }
+
+        pub(in crate::cluster) fn entries(&self) -> Result<Vec<String>, Error> {
+            self.history.entries(3)
+        }
+
+        pub(in crate::cluster) fn file(&self, name: &str, create: bool) -> Result<File, Error> {
+            self.history.file(name, create)
+        }
+
+        pub(in crate::cluster) fn recheck(&self) -> Result<(), Error> {
+            self.history.recheck()?;
+            self.wrap.recheck()?;
+            self.store.recheck()
+        }
+
+        fn custody(&mut self) -> Result<Custody, Error> {
+            self.recheck()?;
+            let wrap = Root::open(&self.wrap.path)?;
+            let store = Root::open(&self.store.path)?;
+            for (actual, expected) in [(&wrap, &self.wrap), (&store, &self.store)] {
+                if !same(
+                    &actual.dir.metadata().map_err(|_| Error::Layout)?,
+                    &expected.dir.metadata().map_err(|_| Error::Layout)?,
+                ) {
+                    return Err(Error::Ownership);
+                }
+            }
+            if self.recovery_lock.is_some() {
+                return Err(Error::Ownership);
+            }
+            self.recovery_lock = Some(Custody::acquire(&store, false)?);
+            let lock = self
+                .recovery_lock
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .map_err(|_| Error::Ownership)?;
+            let installation = codec::installation(&wrap.read("install-context", 25)?)?;
+            let secret = wrap.read_wiped("seal-key", 32)?;
+            let key = codec::wrapping(&secret.0)?;
+            Ok(Custody::owner(wrap, store, lock, installation, key))
+        }
+    }
+
+    pub(in crate::cluster) enum HistoryCustody {
+        Founder(FounderCustody),
+        Learner(Box<LearnerCustody>),
+    }
+
+    impl HistoryCustody {
+        pub(in crate::cluster) fn open(
+            roots: &mut HistoryRoots,
+            founder: bool,
+        ) -> Result<Self, Error> {
+            let custody = roots.custody()?;
+            if founder {
+                return Ok(Self::Founder(FounderCustody(custody)));
+            }
+            Ok(Self::Learner(Box::new(LearnerCustody {
+                custody,
+                sealed: None,
+                voter: Installation::default(),
+            })))
+        }
+
+        pub(in crate::cluster) fn reopen_member(&mut self) -> Result<(), Error> {
+            match self {
+                Self::Founder(custody) => custody.member().map(drop),
+                Self::Learner(learner) => {
+                    let custody = &learner.custody;
+                    if custody.inventory()? != ["custody-lock", "member-key"] {
+                        return Err(Error::Context);
+                    }
+                    let member = member_copy(custody)?;
+                    let key = MemberKey::from_payload(
+                        member.context,
+                        &codec::open(&custody.key, member.context, &member.bytes)?.0,
+                    )?;
+                    learner.sealed = Some(SealedLearner {
+                        key,
+                        source: member.source,
+                        bytes: member.bytes,
+                    });
+                    Ok(())
+                }
+            }
+        }
+
+        pub(in crate::cluster) fn member(&self) -> Result<MemberCopy<'_>, Error> {
+            match self {
+                Self::Founder(custody) => custody.member(),
+                Self::Learner(custody) => custody.member(),
+            }
+        }
+
+        pub(in crate::cluster) fn auth(&self) -> HistoryAuth<'_> {
+            match self {
+                Self::Founder(custody) => custody.history_auth(),
+                Self::Learner(custody) => custody.history_auth(),
+            }
+        }
+    }
+
+    pub(in crate::cluster) struct HistoryAuth<'a> {
+        custody: &'a Custody,
+        founder: bool,
+    }
+
+    impl HistoryAuth<'_> {
+        pub(in crate::cluster) fn installation(&self) -> [u8; 16] {
+            self.custody.installation
+        }
+
+        pub(in crate::cluster) fn objects(
+            &self,
+            roots: &HistoryRoots,
+        ) -> Result<Vec<[u64; 2]>, Error> {
+            roots.recheck()?;
+            let c = self.custody;
+            let entries = c.checked_inventory()?;
+            let expected: &[&str] = if self.founder {
+                &["ca-key", "custody-lock", "member-key"]
+            } else {
+                &["custody-lock", "member-key"]
+            };
+            if entries != expected {
+                return Err(Error::Context);
+            }
+            for (actual, expected) in [(&c.wrap, &roots.wrap), (&c.store, &roots.store)] {
+                if !same(
+                    &actual.dir.metadata().map_err(|_| Error::Layout)?,
+                    &expected.dir.metadata().map_err(|_| Error::Layout)?,
+                ) {
+                    return Err(Error::Ownership);
+                }
+            }
+            let mut files = LearnerReopen::objects(&c.wrap, &c.store)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            if self.founder {
+                files.push(c.store.file("ca-key", false)?);
+            }
+            files
+                .iter()
+                .map(|file| {
+                    let m = file.metadata().map_err(|_| Error::Layout)?;
+                    Ok([m.dev(), m.ino()])
+                })
+                .collect()
+        }
+
+        fn key(&self, domain: u8) -> ring::hmac::Key {
+            use ring::{hkdf, hmac};
+            let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"arxcovo/restart-history/subkey/v1");
+            let prk = salt.extract(&self.custody.key);
+            let role_and_kind = [u8::from(self.founder), domain];
+            let info = [
+                self.custody.installation.as_slice(),
+                role_and_kind.as_slice(),
+            ];
+            let key = prk
+                .expand(&info, hmac::HMAC_SHA256)
+                .expect("SHA-256 history subkey fits HKDF limits");
+            hmac::Key::from(key)
+        }
+
+        pub(in crate::cluster) fn attest(
+            &self,
+            input: crate::cluster::restart_history::Attest<'_>,
+        ) -> [u8; 32] {
+            let (domain, bytes) = input.parts();
+            ring::hmac::sign(&self.key(domain), bytes)
+                .as_ref()
+                .try_into()
+                .unwrap()
+        }
+
+        pub(in crate::cluster) fn verify(
+            &self,
+            input: crate::cluster::restart_history::Verify<'_>,
+        ) -> Result<(), Error> {
+            let (domain, bytes, tag) = input.parts();
+            ring::hmac::verify(&self.key(domain), bytes, tag).map_err(|_| Error::Context)
+        }
+    }
+
+    impl FounderCustody {
+        pub(in crate::cluster) fn history_auth(&self) -> HistoryAuth<'_> {
+            HistoryAuth {
+                custody: &self.0,
+                founder: true,
+            }
+        }
+    }
+
+    impl LearnerCustody {
+        pub(in crate::cluster) fn history_auth(&self) -> HistoryAuth<'_> {
+            HistoryAuth {
+                custody: &self.custody,
+                founder: false,
+            }
+        }
+    }
+
     /// Installation owner for the fresh-founder role only.
     pub(in crate::cluster) struct FounderCustody(pub(super) Custody);
 
@@ -1131,6 +1407,9 @@ mod linux {
 pub(in crate::cluster) use linux::member_copy;
 #[cfg(target_os = "linux")]
 pub(in crate::cluster) use linux::{FounderCustody, LearnerCustody, LearnerReopen, MemberCopy};
+
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) use linux::{HistoryAuth, HistoryCustody, HistoryRoots};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use tests::publication_fixture;

@@ -146,6 +146,8 @@ pub(in crate::cluster) fn fixture_authenticate(
 #[path = "voter_transfer_tests.rs"]
 mod tests;
 
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) use disk::HistoryCandidate;
 #[cfg(all(test, target_os = "linux"))]
 pub(in crate::cluster) use disk::ReceiveStage;
 
@@ -153,8 +155,16 @@ pub(in crate::cluster) use disk::ReceiveStage;
 pub(super) mod disk {
     use super::super::linux::{Custody, FounderCustody, FounderLayout, LearnerCustody, Root, same};
     use super::*;
-    use crate::cluster::startup_plan::Owner;
-    use std::{fs::File, io::Write, os::fd::AsRawFd};
+    use crate::cluster::{
+        restart_history::{DurableVoter, VoterOffer, VoterReopen},
+        startup_plan::Owner,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{
+        fs::File,
+        io::Write,
+        os::{fd::AsRawFd, unix::fs::MetadataExt},
+    };
 
     const DIRECTORY: &str = "voter-custody";
     const RESERVATION: &str = "reservation";
@@ -177,6 +187,8 @@ pub(super) mod disk {
         ChannelOpen,
         BeforeReadback,
         ReadbackOpen,
+        HistoryCandidate,
+        HistoryCommitted,
         Confirmed,
     }
 
@@ -226,6 +238,36 @@ pub(super) mod disk {
     pub(in crate::cluster) struct WrittenVoterCa {
         complete: Complete,
         ciphertext: Vec<u8>,
+    }
+
+    pub(in crate::cluster) struct HistoryCandidate {
+        complete: Complete,
+        offer: VoterOffer,
+        ciphertext: [u8; 32],
+        links: [[u8; 32]; 2],
+    }
+
+    pub(in crate::cluster) struct HistoryBinding<'a> {
+        pub offer: &'a VoterOffer,
+        pub objects: [[u64; 2]; 3],
+        pub ciphertext: [u8; 32],
+        pub links: [[u8; 32]; 2],
+    }
+
+    impl HistoryCandidate {
+        pub(in crate::cluster) fn recheck(&self) -> Result<HistoryBinding<'_>, Error> {
+            let bytes = self.complete.read_ciphertext(self.complete.context)?;
+            let digest: [u8; 32] = Sha256::digest(bytes).into();
+            if digest != self.ciphertext {
+                return Err(Error::Ownership);
+            }
+            Ok(HistoryBinding {
+                offer: &self.offer,
+                objects: self.complete.objects()?,
+                ciphertext: digest,
+                links: self.links,
+            })
+        }
     }
 
     fn ca_context(
@@ -404,6 +446,33 @@ pub(super) mod disk {
             original: &[u8],
         ) -> Result<PreparedVoterCa, Error> {
             self.voter.complete.available()?;
+            self.prepare_voter_context(cluster, original)
+        }
+
+        pub(in crate::cluster) fn spend_voter_history(&mut self) -> Result<(), Error> {
+            self.voter.complete.spend()
+        }
+
+        pub(in crate::cluster) fn prepare_voter_history(
+            &self,
+            cluster: ClusterId,
+            original: &[u8],
+        ) -> Result<PreparedVoterCa, Error> {
+            self.voter_pending()?;
+            self.prepare_voter_context(cluster, original)
+        }
+
+        fn voter_pending(&self) -> Result<(), Error> {
+            matches!(self.voter.complete, Completion::Pending)
+                .then_some(())
+                .ok_or(Error::Ownership)
+        }
+
+        fn prepare_voter_context(
+            &self,
+            cluster: ClusterId,
+            original: &[u8],
+        ) -> Result<PreparedVoterCa, Error> {
             self.member()?;
             let custody = &self.custody;
             let context = ca_context(
@@ -439,6 +508,113 @@ pub(super) mod disk {
             self.voter.complete.spend()?;
             let bytes = seal_installation(&self.custody.key, context, plaintext)?;
             Ok(SealedVoterCa { context, bytes })
+        }
+
+        pub(in crate::cluster) fn seal_voter_history(
+            &mut self,
+            PreparedVoterCa(context): PreparedVoterCa,
+            original: &[u8],
+            now: u64,
+            (key, transcript, sealed): (&[u8; 32], &[u8], Vec<u8>),
+        ) -> Result<SealedVoterCa, Error> {
+            self.voter_pending()?;
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::ChannelOpen);
+            let plaintext = open_channel(key, transcript, sealed)?;
+            validate(&plaintext, original, now)?;
+            let bytes = seal_installation(&self.custody.key, context, plaintext)?;
+            Ok(SealedVoterCa { context, bytes })
+        }
+
+        pub(in crate::cluster) fn candidate_voter_history(
+            &self,
+            WrittenVoterCa {
+                complete,
+                ciphertext,
+            }: WrittenVoterCa,
+            original: &[u8],
+            now: u64,
+            offer: VoterOffer,
+            links: [[u8; 32]; 2],
+        ) -> Result<HistoryCandidate, Error> {
+            self.voter_pending()?;
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::ReadbackOpen);
+            let plaintext = open_installation(&self.custody, complete.context, &ciphertext)?;
+            validate(&plaintext, original, now)?;
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::HistoryCandidate);
+            Ok(HistoryCandidate {
+                complete,
+                ciphertext: Sha256::digest(ciphertext).into(),
+                offer,
+                links,
+            })
+        }
+
+        pub(in crate::cluster) fn complete_voter_history(
+            &mut self,
+            candidate: HistoryCandidate,
+            verified: DurableVoter,
+            installed: impl FnOnce(),
+        ) -> Result<(), Error> {
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::HistoryCommitted);
+            let binding = candidate.recheck()?;
+            if !verified.matches(binding.objects, binding.ciphertext) {
+                return Err(Error::Ownership);
+            }
+            self.voter.complete.confirm(candidate.complete, || Ok(()))?;
+            installed();
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::Confirmed);
+            Ok(())
+        }
+
+        pub(in crate::cluster) fn reopen_voter_history(
+            &mut self,
+            owner: &Owner,
+            original: &[u8],
+            now: u64,
+            expected: Option<VoterReopen<'_>>,
+        ) -> Result<(), Error> {
+            let path = self
+                .custody
+                .store
+                .path
+                .parent()
+                .ok_or(Error::Layout)?
+                .join(DIRECTORY);
+            let Some(evidence) = expected else {
+                if matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Ok(());
+                }
+                return Err(Error::Context);
+            };
+            let layout = FounderLayout::checked(owner)?;
+            let root = Root::open_checked(&path, |m, leaf| layout.check(m, leaf))?;
+            let reservation = root.file(RESERVATION, false)?;
+            let envelope = root.file(ENVELOPE, false)?;
+            let offer = evidence.offer();
+            let context = ca_context(&self.custody, offer.cluster(), offer.root(), original)?;
+            let bytes = root.read(ENVELOPE, FILE_MAX)?;
+            let complete = Complete {
+                root,
+                reservation,
+                envelope,
+                context,
+                bytes,
+            };
+            let actual = complete.read_ciphertext(context)?;
+            let digest: [u8; 32] = Sha256::digest(&actual).into();
+            if !evidence.matches(complete.objects()?, digest) {
+                return Err(Error::Ownership);
+            }
+            let payload = open_installation(&self.custody, context, &actual)?;
+            validate(&payload, original, now)?;
+            self.voter.complete = Completion::Confirmed(complete);
+            Ok(())
         }
 
         pub(in crate::cluster) fn write_voter_ca(
@@ -575,6 +751,18 @@ pub(super) mod disk {
     }
 
     impl Complete {
+        fn objects(&self) -> Result<[[u64; 2]; 3], Error> {
+            let coordinates = |f: &File| {
+                let m = f.metadata().map_err(|_| Error::Layout)?;
+                Ok([m.dev(), m.ino()])
+            };
+            Ok([
+                coordinates(&self.root.dir)?,
+                coordinates(&self.reservation)?,
+                coordinates(&self.envelope)?,
+            ])
+        }
+
         fn read_ciphertext(&self, context: Context) -> Result<Vec<u8>, Error> {
             if self.context != context || self.root.entries(2)? != [ENVELOPE, RESERVATION] {
                 return Err(Error::Context);

@@ -3969,6 +3969,115 @@ async fn listen_learner_for_test(
     (owner, address)
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() {
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let learner = learner_image(&f, 1, true, &f.sm);
+    let spy = rpc_spy(false);
+    let (mut owner, address) = listen_learner_for_test(&f, &f.sm, learner, spy.clone()).await;
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut shared_events = events(&owner);
+    let trace = Arc::new(GatedCallTrace::default());
+    trace.entry.set(Instant::now()).unwrap();
+    owner.observe_gated_inbound(&trace);
+
+    let exchange = timeout(OBSERVE, async {
+        let mut stream = connect(f.client_config(&f.client, 2), address)
+            .await
+            .unwrap_or_else(|_| panic!("selected TLS connection failed"));
+        let source = stream
+            .get_ref()
+            .0
+            .local_addr()
+            .unwrap_or_else(|_| panic!("selected socket source was unavailable"));
+        let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+        assert!(
+            send_frame(&mut stream, &frame, false).await.is_ok(),
+            "selected frame write failed"
+        );
+        assert!(observe(&mut shared_events, Event::Stage(Stage::BeforeDispatch)).await);
+
+        // The accept task can publish stages before connect reports the source.
+        trace.set_source(source);
+        let mut cursor = 0;
+        for expected in [
+            Stage::ServerHandshake,
+            Stage::ServerAuthenticated,
+            Stage::RequestRead,
+            Stage::BeforeDispatch,
+        ] {
+            let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+            assert!(
+                peer == source,
+                "observed stage came from a different connection"
+            );
+            assert_eq!(event, Event::Stage(expected));
+        }
+
+        // The second socket stays in TLS while the selected call is gated.
+        let unrelated = TcpStream::connect(address)
+            .await
+            .unwrap_or_else(|_| panic!("unrelated connection failed"));
+        let unrelated_source = unrelated
+            .local_addr()
+            .unwrap_or_else(|_| panic!("unrelated socket source was unavailable"));
+        assert!(
+            unrelated_source != source,
+            "control needs two distinct connections"
+        );
+        assert_eq!(
+            shared_events.recv().await,
+            Some(Event::Stage(Stage::ServerHandshake))
+        );
+        assert!(spy.calls.lock().unwrap().is_empty());
+        release(&owner, Stage::BeforeDispatch, &hold);
+
+        let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+        assert!(
+            peer == source,
+            "observed dispatch came from a different connection"
+        );
+        assert!(matches!(event, Event::LearnerDispatch(_)));
+        for expected in [Event::Stage(Stage::BeforeReply), Event::Finished(None)] {
+            let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
+            assert!(
+                peer == source,
+                "observed reply came from a different connection"
+            );
+            assert_eq!(event, expected);
+        }
+        assert!(
+            trace
+                .server_events
+                .lock()
+                .unwrap()
+                .unrelated
+                .iter()
+                .any(|(_, event)| *event == Event::Stage(Stage::ServerHandshake))
+        );
+        assert!(
+            read_frame(&mut stream).await.is_ok(),
+            "selected reply read failed"
+        );
+        assert!(
+            clean_eof(&mut stream).await.is_ok(),
+            "selected socket did not finish cleanly"
+        );
+        drop(unrelated);
+        frame
+    })
+    .await;
+    release(&owner, Stage::BeforeDispatch, &hold);
+    assert!(bounded_close(&mut owner).await.is_ok());
+    let frame = exchange.expect("gated exchange observation elapsed");
+    assert!(
+        spy.calls.lock().unwrap().as_slice() == [frame],
+        "selected frame must be the only dispatch"
+    );
+}
+
 async fn exchange_learner_for_test(
     address: SocketAddr,
     config: Arc<ClientConfig>,
@@ -5827,5 +5936,384 @@ mod issuer_refusals {
             )
             .await;
         }
+        use crate::cluster::{
+            consensus::startup_recovery,
+            restart_history::{TestFault, tests as history_fixture},
+            startup_plan::Mode,
+        };
+
+        #[derive(Clone)]
+        struct HistorySender {
+            ca: Arc<ClusterCa>,
+            sealed: Arc<AtomicUsize>,
+        }
+
+        impl issuer_channel::Sender for HistorySender {
+            async fn seal<'a>(
+                &'a self,
+                _: Offer,
+                key: &'a [u8; 32],
+                transcript: &'a [u8],
+            ) -> Result<Vec<u8>, Refusal> {
+                self.sealed.fetch_add(1, Ordering::SeqCst);
+                let private = Wipe(self.ca.private_marker());
+                let keypair =
+                    KeyPair::try_from(private.0.as_slice()).map_err(|_| Refusal::Identity)?;
+                custody::fixture_seal(key, transcript, self.ca.cert_der(), &keypair)
+                    .map_err(|_| Refusal::Identity)
+            }
+        }
+
+        async fn history_receiver_child(base: &std::path::Path, case: &str) {
+            // The connection is to this process's own listener. Use the
+            // host-local private address so the unchanged production route
+            // check also authorizes the sender.
+            let route = UdpSocket::bind("0.0.0.0:0").unwrap();
+            route.connect("192.0.2.1:9").unwrap();
+            let ip = route.local_addr().unwrap().ip();
+            let listener = TcpListener::bind((ip, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(control::qualified(address));
+            let enrollment = SocketAddr::new(ip, if address.port() == 7002 { 7003 } else { 7002 });
+            let mut plan = history_fixture::plan(base, Mode::Join);
+            plan.peer = address.to_string();
+            plan.enrollment = enrollment.to_string();
+            fs::write(&plan.config, format!("{address}\n{enrollment}\n")).unwrap();
+            let wrap = history_fixture::private_dir(base, "wrap");
+            let stage = history_fixture::private_dir(base, "custody");
+            history_fixture::private_dir(base, "history");
+            let mut owner = Owner::acquire(plan).unwrap();
+            let mut slot = history_fixture::slot(base)
+                .check_fresh(&owner, &wrap, &stage)
+                .unwrap();
+            let clock = Arc::new(HostClock::new(0));
+            let now = clock.sample_ms().unwrap();
+            let ca = Arc::new(ClusterCa::ephemeral(CLUSTER, now));
+            let root = ca.cert_der();
+            let ca_key = Wipe(ca.private_marker());
+            let issuer = Issuer::from_ca_cert_der(
+                &CertificateDer::from(root),
+                KeyPair::try_from(ca_key.0.as_slice()).unwrap(),
+            )
+            .unwrap();
+            let seconds = (now / 1000) as i64;
+            let client = Fixture::issue(&issuer, CLUSTER, 1, seconds - 60, seconds + 3600);
+            let mut learner = LearnerCustody::create(&owner, &wrap, &stage).unwrap();
+            let csr = ProvenCsr::parse(&learner.seal(CLUSTER, ca.fingerprint()).unwrap()).unwrap();
+            slot.bind(learner.history_auth()).unwrap();
+            let ticket = crate::cluster::consensus::issue::test_ticket(csr.digest());
+            let target = ticket.node();
+            let leaf = ca.sign_leaf(&ticket, &csr, now).unwrap();
+            let expected = ExpectedIdentity {
+                cluster: CLUSTER,
+                node: target,
+                key: csr.digest(),
+                ca: ca.fingerprint(),
+                origin: Origin::Redeem {
+                    term: ORIGINAL.term,
+                    leader: ORIGINAL.leader,
+                    index: ORIGINAL.index,
+                    anchors: vec![(1, *client.digest().as_bytes())],
+                },
+            };
+            publication::reserve(&mut owner).unwrap();
+            publication::store(
+                &mut owner,
+                Some(&expected),
+                learner.installation(),
+                root,
+                &leaf,
+                &learner.member().unwrap(),
+                Some(now),
+            )
+            .unwrap();
+            let live = history_fixture::learner_record(
+                &mut slot,
+                &owner,
+                &learner,
+                &expected,
+                &leaf,
+                (node(1), client.digest()),
+            );
+            let (mut applied, mut log) = history_fixture::learner_stores(&mut owner);
+            let bindings = [
+                (node(1), client.digest()),
+                (node(3), KeyDigest::of_spki(&[3]).unwrap()),
+                (target, csr.digest()),
+            ];
+            let voters = bindings.map(|(id, _)| id.get());
+            let members = Members::new(
+                vec![voters.into()],
+                voters
+                    .into_iter()
+                    .map(|id| (id, BasicNode::new(address.to_string())))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap();
+            let entries = [
+                (
+                    LogPos {
+                        index: 0,
+                        ..ORIGINAL
+                    },
+                    StoredEntry::Enrollment(Command::Found {
+                        cluster: CLUSTER,
+                        members: FoundMembers::new(bindings).unwrap(),
+                        proposed_at_ms: 100,
+                    }),
+                ),
+                (ORIGINAL, StoredEntry::Blank),
+                (PROMOTED, StoredEntry::Membership(encode(&members).unwrap())),
+            ];
+            for (where_, entry) in &entries {
+                applied.apply(*where_, entry).unwrap();
+            }
+            log.append(&entries).unwrap();
+            let sm = SmAdapter(Arc::new(Mutex::new(applied)));
+            let epoch = log_id(2, 1, PROMOTED.index + 1).leader_id;
+            let sample = Sample::issuer_fixture(epoch, id(PROMOTED), members);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let voter_file = base.join("history/voter");
+            let revoke = case == "revoke";
+            learner.observe_voter_receive({
+                let events = events.clone();
+                let sm = sm.clone();
+                let voter_file = voter_file.clone();
+                move |stage| {
+                    events.lock().unwrap().push(stage);
+                    if matches!(stage, ChannelOpen | ReadbackOpen | HistoryCandidate) {
+                        assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
+                        assert!(!voter_file.exists());
+                        return;
+                    }
+                    let mut store =
+                        sm.0.try_lock()
+                            .expect("disk and final latches are outside the apply guard");
+                    assert_eq!(
+                        voter_file.is_file(),
+                        matches!(stage, HistoryCommitted | Confirmed)
+                    );
+                    if stage == BeforeReadback && revoke {
+                        let next = LogPos {
+                            index: PROMOTED.index + 1,
+                            ..PROMOTED
+                        };
+                        assert_eq!(
+                            store
+                                .apply(
+                                    next,
+                                    &StoredEntry::Enrollment(Command::Remove {
+                                        cluster: CLUSTER,
+                                        node: target,
+                                        proposed_at_ms: 101,
+                                    })
+                                )
+                                .unwrap(),
+                            Some(Outcome::Removed { replay: false })
+                        );
+                    }
+                }
+            });
+            let (job, credentials, gate) = Job::issuer_receiver_fixture(
+                PublishedJoin {
+                    owner,
+                    custody: learner,
+                    expected,
+                    leaf,
+                    time: Arc::new(pki::FixedTime(seconds as u64)),
+                },
+                &sm,
+                sample,
+                clock,
+            );
+            job.set_receiver_fixture_history(slot, live);
+            assert!(base.join("history/strict").is_file());
+            let fault = match case {
+                "temp-sync" => Some(TestFault::FileSync),
+                "final-sync" => Some(TestFault::DirectorySync),
+                "substitute" => Some(TestFault::VoterSubstitution),
+                _ => None,
+            };
+            if let Some(fault) = fault {
+                job.fault_receiver_fixture_history(fault);
+            }
+            let claim = Claim {
+                cluster: CLUSTER,
+                root: ca.fingerprint(),
+                membership: PROMOTED,
+                epoch,
+                sender: (node(1), *client.digest().as_bytes()),
+                receiver: (target, *csr.digest().as_bytes()),
+            };
+            let offer = Offer {
+                claim,
+                sender_address: address,
+                receiver_address: address,
+            };
+            let dispatch = Spy::exact(None);
+            let mut outbound = TransportOwner::new(
+                CLUSTER,
+                node(1),
+                &sm,
+                Credentials {
+                    root: credentials.root.clone(),
+                    leaf: client.cert.clone(),
+                    key: client.private_key(),
+                    time: credentials.time.clone(),
+                },
+                dispatch.clone(),
+            )
+            .unwrap();
+            let (mut inbound, _) = TransportOwner::pending_founder(CLUSTER, target);
+            let res = make_resources_for_learner(
+                CLUSTER,
+                target,
+                &sm,
+                credentials,
+                dispatch.clone(),
+                Some(gate),
+            )
+            .unwrap();
+            inbound.publish(&sm, res, listener).unwrap();
+            inbound.receive_issuer_transfer(job).unwrap();
+            if case == "lost-ack" {
+                inbound
+                    .shared
+                    .hooks
+                    .drop_issuer_ack
+                    .store(true, Ordering::SeqCst);
+            }
+            let sender = HistorySender {
+                ca,
+                sealed: Arc::default(),
+            };
+            let outcome = outbound
+                .send_issuer_transfer(sender.clone(), offer)
+                .unwrap()
+                .outcome()
+                .await;
+            assert_eq!(
+                outcome,
+                if matches!(case, "healthy" | "tamper") {
+                    TransferOutcome::Installed
+                } else {
+                    TransferOutcome::Unknown
+                }
+            );
+            assert_eq!(sender.sealed.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                outbound.send_issuer_transfer(sender, offer),
+                Err(Refusal::Identity)
+            ));
+            inbound.close().await.unwrap();
+            outbound.close().await.unwrap();
+            assert_eq!(dispatch.count(), 0);
+
+            let completed = matches!(case, "healthy" | "lost-ack" | "tamper");
+            let mut expected_stages = vec![BeforeUnwrap, ChannelOpen, BeforeReadback];
+            if case != "revoke" {
+                expected_stages.extend([ReadbackOpen, HistoryCandidate]);
+            }
+            if completed {
+                expected_stages.extend([HistoryCommitted, Confirmed]);
+            }
+            assert_eq!(*events.lock().unwrap(), expected_stages);
+            assert_eq!(
+                job.receiver_fixture_completion(),
+                (completed.then_some(PROMOTED), completed, false)
+            );
+            assert_eq!(voter_file.is_file(), completed || case == "final-sync");
+            assert_eq!(
+                base.join("history/.voter.tmp").is_file(),
+                case == "temp-sync"
+            );
+            assert!(base.join("voter-custody/ca-key").is_file());
+            // Keep the job/custody and stores owned until the subprocess exits.
+            std::mem::forget(log);
+        }
+
+        async fn history_receiver_case(selector: &'static str, case: &'static str) {
+            if let Some((base, observed)) = history_fixture::probe() {
+                assert_eq!(observed, case);
+                return history_receiver_child(&base, case).await;
+            }
+            let layout = Layout::new();
+            let base = layout.root.path();
+            history_fixture::subprocess(selector, base, case);
+            let mut plan = history_fixture::plan(base, Mode::RecoverJoiner);
+            let config = fs::read_to_string(&plan.config).unwrap();
+            let [peer, enrollment] = config.lines().collect::<Vec<_>>().try_into().unwrap();
+            plan.peer = peer.into();
+            plan.enrollment = enrollment.into();
+            if case == "tamper" {
+                let envelope = base.join("voter-custody/ca-key");
+                let mut ciphertext = fs::read(&envelope).unwrap();
+                let last = ciphertext.last_mut().unwrap();
+                *last ^= 1;
+                fs::write(&envelope, &ciphertext).unwrap();
+            }
+            let owner = Owner::acquire(plan).unwrap();
+            let recovery = startup_recovery::recover_process(
+                owner,
+                history_fixture::slot(base),
+                &base.join("wrap"),
+                &base.join("custody"),
+                true,
+            );
+            if case == "tamper" {
+                assert_eq!(
+                    recovery.sqlite_opens(),
+                    2,
+                    "only the read-only pair may open"
+                );
+            }
+            let recovery = recovery.into_ready();
+            if matches!(case, "healthy" | "lost-ack" | "final-sync") {
+                let Ok(recovery) = recovery else {
+                    panic!("complete authentic voter history must reopen")
+                };
+                assert_eq!(
+                    recovery.history.verified().unwrap().voter_position(),
+                    Some(PROMOTED)
+                );
+            } else {
+                assert!(
+                    recovery.is_err(),
+                    "partial or substituted voter history refuses"
+                );
+            }
+        }
+
+        macro_rules! history_receiver_test {
+            ($test:ident, $case:literal) => {
+                #[tokio::test(flavor = "current_thread")]
+                async fn $test() {
+                    let (_, selector) = concat!(module_path!(), "::", stringify!($test))
+                        .split_once("::")
+                        .unwrap();
+                    history_receiver_case(selector, $case).await;
+                }
+            };
+        }
+
+        history_receiver_test!(receiver_history_healthy_ack_after_durable_pair, "healthy");
+        history_receiver_test!(receiver_history_revocation_before_readback, "revoke");
+        history_receiver_test!(
+            receiver_history_temp_sync_failure_preserves_partial,
+            "temp-sync"
+        );
+        history_receiver_test!(
+            receiver_history_final_sync_failure_qualifies_only_after_exit,
+            "final-sync"
+        );
+        history_receiver_test!(
+            receiver_history_postproof_substitution_never_confirms,
+            "substitute"
+        );
+        history_receiver_test!(
+            receiver_history_lost_ack_spends_sender_and_recovers,
+            "lost-ack"
+        );
+        history_receiver_test!(receiver_history_ciphertext_tamper_refuses_reopen, "tamper");
     }
 }

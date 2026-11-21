@@ -1,10 +1,11 @@
 //! Retained published learner composition and same-process reopen.
 use super::*;
 use crate::cluster::{
-    enrollment::durable_join::{PublishedJoin, RetainedJoin},
+    enrollment::durable_join::{HistoryJoin, PublishedJoin, RetainedJoin},
     issuance_publication::check_retained,
     join_receipt::PublicIdentity,
     pki::custody::{LearnerCustody, LearnerReopen},
+    restart_history::{self, Fresh, Live, VoterOffer},
     startup_plan::{Mode, ReopenObjects},
 };
 use checked_clock::{CheckedClock, HostClock};
@@ -37,7 +38,7 @@ pub(super) struct Operation {
 }
 
 enum Input {
-    Published(Box<PublishedJoin>),
+    Published(Box<PublishedJoin>, Option<Box<(Fresh, Live)>>),
     Reopen(Box<Reopen>),
 }
 
@@ -45,6 +46,7 @@ struct Member {
     expected: Arc<ExpectedIdentity>,
     leaf: Vec<u8>,
     custody: LearnerCustody,
+    history: Option<Box<(Fresh, Live)>>,
 }
 
 struct ReopenSeed {
@@ -118,10 +120,23 @@ pub(super) fn start_published(
     #[cfg(test)] fixture: Option<HostedCatchUp>,
 ) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
     Ok(start(
-        Input::Published(Box::new(join.consume()?)),
+        Input::Published(Box::new(join.consume()?), None),
         params,
         #[cfg(test)]
         fixture,
+    ))
+}
+
+pub(super) fn start_history_join(
+    join: HistoryJoin,
+    params: Params,
+) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
+    let (published, slot, issuance) = join.consume()?;
+    Ok(start(
+        Input::Published(Box::new(published), Some(Box::new((slot, issuance)))),
+        params,
+        #[cfg(test)]
+        None,
     ))
 }
 
@@ -140,7 +155,7 @@ pub(super) fn recover(
 
 fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchUp>) -> Run {
     let (plan, expected) = match &input {
-        Input::Published(p) => (&p.owner.plan, &p.expected),
+        Input::Published(p, _) => (&p.owner.plan, &p.expected),
         Input::Reopen(r) => (&r.0.plan, r.0.expected.as_ref()),
     };
     let intent = StartIntent {
@@ -224,7 +239,7 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
     let op = state.learner.as_mut().ok_or(Refusal::Ownership)?;
     let input = op.input.take().ok_or(Refusal::Ownership)?;
     let clock = match input {
-        Input::Published(published) => {
+        Input::Published(published, history) => {
             let PublishedJoin {
                 owner,
                 custody,
@@ -237,6 +252,7 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
                 expected: Arc::new(expected),
                 leaf,
                 custody,
+                history,
             });
             op.local_time = Some(time);
             let owner = state.owner.as_mut().unwrap();
@@ -277,6 +293,7 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
                 expected,
                 leaf,
                 custody,
+                history: None,
             });
             let member = op.member.as_ref().unwrap();
             let (stores, clock) =
@@ -436,26 +453,21 @@ impl Run {
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    pub(super) async fn observe_gated_dispatch(&self) -> oneshot::Receiver<Option<SocketAddr>> {
-        let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
-        transport.lock().await.observe_gated_dispatch()
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
     pub(super) async fn observe_gated_inbound(&self, trace: &Arc<peer_transport::GatedCallTrace>) {
         let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
         transport.lock().await.observe_gated_inbound(trace);
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    pub(super) async fn before_dispatch_gate(&self, arm: bool) {
+    pub(super) async fn arm_before_dispatch_gate(&self) {
         let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
-        let transport = transport.lock().await;
-        if arm {
-            transport.arm_before_dispatch();
-        } else {
-            transport.release_before_dispatch();
-        }
+        transport.lock().await.arm_before_dispatch();
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn release_before_dispatch_gate(&self) -> Option<tokio::time::Instant> {
+        let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
+        transport.lock().await.release_before_dispatch()
     }
 
     pub(super) fn admission_progress(&self) -> Option<(Phase, Option<LogPos>)> {
@@ -474,6 +486,10 @@ impl Run {
             .ok()
     }
 
+    pub(super) fn persist_strict_history(&self) -> Result<(), Refusal> {
+        self.job.persist_strict_history()
+    }
+
     fn pin_for_reopen(&self) -> Result<ReopenSeed, Refusal> {
         let state = self.job.state();
         let owner = state.owner.as_ref().ok_or(Refusal::Ownership)?;
@@ -486,6 +502,9 @@ impl Run {
             return Err(Refusal::Provenance);
         }
         let member = op.member.as_ref().ok_or(Refusal::Identity)?;
+        if member.history.is_some() {
+            return Err(Refusal::Provenance);
+        }
         Ok(ReopenSeed {
             plan: owner.plan.recover_joiner(),
             objects: owner.pin_reopen_objects()?,
@@ -563,7 +582,43 @@ impl Run {
     }
 }
 
+pub struct StrictWitness(LogPos);
+
+impl restart_history::StrictProof for LearnerCustody {
+    type Observation = StrictWitness;
+}
+
+impl restart_history::StrictObservation for StrictWitness {
+    fn position(self) -> LogPos {
+        self.0
+    }
+}
+
 impl Job {
+    fn persist_strict_history(&self) -> Result<(), Refusal> {
+        let mut state = self.state();
+        if state.close_requested || state.status != Status::LearnerReady {
+            return Err(Refusal::Ownership);
+        }
+        let State { owner, learner, .. } = &mut *state;
+        let op = learner.as_mut().ok_or(Refusal::Unavailable)?;
+        let gate = op.gate.as_ref().ok_or(Refusal::Unavailable)?;
+        let (Phase::Strict, Some(position)) = gate
+            .admission_progress()
+            .map_err(|_| Refusal::Unavailable)?
+        else {
+            return Err(Refusal::Provenance);
+        };
+        let member = op.member.as_mut().ok_or(Refusal::Identity)?;
+        let (slot, live) = member.history.as_deref_mut().ok_or(Refusal::Provenance)?;
+        slot.persist_strict(
+            owner.as_ref().ok_or(Refusal::Ownership)?,
+            &member.custody,
+            live,
+            StrictWitness(position),
+        )
+    }
+
     pub(in crate::cluster::consensus) async fn check_issuer_transfer(
         &self,
         claim: super::issuer_transfer::Claim,
@@ -615,6 +670,18 @@ impl Job {
             receiver_parts(&mut state)?.1.issuer_install.clone()
         };
         let _install = install.lock().await;
+        let history = {
+            let mut state = self.state();
+            receiver_parts(&mut state)?
+                .1
+                .member
+                .as_ref()
+                .is_some_and(|m| m.history.is_some())
+        };
+        if history {
+            let result = self.install_voter_history(claim, sender, channel).await;
+            return self.finish_receiver_proof(result);
+        }
         let (prepared, root, now) = {
             let mut state = self.state();
             let (owner, op) = receiver_parts(&mut state)?;
@@ -662,6 +729,90 @@ impl Job {
             })
             .await;
         self.finish_receiver_proof(confirmed)?
+    }
+
+    async fn install_voter_history(
+        &self,
+        claim: super::issuer_transfer::Claim,
+        sender: crate::cluster::pki::verify::AuthenticatedPeer,
+        channel: (&[u8; 32], &[u8], Vec<u8>),
+    ) -> Result<(), peer_transport::Refusal> {
+        let refused = peer_transport::Refusal::Identity;
+        let (prepared, root, now, links) = {
+            let mut state = self.state();
+            let (owner, op) = receiver_parts(&mut state)?;
+            let member = op.member.as_mut().ok_or(refused)?;
+            member.custody.spend_voter_history().map_err(|_| refused)?;
+            let links = member
+                .history
+                .as_deref()
+                .ok_or(refused)?
+                .1
+                .links()
+                .map_err(|_| refused)?;
+            let clock = op.clock.as_ref().ok_or(refused)?;
+            let tls = member.credentials(owner, clock).map_err(|_| refused)?;
+            let now = clock.sample_ms().map_err(|_| refused)?;
+            let prepared = member
+                .custody
+                .prepare_voter_history(claim.cluster, &tls.root)
+                .map_err(|_| refused)?;
+            (prepared, tls.root, now, links)
+        };
+        let sealed = self
+            .with_receiver_proof(claim, sender, |op, _| {
+                op.member
+                    .as_mut()
+                    .ok_or(refused)?
+                    .custody
+                    .seal_voter_history(prepared, &root, now, channel)
+                    .map_err(|_| refused)
+            })
+            .await??;
+        let written = {
+            let mut state = self.state();
+            let (owner, op) = receiver_parts(&mut state)?;
+            op.member
+                .as_ref()
+                .ok_or(refused)?
+                .custody
+                .write_voter_ca(owner, sealed)
+                .map_err(|_| refused)?
+        };
+        let candidate = self
+            .with_receiver_proof(claim, sender, |op, offer| {
+                let claim = offer.claim;
+                let proof = VoterOffer::from_guarded_offer(
+                    claim.cluster,
+                    claim.root,
+                    claim.sender,
+                    claim.receiver,
+                    offer.sender_address,
+                    offer.receiver_address,
+                    (claim.epoch.term, claim.epoch.node_id),
+                    claim.membership,
+                );
+                op.member
+                    .as_ref()
+                    .ok_or(refused)?
+                    .custody
+                    .candidate_voter_history(written, &root, now, proof, links)
+                    .map_err(|_| refused)
+            })
+            .await??;
+        let mut state = self.state();
+        let (owner, op) = receiver_parts(&mut state)?;
+        let member = op.member.as_mut().ok_or(refused)?;
+        let (slot, live) = member.history.as_deref().ok_or(refused)?;
+        let verified = slot
+            .commit_voter(owner, member.custody.history_auth(), live, &candidate)
+            .map_err(|_| refused)?;
+        member
+            .custody
+            .complete_voter_history(candidate, verified, || {
+                op.issuer_membership = Some(claim.membership);
+            })
+            .map_err(|_| refused)
     }
 
     fn finish_receiver_proof<T>(
@@ -865,11 +1016,14 @@ impl Job {
         let expected = Arc::new(expected);
         let address = owner.plan.peer.parse().unwrap();
         let gate = LearnerGate::new(sm, expected.clone(), address, clock.clone(), false);
-        owner.stage_published_join().unwrap();
+        if !owner.has_stores() {
+            owner.stage_published_join().unwrap();
+        }
         let member = Member {
             expected,
             leaf,
             custody,
+            history: None,
         };
         let credentials = member.credentials(&owner, &clock).unwrap();
         let (transport, _) =
@@ -911,6 +1065,46 @@ impl Job {
         });
         state.status = Status::LearnerReady;
         (job, credentials, gate)
+    }
+
+    pub(in crate::cluster::consensus) fn set_receiver_fixture_history(
+        &self,
+        slot: Fresh,
+        live: Live,
+    ) {
+        let mut state = self.state();
+        let member = state.learner.as_mut().unwrap().member.as_mut().unwrap();
+        assert!(member.history.replace(Box::new((slot, live))).is_none());
+        drop(state);
+        self.persist_strict_history().unwrap();
+    }
+
+    pub(in crate::cluster::consensus) fn fault_receiver_fixture_history(
+        &self,
+        fault: restart_history::TestFault,
+    ) {
+        let mut state = self.state();
+        state
+            .learner
+            .as_mut()
+            .unwrap()
+            .member
+            .as_mut()
+            .unwrap()
+            .history
+            .as_deref_mut()
+            .unwrap()
+            .0
+            .fault(fault);
+    }
+
+    pub(in crate::cluster::consensus) fn receiver_fixture_completion(
+        &self,
+    ) -> (Option<LogPos>, bool, bool) {
+        let state = self.state();
+        let op = state.learner.as_ref().unwrap();
+        let (confirmed, available) = op.member.as_ref().unwrap().custody.voter_custody_state();
+        (op.issuer_membership, confirmed, available)
     }
 
     pub(in crate::cluster::consensus) fn assert_fixture_custody(
