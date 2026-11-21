@@ -779,9 +779,9 @@ merged, as listed under "Merged this session".
     AddNodes 2, joint 1, flatten 1, CA transfers 2, enrollment proposals 7; each original
     node restarted once and recovered node 3 issued node 4's enrollment after founder
     close; 6 of 6 processes and 93 of 93 helpers reaped; four disposable users and four groups removed. The 13d grant covered one hosted C13
-    case; once merged, C13 is a standing Ubuntu Rust-job step like C9–C12. The workflow ran
-    it again on main push 44896780073 and docs PR #230 run 44896977694, and both executions
-    passed.
+    case. After PR #229 merged, C13 became part of the standing Ubuntu Rust-job inventory
+    alongside C9–C12. CI runs C13 in its own step. After the 11:00 UTC checkpoint, that
+    step passed on main push 44896780073 and on PR #230’s earlier head in run 44896977694.
     Exact-head review PASS (`D:/Temp/arx-pr229-review/review.md`, SHA256 `0089737d…7241`),
     agent-review status 59546396014; all gates green. Residual P3: C13 stages the
     production `arxd` binary built with the existing CI debug profile under A6. Engine Sol 3/3 and Opus 0/2
