@@ -249,6 +249,98 @@ mod ledger {
                 NodeId::new(1).unwrap(),
             )
         }
+
+        fn binding(&self, member: NodeId) -> Arc<tokio::sync::Mutex<ConsensusNode>> {
+            Arc::new(tokio::sync::Mutex::new(ConsensusNode {
+                id: member.get(),
+                read_permits: Arc::new(Semaphore::new(0)),
+                issue_permits: Arc::new(Semaphore::new(0)),
+                read_blocking: Arc::default(),
+                raft: None,
+                sm: None,
+                log_released: self.log.lock().unwrap().released(),
+                sm_released: self.state.lock().unwrap().released(),
+                log_weak: std::sync::Weak::new(),
+                sm_weak: std::sync::Weak::new(),
+                permits: Arc::new(Semaphore::new(0)),
+                owners: Mutex::default(),
+            }))
+        }
+    }
+
+    #[test]
+    fn checkpoint_uses_qualified_founder_and_promoted_voter_identity() {
+        let stores = Fixture::new(vec![[1, 2, 3].into()]);
+        let first = stores.pending(2, 1);
+        let second = stores.pending(3, 2);
+        let slots = LedgerSlots::for_test(&[first, second]);
+        let epoch = id(position(3)).leader_id;
+
+        for (node, role, status, custody) in [(1, 1, 4, false), (2, 2, 3, true)] {
+            let member = NodeId::new(node).unwrap();
+            let key = KeyDigest::of_spki(&[node as u8]).unwrap();
+            let origin = LedgerOrigin {
+                binding: stores.binding(member),
+                installation: [node as u8 + 10; 16],
+                custody,
+                cluster: CLUSTER,
+                member,
+            };
+            let observe = || {
+                observe_local_ledger(&stores.log, &stores.state, &slots, CLUSTER, member).unwrap()
+            };
+            let issuer = (!custody).then_some((CLUSTER, member, key));
+            let checkpoint = origin
+                .checkpoint(&origin.clone(), issuer, observe(), epoch, role, status)
+                .unwrap();
+            assert_eq!(&checkpoint[..4], &[1, status, role, u8::from(custody)]);
+            assert_eq!(&checkpoint[4..12], &node.to_be_bytes());
+            assert_eq!(&checkpoint[12..20], &1_u64.to_be_bytes());
+            assert_eq!(&checkpoint[20..28], &1_u64.to_be_bytes());
+            assert_eq!(&checkpoint[28..44], &[node as u8 + 10; 16]);
+            assert_eq!(&checkpoint[44..60], &CLUSTER);
+            assert_eq!(&checkpoint[60..92], key.as_bytes());
+            assert_eq!(&checkpoint[92..116], &position_bytes(position(1)));
+            assert_eq!(&checkpoint[116..140], &position_bytes(position(3)));
+            assert_eq!(
+                &checkpoint[140..],
+                &[1_u64, 2, 3].map(u64::to_be_bytes).concat()
+            );
+
+            for current in [
+                LedgerOrigin {
+                    binding: stores.binding(member),
+                    ..origin.clone()
+                },
+                LedgerOrigin {
+                    installation: [55; 16],
+                    ..origin.clone()
+                },
+                LedgerOrigin {
+                    custody: !custody,
+                    ..origin.clone()
+                },
+            ] {
+                assert!(
+                    origin
+                        .checkpoint(&current, issuer, observe(), epoch, role, status)
+                        .is_none()
+                );
+            }
+            let wrong_key = KeyDigest::of_spki(&[99]).unwrap();
+            assert!(
+                origin
+                    .checkpoint(
+                        &origin,
+                        Some((CLUSTER, member, wrong_key)),
+                        observe(),
+                        epoch,
+                        role,
+                        status
+                    )
+                    .is_none()
+            );
+        }
     }
 
     #[test]

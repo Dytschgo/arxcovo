@@ -21,7 +21,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::{
+    sync::{Mutex, MutexGuard, watch},
+    time::Instant,
+};
 
 const OBSERVE: Duration = Duration::from_millis(40);
 const CLOSE: Duration = Duration::from_secs(10);
@@ -556,6 +559,155 @@ struct Work {
     first: Option<activation::Error>,
 }
 
+struct PrivateWorkBudget<'a> {
+    stop: &'a Shutdown,
+    deadline: Instant,
+}
+
+impl PrivateWorkBudget<'_> {
+    fn open(&self) -> bool {
+        !self.stop.is_cancelled() && Instant::now() < self.deadline
+    }
+
+    async fn lock<'a>(&self, work: &'a Mutex<Work>) -> Option<MutexGuard<'a, Work>> {
+        if !self.open() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => None,
+            guard = tokio::time::timeout_at(self.deadline, work.lock()) => {
+                guard.ok().filter(|_| self.open())
+            }
+        }
+    }
+
+    async fn mint(
+        &self,
+        operation: impl Future<Output = cluster_owner::DispatchReply>,
+    ) -> cluster_owner::DispatchReply {
+        use cluster_owner::Reply;
+        if !self.open() {
+            return Reply::Refused.into();
+        }
+        match tokio::time::timeout_at(self.deadline, operation).await {
+            Ok(reply) if self.open() => reply,
+            // An admitted Mint may have proposed before its receipt was lost.
+            _ => Reply::Unknown.into(),
+        }
+    }
+
+    fn observe(
+        &self,
+        operation: impl FnOnce() -> cluster_owner::DispatchReply,
+    ) -> cluster_owner::DispatchReply {
+        use cluster_owner::Reply;
+        if !self.open() {
+            return Reply::Refused.into();
+        }
+        let reply = operation();
+        if self.open() {
+            reply
+        } else {
+            Reply::Refused.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod private_work_tests {
+    use super::*;
+    use cluster_owner::{DispatchReply, Reply};
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_private_request_cannot_take_a_lock_released_at_its_deadline() {
+        let work = Mutex::new(Work {
+            waiting: None,
+            running: None,
+            first: None,
+        });
+        let held = work.lock().await;
+        let stop = Shutdown::default();
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + OBSERVE,
+        };
+        let mut queued = std::pin::pin!(budget.lock(&work));
+        std::future::poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(OBSERVE).await;
+        drop(held);
+        assert!(queued.await.is_none());
+        assert!(work.try_lock().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_mint_after_admission_drops_its_receipt() {
+        fn receipt() -> DispatchReply {
+            DispatchReply::MintReceipt(cluster_owner::MintReceipt {
+                position: crate::cluster::state_store::LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 2,
+                },
+                digest: [3; 32],
+            })
+        }
+
+        let stop = Shutdown::default();
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + OBSERVE,
+        };
+        assert!(matches!(
+            budget.mint(async { receipt() }).await,
+            DispatchReply::MintReceipt(_)
+        ));
+        let late = budget
+            .mint(async {
+                tokio::time::advance(OBSERVE).await;
+                receipt()
+            })
+            .await;
+        assert!(matches!(late, DispatchReply::Control(Reply::Unknown)));
+
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + OBSERVE,
+        };
+        let stopped = budget
+            .mint(async {
+                stop.cancel();
+                receipt()
+            })
+            .await;
+        assert!(matches!(stopped, DispatchReply::Control(Reply::Unknown)));
+        let refused = budget
+            .mint(std::future::poll_fn(|_| panic!("closed Mint was polled")))
+            .await;
+        assert!(matches!(refused, DispatchReply::Control(Reply::Refused)));
+    }
+
+    #[test]
+    fn stopped_observer_drops_its_checkpoint() {
+        let stop = Shutdown::default();
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + cluster_owner::PRIVATE_WORK_WAIT,
+        };
+        let reply = budget.observe(|| {
+            stop.cancel();
+            DispatchReply::Ledger([1; cluster_owner::LEDGER_REPLY_LEN])
+        });
+        assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
+        let reply = budget.observe(|| panic!("closed observation was invoked"));
+        assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
+    }
+}
+
 struct BuildRuntime {
     service: Arc<cluster_build::BuildService>,
     tasks: tokio::task::JoinSet<Result<(), ()>>,
@@ -712,11 +864,14 @@ impl Lifecycle {
                 let routes = routes.clone();
                 async move {
                     use cluster_owner::{Reply, Request};
-                    let deadline = tokio::time::Instant::now() + cluster_owner::PRIVATE_WORK_WAIT;
+                    let budget = PrivateWorkBudget {
+                        stop: &stop,
+                        deadline: Instant::now() + cluster_owner::PRIVATE_WORK_WAIT,
+                    };
                     let private =
                         matches!(request, Request::MintReceipt | Request::ObserveLedger(_));
                     let mut work = if private {
-                        let Ok(work) = tokio::time::timeout_at(deadline, work.lock()).await else {
+                        let Some(work) = budget.lock(&work).await else {
                             return Reply::Refused.into();
                         };
                         work
@@ -735,20 +890,16 @@ impl Lifecycle {
                             let Some(running) = &work.running else {
                                 return Reply::Refused.into();
                             };
-                            tokio::time::timeout_at(deadline, running.mint_receipt(operator))
-                                .await
-                                .unwrap_or_else(|_| Reply::Unknown.into())
+                            budget.mint(running.mint_receipt(operator)).await
                         }
                         Request::ObserveLedger(slots) => {
                             let Some(running) = &work.running else {
                                 return Reply::Refused.into();
                             };
-                            let code = status.borrow().code();
-                            let reply = running.observe_ledger(&slots, code);
-                            if stop.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                                return Reply::Refused.into();
-                            }
-                            reply
+                            budget.observe(|| {
+                                let code = status.borrow().code();
+                                running.observe_ledger(&slots, code)
+                            })
                         }
                         Request::Join(paste) => {
                             let (Some(installation), Some(issuer)) = (work.waiting.take(), issuer)

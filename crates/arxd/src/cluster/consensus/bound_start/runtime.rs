@@ -465,24 +465,16 @@ impl Running {
     }
 
     fn ledger_checkpoint(&self, slots: &LedgerSlots, status: u8) -> Option<[u8; LEDGER_REPLY_LEN]> {
-        let (binding, installation, custody, cluster, member) = {
+        let origin = {
             let state = self.job.state.try_lock().ok()?;
-            let installation = Self::retained_installation_id(&state)?;
-            let custody = self.ledger_custody(&state)?;
-            let peer = match state.status {
-                Status::FounderReady => state.founder.as_ref()?.delegated_build()?,
-                Status::LearnerReady => state.learner.as_ref()?.delegated_build()?,
-                _ => return None,
-            };
-            let (cluster, member) = peer.identity()?;
-            (state.node.clone()?, installation, custody, cluster, member)
+            self.ledger_origin(&state)?
         };
 
         // Drop the Job guard first. Acquire retained node -> log -> state once,
         // without waiting or holding a synchronous guard across an await.
         let (epoch, role, stored) = {
-            let node = binding.try_lock().ok()?;
-            if node.id != member.get() {
+            let node = origin.binding.try_lock().ok()?;
+            if node.id != origin.member.get() {
                 return None;
             }
             let raft = node.raft.as_ref()?;
@@ -506,7 +498,13 @@ impl Running {
             };
             let (epoch, role, membership) = qualified_epoch()?;
             let log = node.log_weak.upgrade()?;
-            let stored = observe_local_ledger(&log, &node.sm.as_ref()?.0, slots, cluster, member)?;
+            let stored = observe_local_ledger(
+                &log,
+                &node.sm.as_ref()?.0,
+                slots,
+                origin.cluster,
+                origin.member,
+            )?;
             if qualified_epoch()? != (epoch, role, membership)
                 || id(stored.membership) != membership
                 || !stored.voters.contains(&epoch.node_id)
@@ -519,33 +517,30 @@ impl Running {
         };
 
         let state = self.job.state.try_lock().ok()?;
-        if !Arc::ptr_eq(state.node.as_ref()?, &binding)
-            || Self::retained_installation_id(&state)? != installation
-            || self.ledger_custody(&state)? != custody
-        {
-            return None;
-        }
-        if let Some(issuer) = &state.issuer {
-            let (issuer_cluster, _, key) = issuer.transfer_identity();
-            if (issuer_cluster, issuer.member(), key) != (cluster, member, stored.key) {
-                return None;
-            }
-        }
+        let current = self.ledger_origin(&state)?;
+        let issuer = state.issuer.as_ref().map(|issuer| {
+            let (cluster, _, key) = issuer.transfer_identity();
+            (cluster, issuer.member(), key)
+        });
+        origin.checkpoint(&current, issuer, stored, epoch, role, status)
+    }
 
-        let mut bytes = [0; LEDGER_REPLY_LEN];
-        bytes[..4].copy_from_slice(&[LEDGER_VERSION, status, role, u8::from(custody)]);
-        bytes[4..12].copy_from_slice(&member.get().to_be_bytes());
-        bytes[12..20].copy_from_slice(&epoch.term.to_be_bytes());
-        bytes[20..28].copy_from_slice(&epoch.node_id.to_be_bytes());
-        bytes[28..44].copy_from_slice(&installation);
-        bytes[44..60].copy_from_slice(&cluster);
-        bytes[60..92].copy_from_slice(stored.key.as_bytes());
-        bytes[92..116].copy_from_slice(&position_bytes(stored.membership));
-        bytes[116..140].copy_from_slice(&position_bytes(stored.applied));
-        for (dest, voter) in bytes[140..].chunks_exact_mut(8).zip(stored.voters) {
-            dest.copy_from_slice(&voter.to_be_bytes());
-        }
-        Some(bytes)
+    fn ledger_origin(&self, state: &State) -> Option<LedgerOrigin> {
+        let installation = Self::retained_installation_id(state)?;
+        let custody = self.ledger_custody(state)?;
+        let peer = match state.status {
+            Status::FounderReady => state.founder.as_ref()?.delegated_build()?,
+            Status::LearnerReady => state.learner.as_ref()?.delegated_build()?,
+            _ => return None,
+        };
+        let (cluster, member) = peer.identity()?;
+        Some(LedgerOrigin {
+            binding: state.node.clone()?,
+            installation,
+            custody,
+            cluster,
+            member,
+        })
     }
 
     fn ledger_custody(&self, state: &State) -> Option<bool> {
@@ -710,6 +705,53 @@ impl Running {
             .learner
             .as_ref()
             .is_some_and(learner::Operation::voter_custody)
+    }
+}
+
+#[derive(Clone)]
+struct LedgerOrigin {
+    binding: Arc<tokio::sync::Mutex<ConsensusNode>>,
+    installation: [u8; 16],
+    custody: bool,
+    cluster: ClusterId,
+    member: NodeId,
+}
+
+impl LedgerOrigin {
+    fn checkpoint(
+        &self,
+        current: &Self,
+        issuer: Option<(ClusterId, NodeId, KeyDigest)>,
+        stored: LocalLedger,
+        epoch: LeaderId,
+        role: u8,
+        status: u8,
+    ) -> Option<[u8; LEDGER_REPLY_LEN]> {
+        if !Arc::ptr_eq(&current.binding, &self.binding)
+            || (
+                current.installation,
+                current.custody,
+                current.cluster,
+                current.member,
+            ) != (self.installation, self.custody, self.cluster, self.member)
+            || issuer.is_some_and(|identity| identity != (self.cluster, self.member, stored.key))
+        {
+            return None;
+        }
+        let mut bytes = [0; LEDGER_REPLY_LEN];
+        bytes[..4].copy_from_slice(&[LEDGER_VERSION, status, role, u8::from(self.custody)]);
+        bytes[4..12].copy_from_slice(&self.member.get().to_be_bytes());
+        bytes[12..20].copy_from_slice(&epoch.term.to_be_bytes());
+        bytes[20..28].copy_from_slice(&epoch.node_id.to_be_bytes());
+        bytes[28..44].copy_from_slice(&self.installation);
+        bytes[44..60].copy_from_slice(&self.cluster);
+        bytes[60..92].copy_from_slice(stored.key.as_bytes());
+        bytes[92..116].copy_from_slice(&position_bytes(stored.membership));
+        bytes[116..140].copy_from_slice(&position_bytes(stored.applied));
+        for (dest, voter) in bytes[140..].chunks_exact_mut(8).zip(stored.voters) {
+            dest.copy_from_slice(&voter.to_be_bytes());
+        }
+        Some(bytes)
     }
 }
 
