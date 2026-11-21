@@ -266,18 +266,32 @@ async fn match_through(raft: &Engine, node: u64, minimum: LogPos) -> Check<()> {
     .map_err(|_| "match observation elapsed")?
 }
 
-async fn stage(events: &mut tokio::sync::mpsc::Receiver<Event>, target: Stage) -> Check<()> {
-    while let Some(event) = events.recv().await {
-        match event {
-            Event::Stage(actual) if target == actual => return Ok(()),
-            Event::Refused(reason) | Event::Finished(Some(reason)) => {
-                eprintln!("C11 frozen replication refused before {target:?}: {reason:?}");
-                return Err("peer replication refused");
-            }
-            _ => {}
+// The transport events have no connection ID. Require a single uninterrupted
+// event sequence on the second learner, through the gated RPC's terminal event.
+async fn transport_event(
+    events: &mut tokio::sync::mpsc::Receiver<Event>,
+    boundary: &str,
+    expected: impl FnOnce(Event) -> bool,
+) -> Check<()> {
+    match events.recv().await {
+        Some(Event::Refused(reason) | Event::Finished(Some(reason))) => {
+            eprintln!("C11 frozen gated replication refused at {boundary}: {reason:?}");
+            Err("gated peer replication refused")
         }
+        Some(event) if expected(event) => Ok(()),
+        Some(event) => {
+            eprintln!("C11 unexpected event at gated replication {boundary}: {event:?}");
+            Err("gated peer replication event sequence differed")
+        }
+        None => Err("gated transport observation closed"),
     }
-    Err("transport observation closed")
+}
+
+async fn stage(events: &mut tokio::sync::mpsc::Receiver<Event>, target: Stage) -> Check<()> {
+    transport_event(events, "transport stage", |event| {
+        event == Event::Stage(target)
+    })
+    .await
 }
 
 async fn admit_below_target(
@@ -293,9 +307,14 @@ async fn admit_below_target(
     let evidence = timeout(OBSERVE, async {
         let (arrival, already_admitted) = tokio::select! {
             result = stage_start(&mut events) => (result?, None),
-            result = &mut request => (stage_start(&mut events).await?, Some(result?)),
+            result = &mut request => {
+                let admitted = result?;
+                (stage_start(&mut events).await?, Some(admitted))
+            }
         };
         timeout_at(arrival + GATE_OBSERVE, async {
+            stage(&mut events, Stage::ServerAuthenticated).await?;
+            stage(&mut events, Stage::RequestRead).await?;
             stage(&mut events, Stage::BeforeDispatch).await?;
             let admitted = match already_admitted {
                 Some(admitted) => admitted,
@@ -335,7 +354,21 @@ async fn admit_below_target(
     .await
     .map_err(|_| "replication arrival elapsed");
     run.before_dispatch_gate(false).await;
-    evidence?
+    let admitted = evidence??;
+    timeout(OBSERVE, async {
+        transport_event(&mut events, "dispatch", |event| {
+            matches!(event, Event::LearnerDispatch(_))
+        })
+        .await?;
+        stage(&mut events, Stage::BeforeReply).await?;
+        transport_event(&mut events, "reply result", |event| {
+            event == Event::Finished(None)
+        })
+        .await
+    })
+    .await
+    .map_err(|_| "gated peer replication reply observation elapsed")??;
+    Ok(admitted)
 }
 
 async fn stage_start(events: &mut tokio::sync::mpsc::Receiver<Event>) -> Check<Instant> {
