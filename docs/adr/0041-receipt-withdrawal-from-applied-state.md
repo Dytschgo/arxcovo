@@ -10,7 +10,7 @@ durable applied position, canonical membership and exact local binding.
 
 Only the published learner's incoming transport can provisionally accept
 an original cluster, node and key tuple absent from the applied registry.
-It checks authority after TLS and before reading application bytes, then
+It checks authority after TLS and before reading any Arxcovo frame, then
 repeats the checked observation before dispatch. The final check grants
 this exception to AppendEntries and full snapshots.
 A conflicting applied key, unavailable store, store poison or failed clock
@@ -63,7 +63,12 @@ unavailable. The earlier learner-only change could not cover this site.
 
 For ordinary owned peer RPCs, both sides complete cryptographic TLS before
 checking the local strict applied binding asynchronously. The client
-checks before its first write and the server before its first read. Strict
+checks before its first frame write and the server before its first frame
+read. During the handshake, Rustls can decrypt and buffer a bounded amount
+of application data before the applied binding check (its 16 KiB plaintext
+backpressure threshold, with record-deframer batch caps); Arxcovo neither
+parses nor acts on those bytes, and refusal drops that data with the
+connection. Strict
 server dispatch, including admission control, and the client's final reply
 check take a fresh applied observation with the same 4 ms acquisition
 budget. Deadline and cancellation checks still cover the exchange.
