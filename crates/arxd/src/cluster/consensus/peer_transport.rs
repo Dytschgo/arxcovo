@@ -245,6 +245,28 @@ fn build_lock<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
 }
 
 #[cfg(target_os = "linux")]
+const BUILD_LEARNER_WAIT: Duration = Duration::from_millis(4);
+
+#[cfg(target_os = "linux")]
+fn build_learner_ready(
+    mut observe: impl FnMut(Instant) -> Result<(), peer_registry::ObservationRefusal>,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> bool {
+    let deadline = now() + BUILD_LEARNER_WAIT;
+    while now() < deadline {
+        match observe(deadline) {
+            Ok(()) => return true,
+            Err(peer_registry::ObservationRefusal::StoreBusy) => {
+                pause(Duration::from_micros(250).min(deadline.saturating_duration_since(now())));
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
 impl BuildPeer {
     fn shared(&self) -> Option<Arc<Shared>> {
         let shared = self.0.upgrade()?;
@@ -264,19 +286,14 @@ impl BuildPeer {
         }
         let resources = state.resources.clone()?;
         drop(state);
-        if let Some(gate) = &resources.learner {
-            let deadline = Instant::now() + Duration::from_millis(4);
-            loop {
-                match gate.inspect_strict(Some(deadline), |_| ()) {
-                    Ok(()) => break,
-                    Err(peer_registry::ObservationRefusal::StoreBusy)
-                        if Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(Duration::from_micros(250));
-                    }
-                    Err(_) => return None,
-                }
-            }
+        if let Some(gate) = &resources.learner
+            && !build_learner_ready(
+                |deadline| gate.inspect_strict(Some(deadline), |_| ()),
+                Instant::now,
+                std::thread::sleep,
+            )
+        {
+            return None;
         }
         Some(resources)
     }
@@ -2980,3 +2997,57 @@ mod issuer_channel {
 
 #[cfg(any(test, target_os = "linux"))]
 pub(super) use issuer_channel::Outcome as TransferOutcome;
+
+#[cfg(all(test, target_os = "linux"))]
+mod build_learner_readiness_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // Hold a real mutex for the busy sample. Advance a controlled monotonic
+    // clock during each pause so the 4 ms result is independent of scheduling.
+    fn contended_readiness(release_after: Duration) -> (bool, Duration, usize) {
+        let state = Mutex::new(());
+        let mut held = Some(state.lock().unwrap());
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut samples = 0;
+        let ready = build_learner_ready(
+            |deadline| {
+                assert_eq!(deadline, start + Duration::from_millis(4));
+                samples += 1;
+                match state.try_lock() {
+                    Ok(_) => Ok(()),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(peer_registry::ObservationRefusal::StoreBusy)
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => panic!("fixture poisoned"),
+                }
+            },
+            || start + elapsed.get(),
+            |duration| {
+                elapsed.set(elapsed.get() + duration);
+                if elapsed.get() >= release_after {
+                    drop(held.take());
+                }
+            },
+        );
+        (ready, elapsed.get(), samples)
+    }
+
+    #[test]
+    fn readiness_recovers_when_contention_clears_inside_budget() {
+        let release_after = Duration::from_millis(1);
+        let (ready, elapsed, samples) = contended_readiness(release_after);
+        assert!(ready);
+        assert_eq!(elapsed, release_after);
+        assert!(samples > 1);
+    }
+
+    #[test]
+    fn readiness_refuses_if_contention_persists_at_deadline() {
+        let (ready, elapsed, samples) = contended_readiness(Duration::MAX);
+        assert!(!ready);
+        assert_eq!(elapsed, Duration::from_millis(4));
+        assert!(samples > 1);
+    }
+}
