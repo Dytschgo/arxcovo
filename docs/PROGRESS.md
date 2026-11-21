@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-21 06:34 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-21 11:00 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -16,8 +16,10 @@ merged, as listed under "Merged this session".
   one reviewer; coordinator-only merge.
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
-  must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `851472bc` (PR227); push CI 44876064810 recorded in the next checkpoint.
+  must stay independent of the builder. One Sol delegate was blocked (step 7a, below);
+  a second, the 13d pre-push review 3, fell back to an Opus 5.5/high reviewer.
+- **Main:** `be64f8db` (PR229); push CI 44896780073 recorded in the next checkpoint.
+  `e0f3ddc1` (PR228) push CI 44877277057 green; `851472bc` (PR227) 44876064810 green.
   `5f6fcef4` (PR225) push CI 44875428857 green; `ddc950db` (PR224) 44873617369 green;
   `f3c4b149` (PR226) 44872586418 green; `79ad98b2` (PR223) 44868467745 green;
   `e0648428` (PR222) 44866961566 green. `b035ab21` (PR220), push CI 44865096894 green.
@@ -77,7 +79,8 @@ merged, as listed under "Merged this session".
   bounded non-blocking wait; C11 diagnostics), PR220 `b035ab21` (step 12, sealed issuer
   custody transfer to promoted voters), PR222 `e0648428` (docs), PR223 `79ad98b2` (13b),
   PR226 `f3c4b149` (C11 per-connection observation), PR224 `ddc950db` (13a), PR225
-  `5f6fcef4` (13c), PR227 `851472bc` (CI gate test in one pwsh process). Every merge had an independent exact-head Sol
+  `5f6fcef4` (13c), PR227 `851472bc` (CI gate test in one pwsh process), PR228 `e0f3ddc1`
+  (docs), PR229 `be64f8db` (13d, daemon activation). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -723,17 +726,63 @@ merged, as listed under "Merged this session".
 - **PR #222 merged** as `e0648428` (docs; review 1 HOLD `D:/Temp/arx-pr222-review/review.md`
   SHA256 `07aeae0e…1a8a`, review 2 PASS `D:/Temp/arx-pr222-review2/review.md` SHA256
   `63846355…ca8c`, agent-review status 59535912676).
-- **13d (in progress):** grant adopted under the pre-approval (one C13 hosted-Linux
-  activation case: six retained Engine starts and owned closes, one Found, three owner
-  Mints, three AnchorQuery/Redeem, two admissions, one joint append, one flatten, two CA
-  transfers, a restart of each original node and survivor issuance after founder close).
-  Coordinator amendments: A6, one Ubuntu-only bounded step in the Rust job running a
-  reviewed tools/ci/m3-c13 launcher that stages disposable owner, daemon, agent and build
-  UIDs, extending to four roles the Linux Rust-job precedent of #199, which staged distinct
-  daemon and build UIDs, with minimal workflow-pin test updates and no gate, matrix or cache
-  change; A7, a move-only typed handoff of recovered custody from authenticated history
-  and a role-checked founder-recovery caller of the existing sealed CA loader, with
-  pki/ca.rs frozen. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **PR #228 merged** as `e0f3ddc1` (docs; review 1 HOLD, review 2 PASS, agent-review
+  status 59539619790).
+- **PR #229 merged** as `be64f8db` (13d, daemon activation and strict recovery of retained
+  nodes; ADR 0047). Grant as adopted under the pre-approval (one C13 hosted-Linux
+  activation case). Coordinator amendments, all under the pre-approval: A6 (one
+  Ubuntu-only bounded C13 step running the reviewed tools/ci/m3-c13 launcher, staging
+  disposable owner, daemon, agent and build UIDs, extending the #199 precedent of distinct
+  daemon and build UIDs; no gate, matrix or cache change); A7 (move-only recovered-custody
+  handoff and a role-checked founder-recovery caller of the existing sealed CA loader,
+  pki/ca.rs frozen); A8 (issuer-transfer reservation after the authenticated receiver
+  check, at most one package per attempt); A9a (named `pub(crate)` re-exports in
+  consensus.rs, bound_start private); A9b (port-0 binding preferred, else a checked
+  foreground-only inherited-socket handoff with strict descriptor validation).
+  - **Builders.** Builder 1 stopped at 3/3; stuck review 1 (SHA256 `946dfec5…0081`) found the
+    work repairable. Builder 2 (fresh 3) committed `8e86d005`; pre-push review 1 HOLD
+    (SHA256 `597bc724…e840`) on six findings; builder 2 then stopped at 3/3 on a Windows
+    compile defect; stuck review 2 (SHA256 `642ec5ee…41b7`). Builder 3 (fresh 3; report SHA256
+    `221e1aea…cb10`) committed `a27724e9`; pre-push review 2 HOLD (SHA256 `081934d8…2184`) on two P1s
+    (PTY hangup could drop the paste; worker/parent shutdown deadlock) and three P2s;
+    builder 3 then stopped at 3/3 on two shutdown close-confirmation controls; stuck review
+    3 (SHA256 `58babaa8…7616`) diagnosed a product defect (only `Clean` was accepted, not
+    `ClosedAfterFounderRefusal`). Builder 4 (one-round budgets; report SHA256 `634eb375…69f6`)
+    produced `c30ecdc4`, `8715bf8a`, `0499289e` and `e2799079`. Builders 1–3 remain 3/3
+    exhausted; builder 4 ended its last round at 1/2.
+  - **Counting rulings (coordinator).** The static Windows quarantine gate is lint-class
+    and exempt; one E0277 defect seen on two platforms at the same revision counts once;
+    the Windows temp-dir ACL preflight is environment setup; from builder 4 onward a
+    one-line, compile-only test adaptation to an API change is trivial-class like a
+    missing import (two earlier compile errors, E0277 and E0283, had been counted).
+  - **Reviews before push.** Pre-push review 3 by Sol was provider-blocked; the Opus
+    fallback (SHA256 `a6a37846…f70c`) confirmed every earlier finding fixed and held on one
+    launcher P1: hosted ubuntu-26.04 has a NO-CARRIER `docker0`, which made the address
+    selection ambiguous. Re-check 4 PASS (SHA256 `e7ff72fb…d919`): default-route source on a
+    carrier link, runner facts passed explicitly through `sudo env`, retained learner lock
+    recorded distinctly.
+  - **Hosted CI.** Run 44892006978 failed two existing Linux issuer-readiness tests broken
+    by the issuer-deferral change (log SHA256 `85145327…fecf`; counted); the fixtures now supply
+    the quorum epoch, and re-check 5 PASS (SHA256 `7f3774a0…dca1`) traced the production path
+    for C13's surviving issuers. Run 44894368929 passed all 1,029 workspace tests but the
+    #199 custody qualification refused with MissingOracle (log SHA256 `5f35042d…bff7`): its
+    parser allowed three digits for libtest's "filtered out" count, which 13d raised from
+    980 to 1,005. This pre-existing parser defect was not counted; `e2799079` accepts four
+    digits with tests. Neither failed run reached the C13 step.
+  - **C13 (single grant, spent once, passed)** in run 44895687254 (log SHA256 `86e67212…f9cd`):
+    starts 6, closes 6, Found 1, owner Mint 3, AnchorQuery 3, Redeem 3, admissions 2,
+    AddNodes 2, joint 1, flatten 1, CA transfers 2, enrollment proposals 7; each original
+    node restarted once and recovered node 3 issued node 4's enrollment after founder
+    close; 6 of 6 processes and 93 of 93 helpers reaped; 8 disposable roles removed.
+    Exact-head review PASS (`D:/Temp/arx-pr229-review/review.md`, SHA256 `0089737d…7241`),
+    agent-review status 59546396014; all gates green. Residual P3: C13 stages the
+    debug-profile `arxd` under A6, not a release-shaped binary. Engine Sol 3/3 and Opus 0/2
+    unchanged.
+- **13e and 14a (in progress):** the plan's proposed 13e grant (P1 first-error-preserving
+  owned close; one J4 hosted-Linux lost-reply case) and 14a grant (preflight-gated Linux
+  executor broker qualification, one real standard build, zero Engine) are adopted
+  verbatim under the pre-approval. Sol 6.2/high builders run in parallel, each with a
+  fresh 3, committing locally until an independent pre-push review.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
