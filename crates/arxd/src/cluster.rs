@@ -1,4 +1,5 @@
 mod bound_open;
+pub(crate) mod c13_diagnostics;
 pub mod consensus;
 pub mod enrollment;
 mod issuance_publication;

@@ -801,7 +801,7 @@ impl Job {
         let node = self.state().node.clone().ok_or(refused)?;
         let node = node.lock().await;
         let mut use_offer = Some(use_offer);
-        peer_registry::wait_for_store(|deadline| {
+        peer_registry::wait_for_store("transfer-receiver", |deadline| {
             let mut state = self.state();
             let (_, op) = receiver_parts(&mut state).map_err(|_| VerifyRefusal::Unavailable)?;
             let gate = op.gate.as_ref().ok_or(VerifyRefusal::Unavailable)?.clone();
@@ -1122,7 +1122,7 @@ fn observe_strict<T>(
     gate.inspect_strict(None, observe)
         .map_err(|error| match error {
             ObservationRefusal::StoreBusy => ActivationError::Deferred,
-            ObservationRefusal::Refused(_) => ActivationError::Refused,
+            _ => ActivationError::Refused,
         })
 }
 
@@ -1532,9 +1532,7 @@ mod activation_tests {
         // Failed clock observation must precede even a normal gate callback.
         assert!(matches!(
             broken_clock.inspect_strict(None, |_| ()),
-            Err(peer_registry::ObservationRefusal::Refused(
-                crate::cluster::pki::verify::VerifyRefusal::Unavailable
-            ))
+            Err(peer_registry::ObservationRefusal::Unavailable("clock"))
         ));
         assert_eq!(observe_strict(&broken_clock, |_| ()), Err(Refused));
         assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Refused));

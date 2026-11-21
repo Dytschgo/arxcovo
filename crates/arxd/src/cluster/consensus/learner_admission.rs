@@ -1,6 +1,6 @@
 //! One retained membership intent, with the existing Owners and proposal unit.
 use super::{membership_observation::AdmissionObservation, *};
-use crate::cluster::pki::verify::AuthenticatedPeer;
+use crate::cluster::{c13_diagnostics::record, pki::verify::AuthenticatedPeer};
 use openraft::{
     ChangeMembers, errors::PreconditionFailed, raft::Precondition,
     type_config::async_runtime::watch::WatchReceiver,
@@ -67,6 +67,20 @@ pub(super) enum Reply {
     StaleTail,
     Refused,
     Unknown,
+}
+
+impl Reply {
+    pub(super) fn refusal_category(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Applied(..) => return None,
+            Self::Revoked(..) => "revoked",
+            Self::Pending => "busy",
+            Self::AddressConflict => "address",
+            Self::StaleTail => "stale-tail",
+            Self::Refused => "refused",
+            Self::Unknown => "unconfirmed",
+        })
+    }
 }
 
 pub(super) fn covers(progress: LogPos, target: LogPos) -> bool {
@@ -198,7 +212,10 @@ impl Controller {
         }
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
-        let node = node.try_lock().map_err(|_| Reply::Refused)?;
+        let node = node.try_lock().map_err(|_| {
+            record("admission-register", "node-busy");
+            Reply::Refused
+        })?;
         let controller = self.clone();
         node.register_admission(intent, async move {
             controller.run(peer, address, deadline, &submitted).await
@@ -217,6 +234,7 @@ impl Controller {
         };
         let (raft, observed) = {
             let Ok(node) = node.try_lock() else {
+                record("admission-worker", "node-busy");
                 return Reply::Refused;
             };
             let Some(raft) = node.raft.clone() else {
@@ -232,6 +250,17 @@ impl Controller {
                 tail,
             }) => (leader, membership, tail),
             Err(error) => {
+                use super::membership_observation::MembershipReadError;
+                record(
+                    "admission-membership",
+                    match error {
+                        MembershipReadError::Busy => "busy",
+                        MembershipReadError::NotLeader => "not-leader",
+                        MembershipReadError::Unavailable => "unavailable",
+                        MembershipReadError::RetryLater => "view-changed",
+                        MembershipReadError::PeerRefused => "identity",
+                    },
+                );
                 #[cfg(test)]
                 if self.hooks.active.load(Ordering::Relaxed) {
                     eprintln!("C10 fresh membership read refused: {error:?}");
@@ -297,6 +326,7 @@ impl Controller {
         };
         let position = pos(response.log_id);
         let Ok(node) = node.try_lock() else {
+            record("admission-confirm", "node-busy");
             return Reply::Unknown;
         };
         match node

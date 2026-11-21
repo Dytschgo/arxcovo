@@ -1,5 +1,6 @@
 //! Linux ownership of the cluster worker and owner-local endpoint.
 use super::{Shutdown, cluster_owner};
+use crate::cluster::c13_diagnostics::record;
 use crate::cluster::consensus::activation::{
     self as activation, Admission, InheritedListeners, Installation, Intent, Route, Running,
 };
@@ -577,12 +578,14 @@ impl Lifecycle {
                         Request::Join(paste) => {
                             let (Some(installation), Some(issuer)) = (work.waiting.take(), issuer)
                             else {
+                                record("owner-join", "refused");
                                 return Reply::Refused;
                             };
                             status.send_replace(Status::Starting);
                             match Running::join(installation, paste, &routes, &fence).await {
                                 Ok(running) => work.running = Some(running),
                                 Err(reason) => {
+                                    record("join-start", "refused");
                                     work.first = Some(reason);
                                     status.send_replace(Status::Refused);
                                     return Reply::Unknown;
@@ -591,13 +594,22 @@ impl Lifecycle {
                             let running = work.running.as_ref().unwrap();
                             let result = tokio::select! {
                                 biased;
-                                _ = stop.cancelled() => return Reply::Unknown,
+                                _ = stop.cancelled() => {
+                                    record("join-attach", "closed");
+                                    return Reply::Unknown;
+                                },
                                 result = running.attached() => result,
                             };
                             let result = match result {
                                 Ok(()) if !stop.is_cancelled() => running.admit(issuer).await,
-                                Ok(()) => return Reply::Unknown,
-                                Err(reason) => Err(reason),
+                                Ok(()) => {
+                                    record("join-attach", "closed");
+                                    return Reply::Unknown;
+                                }
+                                Err(reason) => {
+                                    record("join-attach", "refused");
+                                    Err(reason)
+                                }
                             };
                             match result {
                                 Ok(()) => Reply::Joined,
@@ -736,6 +748,16 @@ async fn hold(work: Arc<Mutex<Work>>, status: watch::Sender<Status>, stop: Shutd
                     });
                 }
                 Err(reason) => {
+                    record(
+                        "lifecycle-observe",
+                        match reason {
+                            activation::Error::Transfer => "transfer",
+                            activation::Error::History => "history",
+                            activation::Error::Issuer => "issuer",
+                            activation::Error::Listener => "listener",
+                            _ => "refused",
+                        },
+                    );
                     work.first = Some(reason);
                     status.send_replace(Status::Refused);
                     return;

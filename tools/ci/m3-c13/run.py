@@ -47,6 +47,20 @@ ASSERTION = re.compile(
     r"publication-possession-refused|publication-helper-failed)"
 )
 FIRST_LIMIT = 160
+OWNER_EXIT = re.compile(
+    r"C13 owner node=[abcd] action=(?:join|mint) exit=(?:[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5]|signal)"
+)
+DIAGNOSTIC = re.compile(
+    r"C13 diagnostic node=[abcd] stage=(?:owner-join|join-start|join-attach|"
+    r"join-publication|join-admission|admission-route|admission-register|admission-worker|"
+    r"admission-membership|admission-confirm|admission-reply|admission-exchange|"
+    r"learner-authorization|peer-pre-frame|peer-dispatch|admission-dispatch|peer-client|"
+    r"transfer-client|transfer-receiver|transfer-exchange|lifecycle-observe) "
+    r"category=(?:unavailable-store-wait|unavailable-store|unavailable|phase-unavailable|"
+    r"clock|identity|busy|node-busy|closed|address|tls|deadline|dispatch|transport|"
+    r"revoked|stale-tail|refused|unconfirmed|incomplete|not-leader|view-changed|"
+    r"transfer|history|issuer|listener)"
+)
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
 
 
@@ -358,8 +372,9 @@ def privileged(stage, deadline):
         print(f"C13 seconds={time.monotonic()-test_start:.3f} result={'timeout' if code is None else code}",
               flush=True)
         for line in lines:
-            if (line == PIN or CLEANUP.fullmatch(line) or re.fullmatch(
-                    r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
+            if (line == PIN or CLEANUP.fullmatch(line) or OWNER_EXIT.fullmatch(line)
+                    or DIAGNOSTIC.fullmatch(line) or re.fullmatch(
+                        r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
                 print(line, flush=True)
         successful = (code == 0 and lines.count(PIN) == 1 and may_remove
                       and clean_close and first is None)

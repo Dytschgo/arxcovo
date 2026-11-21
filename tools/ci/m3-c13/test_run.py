@@ -80,6 +80,8 @@ class LauncherTests(unittest.TestCase):
         publication = "C13 first phase=publication category=assertion"
         join_cleanup = "C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 helpers=17 helpers_reaped=17 helper_unknown=0"
         publication_cleanup = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helpers=93 helpers_reaped=93 helper_unknown=0"
+        diagnostic = "C13 diagnostic node=a stage=admission-dispatch category=unavailable-store-wait"
+        owner_exit = "C13 owner node=c action=join exit=8"
         for first, cleanup, remove in (
             (join, join_cleanup, True),
             (publication, publication_cleanup, True),
@@ -90,7 +92,12 @@ class LauncherTests(unittest.TestCase):
         ):
             with self.subTest(first=first, cleanup=cleanup):
                 capture = RUN.Capture()
-                capture.feed(f"fixture-private-output\n{first}\n{cleanup}\n".encode("ascii"))
+                capture.feed(
+                    (f"fixture-private-output\n{first}\n{cleanup}\n{diagnostic}\n{owner_exit}\n"
+                     f"{diagnostic} secret=fixture-private-output\n"
+                     f"{diagnostic.replace('unavailable-store-wait', 'fixture-private-output')}\n"
+                     "C13 owner node=c action=join exit=256\n").encode("ascii")
+                )
                 stage = MagicMock(is_symlink=lambda: False)
                 stage.stat.return_value.st_uid = 23
                 output = io.StringIO()
@@ -112,6 +119,9 @@ class LauncherTests(unittest.TestCase):
                       redirect_stdout(output), redirect_stderr(output)):
                     self.assertEqual(RUN.privileged("/tmp/arx-c13-abcdefgh", 178), 1)
                 self.assertIn(first + "\n", output.getvalue())
+                self.assertIn(diagnostic + "\n", output.getvalue())
+                self.assertIn(owner_exit + "\n", output.getvalue())
+                self.assertNotIn("exit=256", output.getvalue())
                 self.assertIn(f"roles_removed={8 if remove else 0} "
                               f"roles_retained={0 if remove else 8}", output.getvalue())
                 self.assertNotIn("fixture-private-output", output.getvalue())

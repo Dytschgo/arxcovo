@@ -433,6 +433,7 @@ fn c13_held_successor_restarts_after_owned_listener_and_connection_close() {
 
 #[derive(Clone)]
 struct Node {
+    fixture: &'static str,
     root: PathBuf,
     peer: std::net::SocketAddr,
     enrollment: std::net::SocketAddr,
@@ -489,8 +490,9 @@ impl Node {
             .arg(self.config())
             .args(["--cluster-intent", intent, "--inherit-listeners"])
             .env_clear()
+            .env("ARX_C13_DIAGNOSTICS", self.fixture)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         // SAFETY: transition uses only async-signal-safe system calls.
         unsafe {
@@ -740,6 +742,16 @@ fn owner_command(
         mint_output(&mut master, slave, helpers, deadline).unwrap_or_else(|_| refuse("terminal-io"))
     };
     let (_, status) = helpers.finish();
+    if uid == OWNER && !status.success() {
+        let action = if input.is_some() { "join" } else { "mint" };
+        let exit = status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+        println!(
+            "\nC13 owner node={} action={action} exit={exit}",
+            node.fixture
+        );
+    }
     if input.is_none() && status.success() {
         assert!(validate_mint_output(&mut output));
     }
@@ -855,6 +867,7 @@ fn publish_final(probe: &Path, node: &Node, paste: &Secret, helpers: &mut Helper
         .env_clear()
         .env("ARX_C13_PUBLISH", "1")
         .env("ARX_C13_CONFIG", node.config())
+        .env("ARX_C13_DIAGNOSTICS", node.fixture)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -1117,6 +1130,7 @@ fn c13_activation_restarts_original_nodes_and_issues_after_founder_close() {
         .into_iter()
         .zip(addresses)
         .map(|(name, [peer, enrollment])| Node {
+            fixture: name,
             root: base.join(name),
             peer,
             enrollment,
