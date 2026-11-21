@@ -76,7 +76,75 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(sample=sample), self.assertRaises(run.Failure):
                 run.utc_bounds(*sample)
 
-    def test_reference_is_fixed_tls_head_without_retries(self):
+    def test_reference_uses_fixed_tls_requests_and_bounds_trace(self):
+        context = Mock()
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.getheaders.return_value = [("Date", "Sat, 21 Nov 2026 12:00:00 GMT")]
+        with patch.object(run.ssl, "create_default_context", return_value=context), \
+                patch.object(run.http.client, "HTTPSConnection", return_value=connection) as https:
+            response.status = 204
+            self.assertEqual(run.reference_request(0), 1_795_262_400_000)
+            https.assert_called_once_with("www.google.com", timeout=3, context=context)
+            self.assertEqual(connection.request.call_args.args, ("HEAD", "/generate_204"))
+            response.read.assert_not_called()
+            https.reset_mock()
+            response.status, response.length = 200, 0
+            response.read.return_value = b"ip=ignored\nloc=ignored\nts=1795262400.125\n"
+            self.assertEqual(run.reference_request(1), 1_795_262_400_000)
+            https.assert_called_once_with("1.1.1.1", timeout=3, context=context)
+            connection.request.assert_called_with(
+                "GET", "/cdn-cgi/trace", headers={
+                    "User-Agent": "Time check", "Cache-Control": "no-cache, no-store",
+                    "Connection": "close"})
+            response.read.assert_called_once_with(1024)
+            response.length = 1
+            with self.assertRaisesRegex(run.Failure, "utc-trace-bound"):
+                run.reference_request(1)
+
+    def test_trace_requires_a_single_timestamp_within_two_seconds(self):
+        run.trace_agreement(b"ts=1795262402\n", 1_795_262_400_000)
+        for body, error in (
+            (b"ts=1795262402.001\n", "utc-trace-date-mismatch"),
+            (b"ip=ignored\n", "utc-trace-timestamp"),
+            (b"ts=1795262400\nts=1795262400\n", "utc-trace-timestamp"),
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(run.Failure, error):
+                run.trace_agreement(body, 1_795_262_400_000)
+
+    def test_cross_origin_agreement_is_required_at_checkpoints(self):
+        timestamp = 1_795_262_400_000
+        self.assertEqual(run.origin_agreement(timestamp, timestamp + 5000), 5000)
+        founder = Mock()
+        founder.evidence.return_value.checkpoint_ms = timestamp
+        with patch.object(run, "reference_at", side_effect=[timestamp, timestamp + 5001]), \
+                patch.object(run, "emit"):
+            with self.assertRaisesRegex(run.Failure, "utc-origin-mismatch"):
+                run.utc_witness(founder, "mock-stage", 5)
+
+    def test_preflight_failure_stops_before_telemetry_without_retry(self):
+        with patch.object(run, "qualified_source", return_value=("sha", "image", "run")), \
+                patch.object(run, "c13_tools"), patch.object(run.time, "monotonic", return_value=0), \
+                patch.object(run, "run_helper", return_value=(1, b"")) as helper, \
+                patch.object(run, "clock_telemetry") as telemetry, patch.object(run, "emit"):
+            with self.assertRaisesRegex(run.Failure, "utc-reference-failed"):
+                run.main(["--preflight"])
+        helper.assert_called_once()
+        self.assertEqual(helper.call_args.args[1], 3)
+        telemetry.assert_not_called()
+
+    def test_clock_telemetry_exports_only_status_and_tolerates_missing_tools(self):
+        with patch.object(run, "run_helper", side_effect=[
+            FileNotFoundError, (0, b"ignored: private detail\nstatus: 64\n"),
+        ]), patch.object(run, "emit") as emit:
+            run.clock_telemetry(2)
+        emit.assert_called_once_with("utc-telemetry", tool="adjtimex", status="64")
+        with patch.object(run, "run_helper", side_effect=FileNotFoundError), \
+                patch.object(run, "emit") as emit:
+            run.clock_telemetry(2)
+        emit.assert_called_once_with("utc-telemetry", status="unavailable")
+
+    def test_reference_rejects_redirect_without_retry(self):
         context = Mock()
         connection = Mock()
         connection.getresponse.return_value.status = 302
@@ -87,9 +155,9 @@ class QualificationTests(unittest.TestCase):
             https.assert_not_called()
             with self.assertRaisesRegex(run.Failure, "utc-http-status"):
                 run.reference_request(1)
-        https.assert_called_once_with("www.cloudflare.com", timeout=3, context=context)
+        https.assert_called_once_with("1.1.1.1", timeout=3, context=context)
         connection.request.assert_called_once_with(
-            "HEAD", "/cdn-cgi/trace", headers={
+            "GET", "/cdn-cgi/trace", headers={
                 "User-Agent": "Time check", "Cache-Control": "no-cache, no-store", "Connection": "close"})
         connection.close.assert_called_once()
 
@@ -179,6 +247,8 @@ class QualificationTests(unittest.TestCase):
         self.assertIn("github.run_attempt == 1", workflow)
         self.assertIn("github.sha == vars.M3_TIME_REVIEWED_SHA", workflow)
         self.assertIn("github.workflow_sha == vars.M3_TIME_REVIEWED_SHA", workflow)
+        self.assertIn("timeout-minutes: 30", workflow)
+        self.assertLess(workflow.index("run.py --preflight"), workflow.index("cargo build"))
 
 
 if __name__ == "__main__":

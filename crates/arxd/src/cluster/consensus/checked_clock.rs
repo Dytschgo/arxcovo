@@ -2,7 +2,7 @@
 //! Local anomaly detection does not qualify UTC, restart, or suspend behavior.
 use crate::cluster::enrollment::{MAX_TIME_MS, SKEW_MS};
 use std::{
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -111,7 +111,15 @@ impl HostClock {
     ) -> Result<u64, ClockError> {
         // Serialize before touching either raw clock. Contention is transient;
         // poison is permanently unavailable. Neither waits or collects a pair.
-        let mut state = self.state.try_lock().map_err(|_| ClockError::Unavailable)?;
+        let state = self.state.try_lock().map_err(|_| ClockError::Unavailable)?;
+        self.observe_locked(state, sample)
+    }
+
+    fn observe_locked(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        sample: impl FnOnce() -> Result<Observation, ClockError>,
+    ) -> Result<u64, ClockError> {
         if let Some(error) = state.failure {
             return Err(error);
         }
@@ -155,27 +163,52 @@ impl HostClock {
         }
         result
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn sample_checkpoint(&self, deadline: Instant) -> Result<u64, ClockError> {
+        let state = checkpoint_lock(&self.state, deadline).ok_or(ClockError::Unavailable)?;
+        self.observe_locked(state, || self.raw_sample())
+    }
+
+    fn raw_sample(&self) -> Result<Observation, ClockError> {
+        // One read per sample keeps the test pair coherent across the bracket.
+        #[cfg(all(test, target_os = "linux"))]
+        let shift = *self
+            .test_source
+            .lock()
+            .map_err(|_| ClockError::Unavailable)?;
+        let before = Instant::now()
+            .checked_duration_since(self.anchor)
+            .ok_or(ClockError::Anomaly)?;
+        let wall = SystemTime::now();
+        let after = Instant::now()
+            .checked_duration_since(self.anchor)
+            .ok_or(ClockError::Anomaly)?;
+        #[cfg(all(test, target_os = "linux"))]
+        let (wall, before, after) = shift.apply(wall, before, after)?;
+        observation(wall, before, after)
+    }
 }
 impl CheckedClock for HostClock {
     fn sample_ms(&self) -> Result<u64, ClockError> {
-        self.observe_with(|| {
-            // One read per sample keeps the test pair coherent across the bracket.
-            #[cfg(all(test, target_os = "linux"))]
-            let shift = *self
-                .test_source
-                .lock()
-                .map_err(|_| ClockError::Unavailable)?;
-            let before = Instant::now()
-                .checked_duration_since(self.anchor)
-                .ok_or(ClockError::Anomaly)?;
-            let wall = SystemTime::now();
-            let after = Instant::now()
-                .checked_duration_since(self.anchor)
-                .ok_or(ClockError::Anomaly)?;
-            #[cfg(all(test, target_os = "linux"))]
-            let (wall, before, after) = shift.apply(wall, before, after)?;
-            observation(wall, before, after)
-        })
+        self.observe_with(|| self.raw_sample())
+    }
+}
+
+/// Wait only for contention. A poisoned lock never yields a checkpoint.
+#[cfg(target_os = "linux")]
+pub(super) fn checkpoint_lock<T>(mutex: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        if Instant::now() >= deadline {
+            return None;
+        }
     }
 }
 

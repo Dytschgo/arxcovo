@@ -155,8 +155,9 @@ ingress call site. The slot holds the existing dispatch ordinal, a SHA-256
 digest of the 32-byte Query body under the D5 domain
 `arxcovo-d5-query-v1\0`, the captured checked sample and the typed outcome.
 A forwarding CheckedClock returns the source result unchanged and captures
-its first result. Slot publication and readback use try-locks. A busy or
-stale slot withholds evidence while Query dispatch continues.
+its first result. Slot publication and readback use try-locks. The reader
+acquires the dispatch ordinal while holding the slot lock and withholds a
+busy or stale slot while Query dispatch continues.
 
 The existing authenticated owner socket accepts an empty request with tag
 5 and replies on tag 16. Its version-1 body is 53 bytes. The first five
@@ -166,9 +167,13 @@ sample status. Two big-endian 64-bit timestamp fields follow, then the
 codes are absent, accepted, policy refusal, busy and unavailable, in that
 order. An absent or failed sample has zero in its timestamp field. The
 request takes a checked checkpoint with the same retained issuer clock
-without taking the node's admission lock. The harness serializes these
-samples with client exchanges because they share the checked clock. Existing tag-4 status, public enrollment framing, TTL, clock
-policy, proposal and worker code, and all deadlines stay unchanged.
+without taking the node's admission lock. The Job state and checked clock
+share one 5 ms wait budget for transient mutex contention on this request.
+Poison and checked sampling failures withhold the checkpoint. The harness
+serializes these samples with client exchanges because they share the
+checked clock. Existing tag-4 status, public enrollment framing, TTL,
+clock policy, proposal and worker code, and all enrollment deadlines stay
+unchanged.
 
 The harness reads the fixture's bounded SQLite snapshots and retained log
 using the C13 observation pattern. It correlates the acknowledged Mint to its
@@ -185,15 +190,19 @@ status reply, checked source success and failure, ordinal and contention,
 and the existing public framing. The A13 and E7 source guards and the
 workflow and Windows quarantine guards pass with their existing allowlists.
 
-## W1. Coordinator-approved hosted UTC reference
+## W1b. Coordinator-approved hosted UTC reference
 
-The two fixed reference origins are `https://www.google.com/generate_204`
-and `https://www.cloudflare.com/cdn-cgi/trace`. This implementation uses
-one verified HTTPS HEAD at each origin per checkpoint. A missing Date ends
-the observation. Every request uses a generic User-Agent and sends no
-repository, owner or personal data, cookies, credentials or query
-parameters. The client follows no redirects, reads no response body and
-performs no retries. The origins see ordinary HTTPS connection metadata.
+The coordinator approved one verified HTTPS HEAD to
+`https://www.google.com/generate_204` and one verified HTTPS GET to
+`https://1.1.1.1/cdn-cgi/trace` per checkpoint. The client validates each
+certificate against its host name or IP address. It reads at most 1024
+bytes of the trace response, using only its `ts=` field and the Date
+header. Both must be present and agree within 2 s. The two origins' Dates
+must agree within 5 s. Every request uses a generic User-Agent and sends
+no repository, owner or personal data, cookies, credentials or query
+parameters. The client follows no redirects and performs no retries.
+Both origins see ordinary HTTPS connection metadata, including the
+runner's public egress IP.
 
 Each Date needs a bounded, unambiguous fresh response. An Age header or an
 indication of caching fails the check. Within each before/after bracket
@@ -202,7 +211,10 @@ fit ±30 s after adding ±1 s for Date resolution and the approved ±1 s
 source accuracy. Each origin passes separately. The five checkpoints cover
 the initial Mint and Query, both sides of the dwell, the late refusal and
 the fresh positive. The qualification artifacts contain relative clock
-readings and reference offset bounds.
+readings and reference offset bounds. A shared three-second W1b preflight
+checks both sources and their agreement before Cargo builds. Read-only
+`chronyc tracking` or `adjtimex --print` status is informational. The
+manual workflow has a 30-minute cap and runs outside required CI.
 
 W1 supports the conditional premise in ADR 0030 for the sampled hosted
 Linux profile. C13 supplies the restart evidence at the recovered applied

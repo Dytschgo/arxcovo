@@ -437,3 +437,36 @@ mod test_source {
         assert!(clock.sample_ms().is_ok());
     }
 }
+#[cfg(target_os = "linux")]
+#[test]
+fn checkpoint_waits_for_contention_and_refuses_poison_and_clock_failure() {
+    let clock = HostClock::new(0);
+    let guard = clock.state.lock().unwrap();
+    assert_eq!(
+        clock.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
+        Err(ClockError::Unavailable)
+    );
+    std::thread::scope(|scope| {
+        let checkpoint =
+            scope.spawn(|| clock.sample_checkpoint(Instant::now() + Duration::from_secs(1)));
+        drop(guard);
+        assert!(checkpoint.join().unwrap().is_ok());
+    });
+
+    let failed = HostClock::new(MAX_TIME_MS + 1);
+    assert_eq!(
+        failed.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
+        Err(ClockError::InvalidTime)
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _guard = clock.state.lock().unwrap();
+            panic!("poison checkpoint state");
+        })
+        .is_err()
+    );
+    assert_eq!(
+        clock.sample_checkpoint(Instant::now() + Duration::from_millis(5)),
+        Err(ClockError::Unavailable)
+    );
+}

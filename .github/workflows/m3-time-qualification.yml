@@ -17,7 +17,7 @@ jobs:
       github.sha == vars.M3_TIME_REVIEWED_SHA &&
       github.workflow_sha == vars.M3_TIME_REVIEWED_SHA
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       M3_TIME_REVIEWED_SHA: ${{ vars.M3_TIME_REVIEWED_SHA }}
       M3_TIME_REVIEWED_IMAGE: ${{ vars.M3_TIME_REVIEWED_IMAGE }}

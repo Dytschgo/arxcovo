@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = Path(__file__).resolve()
@@ -32,9 +33,10 @@ TOTAL = 1030
 CLEANUP = 25
 FINAL = 55
 ORIGINS = (
-    ("www.google.com", "/generate_204", 204),
-    ("www.cloudflare.com", "/cdn-cgi/trace", 200),
+    ("www.google.com", "HEAD", "/generate_204", 204),
+    ("1.1.1.1", "GET", "/cdn-cgi/trace", 200),
 )
+TRACE_LIMIT = 1024
 DOMAIN = b"arxcovo-d5-query-v1\0"
 
 
@@ -317,10 +319,27 @@ def date_evidence(headers):
             require((key == "cf-cache-status" and value.upper() in {"DYNAMIC", "BYPASS", "MISS"})
                     or (key == "x-cache" and value.upper() == "MISS"), "utc-cache-evidence")
     require(len(date) == 1, "utc-missing-or-ambiguous")
-    parsed = email.utils.parsedate_to_datetime(date[0])
+    try:
+        parsed = email.utils.parsedate_to_datetime(date[0])
+    except ValueError:
+        raise Failure("utc-date") from None
     require(parsed.tzinfo is not None and email.utils.format_datetime(parsed, usegmt=True) == date[0],
             "utc-date")
     return int(parsed.timestamp() * 1000)
+
+
+def trace_agreement(body, date_ms):
+    matches = [line[3:] for line in body.splitlines() if line.startswith(b"ts=")]
+    require(len(matches) == 1 and re.fullmatch(rb"[0-9]{1,12}(?:\.[0-9]{1,9})?", matches[0]),
+            "utc-trace-timestamp")
+    trace_ms = Decimal(matches[0].decode("ascii")) * 1000
+    require(abs(trace_ms - date_ms) <= 2000, "utc-trace-date-mismatch")
+
+
+def origin_agreement(first, second):
+    delta = abs(first - second)
+    require(delta <= 5000, "utc-origin-mismatch")
+    return delta
 
 
 def utc_bounds(before, after, reference):
@@ -334,15 +353,21 @@ def utc_bounds(before, after, reference):
 
 def reference_request(index):
     require(index in (0, 1), "utc-source")
-    host, path, expected = ORIGINS[index]
+    host, method, path, expected = ORIGINS[index]
     connection = http.client.HTTPSConnection(host, timeout=3, context=ssl.create_default_context())
     try:
-        connection.request("HEAD", path, headers={"User-Agent": "Time check",
-                                                  "Cache-Control": "no-cache, no-store",
-                                                  "Connection": "close"})
+        connection.request(method, path, headers={"User-Agent": "Time check",
+                                                 "Cache-Control": "no-cache, no-store",
+                                                 "Connection": "close"})
         response = connection.getresponse()
         require(response.status == expected, "utc-http-status")
-        return date_evidence(response.getheaders())
+        date_ms = date_evidence(response.getheaders())
+        if method == "GET":
+            body = response.read(TRACE_LIMIT)
+            require(response.length in (None, 0)
+                    and (len(body) < TRACE_LIMIT or response.isclosed()), "utc-trace-bound")
+            trace_agreement(body, date_ms)
+        return date_ms
     finally:
         connection.close()
 
@@ -594,22 +619,55 @@ def closed_ports(endpoints):
                    for _, address, _, state, *_ in map(bytes.split, data.splitlines()[1:]))
 
 
+def reference_at(index, stage, deadline):
+    emit("utc-source", stage=stage, source=ORIGINS[index][0])
+    code, data = run_helper(
+        ["/usr/bin/python3", "-I", "-B", str(SCRIPT), "--reference", str(index)],
+        deadline, 4, limit=16,
+    )
+    require(code == 0 and re.fullmatch(rb"[0-9]{1,15}\n", data), "utc-reference-failed")
+    return int(data)
+
+
+def utc_preflight(deadline):
+    first = reference_at(0, "preflight", deadline)
+    second = reference_at(1, "preflight", deadline)
+    emit("utc-preflight-pass", origin_delta_ms=origin_agreement(first, second))
+
+
+def clock_telemetry(deadline):
+    # Read-only host hints. Export a fixed status and ignore all other fields.
+    for binary, args, pattern in (
+        ("/usr/bin/chronyc", ["-n", "tracking"],
+         rb"^Leap status\s*:\s*(Normal|Insert second|Delete second|Not synchronised)[ \t]*$"),
+        ("/usr/sbin/adjtimex", ["--print"], rb"^[ \t]*status:[ \t]*([0-9]{1,5})[ \t]*$"),
+    ):
+        tool = Path(binary).name
+        try:
+            code, data = run_helper([binary, *args], deadline, 1, limit=4096)
+            match = re.search(pattern, data, re.MULTILINE) if code == 0 else None
+        except (OSError, TimeoutError, subprocess.TimeoutExpired, Failure):
+            match = None
+        if match is not None:
+            emit("utc-telemetry", tool=tool, status=match[1].decode("ascii"))
+            return
+    emit("utc-telemetry", status="unavailable")
+
+
 def utc_witness(founder, stage, deadline):
     first = last = None
-    for index, (host, _, _) in enumerate(ORIGINS):
-        emit("utc-source", stage=stage, source=host)
+    references = []
+    for index, (host, _, _, _) in enumerate(ORIGINS):
         before = founder.evidence(deadline).checkpoint_ms
-        code, data = run_helper(
-            ["/usr/bin/python3", "-I", "-B", str(SCRIPT), "--reference", str(index)],
-            deadline, 4, limit=16,
-        )
-        require(code == 0 and re.fullmatch(rb"[0-9]{1,15}\n", data), "utc-reference-failed")
+        reference = reference_at(index, stage, deadline)
         after = founder.evidence(deadline).checkpoint_ms
-        low, high = utc_bounds(before, after, int(data))
+        low, high = utc_bounds(before, after, reference)
         emit("utc-pass", stage=stage, source=host, bracket_ms=after - before,
              resolution_ms=1000, assumed_accuracy_ms=1000, offset_low_ms=low, offset_high_ms=high)
         first = before if first is None else first
         last = after
+        references.append(reference)
+    emit("utc-agreement", stage=stage, origin_delta_ms=origin_agreement(*references))
     return first, last
 
 
@@ -930,6 +988,8 @@ def main(args):
     if args == ["--preflight"]:
         head, image, run = qualified_source(c13_tools(), time.monotonic() + 3)
         emit("preflight", head=head, image=image, run=run, attempt=1, job="qualification")
+        utc_preflight(time.monotonic() + 3)
+        clock_telemetry(time.monotonic() + 2)
         return 0
     require(not args, "launcher-arguments")
     return 0 if launch() else 1

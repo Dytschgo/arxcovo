@@ -6,7 +6,7 @@ dispatched. D5 remains open pending the approved first hosted attempt.
 ## Authorized run
 
 The dispatch-only M3 time qualification workflow uses `ubuntu-24.04` and a
-25-minute job cap outside required CI. The coordinator dispatches once on
+30-minute job cap outside required CI. The coordinator dispatches once on
 the reviewed main SHA. `M3_TIME_REVIEWED_SHA` gates both the source and the
 workflow SHA. `M3_TIME_REVIEWED_IMAGE` must match the runner's reported
 `ImageVersion` before build. The workflow pins action revisions and the Rust
@@ -57,18 +57,25 @@ The grant authorizes a single dispatch.
 
 ## UTC witness and restart
 
-The coordinator approved W1 for this run. The harness uses HTTPS HEAD on
-`https://www.google.com/generate_204` and
-`https://www.cloudflare.com/cdn-cgi/trace`, with verified TLS and hostnames,
-a generic User-Agent and no cookies, query parameters, redirects or retries.
-The origins receive ordinary HTTPS connection metadata. Requests carry no
-repository, owner or personal data and the harness reads no response body.
-A missing, cached, ambiguous, failed or over-budget sample ends the
-qualification. Each independent Date sample must fit the ±30 s premise
-within the local checked bracket after ±1 s for resolution and ±1 s
-assumed source accuracy. Artifacts record source, bracket duration, offset
-bounds and the first result. There were no reference requests during local
-validation.
+The coordinator approved W1b for this run. The harness sends one HTTPS HEAD
+to `https://www.google.com/generate_204` and one HTTPS GET to
+`https://1.1.1.1/cdn-cgi/trace`. TLS validates the host name or IP address
+against the certificate. Each request uses a generic User-Agent and carries
+no cookies, credentials, query parameters, repository data, or owner
+identifiers. There are no redirects or retries. The origins receive routine
+HTTPS connection metadata, including the runner's public egress IP. The
+Cloudflare body is bounded to 1024 bytes. The harness reads only `ts=` from
+that body and requires it to agree with the Date header within 2 s. The two
+origins' Dates must agree within 5 s. A missing, cached, ambiguous, failed
+or over-budget sample ends the qualification. Each Date must fit the ±30 s
+premise within the local checked bracket after ±1 s for resolution and ±1 s
+assumed source accuracy.
+
+Both sources and their agreement must pass a shared three-second preflight
+before Cargo builds. Read-only `chronyc tracking` or `adjtimex --print`
+status is recorded as telemetry only. Artifacts record source, bracket
+duration, offset bounds and the first result. There were no reference
+requests during local validation.
 
 Existing C13 restart evidence at the persisted committed floor and C15
 controlled clock tests support the conditional hosted interpretation.

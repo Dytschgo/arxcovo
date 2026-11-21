@@ -9,7 +9,7 @@ use crate::cluster::{
 };
 use crate::service::cluster_owner::TIME_EVIDENCE_LEN;
 use anchor_query::AnchorQueryError;
-use checked_clock::{CheckedClock, ClockError, HostClock};
+use checked_clock::{CheckedClock, ClockError, HostClock, checkpoint_lock};
 use issue::found::FOUNDER;
 use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
@@ -19,6 +19,7 @@ use std::{
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
     sync::{Mutex, OnceLock},
+    time::{Duration as StdDuration, Instant as StdInstant},
 };
 use tokio::{net::TcpListener, sync::MutexGuard};
 
@@ -192,8 +193,8 @@ impl ExchangeCounts {
     }
 
     fn count(counter: &std::sync::atomic::AtomicU8) -> u8 {
-        use std::sync::atomic::Ordering::Relaxed;
-        let previous = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let previous = counter.fetch_update(Release, Relaxed, |n| Some(n.saturating_add(1)));
         previous.unwrap_or_else(|n| n).saturating_add(1)
     }
 
@@ -207,11 +208,12 @@ impl ExchangeCounts {
         &self,
         checkpoint: Option<Result<u64, ClockError>>,
     ) -> [u8; TIME_EVIDENCE_LEN] {
+        use std::sync::atomic::Ordering::Acquire;
         let mut body = Self::absent_time_evidence();
         if let Ok(last) = self.last_query.try_lock()
             && let Some(last) = last
                 .as_ref()
-                .filter(|last| last.ordinal == self.observe()[0])
+                .filter(|last| last.ordinal == self.anchors.load(Acquire))
         {
             body[1] = last.ordinal;
             body[2] = match last.outcome {
@@ -261,7 +263,8 @@ impl CheckedClock for QueryClock<'_> {
 
 impl Job {
     pub(super) fn time_evidence(&self) -> [u8; TIME_EVIDENCE_LEN] {
-        let Ok(state) = self.state.try_lock() else {
+        let deadline = StdInstant::now() + StdDuration::from_millis(5);
+        let Some(state) = checkpoint_lock(&self.state, deadline) else {
             return ExchangeCounts::absent_time_evidence();
         };
         let exchange = state.exchange.clone();
@@ -269,7 +272,7 @@ impl Job {
         drop(state);
         // A checkpoint uses the retained clock without taking the node's
         // admission lock. The campaign serializes it with client exchanges.
-        let sample = issuer.map(|issuer| issuer.clock.sample_ms());
+        let sample = issuer.map(|issuer| issuer.clock.sample_checkpoint(deadline));
         exchange.time_evidence(sample)
     }
 }
