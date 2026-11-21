@@ -118,15 +118,22 @@ pub(super) struct Credentials {
 struct Resources {
     cluster: ClusterId,
     node: NodeId,
-    registry: Registry,
+    registry: peer_registry::AppliedRegistry,
     credentials: Credentials,
     learner: Option<Arc<peer_registry::LearnerGate>>,
     server: Arc<ServerConfig>,
     dispatch: Arc<dyn AppendDispatch>,
 }
 impl Resources {
+    // The owned outbound exchange checks applied authority before its first write.
+    fn outbound_tls_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
+        self.client_with_registry(target, Arc::new(|_, _, _| Ok(())))
+    }
+
+    // Raw TLS probes have no owned exchange to perform post-TLS authorization.
+    #[cfg(test)]
     fn client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
-        self.client_with_registry(target, self.registry.clone())
+        self.client_with_registry(target, self.registry.immediate())
     }
 
     fn admission_client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
@@ -652,10 +659,7 @@ async fn inbound(
         trace.inbound(
             peer,
             "TLS client handshake",
-            stream
-                .as_ref()
-                .err()
-                .map(|error| handshake_error(error, "inbound registry unavailable")),
+            stream.as_ref().err().map(handshake_error),
         );
     }
     let mut stream = stream.map_err(|_| Refusal::Tls)?;
@@ -664,23 +668,27 @@ async fn inbound(
     let peer = authenticated
         .authenticated_identity()
         .map_err(|_| Refusal::Identity)?;
-    if let Some(learner) = &resources.learner {
-        // TLS proved the certificate and possession of its key. Establish
-        // learner authority here, before any application bytes are read.
-        let authorized = learner.authorize(peer.0, peer.1, peer.2, true).await;
-        #[cfg(all(test, target_os = "linux"))]
-        if let Some((trace, peer)) = trace {
-            trace.inbound(
-                peer,
-                "learner pre-frame authorization",
-                authorized
-                    .as_ref()
-                    .err()
-                    .map(|reason| format!("{reason:?}")),
-            );
-        }
-        authorized.map_err(|_| Refusal::Tls)?;
+    // TLS proved the certificate and key. Check local authority before
+    // reading any application data, regardless of the peer's lane.
+    let authorized = match &resources.learner {
+        Some(learner) => learner
+            .authorize(peer.0, peer.1, peer.2, true)
+            .await
+            .map(|_| ()),
+        None => resources.registry.authorize(peer.0, peer.1, peer.2).await,
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((trace, peer)) = trace {
+        trace.inbound(
+            peer,
+            "inbound applied pre-frame authorization",
+            authorized
+                .as_ref()
+                .err()
+                .map(|reason| format!("{reason:?}")),
+        );
     }
+    authorized.map_err(|_| Refusal::Tls)?;
     drop(handshake);
     stage(shared, Stage::ServerAuthenticated).await;
     before_dispatch(shared, deadline)?;
@@ -705,7 +713,11 @@ async fn inbound(
         if resources.learner.is_some() {
             return Err(Refusal::Identity);
         }
-        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
         let controller = shared
             .state
@@ -774,7 +786,11 @@ async fn inbound(
         #[cfg(test)]
         event(shared, Event::LearnerDispatch(_lane));
     } else {
-        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
     }
     let reply = match request {
@@ -941,7 +957,7 @@ async fn outbound(
     if let Some(trace) = trace {
         trace.caller("configuration start", None);
     }
-    let config = resources.client_config(target);
+    let config = resources.outbound_tls_config(target);
     #[cfg(all(test, target_os = "linux"))]
     if let Some(trace) = trace {
         trace.caller("configuration", trace_refusal(config.as_ref().err()));
@@ -995,17 +1011,32 @@ async fn outbound(
     #[cfg(all(test, target_os = "linux"))]
     if let Some(trace) = trace {
         trace.caller(
-            "TLS server authorization",
-            stream
-                .as_ref()
-                .err()
-                .map(|error| handshake_error(error, "founder registry unavailable")),
+            "TLS server handshake",
+            stream.as_ref().err().map(handshake_error),
         );
     }
     let mut stream = stream.map_err(|_| Refusal::Tls)?;
     let peer = AuthenticatedPeer::from_client(stream.get_ref().1)
         .and_then(|peer| peer.authenticated_identity())
         .map_err(|_| Refusal::Identity)?;
+    #[cfg(test)]
+    stage(shared, Stage::BeforeClientAuthorization).await;
+    before_dispatch(shared, deadline)?;
+    if caller.is_closed() {
+        return Err(Refusal::Closed);
+    }
+    let authorized = resources.registry.authorize(peer.0, peer.1, peer.2).await;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller(
+            "outbound applied pre-frame authorization",
+            authorized
+                .as_ref()
+                .err()
+                .map(|reason| format!("{reason:?}")),
+        );
+    }
+    authorized.map_err(|_| Refusal::Tls)?;
     drop(handshake);
     stage(shared, Stage::ClientAuthenticated).await;
     before_dispatch(shared, deadline)?;
@@ -1055,7 +1086,11 @@ async fn outbound(
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+    resources
+        .registry
+        .authorize(peer.0, peer.1, peer.2)
+        .await
+        .map_err(|_| Refusal::Identity)?;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
@@ -1073,6 +1108,8 @@ pub(super) enum Stage {
     BeforeReply,
     BeforeConnect,
     ClientHandshake,
+    #[cfg(test)]
+    BeforeClientAuthorization,
     ClientAuthenticated,
     ReplyRead,
     #[cfg(test)]
@@ -1167,7 +1204,7 @@ fn trace_refusal(reason: Option<&Refusal>) -> Option<String> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-fn handshake_error(error: &std::io::Error, unavailable: &str) -> String {
+fn handshake_error(error: &std::io::Error) -> String {
     use rustls::{CertificateError, Error};
     use verify::VerifyRefusal;
 
@@ -1184,7 +1221,6 @@ fn handshake_error(error: &std::io::Error, unavailable: &str) -> String {
         )) => "TLS certificate time".into(),
         Some(Error::InvalidCertificate(CertificateError::Other(other))) => {
             match other.0.downcast_ref::<VerifyRefusal>() {
-                Some(VerifyRefusal::Unavailable) => unavailable.into(),
                 Some(reason) => format!("TLS peer verification {reason:?}"),
                 None => "TLS certificate".into(),
             }
@@ -1531,17 +1567,16 @@ fn make_resources_for_learner(
     dispatch: Arc<dyn AppendDispatch>,
     learner: Option<Arc<peer_registry::LearnerGate>>,
 ) -> Result<Arc<Resources>, Refusal> {
-    let registry = peer_registry::registry(sm);
-    let inbound: Registry = if learner.is_some() {
-        // PeerVerifier still checks the chain and cluster identity. Inbound
-        // learner authorization is asynchronous and runs before framing.
-        Arc::new(|_, _, _| Ok(()))
-    } else {
-        registry.clone()
-    };
-    let verifier = PeerVerifier::new(credentials.root.clone(), cluster, inbound)
-        .map_err(|_| Refusal::Tls)?
-        .server();
+    let registry = peer_registry::AppliedRegistry::new(sm);
+    // PeerVerifier still checks the chain and cluster identity. The owned
+    // inbound exchange performs the store-dependent check before framing.
+    let verifier = PeerVerifier::new(
+        credentials.root.clone(),
+        cluster,
+        Arc::new(|_, _, _| Ok(())),
+    )
+    .map_err(|_| Refusal::Tls)?
+    .server();
     let server = Arc::new(
         verify::server_config(
             verifier,

@@ -54,3 +54,23 @@ store refuses directly. An unhealthy store or clock refuses as soon as the
 guarded observation detects it. The phase lock is still a try-lock. Admission
 reply authorization and the applied registry callback in ADR0027 keep their
 immediate try-lock behavior. The acquisition wait holds neither lock.
+
+## Strict transport extension, 2026-11-21
+
+C11's first outbound AppendEntries reached the learner listener, then the
+issuer's TLS client refused when its own strict applied registry was
+unavailable. The earlier learner-only change could not cover this site.
+
+For ordinary owned peer RPCs, both sides complete cryptographic TLS before
+checking the local strict applied binding asynchronously. The client
+checks before its first write and the server before its first read. Strict
+server dispatch, including admission control, and the client's final reply
+check take a fresh applied observation with the same 4 ms acquisition
+budget. Deadline and cancellation checks still cover the exchange.
+Internal store poison, mutex poison and unavailable or dropped stores
+refuse immediately when detected. TLS still uses its existing time provider.
+The learner receipt path still samples the checked clock during authorization.
+
+The learner's outbound admission-anchor verifier and raw test TLS probes
+keep their immediate authorization checks. This preserves the explicit
+admission route and the semantics of callers without an owned RPC boundary.
