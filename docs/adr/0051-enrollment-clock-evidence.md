@@ -33,6 +33,13 @@ The audit traced the checked clock that each sensitive consumer uses at
 - **Fresh published learner.** A learner whose join was just published has
   no applied state yet and uses floor zero. Promotion reuses the learner's
   instance for the promoted issuer.
+- **Strict and peer admission.** The learner builds its admission gate from
+  the same retained instance that issued its TLS credentials
+  (`bound_start/learner.rs:463`, `LearnerGate::new(sm, expected, address,
+  clock, ...)`). Each gate observation samples that clock before it reads
+  the phase or applied admission state and refuses as unavailable on a
+  clock failure (`peer_registry.rs:199`). Bootstrap and Strict phase
+  decisions therefore never run on an unchecked or stale time source.
 - **Issuer consumers.** One instance covers the TLS time provider of the
   no-client-certificate enrollment listener, local activation, owner Mint
   (proposal time and the post-commit reveal check), AnchorQuery, and Redeem
@@ -66,8 +73,12 @@ original E. Destinations publish only and start no Engine.
    allocate nothing. Redeem work is admitted only while its five-second
    work budget fits the 12-second socket budget. The campaign checks that
    window before it sends the replay. A missed window is a failed
-   observation, never a deadline change. A later connection on A, with a
-   different key and attempt ID, is refused at Query and releases no proof.
+   observation, never a deadline change. Before the held Redeem, the
+   campaign also waits, inside that window, for destination A's real
+   completion. From A's retained publication it requires the returned full
+   E, node and key to equal the applied original. A later connection on A
+   is refused at its Query and releases no proof. Its attempt ID and key
+   are never sent, because the Query is refused first.
 2. **Controlled expiry.** After Mint B the campaign reads the applied store
    directly. It requires B to be pending and usable at a checked sample.
    It then advances only the issuer instance's wall and elapsed sources
@@ -82,6 +93,21 @@ original E. Destinations publish only and start no Engine.
    destination redeems C through the same issuer, using the issuer's TLS
    clock as client time, and publishes. Issued certificates keep the
    unchanged validity arithmetic relative to that controlled time.
+
+**Received refusal.** For the consumed reconnect and for expired B, a
+test-scoped observation client replaces the production `anchor()` call. It
+uses the production verifier configuration, the production Query frame and
+the unchanged 12-second budget. It sends only the Query. It requires a full
+TLS handshake with the retained issuer's certificate, then the exact
+uniform Anchor refusal frame, then a clean TLS close. It reports a deadline,
+EOF before the frame, a transport error, a wrong frame, or a close without
+close-notify as distinct failures. The production client's error mapping
+and the wire are unchanged. Stub-issuer controls cover each outcome and
+confirm that no byte follows the Query.
+
+**Recorder scope.** The Redeem-intent recorder is opt-in. Only C15 builds
+its observation with it, and it keeps at most four entries. Standing
+campaigns that attach an observation record nothing extra.
 
 Logs quote stage and relative millisecond offsets only, never a paste,
 code, verifier or proof. The campaign keeps the first failure, records
