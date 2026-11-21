@@ -4774,19 +4774,39 @@ async fn read_admission_request(stream: &mut (impl AsyncRead + Unpin), advertise
     .unwrap();
 }
 
+fn pause_admission_request(
+    client: &AdmissionClient,
+    boundary: AdmissionWriteBoundary,
+) -> (
+    AdmissionResponse,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    let (reached, arrival) = oneshot::channel();
+    let (resume, release) = oneshot::channel();
+    let pause = AdmissionWritePause {
+        boundary,
+        reached,
+        resume: release,
+    };
+    let response = client.exchange(client.advertised, Some(pause)).unwrap();
+    (response, arrival, resume)
+}
+
 #[tokio::test]
 async fn admission_close_before_first_write_is_definite_refusal() {
     let (f, mut owner, client, listener) = admission_tls_exchange().await;
-    let mut rx = events(&owner);
-    let hold = gate(&owner, Stage::BeforeAdmissionWrite);
-    let response = client.request().unwrap();
+    let mut observed = events(&owner);
+    let (response, reached, resume) =
+        pause_admission_request(&client, AdmissionWriteBoundary::BeforeWrite);
     let mut stream = accept_admission_peer(&f, &listener).await;
-    assert!(observe(&mut rx, Event::Stage(Stage::BeforeAdmissionWrite)).await);
+    timeout(OBSERVE, reached).await.unwrap().unwrap();
 
     let mut close = std::pin::pin!(owner.close());
     assert!(futures_util::poll!(&mut close).is_pending());
-    hold.add_permits(1);
+    resume.send(()).unwrap();
     assert_eq!(response.reply().await, AdmissionReply::Refused);
+    assert_eq!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     let mut byte = [0; 1];
     assert_eq!(
         timeout(OBSERVE, stream.read(&mut byte))
@@ -4802,11 +4822,11 @@ async fn admission_close_before_first_write_is_definite_refusal() {
 #[tokio::test]
 async fn admission_close_after_partial_write_is_unknown() {
     let (f, mut owner, client, listener) = admission_tls_exchange().await;
-    let mut rx = events(&owner);
-    let hold = gate(&owner, Stage::AdmissionPartialWrite);
-    let response = client.request().unwrap();
+    let mut observed = events(&owner);
+    let (response, reached, resume) =
+        pause_admission_request(&client, AdmissionWriteBoundary::AfterPrefix);
     let mut stream = accept_admission_peer(&f, &listener).await;
-    assert!(observe(&mut rx, Event::Stage(Stage::AdmissionPartialWrite)).await);
+    timeout(OBSERVE, reached).await.unwrap().unwrap();
     let mut byte = [0; 1];
     timeout(OBSERVE, stream.read_exact(&mut byte))
         .await
@@ -4816,8 +4836,9 @@ async fn admission_close_after_partial_write_is_unknown() {
 
     let mut close = std::pin::pin!(owner.close());
     assert!(futures_util::poll!(&mut close).is_pending());
-    hold.add_permits(1);
+    resume.send(()).unwrap();
     assert_eq!(response.reply().await, AdmissionReply::Unknown);
+    assert_eq!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     assert_eq!(
         timeout(OBSERVE, stream.read(&mut byte))
             .await
@@ -4843,6 +4864,7 @@ async fn admission_disconnect_after_request_has_unknown_disposition() {
 #[tokio::test]
 async fn admission_complete_tls_reply_returns_applied() {
     let (f, mut owner, client, listener) = admission_tls_exchange().await;
+    let mut observed = events(&owner);
     let response = client.request().unwrap();
     let mut stream = accept_admission_peer(&f, &listener).await;
     read_admission_request(&mut stream, client.advertised).await;
@@ -4862,6 +4884,7 @@ async fn admission_complete_tls_reply_returns_applied() {
     .unwrap()
     .unwrap();
     assert_eq!(response.reply().await, answer);
+    assert_eq!(observed.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     assert_eq!(bounded_close(&mut owner).await, Ok(()));
 }
 

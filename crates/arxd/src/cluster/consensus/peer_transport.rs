@@ -1141,10 +1141,6 @@ pub(super) enum Stage {
     CloseAborted,
     #[cfg(test)]
     SnapshotPartialBody,
-    #[cfg(test)]
-    BeforeAdmissionWrite,
-    #[cfg(test)]
-    AdmissionPartialWrite,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Event {
@@ -2165,17 +2161,49 @@ impl AdmissionResponse {
     }
 }
 
+// Admission boundary probes belong to one exchange. They use private
+// channels so the existing stage and dispatch observers keep their sequence.
+#[cfg(test)]
+enum AdmissionWriteBoundary {
+    BeforeWrite,
+    AfterPrefix,
+}
+
+#[cfg(test)]
+struct AdmissionWritePause {
+    boundary: AdmissionWriteBoundary,
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+impl AdmissionWritePause {
+    async fn wait(self) {
+        if self.reached.send(()).is_ok() {
+            let _ = self.resume.await;
+        }
+    }
+}
+
 impl AdmissionClient {
     pub(super) fn request(&self) -> Option<AdmissionResponse> {
-        self.exchange(self.advertised)
+        self.exchange(
+            self.advertised,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn conflicting_address(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
-        self.exchange(advertised)
+        self.exchange(advertised, None)
     }
 
-    fn exchange(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
+    fn exchange(
+        &self,
+        advertised: SocketAddr,
+        #[cfg(test)] pause: Option<AdmissionWritePause>,
+    ) -> Option<AdmissionResponse> {
         let deadline = Instant::now() + learner_admission::BUDGET;
         let shared = self.shared.upgrade()?;
         let (tx, rx) = oneshot::channel();
@@ -2194,7 +2222,16 @@ impl AdmissionClient {
             state.tasks.spawn(async move {
                 let reply = timeout_at(
                     deadline,
-                    outbound_admission(&shared, admission, issuer, advertised, deadline, &write),
+                    outbound_admission(
+                        &shared,
+                        admission,
+                        issuer,
+                        advertised,
+                        deadline,
+                        &write,
+                        #[cfg(test)]
+                        pause,
+                    ),
                 )
                 .await;
                 let _ = tx.send(reply);
@@ -2216,6 +2253,7 @@ async fn outbound_admission(
     advertised: SocketAddr,
     deadline: Instant,
     write: &AdmissionWrite,
+    #[cfg(test)] pause: Option<AdmissionWritePause>,
 ) -> Result<AdmissionReply, Refusal> {
     let Admission {
         resources,
@@ -2247,25 +2285,29 @@ async fn outbound_admission(
     gate.authorize_admission_anchor(peer.0, peer.1, peer.2)
         .map_err(|_| Refusal::Identity)?;
     let frame = control::request(route, advertised);
-    #[cfg(test)]
-    stage(shared, Stage::BeforeAdmissionWrite).await;
     let frame = frame.as_slice();
     #[cfg(test)]
-    let split = shared
-        .hooks
-        .gates
-        .lock()
-        .unwrap()
-        .contains_key(&Stage::AdmissionPartialWrite);
+    let pause = match pause {
+        Some(
+            pause @ AdmissionWritePause {
+                boundary: AdmissionWriteBoundary::BeforeWrite,
+                ..
+            },
+        ) => {
+            pause.wait().await;
+            None
+        }
+        pause => pause,
+    };
     write.begin(shared, deadline)?;
     #[cfg(test)]
-    let frame = if split {
+    let frame = if let Some(pause) = pause {
         stream
             .write_all(&frame[..1])
             .await
             .map_err(|_| Refusal::Frame)?;
         stream.flush().await.map_err(|_| Refusal::Frame)?;
-        stage(shared, Stage::AdmissionPartialWrite).await;
+        pause.wait().await;
         before_dispatch(shared, deadline)?;
         &frame[1..]
     } else {
