@@ -187,6 +187,11 @@ test('Rust retains every native, Python and package validation with exact comman
         env:
           ARX_EXEC_QUALIFICATION_MODE: build
         run: python3 -I -B tools/ci/m3-containers/executor-probe.py`,
+    `name: Hosted C14 target-authorized delegated build
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
