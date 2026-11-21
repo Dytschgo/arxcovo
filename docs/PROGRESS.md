@@ -9,9 +9,9 @@ entries for named PRs (#196–#204) that say "this PR", "review pending" or "bui
 has N attempts left" are historical checkpoints for those PRs; all of them have
 merged, as listed under "Merged this session".
 
-- **Routing (owner, 2026-11-19 and 2026-11-20).** Coordination moved to Claude
-  Opus 5.5/high after the provider rejected the Sol coordinator turns. On 2026-11-21,
-  coordination handed off to Gemini 4 Neon/high under the owner fallback chain.
+- **Routing (owner, 2026-11-19 and 2026-11-20).** `AGENTS.md` specifies Claude
+  Opus 5.5/high for coordination. The observed coordinator for this 2026-11-21
+  checkpoint was Gemini 4 Neon / high.
   Sol 6.2/high handles engineering, architecture, security and independent
   reviews. Claude handles UI. Each PR has an independent reviewer, with at most
   two builders and one reviewer active. Only the coordinator merges.
@@ -978,12 +978,25 @@ merged, as listed under "Merged this session".
   Pre-push check 4 PASS, `D:/Temp/arx-m3-step14b-prepush4/review.md` (SHA256 `637ce576…cec8`).
   The first hosted C14 run, 44945838517, passed C13, A10 and C14 cluster setup
   (`found=1 mint=1 query=1 redeem=1 proposals=3 add_nodes=1 applied=1 strict_learner=2 membership=1/1/5`).
-  The first build failed at `C14 first phase=ordinary category=refused`
-  (0.13 s), with clean teardown (`starts=2 closes=2 broker=1`).
+  The first build phase reported `C14 first phase=ordinary category=refused`
+  (0.13 s). Teardown confirmed daemon and broker process closes
+  (`starts=2 closes=2 broker=1`). Failure handling skipped disposal of
+  disposable fixture accounts and directories. The archive has no removal evidence.
   Log `D:/Temp/arx-coordinator/job-44945838517.log` (SHA256 `6a0f275d…dbbb`).
-  Builder 1 stopped at **3/3 exhausted**. Independent stuck-rule diagnosis is
-  in progress. The non-required S2b `native-evidence` run failed on historical
-  source pins as expected. A separate re-pin PR is planned.
+  The independent stuck-rule diagnosis is complete
+  (`D:/Temp/arx-pr238-c14-stuck/review.md`, SHA256 `1787c75b…7915`).
+  The fixture directs the unprivileged build child (UID 21072) to read
+  `memory.max` beneath the root-owned `0700` cgroup `runs/<leaf>` path.
+  The archived log confirms the protected mode, which makes that read a
+  code-level blocker before Cargo. The probe collapses exceptions into
+  `category=refused`, leaving the exact branch reached in that run
+  undetermined. The diagnosis also found that the lost-reply path can mask
+  early responses.
+  Builder 1 stopped at **3/3 exhausted**. Fresh fixture-only builder 2 is in
+  progress at 0/3 under the 2026-11-21 owner pre-approval. The repair is fenced
+  to `tools/ci/m3-containers/delegated-build-probe.py`, outside D6, and
+  requires no amendment. The non-required S2b `native-evidence` run failed on
+  historical source pins as expected. A separate re-pin PR is planned.
 - **M3 step 16a / C16 upfront dry-trace completed.** The read-only Sol 6.2/high
   design check confirmed literal-Docker blockers on hosted Ubuntu and traced
   Proposal A for planned ADR 0052. It uses native namespaces, a sealed `ext4`
