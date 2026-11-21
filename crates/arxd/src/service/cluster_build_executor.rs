@@ -329,7 +329,12 @@ impl Reply {
 
     fn into_report(self) -> Report {
         match self {
-            Self::Unavailable(reason) => Report::Unavailable(unavailable(&reason)),
+            Self::Unavailable(reason) => unavailable(&reason).map_or(
+                Report::Failed {
+                    creation: Creation::Unknown,
+                },
+                Report::Unavailable,
+            ),
             Self::Cancelled => Report::CancelledBeforeSpawn,
             Self::Failed(creation) => Report::Failed { creation },
             Self::Completed {
@@ -359,12 +364,19 @@ impl Reply {
     }
 }
 
-fn unavailable(reason: &str) -> Unavailable {
+fn unavailable(reason: &str) -> Option<Unavailable> {
     use Unavailable::*;
     [
+        NotConfigured,
+        ServiceModeRequired,
+        PlatformUnsupported,
         AccountMissing,
         AccountIdentityChanged,
         RightsMismatch,
+        AdminUnsupportedOnPlatform,
+        BatchRightMissing,
+        MechanismUnavailable,
+        ServiceReconfigurationRequired,
         PreflightFailed,
         Quarantined,
         Busy,
@@ -372,7 +384,6 @@ fn unavailable(reason: &str) -> Unavailable {
     ]
     .into_iter()
     .find(|r| r.as_str() == reason)
-    .unwrap_or(MechanismUnavailable)
 }
 
 fn frame(value: &impl Serialize) -> io::Result<Vec<u8>> {
@@ -482,24 +493,53 @@ impl Client {
         budget: Duration,
         stopping: impl Fn() -> bool,
     ) -> io::Result<Reply> {
-        let stream = open_socket(&self.socket)?;
-        if credentials(&stream)? != self.peer {
-            return Err(bad());
+        let reply = (|| {
+            let stream = open_socket(&self.socket)?;
+            if credentials(&stream)? != self.peer {
+                return Err(bad());
+            }
+            exchange(&stream, &operation, budget, stopping)
+        })();
+        // Cancellation is sent on Execute's stream and needs the same
+        // terminal evidence. A later successful exchange never clears this.
+        let confirmed = match (&operation, &reply) {
+            (Operation::Status, Ok(Reply::Ready(pin))) => *pin == self.pin,
+            (Operation::Status | Operation::Execute(_), Ok(Reply::Unavailable(reason))) => {
+                unavailable(reason).is_some()
+            }
+            (
+                Operation::Execute(_),
+                Ok(Reply::Completed {
+                    uid,
+                    gid,
+                    cleanup: true,
+                    ..
+                }),
+            ) => (*uid, *gid) == (self.pin.uid, self.pin.gid),
+            (
+                Operation::Execute(_),
+                Ok(Reply::Cancelled | Reply::Failed(Creation::NotInvoked | Creation::ProvenNone)),
+            )
+            | (Operation::Drain, Ok(Reply::Drained)) => true,
+            _ => false,
+        };
+        if !confirmed {
+            self.cleanup_unknown.store(true, Ordering::Release);
         }
-        exchange(&stream, operation, budget, stopping)
+        reply
     }
 }
 
 fn exchange(
     mut stream: &UnixStream,
-    operation: Operation,
+    operation: &Operation,
     budget: Duration,
     stopping: impl Fn() -> bool,
 ) -> io::Result<Reply> {
     stream.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(HANDSHAKE))?;
     let deadline = Instant::now() + budget;
-    stream.write_all(&frame(&operation)?)?;
+    stream.write_all(&frame(operation)?)?;
     let mut cancelled = false;
     let mut receive = |target: &mut [u8]| -> io::Result<()> {
         let mut offset = 0;
@@ -536,7 +576,9 @@ fn exchange(
 fn status(reply: io::Result<Reply>) -> Result<Pin, Unavailable> {
     match reply {
         Ok(Reply::Ready(pin)) => Ok(pin),
-        Ok(Reply::Unavailable(reason)) => Err(unavailable(&reason)),
+        Ok(Reply::Unavailable(reason)) => {
+            Err(unavailable(&reason).unwrap_or(Unavailable::MechanismUnavailable))
+        }
         _ => Err(Unavailable::MechanismUnavailable),
     }
 }
@@ -552,7 +594,7 @@ pub(super) fn connect(socket: PathBuf, build_uid: u32) -> Result<Arc<Execution>,
     if (peer.uid, peer.gid) != (0, 0) {
         return Err(Unavailable::PreflightFailed);
     }
-    let pin = status(exchange(&stream, Operation::Status, HANDSHAKE, || false))?;
+    let pin = status(exchange(&stream, &Operation::Status, HANDSHAKE, || false))?;
     if pin.uid != build_uid || pin.uid == 0 || pin.gid == 0 || !(1..=4).contains(&pin.slots) {
         return Err(Unavailable::PreflightFailed);
     }
@@ -586,11 +628,6 @@ impl Executor for Client {
             self.transact(Operation::Drain, HANDSHAKE, || false),
             Ok(Reply::Drained)
         );
-        // A later empty broker inventory cannot settle an earlier unacknowledged
-        // execute or erase an explicit unconfirmed terminal reply.
-        if !acknowledged {
-            self.cleanup_unknown.store(true, Ordering::Release);
-        }
         acknowledged && !self.cleanup_unknown.load(Ordering::Acquire)
     }
 
@@ -609,34 +646,15 @@ impl Executor for Client {
             return Report::CancelledBeforeSpawn;
         }
         let budget = Duration::from_secs(request.timeout_s + 6);
-        let report = self
-            .transact(Operation::Execute(request.clone()), budget, || {
-                cancel.is_cancelled() || shutdown.is_cancelled()
-            })
-            .map_or(
-                Report::Failed {
-                    creation: Creation::Unknown,
-                },
-                Reply::into_report,
-            );
-        if !matches!(
-            &report,
-            Report::Unavailable(_)
-                | Report::CancelledBeforeSpawn
-                | Report::Failed {
-                    creation: Creation::NotInvoked | Creation::ProvenNone
-                }
-                | Report::Completed {
-                    evidence: Evidence {
-                        cleanup_confirmed: Some(true),
-                        ..
-                    },
-                    ..
-                }
-        ) {
-            self.cleanup_unknown.store(true, Ordering::Release);
-        }
-        report
+        self.transact(Operation::Execute(request.clone()), budget, || {
+            cancel.is_cancelled() || shutdown.is_cancelled()
+        })
+        .map_or(
+            Report::Failed {
+                creation: Creation::Unknown,
+            },
+            Reply::into_report,
+        )
     }
 }
 

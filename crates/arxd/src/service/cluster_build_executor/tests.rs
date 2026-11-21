@@ -171,10 +171,26 @@ async fn receive_operation(stream: &mut ServerStream) -> Operation {
 }
 
 #[tokio::test]
-async fn lost_and_unconfirmed_execute_replies_cannot_authorize_cluster_close() {
+async fn lost_and_unconfirmed_broker_replies_cannot_authorize_cluster_close() {
     use crate::store::Activity;
 
-    for lost in [true, false] {
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        LostStatus,
+        UnexpectedStatus,
+        LostExecute,
+        UnconfirmedExecute,
+        LostDrain,
+    }
+
+    for fault in [
+        Fault::LostStatus,
+        Fault::UnexpectedStatus,
+        Fault::LostExecute,
+        Fault::UnconfirmedExecute,
+        Fault::LostDrain,
+    ] {
+        let status_failed = matches!(fault, Fault::LostStatus | Fault::UnexpectedStatus);
         let directory = crate::service::application::tests::private_temp();
         let socket = directory.path().join(SOCKET);
         let listener = UnixListener::bind(&socket).unwrap();
@@ -197,67 +213,93 @@ async fn lost_and_unconfirmed_execute_replies_cannot_authorize_cluster_close() {
             PIN.gid,
             PIN.slots,
         );
-        let (started, execute_received) = tokio::sync::oneshot::channel();
+        let (started, request_received) = tokio::sync::oneshot::channel();
         let fixture = tokio::spawn(async move {
             let (mut check, _) = listener.accept().await.unwrap();
             assert!(matches!(
                 receive_operation(&mut check).await,
                 Operation::Status
             ));
-            check
-                .write_all(&frame(&Reply::Ready(PIN)).unwrap())
-                .await
-                .unwrap();
-
-            let (mut execute, _) = listener.accept().await.unwrap();
-            assert!(matches!(
-                receive_operation(&mut execute).await,
-                Operation::Execute(_)
-            ));
-            started.send(()).unwrap();
-            // A real shutdown reaches the broker as cancellation of its in-flight execute.
-            assert_eq!(execute.read_u8().await.unwrap(), CANCEL);
-            if !lost {
-                execute
-                    .write_all(
-                        &frame(&Reply::Completed {
-                            uid: PIN.uid,
-                            gid: PIN.gid,
-                            stop: StopReason::Shutdown,
-                            exit_code: None,
-                            cleanup: false,
-                            stdout: Output(vec![], vec![], 0),
-                            stderr: Output(vec![], vec![], 0),
-                        })
-                        .unwrap(),
-                    )
+            if status_failed {
+                if matches!(fault, Fault::UnexpectedStatus) {
+                    check
+                        .write_all(&frame(&Reply::Drained).unwrap())
+                        .await
+                        .unwrap();
+                }
+                drop(check);
+                started.send(()).unwrap();
+            } else {
+                check
+                    .write_all(&frame(&Reply::Ready(PIN)).unwrap())
                     .await
                     .unwrap();
+                let (mut execute, _) = listener.accept().await.unwrap();
+                assert!(matches!(
+                    receive_operation(&mut execute).await,
+                    Operation::Execute(_)
+                ));
+                started.send(()).unwrap();
+                // A real shutdown cancels an in-flight Execute on its own stream.
+                assert_eq!(execute.read_u8().await.unwrap(), CANCEL);
+                if !matches!(fault, Fault::LostExecute) {
+                    execute
+                        .write_all(
+                            &frame(&Reply::Completed {
+                                uid: PIN.uid,
+                                gid: PIN.gid,
+                                stop: StopReason::Shutdown,
+                                exit_code: None,
+                                cleanup: matches!(fault, Fault::LostDrain),
+                                stdout: Output(vec![], vec![], 0),
+                                stderr: Output(vec![], vec![], 0),
+                            })
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
             }
-            drop(execute);
+            // For a Status failure the next request must be Drain. An
+            // Execute here would prove that refusal did not stop dispatch.
             let (mut drain, _) = listener.accept().await.unwrap();
             assert!(matches!(
                 receive_operation(&mut drain).await,
                 Operation::Drain
             ));
-            // Even a later authenticated drain cannot erase lost terminal evidence.
-            drain
-                .write_all(&frame(&Reply::Drained).unwrap())
-                .await
-                .unwrap();
+            // An acknowledged Drain cannot erase an earlier uncertain reply.
+            if !matches!(fault, Fault::LostDrain) {
+                drain
+                    .write_all(&frame(&Reply::Drained).unwrap())
+                    .await
+                    .unwrap();
+            }
         });
         let activity = Arc::new(Activity::open_service_fixture(directory.path()).unwrap());
         let id = activity
             .start_dedicated("qualification", "run_command")
             .unwrap();
         let call = executor.dispatch(Some(request()), activity, id);
-        crate::service::cluster_runtime::broker_refusal_close_control(executor, execute_received)
+        crate::service::cluster_runtime::broker_refusal_close_control(executor, request_received)
             .await;
-        assert_eq!(
-            call.await
-                .unwrap_or_else(|_| panic!("missing terminal row"))["cleanup_confirmed"],
-            false
-        );
+        let result = call.await;
+        if status_failed {
+            let failure = match result {
+                Err(failure) => failure,
+                Ok(_) => panic!("unexpected successful Status: {fault:?}"),
+            };
+            assert_eq!(
+                failure.execution_reason,
+                Some(Unavailable::MechanismUnavailable)
+            );
+        } else {
+            let value = result.unwrap_or_else(|_| panic!("missing terminal row: {fault:?}"));
+            assert_eq!(
+                value["cleanup_confirmed"],
+                matches!(fault, Fault::LostDrain),
+                "{fault:?}"
+            );
+        }
         fixture.await.unwrap();
     }
 }
