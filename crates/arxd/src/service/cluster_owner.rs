@@ -171,14 +171,39 @@ pub(super) fn address(path: &Path) -> bool {
         && path.parent().is_some_and(|p| p != Path::new("/"))
 }
 
-fn no_acl(path: &Path) -> Result<(), Failure> {
-    let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| Failure::Refused)?;
+/// Bounded startup evidence. It contains no path, identity, or peer input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindError {
+    Policy(&'static str),
+    DirectoryMode(u32),
+    Io {
+        operation: &'static str,
+        kind: io::ErrorKind,
+        errno: Option<i32>,
+    },
+}
+
+impl BindError {
+    fn io(operation: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self::Io {
+            operation,
+            kind: error.kind(),
+            errno: error.raw_os_error(),
+        }
+    }
+}
+
+fn no_acl(path: &Path) -> Result<(), BindError> {
+    let name =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| BindError::Policy("pathname"))?;
     for attr in [c"system.posix_acl_access", c"system.posix_acl_default"] {
         // SAFETY: both strings are terminated. A null/zero buffer queries only the length.
-        if unsafe { libc::lgetxattr(name.as_ptr(), attr.as_ptr(), std::ptr::null_mut(), 0) } >= 0
-            || io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA)
-        {
-            return Err(Failure::Refused);
+        if unsafe { libc::lgetxattr(name.as_ptr(), attr.as_ptr(), std::ptr::null_mut(), 0) } >= 0 {
+            return Err(BindError::Policy("extended ACL"));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENODATA) {
+            return Err(BindError::io("read ACL")(error));
         }
     }
     Ok(())
@@ -187,25 +212,33 @@ fn no_acl(path: &Path) -> Result<(), Failure> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Object(u64, u64);
 
-fn route(path: &Path, owner: u32, daemon: u32, group: Option<u32>) -> Result<Vec<Object>, Failure> {
+fn route(
+    path: &Path,
+    owner: u32,
+    daemon: u32,
+    group: Option<u32>,
+) -> Result<Vec<Object>, BindError> {
     if !address(path) {
-        return Err(Failure::Refused);
+        return Err(BindError::Policy("pathname"));
     }
-    let parent = path.parent().ok_or(Failure::Refused)?;
+    let parent = path.parent().ok_or(BindError::Policy("pathname"))?;
     let mut identities = Vec::new();
     for p in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
-        let m = std::fs::symlink_metadata(p).map_err(|_| Failure::Refused)?;
+        let m = std::fs::symlink_metadata(p).map_err(BindError::io("stat directory"))?;
         let mode = m.mode() & 0o7777;
         if !m.is_dir() || ![0, daemon, owner].contains(&m.uid()) {
-            return Err(Failure::Refused);
+            return Err(BindError::Policy("directory type or owner"));
         }
         if p == parent {
-            if m.uid() != daemon || mode != 0o2710 || group.is_some_and(|g| g != m.gid()) {
-                return Err(Failure::Refused);
+            if m.uid() != daemon || group.is_some_and(|g| g != m.gid()) {
+                return Err(BindError::Policy("directory owner or group"));
+            }
+            if mode != 0o2710 {
+                return Err(BindError::DirectoryMode(mode));
             }
         } else if mode & 0o022 != 0 && !(m.uid() == 0 && mode & 0o1000 != 0) {
             // A root-owned sticky ancestor cannot rename a trusted child as a foreign UID.
-            return Err(Failure::Refused);
+            return Err(BindError::Policy("writable ancestor"));
         }
         no_acl(p)?;
         identities.push(Object(m.dev(), m.ino()));
@@ -213,17 +246,19 @@ fn route(path: &Path, owner: u32, daemon: u32, group: Option<u32>) -> Result<Vec
     Ok(identities)
 }
 
-fn socket(path: &Path, daemon: u32) -> Result<Object, Failure> {
-    let m = std::fs::symlink_metadata(path).map_err(|_| Failure::Refused)?;
-    let dir = std::fs::symlink_metadata(path.parent().ok_or(Failure::Refused)?)
-        .map_err(|_| Failure::Refused)?;
+fn socket(path: &Path, daemon: u32) -> Result<Object, BindError> {
+    let m = std::fs::symlink_metadata(path).map_err(BindError::io("stat socket"))?;
+    let dir = std::fs::symlink_metadata(path.parent().ok_or(BindError::Policy("pathname"))?)
+        .map_err(BindError::io("stat socket directory"))?;
     if !m.file_type().is_socket()
         || m.nlink() != 1
         || m.uid() != daemon
         || m.gid() != dir.gid()
         || m.mode() & 0o7777 != 0o660
     {
-        return Err(Failure::Refused);
+        return Err(BindError::Policy(
+            "socket type, links, owner, group or mode",
+        ));
     }
     no_acl(path)?;
     Ok(Object(m.dev(), m.ino()))
@@ -238,17 +273,19 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub(crate) fn bind(path: PathBuf, roles: Roles) -> Result<Self, Failure> {
-        roles.qualify()?;
+    pub(crate) fn bind(path: PathBuf, roles: Roles) -> Result<Self, BindError> {
+        roles
+            .qualify()
+            .map_err(|_| BindError::Policy("control roles"))?;
         // SAFETY: identity queries take no pointers.
         if unsafe { libc::geteuid() } != roles.daemon {
-            return Err(Failure::Refused);
+            return Err(BindError::Policy("daemon UID"));
         }
         let identities = route(&path, roles.owner, roles.daemon, Some(roles.group))?;
         // Socket creation is exclusive. A stale or swapped object is never unlinked here.
-        let listener = UnixListener::bind(&path).map_err(|_| Failure::Refused)?;
+        let listener = UnixListener::bind(&path).map_err(BindError::io("bind socket"))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
-            .map_err(|_| Failure::Refused)?;
+            .map_err(BindError::io("set socket mode"))?;
         let server = Self {
             listener,
             object: socket(&path, roles.daemon)?,
@@ -257,7 +294,7 @@ impl Server {
             route: identities,
         };
         if !server.original() {
-            return Err(Failure::Refused);
+            return Err(BindError::Policy("route replaced during bind"));
         }
         Ok(server)
     }
@@ -413,14 +450,16 @@ pub(super) async fn connect(path: &Path, daemon: u32) -> Result<UnixStream, Fail
     if owner == 0 || daemon == 0 || owner == daemon || daemon == u32::MAX {
         return Err(Failure::Refused);
     }
-    let before = route(path, owner, daemon, None)?;
-    let object = socket(path, daemon)?;
+    let before = route(path, owner, daemon, None).map_err(|_| Failure::Refused)?;
+    let object = socket(path, daemon).map_err(|_| Failure::Refused)?;
     let stream = timeout(HANDSHAKE, UnixStream::connect(path))
         .await
         .map_err(|_| Failure::Refused)?
         .map_err(|_| Failure::Refused)?;
     peer(&stream, daemon)?;
-    if before != route(path, owner, daemon, None)? || object != socket(path, daemon)? {
+    if before != route(path, owner, daemon, None).map_err(|_| Failure::Refused)?
+        || object != socket(path, daemon).map_err(|_| Failure::Refused)?
+    {
         return Err(Failure::Refused);
     }
     // Tokio owns a close-on-exec descriptor. It has no relationship to standard streams.

@@ -187,10 +187,40 @@ async fn owner_hosted_disposable_uids_enforce_group_and_kernel_credentials() {
             .unwrap()
             .success()
     );
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2710)).unwrap();
     let path = dir.join("control");
-    let server = Server::bind(path.clone(), roles).unwrap();
-    // Group membership of an actual daemon account cannot replace its UID.
+    // Replay the old fixture's successful chmod as the unprivileged runner.
+    // The target GID belongs to the owner, so the kernel silently drops SGID.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2710)).unwrap();
+    match Server::bind(path.clone(), roles) {
+        Err(BindError::DirectoryMode(0o710)) => {
+            eprintln!("old fixture bind refused at directory mode 0710 after chmod requested 2710");
+        }
+        Err(error) => panic!("unexpected old fixture bind rejection: {error:?}"),
+        Ok(_) => panic!("old fixture unexpectedly retained setgid"),
+    }
+    assert!(!path.exists(), "directory policy must reject before bind");
+    let mut mode = tokio::process::Command::new("/usr/bin/sudo");
+    mode.args(["-n", "--", "/usr/bin/chmod", "--", "2710"])
+        .arg(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    assert!(
+        timeout(HANDSHAKE, mode.status())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let metadata = std::fs::symlink_metadata(&dir).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+        (daemon, OWNER, 0o2710)
+    );
+    let server = Server::bind(path.clone(), roles)
+        .unwrap_or_else(|error| panic!("qualified fixture bind failed: {error:?}"));
+    // A role configured to share the owner UID must fail qualification.
     assert_eq!(
         Roles {
             build: OWNER,

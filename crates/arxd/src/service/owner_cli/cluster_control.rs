@@ -272,12 +272,12 @@ impl NoEcho {
             original,
             active: true,
         };
-        set_mode(fd, &input)?;
+        set_mode(fd, &input, false)?;
         Ok(guard)
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        set_mode(self.fd, &self.original)?;
+        set_mode(self.fd, &self.original, true)?;
         self.active = false;
         Ok(())
     }
@@ -291,9 +291,9 @@ impl Drop for NoEcho {
     }
 }
 
-fn set_mode(fd: libc::c_int, mode: &libc::termios) -> io::Result<()> {
+fn set_mode(fd: libc::c_int, mode: &libc::termios, restoring: bool) -> io::Result<()> {
     // Block SIGTTOU on this thread so restoration works even after a job-control
-    // foreground change. TCSAFLUSH discards unread secret bytes before echo resumes.
+    // foreground change. Neither ioctl waits for the output queue to drain.
     let mut mask = std::mem::MaybeUninit::uninit();
     let mut previous = std::mem::MaybeUninit::uninit();
     // SAFETY: initialized mask storage is passed to pthread_sigmask, which saves
@@ -306,19 +306,33 @@ fn set_mode(fd: libc::c_int, mode: &libc::termios) -> io::Result<()> {
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    let result = loop {
+    let change = || {
         // SAFETY: fd belongs to the still-live terminal and mode is initialized.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, mode) } == 0 {
-            break Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            break Err(error);
-        }
+        tty_result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) })
+    };
+    let discard = || {
+        // SAFETY: fd belongs to the still-live terminal. Only input is discarded.
+        tty_result(unsafe { libc::tcflush(fd, libc::TCIFLUSH) })
+    };
+    let result = if restoring {
+        // Attempt restoration even if discarding unread input reports an error.
+        let discarded = discard();
+        let restored = change();
+        restored.and(discarded)
+    } else {
+        discard().and_then(|()| change())
     };
     // SAFETY: successful SIG_BLOCK wrote the previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut()) };
     result
+}
+
+fn tty_result(status: libc::c_int) -> io::Result<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]

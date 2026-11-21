@@ -9,7 +9,9 @@ group. Root and host administration define the deployment trust boundary.
 
 The owner socket uses a pathname under protected ancestors. The dedicated
 daemon-owned directory has mode 2710 and the daemon-owned socket has mode 0660.
-Both use the dedicated control group. Each side walks the pathname without
+Both use the dedicated control group. Provision the directory mode after assigning
+that group and verify the resulting setgid bit. A host administrator or a
+process with the required group membership sets the initial mode. Each side walks the pathname without
 following symlinks, verifies ownership and mode, checks the actual POSIX ACL
 attributes and pins filesystem object identities. A root-owned sticky ancestor
 may contain an entry owned by a trusted UID. The daemon verifies the exact
@@ -42,7 +44,8 @@ socket path and expected daemon UID. It opens and checks the foreground
 controlling terminal independently of redirected program streams. Mint writes
 only to that terminal. Join reads one canonical envelope terminated by Enter
 with echo and canonical mode disabled. The terminal guard restores settings on
-success, errors, timeout and handled signals. The owner protocol and terminal
+success, errors, timeout and handled signals. Input discard uses TCIFLUSH
+and mode changes use TCSANOW so neither waits on terminal output. The owner protocol and terminal
 buffers use bounded allocation and volatile wiping on drop. ADR0040's durable
 Join consumer owns the checksum, CA pin and local route checks. Temporary
 values internal to the frozen codec retain their existing memory behavior.
