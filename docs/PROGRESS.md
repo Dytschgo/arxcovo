@@ -671,8 +671,9 @@ merged, as listed under "Merged this session".
   rejected valid same-term higher-ID leader succession at later indices, plus two test P3s;
   the fix accepts OpenRaft-valid later successors while requiring exact E at the same index.
   Review 2 (`D:/Temp/arx-pr224-review2/review.md`, SHA256 `6bcebe59…94f9`) passed the source but
-  held on a hosted C11 failure with a new signature (an unrelated connection's handshake on
-  the shared stage stream; log `D:/Temp/arx-pr224-fail/ubuntu-rust.log` SHA256 `a6a6d4cc…8f9c`);
+  held on a hosted C11 failure with a new signature (an unexpected `ServerHandshake` on the
+  shared stage stream, without the socket identified; #226 later reproduced the signature
+  with a separate connection; log `D:/Temp/arx-pr224-fail/ubuntu-rust.log` SHA256 `a6a6d4cc…8f9c`);
   the 13a diff had no causal path to it, so the coordinator did not count it. After the C11
   repair the branch was refreshed (`6a9d02b3`, changed lines identical); review 3 PASS
   (`D:/Temp/arx-pr224-review3/review.md`, SHA256 `7739f74a…a918`), agent-review status
@@ -706,8 +707,9 @@ merged, as listed under "Merged this session".
   flush/restore handoff. **Coordinator decision (pre-approval):** Linux cannot atomically
   flush input and restore termios (TCSAFLUSH drops its lock between the two), so the
   terminal-handoff residual is accepted and documented in ADR 0046: verified echo-off
-  before any secret read, a 200 ms no-echo discard window, then flush, restore and
-  verified readback. Builder counted failures 2/3 (report `D:/Temp/arx-m3-step13c/report.md`
+  before any secret read; on refusal, timeout or handled interruption a 200 ms no-echo
+  discard window, then flush, restore and verified readback (a successful paste proceeds
+  directly to the final flush, restore and readback). Builder counted failures 2/3 (report `D:/Temp/arx-m3-step13c/report.md`
   SHA256 `ffc15ac1…9c99`). Review 4 PASS (`D:/Temp/arx-pr225-review4/review.md`, SHA256
   `8e7ed039…9687`), agent-review status 59538971760; all 12 Linux owner tests and every campaign
   passed (1,003 tests). Follow-up: ADR 0046 source links point slightly above the code.
@@ -727,7 +729,8 @@ merged, as listed under "Merged this session".
   transfers, a restart of each original node and survivor issuance after founder close).
   Coordinator amendments: A6, one Ubuntu-only bounded step in the Rust job running a
   reviewed tools/ci/m3-c13 launcher that stages disposable owner, daemon, agent and build
-  UIDs as #199 did, with minimal workflow-pin test updates and no gate, matrix or cache
+  UIDs, extending to four roles the Linux Rust-job precedent of #199, which staged distinct
+  daemon and build UIDs, with minimal workflow-pin test updates and no gate, matrix or cache
   change; A7, a move-only typed handoff of recovered custody from authenticated history
   and a role-checked founder-recovery caller of the existing sealed CA loader, with
   pki/ca.rs frozen. Engine Sol 3/3 and Opus 0/2 unchanged.
