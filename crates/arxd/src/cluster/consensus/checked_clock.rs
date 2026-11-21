@@ -87,6 +87,9 @@ pub(super) struct HostClock {
     anchor: Instant,
     recovered_floor: u64,
     state: Mutex<State>,
+    // Boxed so test builds keep the inline layout within existing size lints.
+    #[cfg(all(test, target_os = "linux"))]
+    test_source: Box<Mutex<TestShift>>,
 }
 impl HostClock {
     pub(super) fn new(recovered_floor: u64) -> Self {
@@ -97,6 +100,8 @@ impl HostClock {
                 failure: (recovered_floor > MAX_TIME_MS).then_some(ClockError::InvalidTime),
                 ..State::default()
             }),
+            #[cfg(all(test, target_os = "linux"))]
+            test_source: Box::default(),
         }
     }
 
@@ -154,6 +159,12 @@ impl HostClock {
 impl CheckedClock for HostClock {
     fn sample_ms(&self) -> Result<u64, ClockError> {
         self.observe_with(|| {
+            // One read per sample keeps the test pair coherent across the bracket.
+            #[cfg(all(test, target_os = "linux"))]
+            let shift = *self
+                .test_source
+                .lock()
+                .map_err(|_| ClockError::Unavailable)?;
             let before = Instant::now()
                 .checked_duration_since(self.anchor)
                 .ok_or(ClockError::Anomaly)?;
@@ -161,8 +172,71 @@ impl CheckedClock for HostClock {
             let after = Instant::now()
                 .checked_duration_since(self.anchor)
                 .ok_or(ClockError::Anomaly)?;
+            #[cfg(all(test, target_os = "linux"))]
+            let (wall, before, after) = shift.apply(wall, before, after)?;
             observation(wall, before, after)
         })
+    }
+}
+
+/// Linux-test-only raw source offsets for one clock instance. They are applied
+/// to the host readings before the unchanged checked arithmetic, so the floor,
+/// range, bracket, rollback and wall/elapsed envelope still decide every sample.
+/// Production builds have no field, switch or environment input for this.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::cluster) struct TestShift {
+    pub(in crate::cluster) wall_ms: u64,
+    pub(in crate::cluster) elapsed_ms: u64,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestShift {
+    fn apply(
+        self,
+        wall: SystemTime,
+        before: Duration,
+        after: Duration,
+    ) -> Result<(SystemTime, Duration, Duration), ClockError> {
+        let elapsed = Duration::from_millis(self.elapsed_ms);
+        Ok((
+            wall.checked_add(Duration::from_millis(self.wall_ms))
+                .ok_or(ClockError::InvalidTime)?,
+            before.checked_add(elapsed).ok_or(ClockError::InvalidTime)?,
+            after.checked_add(elapsed).ok_or(ClockError::InvalidTime)?,
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl HostClock {
+    /// Advance this instance's bracketed wall and elapsed sources together.
+    pub(in crate::cluster) fn advance_for_test(&self, ms: u64) -> Result<TestShift, ClockError> {
+        self.shift_for_test(ms, ms)
+    }
+
+    /// Forward-only per-instance offsets. Other instances and the host stay unchanged.
+    pub(in crate::cluster) fn shift_for_test(
+        &self,
+        wall_ms: u64,
+        elapsed_ms: u64,
+    ) -> Result<TestShift, ClockError> {
+        let mut shift = self
+            .test_source
+            .lock()
+            .map_err(|_| ClockError::Unavailable)?;
+        let next = TestShift {
+            wall_ms: shift
+                .wall_ms
+                .checked_add(wall_ms)
+                .ok_or(ClockError::InvalidTime)?,
+            elapsed_ms: shift
+                .elapsed_ms
+                .checked_add(elapsed_ms)
+                .ok_or(ClockError::InvalidTime)?,
+        };
+        *shift = next;
+        Ok(next)
     }
 }
 
