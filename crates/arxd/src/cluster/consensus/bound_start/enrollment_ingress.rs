@@ -257,6 +257,7 @@ impl Backend for Issuer {
             observation
                 .redeem_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            observation.record_intent(input.request, &csr);
         }
         // Join through the operation's own deadline. An outer socket timeout
         // cannot cancel admitted work. All failures have one wire status and
@@ -438,6 +439,7 @@ mod hosted {
 
     mod admission_campaign;
     mod catch_up_campaign;
+    mod clock_reuse_campaign;
     #[cfg(test)]
     mod durable_join_campaign;
     mod issuer_transfer_campaign;
@@ -452,11 +454,23 @@ mod hosted {
         anchor_outcomes:
             Mutex<Vec<Result<Vec<u8>, crate::cluster::consensus::anchor_query::AnchorQueryError>>>,
         result: Mutex<Option<Result<(), issue::IssueError>>>,
+        // Dispatched attempt ID and public CSR only; never the proof or code.
+        redeem_intents: Mutex<Vec<(crate::cluster::enrollment::RequestId, Vec<u8>)>>,
         finished: Notify,
         release: Notify,
     }
 
     impl Observation {
+        pub(super) fn record_intent(
+            &self,
+            request: crate::cluster::enrollment::RequestId,
+            csr: &[u8],
+        ) {
+            self.redeem_intents
+                .lock()
+                .unwrap()
+                .push((request, csr.to_vec()));
+        }
         #[cfg(test)]
         pub(super) fn record_anchor(
             &self,
