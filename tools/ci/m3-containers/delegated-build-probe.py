@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """One hosted C14 run using the A10 broker and C13 runner qualification."""
 from collections import Counter
+from contextlib import contextmanager, redirect_stdout
 import errno
 import hashlib
 import json
@@ -31,7 +32,10 @@ COMMAND = ["build", "--offline", "--locked", "--target-dir", "out/target"]
 SELECTOR = "c14_target_authorized_build_and_lost_reply"
 WRAPPER_READY = b"C14 wrapper-ready\n"
 PROBE_ERRORS = (ValueError, OSError, KeyError, IndexError, RuntimeError,
-                subprocess.SubprocessError, sqlite3.Error)
+                TypeError, subprocess.SubprocessError, sqlite3.Error)
+OUTCOMES = ("refused", "failed", "unknown", "rejected", "interrupted", "succeeded")
+OPERATION = re.compile(r"[0-9a-f]{64}")
+MEMBERSHIP = "0::/system.slice/arxd.service/runs/"
 PASS = "C14 build admitted=2 executed=2 a_executed=0 ordinary=1 lost_reply_status=1"
 PROVENANCE = ("CI", "GITHUB_ACTIONS", "RUNNER_OS", "RUNNER_ENVIRONMENT",
               "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA",
@@ -41,6 +45,42 @@ PROVENANCE = ("CI", "GITHUB_ACTIONS", "RUNNER_OS", "RUNNER_ENVIRONMENT",
 def expect(value, reason):
     if not value:
         raise ValueError(reason)
+
+
+class Fault(ValueError):
+    def __init__(self, checkpoint, category):
+        super().__init__(checkpoint, category)
+        self.checkpoint = checkpoint
+        self.category = category
+
+
+@contextmanager
+def checking(checkpoint, category="invalid"):
+    try:
+        yield
+    except Fault:
+        raise
+    except (TimeoutError, subprocess.TimeoutExpired):
+        raise Fault(checkpoint, "timeout") from None
+    except PROBE_ERRORS:
+        raise Fault(checkpoint, category) from None
+
+
+class Evidence:
+    def __init__(self):
+        self.failed = False
+        self.confirmed_close = True
+        self.close_reported = False
+        self.confirmed_ownership = True
+
+    def first(self, fault):
+        if not self.failed:
+            print(f"C14 first checkpoint={fault.checkpoint} category={fault.category}", flush=True)
+            self.failed = True
+
+    def report_close(self):
+        print(f"C14 process closure={'confirmed' if self.confirmed_close else 'unconfirmed'}", flush=True)
+        self.close_reported = True
 
 
 def left(end, bound):
@@ -80,18 +120,19 @@ def role(uid):
 
 
 class Mcp:
-    def __init__(self, root, config, deadline):
+    def __init__(self, root, config, deadline, clients):
         self.deadline = deadline
         self.process = subprocess.Popen(
             role(AGENT) + [root / "arxd", "mcp-stdio", "--client-config", config],
             env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        clients.append(self)
         self.pending = bytearray()
         try:
             self.write({"jsonrpc":"2.0", "id":1, "method":"initialize",
                         "params":{"protocolVersion":"2025-11-25", "capabilities":{},
                                   "clientInfo":{"name":"c14", "version":"1"}}})
-            expect("result" in self.read(1, 5), "mcp-initialize")
+            expect("result" in self.read(1, phase_end(deadline, 5)), "mcp-initialize")
             self.write({"jsonrpc":"2.0", "method":"notifications/initialized"})
         except PROBE_ERRORS:
             try:
@@ -104,22 +145,31 @@ class Mcp:
         self.process.stdin.write(json.dumps(value).encode("ascii") + b"\n")
         self.process.stdin.flush()
 
-    def read(self, id_, seconds):
-        end = phase_end(self.deadline, seconds)
+    def ready(self):
+        return bool(self.pending or select.select([self.process.stdout], [], [], 0)[0])
+
+    def read(self, id_, end):
         fd = self.process.stdout.fileno()
-        while time.monotonic() < end and len(self.pending) <= 65536:
+        while len(self.pending) <= 65536:
             if b"\n" in self.pending:
                 line, tail = self.pending.split(b"\n", 1)
                 self.pending = bytearray(tail)
-                value = json.loads(line)
-                expect(value.get("id") == id_, "mcp-id")
+                with checking("rpc", "malformed"):
+                    value = json.loads(line)
+                    expect(isinstance(value, dict) and value.get("jsonrpc") == "2.0"
+                           and value.get("id") == id_, "mcp-envelope")
+                    expect(("error" in value) != ("result" in value), "mcp-variant")
+                if "error" in value:
+                    raise Fault("rpc", "rpc-error")
                 return value
+            if time.monotonic() >= end:
+                raise Fault("rpc", "timeout")
             if select.select([fd], [], [], left(end, 1))[0]:
                 chunk = os.read(fd, 4096)
                 if not chunk:
-                    break
+                    raise Fault("rpc", "eof")
                 self.pending.extend(chunk)
-        raise ValueError("mcp-response")
+        raise Fault("rpc", "malformed")
 
     def send(self, name, arguments):
         self.write({"jsonrpc":"2.0", "id":2, "method":"tools/call",
@@ -127,14 +177,19 @@ class Mcp:
 
     def call(self, name, arguments, seconds=5):
         self.send(name, arguments)
-        result = self.read(2, seconds)
-        expect("result" in result, "mcp-call-refused")
-        return json.loads(result["result"]["content"][0]["text"])
+        return self.result(phase_end(self.deadline, seconds))
 
-    def close(self):
+    def result(self, end):
+        reply = self.read(2, end)
+        with checking("rpc", "malformed"):
+            result = json.loads(reply["result"]["content"][0]["text"])
+            expect(isinstance(result, dict), "mcp-result")
+        return result
+
+    def close(self, deadline=None):
         if self.process.poll() is None:
             self.process.kill()
-        self.process.wait(timeout=left(self.deadline, 2))
+        self.process.wait(timeout=left(self.deadline if deadline is None else deadline, 2))
         self.process.stdin.close()
         self.process.stdout.close()
 
@@ -146,7 +201,7 @@ class Mcp:
             self.close()
         except PROBE_ERRORS:
             if exc_type is None:
-                raise
+                raise Fault("cleanup", "unconfirmed") from None
 
 
 def owner_exchange(path, daemon, tag, payload):
@@ -281,64 +336,171 @@ def account_counts(root, evidence, tags):
           f" strict_learner=2 membership={term}/{leader}/{index}", flush=True)
 
 
-def build(root, slot, deadline):
-    base = root / "a/clients/fixture.json"
-    args = {"target":2,"workspace":slot,"tool":"cargo","args":COMMAND,"timeout_s":12,"output_bytes":1024}
-    with Mcp(root, base, deadline) as client:
-        if slot == "ordinary":
-            expect(client.call("discover_build_targets", {}) == {"targets":[2]}, "strict-route")
-            result = client.call("run_command", args, 16)
-        else:
-            client.send("run_command", args)
-            end = phase_end(deadline, 8)
-            while not (root / "workspace/lost/out/observed").is_file():
-                expect(client.process.poll() is None and time.monotonic() < end, "loss-before-admission")
-                time.sleep(0.025)
-            expect(not client.pending and not select.select([client.process.stdout], [], [], 0)[0],
-                   "reply-before-loss")
-            client.process.kill()
-            expect(client.process.wait(timeout=left(deadline, 2)) == -signal.SIGKILL, "response-observer-loss")
-            (root / "workspace/lost/out/release").touch(exist_ok=False)
-            result = None
-    if result is None:
-        def last_outcome(node):
-            check = ("SELECT a.outcome FROM delegated_build d JOIN activity a ON a.id=d.activity_id "
-                     "ORDER BY a.id DESC LIMIT 1")
-            result = rows(root / node / "activity/activity.sqlite3", check)
-            expect(len(result) == 1, "lost-reply-correlation")
-            return result[0][0]
+def outcome(result):
+    value = result.get("outcome")
+    return value if value in OUTCOMES else "malformed"
 
-        end = phase_end(deadline, 8)
-        while last_outcome("b") == "started":
-            expect(time.monotonic() < end, "lost-terminal")
-            time.sleep(.04)
-        expect(last_outcome("b") == "succeeded" and last_outcome("a") == "started",
-               "reply-not-applied-at-source")
-        with Mcp(root, base, deadline) as status:
-            ids = status.call("delegated_build_status", {"target":2})["operations"]
-        expect(len(ids) == 2, "forwarded-correlation")
-        operation = ids[0]
-        with Mcp(root, root / "a/clients/foreign.json", deadline) as outsider:
-            denied = outsider.call("delegated_build_status", {"target":2,"operation_id":operation})
-            expect(denied == {"outcome":"refused"}, "foreign-status")
+
+def negative_control(client, tool, arguments, checkpoint):
+    with checking(checkpoint):
+        result = client.call(tool, arguments)
+        if result != {"outcome":"refused"}:
+            raise Fault(checkpoint, outcome(result))
+
+
+def private_cgroup(path):
+    mode = path.lstat()
+    expect(stat.S_ISDIR(mode.st_mode) and (mode.st_uid, mode.st_gid) == (0, 0)
+           and stat.S_IMODE(mode.st_mode) == 0o700, "private-cgroup")
+
+
+def observe(root, slot, broker_pid, a10):
+    read_live = a10["read"]
+    with checking("witness"):
+        try:
+            value = read_live(root / "workspace" / slot / "out/observed", 64, BUILD)
+        except FileNotFoundError:
+            return None
+        if not value:
+            return None
+        match = re.fullmatch(r"([1-9][0-9]{0,9}) (arx-[^\s]+)\n", value)
+        expect(match, "witness-frame")
+        pid, leaf = match.groups()
+        expect(int(pid) <= 2**31 - 1 and a10["LEAF"].fullmatch(leaf)
+               and leaf.split("-")[1] == str(broker_pid), "witness-identity")
+        path = a10["RUNS"] / leaf
+        private_cgroup(a10["RUNS"])
+        private_cgroup(path)
+        expect(read_live(Path("/proc") / pid / "cgroup", 256).strip() == MEMBERSHIP + leaf
+               and pid in read_live(path / "cgroup.procs").split(), "witness-membership")
+    with checking("limits"):
+        for control, value in (("memory.max", a10["MEMORY"]), ("pids.max", a10["PIDS"]),
+                               ("memory.swap.max", 0)):
+            expect(read_live(path / control, 40).strip() == str(value), "controller-value")
+    with checking("role"):
+        facts = a10["proc_status"](pid)
+        expect(facts["Uid"] == facts["Gid"] == [str(BUILD)] * 4 and facts["Groups"] == []
+               and facts["NoNewPrivs"] == ["1"] and facts["CapBnd"] == [a10["CAPS"]], "credential")
+        expect(all(facts[key] == ["0" * 16] for key in ("CapEff", "CapPrm", "CapInh", "CapAmb")),
+               "capabilities")
+    return pid, leaf
+
+
+def reject_early_reply(client, end):
+    if client.ready():
+        result = client.result(end)
+        category = outcome(result)
+        raise Fault("terminal" if category in ("failed", "rejected", "interrupted") else "admission",
+                    "premature" if category == "succeeded" else category)
+
+
+def gate(root, slot, client, broker_pid, a10, end, deadline):
+    while time.monotonic() < end:
+        reject_early_reply(client, end)
+        witness = observe(root, slot, broker_pid, a10)
+        if witness is None:
+            time.sleep(.025)
+            continue
+        pid, leaf = witness
+        reject_early_reply(client, end)
+        if time.monotonic() >= end:
+            break
+        if slot == "lost":
+            with checking("observer-loss"):
+                client.process.kill()
+                expect(client.process.wait(timeout=left(deadline, 2)) == -signal.SIGKILL,
+                       "response-observer-loss")
+        with checking("witness-release"):
+            a10["publish_observer_ack"](root / "observer" / slot, pid)
+        print(f"C14 observed slot={slot} private=0700 uid={BUILD} gid={BUILD} "
+              f"memory={a10['MEMORY']} pids={a10['PIDS']} swap=0 no_new_privs=1", flush=True)
+        return leaf
+    raise Fault("witness", "timeout")
+
+
+def admissions(root, node, forwarded):
+    # Both call sites pass a fixed flag. Bound the read to one row beyond the expected two.
+    query = ("SELECT hex(d.operation),a.id,a.outcome FROM delegated_build d "
+             f"JOIN activity a ON a.id=d.activity_id WHERE d.forwarded={int(forwarded)} "
+             "ORDER BY a.id LIMIT 3")
+    return rows(root / node / "activity/activity.sqlite3", query)
+
+
+def recover_lost(root, connect, deadline, first):
+    with checking("terminal"):
         end = phase_end(deadline, 8)
         while time.monotonic() < end:
-            with Mcp(root, base, end) as status:
-                result = status.call("delegated_build_status", {"target":2,"operation_id":operation})
-            if result["outcome"] != "unknown":
+            before = admissions(root, "b", False)
+            expect(len(before) == 2 and before[0] == (first[0].upper(), first[1], "succeeded"),
+                   "lost-target-admission")
+            if before[1][2] != "started":
                 break
-            time.sleep(0.04)
-    expect(result and result["outcome"] == "succeeded" and
-           re.fullmatch("[0-9a-f]{64}", result["operation_id"]), "terminal-outcome")
-    status = result["target_activity"]
-    expect((status["uid"], status["gid"], status["cleanup_confirmed"], status["exit_code"]) ==
-           (BUILD, BUILD, True, 0), "terminal-identity")
-    artifact = root / "workspace" / slot / "out/target/debug/c14-fixture"
-    expect(artifact.is_file() and not artifact.is_symlink() and artifact.stat().st_uid == BUILD, "artifact")
-    observed = read(root / "workspace" / slot / "out/observed", 128).decode("ascii")
-    expect(re.fullmatch(r"arx-\d+-\d+\n", observed), "cgroup-leaf")
-    expect(not (Path("/sys/fs/cgroup/system.slice/arxd.service/runs") / observed.strip()).exists(),
-           "cgroup-residue")
+            time.sleep(.04)
+        else:
+            raise Fault("terminal", "timeout")
+        key, _, state = before[1]
+        if state != "succeeded":
+            raise Fault("terminal", outcome({"outcome":state}))
+        operation = key.lower()
+        expect(OPERATION.fullmatch(operation) and operation != first[0], "distinct-operation")
+        source = admissions(root, "a", True)
+        expect([(key, state) for key, _, state in source] ==
+               [(first[0].upper(), "succeeded"), (key, "started")], "source-pending-before-status")
+
+    with checking("rpc"):
+        with connect("fixture", deadline) as status:
+            listed = status.call("delegated_build_status", {"target":2})
+        expect(listed == {"operations":[operation, first[0]]}, "forwarded-correlation")
+        arguments = {"target":2,"operation_id":operation}
+        with connect("foreign", deadline) as outsider:
+            negative_control(outsider, "delegated_build_status", arguments, "foreign-status")
+        end = phase_end(deadline, 8)
+        while time.monotonic() < end:
+            with connect("fixture", end) as status:
+                result = status.call("delegated_build_status", arguments)
+            if outcome(result) != "unknown":
+                break
+            time.sleep(.04)
+        else:
+            raise Fault("terminal", "unknown")
+    with checking("terminal"):
+        expect(admissions(root, "b", False) == before, "status-repeated-execution")
+        if outcome(result) == "succeeded":
+            expect(result.get("operation_id") == operation, "status-correlation")
+    return result
+
+
+def build(root, slot, deadline, connect, broker_pid, a10, first=None):
+    args = {"target":2,"workspace":slot,"tool":"cargo","args":COMMAND,"timeout_s":12,"output_bytes":1024}
+    with checking("rpc"):
+        with connect("fixture", deadline) as client:
+            if slot == "ordinary":
+                with checking("route"):
+                    expect(client.call("discover_build_targets", {}) == {"targets":[2]}, "strict-route")
+            client.send("run_command", args)
+            reply_end = phase_end(deadline, 16)
+            leaf = gate(root, slot, client, broker_pid, a10, phase_end(reply_end, 8), deadline)
+            result = client.result(reply_end) if slot == "ordinary" else None
+    if slot == "lost":
+        result = recover_lost(root, connect, deadline, first)
+    with checking("terminal", "malformed"):
+        category = outcome(result)
+        if category != "succeeded":
+            raise Fault("terminal", category)
+        expect(OPERATION.fullmatch(result["operation_id"]), "operation")
+        status = result["target_activity"]
+        expect((status["uid"], status["gid"]) == (BUILD, BUILD)
+               and status["cleanup_confirmed"] is True
+               and type(status["exit_code"]) is int and status["exit_code"] == 0, "terminal-identity")
+        expect(type(status["activity_id"]) is int and status["activity_id"] > 0, "activity-id")
+    with checking("artifact"):
+        out = root / "workspace" / slot / "out"
+        for path in (out / "target", out / "target/debug"):
+            expect(stat.S_ISDIR(path.lstat().st_mode), "artifact-directory")
+        artifact = (out / "target/debug/c14-fixture").lstat()
+        expect(stat.S_ISREG(artifact.st_mode) and artifact.st_uid == BUILD, "artifact")
+    with checking("leaf-cleanup"):
+        expect(not (a10["RUNS"] / leaf).exists(), "cgroup-residue")
     return result["operation_id"], status["activity_id"]
 
 
@@ -376,33 +538,37 @@ def reap_wrapper(wrapper, deadline):
                 pass
 
 
-def supervise(wrapper, work, cleanup, first_failure, deadline, cleanup_deadline):
+def supervise(wrapper, work, cleanup, evidence, deadline, cleanup_deadline):
+    evidence.confirmed_close = False
     try:
-        work(deadline)
-        expect(time.monotonic() < deadline, "campaign-deadline")
-        wrapper.stdin.write(b"\1")
-        wrapper.stdin.close()
-        expect(wrapper.wait(timeout=left(deadline, 3)) == 0, "wrapper-result")
-    except PROBE_ERRORS:
-        first_failure()
-        raise
+        with checking("campaign"):
+            work(deadline)
+            if time.monotonic() >= deadline:
+                raise Fault("campaign", "timeout")
+            wrapper.stdin.write(b"\1")
+            wrapper.stdin.close()
+            expect(wrapper.wait(timeout=left(deadline, 3)) == 0, "wrapper-result")
+    except Fault as fault:
+        evidence.first(fault)
     finally:
         reaped = reap_wrapper(wrapper, cleanup_deadline)
-        if not reaped:
-            print("C14 cleanup wrapper=unconfirmed", flush=True)
         try:
             closed = cleanup(cleanup_deadline)
         except PROBE_ERRORS:
             closed = False
-    if not (reaped and closed):
-        first_failure()
-        raise ValueError("owned-close")
+        evidence.confirmed_close = reaped and closed
+        if not evidence.confirmed_close:
+            evidence.first(Fault("cleanup", "unconfirmed"))
+        print(f"C14 cleanup wrapper_reaped={int(reaped)}", flush=True)
+        evidence.report_close()
 
 
-def campaign(root, address, tags, a10, cleanup_deadline):
+def campaign(root, address, tags, a10, cleanup_deadline, evidence):
     deadline = cleanup_deadline - 13
-    expect(time.monotonic() < deadline, "campaign-budget")
+    if time.monotonic() >= deadline:
+        raise Fault("campaign", "timeout")
     owned = []
+    clients = []
     phase = "founder"
     broker_started = False
     wrapper = subprocess.Popen(
@@ -411,7 +577,10 @@ def campaign(root, address, tags, a10, cleanup_deadline):
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
 
-    def work(deadline):
+    def connect(principal, deadline):
+        return Mcp(root, root / "a/clients" / (principal + ".json"), deadline, clients)
+
+    def setup(deadline):
         nonlocal phase, broker_started
         wrapper_ready(wrapper, deadline)
         ports = []
@@ -437,7 +606,12 @@ def campaign(root, address, tags, a10, cleanup_deadline):
         phase = "broker"
         broker_started = True
         a10["start"](root, phase_end(deadline, 7))
-        a10["wait_ready"](root, phase_end(deadline, 8))
+        # The A10 setup validates ancestry and delegation. Its report includes
+        # paths and PID, so C14 emits only the fixed qualification facts.
+        with open(os.devnull, "w") as sink, redirect_stdout(sink):
+            broker_pid = a10["wait_ready"](root, phase_end(deadline, 8))
+        private_cgroup(a10["RUNS"])
+        print("C14 broker setup=ready runs_owner=0 runs_mode=0700", flush=True)
         phase = "join"
         expect(time.monotonic() < deadline, "join-deadline")
         b = start(root, "b", "join")
@@ -449,31 +623,40 @@ def campaign(root, address, tags, a10, cleanup_deadline):
         founder = ready(root, "a", a, 4, deadline)
         expect(founder[1:3] == b"\1\1", "enrollment-dispatch")
         account_counts(root, strict, tags)
-        phase = "ordinary"
+        return broker_pid
+
+    def work(deadline):
+        try:
+            broker_pid = setup(deadline)
+        except (TimeoutError, subprocess.TimeoutExpired):
+            raise Fault(phase, "timeout") from None
+        except PROBE_ERRORS:
+            raise Fault(phase, "invalid") from None
         arguments = {"target":2,"workspace":"ordinary","tool":"cargo","args":COMMAND,
                      "timeout_s":12,"output_bytes":1024}
-        with Mcp(root, root / "a/clients/foreign.json", deadline) as ungranted:
-            expect(ungranted.call("run_command", arguments) == {"outcome":"refused"}, "agent-policy")
-        with Mcp(root, root / "a/clients/fixture.json", deadline) as agent:
-            for slot in REFUSED_SLOTS:
-                expect(agent.call("run_command", {**arguments, "workspace":slot}) == {"outcome":"refused"},
-                       "workspace-policy")
-        first = build(root, "ordinary", deadline)
-        phase = "lost"
-        second = build(root, "lost", deadline)
-        expect(first[0] != second[0] and first[1] != second[1], "distinct-correlations")
-        query = ("SELECT hex(d.operation),a.id,a.outcome FROM delegated_build d "
-                 "JOIN activity a ON a.id=d.activity_id WHERE d.forwarded=0 ORDER BY a.id LIMIT 3")
-        expect(rows(root / "b/activity/activity.sqlite3", query) ==
-               [(key.upper(), row, "succeeded") for key, row in (first, second)], "correlated-starts")
-        expect(not rows(root / "a/activity/activity.sqlite3", query), "no-a-admission")
-        print(PASS, flush=True)
-        phase = "close"
-
-    def first_failure():
-        print(f"C14 first phase={phase} category=refused", flush=True)
+        with checking("principal-control"):
+            with connect("foreign", deadline) as ungranted:
+                negative_control(ungranted, "run_command", arguments, "principal-control")
+        with checking("workspace-control"):
+            with connect("fixture", deadline) as agent:
+                for slot in REFUSED_SLOTS:
+                    negative_control(agent, "run_command", {**arguments, "workspace":slot},
+                                     "workspace-control")
+        first = build(root, "ordinary", deadline, connect, broker_pid, a10)
+        second = build(root, "lost", deadline, connect, broker_pid, a10, first)
+        with checking("admission"):
+            expect(first[0] != second[0] and first[1] != second[1], "distinct-correlations")
+            expect(admissions(root, "b", False) ==
+                   [(key.upper(), row, "succeeded") for key, row in (first, second)], "correlated-starts")
+            expect(not admissions(root, "a", False), "no-a-admission")
 
     def cleanup(end):
+        mcp_closed = True
+        for client in reversed(clients):
+            try:
+                client.close(end)
+            except PROBE_ERRORS:
+                mcp_closed = False
         closes = 0
         for process in reversed(owned):
             try:
@@ -486,17 +669,18 @@ def campaign(root, address, tags, a10, cleanup_deadline):
                     process.wait(timeout=left(end, 1))
             except PROBE_ERRORS:
                 print("C14 cleanup daemon=unconfirmed", flush=True)
-        broker_closed = False
+        broker_closed = not broker_started
         if broker_started:
             try:
                 a10["stop"](root, end, 1, [])
                 broker_closed = True
             except PROBE_ERRORS:
                 print("C14 cleanup broker=unconfirmed", flush=True)
-        print(f"C14 close starts={len(owned)} closes={closes} broker={int(broker_closed)}", flush=True)
-        return len(owned) == closes == 2 and broker_closed
+        print(f"C14 close starts={len(owned)} closes={closes} broker={int(broker_closed)} "
+              f"mcp={int(mcp_closed)}", flush=True)
+        return len(owned) == closes and broker_closed and mcp_closed
 
-    supervise(wrapper, work, cleanup, first_failure, deadline, cleanup_deadline)
+    supervise(wrapper, work, cleanup, evidence, deadline, cleanup_deadline)
 
 
 def child(root):
@@ -506,13 +690,9 @@ def child(root):
            "build-command")
     expect(os.getuid() == BUILD and os.getgid() == BUILD and not os.getgroups(), "build-role")
     line = read(Path("/proc/self/cgroup"), 256).decode("ascii").strip()
-    leaf = line.removeprefix("0::/system.slice/arxd.service/runs/")
-    expect(re.fullmatch(r"arx-\d+-\d+", leaf), "build-cgroup")
-    leaf_path = Path("/sys/fs/cgroup/system.slice/arxd.service/runs") / leaf
-    expect(read(leaf_path / "memory.max", 40).strip() == str(a10["MEMORY"]).encode()
-           and read(leaf_path / "pids.max", 40).strip() == str(a10["PIDS"]).encode()
-           and read(leaf_path / "memory.swap.max", 40).strip() == b"0", "build-caps")
-    a10["cgroup_denials"](leaf_path)
+    leaf = line.removeprefix(MEMBERSHIP)
+    expect(a10["LEAF"].fullmatch(leaf) and line == MEMBERSHIP + leaf, "build-cgroup")
+    a10["cgroup_denials"](a10["RUNS"] / leaf)
     a10["verify_child_fds"]()
     for path in ["broker/settings.json", "b/wrap", "b/private/custody", "b/history", "b/activity"]:
         try:
@@ -530,14 +710,24 @@ def child(root):
         expect(error.errno in (errno.EACCES, errno.EPERM), "slot-replacement-denial")
     else:
         raise ValueError("replaced-slot")
+    pid = str(os.getpid())
     with (slot / "out/observed").open("x", encoding="ascii") as out:
-        out.write(leaf + "\n")
-    if slot.name == "lost":
-        end = time.monotonic() + 6
-        while not (slot / "out/release").is_file():
-            expect(time.monotonic() < end, "loss-observer")
-            time.sleep(.025)
+        out.write(f"{pid} {leaf}\n")
+    wait_for_ack(root / "observer" / slot.name / "confirmed", pid, a10["read"],
+                 time.monotonic() + 6)
     os.execve(root / "toolchain/bin/cargo", ["cargo", *COMMAND], os.environ)
+
+
+def wait_for_ack(path, pid, read_ack, end):
+    while time.monotonic() < end:
+        try:
+            ack = read_ack(path, 16, 0)
+        except FileNotFoundError:
+            time.sleep(.025)
+        else:
+            expect(ack == pid, "observer-ack")
+            return
+    raise ValueError("observer-timeout")
 
 
 def stage_child(root, sources):
@@ -555,6 +745,7 @@ def stage_workspace(root, a10):
     directory(root / "broker", mode=0o700)
     directory(root / "control", gid=DAEMON, mode=0o710)
     directory(root / "workspace")
+    directory(root / "observer")
     directory(root / "tools")
     worker_roots = ["workspace","state","credentials","wrap","private","history","activity"]
     for name in ("a", "b"):
@@ -567,6 +758,7 @@ def stage_workspace(root, a10):
         directory(node / "mcp", DAEMON, AGENT, 0o2710)
         directory(node / "clients", AGENT, AGENT, 0o700)
     for name in SLOTS:
+        directory(root / "observer" / name)
         slot = root / "workspace" / name
         directory(slot)
         directory(slot / "src")
@@ -612,28 +804,70 @@ def stage_toolchain(source, destination):
                        stderr=subprocess.DEVNULL, timeout=5, check=True)
 
 
-def privileged(stage, sources, a10, c13, receipt, end):
-    m = stage.lstat()
-    expect(os.geteuid() == 0 and stage.parent == Path("/tmp")
-           and re.fullmatch("arx-c14-[a-z0-9_]{8}", stage.name)
-           and stat.S_ISDIR(m.st_mode) and stat.S_IMODE(m.st_mode) == 0o700
-           and m.st_uid == int(os.environ["SUDO_UID"]), "staging")
-    root = Path("/var/lib") / f"arx-c14-{receipt['run']}-{receipt['attempt']}"
-    expect(all(a10["role_unused"](name, uid) for name, uid in ROLES), "account-collision")
-    deadline = phase_end(end - 26, 40)
-    tags = frozen_kinds(sources.parents[3])
-    a10["ancestry"](root.parent)
-    expect(a10["properties"](deadline)["LoadState"] == "not-found", "unit-collision")
+def staged_scope(root, prepare, remove_role, evidence, end):
     owned = []
-    removable = True
-    directory(root)
+    identity = None
     try:
+        with checking("staging"):
+            root.mkdir(mode=0o755)
+            identity = root.lstat()
+            root.chmod(0o755)
+            prepare(owned)
+    except Fault as fault:
+        evidence.first(fault)
+    if not evidence.close_reported:
+        evidence.report_close()
+    if identity is None or not (evidence.confirmed_close and evidence.confirmed_ownership):
+        print("C14 staging cleanup=retained", flush=True)
+        return
+    try:
+        with checking("cleanup", "unconfirmed"):
+            current = root.lstat()
+            expect(stat.S_ISDIR(current.st_mode) and
+                   (current.st_dev, current.st_ino, current.st_uid) ==
+                   (identity.st_dev, identity.st_ino, identity.st_uid), "fixture-ownership")
+            deadline = phase_end(end, 12)
+            clean = [remove_role(kind, name, uid, deadline) for kind, name, uid in reversed(owned)]
+            expect(all(value == "removed" for value in clean), "account-cleanup")
+            shutil.rmtree(root)
+    except Fault as fault:
+        evidence.first(fault)
+        print("C14 staging cleanup=unconfirmed", flush=True)
+    else:
+        print("C14 staging cleanup=removed", flush=True)
+
+
+def privileged(stage, sources, a10, c13, receipt, end):
+    evidence = Evidence()
+    try:
+        with checking("staging"):
+            m = stage.lstat()
+            expect(os.geteuid() == 0 and stage.parent == Path("/tmp")
+                   and re.fullmatch("arx-c14-[a-z0-9_]{8}", stage.name)
+                   and stat.S_ISDIR(m.st_mode) and stat.S_IMODE(m.st_mode) == 0o700
+                   and m.st_uid == int(os.environ["SUDO_UID"]), "staging")
+            root = Path("/var/lib") / f"arx-c14-{receipt['run']}-{receipt['attempt']}"
+            expect(all(a10["role_unused"](name, uid) for name, uid in ROLES), "account-collision")
+            deadline = phase_end(end - 26, 40)
+            tags = frozen_kinds(sources.parents[3])
+            a10["ancestry"](root.parent)
+            expect(a10["properties"](deadline)["LoadState"] == "not-found", "unit-collision")
+    except Fault as fault:
+        evidence.first(fault)
+        evidence.report_close()
+        return 1
+
+    def prepare(owned):
         for name, uid in ROLES:
-            owned.append(("group", name, uid))
+            # A failed creation can leave a partial account. Only claim a
+            # successfully created object and retain the fixture if uncertain.
+            evidence.confirmed_ownership = False
             a10["command"](["/usr/sbin/groupadd", "--gid", str(uid), name], deadline, "group")
-            owned.append(("user", name, uid))
+            owned.append(("group", name, uid))
             a10["command"](a10["useradd_argv"](name, uid), deadline, "account")
+            owned.append(("user", name, uid))
             a10["role"](name, uid)
+            evidence.confirmed_ownership = True
         for name in ("arxd", "campaign"):
             c13["stage_binary"](stage / name, root / name, deadline)
             (root / name).chmod(0o755)
@@ -641,15 +875,13 @@ def privileged(stage, sources, a10, c13, receipt, end):
         stage_child(root, sources)
         stage_toolchain(stage / "toolchains/fixture-x86_64-unknown-linux-gnu", root / "toolchain")
         ip = c13["primary_ip"](deadline)
-        removable = False
-        campaign(root, ip, tags, a10, phase_end(end - 13, 55))
-        removable = True
-    finally:
-        if removable:
-            deadline = phase_end(end, 12)
-            clean = [c13["remove_role"](kind, name, uid, deadline) for kind, name, uid in reversed(owned)]
-            expect(all(value == "removed" for value in clean), "account-cleanup")
-            shutil.rmtree(root)
+        campaign(root, ip, tags, a10, phase_end(end - 13, 55), evidence)
+
+    staged_scope(root, prepare, c13["remove_role"], evidence, end)
+    if evidence.failed:
+        return 1
+    print(PASS, flush=True)
+    return 0
 
 
 def select_campaign(deps, c13, deadline):
@@ -672,33 +904,363 @@ def select_campaign(deps, c13, deadline):
 
 
 def self_test(workspace):
+    from io import BytesIO, StringIO
+    from types import SimpleNamespace
     import unittest
+    from unittest.mock import MagicMock, Mock, patch
+
+    a10 = runpy.run_path(str(Path(__file__).with_name("executor-probe.py")))
 
     class ProbeTest(unittest.TestCase):
-        def test_staged_child_loads_helper_and_validates_command_before_build(self):
-            # Intercept the first UID check, which follows the helper import and
-            # command validation. The child cannot reach procfs, cgroups or Cargo.
-            enter = (
-                "import os, runpy, sys; from unittest.mock import patch\n"
-                "sys.argv = sys.argv[1:]\n"
-                "with patch.object(os, 'getuid', side_effect=SystemExit(23), create=True):\n"
-                "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
-            )
+        def test_staged_children_require_protected_ack_before_cargo(self):
+            enter = """
+import errno, os, runpy, sys
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.argv = sys.argv[1:]
+probe = runpy.run_path(sys.argv[0])
+root = Path(sys.argv[0]).parent.parent
+slot = Path.cwd()
+helper = runpy.run_path(str(root / 'a10.py'))
+leaf = 'arx-42-0'
+confirmed = root / 'observer' / slot.name / 'confirmed'
+
+def evidence(path, size, uid):
+    assert (path, size, uid) == (confirmed, 16, 0)
+    (slot / 'out/waiting').write_bytes(b'')
+    return path.read_text(encoding='ascii')
+
+def proc_only(path, size):
+    assert path == Path('/proc/self/cgroup'), 'unexpected privileged read'
+    return (probe['MEMBERSHIP'] + leaf + '\\n').encode('ascii')
+
+def denied_open(path, flags):
+    assert path.is_relative_to(root) and not path.is_relative_to(root / 'workspace')
+    raise PermissionError(errno.EACCES, 'private')
+
+def cargo(path, argv, env):
+    assert path == root / 'toolchain/bin/cargo' and argv == ['cargo', *probe['COMMAND']]
+    (slot / 'out/cargo-called').write_bytes(b'')
+
+denials = Mock()
+fds = Mock()
+sockets = Mock()
+helper.update(read=evidence, cgroup_denials=denials, verify_child_fds=fds, socket_denied=sockets)
+with patch.dict(probe['child'].__globals__, {'read': proc_only}), \\
+     patch.object(runpy, 'run_path', return_value=helper), \\
+     patch.object(os, 'getuid', return_value=probe['BUILD'], create=True), \\
+     patch.object(os, 'getgid', return_value=probe['BUILD'], create=True), \\
+     patch.object(os, 'getgroups', return_value=[], create=True), \\
+     patch.object(os, 'O_NOFOLLOW', 0x20000, create=True), \\
+     patch.object(os, 'open', side_effect=denied_open), \\
+     patch.object(os, 'rename', side_effect=PermissionError(errno.EACCES, 'private')), \\
+     patch.object(os, 'execve', side_effect=cargo):
+    probe['main']()
+denials.assert_called_once_with(helper['RUNS'] / leaf)
+fds.assert_called_once_with()
+assert sockets.call_count == 2
+"""
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve() / "var/lib/arx-c14-fixture"
                 (root / "tools").mkdir(parents=True)
-                slots = [root / "workspace" / name for name in SLOTS]
-                for slot in slots:
-                    slot.mkdir(parents=True)
                 stage_child(root, Path(__file__).resolve())
                 wrapper = [sys.executable, "-I", "-B", "-c", enter, root / "tools/cargo"]
-                for slot in slots:
-                    accepted = subprocess.run(wrapper + COMMAND, cwd=slot, timeout=5,
-                                              capture_output=True)
-                    self.assertEqual(accepted.returncode, 23, accepted.stderr)
-                refused = subprocess.run(wrapper + ["build"], cwd=slots[0], timeout=5,
-                                         capture_output=True)
-                self.assertEqual(refused.returncode, 1)
+                for name in SLOTS:
+                    with self.subTest(slot=name):
+                        slot = root / "workspace" / name
+                        out = slot / "out"
+                        out.mkdir(parents=True)
+                        ack = root / "observer" / name
+                        ack.mkdir(parents=True)
+                        with subprocess.Popen(wrapper + COMMAND, cwd=slot, stderr=subprocess.DEVNULL) as proc:
+                            try:
+                                end = time.monotonic() + 5
+                                while not (out / "waiting").exists() and proc.poll() is None:
+                                    self.assertLess(time.monotonic(), end)
+                                    time.sleep(.01)
+                                self.assertIsNone(proc.poll())
+                                self.assertEqual((out / "observed").read_text(encoding="ascii"),
+                                                 f"{proc.pid} arx-42-0\n")
+                                # An old build-owned release file has no effect.
+                                (out / "release").touch()
+                                self.assertFalse((out / "cargo-called").exists())
+                                a10["publish_observer_ack"](ack, str(proc.pid))
+                                self.assertEqual(proc.wait(timeout=5), 0)
+                                self.assertTrue((out / "cargo-called").is_file())
+                            finally:
+                                if proc.poll() is None:
+                                    proc.kill()
+
+        def test_missing_or_wrong_ack_fails_closed(self):
+            path = Path("confirmed")
+            with patch.object(time, "monotonic", side_effect=[0, 2]), patch.object(time, "sleep"):
+                missing = Mock(side_effect=FileNotFoundError)
+                with self.assertRaisesRegex(ValueError, "observer-timeout"):
+                    wait_for_ack(path, "25", missing, 1)
+                missing.assert_called_once_with(path, 16, 0)
+            with self.assertRaisesRegex(ValueError, "observer-ack"):
+                wait_for_ack(path, "25", Mock(return_value="26"), time.monotonic() + 1)
+
+        def test_observer_validates_live_membership_limits_modes_and_credentials(self):
+            root = Path("fixture")
+            leaf = "arx-42-0"
+            runs = a10["RUNS"]
+            path = runs / leaf
+            witness = root / "workspace/ordinary/out/observed"
+            proc = Path("/proc/25/cgroup")
+            records = {
+                witness: f"25 {leaf}\n", proc: MEMBERSHIP + leaf + "\n",
+                path / "cgroup.procs": "25\n", path / "memory.max": str(a10["MEMORY"]),
+                path / "pids.max": str(a10["PIDS"]), path / "memory.swap.max": "0",
+            }
+            credentials = {"Uid":[str(BUILD)] * 4, "Gid":[str(BUILD)] * 4, "Groups":[],
+                           "NoNewPrivs":["1"], "CapBnd":[a10["CAPS"]],
+                           **{key:["0" * 16] for key in ("CapEff", "CapPrm", "CapInh", "CapAmb")}}
+            modes = {directory: SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0)
+                     for directory in (runs, path)}
+
+            def host_read(file, limit=4096, owner=None):
+                if file == witness:
+                    self.assertEqual((limit, owner), (64, BUILD))
+                return records[file]
+
+            helper = {**a10, "read":host_read, "proc_status":Mock(return_value=credentials)}
+            with patch.object(type(runs), "lstat", autospec=True, side_effect=modes.__getitem__):
+                self.assertEqual(observe(root, "ordinary", 42, helper), ("25", leaf))
+                helper["proc_status"].assert_called_once_with("25")
+                for file, wrong in (
+                    (witness, f"0 {leaf}\n"), (witness, f"2147483648 {leaf}\n"),
+                    (witness, f"26 {leaf}\n"), (witness, f"{leaf}\n"),
+                    (witness, "25 arx-43-0\n"), (witness, "25 arx-42-../0\n"),
+                    (proc, MEMBERSHIP + "arx-42-1"), (path / "cgroup.procs", "125\n"),
+                    (path / "memory.max", "max"), (path / "pids.max", "31"),
+                    (path / "memory.swap.max", "1"),
+                ):
+                    with self.subTest(file=file.name, wrong=wrong), patch.dict(records, {file:wrong}):
+                        with self.assertRaises(Fault):
+                            observe(root, "ordinary", 42, helper)
+                for key, correct in credentials.copy().items():
+                    with self.subTest(credential=key):
+                        for wrong in (["unexpected"], None):
+                            with patch.dict(credentials, {key:wrong}):
+                                if wrong is None:
+                                    del credentials[key]
+                                with self.assertRaisesRegex(Fault, "role"):
+                                    observe(root, "ordinary", 42, helper)
+                        self.assertEqual(credentials[key], correct)
+                for directory in modes:
+                    for info in ({"st_mode":stat.S_IFDIR | 0o755, "st_uid":0},
+                                 {"st_mode":stat.S_IFDIR | 0o700, "st_uid":BUILD},
+                                 {"st_mode":stat.S_IFLNK | 0o700, "st_uid":0}):
+                        with self.subTest(directory=directory.name, info=info):
+                            with patch.dict(modes, {directory:SimpleNamespace(st_gid=0, **info)}):
+                                with self.assertRaisesRegex(Fault, "witness"):
+                                    observe(root, "ordinary", 42, helper)
+
+        def test_witness_reader_rejects_unsafe_files(self):
+            # Use the standing A10 reader with an injected POSIX open/fstat
+            # seam so the same flags and metadata checks run on Windows.
+            for kind in ("oversized", "unowned", "symlink", "hardlink", "fifo"):
+                with self.subTest(kind=kind):
+                    data = b"x" * 65 if kind == "oversized" else b"25 arx-42-0\n"
+                    metadata = SimpleNamespace(st_uid=0 if kind == "unowned" else BUILD,
+                                               st_nlink=2 if kind == "hardlink" else 1,
+                                               st_mode=stat.S_IFIFO if kind == "fifo" else stat.S_IFREG)
+                    with patch.object(os, "O_NOFOLLOW", 0x20000, create=True), \
+                         patch.object(os, "O_NONBLOCK", 0x800, create=True), \
+                         patch.object(os, "O_CLOEXEC", 0x80000, create=True), \
+                         patch.object(os, "open", return_value=7) as opened, \
+                         patch.object(os, "fdopen", return_value=MagicMock()) as wrapped, \
+                         patch.object(os, "fstat", return_value=metadata):
+                        if kind == "symlink":
+                            opened.side_effect = OSError(errno.ELOOP, "private")
+                        wrapped.return_value.__enter__.return_value.read = BytesIO(data).read
+                        with self.assertRaisesRegex(Fault, "witness"):
+                            observe(Path("fixture"), "ordinary", 42, a10)
+                        self.assertTrue(opened.call_args.args[1] & os.O_NOFOLLOW)
+
+        def test_both_gates_reject_early_pipe_results_before_witness(self):
+            sentinel = "redaction-sentinel"
+
+            def response(result):
+                return {"result":{"content":[{"text":json.dumps(result)}]}}
+
+            cases = (
+                ({"error":{"message":sentinel}}, ("rpc", "rpc-error")),
+                (response({"outcome":"refused"}), ("admission", "refused")),
+                (response({"outcome":"failed", "target_activity":{"exit_code":1},
+                           "stderr":sentinel}), ("terminal", "failed")),
+                (response({"outcome":"unknown"}), ("admission", "unknown")),
+                (response({"outcome":"succeeded"}), ("admission", "premature")),
+                (response({"outcome":sentinel}), ("admission", "malformed")),
+                (b"{", ("rpc", "malformed")),
+                (b"", ("rpc", "eof")),
+            )
+            for slot in SLOTS:
+                for frame, expected in cases:
+                    with self.subTest(slot=slot, reason=expected):
+                        client = Mcp.__new__(Mcp)
+                        client.pending = bytearray()
+                        client.process = Mock()
+                        data = frame if isinstance(frame, bytes) else json.dumps(
+                            {"jsonrpc":"2.0", "id":2, **frame}).encode("ascii")
+                        if data:
+                            data += b"\n"
+                        with patch.object(select, "select", return_value=([7], [], [])), \
+                             patch.object(os, "read", return_value=data), \
+                             patch.dict(gate.__globals__, {"observe":Mock()}) as functions:
+                            end = time.monotonic() + 1
+                            with self.assertRaises(Fault) as caught:
+                                gate(Path("fixture"), slot, client, 42, a10, end, end)
+                            self.assertEqual((caught.exception.checkpoint, caught.exception.category),
+                                             expected)
+                            output = StringIO()
+                            with redirect_stdout(output):
+                                Evidence().first(caught.exception)
+                            self.assertNotIn(sentinel, output.getvalue())
+                            functions["observe"].assert_not_called()
+                            client.process.kill.assert_not_called()
+
+        def test_negative_control_requires_a_json_refusal(self):
+            client = Mock()
+            for checkpoint in ("principal-control", "workspace-control", "foreign-status"):
+                with self.subTest(checkpoint=checkpoint):
+                    client.call.return_value = {"outcome":"refused"}
+                    negative_control(client, "probe", {}, checkpoint)
+                    client.call.return_value = {"outcome":"failed"}
+                    with self.assertRaisesRegex(Fault, checkpoint):
+                        negative_control(client, "probe", {}, checkpoint)
+            client.call.side_effect = Fault("rpc", "rpc-error")
+            with self.assertRaisesRegex(Fault, "rpc-error"):
+                negative_control(client, "probe", {}, "principal-control")
+
+        def test_gate_order_and_witness_timeout(self):
+            root = Path("fixture")
+            for slot in SLOTS:
+                with self.subTest(slot=slot):
+                    calls = Mock()
+                    calls.observe.return_value = ("25", "arx-42-0")
+                    calls.client.ready.return_value = False
+                    calls.client.process.wait.return_value = -signal.SIGKILL if os.name != "nt" else -9
+                    with patch.dict(gate.__globals__, {"observe":calls.observe}), \
+                         patch.object(signal, "SIGKILL", 9, create=True), redirect_stdout(StringIO()):
+                        end = time.monotonic() + 1
+                        leaf = gate(root, slot, calls.client, 42, {"publish_observer_ack":calls.publish,
+                                    "MEMORY":a10["MEMORY"], "PIDS":a10["PIDS"]}, end, end)
+                    self.assertEqual(leaf, "arx-42-0")
+                    self.assertEqual([call[0] for call in calls.mock_calls],
+                                     ["client.ready", "observe", "client.ready"] +
+                                     (["client.process.kill", "client.process.wait"] if slot == "lost" else []) +
+                                     ["publish"])
+                    calls.publish.assert_called_once_with(root / "observer" / slot, "25")
+
+                    calls.reset_mock()
+                    calls.client.ready.side_effect = [False, True]
+                    calls.client.result.return_value = {"outcome":"succeeded"}
+                    with patch.dict(gate.__globals__, {"observe":calls.observe}):
+                        end = time.monotonic() + 1
+                        with self.assertRaisesRegex(Fault, "premature"):
+                            gate(root, slot, calls.client, 42, a10, end, end)
+                    calls.client.process.kill.assert_not_called()
+                    calls.publish.assert_not_called()
+
+                    calls.reset_mock(side_effect=True)
+                    calls.observe.return_value = None
+                    with patch.object(time, "monotonic", side_effect=[0, 2]), \
+                         patch.object(time, "sleep"), patch.dict(gate.__globals__, {"observe":calls.observe}):
+                        with self.assertRaisesRegex(Fault, "witness.*timeout"):
+                            gate(root, slot, calls.client, 42, a10, 1, 1)
+                    calls.client.ready.assert_called_once()
+                    calls.observe.assert_called_once()
+                    calls.client.process.kill.assert_not_called()
+
+        def test_build_checks_terminal_identity_artifact_and_leaf_removal(self):
+            operation = "a" * 64
+            leaf = "arx-42-0"
+            result = {"outcome":"succeeded", "operation_id":operation, "target_activity":{
+                "uid":BUILD, "gid":BUILD, "exit_code":0, "cleanup_confirmed":True, "activity_id":3,
+            }}
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                artifact = root / "workspace/ordinary/out/target/debug/c14-fixture"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b"fixture")
+                helper = {**a10, "RUNS":root / "runs"}
+                client = MagicMock()
+                client.__enter__.return_value = client
+                client.call.return_value = {"targets":[2]}
+                client.result.return_value = result
+                lstat = type(root).lstat
+
+                def observed_stat(path):
+                    metadata = lstat(path)
+                    if path == artifact:
+                        return SimpleNamespace(st_mode=metadata.st_mode, st_uid=BUILD)
+                    return metadata
+
+                end = time.monotonic() + 5
+                with patch.dict(build.__globals__, {"gate":Mock(return_value=leaf)}), \
+                     patch.object(type(root), "lstat", observed_stat):
+                    self.assertEqual(build(root, "ordinary", end, Mock(return_value=client), 42, helper),
+                                     (operation, 3))
+                    with patch.dict(result["target_activity"], {"exit_code":1}):
+                        with self.assertRaisesRegex(Fault, "terminal"):
+                            build(root, "ordinary", end, Mock(return_value=client), 42, helper)
+                    (helper["RUNS"] / leaf).mkdir(parents=True)
+                    with self.assertRaisesRegex(Fault, "leaf-cleanup"):
+                        build(root, "ordinary", end, Mock(return_value=client), 42, helper)
+                    artifact.unlink()
+                    with self.assertRaisesRegex(Fault, "artifact"):
+                        build(root, "ordinary", end, Mock(return_value=client), 42, helper)
+
+        def test_lost_oracle_checks_one_spend_and_pending_source_before_status(self):
+            first, second = "a" * 64, "b" * 64
+            for failure in (None, "prior-spend", "source-applied", "status-repeats"):
+                with self.subTest(failure=failure):
+                    spent = [(first.upper(), 10, "succeeded"), (second.upper(), 11, "succeeded")]
+                    if failure == "prior-spend":
+                        spent.append((second.upper(), 12, "succeeded"))
+                    source = [(first.upper(), 20, "succeeded"),
+                              (second.upper(), 21, "succeeded" if failure == "source-applied" else "started")]
+                    events = []
+
+                    def admitted(_root, node, forwarded):
+                        events.append((node, forwarded))
+                        return list(source if forwarded else spent)
+
+                    @contextmanager
+                    def connect(principal, _deadline):
+                        client = Mock()
+
+                        def status(tool, args):
+                            self.assertEqual(tool, "delegated_build_status")
+                            events.append(principal)
+                            if "operation_id" not in args:
+                                self.assertEqual(events[:3], [("b", False), ("a", True), "fixture"])
+                                return {"operations":[second, first]}
+                            self.assertEqual(args["operation_id"], second)
+                            if principal == "foreign":
+                                return {"outcome":"refused"}
+                            if failure == "status-repeats":
+                                spent.append((second.upper(), 12, "succeeded"))
+                            return {"operation_id":second, "outcome":"succeeded"}
+
+                        client.call.side_effect = status
+                        yield client
+
+                    with patch.dict(recover_lost.__globals__, {"admissions":admitted}):
+                        end = time.monotonic() + 5
+                        if failure:
+                            with self.assertRaisesRegex(Fault, "terminal"):
+                                recover_lost(Path("fixture"), connect, end, (first, 10))
+                            if failure != "status-repeats":
+                                self.assertNotIn("fixture", events)
+                        else:
+                            self.assertEqual(recover_lost(Path("fixture"), connect, end, (first, 10)),
+                                             {"operation_id":second, "outcome":"succeeded"})
+                            self.assertEqual(events, [("b", False), ("a", True), "fixture", "foreign",
+                                                      "fixture", ("b", False)])
 
         def test_frozen_tag_kinds_and_admission_sequence(self):
             tags = frozen_kinds(workspace)
@@ -726,21 +1288,61 @@ def self_test(workspace):
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
             events = []
+            evidence = Evidence()
+            output = StringIO()
 
             def cleanup(_deadline):
                 self.assertIsNotNone(wrapper.returncode)
                 events.append("cleanup")
-                raise ValueError("later cleanup failure")
+                raise ValueError("redaction-sentinel")
 
             try:
                 end = time.monotonic() + .2
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    supervise(wrapper, lambda _: None, cleanup, lambda: events.append("first"),
-                              end, end + 2)
-                self.assertEqual(events, ["first", "cleanup"])
+                with redirect_stdout(output):
+                    supervise(wrapper, lambda _: None, cleanup, evidence, end, end + 2)
+                self.assertEqual(events, ["cleanup"])
+                self.assertEqual(output.getvalue().count("C14 first"), 1)
+                self.assertIn("checkpoint=campaign category=timeout", output.getvalue())
+                self.assertIn("process closure=unconfirmed", output.getvalue())
+                self.assertNotIn("redaction-sentinel", output.getvalue())
+                self.assertTrue(evidence.failed)
+                self.assertFalse(evidence.confirmed_close)
                 self.assertNotEqual(wrapper.returncode, 0)
             finally:
                 reap_wrapper(wrapper, time.monotonic() + 2)
+
+        def test_staging_uses_confirmed_closure_even_after_campaign_failure(self):
+            for closed, ownership, removal in ((True, True, True), (False, True, False),
+                                               (True, False, False), (True, True, False)):
+                with self.subTest(closed=closed, ownership=ownership, removal=removal), \
+                     tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp) / "fixture"
+                    evidence = Evidence()
+                    wrapper = MagicMock()
+                    wrapper.poll.return_value = 0
+                    remove = Mock(return_value="removed" if removal else "retained")
+                    output = StringIO()
+                    end = time.monotonic() + 5
+
+                    def prepare(owned):
+                        owned.extend((("group", "fixture", BUILD), ("user", "fixture", BUILD)))
+                        evidence.confirmed_ownership = ownership
+
+                        def work(_):
+                            raise Fault("witness", "timeout")
+
+                        supervise(wrapper, work, lambda _: closed, evidence, end, end)
+
+                    with redirect_stdout(output):
+                        staged_scope(root, prepare, remove, evidence, end)
+                    self.assertEqual(evidence.confirmed_close, closed)
+                    self.assertTrue(evidence.failed)
+                    self.assertEqual(output.getvalue().count("C14 first"), 1)
+                    self.assertIn("checkpoint=witness category=timeout", output.getvalue())
+                    self.assertEqual(root.exists(), not removal)
+                    self.assertEqual([call.args[:3] for call in remove.call_args_list],
+                                     [("user", "fixture", BUILD), ("group", "fixture", BUILD)]
+                                     if closed and ownership else [])
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ProbeTest)
     if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
@@ -792,16 +1394,19 @@ def main():
         arch = Path("lib/rustlib/x86_64-unknown-linux-gnu")
         shutil.copytree(toolchain / arch, local / arch)
         end = time.monotonic() + 95
-        subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env",
+        completed = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env",
                         *[f"{k}={v}" for k, v in zip(PROVENANCE, facts)],
                         "/usr/bin/python3", "-I", "-B", here, "--staged", stage,
                         str(int((end - 1) * 1000))],
-                       env=ENV, stdin=subprocess.DEVNULL, timeout=left(end, 95), check=True)
+                       env=ENV, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=left(end, 95))
+        return completed.returncode
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except PROBE_ERRORS:
-        print("C14 bounded launcher refusal", file=sys.stderr, flush=True)
+        stream = sys.stdout if sys.argv[1:2] == ["--staged"] else sys.stderr
+        print("C14 first checkpoint=launcher category=invalid", file=stream, flush=True)
         sys.exit(1)
