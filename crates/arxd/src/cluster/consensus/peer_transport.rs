@@ -41,6 +41,8 @@ const HANDSHAKES: usize = 4;
 const INBOUND_BUDGET: Duration = Duration::from_secs(5);
 const CLOSE_BUDGET: Duration = Duration::from_secs(5);
 const SEND_BUFFER: usize = 65536;
+#[cfg(any(test, target_os = "linux"))]
+const ISSUER_EXPORTER_LABEL: &[u8] = b"EXPORTER-Arxcovo-voter-ca/sender-to-receiver/v1";
 
 pub(super) type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<AppendResult<Arx>, Refusal>> + Send>>;
@@ -161,6 +163,8 @@ struct State {
     closed: bool,
     resources: Option<Arc<Resources>>,
     admission: Option<Arc<Controller>>,
+    #[cfg(target_os = "linux")]
+    voter_receiver: Option<&'static super::bound_start::Job>,
     keeper: Option<SmAdapter>,
     tasks: JoinSet<()>,
     // <=32 task results plus the single accept-loop result during close.
@@ -261,6 +265,8 @@ impl TransportOwner {
                     closed: false,
                     resources: Some(resources),
                     admission: None,
+                    #[cfg(target_os = "linux")]
+                    voter_receiver: None,
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -642,6 +648,18 @@ async fn inbound(
         .read_exact(&mut magic)
         .await
         .map_err(|_| Refusal::Frame)?;
+    #[cfg(target_os = "linux")]
+    if magic == control::issuer::MAGIC {
+        return issuer_channel::receive(
+            shared,
+            &resources,
+            stream,
+            authenticated,
+            source.map_err(|_| Refusal::Address)?,
+            deadline,
+        )
+        .await;
+    }
     if magic == control::MAGIC {
         let address =
             control::read_request(&mut stream, route, source.map_err(|_| Refusal::Address)?)
@@ -1443,6 +1461,8 @@ impl TransportOwner {
                 closed: false,
                 resources: None,
                 admission: None,
+                #[cfg(target_os = "linux")]
+                voter_receiver: None,
                 keeper: None,
                 tasks: JoinSet::new(),
                 join_errors: Vec::new(),
@@ -1911,3 +1931,235 @@ async fn outbound_admission(
     before_dispatch(shared, deadline)?;
     Ok(reply)
 }
+
+#[cfg(target_os = "linux")]
+mod issuer_channel {
+    use super::*;
+    use crate::cluster::{
+        consensus::{
+            bound_start::Job,
+            issuer_transfer::{Claim, Offer},
+        },
+        pki::ca::fingerprint_of,
+    };
+    use control::issuer as wire;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_rustls::server::TlsStream;
+
+    struct ChannelKey([u8; 32]);
+
+    impl Drop for ChannelKey {
+        fn drop(&mut self) {
+            self.0.fill(0);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::cluster::consensus) enum Outcome {
+        Installed,
+        Unknown,
+        Refused,
+    }
+
+    pub(super) async fn receive(
+        shared: &Shared,
+        resources: &Resources,
+        mut stream: TlsStream<TcpStream>,
+        sender: AuthenticatedPeer,
+        source: SocketAddr,
+        deadline: Instant,
+    ) -> Result<(), Refusal> {
+        let claim = wire::read_hello(&mut stream).await?;
+        let gate = resources.learner.as_ref().ok_or(Refusal::Identity)?;
+        if claim.root != fingerprint_of(resources.credentials.root.as_ref())
+            || claim.receiver.0 != resources.node
+            || gate.phase().map_err(|_| Refusal::Identity)? != peer_registry::Phase::Strict
+        {
+            return Err(Refusal::Identity);
+        }
+        let receiver = shared
+            .state
+            .lock()
+            .map_err(|_| Refusal::Closed)?
+            .voter_receiver
+            .ok_or(Refusal::NotReady)?;
+        check_receiver(shared, deadline, receiver, claim, sender, source)?;
+        let mut challenge = [0; 32];
+        getrandom::fill(&mut challenge).map_err(|_| Refusal::Tls)?;
+        let transcript = claim.transcript(&challenge);
+        let mut key = ChannelKey([0; 32]);
+        stream
+            .get_ref()
+            .1
+            .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
+            .map_err(|_| Refusal::Tls)?;
+        wire::challenge(&mut stream, &challenge).await?;
+        let sealed = wire::read_sealed(&mut stream).await?;
+        check_receiver(shared, deadline, receiver, claim, sender, source)?;
+        receiver.install_voter_custody(claim, sender, (&key.0, &transcript, sealed))?;
+        drop(key);
+        check_receiver(shared, deadline, receiver, claim, sender, source)?;
+        wire::acknowledge(&mut stream, &challenge).await
+    }
+
+    fn check_receiver(
+        shared: &Shared,
+        deadline: Instant,
+        receiver: &Job,
+        claim: Claim,
+        sender: AuthenticatedPeer,
+        source: SocketAddr,
+    ) -> Result<(), Refusal> {
+        before_dispatch(shared, deadline)?;
+        let offer = receiver.check_issuer_transfer(claim, sender)?;
+        if source.ip() != offer.sender_address.ip() {
+            return Err(Refusal::Address);
+        }
+        Ok(())
+    }
+
+    pub(in crate::cluster::consensus) struct Transfer {
+        reply: oneshot::Receiver<Result<(), Refusal>>,
+        sent: Arc<AtomicBool>,
+        deadline: Instant,
+    }
+
+    impl Transfer {
+        pub(in crate::cluster::consensus) async fn outcome(self) -> Outcome {
+            match timeout_at(self.deadline, self.reply).await {
+                Ok(Ok(Ok(()))) if Instant::now() < self.deadline => Outcome::Installed,
+                _ if self.sent.load(Ordering::SeqCst) => Outcome::Unknown,
+                _ => Outcome::Refused,
+            }
+        }
+    }
+
+    impl TransportOwner {
+        pub(in crate::cluster::consensus) fn receive_issuer_transfer(
+            &mut self,
+            receiver: &'static Job,
+        ) -> Result<(), Refusal> {
+            let mut state = self.shared.state.lock().map_err(|_| Refusal::Closed)?;
+            if state.closed || state.voter_receiver.is_some() {
+                return Err(Refusal::Closed);
+            }
+            state.voter_receiver = Some(receiver);
+            Ok(())
+        }
+
+        pub(in crate::cluster::consensus) fn send_issuer_transfer(
+            &self,
+            sender: &'static Job,
+            offer: Offer,
+        ) -> Result<Transfer, Refusal> {
+            let shared = &self.shared;
+            let (tx, reply) = oneshot::channel();
+            let deadline = Instant::now() + INBOUND_BUDGET;
+            let sent = Arc::new(AtomicBool::new(false));
+            let mut state = shared.state.lock().map_err(|_| Refusal::Closed)?;
+            let admission = shared.admission(&mut state);
+            let join_errors = if state.closed {
+                Vec::new()
+            } else {
+                std::mem::take(&mut state.join_errors)
+            };
+            if let Ok(admission) = admission {
+                let shared = shared.clone();
+                let sent = sent.clone();
+                state.tasks.spawn(async move {
+                    let result = timeout_at(
+                        deadline,
+                        send(&shared, admission, sender, offer, deadline, &sent),
+                    )
+                    .await
+                    .unwrap_or(Err(Refusal::Deadline));
+                    let _ = tx.send(result);
+                });
+            } else {
+                let refusal = admission.err().expect("refused admission");
+                drop(state);
+                drop(join_errors);
+                return Err(refusal);
+            }
+            drop(state);
+            drop(join_errors);
+            Ok(Transfer {
+                reply,
+                sent,
+                deadline,
+            })
+        }
+    }
+
+    async fn send(
+        shared: &Shared,
+        admission: Admission,
+        sender: &'static Job,
+        offer: Offer,
+        deadline: Instant,
+        sent: &AtomicBool,
+    ) -> Result<(), Refusal> {
+        let Admission {
+            resources,
+            connection: _connection,
+            handshake,
+        } = admission;
+        let claim = offer.claim;
+        if resources.learner.is_some()
+            || resources.node != claim.sender.0
+            || resources.cluster != claim.cluster
+            || fingerprint_of(resources.credentials.root.as_ref()) != claim.root
+        {
+            return Err(Refusal::Identity);
+        }
+        before_dispatch(shared, deadline)?;
+        let config = resources.client_config(claim.receiver.0)?;
+        let socket = TcpStream::connect(offer.receiver_address)
+            .await
+            .map_err(|_| Refusal::Tls)?;
+        if socket.local_addr().map_err(|_| Refusal::Address)?.ip() != offer.sender_address.ip()
+            || socket.peer_addr().map_err(|_| Refusal::Address)? != offer.receiver_address
+        {
+            return Err(Refusal::Address);
+        }
+        let mut stream = TlsConnector::from(config)
+            .connect_with(
+                ServerName::try_from(verify::SERVER_NAME).map_err(|_| Refusal::Tls)?,
+                socket,
+                |connection| connection.set_buffer_limit(Some(SEND_BUFFER)),
+            )
+            .await
+            .map_err(|_| Refusal::Tls)?;
+        let peer = AuthenticatedPeer::from_client(stream.get_ref().1)
+            .and_then(|peer| peer.authenticated_identity())
+            .map_err(|_| Refusal::Identity)?;
+        drop(handshake);
+        if (peer.0, peer.1, *peer.2.as_bytes())
+            != (claim.cluster, claim.receiver.0, claim.receiver.1)
+        {
+            return Err(Refusal::Identity);
+        }
+        wire::hello(&mut stream, claim).await?;
+        let challenge = wire::read_challenge(&mut stream).await?;
+        let transcript = claim.transcript(&challenge);
+        let mut key = ChannelKey([0; 32]);
+        stream
+            .get_ref()
+            .1
+            .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
+            .map_err(|_| Refusal::Tls)?;
+        before_dispatch(shared, deadline)?;
+        let sealed = sender
+            .seal_voter_transfer(offer, &key.0, &transcript)
+            .await?;
+        drop(key);
+        before_dispatch(shared, deadline)?;
+        sent.store(true, Ordering::SeqCst);
+        wire::sealed(&mut stream, &sealed).await?;
+        wire::read_acknowledgement(&mut stream, &challenge).await?;
+        before_dispatch(shared, deadline)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) use issuer_channel::Outcome as TransferOutcome;

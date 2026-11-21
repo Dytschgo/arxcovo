@@ -1,4 +1,4 @@
-//! Private enrollment ingress for the published retained founder.
+//! Private enrollment ingress for the eligible retained issuer.
 use super::*;
 use crate::cluster::{
     enrollment::{
@@ -9,6 +9,7 @@ use crate::cluster::{
 };
 use checked_clock::{CheckedClock, HostClock};
 use issue::found::FOUNDER;
+use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use peer_transport::Credentials;
 use std::net::SocketAddr;
@@ -21,6 +22,7 @@ pub(super) struct ReadyIssuer {
     clock: Arc<HostClock>,
     key: KeyDigest,
     tls: Credentials,
+    promoted: Option<(Voter, LogPos)>,
 }
 
 impl ReadyIssuer {
@@ -39,12 +41,48 @@ impl ReadyIssuer {
             clock,
             key,
             tls,
+            promoted: None,
         }
+    }
+
+    pub(super) fn promoted(
+        endpoint: SocketAddr,
+        cluster: ClusterId,
+        ca: ClusterCa,
+        clock: Arc<HostClock>,
+        voter: Voter,
+        installed_at: LogPos,
+        tls: Credentials,
+    ) -> Self {
+        Self {
+            promoted: Some((voter, installed_at)),
+            ..Self::new(endpoint, cluster, ca, clock, voter.key, tls)
+        }
+    }
+
+    fn member(&self) -> crate::cluster::enrollment::NodeId {
+        self.promoted.map_or(FOUNDER, |(voter, _)| voter.node)
+    }
+
+    pub(super) fn transfer_identity(&self) -> (ClusterId, [u8; 32], KeyDigest) {
+        (self.cluster, self.ca.fingerprint(), self.key)
+    }
+
+    pub(super) fn transfer_context(
+        &self,
+    ) -> Result<(ClusterId, &[u8], u64), peer_transport::Refusal> {
+        Ok((
+            self.cluster,
+            self.ca.cert_der(),
+            self.clock
+                .sample_ms()
+                .map_err(|_| peer_transport::Refusal::Identity)?,
+        ))
     }
 
     // This is a local refusal check. Only the existing enroll guards establish
     // proposal and issuance authority.
-    fn available(&self, node: &ConsensusNode) -> Result<(), Refused> {
+    pub(super) fn available(&self, node: &ConsensusNode) -> Result<(), Refused> {
         let raft = node.raft.as_ref().ok_or(Refused)?;
         let metrics = raft.metrics();
         let leader = {
@@ -60,11 +98,16 @@ impl ReadyIssuer {
         {
             return Err(Refused);
         }
+        if let Some((voter, installed_at)) = self.promoted {
+            return node
+                .issuer_voter(self.cluster, voter, installed_at, true)
+                .map_err(|_| Refused);
+        }
         let sm = node.sm.as_ref().ok_or(Refused)?;
         let store = sm.0.try_lock().map_err(|_| Refused)?;
         store
             .state()
-            .authorize_peer(self.cluster, FOUNDER, self.key)
+            .authorize_peer(self.cluster, self.member(), self.key)
             .map_err(|_| Refused)
     }
 }
@@ -112,7 +155,7 @@ impl Backend for Issuer {
         }
         let bytes = result.map_err(|_| Refused)?;
         let voters = BoundVoters::decode(&bytes).map_err(|_| Refused)?;
-        if !voters.contains(FOUNDER, self.ready.key) {
+        if !voters.contains(self.ready.member(), self.ready.key) {
             return Err(Refused);
         }
         self.ready.available(&node)?;
@@ -153,7 +196,9 @@ impl Job {
         #[cfg(test)] observation: Option<Arc<hosted::Observation>>,
     ) -> Result<(), Refused> {
         let mut state = self.state();
-        if state.status != Status::FounderReady || state.close_requested || state.ingress.is_some()
+        if !matches!(state.status, Status::FounderReady | Status::LearnerReady)
+            || state.close_requested
+            || state.ingress.is_some()
         {
             return Err(Refused);
         }
@@ -220,6 +265,7 @@ mod hosted {
     mod catch_up_campaign;
     #[cfg(test)]
     mod durable_join_campaign;
+    mod issuer_transfer_campaign;
     mod promotion_campaign;
 
     #[derive(Default)]

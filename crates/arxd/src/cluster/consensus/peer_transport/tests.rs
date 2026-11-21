@@ -4625,3 +4625,86 @@ async fn admission_tls_original_anchor_is_exact_and_withdraws_at_cutover() {
     assert!(bounded_close(&mut original).await.is_ok());
     assert!(bounded_close(&mut substitute).await.is_ok());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn issuer_channel_uses_mutual_tls13_exporters_bound_to_session_and_challenge() {
+    use crate::cluster::consensus::issuer_transfer::Claim;
+    let f = Fixture::new();
+    let server = f.server_config(&f.server);
+    let client = f.client_config(&f.client, 2);
+    let claim = Claim {
+        cluster: CLUSTER,
+        root: crate::cluster::pki::ca::fingerprint_of(f.root.as_ref()),
+        sender: (node(1), *f.client.digest().as_bytes()),
+        receiver: (node(2), *f.server.digest().as_bytes()),
+        epoch: log_id(7, 1, 6).leader_id,
+        membership: LogPos {
+            term: 6,
+            leader: 1,
+            index: 5,
+        },
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut previous = None;
+    for _ in 0..2 {
+        let (from_client, from_server) = tokio::join!(
+            async {
+                let stream = connect(client.clone(), address).await.unwrap();
+                let connection = stream.get_ref().1;
+                assert_eq!(
+                    connection.protocol_version(),
+                    Some(rustls::ProtocolVersion::TLSv1_3)
+                );
+                assert_eq!(
+                    connection.handshake_kind(),
+                    Some(rustls::HandshakeKind::Full)
+                );
+                let (cluster, peer, key) = AuthenticatedPeer::from_client(connection)
+                    .unwrap()
+                    .authenticated_identity()
+                    .unwrap();
+                assert!(cluster == CLUSTER && (peer, *key.as_bytes()) == claim.receiver);
+                std::array::from_fn::<_, 2, _>(|i| {
+                    connection
+                        .export_keying_material(
+                            [0; 32],
+                            ISSUER_EXPORTER_LABEL,
+                            Some(&claim.transcript(&[i as u8; 32])),
+                        )
+                        .unwrap()
+                })
+            },
+            async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let stream = TlsAcceptor::from(server.clone())
+                    .accept(socket)
+                    .await
+                    .unwrap();
+                let connection = stream.get_ref().1;
+                assert_eq!(
+                    connection.handshake_kind(),
+                    Some(rustls::HandshakeKind::Full)
+                );
+                let (cluster, peer, key) = AuthenticatedPeer::from_server(connection)
+                    .unwrap()
+                    .authenticated_identity()
+                    .unwrap();
+                assert!(cluster == CLUSTER && (peer, *key.as_bytes()) == claim.sender);
+                std::array::from_fn::<_, 2, _>(|i| {
+                    connection
+                        .export_keying_material(
+                            [0; 32],
+                            ISSUER_EXPORTER_LABEL,
+                            Some(&claim.transcript(&[i as u8; 32])),
+                        )
+                        .unwrap()
+                })
+            }
+        );
+        assert!(from_client == from_server);
+        assert!(from_client[0] != from_client[1]);
+        assert!(previous != Some(from_client));
+        previous = Some(from_client);
+    }
+}

@@ -49,6 +49,8 @@ struct State {
     #[cfg(target_os = "linux")]
     founder: Option<founder::Operation>,
     #[cfg(target_os = "linux")]
+    voter_transfers: [Option<crate::cluster::enrollment::NodeId>; 2],
+    #[cfg(target_os = "linux")]
     founder_failure: Option<founder::Error>,
     #[cfg(target_os = "linux")]
     issuer: Option<Arc<enrollment_ingress::ReadyIssuer>>,
@@ -106,6 +108,8 @@ impl Job {
                 strict_learner_recovery: false,
                 #[cfg(target_os = "linux")]
                 founder: None,
+                #[cfg(target_os = "linux")]
+                voter_transfers: [None; 2],
                 #[cfg(target_os = "linux")]
                 founder_failure: None,
                 #[cfg(target_os = "linux")]
