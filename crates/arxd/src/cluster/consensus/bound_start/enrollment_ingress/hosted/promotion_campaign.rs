@@ -212,7 +212,13 @@ async fn start_learner(
 async fn admit(run: &Run, address: SocketAddr) -> Check<LogPos> {
     match run.admit().await {
         Reply::Applied(position, actual) if actual == address => Ok(position),
-        reply => {
+        Reply::Applied(..) => Err("learner admission applied at a different address"),
+        Reply::Revoked(..) => Err("learner admission revoked"),
+        reply @ (Reply::Pending
+        | Reply::AddressConflict
+        | Reply::StaleTail
+        | Reply::Refused
+        | Reply::Unknown) => {
             eprintln!("C11 frozen admission did not confirm apply: {reply:?}");
             Err("learner admission refused")
         }
@@ -336,7 +342,7 @@ async fn admit_below_target(
     trace: &GatedCallTrace,
 ) -> Check<LogPos> {
     let mut cursor = 0;
-    run.before_dispatch_gate(true).await;
+    run.arm_before_dispatch_gate().await;
     let mut gate_held = true;
     let mut request = std::pin::pin!(admit(run, address));
     let evidence = timeout(OBSERVE, async {
@@ -352,46 +358,61 @@ async fn admit_below_target(
                         (stage(trace, &mut cursor, Stage::ServerHandshake).await?.1, Some(admitted))
                     }
                 };
-                let (admitted, server_peer) = timeout_at(arrival + GATE_OBSERVE, async {
-                    stage(trace, &mut cursor, Stage::ServerAuthenticated).await?;
-                    stage(trace, &mut cursor, Stage::RequestRead).await?;
-                    let (server_peer, _) = stage(trace, &mut cursor, Stage::BeforeDispatch).await?;
-                    let admitted = match already_admitted {
-                        Some(admitted) => admitted,
-                        None => request.await?,
-                    };
-                    let metrics = raft.metrics();
-                    let current = metrics.borrow_watched();
-                    let committed = current
-                        .cluster_committed
-                        .map(pos)
-                        .ok_or("fresh target missing")?;
-                    let matched = current
-                        .replication
-                        .as_ref()
-                        .and_then(|r| r.get(&run.binding().0.get()))
-                        .copied()
-                        .flatten()
-                        .map(pos);
-                    if *current.committed_membership_config.log_id() != Some(id(admitted))
-                        || !current
-                            .committed_membership_config
-                            .membership()
-                            .voter_ids()
-                            .eq([FOUNDER.get()])
-                        || !covers(committed, admitted)
-                        || matched.is_some_and(|matched| covers(matched, committed))
-                        || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
-                        || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
-                    {
-                        return Err("gated second learner did not prove the below-target state");
+                let deadline = arrival + GATE_OBSERVE;
+                let (admitted, server_peer) = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err("short transport gate observation elapsed");
                     }
-                    Ok((admitted, server_peer))
-                }).await.map_err(|_| "short transport gate observation elapsed")??;
+                    result = async {
+                        stage(trace, &mut cursor, Stage::ServerAuthenticated).await?;
+                        stage(trace, &mut cursor, Stage::RequestRead).await?;
+                        let (server_peer, _) = stage(trace, &mut cursor, Stage::BeforeDispatch).await?;
+                        let admitted = match already_admitted {
+                            Some(admitted) => admitted,
+                            None => request.await?,
+                        };
+                        {
+                            let metrics = raft.metrics();
+                            let current = metrics.borrow_watched();
+                            let committed = current
+                                .cluster_committed
+                                .map(pos)
+                                .ok_or("fresh target missing")?;
+                            let matched = current
+                                .replication
+                                .as_ref()
+                                .and_then(|r| r.get(&run.binding().0.get()))
+                                .copied()
+                                .flatten()
+                                .map(pos);
+                            if *current.committed_membership_config.log_id() != Some(id(admitted))
+                                || !current
+                                    .committed_membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .eq([FOUNDER.get()])
+                                || !covers(committed, admitted)
+                                || matched.is_some_and(|matched| covers(matched, committed))
+                                || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
+                                || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
+                            {
+                                return Err("gated second learner did not prove the below-target state");
+                            }
+                        }
+                        let released = run.release_before_dispatch_gate().await
+                            .ok_or("gated dispatch gate was unavailable")?;
+                        gate_held = false;
+                        trace.caller("gate release observed", None);
+                        // A buffered branch can finish in one poll even after the timer was polled.
+                        if released > deadline {
+                            eprintln!("C11 gate released after {:?}", released.duration_since(arrival));
+                            return Err("short transport gate released after deadline");
+                        }
+                        Ok((admitted, server_peer))
+                    } => result?,
+                };
 
-                run.before_dispatch_gate(false).await;
-                trace.caller("gate release observed", None);
-                gate_held = false;
                 transport_event(trace, &mut cursor, "dispatch", |event| {
                     matches!(event, Event::LearnerDispatch(_))
                 }).await?;
@@ -407,7 +428,7 @@ async fn admit_below_target(
     .map_err(|_| "gated replication observation elapsed");
 
     if gate_held {
-        run.before_dispatch_gate(false).await;
+        let _ = run.release_before_dispatch_gate().await;
         trace.caller("cleanup gate release observed", None);
     }
     eprintln!(

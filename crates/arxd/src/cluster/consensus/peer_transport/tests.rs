@@ -3986,10 +3986,17 @@ async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() 
     let exchange = timeout(OBSERVE, async {
         let mut stream = connect(f.client_config(&f.client, 2), address)
             .await
-            .unwrap();
-        let source = stream.get_ref().0.local_addr().unwrap();
+            .unwrap_or_else(|_| panic!("selected TLS connection failed"));
+        let source = stream
+            .get_ref()
+            .0
+            .local_addr()
+            .unwrap_or_else(|_| panic!("selected socket source was unavailable"));
         let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
-        send_frame(&mut stream, &frame, false).await.unwrap();
+        assert!(
+            send_frame(&mut stream, &frame, false).await.is_ok(),
+            "selected frame write failed"
+        );
         assert!(observe(&mut shared_events, Event::Stage(Stage::BeforeDispatch)).await);
 
         // The accept task can publish stages before connect reports the source.
@@ -4002,12 +4009,24 @@ async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() 
             Stage::BeforeDispatch,
         ] {
             let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
-            assert_eq!((peer, event), (source, Event::Stage(expected)));
+            assert!(
+                peer == source,
+                "observed stage came from a different connection"
+            );
+            assert_eq!(event, Event::Stage(expected));
         }
 
         // The second socket stays in TLS while the selected call is gated.
-        let unrelated = TcpStream::connect(address).await.unwrap();
-        assert_ne!(unrelated.local_addr().unwrap(), source);
+        let unrelated = TcpStream::connect(address)
+            .await
+            .unwrap_or_else(|_| panic!("unrelated connection failed"));
+        let unrelated_source = unrelated
+            .local_addr()
+            .unwrap_or_else(|_| panic!("unrelated socket source was unavailable"));
+        assert!(
+            unrelated_source != source,
+            "control needs two distinct connections"
+        );
         assert_eq!(
             shared_events.recv().await,
             Some(Event::Stage(Stage::ServerHandshake))
@@ -4016,11 +4035,18 @@ async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() 
         release(&owner, Stage::BeforeDispatch, &hold);
 
         let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
-        assert_eq!(peer, source);
+        assert!(
+            peer == source,
+            "observed dispatch came from a different connection"
+        );
         assert!(matches!(event, Event::LearnerDispatch(_)));
         for expected in [Event::Stage(Stage::BeforeReply), Event::Finished(None)] {
             let (peer, _, event) = trace.next_server_event(&mut cursor).await.unwrap();
-            assert_eq!((peer, event), (source, expected));
+            assert!(
+                peer == source,
+                "observed reply came from a different connection"
+            );
+            assert_eq!(event, expected);
         }
         assert!(
             trace
@@ -4031,15 +4057,25 @@ async fn gated_call_observer_ignores_unrelated_handshake_during_dispatch_gate() 
                 .iter()
                 .any(|(_, event)| *event == Event::Stage(Stage::ServerHandshake))
         );
-        read_frame(&mut stream).await.unwrap();
-        clean_eof(&mut stream).await.unwrap();
+        assert!(
+            read_frame(&mut stream).await.is_ok(),
+            "selected reply read failed"
+        );
+        assert!(
+            clean_eof(&mut stream).await.is_ok(),
+            "selected socket did not finish cleanly"
+        );
         drop(unrelated);
         frame
     })
     .await;
     release(&owner, Stage::BeforeDispatch, &hold);
     assert!(bounded_close(&mut owner).await.is_ok());
-    assert_eq!(spy.calls.lock().unwrap().as_slice(), &[exchange.unwrap()]);
+    let frame = exchange.expect("gated exchange observation elapsed");
+    assert!(
+        spy.calls.lock().unwrap().as_slice() == [frame],
+        "selected frame must be the only dispatch"
+    );
 }
 
 async fn exchange_learner_for_test(
