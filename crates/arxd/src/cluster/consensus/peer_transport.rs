@@ -23,7 +23,10 @@ use std::{
     future::{Future, poll_fn},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
+    },
     task::{Poll, ready},
     time::Duration,
 };
@@ -1302,6 +1305,8 @@ impl TestHooks {
 }
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) use tests::admission_test_peer;
 pub(super) type BallotFuture =
     Pin<Box<dyn Future<Output = Result<openraft::raft::VoteResponse<Arx>, Refusal>> + Send>>;
 pub(super) type SnapshotFuture =
@@ -2095,38 +2100,114 @@ impl TransportOwner {
     }
 }
 
+// A response deadline and the writer compete to settle an unsent request.
+// Once the write can start, I/O failure cannot establish non-delivery.
+#[derive(Default)]
+struct AdmissionWrite(AtomicU8);
+
+impl AdmissionWrite {
+    const UNSENT: u8 = 0;
+    const WITHHELD: u8 = 1;
+    const POSSIBLE: u8 = 2;
+
+    fn begin(&self, shared: &Shared, deadline: Instant) -> Result<(), Refusal> {
+        // Use the same gate as close through the transition to a possible write.
+        let state = shared.state.lock().map_err(|_| Refusal::Closed)?;
+        if state.closed || *shared.stop.borrow() {
+            return Err(Refusal::Closed);
+        }
+        if shared.failed.load(AtomicOrdering::Acquire) {
+            return Err(Refusal::Dispatch);
+        }
+        if Instant::now() >= deadline {
+            return Err(Refusal::Deadline);
+        }
+        self.0
+            .compare_exchange(
+                Self::UNSENT,
+                Self::POSSIBLE,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| Refusal::Deadline)
+    }
+
+    fn unconfirmed(&self) -> AdmissionReply {
+        match self.0.compare_exchange(
+            Self::UNSENT,
+            Self::WITHHELD,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Err(Self::POSSIBLE) => AdmissionReply::Unknown,
+            _ => AdmissionReply::Refused,
+        }
+    }
+}
+
 pub(super) struct AdmissionResponse {
     reply: oneshot::Receiver<Result<Result<AdmissionReply, Refusal>, tokio::time::error::Elapsed>>,
     deadline: Instant,
-    sent: Arc<std::sync::atomic::AtomicBool>,
+    write: Arc<AdmissionWrite>,
 }
 
 impl AdmissionResponse {
     pub(super) async fn reply(self) -> AdmissionReply {
         match timeout_at(self.deadline, self.reply).await {
             Ok(Ok(Ok(Ok(reply)))) if Instant::now() < self.deadline => reply,
-            _ if self.sent.load(std::sync::atomic::Ordering::SeqCst) => AdmissionReply::Unknown,
-            _ => AdmissionReply::Refused,
+            _ => self.write.unconfirmed(),
+        }
+    }
+}
+
+// Admission boundary probes belong to one exchange. They use private
+// channels so the existing stage and dispatch observers keep their sequence.
+#[cfg(test)]
+enum AdmissionWriteBoundary {
+    BeforeWrite,
+    AfterPrefix,
+}
+
+#[cfg(test)]
+struct AdmissionWritePause {
+    boundary: AdmissionWriteBoundary,
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+impl AdmissionWritePause {
+    async fn wait(self) {
+        if self.reached.send(()).is_ok() {
+            let _ = self.resume.await;
         }
     }
 }
 
 impl AdmissionClient {
     pub(super) fn request(&self) -> Option<AdmissionResponse> {
-        self.exchange(self.advertised)
+        self.exchange(
+            self.advertised,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn conflicting_address(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
-        self.exchange(advertised)
+        self.exchange(advertised, None)
     }
 
-    fn exchange(&self, advertised: SocketAddr) -> Option<AdmissionResponse> {
-        use std::sync::atomic::AtomicBool;
+    fn exchange(
+        &self,
+        advertised: SocketAddr,
+        #[cfg(test)] pause: Option<AdmissionWritePause>,
+    ) -> Option<AdmissionResponse> {
         let deadline = Instant::now() + learner_admission::BUDGET;
         let shared = self.shared.upgrade()?;
         let (tx, rx) = oneshot::channel();
-        let sent = Arc::new(AtomicBool::new(false));
+        let write = Arc::new(AdmissionWrite::default());
         let mut join_errors = Vec::new();
         {
             let mut state = shared.state.lock().ok()?;
@@ -2137,11 +2218,20 @@ impl AdmissionClient {
             let admission = admission.ok()?;
             let shared = shared.clone();
             let issuer = self.issuer;
-            let sent = sent.clone();
+            let write = write.clone();
             state.tasks.spawn(async move {
                 let reply = timeout_at(
                     deadline,
-                    outbound_admission(&shared, admission, issuer, advertised, deadline, &sent),
+                    outbound_admission(
+                        &shared,
+                        admission,
+                        issuer,
+                        advertised,
+                        deadline,
+                        &write,
+                        #[cfg(test)]
+                        pause,
+                    ),
                 )
                 .await;
                 let _ = tx.send(reply);
@@ -2151,7 +2241,7 @@ impl AdmissionClient {
         Some(AdmissionResponse {
             reply: rx,
             deadline,
-            sent,
+            write,
         })
     }
 }
@@ -2162,7 +2252,8 @@ async fn outbound_admission(
     issuer: SocketAddr,
     advertised: SocketAddr,
     deadline: Instant,
-    sent: &std::sync::atomic::AtomicBool,
+    write: &AdmissionWrite,
+    #[cfg(test)] pause: Option<AdmissionWritePause>,
 ) -> Result<AdmissionReply, Refusal> {
     let Admission {
         resources,
@@ -2193,9 +2284,36 @@ async fn outbound_admission(
     };
     gate.authorize_admission_anchor(peer.0, peer.1, peer.2)
         .map_err(|_| Refusal::Identity)?;
-    sent.store(true, std::sync::atomic::Ordering::SeqCst);
-    before_dispatch(shared, deadline)?;
-    send_frame(&mut stream, &control::request(route, advertised)).await?;
+    let frame = control::request(route, advertised);
+    let frame = frame.as_slice();
+    #[cfg(test)]
+    let pause = match pause {
+        Some(
+            pause @ AdmissionWritePause {
+                boundary: AdmissionWriteBoundary::BeforeWrite,
+                ..
+            },
+        ) => {
+            pause.wait().await;
+            None
+        }
+        pause => pause,
+    };
+    write.begin(shared, deadline)?;
+    #[cfg(test)]
+    let frame = if let Some(pause) = pause {
+        stream
+            .write_all(&frame[..1])
+            .await
+            .map_err(|_| Refusal::Frame)?;
+        stream.flush().await.map_err(|_| Refusal::Frame)?;
+        pause.wait().await;
+        before_dispatch(shared, deadline)?;
+        &frame[1..]
+    } else {
+        frame
+    };
+    send_frame(&mut stream, frame).await?;
     let reply = control::read_reply(&mut stream, reverse(route), advertised).await?;
     clean_end(&mut stream).await?;
     gate.authorize_admission_anchor(peer.0, peer.1, peer.2)
