@@ -17,7 +17,10 @@ the consumed code. The issuer must refuse before continuation, with the
 allocation and applied log unchanged.
 
 P1 and J4 retain the first observation or assertion failure while releasing
-the test hold and observing one owned close under its own bound. P1 keeps its
+the test hold and observing one owned close under its own bound. When the
+founder driver already owns that close, the fixture subscribes to it. J4
+records the available bounded log and applied-store evidence and the current
+destination status before cleanup can release the stores. P1 keeps its
 existing successful in-flight close and certificate assertions.
 
 ## Consequences

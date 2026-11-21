@@ -3,16 +3,18 @@ use crate::cluster::{
     consensus::anchor_query::AnchorQueryError,
     enrollment::{
         durable_join::{self, Destination},
-        session::SuppressedReply,
+        session::{SuppressedReply, TerminalLoss},
         transfer::{self, LocalRoute},
     },
+    log_store::LogState,
     pki::{
         ca::fingerprint_of,
         preproof::{ExchangeError, anchor},
     },
     startup_plan::tests::objects,
+    state_store::StateStore,
 };
-use std::path::Path;
+use std::{path::Path, sync::Weak};
 
 fn private_dirs(layout: &Layout, names: [&str; 2]) -> [std::path::PathBuf; 2] {
     names.map(|name| {
@@ -65,6 +67,172 @@ fn retained_destination(path: &Path) -> DestinationObjects {
     DestinationObjects { directories }
 }
 
+const LOG_WINDOW: u64 = 16;
+
+struct LogReadback {
+    state: LogState,
+    rows: Vec<(LogPos, StoredEntry)>,
+}
+
+fn read_log(log: &mut VoteLogStore) -> Result<LogReadback, String> {
+    let state = log.log_state().map_err(|error| format!("{error:?}"))?;
+    let rows = log
+        .entries(0, LOG_WINDOW, LOG_WINDOW as usize)
+        .map_err(|error| format!("{error:?}"))?;
+    Ok(LogReadback { state, rows })
+}
+
+#[derive(Clone)]
+struct IssuerStores {
+    log: Weak<Mutex<VoteLogStore>>,
+    state: Weak<Mutex<StateStore>>,
+}
+
+impl IssuerStores {
+    fn from_node(node: &ConsensusNode) -> Self {
+        Self {
+            log: node.log_weak.clone(),
+            state: node.sm_weak.clone(),
+        }
+    }
+
+    fn from_job(job: &Job) -> Option<Self> {
+        let state = job.state.try_lock().ok()?;
+        if let Some((log, sm)) = &state.adapters {
+            return Some(Self {
+                log: Arc::downgrade(&log.0),
+                state: Arc::downgrade(&sm.0),
+            });
+        }
+        let node = state.node.as_ref()?.clone();
+        drop(state);
+        let node = node.try_lock().ok()?;
+        Some(Self::from_node(&node))
+    }
+}
+
+fn read_retained<T, U>(
+    store: &Weak<Mutex<T>>,
+    read: impl FnOnce(&mut T) -> Result<U, String>,
+) -> Result<U, String> {
+    let store = store.upgrade().ok_or("store unavailable")?;
+    let mut guard = store.try_lock().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => "store busy",
+        std::sync::TryLockError::Poisoned(_) => "store lock poisoned",
+    })?;
+    read(&mut guard)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AppliedReadback {
+    position: Option<LogPos>,
+    next_node: NodeId,
+    allocation_delta: Option<u64>,
+}
+
+fn read_applied(state: &StateStore, baseline: Option<NodeId>) -> Result<AppliedReadback, String> {
+    if state.is_poisoned() {
+        return Err("applied store poisoned".into());
+    }
+    let next_node = state.state().next_node_id();
+    Ok(AppliedReadback {
+        position: state.applied(),
+        next_node,
+        allocation_delta: baseline.and_then(|first| next_node.get().checked_sub(first.get())),
+    })
+}
+
+fn proposal_positions(log: &LogReadback) -> Vec<(&'static str, LogPos)> {
+    log.rows
+        .iter()
+        .filter_map(|(at, row)| {
+            let kind = match row {
+                StoredEntry::Enrollment(Command::Found { .. }) => "Found",
+                StoredEntry::Enrollment(Command::Mint { .. }) => "Mint",
+                StoredEntry::Enrollment(Command::Redeem { .. }) => "Redeem",
+                StoredEntry::Enrollment(_) => "other enrollment",
+                StoredEntry::Membership(_) => "Membership",
+                StoredEntry::Blank => return None,
+            };
+            Some((kind, *at))
+        })
+        .collect()
+}
+
+struct IssuerReadback {
+    log: Result<LogReadback, String>,
+    applied: Result<AppliedReadback, String>,
+}
+
+#[derive(Default)]
+struct AttemptEvidence {
+    stores: Option<IssuerStores>,
+    first_free: Option<NodeId>,
+    mint_submitted: bool,
+    destination: Option<durable_join::Observer>,
+    fresh_query_started: bool,
+    loss: Option<Arc<TerminalLoss>>,
+}
+
+impl AttemptEvidence {
+    fn record_before_close(&mut self, job: &Job, observed: &Observation) {
+        let destination = self.destination.as_mut().map(|observer| {
+            observer
+                .terminal()
+                .now_or_never()
+                .unwrap_or(durable_join::Status::Joining)
+        });
+        let suppression = self
+            .loss
+            .as_ref()
+            .and_then(|loss| loss.observed())
+            .map(|reply| (reply.node, reply.original));
+        eprintln!(
+            "J4 pre-close: issuer={:?}, destination={destination:?}, Mint submitted={}, fresh Query started={}, actual AnchorQuery={}, Redeem={}, suppressed={suppression:?}",
+            job.observe().status(),
+            self.mint_submitted,
+            self.fresh_query_started,
+            observed.anchor_calls.load(Relaxed),
+            observed.redeem_calls.load(Relaxed),
+        );
+        let Some(readback) = self.read_issuer(job) else {
+            eprintln!("J4 pre-close retained log and applied store unavailable");
+            return;
+        };
+        match readback.log {
+            Ok(log) => eprintln!(
+                "J4 pre-close retained log: window=0..{LOG_WINDOW}, tail={:?}, purged={:?}, entries={:?}",
+                log.state.last,
+                log.state.purged,
+                proposal_positions(&log)
+            ),
+            Err(error) => eprintln!("J4 pre-close retained log unavailable: {error}"),
+        }
+        match readback.applied {
+            Ok(applied) => eprintln!("J4 pre-close applied store: {applied:?}"),
+            Err(error) => eprintln!("J4 pre-close applied store unavailable: {error}"),
+        }
+    }
+
+    fn read_issuer(&self, job: &Job) -> Option<IssuerReadback> {
+        let stores = self
+            .stores
+            .clone()
+            .or_else(|| IssuerStores::from_job(job))?;
+        Some(IssuerReadback {
+            log: read_retained(&stores.log, read_log),
+            applied: read_retained(&stores.state, |state| read_applied(state, self.first_free)),
+        })
+    }
+}
+
+fn preserve_first_failure<E>(first: Result<(), E>, record: impl FnOnce()) -> Result<(), E> {
+    if first.is_err() && std::panic::catch_unwind(AssertUnwindSafe(record)).is_err() {
+        eprintln!("J4 pre-close evidence observation panicked");
+    }
+    first
+}
+
 fn inventory(
     node: &ConsensusNode,
     code: &JoinCode,
@@ -74,14 +242,10 @@ fn inventory(
     original_membership: &(LogPos, MembershipBlob),
 ) -> LogPos {
     let log = node.log_weak.upgrade().expect("J4 retained log");
-    let rows = {
-        let mut log = log.lock().unwrap();
-        let state = log.log_state().unwrap();
-        assert!(state.purged.is_none());
-        let last = state.last.expect("J4 nonempty log");
-        assert!(last.index < 16, "J4 log exceeds bounded inventory");
-        log.entries(0, last.index + 1, 16).unwrap()
-    };
+    let LogReadback { state, rows } = read_log(&mut log.lock().unwrap()).unwrap();
+    assert!(state.purged.is_none());
+    let last = state.last.expect("J4 nonempty log");
+    assert!(last.index < LOG_WINDOW, "J4 log exceeds bounded inventory");
     let key = suppressed.key.expect("J4 accepted CSR key");
     let mut enroll = Vec::new();
     let mut membership = Vec::new();
@@ -177,6 +341,7 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
     )
     .expect("J4 retained founder dispatch");
     let observed = Arc::new(Observation::default());
+    let mut evidence = AttemptEvidence::default();
     let first = AssertUnwindSafe(async {
         observe_retained_status(&mut observer, Status::FounderReady, job).await?;
         eprintln!("J4 founder ready; issuer Engine started");
@@ -192,6 +357,7 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
         };
         let (voters, code, mint, first_free, membership) = {
             let node = node.lock().await;
+            evidence.stores = Some(IssuerStores::from_node(&node));
             let (voters, first_free, membership) = {
                 let store = node.sm.as_ref().unwrap().0.lock().unwrap();
                 let membership = store.membership().unwrap().clone();
@@ -201,15 +367,18 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
                 ).unwrap();
                 (voters, store.state().next_node_id(), membership)
             };
+            evidence.first_free = Some(first_free);
             let code = JoinCode::generate(cluster, fingerprint_of(&root), voters.anchor(cluster), getrandom::fill)
                 .map_err(|_| "J4 fixture code creation refused")?;
+            let proposed_at_ms = clock.sample_ms().map_err(|_| "J4 fixture Mint clock refused")?;
+            evidence.mint_submitted = true;
             let (mint, minted) = node.propose(Command::Mint {
                 cluster,
                 actor: [3; 16],
                 request: [4; 16],
                 code: code.code_id(),
                 verifier: code.verifier(),
-                proposed_at_ms: clock.sample_ms().map_err(|_| "J4 fixture Mint clock refused")?,
+                proposed_at_ms,
             }).await.map_err(|reason| format!("J4 fixture Mint refused: {reason:?}"))?;
             if !matches!(minted, Some(Outcome::Minted { replay: false, .. })) {
                 return Err("J4 fixture Mint did not allocate a code".into());
@@ -219,19 +388,20 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
         eprintln!("J4 fixture Mint applied: {mint:?}");
         job.start_enrollment(Some(observed.clone()))
             .map_err(|reason| format!("J4 issuer ingress: {reason:?}"))?;
-        let loss = job.state().ingress.as_ref().unwrap().arm_terminal_loss()
-            .map_err(|_| "J4 listener loss already armed")?;
+        let loss = evidence.loss.insert(job.state().ingress.as_ref().unwrap().arm_terminal_loss()
+            .map_err(|_| "J4 listener loss already armed")?);
 
         let destination = Layout::new();
         let [wrap, staging] = private_dirs(&destination, ["wrap", "staging"]);
         let plan = destination.plan("join");
         let paste = transfer::encode(endpoint, &root, &code).map_err(|_| "J4 fixture paste refused")?;
-        let (_join, mut result) = durable_join::start_retained(
+        let (_join, result) = durable_join::start_retained(
             Destination { plan, wrap, staging },
             paste.expose_for_owner_transfer(),
             &[LocalRoute { network: ip, prefix: 32 }],
             time.clone(),
         ).map_err(|status| format!("J4 destination dispatch: {status:?}"))?;
+        let result = evidence.destination.insert(result);
         // The destination owns this reservation beyond the observer and the campaign.
         let destination = destination.root.keep();
 
@@ -267,6 +437,7 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
 
         // A new TLS flow sends Query only. The real issuer must refuse before
         // any challenge handoff. No method can spend a second time here.
+        evidence.fresh_query_started = true;
         let fresh = anchor(endpoint, &code, &root, time, SocketLimits::default()).await;
         if !matches!(fresh, Err(ExchangeError::Refused)) {
             return Err("J4 consumed code unexpectedly reached the fresh continuation".into());
@@ -293,11 +464,14 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
     .catch_unwind()
     .await;
 
+    let first = preserve_first_failure(latch_attempt("J4", first), || {
+        evidence.record_before_close(job, &observed);
+    });
     let (first, close) = finish_attempt(
-        latch_attempt("J4", first),
+        first,
         &mut None,
         || observed.release.notify_one(),
-        || job.request_close(),
+        || observe_or_request_close(job, || job.request_close()),
         async |observer| observe_close(supervisor, observer).await,
     )
     .await;
@@ -318,4 +492,133 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
         let _ = layout.root.keep();
     }
     require_attempt("J4", first, &close, job);
+}
+
+#[tokio::test]
+async fn applied_redeem_then_issuance_refusal_keeps_effect_evidence() {
+    use crate::cluster::{enrollment::FoundMembers, state_store::Init};
+
+    let layout = Layout::new();
+    let dir = layout.root.path().join("state");
+    let cluster = [1; 16];
+    let first_free = NodeId::new(2).unwrap();
+    let mut store = StateStore::open(
+        &dir,
+        Init {
+            cluster,
+            first_free,
+        },
+    )
+    .unwrap();
+    let position = |index| LogPos {
+        term: 4,
+        leader: 1,
+        index,
+    };
+    let founder_key = KeyDigest::of_spki(b"J4 synthetic founder").unwrap();
+    let membership = WireMembership::new(
+        vec![[1].into_iter().collect()],
+        [(1, "127.0.0.1:7001".into())].into_iter().collect(),
+    )
+    .unwrap();
+    let mut rows = vec![
+        (
+            position(0),
+            StoredEntry::Membership(MembershipBlob::new(membership.encode().unwrap()).unwrap()),
+        ),
+        (
+            position(1),
+            StoredEntry::Enrollment(Command::Found {
+                cluster,
+                members: FoundMembers::new([(FOUNDER, founder_key)]).unwrap(),
+                proposed_at_ms: 10,
+            }),
+        ),
+    ];
+    for (at, entry) in &rows {
+        store.apply(*at, entry).unwrap();
+    }
+    let first_free = store.state().next_node_id();
+    let anchor = store.state().voter_anchor(&membership).unwrap();
+    let code = JoinCode::generate(cluster, [2; 32], anchor, |bytes| {
+        bytes.fill(7);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let redeemed = position(3);
+    rows.extend([
+        (
+            position(2),
+            StoredEntry::Enrollment(Command::Mint {
+                cluster,
+                actor: [3; 16],
+                request: [4; 16],
+                code: code.code_id(),
+                verifier: code.verifier(),
+                proposed_at_ms: 11,
+            }),
+        ),
+        (
+            redeemed,
+            StoredEntry::Enrollment(Command::redeem(
+                cluster,
+                [5; 16],
+                code.code_id(),
+                &code.proof(),
+                KeyDigest::of_spki(b"J4 synthetic learner").unwrap(),
+                anchor,
+                12,
+            )),
+        ),
+    ]);
+    for (at, entry) in &rows[2..] {
+        store.apply(*at, entry).unwrap();
+    }
+    let mut log = VoteLogStore::open(&dir, cluster).unwrap();
+    log.append(&rows).unwrap();
+
+    let log = Arc::new(Mutex::new(log));
+    let state = Arc::new(Mutex::new(store));
+    let evidence = AttemptEvidence {
+        stores: Some(IssuerStores {
+            log: Arc::downgrade(&log),
+            state: Arc::downgrade(&state),
+        }),
+        first_free: Some(first_free),
+        ..AttemptEvidence::default()
+    };
+    let observation = Observation::default();
+    observation
+        .complete(Err(issue::IssueError::Unavailable))
+        .await;
+    let job = Job::anchor();
+    let mut readback = None;
+    let first = preserve_first_failure(observe_enroll(&observation).await, || {
+        readback = evidence.read_issuer(job);
+    });
+    let readback = readback.unwrap();
+    assert_eq!(first.unwrap_err(), "actual enroll refused: Unavailable");
+    assert_eq!(
+        proposal_positions(&readback.log.unwrap()),
+        [
+            ("Membership", position(0)),
+            ("Found", position(1)),
+            ("Mint", position(2)),
+            ("Redeem", redeemed),
+        ]
+    );
+    assert_eq!(
+        readback.applied.unwrap(),
+        AppliedReadback {
+            position: Some(redeemed),
+            next_node: NodeId::new(3).unwrap(),
+            allocation_delta: Some(1),
+        }
+    );
+
+    // A busy retained log cannot hide the independently readable applied effect.
+    let _held = log.lock().unwrap();
+    let readback = evidence.read_issuer(job).unwrap();
+    assert_eq!(readback.log.err().as_deref(), Some("store busy"));
+    assert_eq!(readback.applied.unwrap().allocation_delta, Some(1));
 }

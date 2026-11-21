@@ -568,6 +568,21 @@ mod hosted {
         (first, observed)
     }
 
+    fn observe_or_request_close(job: &Job, request: impl FnOnce() -> Observer) -> Observer {
+        let already_owned = {
+            let state = job.state();
+            state.close_requested
+                || state.close_dispatched
+                // The hosted founder publishes the refusal just before requesting close.
+                || (state.status == Status::FounderRefused && !state.process_owned)
+        };
+        if already_owned {
+            job.observe()
+        } else {
+            request()
+        }
+    }
+
     async fn observe_close(
         supervisor: tokio::task::JoinHandle<()>,
         observer: &Observer,
@@ -620,19 +635,24 @@ mod hosted {
     #[tokio::test]
     async fn first_found_refusal_survives_owned_close() {
         let job = Job::anchor();
-        job.state().founder_failure = Some(founder::Error::Preparation);
-        job.set(Status::FounderRefused);
+        founder::linux::refuse(job, founder::Error::Preparation);
+        assert!(job.state().close_requested);
         let first = observe_retained_status(&mut job.observe(), Status::FounderReady, job).await;
+        let supervisor = tokio::spawn(async move {
+            job.close.notified().await;
+            assert!(job.begin_close());
+            job.finish_close(None, true, false);
+        });
         let released = std::cell::Cell::new(false);
         let (first, close) = finish_attempt(
             first,
             &mut None,
             || released.set(true),
-            || {
+            || observe_or_request_close(job, || panic!("founder already requested close")),
+            async |observer| {
                 assert!(released.get());
-                Status::ClosedAfterFounderRefusal
+                observe_close(supervisor, observer).await
             },
-            async |status| CloseObservation::Joined(*status),
         )
         .await;
         assert_eq!(
@@ -742,7 +762,7 @@ mod hosted {
             latch_attempt("P1", first),
             &mut close,
             || observation.release.notify_one(),
-            || job.request_close(),
+            || observe_or_request_close(job, || job.request_close()),
             async |observer| observe_close(supervisor, observer).await,
         )
         .await;
@@ -852,7 +872,8 @@ mod hosted {
         assert_eq!(observation.anchor_calls.load(Relaxed), 1);
         assert_eq!(observation.redeem_calls.load(Relaxed), 1);
 
-        let observer = close.get_or_insert_with(|| job.request_close());
+        let observer =
+            close.get_or_insert_with(|| observe_or_request_close(job, || job.request_close()));
         observe_retained_status(observer, Status::Closing, job).await?;
         assert!(job.start_enrollment(None).is_err());
         assert!(
