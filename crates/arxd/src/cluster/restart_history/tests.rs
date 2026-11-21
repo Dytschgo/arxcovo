@@ -54,6 +54,19 @@ pub(in crate::cluster) fn subprocess(name: &'static str, root: &Path, mode: &str
                 status.success(),
                 "restart history subprocess refused its case"
             );
+            let mut output = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .take(4096)
+                .read_to_string(&mut output)
+                .unwrap();
+            assert!(
+                output.lines().any(|line| line
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "restart history subprocess must run exactly one probe"
+            );
             return;
         }
         if Instant::now() >= deadline {
@@ -62,6 +75,96 @@ pub(in crate::cluster) fn subprocess(name: &'static str, root: &Path, mode: &str
             panic!("restart history subprocess exceeded its bound");
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[should_panic(expected = "restart history subprocess must run exactly one probe")]
+fn history_subprocess_refuses_unmatched_selector() {
+    subprocess(
+        "cluster::restart_history::tests::missing_probe_fixture_case",
+        &std::env::temp_dir(),
+        "unmatched",
+    );
+}
+
+#[test]
+fn history_coverage_follows_advanced_log_id_at_later_indices_only() {
+    use openraft::{LogId, impls::leader_id_adv::LeaderId};
+    let previous = LogPos {
+        term: 8,
+        leader: 2,
+        index: 40,
+    };
+    let to_log_id = |p: LogPos| {
+        LogId::new(
+            LeaderId {
+                term: p.term,
+                node_id: p.leader,
+            },
+            p.index,
+        )
+    };
+    for (current, expected) in [
+        (previous, true),
+        (
+            LogPos {
+                index: 41,
+                ..previous
+            },
+            true,
+        ),
+        (
+            LogPos {
+                leader: 3,
+                index: 41,
+                ..previous
+            },
+            true,
+        ),
+        (
+            LogPos {
+                leader: 1,
+                index: 41,
+                ..previous
+            },
+            false,
+        ),
+        (
+            LogPos {
+                term: 9,
+                leader: 1,
+                index: 41,
+            },
+            true,
+        ),
+        (
+            LogPos {
+                term: 9,
+                index: 39,
+                ..previous
+            },
+            false,
+        ),
+        (
+            LogPos {
+                leader: 3,
+                ..previous
+            },
+            false,
+        ),
+        (
+            LogPos {
+                term: 9,
+                ..previous
+            },
+            false,
+        ),
+    ] {
+        let later_log_id =
+            current.index > previous.index && to_log_id(current) > to_log_id(previous);
+        assert_eq!(expected, current == previous || later_log_id);
+        assert_eq!(covers(current, previous), expected);
     }
 }
 

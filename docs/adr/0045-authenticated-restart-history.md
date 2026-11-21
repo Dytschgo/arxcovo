@@ -90,8 +90,12 @@ and authenticates issuance and linked learner Strict history before
 opening the writable pair. The reader checks the canonical state image,
 actual applied position, membership, binding and required local route,
 and compatible retained log positions and purge marker. A qualifying
-canonical state snapshot can cover a purged range. E and the Strict
-position compare by full ID at equality. The reader repeats the checked
+canonical state snapshot can cover a purged range. At a historical
+index, the full term, leader and index must match. At a later index,
+the position must also sort after the witness in the project's pinned
+OpenRaft 0.10.0 advanced-mode LogId order (term, leader node ID, index).
+Within a term, a higher leader ID can advance the position and a lower
+leader ID refuses. The reader repeats the checked
 state and log comparison and revalidates the original objects on the
 writable pair. Retained credentials use the HostClock based on recovered
 committed time. A typed failure retains acquired ownership and provides

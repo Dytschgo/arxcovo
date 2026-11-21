@@ -6150,8 +6150,15 @@ mod issuer_refusals {
                 &base.join("wrap"),
                 &base.join("custody"),
                 true,
-            )
-            .into_ready();
+            );
+            if case == "tamper" {
+                assert_eq!(
+                    recovery.sqlite_opens(),
+                    2,
+                    "only the read-only pair may open"
+                );
+            }
+            let recovery = recovery.into_ready();
             if matches!(case, "healthy" | "lost-ack" | "final-sync") {
                 let Ok(recovery) = recovery else {
                     panic!("complete authentic voter history must reopen")

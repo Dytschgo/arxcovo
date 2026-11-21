@@ -62,9 +62,9 @@ pub(super) fn covers(actual: LogPos, earlier: LogPos) -> bool {
     if actual.index == earlier.index {
         actual == earlier
     } else {
-        actual.index > earlier.index
-            && (actual.term > earlier.term
-                || actual.term == earlier.term && actual.leader == earlier.leader)
+        // LogPos orders (term, leader, index), like the configured
+        // OpenRaft advanced LogId.
+        actual.index > earlier.index && actual > earlier
     }
 }
 

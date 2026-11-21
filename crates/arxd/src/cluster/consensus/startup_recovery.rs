@@ -673,6 +673,13 @@ pub(super) struct HistoryReady {
 
 #[cfg(target_os = "linux")]
 impl ProcessRecovery {
+    #[cfg(test)]
+    pub(super) fn sqlite_opens(&self) -> usize {
+        self.stores
+            .as_ref()
+            .map_or(0, |stores| stores.io_counts().1)
+    }
+
     pub(super) fn into_ready(self) -> std::result::Result<HistoryReady, Box<Self>> {
         if self.ready.is_err() {
             return Err(Box::new(self));
@@ -1271,11 +1278,7 @@ mod tests {
                 &base.join("custody"),
                 require_route,
             );
-            let opened = result
-                .stores
-                .as_ref()
-                .map_or(0, |stores| stores.io_counts().1);
-            assert_eq!(opened, expected_opens);
+            assert_eq!(result.sqlite_opens(), expected_opens);
             let external = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1428,6 +1431,49 @@ mod tests {
                 run(layout.root.path(), false, route_required, 2);
                 assert_eq!(layout.snapshot(), before);
             }
+        }
+
+        #[test]
+        fn process_history_reopens_after_same_term_leader_succession() {
+            use crate::cluster::membership::Membership;
+            let e = fixture::E;
+            let promoted = LogPos {
+                index: e.index + 1,
+                ..e
+            };
+            let mut f = fixture::Fixture::new(false, true, None);
+            let local = f.expected.node.get();
+            let successor = LogPos {
+                leader: local,
+                index: promoted.index + 1,
+                ..e
+            };
+            f.seed(e, e, None);
+            let members = Membership::new(
+                vec![[e.leader, local].into()],
+                [
+                    (e.leader, "127.0.0.1:7991".into()),
+                    (local, f.owner.plan.peer.clone()),
+                ]
+                .into(),
+            )
+            .unwrap();
+            let entries = [
+                (
+                    promoted,
+                    Entry::Membership(MembershipBlob::new(members.encode().unwrap()).unwrap()),
+                ),
+                (successor, Entry::Blank),
+            ];
+            let state = f.state.as_mut().unwrap();
+            for (position, entry) in &entries {
+                state.apply(*position, entry).unwrap();
+            }
+            assert_eq!(state.applied(), Some(successor));
+            f.log.as_mut().unwrap().append(&entries).unwrap();
+            f.strict(successor);
+            let layout = f.release();
+            run(layout.root.path(), false, true, 4);
         }
 
         #[test]
