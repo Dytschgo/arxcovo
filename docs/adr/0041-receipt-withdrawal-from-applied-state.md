@@ -89,8 +89,11 @@ at 8.323 ms. The 4.089 ms interval exhausted the 4 ms store wait with about
 at 6.423 ms.
 
 Each applied-store acquisition wait now has a 20 ms cap, shortened to the
-remaining local RPC deadline where one applies. The 250 µs poll interval
-and the guarded checks are unchanged. From a 75 ms budget, two sequential
+remaining local RPC deadline where one applies. The cap applies from the
+first attempt, including founder node admission and the guarded availability
+and offer rechecks during sealing. Once admitted, a fresh read uses its
+separate 1.5 s budget. The 250 µs poll interval is unchanged.
+From a 75 ms budget, two sequential
 checks can consume up to 40 ms of acquisition waiting, leaving at least
 35 ms for the rest of the exchange. Three can consume up to 60 ms, leaving
 at least 15 ms. Admission and transfer retain their 5 s budgets.
