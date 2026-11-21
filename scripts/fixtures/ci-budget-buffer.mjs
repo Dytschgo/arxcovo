@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
 
 const scenario = process.argv[2];
+const probesBuffer = ['large-candidate', 'removed-label'].includes(scenario) || scenario.startsWith('oversized-');
 const incompleteMain = ['incomplete-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario);
 const mainSeconds = ['fast-main', 'fast-incomplete-main', 'record-incomplete-main'].includes(scenario) ? 800 : 1200;
 const head = 'a'.repeat(40);
@@ -68,7 +69,10 @@ function fakeExec(command, args, options) {
   const path = args[1].slice(prefix.length);
   calls.push(path);
   const payload = JSON.stringify(response(path, args.slice(2)));
-  payloadBytes.push(Buffer.byteLength(payload));
+  const bytes = Buffer.byteLength(payload);
+  payloadBytes.push(bytes);
+  // Only large reads in buffer scenarios need the subprocess transport.
+  if (!probesBuffer || bytes <= 1024 * 1024) return payload;
   try {
     // Exercise the real execFileSync byte bound, with synthetic JSON on stdin.
     return execFileSync(process.execPath, ['-e', "process.stdout.write(require('node:fs').readFileSync(0))"], {
