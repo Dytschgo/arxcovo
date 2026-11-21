@@ -762,10 +762,13 @@ impl Job {
             .map_err(|_| Refused)
     }
 
-    async fn wait_for_strict_history(&self) -> Result<(), peer_transport::Refusal> {
+    async fn wait_for_strict_history(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(), peer_transport::Refusal> {
         use crate::cluster::pki::verify::VerifyRefusal;
         use peer_registry::ObservationRefusal;
-        peer_registry::wait_for_store(|deadline| {
+        peer_registry::wait_for_store(deadline, |deadline| {
             self.persist_strict_history_before(deadline)
                 .map_err(|error| match error {
                     ActivationError::Deferred => ObservationRefusal::StoreBusy,
@@ -780,6 +783,7 @@ impl Job {
         &self,
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
+        deadline: Instant,
     ) -> Result<super::issuer_transfer::Offer, peer_transport::Refusal> {
         let activation = {
             let state = self.state();
@@ -806,9 +810,9 @@ impl Job {
                 }
                 metrics.changed().await.map_err(|_| refused)?;
             }
-            self.wait_for_strict_history().await?;
+            self.wait_for_strict_history(Some(deadline)).await?;
         }
-        self.with_receiver_proof(claim, sender, |_, offer| offer)
+        self.with_receiver_proof(claim, sender, deadline, |_, offer| offer)
             .await
     }
 
@@ -816,6 +820,7 @@ impl Job {
         &self,
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
+        deadline: Instant,
         use_offer: impl FnOnce(&mut Operation, super::issuer_transfer::Offer) -> T,
     ) -> Result<T, peer_transport::Refusal> {
         use crate::cluster::pki::verify::VerifyRefusal;
@@ -823,7 +828,7 @@ impl Job {
         let node = self.state().node.clone().ok_or(refused)?;
         let node = node.lock().await;
         let mut use_offer = Some(use_offer);
-        peer_registry::wait_for_store(|deadline| {
+        peer_registry::wait_for_store(Some(deadline), |deadline| {
             let mut state = self.state();
             let (_, op) = receiver_parts(&mut state).map_err(|_| VerifyRefusal::Unavailable)?;
             let gate = op.gate.as_ref().ok_or(VerifyRefusal::Unavailable)?.clone();
@@ -847,6 +852,7 @@ impl Job {
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
         channel: (&[u8; 32], &[u8], Vec<u8>),
+        deadline: Instant,
     ) -> Result<(), peer_transport::Refusal> {
         let refused = peer_transport::Refusal::Identity;
         let install = {
@@ -863,7 +869,9 @@ impl Job {
                 .is_some_and(|m| m.history.is_some())
         };
         if history {
-            let result = self.install_voter_history(claim, sender, channel).await;
+            let result = self
+                .install_voter_history(claim, sender, channel, deadline)
+                .await;
             return self.finish_receiver_proof(result);
         }
         let (prepared, root, now) = {
@@ -880,7 +888,7 @@ impl Job {
             (prepared, tls.root, now)
         };
         let sealed = self
-            .with_receiver_proof(claim, sender, |op, _| {
+            .with_receiver_proof(claim, sender, deadline, |op, _| {
                 op.member
                     .as_mut()
                     .ok_or(refused)?
@@ -901,7 +909,7 @@ impl Job {
                 .map_err(|_| refused)?
         };
         let confirmed = self
-            .with_receiver_proof(claim, sender, |op, _| {
+            .with_receiver_proof(claim, sender, deadline, |op, _| {
                 op.member
                     .as_mut()
                     .ok_or(refused)?
@@ -920,6 +928,7 @@ impl Job {
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
         channel: (&[u8; 32], &[u8], Vec<u8>),
+        deadline: Instant,
     ) -> Result<(), peer_transport::Refusal> {
         let refused = peer_transport::Refusal::Identity;
         let (prepared, root, now, links) = {
@@ -944,7 +953,7 @@ impl Job {
             (prepared, tls.root, now, links)
         };
         let sealed = self
-            .with_receiver_proof(claim, sender, |op, _| {
+            .with_receiver_proof(claim, sender, deadline, |op, _| {
                 op.member
                     .as_mut()
                     .ok_or(refused)?
@@ -964,7 +973,7 @@ impl Job {
                 .map_err(|_| refused)?
         };
         let candidate = self
-            .with_receiver_proof(claim, sender, |op, offer| {
+            .with_receiver_proof(claim, sender, deadline, |op, offer| {
                 let claim = offer.claim;
                 let proof = VoterOffer::from_guarded_offer(
                     claim.cluster,
@@ -1337,7 +1346,7 @@ impl Job {
             assert!(member.history.replace(Box::new((slot, live))).is_none());
         }
         tokio::time::pause();
-        let mut persisted = std::pin::pin!(self.wait_for_strict_history());
+        let mut persisted = std::pin::pin!(self.wait_for_strict_history(None));
         {
             let _held = sm.0.lock().unwrap();
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());

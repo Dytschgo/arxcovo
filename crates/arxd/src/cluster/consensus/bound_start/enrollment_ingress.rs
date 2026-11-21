@@ -244,7 +244,7 @@ async fn wait_for_available<'a, N>(
     deadline: Instant,
     check: impl Fn(&N) -> Result<(), AvailabilityError>,
 ) -> Result<MutexGuard<'a, N>, Refused> {
-    let retry_until = (Instant::now() + peer_registry::STORE_WAIT).min(deadline);
+    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
     while Instant::now() < retry_until {
         // There is no queue behind a retained node owner. Drop the node
         // before yielding when either it or the applied store is busy.
