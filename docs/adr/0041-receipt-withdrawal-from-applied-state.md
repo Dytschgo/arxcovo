@@ -79,3 +79,25 @@ The learner receipt path still samples the checked clock during authorization.
 The learner's outbound admission-anchor verifier and raw test TLS probes
 keep their immediate authorization checks. This preserves the explicit
 admission route and the semantics of callers without an owned RPC boundary.
+
+## Amendment A22, 2026-11-21
+
+In main CI run 44940294254, C11 completed its outbound TLS handshake at
+4.234 ms and refused outbound applied pre-frame authorization as unavailable
+at 8.323 ms. The 4.089 ms interval exhausted the 4 ms store wait with about
+66.6 ms left on the 75 ms soft TTL. The inbound pre-frame check had passed
+at 6.423 ms.
+
+Each applied-store acquisition wait now has a 20 ms cap, shortened to the
+remaining local RPC deadline where one applies. The cap applies from the
+first attempt, including founder node admission and the guarded availability
+and offer rechecks during sealing. Once admitted, a fresh read uses its
+separate 1.5 s budget. The 250 µs poll interval is unchanged.
+From a 75 ms budget, two sequential
+checks can consume up to 40 ms of acquisition waiting, leaving at least
+35 ms for the rest of the exchange. Three can consume up to 60 ms, leaving
+at least 15 ms. Admission and transfer retain their 5 s budgets.
+
+The outer budgets remain 75 ms for AppendEntries, 1.5 s for a fresh read,
+5 s for admission, inbound, transfer and Found, and 16 s for the owner.
+All other D6 boundaries remain unchanged.

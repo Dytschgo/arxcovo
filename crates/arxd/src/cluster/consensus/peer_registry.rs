@@ -12,12 +12,15 @@ use std::{
 };
 use tokio::time::{Instant, sleep_until};
 
-// Each transport check can wait 4 ms. The caller's 75 ms absolute
-// AppendEntries deadline still applies across the entire exchange.
-pub(super) const STORE_WAIT: Duration = Duration::from_millis(4);
+// Each acquisition wait is capped by the remaining local RPC budget.
+pub(super) const STORE_WAIT: Duration = Duration::from_millis(20);
 const STORE_POLL: Duration = Duration::from_micros(250);
 
-#[cfg(target_os = "linux")]
+pub(super) fn store_wait_deadline(outer_deadline: Option<Instant>) -> Instant {
+    let cap = Instant::now() + STORE_WAIT;
+    outer_deadline.map_or(cap, |deadline| cap.min(deadline))
+}
+
 pub(super) async fn poll_store_until(deadline: Instant) -> bool {
     let now = Instant::now();
     if now >= deadline {
@@ -87,23 +90,27 @@ fn observe_store<T>(
 
 async fn wait_for_store_reporting<T>(
     stage: &'static str,
+    outer_deadline: Option<Instant>,
     observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, VerifyRefusal> {
-    wait_for_store(observe).await.map_err(|error| {
-        record(stage, error.diagnostic_category());
-        error.into()
-    })
+    wait_for_store(outer_deadline, observe)
+        .await
+        .map_err(|error| {
+            record(stage, error.diagnostic_category());
+            error.into()
+        })
 }
 
 #[cfg(any(test, target_os = "linux"))]
 pub(super) async fn wait_for_receiver_store<N, T>(
     node: &tokio::sync::Mutex<N>,
+    outer_deadline: Option<Instant>,
     mut observe: impl FnMut(&N, Option<Instant>) -> Result<T, ObservationRefusal>,
     report: impl FnOnce(&'static str),
 ) -> Result<T, VerifyRefusal> {
     let result = {
         let node = node.lock().await;
-        wait_for_store(|deadline| observe(&node, deadline)).await
+        wait_for_store(outer_deadline, |deadline| observe(&node, deadline)).await
     };
     result.map_err(|error| {
         report(error.diagnostic_category());
@@ -112,26 +119,19 @@ pub(super) async fn wait_for_receiver_store<N, T>(
 }
 
 pub(super) async fn wait_for_store<T>(
+    outer_deadline: Option<Instant>,
     mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, ObservationRefusal> {
-    let deadline = Instant::now() + STORE_WAIT;
-    let mut acquisition_deadline = None;
-    loop {
-        match observe(acquisition_deadline) {
+    let deadline = store_wait_deadline(outer_deadline);
+    while Instant::now() < deadline {
+        match observe(Some(deadline)) {
             Err(ObservationRefusal::StoreBusy) => {}
             result => return result,
         }
-        // Each synchronous attempt returns before the store/phase guards can
-        // reach this retry loop.
-        let now = Instant::now();
-        if now >= deadline {
+        // The synchronous observation returned with neither lock held.
+        if !poll_store_until(deadline).await {
             break;
         }
-        sleep_until((now + STORE_POLL).min(deadline)).await;
-        if Instant::now() >= deadline {
-            break;
-        }
-        acquisition_deadline = Some(deadline);
     }
     Err(ObservationRefusal::StoreBusy)
 }
@@ -149,9 +149,13 @@ impl AppliedRegistry {
         cluster: ClusterId,
         node: NodeId,
         key: KeyDigest,
+        deadline: Instant,
         stage: &'static str,
     ) -> Result<(), VerifyRefusal> {
-        wait_for_store_reporting(stage, |deadline| self.observe(cluster, node, key, deadline)).await
+        wait_for_store_reporting(stage, Some(deadline), |deadline| {
+            self.observe(cluster, node, key, deadline)
+        })
+        .await
     }
 
     fn observe(
@@ -355,8 +359,9 @@ impl LearnerGate {
         node: crate::cluster::enrollment::NodeId,
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
+        deadline: Instant,
     ) -> Result<Lane, VerifyRefusal> {
-        wait_for_store_reporting("learner-authorization", |deadline| {
+        wait_for_store_reporting("learner-authorization", Some(deadline), |deadline| {
             self.try_authorize(cluster, node, key, bootstrap_allowed, deadline)
         })
         .await
@@ -455,6 +460,7 @@ mod tests {
             let mut category = None;
             let result = wait_for_receiver_store(
                 &node,
+                None,
                 |_, _| {
                     assert!(node.try_lock().is_err());
                     if busy {
@@ -535,18 +541,41 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn learner_inbound_authorizes_when_applied_store_is_released_within_budget() {
+        use super::super::{BasicNode, Members, encode};
         let (_dir, sm) = fixture();
         let gate = learner_gate(&sm);
-        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
-        {
-            let _held = sm.0.lock().unwrap();
-            assert!(
-                authorization
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-            );
-        }
+        assert_eq!(gate.phase(), Ok(Phase::Bootstrap));
+        let membership = Members::new(
+            vec![[1, 2].into()],
+            std::collections::BTreeMap::from([
+                (1, BasicNode::new("192.168.0.1:7001")),
+                (2, BasicNode::new("192.168.0.2:7001")),
+            ]),
+        )
+        .unwrap();
+        let store = sm.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let mut held = store.0.lock().unwrap();
+            entered.send(()).unwrap();
+            if wait.recv().is_ok() {
+                held.apply(
+                    position(1),
+                    &Entry::Membership(encode(&membership).unwrap()),
+                )
+                .unwrap();
+            }
+        });
+        ready.await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut authorization =
+            std::pin::pin!(gate.authorize([1; 16], node(1), key(1), false, deadline));
+        assert!(futures_util::poll!(&mut authorization).is_pending());
+        tokio::time::advance(Duration::from_millis(12)).await;
+        assert!(futures_util::poll!(&mut authorization).is_pending());
+        release.send(()).unwrap();
+        holder.await.unwrap();
         assert_eq!(authorization.await, Ok(Lane::Strict));
     }
 
@@ -554,30 +583,60 @@ mod tests {
     async fn learner_inbound_refuses_when_applied_store_outlasts_budget() {
         let (_dir, sm) = fixture();
         let gate = learner_gate(&sm);
+        let registry = AppliedRegistry::new(&sm);
+        let store = sm.clone();
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = mpsc::channel::<()>();
         let holder = tokio::task::spawn_blocking(move || {
-            let _held = sm.0.lock().unwrap();
+            let _held = store.0.lock().unwrap();
             entered.send(()).unwrap();
             let _ = wait.recv();
         });
         ready.await.unwrap();
-        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
-        assert!(
-            authorization
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        tokio::time::advance(Duration::from_millis(4)).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut authorization =
+            std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true, deadline));
+        let mut released_at_cap =
+            std::pin::pin!(registry.authorize([1; 16], node(1), key(1), deadline, "peer-client"));
+        assert!(futures_util::poll!(&mut authorization).is_pending());
+        assert!(futures_util::poll!(&mut released_at_cap).is_pending());
+        tokio::time::advance(Duration::from_millis(20)).await;
         assert_eq!(
-            authorization
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop())),
+            futures_util::poll!(&mut authorization),
             Poll::Ready(Err(VerifyRefusal::Unavailable))
         );
         drop(release);
         holder.await.unwrap();
+        assert_eq!(
+            futures_util::poll!(&mut released_at_cap),
+            Poll::Ready(Err(VerifyRefusal::Unavailable))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn applied_registry_refuses_at_the_shorter_rpc_deadline() {
+        let (_dir, sm) = fixture();
+        let registry = AppliedRegistry::new(&sm);
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut authorization =
+            std::pin::pin!(registry.authorize([1; 16], node(1), key(1), deadline, "peer-client"));
+        {
+            let _held = sm.0.lock().unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(authorization.as_mut().poll(&mut cx).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(5)).await;
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(
+            futures_util::poll!(&mut authorization),
+            Poll::Ready(Err(VerifyRefusal::Unavailable))
+        );
+        let mut expired =
+            std::pin::pin!(registry.authorize([1; 16], node(1), key(1), deadline, "peer-client"));
+        assert_eq!(
+            futures_util::poll!(&mut expired),
+            Poll::Ready(Err(VerifyRefusal::Unavailable))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -602,6 +661,7 @@ mod tests {
         let gate = learner_gate(&sm);
         let mut observation = std::pin::pin!(wait_for_store_reporting(
             "learner-authorization",
+            None,
             |deadline| {
                 gate.inspect_strict(deadline, |store| {
                     assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
