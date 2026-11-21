@@ -17,7 +17,7 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `b035ab21` (PR220); push CI 44865096894 recorded in the next checkpoint.
+- **Main:** `b035ab21` (PR220), push CI 44865096894 green.
   `123dab63` (PR221) push CI 44861802922 green. `863ac6cc` (PR219) push CI 44848531876
   green. `12c21292` (PR218), push CI 44846740760 green. `80a71cf6` (PR217) push CI
   44840557829 green. `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
@@ -591,11 +591,12 @@ merged, as listed under "Merged this session".
   (2026-11-21):** a separate C11 investigation and repair grant, and a fresh step 12
   builder for the two P2s.
 - **PR #221 (C11 cause and fix) merged** as `123dab63`. Linux-test-only C11 diagnostics
-  located the refusal: during the handshake the issuer's outbound strict-registry check of
-  the learner's server certificate took the applied-store lock with a non-waiting
-  try-lock and failed closed when the issuer's own store was momentarily busy (run
-  44858188771: "TLS server authorization" refused "founder registry unavailable" at
-  3.66 ms; log `D:/Temp/arx-pr221-fail/ubuntu-rust.log` SHA256 `55998d64…462b`). **Owner decision
+  located the refusal. During TLS the issuer's outbound strict-registry check of the
+  learner's server certificate returned ‘founder registry unavailable’ at 3.66 ms. The
+  check used a non-waiting applied-store try-lock, and transient contention was the
+  leading explanation. The trace reported registry unavailability without identifying the
+  specific store condition (run 44858188771, stage ‘TLS server authorization’, log
+  `D:/Temp/arx-pr221-fail/ubuntu-rust.log` SHA256 `55998d64…462b`). **Owner decision
   (2026-11-21):** a narrow production fix, a short bounded wait instead of instant refusal
   on contention, keeping instant fail-closed refusal for poison, an unavailable store and
   clock failure. Final design: rustls keeps full chain, cluster and possession checks;
@@ -609,16 +610,17 @@ merged, as listed under "Merged this session".
   superseded; 3 (`D:/Temp/arx-pr221-review3/review.md`, SHA256 `9568520f…5586`) resolved its
   security P2 after the coordinator clarified the intended property (no application data
   parsed or acted on before authorization, bounded buffering acceptable) and asked for ADR
-  wording; the coordinator made two docs-only ADR edits; 4 HOLD on one sentence
-  (`D:/Temp/arx-pr221-review4/review.md`, SHA256 `a664eed6…6ae5`); 5 PASS
-  (`D:/Temp/arx-pr221-review5/review.md`, SHA256 `f1725fc7…4c1b`), agent-review status
+  wording. The coordinator made the first ADR-only edit (`06ae3b1e`). Review 4 held on
+  one remaining sentence (`D:/Temp/arx-pr221-review4/review.md`, SHA256 `a664eed6…6ae5`). The second ADR-only edit
+  (`353b942d`) corrected it and review 5 passed (`D:/Temp/arx-pr221-review5/review.md`, SHA256 `f1725fc7…4c1b`), agent-review status
   59534006830. Builder counted failures 1/3 (C11 still failed after the learner-only
   change); report `D:/Temp/arx-c11-fixture/report.md` SHA256 `1d446df7…b216`. Hosted run
   44860863540 green with 942 tests; C11, C9, C10, the J tests, 7b P1 and O1 all passed.
   An unrelated UI Node test (`scripts/ci-workflow.test.mjs` "required gates accept only
   both successful matrices") timed out once at 10 s on run 44855233311 and has passed since.
 - **PR #220 merged** as `b035ab21` (step 12). The second step 12 builder (fresh 3) fixed
-  the two P2s after #221 merged (`2e034968`; report `D:/Temp/arx-m3-step12-b2/report.md`
+  the two P2s in `0d5daae0`, then integrated #221 after its merge (`da51e214`) and aligned
+  the custody path with bounded authorization in `2e034968` (report `D:/Temp/arx-m3-step12-b2/report.md`
   SHA256 `4c390d9c…3afb`): the receiver holds the applied guard through unwrap, readback and both
   confirmations, with disk I/O between guarded steps; three Linux production-receiver mTLS
   tests. Review 3 HOLD (`D:/Temp/arx-pr220-review3/review.md`, SHA256 `fad71a6a…b7c6`): the final
