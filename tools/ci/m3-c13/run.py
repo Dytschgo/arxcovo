@@ -51,7 +51,7 @@ OWNER_EXIT = re.compile(
     r"C13 owner node=[abcd] action=(?:join|mint) exit=(?:[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5]|signal)"
 )
 DIAGNOSTIC = re.compile(
-    r"C13 diagnostic node=[abcd] stage=(?:owner-join|join-start|join-attach|"
+    r"C13 diagnostic node=[abcd] (?:stage=(?:owner-join|join-start|join-attach|"
     r"join-publication|join-admission|admission-route|admission-register|admission-worker|"
     r"admission-membership|admission-confirm|admission-reply|admission-exchange|"
     r"learner-authorization|peer-pre-frame|peer-dispatch|admission-dispatch|peer-client|"
@@ -59,7 +59,9 @@ DIAGNOSTIC = re.compile(
     r"category=(?:unavailable-store-wait|unavailable-store|unavailable|phase-unavailable|"
     r"clock|identity|busy|node-busy|closed|address|tls|deadline|dispatch|transport|"
     r"revoked|stale-tail|refused|unconfirmed|incomplete|not-leader|view-changed|"
-    r"transfer|history|issuer|listener)"
+    r"transfer|history|issuer|listener)|"
+    r"stage=transfer-seal category=(?:offer-node-busy|offer-fresh-read-busy|offer-read|offer-changed|issuer-busy|"
+    r"issuer-refused|seal|recheck-busy|recheck-refused))"
 )
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
 
@@ -220,13 +222,13 @@ def pipe_capacity(fd):
     return fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
 
 
-def bounded_run(args, *, env, timeout):
+def bounded_run(args, *, env, timeout, stderr=subprocess.DEVNULL):
     capture = Capture()
     deadline = time.monotonic() + timeout
     work_deadline = deadline - REAP_GRACE
     remaining(work_deadline, timeout)
     process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
+                               stderr=stderr)
     # Popen's context exit waits implicitly. Own the pipe separately so an
     # unobserved child cannot extend either exit path.
     with process.stdout, selectors.DefaultSelector() as sel:
@@ -260,6 +262,26 @@ def bounded_run(args, *, env, timeout):
                 capture.feed(data)
                 pending -= len(data)
     return code, capture
+
+
+def run_campaign(args, *, env, timeout):
+    # Optional diagnostics never enter Capture or influence cleanup evidence.
+    try:
+        reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        code, capture = bounded_run(args, env=env, timeout=timeout)
+        return code, capture, b""
+    try:
+        code, capture = bounded_run(args, env=env, timeout=timeout, stderr=writer)
+        # Nonblocking and bounded even if a descendant still owns the writer.
+        try:
+            diagnostic = os.read(reader, OUTPUT_LIMIT)
+        except OSError:
+            diagnostic = b""
+        return code, capture, diagnostic
+    finally:
+        os.close(writer)
+        os.close(reader)
 
 
 def cleanup_disposition(lines):
@@ -320,6 +342,32 @@ def launch_privileged(stage, root_deadline, deadline):
     return int(result.returncode != 0)
 
 
+def relay_diagnostics(diagnostic):
+    if not diagnostic:
+        return
+    try:
+        stderr = sys.stderr.fileno()
+        original = os.fstat(stderr)
+        if not stat.S_ISFIFO(original.st_mode):
+            return
+        # Reopen the pipe with independent status flags. A dup would share
+        # O_NONBLOCK with any mandatory output using the same description.
+        writer = os.open(f"/proc/self/fd/{stderr}", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            reopened = os.fstat(writer)
+            if (not stat.S_ISFIFO(reopened.st_mode)
+                    or (reopened.st_dev, reopened.st_ino) != (original.st_dev, original.st_ino)):
+                return
+            for raw in diagnostic[:OUTPUT_LIMIT].split(b"\n")[:-1]:
+                if len(raw) < 128 and DIAGNOSTIC.fullmatch(raw.decode("ascii", errors="replace")):
+                    os.write(writer, raw + b"\n")
+        finally:
+            os.close(writer)
+    except (OSError, ValueError, AttributeError):
+        # An unavailable, full or closed diagnostic endpoint is disposable.
+        pass
+
+
 def privileged(stage, deadline):
     qualify_runner()
     if os.geteuid() != 0:
@@ -338,6 +386,7 @@ def privileged(stage, deadline):
     may_remove = True
     successful = False
     first = None
+    diagnostic = b""
     start = time.monotonic()
     phase = "staging"
     try:
@@ -361,8 +410,10 @@ def privileged(stage, deadline):
         if timeout < CAMPAIGN_TIMEOUT - 1:
             raise TimeoutError("campaign cleanup reserve unavailable")
         may_remove = False
-        code, capture = bounded_run([root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
-                                    env=environment, timeout=timeout)
+        code, capture, diagnostic = run_campaign(
+            [root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
+            env=environment, timeout=timeout,
+        )
         lines = capture.text().splitlines()
         first = capture.first
         reaped_all, clean_close = cleanup_disposition(lines)
@@ -373,7 +424,7 @@ def privileged(stage, deadline):
               flush=True)
         for line in lines:
             if (line == PIN or CLEANUP.fullmatch(line) or OWNER_EXIT.fullmatch(line)
-                    or DIAGNOSTIC.fullmatch(line) or re.fullmatch(
+                    or re.fullmatch(
                         r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
                 print(line, flush=True)
         successful = (code == 0 and lines.count(PIN) == 1 and may_remove
@@ -406,6 +457,7 @@ def privileged(stage, deadline):
         print(f"C13 teardown fixture={fixture} roles_removed={removed} "
               f"roles_retained={retained} roles_unknown={unknown} "
               f"seconds={time.monotonic()-start:.3f}", flush=True)
+    relay_diagnostics(diagnostic)
     return int(not successful or retained != 0 or unknown != 0 or fixture != "removed")
 
 

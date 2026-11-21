@@ -2,6 +2,8 @@
 
 #[path = "support/c13_failure.rs"]
 mod c13_failure;
+#[path = "support/c13_diagnostic_endpoint.rs"]
+mod diagnostic_endpoint;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -130,19 +132,204 @@ impl Helpers {
     }
 }
 
+struct DiagnosticPipe {
+    read: File,
+    write: File,
+}
+
+impl DiagnosticPipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe2 writes both descriptors on success.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: these newly owned descriptors are distinct.
+        let [read, write] = fds.map(|fd| unsafe { File::from_raw_fd(fd) });
+        Ok(Self { read, write })
+    }
+
+    fn configure_daemon(pipe: Option<&Self>, command: &mut Command, fixture: &'static str) {
+        if let Some(write) = pipe.and_then(|pipe| pipe.write.try_clone().ok()) {
+            command
+                .env("ARX_C13_DIAGNOSTICS", fixture)
+                .stdout(Stdio::from(write));
+        } else {
+            command.stdout(Stdio::null());
+        }
+    }
+
+    fn drain(&mut self, mut emit: impl FnMut(&[u8])) {
+        let mut buffer = [0; 32_768];
+        let Ok(count) = self.read.read(&mut buffer) else {
+            return;
+        };
+        for line in buffer[..count].split_inclusive(|byte| *byte == b'\n') {
+            // The private launcher pipe still independently validates the node,
+            // stage and category allowlist before releasing any line.
+            if line.len() <= 128
+                && line.starts_with(b"C13 diagnostic node=")
+                && line.ends_with(b"\n")
+                && line.is_ascii()
+            {
+                emit(line);
+            }
+        }
+    }
+
+    fn relay(&mut self) {
+        // The launcher owns this second diagnostic pipe. Never fall back to
+        // campaign stdout or write into a blocking stderr.
+        if diagnostic_endpoint::pipe_writer_identity(libc::STDERR_FILENO).is_some() {
+            self.drain(|line| {
+                // SAFETY: this slice is live and the fixed pipe is nonblocking.
+                unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+            });
+        }
+    }
+}
+
+fn configure_publication_handoff(
+    command: &mut Command,
+    read: io::PipeReader,
+    diagnostics: Option<&DiagnosticPipe>,
+    fixture: &'static str,
+) {
+    use diagnostic_endpoint::{
+        PUBLICATION_DIAGNOSTIC_FD, PUBLICATION_DIAGNOSTIC_PIPE, pipe_writer_identity,
+    };
+
+    // The paste pipe already reserves both ends before the optional writer is cloned.
+    let writer = diagnostics.and_then(|pipe| pipe.write.try_clone().ok());
+    let diagnostic = writer.and_then(|writer| {
+        let (dev, ino) = pipe_writer_identity(writer.as_raw_fd())?;
+        command
+            .env("ARX_C13_DIAGNOSTICS", fixture)
+            .env(PUBLICATION_DIAGNOSTIC_PIPE, format!("{dev}:{ino}"));
+        Some(writer)
+    });
+    // SAFETY: these owned descriptors live through spawn. The callback uses
+    // only fd syscalls and marks unrelated handles close-on-exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(read.as_raw_fd(), 3) == -1
+                || libc::fcntl(3, libc::F_SETFD, 0) == -1
+                || libc::syscall(
+                    libc::SYS_close_range,
+                    4u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if let Some(writer) = &diagnostic
+                && libc::dup2(writer.as_raw_fd(), PUBLICATION_DIAGNOSTIC_FD) >= 0
+            {
+                // This also handles a writer already at the target slot.
+                libc::fcntl(PUBLICATION_DIAGNOSTIC_FD, libc::F_SETFD, 0);
+            }
+            Ok(())
+        });
+    }
+}
+
+const HANDOFF_RECORD: &[u8] = b"C13 diagnostic node=d stage=admission-worker category=busy\n";
+
+#[test]
+#[ignore = "harmless diagnostic handoff subprocess"]
+fn diagnostic_handoff_child() {
+    // SAFETY: this child exclusively owns the two descriptors from the test launcher.
+    let writer = unsafe { diagnostic_endpoint::claim_publication_writer() }.unwrap();
+    let paste = unsafe { File::from_raw_fd(3) };
+    let mut bytes = Vec::new();
+    paste.take(32).read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"handoff input");
+    assert!(
+        Command::new("/bin/sh")
+            .args(["-c", "test ! -e /proc/self/fd/4"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut diagnostic = File::from(writer);
+    match diagnostic.write(HANDOFF_RECORD) {
+        Ok(count) => assert_eq!(count, HANDOFF_RECORD.len()),
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+    }
+    println!("\nmandatory handoff output");
+}
+
+#[test]
+fn diagnostic_pipe_does_not_capture_campaign_stdout() {
+    for full in [false, true] {
+        let mut pipe = DiagnosticPipe::new().unwrap();
+        if full {
+            // SAFETY: fcntl queries the capacity of the owned pipe.
+            let capacity = unsafe { libc::fcntl(pipe.write.as_raw_fd(), libc::F_GETPIPE_SZ) };
+            assert!(capacity > 0);
+            pipe.write
+                .write_all(&vec![b'x'; capacity as usize])
+                .unwrap();
+        }
+        let (read, mut write) = io::pipe().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "diagnostic_handoff_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_publication_handoff(&mut command, read, Some(&pipe), "d");
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        write.write_all(b"handoff input").unwrap();
+        drop(write);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                child.wait().unwrap();
+                panic!("diagnostic handoff blocked");
+            }
+            sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "mandatory handoff output")
+        );
+        assert!(!stdout.contains("C13 diagnostic"));
+        assert!(output.stderr.is_empty());
+        let mut diagnostics = Vec::new();
+        pipe.drain(|line| diagnostics.extend_from_slice(line));
+        assert_eq!(diagnostics, if full { &[] } else { HANDOFF_RECORD });
+    }
+}
+
 #[derive(Default)]
 struct Campaign {
     processes: Vec<(Node, OwnedChild)>,
     closes: usize,
     helpers: Helpers,
     confirmed: Vec<bool>,
+    diagnostics: Option<DiagnosticPipe>,
 }
 
 impl Campaign {
     fn start(&mut self, node: &Node, binary: &Path, intent: &str, sockets: SocketPair) -> usize {
         assert!(Instant::now() < phase_end(), "C13 campaign budget expired");
-        self.processes
-            .push((node.clone(), node.start(binary, intent, sockets)));
+        self.processes.push((
+            node.clone(),
+            node.start(binary, intent, sockets, self.diagnostics.as_ref()),
+        ));
         self.confirmed.push(false);
         self.processes.len() - 1
     }
@@ -214,6 +401,9 @@ impl Drop for Campaign {
         if let Some(deadline) = END.get() {
             let end = (Instant::now() + CLEANUP).min(*deadline + CLEANUP);
             println!("{}", self.cleanup(end));
+            if let Some(pipe) = self.diagnostics.as_mut() {
+                pipe.relay();
+            }
         }
     }
 }
@@ -480,7 +670,13 @@ impl Node {
         config.sync_all().unwrap();
     }
 
-    fn start(&self, binary: &Path, intent: &str, sockets: SocketPair) -> OwnedChild {
+    fn start(
+        &self,
+        binary: &Path,
+        intent: &str,
+        sockets: SocketPair,
+        diagnostics: Option<&DiagnosticPipe>,
+    ) -> OwnedChild {
         let [peer, enrollment] = sockets.map(|socket| {
             handoff_descriptor(socket, intent != "join").unwrap_or_else(|_| refuse("listener"))
         });
@@ -490,10 +686,9 @@ impl Node {
             .arg(self.config())
             .args(["--cluster-intent", intent, "--inherit-listeners"])
             .env_clear()
-            .env("ARX_C13_DIAGNOSTICS", self.fixture)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::null());
+        DiagnosticPipe::configure_daemon(diagnostics, &mut command, self.fixture);
         // SAFETY: transition uses only async-signal-safe system calls.
         unsafe {
             command.pre_exec(move || {
@@ -859,7 +1054,13 @@ fn c13_mint_capture_waits_for_delayed_controlling_tty_open() {
     assert!(!validate_mint_output(&mut Secret(b"arxje1-abcd".to_vec())));
 }
 
-fn publish_final(probe: &Path, node: &Node, paste: &Secret, helpers: &mut Helpers) {
+fn publish_final(
+    probe: &Path,
+    node: &Node,
+    paste: &Secret,
+    helpers: &mut Helpers,
+    diagnostics: Option<&DiagnosticPipe>,
+) {
     let (read, mut write) = io::pipe().expect("one-use publication pipe");
     let mut command = Command::new(probe);
     command
@@ -867,26 +1068,13 @@ fn publish_final(probe: &Path, node: &Node, paste: &Secret, helpers: &mut Helper
         .env_clear()
         .env("ARX_C13_PUBLISH", "1")
         .env("ARX_C13_CONFIG", node.config())
-        .env("ARX_C13_DIAGNOSTICS", node.fixture)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    // SAFETY: read is the owned private pipe. The child closes unrelated handles.
+        .stderr(Stdio::null());
+    configure_publication_handoff(&mut command, read, diagnostics, node.fixture);
+    // SAFETY: the transition uses only syscalls after the descriptor handoff.
     unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(read.as_raw_fd(), 3) == -1
-                || libc::fcntl(3, libc::F_SETFD, 0) == -1
-                || libc::syscall(
-                    libc::SYS_close_range,
-                    4u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                ) == -1
-            {
-                return Err(io::Error::last_os_error());
-            }
-            transition(DAEMON)
-        });
+        command.pre_exec(|| transition(DAEMON));
     }
     helpers.spawn(&mut command);
     drop(command);
@@ -1100,6 +1288,7 @@ fn c13_activation_restarts_original_nodes_and_issues_after_founder_close() {
     std::panic::set_hook(Box::new(|panic| first_failure("assertion", Some(panic))));
     END.set(Instant::now() + CAMPAIGN).unwrap();
     let mut campaign = Campaign::default();
+    campaign.diagnostics = DiagnosticPipe::new().ok();
     assert_eq!(std::env::var("ARX_C13_HOSTED").as_deref(), Ok("1"));
     // SAFETY: this samples the process UID for the launcher precondition.
     assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -1290,7 +1479,13 @@ fn c13_activation_restarts_original_nodes_and_issues_after_founder_close() {
     let (mint, paste) = owner_command(&binary, survivor, OWNER, None, &mut campaign.helpers);
     assert!(mint.success(), "C13 survivor Mint refused");
     phase("publication");
-    publish_final(&probe, d, &paste, &mut campaign.helpers);
+    publish_final(
+        &probe,
+        d,
+        &paste,
+        &mut campaign.helpers,
+        campaign.diagnostics.as_ref(),
+    );
     assert!(fs::read(d.root.join("credentials/ca.der")).unwrap() == original_root);
     let issuer_id = if survivor.root == b.root { 2 } else { 3 };
     let final_position = publication(d, 4, issuer_id);

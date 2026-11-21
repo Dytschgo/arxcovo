@@ -74,6 +74,7 @@ pub(super) mod linux {
     use super::*;
     use crate::cluster::consensus::bound_start::*;
     use crate::cluster::{
+        c13_diagnostics::record,
         enrollment::{BoundVoters, ClusterId, KeyDigest, NodeId},
         issuance_publication,
         join_receipt::Origin,
@@ -83,6 +84,7 @@ pub(super) mod linux {
     };
     use checked_clock::HostClock;
     use issue::found::{FOUNDER, FoundError};
+    use membership_observation::MembershipReadError;
     use peer_network::EngineDispatch;
     use peer_transport::{self, Credentials, TransportOwner};
     use rustls::{pki_types::UnixTime, time_provider::TimeProvider};
@@ -742,18 +744,26 @@ pub(super) mod linux {
             let (cluster, root, key) = ready.transfer_identity();
             (state.node.clone().ok_or(R::NotReady)?, cluster, root, key)
         };
-        let offer = {
-            let node = node.try_lock().map_err(|_| R::Busy)?;
-            node.issuer_offer(cluster, root, target)
-                .await
-                .map_err(|error| {
-                    #[cfg(test)]
-                    eprintln!("issuer transfer fresh membership refused: {error:?}");
-                    let _ = error;
-                    R::Identity
-                })?
+        let offer_result = {
+            let node = node.try_lock().map_err(|_| {
+                record("transfer-seal", "offer-node-busy");
+                R::Busy
+            })?;
+            node.issuer_offer(cluster, root, target).await
         };
+        let offer = offer_result.map_err(|error| {
+            #[cfg(test)]
+            eprintln!("issuer transfer fresh membership refused: {error:?}");
+            let category = if error == MembershipReadError::Busy {
+                "offer-fresh-read-busy"
+            } else {
+                "offer-read"
+            };
+            record("transfer-seal", category);
+            R::Identity
+        })?;
         if offer.claim.sender.1 != *key.as_bytes() {
+            record("transfer-seal", "offer-changed");
             return Err(R::Identity);
         }
         Ok((offer, node))
@@ -788,25 +798,45 @@ pub(super) mod linux {
         use peer_transport::Refusal as R;
         let (current, node) = retained_issuer(job, offer.claim.receiver.0).await?;
         if current != offer {
+            record("transfer-seal", "offer-changed");
             return Err(R::Identity);
         }
-        let node = node.try_lock().map_err(|_| R::Busy)?;
-        let state = job.state();
-        let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
-        if state.close_requested || ready.available(&node).is_err() {
-            return Err(R::Identity);
-        }
-        let custody = state
-            .founder
-            .as_ref()
-            .and_then(|op| op.custody.as_ref())
-            .ok_or(R::NotReady)?;
-        let (cluster, root, now) = ready.transfer_context()?;
-        let sealed = custody
-            .seal_for_voter(cluster, root, now, key, context)
-            .map_err(|_| R::Identity)?;
-        node.recheck_issuer_offer(offer).map_err(|_| R::Identity)?;
-        Ok(sealed)
+        let result = (|| {
+            let node = node
+                .try_lock()
+                .map_err(|_| (R::Busy, Some("issuer-busy")))?;
+            let state = job.state();
+            let ready = state.issuer.as_ref().ok_or((R::NotReady, None))?;
+            if state.close_requested || ready.available(&node).is_err() {
+                return Err((R::Identity, Some("issuer-refused")));
+            }
+            let custody = state
+                .founder
+                .as_ref()
+                .and_then(|op| op.custody.as_ref())
+                .ok_or((R::NotReady, None))?;
+            let (cluster, root, now) = ready
+                .transfer_context()
+                .map_err(|error| (error, Some("issuer-refused")))?;
+            let sealed = custody
+                .seal_for_voter(cluster, root, now, key, context)
+                .map_err(|_| (R::Identity, Some("seal")))?;
+            node.recheck_issuer_offer(offer).map_err(|error| {
+                let category = if error == MembershipReadError::Busy {
+                    "recheck-busy"
+                } else {
+                    "recheck-refused"
+                };
+                (R::Identity, Some(category))
+            })?;
+            Ok(sealed)
+        })();
+        result.map_err(|(error, category)| {
+            if let Some(category) = category {
+                record("transfer-seal", category);
+            }
+            error
+        })
     }
 
     pub(in super::super) async fn close_transport(job: &Job) -> bool {

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,43 @@ SPEC.loader.exec_module(RUN)
 
 
 class LauncherTests(unittest.TestCase):
+    def fixture_campaign(self, code, capture, diagnostics):
+        stage = MagicMock(is_symlink=lambda: False)
+        stage.stat.return_value.st_uid = 23
+        output = io.StringIO()
+        with (patch.object(RUN, "qualify_runner"),
+              patch.object(RUN.os, "geteuid", return_value=0, create=True),
+              patch.dict(RUN.os.environ, {"SUDO_UID": "23"}),
+              patch.object(RUN, "Path", return_value=stage),
+              patch.object(stage, "parent", stage),
+              patch.object(stage, "name", "arx-c13-abcdefgh"),
+              patch.object(RUN, "unused", return_value=True),
+              patch.object(RUN, "command") as command,
+              patch.object(RUN.tempfile, "mkdtemp", return_value="/tmp/arx-c13-fixture"),
+              patch.object(RUN, "stage_tree"),
+              patch.object(RUN, "stage_binary"),
+              patch.object(RUN, "primary_ip", return_value="10.1.0.22"),
+              patch.object(RUN, "run_campaign", return_value=(code, capture, diagnostics)),
+              patch.object(RUN, "remove_role", return_value="removed") as remove_role,
+              patch.object(RUN.time, "monotonic", return_value=10),
+              redirect_stdout(output)):
+            status = RUN.privileged("/tmp/arx-c13-abcdefgh", 178)
+        return status, output.getvalue(), remove_role.call_count, command.call_count
+
+    def optional_pipe(self, write_effect=None):
+        from contextlib import ExitStack
+
+        stack = self.enterContext(ExitStack())
+        stack.enter_context(redirect_stderr(MagicMock(**{"fileno.return_value": 10})))
+        metadata = SimpleNamespace(st_mode=RUN.stat.S_IFIFO, st_dev=1, st_ino=2)
+        stack.enter_context(patch.object(RUN.os, "O_NONBLOCK", 0x800, create=True))
+        stack.enter_context(patch.object(RUN.os, "O_CLOEXEC", 0x80000, create=True))
+        stack.enter_context(patch.object(RUN.os, "fstat", return_value=metadata))
+        open_pipe = stack.enter_context(patch.object(RUN.os, "open", return_value=11))
+        write = stack.enter_context(patch.object(RUN.os, "write", side_effect=write_effect))
+        close = stack.enter_context(patch.object(RUN.os, "close"))
+        return open_pipe, write, close
+
     def test_selection_is_exact(self):
         listed = f"{RUN.SELECTOR}: test\n\n1 test, 0 benchmarks\n"
         self.assertTrue(RUN.exact_listing(listed, RUN.SELECTOR))
@@ -81,7 +119,12 @@ class LauncherTests(unittest.TestCase):
         join_cleanup = "C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 helpers=17 helpers_reaped=17 helper_unknown=0"
         publication_cleanup = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helpers=93 helpers_reaped=93 helper_unknown=0"
         diagnostic = "C13 diagnostic node=a stage=admission-dispatch category=unavailable-store-wait"
+        seal = "C13 diagnostic node=a stage=transfer-seal category=recheck-busy"
+        node_busy = "C13 diagnostic node=a stage=transfer-seal category=offer-node-busy"
+        read_busy = "C13 diagnostic node=a stage=transfer-seal category=offer-fresh-read-busy"
+        misplaced = "C13 diagnostic node=c stage=transfer-seal category=offer-read"
         owner_exit = "C13 owner node=c action=join exit=8"
+        _, write, _ = self.optional_pipe()
         for first, cleanup, remove in (
             (join, join_cleanup, True),
             (publication, publication_cleanup, True),
@@ -91,42 +134,72 @@ class LauncherTests(unittest.TestCase):
             (join, join_cleanup.replace("reaped=3", "reaped=2"), False),
         ):
             with self.subTest(first=first, cleanup=cleanup):
+                write.reset_mock()
                 capture = RUN.Capture()
                 capture.feed(
-                    (f"fixture-private-output\n{first}\n{cleanup}\n{diagnostic}\n{owner_exit}\n"
-                     f"{diagnostic} secret=fixture-private-output\n"
-                     f"{diagnostic.replace('unavailable-store-wait', 'fixture-private-output')}\n"
+                    (f"fixture-private-output\n{first}\n{cleanup}\n{misplaced}\n{owner_exit}\n"
                      "C13 owner node=c action=join exit=256\n").encode("ascii")
                 )
-                stage = MagicMock(is_symlink=lambda: False)
-                stage.stat.return_value.st_uid = 23
-                output = io.StringIO()
-                with (patch.object(RUN, "qualify_runner"),
-                      patch.object(RUN.os, "geteuid", return_value=0, create=True),
-                      patch.dict(RUN.os.environ, {"SUDO_UID": "23"}),
-                      patch.object(RUN, "Path", return_value=stage),
-                      patch.object(stage, "parent", stage),
-                      patch.object(stage, "name", "arx-c13-abcdefgh"),
-                      patch.object(RUN, "unused", return_value=True),
-                      patch.object(RUN, "command") as command,
-                      patch.object(RUN.tempfile, "mkdtemp", return_value="/tmp/arx-c13-fixture"),
-                      patch.object(RUN, "stage_tree"),
-                      patch.object(RUN, "stage_binary"),
-                      patch.object(RUN, "primary_ip", return_value="10.1.0.22"),
-                      patch.object(RUN, "bounded_run", return_value=(101, capture)),
-                      patch.object(RUN, "remove_role", return_value="removed") as remove_role,
-                      patch.object(RUN.time, "monotonic", return_value=10),
-                      redirect_stdout(output), redirect_stderr(output)):
-                    self.assertEqual(RUN.privileged("/tmp/arx-c13-abcdefgh", 178), 1)
-                self.assertIn(first + "\n", output.getvalue())
-                self.assertIn(diagnostic + "\n", output.getvalue())
-                self.assertIn(owner_exit + "\n", output.getvalue())
-                self.assertNotIn("exit=256", output.getvalue())
+                diagnostics = (
+                    f"{diagnostic}\n{seal}\n{node_busy}\n{read_busy}\n{cleanup}\n{first}\n"
+                    f"{diagnostic} secret=fixture-private-output\n"
+                    f"{diagnostic.replace('unavailable-store-wait', 'fixture-private-output')}\n"
+                    f"{seal.replace('transfer-seal', 'admission-dispatch')}\n"
+                    "C13 diagnostic node=a stage=transfer-seal category=seal"
+                ).encode("ascii")
+                status, output, roles, commands = self.fixture_campaign(101, capture, diagnostics)
+                self.assertEqual(status, 1)
+                self.assertIn(first + "\n", output)
+                self.assertNotIn("C13 diagnostic", output)
+                self.assertEqual([call.args for call in write.call_args_list], [
+                    (11, f"{line}\n".encode("ascii"))
+                    for line in (diagnostic, seal, node_busy, read_busy)
+                ])
+                self.assertIn(owner_exit + "\n", output)
+                self.assertNotIn("exit=256", output)
                 self.assertIn(f"roles_removed={8 if remove else 0} "
-                              f"roles_retained={0 if remove else 8}", output.getvalue())
-                self.assertNotIn("fixture-private-output", output.getvalue())
-                self.assertEqual(remove_role.call_count, 8 if remove else 0)
-                self.assertEqual(command.call_count, 9 if remove else 8)
+                              f"roles_retained={0 if remove else 8}", output)
+                self.assertNotIn("fixture-private-output", output)
+                self.assertEqual(roles, 8 if remove else 0)
+                self.assertEqual(commands, 9 if remove else 8)
+
+    def test_closed_stderr_preserves_success_and_teardown(self):
+        capture = RUN.Capture()
+        capture.feed((RUN.PIN + "\n"
+                      "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 "
+                      "helpers=93 helpers_reaped=93 helper_unknown=0\n").encode("ascii"))
+        diagnostic = b"C13 diagnostic node=d stage=admission-worker category=busy\n"
+        _, write, close = self.optional_pipe(BrokenPipeError)
+        status, output, roles, commands = self.fixture_campaign(0, capture, diagnostic)
+        self.assertEqual(status, 0)
+        self.assertIn("fixture=removed roles_removed=8 roles_retained=0 roles_unknown=0", output)
+        self.assertEqual((roles, commands), (8, 9))
+        write.assert_called_once_with(11, diagnostic)
+        close.assert_called_once_with(11)
+
+    def test_full_stderr_drops_optional_output_on_independent_nonblocking_writer(self):
+        diagnostic = b"C13 diagnostic node=d stage=admission-worker category=busy\n"
+        open_pipe, write, close = self.optional_pipe(BlockingIOError)
+        RUN.relay_diagnostics(diagnostic * 2)
+        open_pipe.assert_called_once_with("/proc/self/fd/10", RUN.os.O_WRONLY | 0x80800)
+        write.assert_called_once_with(11, diagnostic)
+        close.assert_called_once_with(11)
+
+    def test_campaign_diagnostic_read_failure_preserves_mandatory_capture(self):
+        capture = RUN.Capture()
+        capture.feed(b"C13 first phase=join category=assertion\n")
+        with (patch.object(RUN.os, "O_NONBLOCK", 0x800, create=True),
+              patch.object(RUN.os, "O_CLOEXEC", 0x80000, create=True),
+              patch.object(RUN.os, "pipe2", return_value=(10, 11), create=True) as pipe,
+              patch.object(RUN.os, "read", side_effect=BlockingIOError) as read,
+              patch.object(RUN.os, "close") as close,
+              patch.object(RUN, "bounded_run", return_value=(101, capture)) as run):
+            self.assertEqual(RUN.run_campaign(["fixture"], env={}, timeout=1),
+                             (101, capture, b""))
+        pipe.assert_called_once_with(0x80800)
+        run.assert_called_once_with(["fixture"], env={}, timeout=1, stderr=11)
+        read.assert_called_once_with(10, RUN.OUTPUT_LIMIT)
+        self.assertEqual([call.args for call in close.call_args_list], [(11,), (10,)])
 
     def test_workflow_pins_one_runner_only_step(self):
         workflow = (RUN.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

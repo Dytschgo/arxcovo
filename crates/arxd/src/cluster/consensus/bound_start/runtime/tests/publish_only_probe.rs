@@ -1,5 +1,6 @@
 //! Fixed C13-only publication subprocess. It cannot start a retained node.
 use super::super::*;
+use crate::cluster::c13_diagnostics::{endpoint, register_publication_writer};
 use std::{
     fs::File,
     io::Read,
@@ -19,6 +20,8 @@ const PASTE_FD: RawFd = 3;
 #[ignore = "one C13 hosted launch through the fixed inherited pipe"]
 async fn c13_final_publication_only() {
     assert_eq!(std::env::var("ARX_C13_PUBLISH").as_deref(), Ok("1"));
+    // SAFETY: the dedicated child claims the launcher's private optional writer.
+    register_publication_writer(unsafe { endpoint::claim_publication_writer() });
     std::panic::set_hook(Box::new(|panic| {
         c13_failure::report_assertion("publication", file!(), panic);
     }));
