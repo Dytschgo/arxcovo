@@ -4286,6 +4286,7 @@ async fn dispatch_waits_for_applied_store(learner: bool, expire: bool) {
             .unwrap();
     let (mut owner, _) = TransportOwner::pending_founder(CLUSTER, node(2));
     let hold = gate(&owner, Stage::BeforeDispatch);
+    let reply = gate(&owner, Stage::BeforeReply);
     let mut events = events(&owner);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -4325,12 +4326,21 @@ async fn dispatch_waits_for_applied_store(learner: bool, expire: bool) {
         )
         .await;
         if let Some(refusal) = expired {
+            tokio::time::resume();
             assert_eq!(refusal, Err(Refusal::Identity));
             assert!(client.await.is_err());
         } else {
+            // Finish the 4 ms authorization check on the paused clock.
+            // Resume before the reply needs real socket readiness.
+            tokio::select! {
+                result = &mut server => panic!("server finished before reply gate: {result:?}"),
+                reached = observe(&mut events, Event::Stage(Stage::BeforeReply)) => assert!(reached),
+            }
+            tokio::time::resume();
+            release(&owner, Stage::BeforeReply, &reply);
             let (server_result, client_result) = tokio::join!(server, client);
             assert_eq!(server_result, Ok(()));
-            assert!(client_result.is_ok());
+            client_result.expect("client must read a complete reply and clean EOF");
         }
     }
     if expire {
