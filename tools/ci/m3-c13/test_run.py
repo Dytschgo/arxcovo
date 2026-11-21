@@ -2,7 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SPEC = importlib.util.spec_from_file_location("c13_run", Path(__file__).with_name("run.py"))
 RUN = importlib.util.module_from_spec(SPEC)
@@ -77,3 +77,26 @@ class LauncherTests(unittest.TestCase):
         self.assertIsNone(capture.first)
         capture.feed(b"\n")
         self.assertEqual(capture.first, first.decode("ascii"))
+
+    def test_timeout_preserves_first_failure_when_child_cannot_be_reaped(self):
+        record = b"C13 first phase=join category=pipe-io\n"
+        child = MagicMock()
+        child.args = ["fixture"]
+        child.wait.side_effect = RUN.subprocess.TimeoutExpired(child.args, RUN.REAP_GRACE)
+        selector = MagicMock()
+        selector.__enter__.return_value.select.side_effect = TimeoutError
+        with (patch.object(RUN.subprocess, "Popen", return_value=child),
+              patch.object(RUN.selectors, "DefaultSelector", return_value=selector),
+              patch.object(RUN.time, "monotonic", side_effect=[10, 10, 10, 10.8]),
+              patch.object(RUN.os, "set_blocking"),
+              patch.object(RUN, "pipe_capacity", return_value=4096),
+              patch.object(RUN.os, "read", side_effect=[record, BlockingIOError])):
+            code, capture = RUN.bounded_run(child.args, env={}, timeout=1)
+        self.assertIsNone(code)
+        self.assertEqual(capture.first, record.decode("ascii").strip())
+        child.kill.assert_called_once_with()
+        selector.__enter__.return_value.select.assert_called_once_with(1 - RUN.REAP_GRACE)
+        child.wait.assert_called_once()
+        self.assertAlmostEqual(child.wait.call_args.kwargs["timeout"], 0.2)
+        child.__exit__.assert_not_called()
+        child.stdout.__exit__.assert_called_once()

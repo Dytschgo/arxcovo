@@ -607,9 +607,13 @@ fn pty() -> (File, File) {
         0
     );
     // SAFETY: successful openpty returned two newly owned descriptors.
-    (unsafe { File::from_raw_fd(master) }, unsafe {
-        File::from_raw_fd(slave)
-    })
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    // SAFETY: fcntl sets descriptor flags on the live PTY master.
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0
+    );
+    (master, slave)
 }
 
 fn nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
@@ -723,36 +727,117 @@ fn owner_command(
             .and_then(|()| write_bounded(&mut master, b"\r", deadline))
             .unwrap_or_else(|_| refuse("terminal-io"));
     }
-    drop(slave);
-    let mut output = Secret(Vec::new());
-    if input.is_none() {
-        let mut chunk = [0u8; 1024];
-        loop {
-            if Instant::now() >= deadline {
-                refuse("terminal-io");
-            }
-            match master.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) if output.0.len() + n <= 8_802 => output.0.extend_from_slice(&chunk[..n]),
-                Ok(_) => refuse("terminal-io"),
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    wait_io(master.as_raw_fd(), libc::POLLIN, deadline)
-                        .unwrap_or_else(|_| refuse("terminal-io"));
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => refuse("terminal-io"),
-            }
-        }
-    }
+    let mut output = if input.is_some() {
+        Secret(Vec::new())
+    } else {
+        mint_output(&mut master, slave, helpers, deadline).unwrap_or_else(|_| refuse("terminal-io"))
+    };
     let (_, status) = helpers.finish();
     if input.is_none() && status.success() {
-        while output.0.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
-            output.0.pop();
-        }
-        assert!(output.0.starts_with(b"arxje1-") && output.0.len() <= 8_800);
+        assert!(validate_mint_output(&mut output));
     }
     (status, output)
+}
+
+fn validate_mint_output(output: &mut Secret) -> bool {
+    let Some(frame) = output.0.strip_suffix(b"\n") else {
+        return false;
+    };
+    let frame = frame.strip_suffix(b"\r").unwrap_or(frame);
+    let valid = frame.strip_prefix(b"arxje1-").is_some_and(|payload| {
+        !payload.is_empty()
+            && payload.len() % 2 == 0
+            && payload
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    });
+    output.0.truncate(frame.len());
+    valid && output.0.len() <= 8_800
+}
+
+fn mint_output(
+    master: &mut File,
+    slave: File,
+    helpers: &mut Helpers,
+    deadline: Instant,
+) -> io::Result<Secret> {
+    // Keep the slave open while the helper execs and opens its controlling tty.
+    let _slave = slave;
+    let mut output = Secret(Vec::new());
+    let mut chunk = [0; 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let exited = helpers
+            .active
+            .as_mut()
+            .unwrap()
+            .process
+            .try_wait()?
+            .is_some();
+        match master.read(&mut chunk) {
+            Ok(n) if n > 0 && output.0.len() + n <= 8_802 => {
+                output.0.extend_from_slice(&chunk[..n]);
+                continue;
+            }
+            Ok(0) => {}
+            Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => return Err(error),
+        }
+        if exited {
+            return Ok(output);
+        }
+        sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn c13_mint_capture_waits_for_delayed_controlling_tty_open() {
+    let (mut master, slave) = pty();
+    nonblocking(master.as_raw_fd()).unwrap();
+    let fd = slave.as_raw_fd();
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "test ! -e /proc/self/fd/$1 || exit 42; sleep 0.05; printf 'arxje1-abcd\\n' > /dev/tty",
+        "probe",
+        &master.as_raw_fd().to_string(),
+    ]);
+    // SAFETY: the slave is held through exec; the child uses fixed syscalls.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 || libc::ioctl(fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::close(fd);
+            Ok(())
+        });
+    }
+    let mut helpers = Helpers {
+        active: Some(OwnedChild::new(command.spawn().unwrap())),
+        started: 1,
+        ..Helpers::default()
+    };
+    let mut output = mint_output(&mut master, slave, &mut helpers, Instant::now() + WAIT).unwrap();
+    assert!(
+        helpers
+            .active
+            .as_mut()
+            .unwrap()
+            .process
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(validate_mint_output(&mut output));
+    assert!(output.0 == b"arxje1-abcd");
+    assert!(!validate_mint_output(&mut Secret(b"arxje1-abcd".to_vec())));
 }
 
 fn publish_final(probe: &Path, node: &Node, paste: &Secret, helpers: &mut Helpers) {

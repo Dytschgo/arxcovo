@@ -4,11 +4,19 @@ use crate::cluster::consensus::activation::{
     self as activation, Admission, InheritedListeners, Installation, Intent, Route, Running,
 };
 use std::{
-    fs::OpenOptions,
+    collections::BTreeMap,
+    ffi::CString,
+    fs::{File, Metadata, OpenOptions},
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -53,33 +61,147 @@ fn refusal() -> anyhow::Error {
     anyhow::anyhow!("cluster-configuration")
 }
 
-fn disjoint(paths: &[&Path]) -> anyhow::Result<()> {
-    let mut objects = std::collections::HashSet::new();
-    for (i, path) in paths.iter().enumerate() {
-        crate::config::checked_path(path).map_err(|_| refusal())?;
-        if paths[..i]
-            .iter()
-            .any(|other| path.starts_with(other) || other.starts_with(path))
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn object(metadata: &Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+// Each shared ancestor is opened once. All later lookups are relative to
+// those directory handles, including the configuration read and alias checks.
+struct LayoutPass(BTreeMap<PathBuf, (File, Metadata)>);
+
+impl LayoutPass {
+    fn new() -> anyhow::Result<Self> {
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open("/")
+            .map_err(|_| refusal())?;
+        let metadata = root.metadata().map_err(|_| refusal())?;
+        Ok(Self(BTreeMap::from([(
+            PathBuf::from("/"),
+            (root, metadata),
+        )])))
+    }
+
+    fn open(&mut self, path: &Path, config: bool) -> anyhow::Result<bool> {
+        let mut components = path.components();
+        if components.next() != Some(Component::RootDir)
+            || path.as_os_str().as_bytes().len() >= libc::PATH_MAX as usize
         {
             return Err(refusal());
         }
-        let metadata = std::fs::metadata(path).map_err(|_| refusal())?;
-        if !objects.insert((metadata.dev(), metadata.ino())) {
+        let mut prefix = PathBuf::from("/");
+        for part in components {
+            let Component::Normal(part) = part else {
+                return Err(refusal());
+            };
+            let parent = &self.0[&prefix];
+            if !parent.1.is_dir() {
+                return Err(refusal());
+            }
+            let dir = parent.0.as_raw_fd();
+            prefix.push(part);
+            if self.0.contains_key(&prefix) {
+                continue;
+            }
+            let name = CString::new(part.as_bytes()).map_err(|_| refusal())?;
+            let access = if config && prefix == path {
+                libc::O_RDONLY | libc::O_NONBLOCK
+            } else {
+                libc::O_PATH
+            };
+            // SAFETY: dir is a borrowed directory descriptor, and name is a
+            // single NUL-terminated path component. The returned fd is owned.
+            let fd = unsafe {
+                libc::openat(
+                    dir,
+                    name.as_ptr(),
+                    access | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd == -1 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(refusal());
+            }
+            // SAFETY: openat succeeded and returned a new descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata().map_err(|_| refusal())?;
+            if metadata.is_symlink() {
+                return Err(refusal());
+            }
+            self.0.insert(prefix.clone(), (file, metadata));
+        }
+        Ok(true)
+    }
+
+    fn stamp(&self, data: &[u8]) -> ConfigStamp {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update((data.len() as u64).to_be_bytes());
+        digest.update(data);
+        for (path, (_, metadata)) in &self.0 {
+            let path = path.as_os_str().as_bytes();
+            digest.update((path.len() as u64).to_be_bytes());
+            digest.update(path);
+            for value in [
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode().into(),
+                metadata.uid().into(),
+                metadata.gid().into(),
+            ] {
+                digest.update(value.to_be_bytes());
+            }
+        }
+        ConfigStamp(digest.finalize().into())
+    }
+
+    fn ordinary_disjoint(&mut self, root: &Path, paths: &[&Path]) -> anyhow::Result<()> {
+        if paths.iter().any(|path| overlaps(path, root)) {
             return Err(refusal());
         }
+        let exists = self.open(root, false)?;
+        for &path in paths {
+            let entry = object(&self.0[path].1);
+            // A differently named ordinary ancestor can still be the same
+            // object as a protected root (for example through a bind mount).
+            if root
+                .ancestors()
+                .filter_map(|ancestor| self.0.get(ancestor))
+                .any(|(_, metadata)| object(metadata) == entry)
+                || (exists
+                    && path
+                        .ancestors()
+                        .any(|ancestor| object(&self.0[ancestor].1) == object(&self.0[root].1)))
+            {
+                return Err(refusal());
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConfigStamp([u8; 32]);
+
 impl Settings {
-    fn read(path: &Path, uid: u32) -> anyhow::Result<Self> {
-        crate::config::checked_path(path).map_err(|_| refusal())?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|_| refusal())?;
-        let metadata = file.metadata().map_err(|_| refusal())?;
+    fn vetted(
+        path: &Path,
+        uid: u32,
+        ordinary: &[&Path],
+        expected: Option<ConfigStamp>,
+    ) -> anyhow::Result<(Self, ConfigStamp)> {
+        let mut pass = LayoutPass::new()?;
+        if !pass.open(path, true)? {
+            return Err(refusal());
+        }
+        let (file, metadata) = &pass.0[path];
         if uid == 0
             || !metadata.is_file()
             || metadata.nlink() != 1
@@ -95,62 +217,80 @@ impl Settings {
         if data.len() > 16384 {
             return Err(refusal());
         }
-        serde_json::from_slice(&data).map_err(|_| refusal())
-    }
-
-    fn layout(&self, path: &Path, ordinary: &[&Path]) -> anyhow::Result<()> {
-        let socket_dir = self.owner_socket.parent().ok_or_else(refusal)?;
+        let settings: Self = serde_json::from_slice(&data).map_err(|_| refusal())?;
+        if settings.daemon_uid != uid {
+            return Err(refusal());
+        }
+        let socket_dir = settings.owner_socket.parent().ok_or_else(refusal)?;
+        let private = [
+            settings.workspace.as_path(),
+            &settings.state,
+            &settings.credentials,
+            &settings.wrap,
+            &settings.custody,
+            &settings.history,
+        ];
         let paths = [
-            path,
-            &self.workspace,
-            &self.state,
-            &self.credentials,
-            &self.wrap,
-            &self.custody,
-            &self.history,
+            path, private[0], private[1], private[2], private[3], private[4], private[5],
             socket_dir,
         ];
-        disjoint(&paths)?;
-        for path in paths {
-            for &root in ordinary {
-                if path.starts_with(root) || root.starts_with(path) {
-                    return Err(refusal());
-                }
-                if root.exists() {
-                    disjoint(&[path, root])?;
-                } else if let Some(parent) = root.ancestors().skip(1).find(|p| p.exists()) {
-                    crate::config::checked_path(parent).map_err(|_| refusal())?;
-                }
-            }
-        }
-        for directory in [
-            &self.workspace,
-            &self.state,
-            &self.credentials,
-            &self.wrap,
-            &self.custody,
-            &self.history,
-            self.custody.parent().ok_or_else(refusal)?,
-        ] {
-            let metadata = std::fs::symlink_metadata(directory).map_err(|_| refusal())?;
-            if !metadata.is_dir()
-                || metadata.uid() != self.daemon_uid
-                || metadata.mode() & 0o7777 != 0o700
+        for (i, &path) in paths.iter().enumerate().skip(1) {
+            if !pass.open(path, false)?
+                || !pass.0[path].1.is_dir()
+                || paths[..i].iter().any(|other| {
+                    overlaps(path, other) || object(&pass.0[path].1) == object(&pass.0[*other].1)
+                })
             {
                 return Err(refusal());
             }
         }
-        Ok(())
-    }
-
-    fn checked(path: &Path, intent: Intent) -> anyhow::Result<Checked> {
-        // SAFETY: these identity getters take no pointers.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let settings = Self::read(path, uid)?;
-        if settings.daemon_uid != uid || settings.daemon_gid != gid {
+        let custody_parent = settings.custody.parent().ok_or_else(refusal)?;
+        for dir in private.into_iter().chain([custody_parent]) {
+            let metadata = &pass.0[dir].1;
+            if metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
+                return Err(refusal());
+            }
+        }
+        let socket_metadata = &pass.0[socket_dir].1;
+        if socket_metadata.uid() != uid
+            || socket_metadata.gid() != settings.owner_gid
+            || socket_metadata.mode() & 0o7777 != 0o2710
+        {
             return Err(refusal());
         }
-        settings.layout(path, &[])?;
+        if expected.is_some() || !ordinary.is_empty() {
+            // Native activation uses these paths after handoff. Forbid a
+            // third-party writer from moving any component in that layout.
+            for (_, metadata) in pass.0.values().filter(|(_, metadata)| metadata.is_dir()) {
+                let mode = metadata.mode();
+                if ![0, uid].contains(&metadata.uid())
+                    || (mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0))
+                {
+                    return Err(refusal());
+                }
+            }
+        }
+        let stamp = pass.stamp(&data);
+        if expected.is_some_and(|expected| expected != stamp) {
+            return Err(refusal());
+        }
+        for root in ordinary {
+            pass.ordinary_disjoint(root, &paths)?;
+        }
+        Ok((settings, stamp))
+    }
+
+    fn checked(
+        path: &Path,
+        intent: Intent,
+        expected: Option<ConfigStamp>,
+    ) -> anyhow::Result<Checked> {
+        // SAFETY: these identity getters take no pointers.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (settings, _) = Self::vetted(path, uid, &[], expected)?;
+        if settings.daemon_gid != gid {
+            return Err(refusal());
+        }
         let peer = activation::peer_endpoint(&settings.peer).ok_or_else(refusal)?;
         let enrollment = activation::peer_endpoint(&settings.enrollment).ok_or_else(refusal)?;
         if peer.port() == enrollment.port() || peer.ip() != enrollment.ip() {
@@ -351,12 +491,11 @@ pub(crate) struct Lifecycle {
 }
 
 impl Lifecycle {
-    pub(crate) async fn start(
-        path: &Path,
+    async fn start(
+        checked: Checked,
         intent: Intent,
         fence: Arc<Admission>,
     ) -> anyhow::Result<Self> {
-        let checked = Settings::checked(path, intent)?;
         if !fence.check_addresses(checked.installation.peer, checked.installation.enrollment) {
             return Err(refusal());
         }
@@ -495,7 +634,8 @@ impl Lifecycle {
             .ok_or(())
     }
 
-    pub(crate) async fn close(self) -> Result<(), ()> {
+    // Ok records a confirmed owned close and whether work had already refused.
+    async fn close(self) -> Result<bool, ()> {
         if !self.joined {
             return Err(());
         }
@@ -503,13 +643,14 @@ impl Lifecycle {
         let running = work.running.take();
         let failed = work.first.is_some();
         drop(work);
-        let closed = match running {
+        let refused = match running {
             Some(running) => tokio::time::timeout(CLOSE, running.close())
                 .await
-                .is_ok_and(|r| r.is_ok()),
-            None => true,
+                .map_err(|_| ())?
+                .map_err(|_| ())?,
+            None => false,
         };
-        (closed && !failed).then_some(()).ok_or(())
+        Ok(failed || refused)
     }
 }
 
@@ -746,6 +887,8 @@ fn inherited_listeners(intent: Intent) -> Result<InheritedListeners, ()> {
     })
 }
 const READY: u8 = b'R';
+const FAILED: u8 = b'F';
+const UNJOINED: u8 = b'U';
 const STOP: u8 = b'S';
 const JOINED: u8 = b'J';
 const CLOSE_NOW: u8 = b'C';
@@ -781,42 +924,106 @@ async fn process(
     worker: bool,
     inherited: Option<InheritedListeners>,
 ) -> Result<(), ()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     let fence = Arc::new(Admission::with_listeners(inherited));
     let stop = fence.signal();
     let signals = super::unix::Signals::install().map_err(|_| ())?;
     let saw_signal = Shutdown::default();
     let forwarding = tokio::spawn(signals.forward(saw_signal.clone()));
-    let parent = worker.then(worker_control).transpose()?;
-    let (mut reader, mut writer) = parent.map_or((None, None), |stream| {
-        let (reader, writer) = stream.into_split();
-        (Some(reader), Some(writer))
-    });
+    let mut parent = worker.then(worker_control).transpose()?;
+    let mut expected = None;
+    if let Some(stream) = &mut parent {
+        let mut stamp = ConfigStamp([0; 32]);
+        tokio::time::timeout(CLOSE, stream.read_exact(&mut stamp.0))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        expected = Some(stamp);
+    }
+    let checked = Settings::checked(path, intent, expected).map_err(|_| ())?;
     let signal_fence = fence.clone();
     let signal_stop = tokio::spawn(async move {
         saw_signal.cancelled().await;
         signal_fence.stop();
     });
-    let parent_fence = fence.clone();
-    let mut parent_stop = reader.take().map(|mut reader| {
-        tokio::spawn(async move {
-            let valid = matches!(reader.read_u8().await, Ok(STOP));
-            parent_fence.stop();
-            valid.then_some(reader).ok_or(())
-        })
-    });
-    let mut lifecycle = Lifecycle::start(path, intent, fence)
+    let parent = parent.map(|stream| ParentControl::new(stream, fence.clone()));
+    let lifecycle = Lifecycle::start(checked, intent, fence)
         .await
         .map_err(|_| ())?;
+    let result = run_lifecycle(lifecycle, stop, parent).await;
+    signal_stop.abort();
+    forwarding.abort();
+    result
+}
+
+struct ParentControl {
+    stop_received: Arc<std::sync::atomic::AtomicBool>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    stop: tokio::task::JoinHandle<Result<tokio::net::unix::OwnedReadHalf, ()>>,
+}
+
+impl ParentControl {
+    fn new(stream: tokio::net::UnixStream, fence: Arc<Admission>) -> Self {
+        use tokio::io::AsyncReadExt;
+        let (mut reader, writer) = stream.into_split();
+        let stop_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let received = stop_received.clone();
+        let stop = tokio::spawn(async move {
+            let valid = matches!(reader.read_u8().await, Ok(STOP));
+            received.store(valid, std::sync::atomic::Ordering::Release);
+            fence.stop();
+            valid.then_some(reader).ok_or(())
+        });
+        Self {
+            writer,
+            stop,
+            stop_received,
+        }
+    }
+
+    fn stop_received(&self) -> bool {
+        self.stop_received
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn authorize_close(&mut self, joined: bool) -> Result<(), ()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The parent bounds quiesce and its ordinary drain. It closes control
+        // if either is unconfirmed. Waiting on that channel avoids an
+        // independent worker timer expiring during the parent's drain.
+        let mut reader = (&mut self.stop).await.map_err(|_| ())??;
+        self.writer
+            .write_u8(if joined { JOINED } else { UNJOINED })
+            .await
+            .map_err(|_| ())?;
+        (joined && matches!(reader.read_u8().await, Ok(CLOSE_NOW)))
+            .then_some(())
+            .ok_or(())
+    }
+}
+
+impl Drop for ParentControl {
+    fn drop(&mut self) {
+        self.stop.abort();
+    }
+}
+
+async fn run_lifecycle(
+    mut lifecycle: Lifecycle,
+    stop: Shutdown,
+    mut parent: Option<ParentControl>,
+) -> Result<(), ()> {
+    use tokio::io::AsyncWriteExt;
+
     let mut result = Ok(());
-    if let Some(stream) = &mut writer {
+    if let Some(parent) = &mut parent {
         result = tokio::select! {
             biased;
             _ = stop.cancelled() => Ok(()),
             ready = lifecycle.ready() => {
                 if ready.is_ok() && !stop.is_cancelled() {
-                    stream.write_u8(READY).await.map_err(|_| ())
+                    parent.writer.write_u8(READY).await.map_err(|_| ())
                 } else {
                     ready
                 }
@@ -830,44 +1037,24 @@ async fn process(
             _ = lifecycle.stopped_or_failed() => Err(()),
         };
     }
+    lifecycle.fence.stop();
+    if let Some(parent) = &mut parent
+        && (result.is_err() || !parent.stop_received())
+    {
+        let notice = parent.writer.write_u8(FAILED).await.map_err(|_| ());
+        result = result.and(notice);
+    }
     let joined = lifecycle.quiesce().await;
-    result = result.and(joined);
-    let mut parent_drained = writer.is_none() && joined.is_ok();
-    if joined.is_ok()
-        && let (Some(stream), Some(reader)) = (&mut writer, &mut parent_stop)
-    {
-        let disposition = async {
-            let mut reader = reader.await.map_err(|_| ())??;
-            stream.write_u8(JOINED).await.map_err(|_| ())?;
-            matches!(reader.read_u8().await, Ok(CLOSE_NOW))
-                .then_some(())
-                .ok_or(())
-        };
-        let disposition = tokio::time::timeout(CLOSE, disposition)
-            .await
-            .unwrap_or(Err(()));
-        parent_drained = disposition.is_ok();
-        result = result.and(disposition);
-    }
-    // A worker whose parent cannot confirm its ordinary drain exits
-    // unconfirmed with the retained resources still owned until exit.
-    let closed = if parent_drained {
-        lifecycle.close().await
-    } else {
-        Err(())
+    let authorized = match &mut parent {
+        Some(parent) => parent.authorize_close(joined.is_ok()).await,
+        None => joined,
     };
-    result = result.and(closed);
-    if let Some(stream) = writer.as_mut()
-        && result.is_ok()
-    {
-        result = stream.write_u8(CLOSED).await.map_err(|_| ());
+    authorized?;
+    let failed = lifecycle.close().await?;
+    if let Some(parent) = &mut parent {
+        parent.writer.write_u8(CLOSED).await.map_err(|_| ())?;
     }
-    signal_stop.abort();
-    forwarding.abort();
-    if let Some(task) = parent_stop {
-        task.abort();
-    }
-    result
+    result.and((!failed).then_some(()).ok_or(()))
 }
 
 #[derive(Clone, Copy)]
@@ -945,11 +1132,6 @@ impl Child {
         {
             return Err(ExitCode::Config);
         }
-        let settings =
-            Settings::read(&launch.config, launch.daemon_uid).map_err(|_| ExitCode::Config)?;
-        if settings.daemon_uid != launch.daemon_uid || settings.daemon_gid != launch.daemon_gid {
-            return Err(ExitCode::Config);
-        }
         let mut ordinary = layout
             .private_dirs()
             .iter()
@@ -958,9 +1140,12 @@ impl Child {
         ordinary.push(layout.binary().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(layout.endpoint().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(Path::new(service.workspace()));
-        settings
-            .layout(&launch.config, &ordinary)
-            .map_err(|_| ExitCode::Layout)?;
+        let (settings, stamp) =
+            Settings::vetted(&launch.config, launch.daemon_uid, &ordinary, None)
+                .map_err(|_| ExitCode::Config)?;
+        if settings.daemon_gid != launch.daemon_gid {
+            return Err(ExitCode::Config);
+        }
 
         let mut command =
             std::process::Command::new(std::env::current_exe().map_err(|_| ExitCode::Layout)?);
@@ -972,21 +1157,29 @@ impl Child {
         Self::spawn_worker(
             command,
             WorkerIdentity::Dedicated(launch.daemon_uid, launch.daemon_gid),
+            Some(stamp),
         )
     }
 
     fn spawn_worker(
         mut command: std::process::Command,
         identity: WorkerIdentity,
+        stamp: Option<ConfigStamp>,
     ) -> Result<Self, super::ExitCode> {
         use super::ExitCode;
         use std::os::fd::AsRawFd;
         use std::{os::unix::process::CommandExt, process::Stdio};
-        let (parent, child) =
+        let (mut parent, child) =
             std::os::unix::net::UnixStream::pair().map_err(|_| ExitCode::Permissions)?;
         parent
             .set_nonblocking(true)
             .map_err(|_| ExitCode::Permissions)?;
+        if let Some(stamp) = stamp {
+            use std::io::Write;
+            parent
+                .write_all(&stamp.0)
+                .map_err(|_| ExitCode::Permissions)?;
+        }
         let control =
             tokio::net::UnixStream::from_std(parent).map_err(|_| ExitCode::Permissions)?;
         command
@@ -1032,8 +1225,11 @@ impl Child {
             .ok_or(super::ExitCode::Endpoint)
     }
 
-    pub(super) async fn exited(&mut self) -> Result<(), super::ExitCode> {
-        let _ = self.reap().await;
+    pub(super) async fn failed_or_exited(&mut self) -> Result<(), super::ExitCode> {
+        use tokio::io::AsyncReadExt;
+        // A failure byte or a lost control connection starts ordinary drain.
+        // Reap belongs to finish, after the drain and close decision.
+        let _ = self.control.read_u8().await;
         Err(super::ExitCode::Endpoint)
     }
 
@@ -1059,7 +1255,7 @@ impl Child {
             .map_err(|_| super::ExitCode::Endpoint)?;
         loop {
             match self.control.read_u8().await {
-                Ok(READY) => continue,
+                Ok(READY | FAILED) => continue,
                 Ok(JOINED) => {
                     self.joined = true;
                     return Ok(());
@@ -1080,9 +1276,11 @@ impl Child {
         .unwrap_or(false);
         let _ = self.control.shutdown().await;
         let reaped = self.observe_reap().await;
-        (closed && reaped)
-            .then_some(())
-            .ok_or(super::ExitCode::Store)
+        match (closed, self.reaped, reaped) {
+            (true, _, true) => Ok(()),
+            (true, Some(_), false) => Err(super::ExitCode::Endpoint),
+            _ => Err(super::ExitCode::Store),
+        }
     }
     pub(super) async fn finish_after_drain(
         &mut self,
@@ -1110,7 +1308,7 @@ impl Child {
 
 #[cfg(test)]
 pub(crate) fn publication_inputs(path: &Path) -> Result<(Installation, Vec<Route>), ()> {
-    let checked = Settings::checked(path, Intent::Join).map_err(|_| ())?;
+    let checked = Settings::checked(path, Intent::Join, None).map_err(|_| ())?;
     Ok((checked.installation, checked.routes))
 }
 

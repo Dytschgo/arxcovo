@@ -14,7 +14,14 @@ private control socket and inherits standard error. Its standard input
 and output are null. No other descriptor is inherited. Real and
 effective IDs are checked after setting the UID and GID and clearing
 supplementary groups. The worker accepts control only from the root
-parent identified by kernel peer credentials.
+parent identified by kernel peer credentials. Over that channel the parent
+provides a digest of the exact configuration bytes and the device, inode,
+owner and mode of each protected path component. The parent checks
+separation from ordinary roots in the same descriptor-relative pass. The
+worker repeats the protected walk and requires the same evidence before
+binding owner control. Native startup requires namespace components
+controlled by root or the dedicated daemon identity. The layout stays
+fixed while the worker uses it.
 
 The retained lifecycle holds the owner-local endpoint, pending Join,
 admission and issuer work and its retained cluster job. Cluster
@@ -33,11 +40,15 @@ signer through checked sealed custody. Confirmed voter history is prior
 installation evidence. The existing guarded live proof still controls
 issuer activation and use.
 
-Foreground handles SIGINT and SIGTERM. Service shutdown first waits
-for the child to stop and join its owner work, drains the ordinary
-service resources, then tells the child to close the retained cluster
-job. The root parent checks the final worker result and observes
-actual child exit. Missing or nonclean outcomes are failures.
+Foreground handles SIGINT and SIGTERM. A supervised worker reports refusal
+over its control socket while retaining its cluster resources. The parent
+requests stop and waits for the owner-work join, drains ordinary service
+resources, then authorizes the retained cluster close. The worker waits for
+that authorization or a closed control channel. The parent observes the
+close acknowledgement and actual child exit separately. A confirmed
+founder close after refusal earns the acknowledgement and the worker
+still exits with failure. An unconfirmed close or a learner's retained
+outer lock prevents the acknowledgement.
 
 Foreground can explicitly adopt TCP descriptors 3 and 4. It checks the
 exec-time descriptor inventory, socket type, protocol, family, listen state

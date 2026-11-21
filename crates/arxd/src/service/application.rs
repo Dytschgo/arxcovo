@@ -360,7 +360,7 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         let returned = if let Some(cluster) = self.cluster.as_mut() {
             tokio::select! {
                 returned = task => returned,
-                returned = cluster.exited() => return returned,
+                returned = cluster.failed_or_exited() => return returned,
             }
         } else {
             task.await

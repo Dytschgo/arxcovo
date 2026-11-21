@@ -15,22 +15,6 @@ fn private_prefixes_reject_bad_masks_and_ipv4_boundary_hosts() {
     assert!(!covers(route, v4("fd00:124::9")));
 }
 
-#[test]
-fn runtime_rejects_overlapping_or_substituted_layouts() {
-    let root = tempfile::tempdir().unwrap();
-    let a = root.path().join("a");
-    let b = root.path().join("b");
-    let c = a.join("c");
-    std::fs::create_dir_all(&c).unwrap();
-    std::fs::create_dir(&b).unwrap();
-    assert!(disjoint(&[&a, &b]).is_ok());
-    assert!(disjoint(&[&a, &a]).is_err());
-    assert!(disjoint(&[&a, &c]).is_err());
-    let link = root.path().join("link");
-    std::os::unix::fs::symlink(&b, &link).unwrap();
-    assert!(disjoint(&[&a, &link]).is_err());
-}
-
 fn supervisor_worker(root: &Path, behavior: &str) -> Child {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -99,7 +83,7 @@ with socket.socket(fileno=3) as control:
             &usize::from(uid != 0).to_string(),
         ])
         .arg(root.join("lock"));
-    Child::spawn_worker(command, identity).unwrap()
+    Child::spawn_worker(command, identity, None).unwrap()
 }
 
 #[tokio::test]
@@ -143,14 +127,15 @@ async fn supervisor_does_not_accept_close_frame_as_readiness() {
     let root = tempfile::tempdir().unwrap();
     let mut child = supervisor_worker(root.path(), "refuse");
     assert!(child.wait_ready().await.is_err());
-    assert!(child.exited().await.is_err());
+    assert!(child.failed_or_exited().await.is_err());
+    assert!(!child.observe_reap().await);
     assert_eq!(child.reaped.unwrap().code(), Some(41));
 }
 
 #[tokio::test]
 async fn foreground_founder_attach_refusal_waits_for_admitted_owner_task() {
     let fence = Arc::new(Admission::default());
-    let (running, mut cluster_closed) = activation::refused_founder_for_test(&fence);
+    let (running, mut cluster_closed) = activation::refused_founder_for_test(&fence, true);
     let (finish_owner, owner_work) = tokio::sync::oneshot::channel();
     let (admitted, admission) = tokio::sync::oneshot::channel();
     let owner = tokio::spawn(async move {
@@ -164,7 +149,7 @@ async fn foreground_founder_attach_refusal_waits_for_admitted_owner_task() {
         work: Arc::new(Mutex::new(Work {
             waiting: None,
             running: Some(running),
-            first: Some(activation::Error::Listener),
+            first: None,
         })),
         fence: fence.clone(),
         joined: false,
@@ -183,7 +168,7 @@ async fn foreground_founder_attach_refusal_waits_for_admitted_owner_task() {
     ));
     finish_owner.send(()).unwrap();
     cluster_closed.await.unwrap();
-    assert_eq!(closing.await.unwrap(), Err(()));
+    assert_eq!(closing.await.unwrap(), Ok(true));
 }
 
 #[test]
@@ -203,9 +188,9 @@ fn inherited_listener_refuses_wrong_address_and_non_listening_descriptors() {
     assert!(qualify_listener(unix.as_raw_fd(), None, true).is_err());
 }
 
-struct FailingDrain(Child);
+struct DrainProbe(Child, bool, Option<Result<(), super::super::ExitCode>>);
 
-impl crate::service::Application for FailingDrain {
+impl crate::service::Application for DrainProbe {
     async fn load_config(&mut self) -> Result<(), super::super::ExitCode> {
         Ok(())
     }
@@ -233,10 +218,17 @@ impl crate::service::Application for FailingDrain {
     }
     async fn drain(&mut self) -> Result<(), super::super::ExitCode> {
         self.0.quiesce().await?;
-        Err(super::super::ExitCode::Store)
+        assert!(self.0.process.try_wait().unwrap().is_none());
+        if self.1 {
+            Err(super::super::ExitCode::Store)
+        } else {
+            Ok(())
+        }
     }
     async fn finish_after_drain(&mut self, drained: bool) -> Result<(), super::super::ExitCode> {
-        self.0.finish_after_drain(drained).await
+        let result = self.0.finish_after_drain(drained).await;
+        self.2 = Some(result);
+        result
     }
     async fn service_stop(&mut self) -> Result<(), super::super::ExitCode> {
         Ok(())
@@ -248,23 +240,278 @@ impl crate::service::Application for FailingDrain {
 
 #[tokio::test]
 async fn service_drain_error_denies_close_now_and_still_reaps_child() {
-    use crate::service::{ExitCode, Host, Reporter, State};
+    use crate::service::{ExitCode, Host};
     use std::os::unix::fs::PermissionsExt;
-    struct Silent;
-    impl Reporter for Silent {
-        fn report(&mut self, _: State, _: ExitCode) -> Result<(), ExitCode> {
-            Ok(())
-        }
-    }
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = root.path().join("lock");
     std::fs::write(&path, "").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-    let mut application = FailingDrain(supervisor_worker(root.path(), "drain-refuse"));
+    let mut application = DrainProbe(supervisor_worker(root.path(), "drain-refuse"), true, None);
     assert_eq!(
         Host::run(&mut application, Shutdown::default(), &mut Silent).await,
         ExitCode::Endpoint
     );
     assert_eq!(application.0.reaped.unwrap().code(), Some(43));
+}
+
+#[tokio::test]
+async fn worker_refusal_reports_before_stop_and_waits_for_close_authorization() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (initial, confirmed) in [
+        (Status::Refused, true),
+        (Status::Pending, true),
+        (Status::Pending, false),
+    ] {
+        let fence = Arc::new(Admission::default());
+        let (running, mut cluster_closed) = activation::refused_founder_for_test(&fence, confirmed);
+        let (status, receiver) = watch::channel(initial);
+        let lifecycle = Lifecycle {
+            work: Arc::new(Mutex::new(Work {
+                waiting: None,
+                running: Some(running),
+                first: Some(activation::Error::Listener),
+            })),
+            fence: fence.clone(),
+            joined: false,
+            status: receiver,
+            control: cluster_owner::Control::observe_task(tokio::spawn(async { Ok(()) })),
+            supervisor: tokio::spawn(async {}),
+        };
+        let (mut parent, worker) = tokio::net::UnixStream::pair().unwrap();
+        let stop = fence.signal();
+        let worker = ParentControl::new(worker, fence);
+        let task = tokio::spawn(run_lifecycle(lifecycle, stop, Some(worker)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if initial == Status::Pending {
+                assert_eq!(parent.read_u8().await.unwrap(), READY);
+                status.send_replace(Status::Refused);
+            }
+            assert_eq!(parent.read_u8().await.unwrap(), FAILED);
+            assert!(!task.is_finished());
+            parent.write_u8(STOP).await.unwrap();
+            assert_eq!(parent.read_u8().await.unwrap(), JOINED);
+            assert!(matches!(
+                cluster_closed.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!task.is_finished());
+            parent.write_u8(CLOSE_NOW).await.unwrap();
+            cluster_closed.await.unwrap();
+            if confirmed {
+                assert_eq!(parent.read_u8().await.unwrap(), CLOSED);
+            } else {
+                assert_eq!(parent.read(&mut [0; 1]).await.unwrap(), 0);
+            }
+            assert_eq!(task.await.unwrap(), Err(()));
+        })
+        .await
+        .unwrap();
+    }
+}
+
+struct Silent;
+
+impl crate::service::Reporter for Silent {
+    fn report(
+        &mut self,
+        _: crate::service::State,
+        _: crate::service::ExitCode,
+    ) -> Result<(), crate::service::ExitCode> {
+        Ok(())
+    }
+}
+
+fn fixture_worker(selector: &str, cwd: &Path, stamp: Option<ConfigStamp>) -> Child {
+    // SAFETY: scalar identity getters take no pointers.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let identity = if uid == 0 {
+        WorkerIdentity::Dedicated(65534, 65534)
+    } else {
+        WorkerIdentity::Inherited(uid, gid)
+    };
+    let mut command = std::process::Command::new("/proc/self/exe");
+    command
+        .current_dir(cwd)
+        .args([selector, "--exact", "--ignored", "--nocapture"]);
+    Child::spawn_worker(command, identity, stamp).unwrap()
+}
+
+const REFUSAL_FIXTURE: &str = "service::cluster_runtime::tests::refused_worker_fixture";
+
+#[tokio::test]
+#[ignore = "spawned by the parent shutdown control"]
+async fn refused_worker_fixture() {
+    use std::os::fd::FromRawFd;
+    // SAFETY: spawn_worker transferred ownership of the fixed control FD.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(CONTROL_FD) };
+    stream.set_nonblocking(true).unwrap();
+    let fence = Arc::new(Admission::default());
+    let (running, closed) = activation::refused_founder_for_test(&fence, true);
+    let (_sender, status) = watch::channel(Status::Refused);
+    let lifecycle = Lifecycle {
+        work: Arc::new(Mutex::new(Work {
+            waiting: None,
+            running: Some(running),
+            first: None,
+        })),
+        fence: fence.clone(),
+        joined: false,
+        status,
+        control: cluster_owner::Control::observe_task(tokio::spawn(async { Ok(()) })),
+        supervisor: tokio::spawn(async {}),
+    };
+    let parent = ParentControl::new(
+        tokio::net::UnixStream::from_std(stream).unwrap(),
+        fence.clone(),
+    );
+    assert_eq!(
+        run_lifecycle(lifecycle, fence.signal(), Some(parent)).await,
+        Err(())
+    );
+    closed.await.unwrap();
+    std::process::exit(41);
+}
+
+#[tokio::test]
+async fn service_parent_drains_and_reaps_refused_worker_after_confirmed_close() {
+    use crate::service::{ExitCode, Host};
+    let child = fixture_worker(REFUSAL_FIXTURE, Path::new("/"), None);
+    let mut application = DrainProbe(child, false, None);
+    assert_eq!(
+        Host::run(&mut application, Shutdown::default(), &mut Silent).await,
+        ExitCode::Endpoint
+    );
+    assert_eq!(application.2, Some(Err(ExitCode::Endpoint)));
+    assert_eq!(application.0.reaped.unwrap().code(), Some(41));
+}
+
+fn private_fixture() -> (tempfile::TempDir, u32, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: scalar identity getters take no pointers.
+    let (effective_uid, effective_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let (uid, gid) = if effective_uid == 0 {
+        (65534, 65534)
+    } else {
+        (effective_uid, effective_gid)
+    };
+    let root = tempfile::tempdir().unwrap();
+    let qualify = |path: &Path, mode| {
+        if effective_uid == 0 {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid)).unwrap();
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let path = |name| root.path().join(name);
+    for (name, mode) in [
+        ("workspace", 0o700),
+        ("state", 0o700),
+        ("credentials", 0o700),
+        ("wrap", 0o700),
+        ("pki", 0o700),
+        ("pki/custody", 0o700),
+        ("history", 0o700),
+        ("control", 0o2710),
+    ] {
+        let dir = path(name);
+        std::fs::create_dir(&dir).unwrap();
+        qualify(&dir, mode);
+    }
+    let config = path("cluster.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "workspace": path("workspace"), "state": path("state"),
+            "credentials": path("credentials"), "wrap": path("wrap"),
+            "custody": path("pki/custody"), "history": path("history"),
+            "owner_socket": path("control/owner"), "peer": "192.168.1.9:2000",
+            "enrollment": "192.168.1.9:2001", "owner_uid": 1, "daemon_uid": uid,
+            "daemon_gid": gid, "agent_uid": 3, "build_uid": 4, "owner_gid": gid,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    qualify(&config, 0o600);
+    qualify(root.path(), 0o700);
+    (root, uid, config)
+}
+
+#[test]
+fn worker_config_stamp_rejects_in_place_edit_and_object_replacement() {
+    let (root, uid, config) = private_fixture();
+    let (_, stamp) = Settings::vetted(&config, uid, &[], None).unwrap();
+    assert!(Settings::vetted(&config, uid, &[], Some(stamp)).is_ok());
+    assert!(Settings::vetted(&config, uid, &[&root.path().join("state/ordinary")], None).is_err());
+    let alias = root.path().join("ordinary-link");
+    std::os::unix::fs::symlink(root.path().join("state"), &alias).unwrap();
+    assert!(Settings::vetted(&config, uid, &[&alias], None).is_err());
+
+    let contents = std::fs::read(&config).unwrap();
+    let edited = [contents.as_slice(), b"\n"].concat();
+    std::fs::write(&config, edited).unwrap();
+    assert!(Settings::vetted(&config, uid, &[], None).is_ok());
+    assert!(Settings::vetted(&config, uid, &[], Some(stamp)).is_err());
+    std::fs::write(&config, contents).unwrap();
+    let original = root.path().join("original.json");
+    std::fs::rename(&config, &original).unwrap();
+    std::fs::copy(&original, &config).unwrap();
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        let metadata = std::fs::metadata(original).unwrap();
+        std::os::unix::fs::chown(&config, Some(uid), Some(metadata.gid())).unwrap();
+    }
+    assert!(Settings::vetted(&config, uid, &[], None).is_ok());
+    assert!(Settings::vetted(&config, uid, &[], Some(stamp)).is_err());
+}
+
+const CONFIG_FIXTURE: &str = "service::cluster_runtime::tests::config_worker_fixture";
+
+#[tokio::test]
+#[ignore = "spawned by the parent layout substitution control"]
+async fn config_worker_fixture() {
+    use std::os::fd::FromRawFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // SAFETY: spawn_worker transferred ownership of the fixed control FD.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(CONTROL_FD) };
+    stream.set_nonblocking(true).unwrap();
+    let mut stream = tokio::net::UnixStream::from_std(stream).unwrap();
+    let mut stamp = ConfigStamp([0; 32]);
+    stream.read_exact(&mut stamp.0).await.unwrap();
+    // SAFETY: geteuid takes no pointers.
+    let uid = unsafe { libc::geteuid() };
+    let path = std::env::current_dir().unwrap().join("cluster.json");
+    assert!(Settings::vetted(&path, uid, &[], None).is_ok());
+    if Settings::vetted(&path, uid, &[], Some(stamp)).is_err() {
+        std::process::exit(42);
+    }
+    stream.write_u8(READY).await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_config_stamp_rejects_replaced_layout_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, uid, config) = private_fixture();
+    let ordinary = root.path().join("absent-ordinary");
+    let (_, stamp) = Settings::vetted(&config, uid, &[&ordinary], None).unwrap();
+    let check = |stamp| fixture_worker(CONFIG_FIXTURE, root.path(), Some(stamp));
+    let mut original = check(stamp);
+    assert!(original.wait_ready().await.is_ok());
+    assert!(original.observe_reap().await);
+    let ancestor = root.path().join("pki");
+    let moved = root.path().join("pki-original");
+    std::fs::rename(&ancestor, &moved).unwrap();
+    std::fs::create_dir(&ancestor).unwrap();
+    let metadata = std::fs::metadata(&moved).unwrap();
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(&ancestor, Some(uid), Some(metadata.gid())).unwrap();
+    }
+    std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(moved.join("custody"), ancestor.join("custody")).unwrap();
+    let mut replaced = check(stamp);
+    assert!(replaced.wait_ready().await.is_err());
+    assert!(!replaced.observe_reap().await);
+    assert_eq!(replaced.reaped.unwrap().code(), Some(42));
+    assert!(!root.path().join("control/owner").exists());
 }

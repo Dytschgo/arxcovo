@@ -97,6 +97,7 @@ pub(crate) enum Error {
     Issuer,
     Listener,
     Close,
+    LearnerLockRetained,
 }
 
 pub(super) enum RecoveryHold {
@@ -359,21 +360,23 @@ impl Running {
         }
     }
 
-    pub(crate) async fn close(self) -> Result<(), Error> {
+    pub(crate) async fn close(self) -> Result<bool, Error> {
         if let Some(learner) = self.learner {
-            return learner
-                .close(false)
-                .await
-                .map(|_| ())
-                .map_err(|_| Error::Close);
+            return learner.close(false).await.map(|_| false).map_err(|_| {
+                if self.job.observe().status() == Status::ClosedAfterLearnerRefusal {
+                    Error::LearnerLockRetained
+                } else {
+                    Error::Close
+                }
+            });
         }
         self.job.request_close();
         let supervisor = self.supervisor.ok_or(Error::Close)?;
         supervisor.await.map_err(|_| Error::Close)?;
-        if self.job.observe().status() == Status::Clean {
-            Ok(())
-        } else {
-            Err(Error::Close)
+        match self.job.observe().status() {
+            Status::Clean => Ok(false),
+            Status::ClosedAfterFounderRefusal => Ok(true),
+            _ => Err(Error::Close),
         }
     }
 
@@ -414,33 +417,26 @@ impl Running {
             && strict
             && !self.strict_written
         {
-            learner
-                .persist_strict_history()
-                .map_err(|_| Error::History)?;
-            self.strict_written = true;
-        }
-        let (leader, candidates) = self.leader_and_transfer_targets();
-        if leader && strict && !self.enrollment_started {
-            if self.learner.is_some() {
-                if !self.voter_custody() {
+            use enrollment_ingress::ActivationError::{Deferred, Refused};
+            match learner.persist_strict_history() {
+                Ok(()) => self.strict_written = true,
+                Err(Deferred) => {
                     return Ok(Readiness {
-                        strict,
+                        strict: false,
                         issuer: false,
                         transferred: self.transfer_done,
                     });
                 }
-                self.job
-                    .activate_promoted_issuer()
-                    .await
-                    .map_err(|_| Error::Issuer)?;
+                Err(Refused) => return Err(Error::History),
             }
-            self.job
-                .start_enrollment(
-                    #[cfg(test)]
-                    None,
-                )
-                .map_err(|_| Error::Listener)?;
-            self.enrollment_started = true;
+        }
+        let (leader, candidates) = self.leader_and_transfer_targets();
+        if leader && strict && !self.enrollment_started && !self.start_issuer().await? {
+            return Ok(Readiness {
+                strict,
+                issuer: false,
+                transferred: self.transfer_done,
+            });
         }
         if self.fresh_founder
             && !self.transfer_done
@@ -462,6 +458,38 @@ impl Running {
             issuer,
             transferred: self.transfer_done,
         })
+    }
+
+    async fn start_issuer(&mut self) -> Result<bool, Error> {
+        use enrollment_ingress::ActivationError::{Deferred, Refused};
+        if self.learner.is_some() {
+            if !self.voter_custody() {
+                return Ok(false);
+            }
+            match self.job.activate_promoted_issuer().await {
+                Ok(()) => {}
+                Err(Deferred) => return Ok(false),
+                Err(Refused) => return Err(Error::Issuer),
+            }
+        }
+        match self.job.start_enrollment(
+            #[cfg(test)]
+            None,
+        ) {
+            Ok(()) => {
+                self.enrollment_started = true;
+                Ok(true)
+            }
+            Err(Deferred) => {
+                if self.learner.is_some() {
+                    // Renewal must earn a fresh quorum proof for the next
+                    // attempt rather than reuse authority from an old epoch.
+                    self.job.state().issuer.take();
+                }
+                Ok(false)
+            }
+            Err(Refused) => Err(Error::Listener),
+        }
     }
 
     fn leader_and_transfer_targets(&self) -> (bool, Option<[u64; 2]>) {
@@ -567,6 +595,7 @@ mod tests;
 #[cfg(test)]
 pub(crate) fn refused_founder_for_test(
     fence: &Admission,
+    confirmed: bool,
 ) -> (Running, tokio::sync::oneshot::Receiver<()>) {
     let job = Job::anchor();
     fence.register(job);
@@ -578,7 +607,7 @@ pub(crate) fn refused_founder_for_test(
     let supervisor = tokio::spawn(async move {
         job.close.notified().await;
         assert!(job.begin_close());
-        job.finish_close(None, true, false);
+        job.finish_close(None, confirmed, false);
         closed.send(()).unwrap();
     });
     (Running::founder(job, Some(supervisor), false), observed)

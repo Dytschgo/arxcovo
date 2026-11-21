@@ -28,6 +28,7 @@ ROOT_TEARDOWN = 14
 OUTER_MARGIN = 6
 CAMPAIGN_TIMEOUT = 124  # 102 s work + 17 s joined cleanup + process margin.
 OUTPUT_LIMIT = 32_768
+REAP_GRACE = 0.25
 CLEANUP = re.compile(
     r"C13 cleanup spawned=([0-6]) signaled=([0-6]) reaped=([0-6]) clean=([0-6]) "
     r"helpers=(\d{1,4}) helpers_reaped=(\d{1,4}) helper_unknown=([01])"
@@ -190,30 +191,41 @@ class Capture:
         return self.bulk.decode("utf-8", errors="replace")
 
 
-def bounded_run(args, *, env, timeout):
+def pipe_capacity(fd):
     import fcntl
+    return fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
 
+
+def bounded_run(args, *, env, timeout):
     capture = Capture()
     deadline = time.monotonic() + timeout
-    with subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL) as process, selectors.DefaultSelector() as sel:
+    work_deadline = deadline - REAP_GRACE
+    remaining(work_deadline, timeout)
+    process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    # Popen's context exit waits implicitly. Own the pipe separately so an
+    # unobserved child cannot extend either exit path.
+    with process.stdout, selectors.DefaultSelector() as sel:
         fd = process.stdout.fileno()
         os.set_blocking(fd, False)
         sel.register(fd, selectors.EVENT_READ)
         try:
-            while sel.select(remaining(deadline, timeout)):
+            while sel.select(remaining(work_deadline, timeout)):
                 data = os.read(fd, 4096)
                 if not data:
                     break
                 capture.feed(data)
-            code = process.wait(timeout=remaining(deadline, timeout))
+            code = process.wait(timeout=remaining(work_deadline, timeout))
         except (TimeoutError, subprocess.TimeoutExpired):
             process.kill()
-            process.wait()
+            try:
+                process.wait(timeout=remaining(deadline, REAP_GRACE))
+            except (TimeoutError, subprocess.TimeoutExpired):
+                pass  # Disposition stays unknown whether reap succeeded or timed out.
             code = None
             # Retain already-written records even at the deadline. Bound this
             # drain to one pipe capacity in case a descendant kept stdout.
-            pending = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+            pending = pipe_capacity(fd)
             while pending:
                 try:
                     data = os.read(fd, min(pending, 4096))

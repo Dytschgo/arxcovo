@@ -69,3 +69,27 @@ fn membership_coverage_uses_index_and_exact_position_at_equality() {
     ));
     assert!(covers_log(id(LogPos { index: 9, ..target }), id(target)));
 }
+
+#[test]
+fn issuer_activation_defers_only_transient_authority_failures() {
+    use crate::cluster::consensus::ReadError;
+    use enrollment_ingress::ActivationError::{self, Deferred, Refused};
+    use membership_observation::MembershipReadError;
+    for transient in [ReadError::Busy, ReadError::NotLeader, ReadError::NoQuorum] {
+        assert_eq!(ActivationError::from(transient), Deferred);
+    }
+    assert_eq!(ActivationError::from(ReadError::Unavailable), Refused);
+    for transient in [
+        MembershipReadError::Busy,
+        MembershipReadError::NotLeader,
+        MembershipReadError::RetryLater,
+    ] {
+        assert_eq!(ActivationError::from(transient), Deferred);
+    }
+    for terminal in [
+        MembershipReadError::Unavailable,
+        MembershipReadError::PeerRefused,
+    ] {
+        assert_eq!(ActivationError::from(terminal), Refused);
+    }
+}
