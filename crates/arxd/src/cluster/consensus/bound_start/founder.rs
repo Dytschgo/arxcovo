@@ -74,6 +74,7 @@ pub(super) mod linux {
     use super::*;
     use crate::cluster::consensus::bound_start::*;
     use crate::cluster::{
+        c13_diagnostics::record,
         enrollment::{BoundVoters, ClusterId, KeyDigest, NodeId},
         issuance_publication,
         join_receipt::Origin,
@@ -83,6 +84,7 @@ pub(super) mod linux {
     };
     use checked_clock::HostClock;
     use issue::found::{FOUNDER, FoundError};
+    use membership_observation::MembershipReadError;
     use peer_network::EngineDispatch;
     use peer_transport::{self, Credentials, TransportOwner};
     use rustls::{pki_types::UnixTime, time_provider::TimeProvider};
@@ -722,7 +724,6 @@ pub(super) mod linux {
                 .is_some_and(|node| node == address))
     }
 
-    use membership_observation::MembershipReadError;
     use peer_transport::Refusal as TransferRefusal;
 
     fn retryable_offer(error: MembershipReadError) -> bool {
@@ -774,6 +775,7 @@ pub(super) mod linux {
         loop {
             let (live, current) = transfer_binding(job)?;
             if !Arc::ptr_eq(&node, &live) || identity != current {
+                record("transfer-seal", "offer-changed");
                 return Err(R::Identity);
             }
             let read = node.try_lock().map(|node| {
@@ -782,7 +784,7 @@ pub(super) mod linux {
                 }
                 start_read(&node, cluster, root, target)
             });
-            let refusal = match read {
+            let (refusal, category) = match read {
                 Ok(Ok(read)) => {
                     // Once admitted, the fresh read keeps its existing budget.
                     match read.await {
@@ -792,27 +794,41 @@ pub(super) mod linux {
                                 || !Arc::ptr_eq(&node, &live)
                                 || identity != current
                             {
+                                record("transfer-seal", "offer-changed");
                                 return Err(R::Identity);
                             }
                             return Ok((offer, node));
                         }
-                        Err(error) if retryable_offer(error) => R::Identity,
+                        Err(error) if retryable_offer(error) => {
+                            (R::Identity, offer_category(error))
+                        }
                         Err(error) => {
                             #[cfg(test)]
                             eprintln!("issuer transfer fresh membership refused: {error:?}");
-                            let _ = error;
+                            record("transfer-seal", offer_category(error));
                             return Err(R::Identity);
                         }
                     }
                 }
-                Ok(Err(error)) if retryable_offer(error) => R::Identity,
-                Ok(Err(_)) => return Err(R::Identity),
-                Err(_) => R::Busy,
+                Ok(Err(error)) if retryable_offer(error) => (R::Identity, offer_category(error)),
+                Ok(Err(error)) => {
+                    record("transfer-seal", offer_category(error));
+                    return Err(R::Identity);
+                }
+                Err(_) => (R::Busy, "offer-node-busy"),
             };
             if !peer_registry::poll_store_until(retry_until).await {
+                record("transfer-seal", category);
                 return Err(refusal);
             }
             retrying = true;
+        }
+    }
+
+    fn offer_category(error: MembershipReadError) -> &'static str {
+        match error {
+            MembershipReadError::Busy => "offer-fresh-read-busy",
+            _ => "offer-read",
         }
     }
 
@@ -856,7 +872,9 @@ pub(super) mod linux {
 
     enum SealError {
         Retry(TransferRefusal),
+        RetryRecheck(&'static str),
         Refused(TransferRefusal),
+        RefusedWithDiagnostic(TransferRefusal, &'static str),
     }
 
     impl From<TransferRefusal> for SealError {
@@ -892,6 +910,7 @@ pub(super) mod linux {
         seal: impl Fn(&N, Option<Instant>) -> Result<T, SealError>,
     ) -> Result<T, TransferRefusal> {
         if current != expected {
+            record("transfer-seal", "offer-changed");
             return Err(TransferRefusal::Identity);
         }
         let retry_until = Instant::now() + peer_registry::STORE_WAIT;
@@ -899,7 +918,7 @@ pub(super) mod linux {
         loop {
             check_seal_deadline(acquisition_deadline)?;
             check_open(acquisition_deadline)?;
-            let refusal = match node.try_lock() {
+            let error = match node.try_lock() {
                 Ok(node) => {
                     check_seal_deadline(acquisition_deadline)?;
                     match seal(&node, acquisition_deadline) {
@@ -907,13 +926,23 @@ pub(super) mod linux {
                             check_seal_deadline(acquisition_deadline)?;
                             return Ok(sealed);
                         }
-                        Err(SealError::Refused(error)) => return Err(error),
-                        Err(SealError::Retry(error)) => error,
+                        Err(error) => Some(error),
                     }
                 }
-                Err(_) => TransferRefusal::Busy,
+                Err(_) => None,
+            };
+            let (refusal, category) = match error {
+                Some(SealError::Refused(error)) => return Err(error),
+                Some(SealError::RefusedWithDiagnostic(error, category)) => {
+                    record("transfer-seal", category);
+                    return Err(error);
+                }
+                Some(SealError::Retry(error)) => (error, "issuer-refused"),
+                Some(SealError::RetryRecheck(category)) => (TransferRefusal::Identity, category),
+                None => (TransferRefusal::Busy, "issuer-busy"),
             };
             if !peer_registry::poll_store_until(retry_until).await {
+                record("transfer-seal", category);
                 return Err(refusal);
             }
             acquisition_deadline = Some(retry_until);
@@ -939,32 +968,47 @@ pub(super) mod linux {
         if (cluster, root, *sender_key.as_bytes())
             != (offer.claim.cluster, offer.claim.root, offer.claim.sender.1)
         {
-            return Err(R::Identity.into());
+            return Err(SealError::RefusedWithDiagnostic(
+                R::Identity,
+                "offer-changed",
+            ));
         }
         match ready.availability_before(node, acquisition_deadline) {
             Ok(()) => {}
             Err(enrollment_ingress::AvailabilityError::Busy) => {
                 return Err(SealError::Retry(R::Identity));
             }
-            Err(_) => return Err(R::Identity.into()),
+            Err(_) => {
+                return Err(SealError::RefusedWithDiagnostic(
+                    R::Identity,
+                    "issuer-refused",
+                ));
+            }
         }
         let custody = state
             .founder
             .as_ref()
             .and_then(|op| op.custody.as_ref())
             .ok_or(R::NotReady)?;
-        let (cluster, root, now) = ready.transfer_context()?;
+        let (cluster, root, now) = ready
+            .transfer_context()
+            .map_err(|error| SealError::RefusedWithDiagnostic(error, "issuer-refused"))?;
         check_seal_deadline(acquisition_deadline)?;
         let sealed = custody
             .seal_for_voter(cluster, root, now, key, context)
-            .map_err(|_| R::Identity)?;
+            .map_err(|_| SealError::RefusedWithDiagnostic(R::Identity, "seal"))?;
         check_seal_deadline(acquisition_deadline)?;
         node.recheck_issuer_offer(offer, acquisition_deadline)
             .map_err(|error| {
                 if retryable_offer(error) {
-                    SealError::Retry(R::Identity)
+                    let category = if error == MembershipReadError::Busy {
+                        "recheck-busy"
+                    } else {
+                        "recheck-refused"
+                    };
+                    SealError::RetryRecheck(category)
                 } else {
-                    R::Identity.into()
+                    SealError::RefusedWithDiagnostic(R::Identity, "recheck-refused")
                 }
             })?;
         Ok(sealed)

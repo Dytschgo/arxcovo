@@ -2,6 +2,7 @@
 //! Temporary ownership can run store destructors; this is not TLS task ownership.
 use super::adapter::SmAdapter;
 use crate::cluster::{
+    c13_diagnostics::record,
     enrollment::{ClusterId, KeyDigest, NodeId, PeerRefusal},
     pki::verify::VerifyRefusal,
 };
@@ -30,7 +31,19 @@ type AppliedStore = Weak<Mutex<super::StateStore>>;
 
 pub(super) enum ObservationRefusal {
     StoreBusy,
+    Unavailable(&'static str),
     Refused(VerifyRefusal),
+}
+
+impl ObservationRefusal {
+    fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::StoreBusy => "unavailable-store-wait",
+            Self::Unavailable(category) => category,
+            Self::Refused(VerifyRefusal::Unavailable) => "unavailable",
+            Self::Refused(_) => "identity",
+        }
+    }
 }
 
 impl From<VerifyRefusal> for ObservationRefusal {
@@ -42,7 +55,7 @@ impl From<VerifyRefusal> for ObservationRefusal {
 impl From<ObservationRefusal> for VerifyRefusal {
     fn from(reason: ObservationRefusal) -> Self {
         match reason {
-            ObservationRefusal::StoreBusy => Self::Unavailable,
+            ObservationRefusal::StoreBusy | ObservationRefusal::Unavailable(_) => Self::Unavailable,
             ObservationRefusal::Refused(reason) => reason,
         }
     }
@@ -53,43 +66,74 @@ fn observe_store<T>(
     acquisition_deadline: Option<Instant>,
     observe: impl FnOnce(&super::StateStore) -> Result<T, ObservationRefusal>,
 ) -> Result<T, ObservationRefusal> {
-    let store = store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
+    let store = store
+        .upgrade()
+        .ok_or(ObservationRefusal::Unavailable("unavailable-store"))?;
     let guard = match store.try_lock() {
         Ok(guard) => guard,
         Err(TryLockError::WouldBlock) if !store.is_poisoned() => {
             return Err(ObservationRefusal::StoreBusy);
         }
-        Err(_) => return Err(VerifyRefusal::Unavailable.into()),
+        Err(_) => return Err(ObservationRefusal::Unavailable("unavailable-store")),
     };
-    if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-        || guard.is_poisoned()
-    {
-        return Err(VerifyRefusal::Unavailable.into());
+    if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ObservationRefusal::Unavailable("unavailable-store-wait"));
+    }
+    if guard.is_poisoned() {
+        return Err(ObservationRefusal::Unavailable("unavailable-store"));
     }
     observe(&guard)
 }
 
+async fn wait_for_store_reporting<T>(
+    stage: &'static str,
+    observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
+) -> Result<T, VerifyRefusal> {
+    wait_for_store(observe).await.map_err(|error| {
+        record(stage, error.diagnostic_category());
+        error.into()
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(super) async fn wait_for_receiver_store<N, T>(
+    node: &tokio::sync::Mutex<N>,
+    mut observe: impl FnMut(&N, Option<Instant>) -> Result<T, ObservationRefusal>,
+    report: impl FnOnce(&'static str),
+) -> Result<T, VerifyRefusal> {
+    let result = {
+        let node = node.lock().await;
+        wait_for_store(|deadline| observe(&node, deadline)).await
+    };
+    result.map_err(|error| {
+        report(error.diagnostic_category());
+        error.into()
+    })
+}
+
 pub(super) async fn wait_for_store<T>(
     mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
-) -> Result<T, VerifyRefusal> {
+) -> Result<T, ObservationRefusal> {
     let deadline = Instant::now() + STORE_WAIT;
     let mut acquisition_deadline = None;
     loop {
         match observe(acquisition_deadline) {
             Err(ObservationRefusal::StoreBusy) => {}
-            result => return result.map_err(Into::into),
+            result => return result,
         }
-        // The synchronous observation returned with neither lock held.
+        // Each synchronous attempt returns before the store/phase guards can
+        // reach this retry loop.
         let now = Instant::now();
         if now >= deadline {
-            return Err(VerifyRefusal::Unavailable);
+            break;
         }
         sleep_until((now + STORE_POLL).min(deadline)).await;
         if Instant::now() >= deadline {
-            return Err(VerifyRefusal::Unavailable);
+            break;
         }
         acquisition_deadline = Some(deadline);
     }
+    Err(ObservationRefusal::StoreBusy)
 }
 
 #[derive(Clone)]
@@ -105,8 +149,9 @@ impl AppliedRegistry {
         cluster: ClusterId,
         node: NodeId,
         key: KeyDigest,
+        stage: &'static str,
     ) -> Result<(), VerifyRefusal> {
-        wait_for_store(|deadline| self.observe(cluster, node, key, deadline)).await
+        wait_for_store_reporting(stage, |deadline| self.observe(cluster, node, key, deadline)).await
     }
 
     fn observe(
@@ -207,12 +252,12 @@ impl LearnerGate {
     ) -> Result<T, ObservationRefusal> {
         observe_store(&self.store, acquisition_deadline, |store| {
             if self.clock.sample_ms().is_err() {
-                return Err(VerifyRefusal::Unavailable.into());
+                return Err(ObservationRefusal::Unavailable("clock"));
             }
             let mut phase = self
                 .phase
                 .try_lock()
-                .map_err(|_| VerifyRefusal::Unavailable)?;
+                .map_err(|_| ObservationRefusal::Unavailable("phase-unavailable"))?;
             let original = self.identity.origin.position();
             if *phase != Phase::Refused {
                 if let Some(applied) = store.applied().filter(|p| p.index >= original.index) {
@@ -311,7 +356,7 @@ impl LearnerGate {
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
-        wait_for_store(|deadline| {
+        wait_for_store_reporting("learner-authorization", |deadline| {
             self.try_authorize(cluster, node, key, bootstrap_allowed, deadline)
         })
         .await
@@ -399,6 +444,35 @@ mod tests {
         task::{Context, Poll, Waker},
         thread,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn c13_receiver_diagnostics_run_after_node_unlock() {
+        let node = tokio::sync::Mutex::new(());
+        for (busy, expected, expected_category) in [
+            (false, VerifyRefusal::NotMember, "identity"),
+            (true, VerifyRefusal::Unavailable, "unavailable-store-wait"),
+        ] {
+            let mut category = None;
+            let result = wait_for_receiver_store(
+                &node,
+                |_, _| {
+                    assert!(node.try_lock().is_err());
+                    if busy {
+                        Err::<(), _>(ObservationRefusal::StoreBusy)
+                    } else {
+                        Err(VerifyRefusal::NotMember.into())
+                    }
+                },
+                |reason| {
+                    assert!(node.try_lock().is_ok());
+                    category = Some(reason);
+                },
+            )
+            .await;
+            assert_eq!(result, Err(expected));
+            assert_eq!(category, Some(expected_category));
+        }
+    }
 
     fn node(n: u64) -> NodeId {
         NodeId::new(n).unwrap()
@@ -526,12 +600,15 @@ mod tests {
             )
             .unwrap();
         let gate = learner_gate(&sm);
-        let mut observation = std::pin::pin!(wait_for_store(|deadline| {
-            gate.inspect_strict(deadline, |store| {
-                assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
-                store.applied()
-            })
-        }));
+        let mut observation = std::pin::pin!(wait_for_store_reporting(
+            "learner-authorization",
+            |deadline| {
+                gate.inspect_strict(deadline, |store| {
+                    assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
+                    store.applied()
+                })
+            }
+        ));
         {
             let _held = sm.0.lock().unwrap();
             assert!(

@@ -818,26 +818,30 @@ impl Job {
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
         use_offer: impl FnOnce(&mut Operation, super::issuer_transfer::Offer) -> T,
     ) -> Result<T, peer_transport::Refusal> {
-        use crate::cluster::pki::verify::VerifyRefusal;
+        use crate::cluster::{c13_diagnostics::record, pki::verify::VerifyRefusal};
         let refused = peer_transport::Refusal::Identity;
         let node = self.state().node.clone().ok_or(refused)?;
-        let node = node.lock().await;
         let mut use_offer = Some(use_offer);
-        peer_registry::wait_for_store(|deadline| {
-            let mut state = self.state();
-            let (_, op) = receiver_parts(&mut state).map_err(|_| VerifyRefusal::Unavailable)?;
-            let gate = op.gate.as_ref().ok_or(VerifyRefusal::Unavailable)?.clone();
-            gate.inspect_strict(deadline, |store| {
-                let expected = &op.member.as_ref().ok_or(refused)?.expected;
-                let address = op.advertised.ok_or(refused)?;
-                let membership = op.issuer_membership_view(&node);
-                let offer = receiver_offer(&membership, store, expected, address, claim, sender)
-                    .ok_or(refused)?;
-                Ok(use_offer.take().expect("one guarded observation")(
-                    op, offer,
-                ))
-            })
-        })
+        peer_registry::wait_for_receiver_store(
+            &node,
+            |node, deadline| {
+                let mut state = self.state();
+                let (_, op) = receiver_parts(&mut state).map_err(|_| VerifyRefusal::Unavailable)?;
+                let gate = op.gate.as_ref().ok_or(VerifyRefusal::Unavailable)?.clone();
+                gate.inspect_strict(deadline, |store| {
+                    let expected = &op.member.as_ref().ok_or(refused)?.expected;
+                    let address = op.advertised.ok_or(refused)?;
+                    let membership = op.issuer_membership_view(node);
+                    let offer =
+                        receiver_offer(&membership, store, expected, address, claim, sender)
+                            .ok_or(refused)?;
+                    Ok(use_offer.take().expect("one guarded observation")(
+                        op, offer,
+                    ))
+                })
+            },
+            |category| record("transfer-receiver", category),
+        )
         .await
         .map_err(|_| refused)?
     }
@@ -1152,7 +1156,7 @@ fn observe_strict_before<T>(
     gate.inspect_strict(deadline, observe)
         .map_err(|error| match error {
             ObservationRefusal::StoreBusy => ActivationError::Deferred,
-            ObservationRefusal::Refused(_) => ActivationError::Refused,
+            _ => ActivationError::Refused,
         })
 }
 
@@ -1573,9 +1577,7 @@ mod activation_tests {
         // Failed clock observation must precede even a normal gate callback.
         assert!(matches!(
             broken_clock.inspect_strict(None, |_| ()),
-            Err(peer_registry::ObservationRefusal::Refused(
-                crate::cluster::pki::verify::VerifyRefusal::Unavailable
-            ))
+            Err(peer_registry::ObservationRefusal::Unavailable("clock"))
         ));
         assert_eq!(observe_strict(&broken_clock, |_| ()), Err(Refused));
         assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Refused));
