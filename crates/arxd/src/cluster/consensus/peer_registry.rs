@@ -25,6 +25,17 @@ pub(super) enum ObservationRefusal {
     Refused(VerifyRefusal),
 }
 
+impl ObservationRefusal {
+    fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::StoreBusy => "unavailable-store-wait",
+            Self::Unavailable(category) => category,
+            Self::Refused(VerifyRefusal::Unavailable) => "unavailable",
+            Self::Refused(_) => "identity",
+        }
+    }
+}
+
 impl From<VerifyRefusal> for ObservationRefusal {
     fn from(reason: VerifyRefusal) -> Self {
         Self::Refused(reason)
@@ -66,31 +77,42 @@ fn observe_store<T>(
 
 pub(super) async fn wait_for_store<T>(
     stage: &'static str,
-    mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
+    observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, VerifyRefusal> {
+    observe_with_wait(observe).await.map_err(|error| {
+        record(stage, error.diagnostic_category());
+        error.into()
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(super) async fn wait_for_receiver_store<N, T>(
+    node: &tokio::sync::Mutex<N>,
+    mut observe: impl FnMut(&N, Option<Instant>) -> Result<T, ObservationRefusal>,
+    report: impl FnOnce(&'static str),
+) -> Result<T, VerifyRefusal> {
+    let result = {
+        let node = node.lock().await;
+        observe_with_wait(|deadline| observe(&node, deadline)).await
+    };
+    result.map_err(|error| {
+        report(error.diagnostic_category());
+        error.into()
+    })
+}
+
+async fn observe_with_wait<T>(
+    mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
+) -> Result<T, ObservationRefusal> {
     let deadline = Instant::now() + STORE_WAIT;
     let mut acquisition_deadline = None;
     loop {
         match observe(acquisition_deadline) {
             Err(ObservationRefusal::StoreBusy) => {}
-            result => {
-                return result.map_err(|error| {
-                    record(
-                        stage,
-                        match error {
-                            ObservationRefusal::StoreBusy => "unavailable-store-wait",
-                            ObservationRefusal::Unavailable(category) => category,
-                            ObservationRefusal::Refused(VerifyRefusal::Unavailable) => {
-                                "unavailable"
-                            }
-                            ObservationRefusal::Refused(_) => "identity",
-                        },
-                    );
-                    error.into()
-                });
-            }
+            result => return result,
         }
-        // The synchronous observation returned with neither lock held.
+        // Each synchronous attempt returns before the store/phase guards can
+        // reach this retry loop.
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -101,8 +123,7 @@ pub(super) async fn wait_for_store<T>(
         }
         acquisition_deadline = Some(deadline);
     }
-    record(stage, "unavailable-store-wait");
-    Err(VerifyRefusal::Unavailable)
+    Err(ObservationRefusal::StoreBusy)
 }
 
 #[derive(Clone)]
@@ -413,6 +434,35 @@ mod tests {
         task::{Context, Poll, Waker},
         thread,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn c13_receiver_diagnostics_run_after_node_unlock() {
+        let node = tokio::sync::Mutex::new(());
+        for (busy, expected, expected_category) in [
+            (false, VerifyRefusal::NotMember, "identity"),
+            (true, VerifyRefusal::Unavailable, "unavailable-store-wait"),
+        ] {
+            let mut category = None;
+            let result = wait_for_receiver_store(
+                &node,
+                |_, _| {
+                    assert!(node.try_lock().is_err());
+                    if busy {
+                        Err::<(), _>(ObservationRefusal::StoreBusy)
+                    } else {
+                        Err(VerifyRefusal::NotMember.into())
+                    }
+                },
+                |reason| {
+                    assert!(node.try_lock().is_ok());
+                    category = Some(reason);
+                },
+            )
+            .await;
+            assert_eq!(result, Err(expected));
+            assert_eq!(category, Some(expected_category));
+        }
+    }
 
     fn node(n: u64) -> NodeId {
         NodeId::new(n).unwrap()
