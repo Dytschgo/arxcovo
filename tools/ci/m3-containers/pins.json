@@ -1,0 +1,41 @@
+{
+  "schema": "arxcovo/r2/1",
+  "host": {
+    "label": "ubuntu-latest",
+    "os": "26.04",
+    "image_os": "ubuntu26",
+    "image_version": "20261116.202.1",
+    "kernel": "7.0.0-1020-azure",
+    "systemd_package": "259.9-0ubuntu0.1",
+    "rust": "1.95.0-x86_64-unknown-linux-gnu",
+    "parent": "/var/lib",
+    "tools": {
+      "cc": "/usr/bin/gcc", "nft": "/usr/sbin/nft", "ip": "/usr/sbin/ip",
+      "mkfs": "/usr/sbin/mkfs.ext4", "loop": "/usr/sbin/losetup",
+      "unit": "/usr/bin/systemd-run", "systemctl": "/usr/bin/systemctl",
+      "mount": "/usr/bin/mount", "umount": "/usr/bin/umount",
+      "findmnt": "/usr/bin/findmnt", "ldd": "/usr/bin/ldd",
+      "dpkg": "/usr/bin/dpkg-query", "git": "/usr/bin/git"
+    }
+  },
+  "rootfs": {
+    "userland": "24.04", "bytes": 1073741824, "data_bytes": 268435456,
+    "run_bytes": 4194304, "tmp_bytes": 8388608, "dev_bytes": 1048576,
+    "block_size": 4096, "data_inodes": 16384
+  },
+  "roles": {"owner": 21070, "daemon": 21071, "build": 21072, "agent": 21073},
+  "network": {
+    "nodes": {
+      "a": ["198.18.72.11", "02:72:00:00:00:11"],
+      "b": ["198.18.72.12", "02:72:00:00:00:12"],
+      "c": ["198.18.72.13", "02:72:00:00:00:13"]
+    },
+    "prefix": 24,
+    "ports": {"peer": 22171, "enrollment": 22172, "build": 22173, "forbidden": 22174},
+    "local": ["198.18.72.14", "02:72:00:00:00:14"],
+    "outside": "192.0.2.72", "link_local": "169.254.254.72", "ipv6": "fd42:72::13"
+  },
+  "outer": {"cpu_percent": 100, "memory": 536870912, "swap": 0, "pids": 128, "nofile": 128, "core": 0},
+  "inner": {"caps": 193, "nnp": 1, "memory": 134217728, "swap": 0, "pids": 32},
+  "seconds": {"preflight": 8, "stage": 24, "contain": 16, "network": 12, "cleanup": 25}
+}

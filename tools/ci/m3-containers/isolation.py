@@ -1,0 +1,758 @@
+"""Attributed hosted-only resources for the zero-daemon R2 exercise."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import socket
+import stat
+import time
+
+from fixture import (INNER, NETWORK, OUTER, Refusal, allocate, bounded_read, data_layout,
+                     filesystem_facts, host_command, image_stat, private_directory,
+                     remaining, require, unique_pairs)
+
+
+def json_rows(value):
+    data = json.loads(value, object_pairs_hook=unique_pairs)
+    require(isinstance(data, list) and len(data) <= 128, "readback-inventory")
+    return data
+
+
+def require_same(observed, expected, category):
+    require(observed == expected, category)
+
+
+def token(receipt):
+    raw = "|".join(receipt[key] for key in ("repo", "head", "run", "attempt"))
+    return hashlib.sha256(raw.encode("ascii")).hexdigest()[:16]
+
+
+class Resources:
+    def __init__(self, receipt, pins):
+        self.id = token(receipt)
+        self.root = Path("/var/lib") / f"arx-r2-{self.id}"
+        self.bridge = "r2" + self.id[:11]
+        self.table = "r2_" + self.id
+        self.namespaces = {node: f"r2-{self.id}-{node}" for node in "abc"}
+        self.links = {node: f"{self.bridge}{node}" for node in "abc"}
+        self.budget = pins["rootfs"]
+        self.cleanup_stack = []
+        self.facts = {}
+
+    def remember(self, label, cleanup):
+        self.cleanup_stack.append((label, cleanup))
+
+    def cleanup(self, end):
+        errors = []
+        for label, action in reversed(self.cleanup_stack):
+            try:
+                action(end)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                errors.append(label)
+        return errors
+
+    def arena(self):
+        parent = self.root.parent.lstat()
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == 0 and not parent.st_mode & 0o022,
+                "arena-parent")
+        private_directory(self.root, 0o700)
+        identity = self.root.stat()
+        self.remember("arena", lambda end: self.remove_arena(identity, end))
+
+    def remove_arena(self, identity, end):
+        remaining(end)
+        current = self.root.lstat()
+        require(stat.S_ISDIR(current.st_mode) and current.st_uid == 0
+                and (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino), "arena-identity")
+        views = bounded_read(Path("/proc/self/mountinfo"), 256*1024).decode("ascii").splitlines()
+        require(all(not Path(line.split()[4]).is_relative_to(self.root) for line in views), "mount-residue")
+        require(not self.unit_groups(), "unit-residue")
+        require(not self.loop_rows(end), "loop-residue")
+        require(not self.network_names(end), "network-residue")
+        # No filesystem tree is removed if an attributed child remains.
+        shutil.rmtree(self.root)
+        require(not self.root.exists(), "arena-residue")
+
+    def unit_groups(self):
+        parent = Path("/sys/fs/cgroup/system.slice")
+        return list(parent.glob(f"arx-r2-{self.id}-?.service")) + list(parent.glob(f"arx-r2-{self.id}-??.service"))
+
+    def loop_rows(self, end, file=None):
+        args = ["-J", "-l", "-O", "NAME,BACK-FILE,RO,SIZELIMIT,OFFSET"]
+        if file is not None:
+            args.extend(("-j", str(file)))
+        data = json.loads(host_command("loop", end, *args), object_pairs_hook=unique_pairs)
+        rows = data["loopdevices"]
+        require(isinstance(rows, list) and len(rows) <= 128, "loop-inventory")
+        return [row for row in rows if Path(row["back-file"]).is_relative_to(self.root)]
+
+    def volume(self, name, source, end):
+        require(name in ("root", "a", "b", "c") and source.parent == self.root, "volume-name")
+        sealed = name == "root"
+        size = self.budget["bytes" if sealed else "data_bytes"]
+        image = self.root / f"{name}.ext4"
+        mount = self.root / name
+        allocate(image, size)
+        flags = ["-q", "-F", "-b", "4096", "-m", "0", "-E", "nodiscard,lazy_itable_init=0,lazy_journal_init=0"]
+        if not sealed:
+            flags.extend(("-N", str(self.budget["data_inodes"])))
+        host_command("mkfs", end, *flags, "-d", source, image)
+        if sealed:
+            image.chmod(0o400)
+        image_stat(image.lstat(), size)
+        require(not self.loop_rows(end, image), "loop-already-attached")
+        args = ["--find", "--show", "--nooverlap"]
+        if sealed:
+            args.append("--read-only")
+        try:
+            loop = host_command("loop", end, *args, image).strip()
+        finally:
+            self.remember(f"loop-{name}", lambda deadline: self.release_loop(image, size, sealed, deadline))
+        self.check_loop(image, loop, size, sealed, end)
+        private_directory(mount, 0o755)
+        try:
+            host_command("mount", end, "-t", "ext4", "-o",
+                         "ro,nodev,nosuid" if sealed else "rw,nodev,nosuid,noexec", loop, mount)
+        finally:
+            self.remember(f"mount-{name}", lambda deadline: self.release_mount(mount, loop, deadline))
+        self.check_mount(mount, loop, end)
+        stats = os.statvfs(mount)
+        require(bool(stats.f_flag & os.ST_RDONLY) == sealed, "volume-readonly")
+        self.facts[name] = filesystem_facts(stats, self.budget, writable=not sealed)
+        return mount
+
+    def check_loop(self, image, loop, size, sealed, end):
+        require(re.fullmatch(r"/dev/loop[0-9]{1,4}", loop), "loop-name")
+        rows = self.loop_rows(end, image)
+        require(len(rows) == 1, "ambiguous-loop")
+        row = rows[0]
+        require(row["name"] == loop and row["back-file"] == str(image) and row["ro"] is sealed
+                and row["offset"] == 0 and row["sizelimit"] == 0, "loop-identity")
+        image_stat(image.lstat(), size)
+        actual = bounded_read(Path("/sys/class/block") / Path(loop).name / "size", 32)
+        require(int(actual) * 512 == size, "loop-size")
+
+    def release_loop(self, image, size, sealed, end):
+        rows = self.loop_rows(end, image)
+        if rows:
+            require(len(rows) == 1, "ambiguous-loop")
+            loop = rows[0]["name"]
+            self.check_loop(image, loop, size, sealed, end)
+            host_command("loop", end, "-d", loop)
+        require(not self.loop_rows(end, image), "loop-still-attached")
+
+    @staticmethod
+    def mounts(path, end):
+        return host_command("findmnt", end, "-nr", "-o", "TARGET,SOURCE,FSTYPE,FSROOT",
+                            "--mountpoint", path, statuses=(0, 1)).splitlines()
+
+    def check_mount(self, path, loop, end):
+        require_same(self.mounts(path, end), [f"{path} {loop} ext4 /"], "mount-identity")
+
+    def release_mount(self, path, loop, end):
+        if self.mounts(path, end):
+            self.check_mount(path, loop, end)
+            host_command("umount", end, path)
+        require(not self.mounts(path, end), "mount-still-active")
+
+    def stage_data(self, end):
+        for node in self.namespaces:
+            source = self.root / f"data-{node}"
+            private_directory(source, 0o755)
+            data_layout(source, node)
+            for role, uid in (("daemon", 21071), ("build", 21072)):
+                private_directory(source / "probe" / role, 0o755, uid, uid)
+            self.volume(node, source, end)
+
+    def ip(self, end, *args, **options):
+        return host_command("ip", end, *args, **options)
+
+    def ns(self, end, node, *args):
+        return self.ip(end, "-n", self.namespaces[node], *args)
+
+    def links_at(self, end, name):
+        output = self.ip(end, "-j", "-d", "link", "show", "dev", name, statuses=(0, 1))
+        if output.startswith("Device ") and output.rstrip().endswith("does not exist."):
+            return []
+        return json_rows(output)
+
+    def tag_link(self, name, end):
+        self.ip(end, "link", "set", "dev", name, "alias", self.table)
+        rows = self.links_at(end, name)
+        require(len(rows) == 1 and rows[0].get("ifalias") == self.table, "link-attribution")
+        index = rows[0]["ifindex"]
+        self.remember("link", lambda deadline: self.remove_link(name, index, deadline))
+
+    def remove_link(self, name, index, end):
+        rows = self.links_at(end, name)
+        if rows:
+            require(len(rows) == 1 and rows[0]["ifindex"] == index
+                    and rows[0].get("ifalias") == self.table, "link-attribution")
+            self.ip(end, "link", "del", "dev", name)
+        require(not self.links_at(end, name), "link-residue")
+
+    def network_names(self, end):
+        namespaces = self.ip(end, "netns", "list").splitlines()
+        tables = host_command("nft", end, "list", "tables").splitlines()
+        return (any(line.split()[0] in self.namespaces.values() for line in namespaces)
+                or any(line.split()[-1] == self.table for line in tables)
+                or any(self.links_at(end, name) for name in (self.bridge, *self.links.values())))
+
+    def remove_namespace(self, node, identity, end):
+        name = self.namespaces[node]
+        path = Path("/run/netns") / name
+        current = path.stat()
+        require((current.st_dev, current.st_ino) == identity, "netns-attribution")
+        require(not self.ip(end, "netns", "pids", name).strip(), "netns-children")
+        self.ip(end, "netns", "del", name)
+        require(not path.exists(), "netns-residue")
+
+    def make_links(self, end):
+        require(not self.network_names(end), "network-preexisting")
+        self.ip(end, "link", "add", "name", self.bridge, "address", NETWORK["local"][1], "type", "bridge",
+                "stp_state", "0", "mcast_snooping", "0")
+        self.tag_link(self.bridge, end)
+        self.ip(end, "link", "set", "dev", self.bridge, "addrgenmode", "none")
+        for node, (address, mac) in NETWORK["nodes"].items():
+            namespace = self.namespaces[node]
+            self.ip(end, "netns", "add", namespace)
+            info = (Path("/run/netns") / namespace).stat()
+            self.remember("namespace", lambda deadline, node=node, identity=(info.st_dev, info.st_ino):
+                          self.remove_namespace(node, identity, deadline))
+            link = self.links[node]
+            self.ip(end, "link", "add", "name", link, "type", "veth", "peer", "name", "eth0", "netns", namespace)
+            self.tag_link(link, end)
+            self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
+            self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
+            self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
+            for other, (peer, peer_mac) in NETWORK["nodes"].items():
+                if other != node:
+                    self.ns(end, node, "neigh", "add", peer, "lladdr", peer_mac, "nud", "permanent", "dev", "eth0")
+
+    def nft(self, end, *args):
+        return host_command("nft", end, *args)
+
+    def apply_policy(self, end):
+        rules = policy(self.bridge, self.links)
+        lines = []
+        for family, entries in rules.items():
+            lines.append(f"table {family} {self.table} {{")
+            for chain, (hook, body) in entries.items():
+                layer = "filter"
+                lines.append(f" chain {chain} {{")
+                if hook:
+                    lines.append(f"  type {layer} hook {hook} priority -310; policy accept;")
+                lines.extend(f'  {expression} counter {action} comment "r2-{key}"'
+                             for key, expression, action in body)
+                lines.append(" }")
+            lines.append("}")
+        config = self.root / "policy.nft"
+        config.write_text("\n".join(lines) + "\n", encoding="ascii")
+        first_link = next(index for index, (label, _) in enumerate(self.cleanup_stack) if label == "link")
+        self.nft(end, "-f", config)
+        for family in rules:
+            rows = self.nft_table(family, end)
+            handle = table_handle(rows, family, self.table)
+            self.cleanup_stack.insert(first_link, ("nft", lambda deadline, family=family, handle=handle:
+                                                    self.remove_table(family, handle, deadline)))
+        self.rule_graph = rules
+        self.rule_receipt = self.counters(end)
+
+    def nft_table(self, family, end):
+        return json.loads(self.nft(end, "-j", "-a", "list", "table", family, self.table),
+                          object_pairs_hook=unique_pairs)["nftables"]
+
+    def remove_table(self, family, handle, end):
+        require(not any(self.links_at(end, name) for name in (self.bridge, *self.links.values())),
+                "nft-live-link")
+        require(table_handle(self.nft_table(family, end), family, self.table) == handle, "nft-attribution")
+        self.nft(end, "delete", "table", family, self.table)
+        require(f"table {family} {self.table}" not in self.nft(end, "list", "tables").splitlines(),
+                "nft-residue")
+
+    def counters(self, end):
+        return {key: value for family, chains in self.rule_graph.items()
+                for key, value in read_counters(self.nft_table(family, end), chains, family, self.table).items()}
+
+    def activate(self, end):
+        self.ip(end, "link", "set", "dev", self.bridge, "up")
+        for node, link in self.links.items():
+            self.ip(end, "link", "set", "dev", link, "up")
+            self.ns(end, node, "link", "set", "dev", "lo", "up")
+            self.ns(end, node, "link", "set", "dev", "eth0", "up")
+
+    def synthetic(self, end):
+        """Endpoints exist only on C or on the fixture bridge during the probes."""
+        node = "b"
+        c_address, c_mac = NETWORK["nodes"]["c"]
+        local, mac = NETWORK["local"]
+        self.ip(end, "address", "add", f"{local}/32", "dev", self.bridge)
+        self.ns(end, node, "neigh", "add", local, "lladdr", mac, "nud", "permanent", "dev", "eth0")
+        self.ip(end, "neigh", "add", c_address, "lladdr", c_mac, "nud", "permanent", "dev", self.bridge)
+        self.ip(end, "route", "add", f'{NETWORK["outside"]}/32', "via", c_address, "dev", self.bridge, "onlink")
+        self.forwarding = Path("/proc/sys/net/ipv4/conf") / self.bridge / "forwarding"
+        self.original_forwarding = bounded_read(self.forwarding, 8)
+        require(self.original_forwarding in (b"0\n", b"1\n"), "bridge-forwarding")
+        self.forwarding.write_bytes(b"1\n")
+        require(bounded_read(self.forwarding, 8) == b"1\n", "bridge-forwarding")
+        self.ns(end, "c", "address", "add", f'{NETWORK["ipv6"]}/64', "dev", "eth0", "nodad")
+        self.ns(end, node, "address", "add", "fd42:72::12/64", "dev", "eth0", "nodad")
+        self.ns(end, node, "-6", "neigh", "add", NETWORK["ipv6"], "lladdr", c_mac, "nud", "permanent", "dev", "eth0")
+        for key in ("outside", "link_local"):
+            target = NETWORK[key]
+            self.ns(end, "c", "address", "add", f"{target}/32", "dev", "lo")
+            self.ns(end, node, "route", "add", f"{target}/32", "via",
+                    local if key == "outside" else c_address, "dev", "eth0")
+
+    def clear_synthetic(self, end):
+        local, _ = NETWORK["local"]
+        c_address, _ = NETWORK["nodes"]["c"]
+        self.forwarding.write_bytes(self.original_forwarding)
+        require(bounded_read(self.forwarding, 8) == self.original_forwarding, "bridge-forwarding-restore")
+        self.ip(end, "route", "del", f'{NETWORK["outside"]}/32', "via", c_address, "dev", self.bridge, "onlink")
+        self.ip(end, "neigh", "del", c_address, "dev", self.bridge)
+        self.ns(end, "b", "neigh", "del", local, "dev", "eth0")
+        self.ip(end, "address", "del", f"{local}/32", "dev", self.bridge)
+        self.ns(end, "b", "-6", "neigh", "del", NETWORK["ipv6"], "dev", "eth0")
+        self.ns(end, "c", "address", "del", f'{NETWORK["ipv6"]}/64', "dev", "eth0")
+        self.ns(end, "b", "address", "del", "fd42:72::12/64", "dev", "eth0")
+        for key in ("outside", "link_local"):
+            target = NETWORK[key]
+            self.ns(end, "b", "route", "del", f"{target}/32", "via",
+                    local if key == "outside" else c_address, "dev", "eth0")
+            self.ns(end, "c", "address", "del", f"{target}/32", "dev", "lo")
+        self.endpoint_inventory(end, temporary=False)
+
+    def endpoint_inventory(self, end, *, temporary):
+        bridge_ports = json_rows(self.ip(end, "-j", "link", "show", "master", self.bridge))
+        require_same({row["ifname"] for row in bridge_ports}, set(self.links.values()), "bridge-endpoints")
+        bridge_address = json_rows(self.ip(end, "-j", "address", "show", "dev", self.bridge))
+        require(len(bridge_address) == 1, "bridge-address")
+        require_same([row["local"] for row in bridge_address[0]["addr_info"]],
+                     [NETWORK["local"][0]] if temporary else [], "numbered-bridge")
+        for node, (address, mac) in NETWORK["nodes"].items():
+            links = json_rows(self.ns(end, node, "-j", "address", "show"))
+            ipv4 = json_rows(self.ns(end, node, "-j", "-4", "route", "show", "table", "main"))
+            ipv6 = json_rows(self.ns(end, node, "-j", "-6", "route", "show", "table", "main"))
+            endpoint_inventory(node, address, mac, links, ipv4, ipv6, temporary)
+
+    def unit_info(self, unit, end):
+        keys = ("Id", "LoadState", "ActiveState", "ControlGroup", "MainPID", "InvocationID",
+                "MemoryMax", "MemorySwapMax", "TasksMax", "CPUQuotaPerSecUSec", "LimitNOFILE", "LimitCORE")
+        result = host_command("systemctl", end, "show", unit, "--property=" + ",".join(keys), statuses=(0, 1))
+        rows = [line.split("=", 1) for line in result.splitlines()]
+        require(all(len(row) == 2 for row in rows) and len(dict(rows)) == len(rows), "unit-fields")
+        return dict(rows)
+
+    def stop_unit(self, unit, invocation, end, *, crash=False):
+        facts = self.unit_info(unit, end)
+        if facts.get("LoadState") != "not-found":
+            require(facts.get("Id") == unit and facts.get("InvocationID") == invocation
+                    and facts.get("ControlGroup") == f"/system.slice/{unit}", "unit-attribution")
+            if crash:
+                host_command("systemctl", end, "kill", "--kill-whom=all", "--signal=SIGKILL", unit)
+            host_command("systemctl", end, "stop", unit)
+        require(not (Path("/sys/fs/cgroup/system.slice") / unit).exists(), "unit-cgroup-residue")
+
+    def start(self, instance, end):
+        require(instance in ("a0", "b0", "b1", "c0"), "boot-instance")
+        unit = f"arx-r2-{self.id}-{instance}.service"
+        require(self.unit_info(unit, end).get("LoadState") == "not-found", "unit-preexisting")
+        properties = {
+            "Type": "exec", "Delegate": "memory pids", "CPUQuota": "100%", "MemoryMax": "512M",
+            "MemorySwapMax": "0", "TasksMax": "128", "LimitNOFILE": "128", "LimitCORE": "0",
+            "RuntimeMaxSec": "34s", "TimeoutStopSec": "1s", "KillMode": "control-group", "Restart": "no",
+            "StandardInput": "null", "StandardOutput": "journal", "StandardError": "journal",
+        }
+        args = [f"--property={name}={value}" for name, value in properties.items()]
+        try:
+            host_command("unit", end, "--quiet", "--unit", unit, *args,
+                         self.root / "bootstrap", "boot", self.id, instance)
+        finally:
+            # An incomplete launch still owns any attributable invocation under the
+            # freshly reserved name, which must go through the same stop checks.
+            facts = self.unit_info(unit, end)
+            if facts.get("LoadState") != "not-found":
+                invocation = facts.get("InvocationID", "")
+                require(re.fullmatch(r"[0-9a-f]{32}", invocation), "unit-invocation")
+                self.remember("unit", lambda deadline: self.stop_unit(unit, invocation, deadline))
+        validate_unit(unit, facts)
+        group = Path("/sys/fs/cgroup") / facts["ControlGroup"].lstrip("/")
+        observe_limits(group)
+        return unit, invocation, int(facts["MainPID"])
+
+    def event(self, node, path, expected, end, *, process=None):
+        file = self.root / node / "probe" / path
+        while not file.exists():
+            remaining(end)
+            if process is not None:
+                require(Path(f"/proc/{process}").exists(), "probe-process-exited")
+            time.sleep(0.01)
+        require(stat.S_ISREG(file.lstat().st_mode), "probe-receipt-type")
+        raw = bounded_read(file, 256)
+        require(raw == expected, "probe-receipt")
+
+    def contain(self, end):
+        self.make_links(end)
+        self.apply_policy(end)
+        self.activate(end)
+        self.synthetic(end)
+        self.endpoint_inventory(end, temporary=True)
+        a = self.start("a0", end)
+        c = self.start("c0", end)
+        b = self.start("b0", end)
+        for node, (_unit, _invocation, pid) in zip("acb", (a, c, b)):
+            self.event(node, "boot0", b"r2-init-v1\n", end, process=pid)
+            self.check_namespace(node, pid, end)
+        for node in "ac":
+            self.event(node, "daemon/listeners", b"r2-listeners-v1\n", end)
+        marker = self.root / "b/probe/persistent"
+        before = marker.stat()
+        with_pid = os.pidfd_open(b[2], 0)
+        try:
+            self.stop_unit(*b[:2], end, crash=True)
+            watched = select.poll()
+            watched.register(with_pid, select.POLLIN)
+            events = watched.poll(0)
+            require(len(events) == 1 and events[0][0] == with_pid and events[0][1] & select.POLLIN,
+                    "restart-pidfd")
+            require(not Path(f"/proc/{b[2]}").exists(), "restart-host-pid")
+            require(not self.ip(end, "netns", "pids", self.namespaces["b"]).strip(), "restart-netns-pids")
+        finally:
+            os.close(with_pid)
+        restarted = self.start("b1", end)
+        self.event("b", "boot1", b"r2-init-v1\n", end, process=restarted[2])
+        self.event("b", "daemon/listeners1", b"r2-listeners-v1\n", end, process=restarted[2])
+        after = marker.stat()
+        require((after.st_dev, after.st_ino, after.st_mtime_ns) == (before.st_dev, before.st_ino, before.st_mtime_ns),
+                "restart-image-identity")
+        self.check_namespace("b", restarted[2], end)
+        require(restarted[2] != b[2], "restart-process-identity")
+        self.facts["restart"] = "same-data-fresh-run"
+
+    def check_namespace(self, node, pid, end):
+        remaining(end)
+        outer = Path(f"/proc/{pid}")
+        children = bounded_read(outer / f"task/{pid}/children", 1024).decode("ascii").split()
+        require(len(children) == 1 and re.fullmatch(r"[1-9][0-9]{0,9}", children[0]), "namespace-init")
+        init = Path("/proc") / children[0]
+        status = bounded_read(init / "status", 8192).decode("ascii")
+        require(re.search(r"^NSpid:\s+" + children[0] + r"\s+1$", status, re.M) is not None,
+                "namespace-init-pid")
+        check_security_status(status, 0, 0)
+        check_mount_inventory(bounded_read(init / "mountinfo", 8192).decode("ascii"), node == "b")
+        for namespace in ("mnt", "uts", "ipc", "pid", "net", "cgroup"):
+            actual = (init / "ns" / namespace).stat().st_ino
+            require(actual != (Path("/proc/self/ns") / namespace).stat().st_ino, "namespace-host-alias")
+            if namespace == "net":
+                require(actual == (Path("/run/netns") / self.namespaces[node]).stat().st_ino, "namespace-net-alias")
+        require(re.search(r"^Seccomp:\s+[012]$", status, re.M), "seccomp-readback")
+        lsm = bounded_read(init / "attr/current", 256).decode("ascii").strip()
+        require(re.fullmatch(r"[\w./ ()-]{1,100}", lsm), "lsm-readback")
+        self.facts[node]["seccomp"] = re.search(r"^Seccomp:\s+([012])$", status, re.M)[1]
+        self.facts[node]["lsm"] = lsm
+        if node == "b":
+            cgroup = bounded_read(outer / "cgroup", 256).decode("ascii").strip()
+            require(re.fullmatch(r"0::/system\.slice/arx-r2-[0-9a-f]{16}-b[01]\.service/init", cgroup),
+                    "broker-host-membership")
+            unit = Path("/sys/fs/cgroup") / cgroup[4:].removesuffix("/init") / "system.slice/arxd.service"
+            self.facts[node]["broker"] = self.check_delegate(unit, init)
+
+    @staticmethod
+    def check_delegate(unit, init):
+        require(os.getxattr(unit, "user.delegate", follow_symlinks=False) == b"1", "delegate-xattr")
+        require(bounded_read(unit / "cgroup.type", 32) == b"domain\n"
+                and bounded_read(unit / "cgroup.procs", 32) == b"", "delegate-domain")
+        for parent in (unit, unit / "runs"):
+            require({b"memory", b"pids"} <= set(bounded_read(parent / "cgroup.subtree_control", 256).split()),
+                    "delegate-controllers")
+        entries = sorted(path.name for path in (unit / "runs").iterdir() if path.is_dir())
+        require(entries == ["fixture"], "runs-inventory")
+        leaf = unit / "runs/fixture"
+        for name, key in (("memory.max", "memory"), ("memory.swap.max", "swap"), ("pids.max", "pids")):
+            require(bounded_read(leaf / name, 32).strip() == str(INNER[key]).encode("ascii"), "inner-limit")
+        for group, caps, uid in ((unit / "supervisor", 193, 0), (leaf, 0, 21072)):
+            raw = bounded_read(group / "cgroup.procs", 128)
+            require(re.fullmatch(rb"[1-9][0-9]{0,9}\n", raw), "delegate-sole-pid")
+            process = Path("/proc") / raw.strip().decode("ascii")
+            facts = bounded_read(process / "status", 8192).decode("ascii")
+            check_security_status(facts, caps, uid)
+            require((process / "ns/pid").stat().st_ino == (init / "ns/pid").stat().st_ino, "delegate-pid-namespace")
+            require(sorted(path.name for path in (process / "fd").iterdir()) == ["0", "1", "2"], "extra-fd")
+        return {"caps": 193, "nnp": 1, "memory": INNER["memory"], "swap": INNER["swap"], "pids": INNER["pids"]}
+
+    def network(self, end):
+        counters = self.counters(end)
+        stable_rules(self.rule_receipt, counters)
+        trigger = self.root / "a/probe/daemon/build-go"
+        with trigger.open("xb") as output:
+            output.write(b"r2-network-v1\n")
+        trigger.chmod(0o644)
+        self.event("a", "daemon/build-result", b"r2-network-v1\n", end)
+        latest = self.counters(end)
+        self.facts["build_route"] = counter_delta(counters, latest, required={"build", "build-return"})
+        counters = latest
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            address = (NETWORK["local"][0], NETWORK["ports"]["forbidden"])
+            listener.bind(address)
+            listener.listen(4)
+            with socket.create_connection(address, timeout=remaining(end)) as control:
+                with listener.accept()[0] as accepted:
+                    control.sendall(b"r2")
+                    require(accepted.recv(2) == b"r2", "local-input-positive-control")
+            for role in ("daemon", "build"):
+                trigger = self.root / "b/probe" / role / "go"
+                with trigger.open("xb") as output:
+                    output.write(b"r2-network-v1\n")
+                trigger.chmod(0o644)
+                self.event("b", f"{role}/result", b"r2-network-v1\n", end)
+                latest = self.counters(end)
+                self.facts[role] = counter_delta(counters, latest)
+                counters = latest
+        trigger = self.root / "c/probe/daemon/finish"
+        with trigger.open("xb") as output:
+            output.write(b"r2-network-v1\n")
+        trigger.chmod(0o644)
+        self.event("c", "daemon/closed", b"r2-network-v1\n", end)
+        self.clear_synthetic(end)
+        stable_rules(counters, self.counters(end))
+
+
+def endpoint_inventory(node, address, mac, links, ipv4, ipv6, temporary):
+    require(len(links) == 2 and {row["ifname"] for row in links} == {"eth0", "lo"}, "node-endpoints")
+    eth = next(row for row in links if row["ifname"] == "eth0")
+    loopback = next(row for row in links if row["ifname"] == "lo")
+    require(eth["address"] == mac, "node-source-mac")
+    expected_eth = {(address, 24)}
+    expected_lo = {("127.0.0.1", 8), ("::1", 128)}
+    if temporary and node in "bc":
+        expected_eth.add(("fd42:72::12" if node == "b" else NETWORK["ipv6"], 64))
+    if temporary and node == "c":
+        expected_lo.update((NETWORK[key], 32) for key in ("outside", "link_local"))
+    for interface, expected in ((eth, expected_eth), (loopback, expected_lo)):
+        observed = [(row["local"], row["prefixlen"]) for row in interface["addr_info"]]
+        require(len(observed) == len(expected) and set(observed) == expected, "node-addresses")
+    routes = [("198.18.72.0/24", "eth0", None)]
+    if temporary and node == "b":
+        routes.extend(((NETWORK["outside"], "eth0", NETWORK["local"][0]),
+                       (NETWORK["link_local"], "eth0", NETWORK["nodes"]["c"][0])))
+    actual = [(row["dst"].removesuffix("/32"), row.get("dev"), row.get("gateway")) for row in ipv4]
+    require(sorted(actual) == sorted(routes), "node-ipv4-routes")
+    expected_v6 = [("fd42:72::/64", "eth0", None)] if temporary and node in "bc" else []
+    require([(row["dst"], row.get("dev"), row.get("gateway")) for row in ipv6] == expected_v6, "node-ipv6-routes")
+
+
+def validate_unit(unit, facts):
+    expected = {
+        "Id": unit, "LoadState": "loaded", "ActiveState": "active",
+        "ControlGroup": f"/system.slice/{unit}", "MemoryMax": str(OUTER["memory"]),
+        "MemorySwapMax": str(OUTER["swap"]), "TasksMax": str(OUTER["pids"]),
+        "CPUQuotaPerSecUSec": "1s", "LimitNOFILE": str(OUTER["nofile"]), "LimitCORE": str(OUTER["core"]),
+    }
+    require(all(facts.get(key) == value for key, value in expected.items())
+            and re.fullmatch(r"[1-9][0-9]{0,9}", facts.get("MainPID", ""))
+            and re.fullmatch(r"[0-9a-f]{32}", facts.get("InvocationID", "")), "unit-envelope")
+
+
+def observe_limits(group):
+    files = {"memory.max": str(OUTER["memory"]), "memory.swap.max": str(OUTER["swap"]),
+             "pids.max": str(OUTER["pids"])}
+    for name, expected in files.items():
+        require(bounded_read(group / name, 64).decode("ascii").strip() == expected, "cgroup-outer-limit")
+    quota, period = bounded_read(group / "cpu.max", 64).decode("ascii").split()
+    require(quota.isdecimal() and period.isdecimal() and 0 < int(quota) == int(period), "cgroup-cpu")
+    for parent in (group.parent, group.parent.parent):
+        for name, ceiling in files.items():
+            value = bounded_read(parent / name, 64).decode("ascii").strip()
+            require(value == "max" or value.isdecimal() and int(value) >= int(ceiling), "cgroup-ancestor-limit")
+
+
+def policy(bridge, links):
+    nodes = NETWORK["nodes"]
+    for node, link in links.items():
+        require(node in nodes and re.fullmatch(r"r2[0-9a-f]{11}[abc]", link), "policy-interface")
+    require(set(links) == set(nodes) and re.fullmatch(r"r2[0-9a-f]{11}", bridge), "policy-bridge")
+    def port(node, direction):
+        return f'{direction}ifname "{links[node]}"'
+    def pair(source, target):
+        source_ip, source_mac = nodes[source]
+        target_ip, target_mac = nodes[target]
+        return (f"{port(source, 'i')} {port(target, 'o')} ether saddr {source_mac} ether daddr {target_mac}"
+                f" ip saddr {source_ip} ip daddr {target_ip}")
+    forward = []
+    flows = (("peer", "b", "a"), ("enrollment", "b", "c"), ("build", "a", "b"))
+    for name, source, target in flows:
+        service = NETWORK["ports"][name]
+        forward.extend(((name, f"{pair(source, target)} tcp dport {service}", "accept"),
+                        (name + "-return", f"{pair(target, source)} tcp sport {service} ct state established", "accept")))
+    b_ip, b_mac = nodes["b"]
+    c_ip, c_mac = nodes["c"]
+    identity = f"{port('b', 'i')} {port('c', 'o')} ether saddr {b_mac} ether daddr {c_mac}"
+    exceptional = [
+        ("forbidden", f"{identity} ip saddr {b_ip} ip daddr {c_ip} tcp dport 22174"),
+        ("stray-outside", f'{identity} ip saddr {b_ip} ip daddr {NETWORK["outside"]} tcp dport 22174'),
+        ("link-local", f'{identity} ip saddr {b_ip} ip daddr {NETWORK["link_local"]} tcp dport 22174'),
+        ("ipv6", f'{identity} ip6 saddr fd42:72::12 ip6 daddr {NETWORK["ipv6"]} tcp dport 22174'),
+        ("dns-tcp", f"{identity} ip saddr {b_ip} ip daddr {c_ip} tcp dport 53"),
+        ("dns-udp", f"{identity} ip saddr {b_ip} ip daddr {c_ip} udp dport 53"),
+    ]
+    forward.extend((key, match, "drop") for key, match in exceptional)
+    for source, (source_ip, source_mac) in nodes.items():
+        for target, (target_ip, _target_mac) in nodes.items():
+            if source != target:
+                forward.append((f"arp-{source}-{target}",
+                                f"{port(source, 'i')} {port(target, 'o')} ether saddr {source_mac} "
+                                f"arp saddr ether {source_mac} arp saddr ip {source_ip} arp daddr ip {target_ip}", "accept"))
+    local, local_mac = NETWORK["local"]
+    local_probe = (f"{port('b', 'i')} ether saddr {b_mac} ether daddr {local_mac}"
+                   f" ip saddr {b_ip} ip daddr {local} tcp dport 22174")
+    outside_probe = local_probe.replace(f"ip daddr {local}", f'ip daddr {NETWORK["outside"]}')
+    input_rules = [("synthetic-local", local_probe, "accept"), ("outside-to-host", outside_probe, "accept")]
+    for node in nodes:
+        forward.extend(((f"forward-in-{node}", port(node, "i"), "drop"),
+                        (f"forward-out-{node}", port(node, "o"), "drop")))
+        input_rules.append((f"bridge-input-{node}", port(node, "i"), "drop"))
+    scoped = [bridge, *links.values()]
+    return {
+        "bridge": {"r2_forward": ("forward", forward), "r2_input": ("input", input_rules)},
+        "inet": {
+            "r2_input": ("input", [("local", f'iifname "{bridge}" ip saddr {b_ip} ip daddr {local} tcp dport 22174', "drop")]
+                         + [(f"host-input-{i}", f'iifname "{name}"', "drop") for i, name in enumerate(scoped)]),
+            "r2_forward": ("forward", [
+                ("outside", f'iifname "{bridge}" oifname "{bridge}" ip saddr {b_ip} '
+                 f'ip daddr {NETWORK["outside"]} tcp dport 22174', "drop"),
+            ] + [(f"host-forward-{d}-{i}", f'{d}ifname "{name}"', "drop") for i, name in enumerate(scoped) for d in "io"]),
+        },
+    }
+
+
+def table_handle(rows, family, name):
+    tables = [row["table"] for row in rows if "table" in row]
+    require(len(tables) == 1 and tables[0]["family"] == family and tables[0]["name"] == name
+            and type(tables[0]["handle"]) is int and tables[0]["handle"] > 0, "nft-table")
+    return tables[0]["handle"]
+
+
+def read_counters(rows, chains, family, name):
+    handle = table_handle(rows, family, name)
+    entries = {key: [] for key in chains}
+    found = set()
+    handles = set()
+    facts = {}
+    for row in rows:
+        require(len(row) == 1, "nft-row")
+        if "table" in row or "metainfo" in row:
+            continue
+        if "chain" in row:
+            chain = row["chain"]
+            key = chain["name"]
+            require(key in chains and key not in found and chain["family"] == family and chain["table"] == name
+                    and chain["type"] == "filter" and chain["hook"] == chains[key][0] and chain["prio"] == -310
+                    and chain["policy"] == "accept", "nft-chain")
+            found.add(key)
+            continue
+        require("rule" in row, "nft-rule-type")
+        rule = row["rule"]
+        key = rule["chain"]
+        ident = rule["handle"]
+        comment = rule["comment"]
+        expr = rule["expr"]
+        require(key in entries and rule["family"] == family and rule["table"] == name
+                and type(ident) is int and ident > 0 and ident not in handles and comment.startswith("r2-")
+                and len(expr) >= 3, "nft-rule-identity")
+        index = len(entries[key])
+        require(index < len(chains[key][1]), "nft-extra-rule")
+        label, source, verdict = chains[key][1][index]
+        require(comment == "r2-" + label and expr[-1] == {verdict: None}, "nft-rule-order-verdict")
+        rules_readback(expr[:-2], source)
+        counter = expr[-2].get("counter", {})
+        packets, total = counter.get("packets"), counter.get("bytes")
+        require(type(packets) is int and type(total) is int and packets >= 0 and total >= 0, "nft-counter")
+        entries[key].append(label)
+        handles.add(ident)
+        facts[label] = (handle, ident, packets, total)
+    require(found == chains.keys() and all(len(entries[key]) == len(rules) for key, (_, rules) in chains.items()),
+            "nft-missing-rule")
+    return facts
+
+
+def rules_readback(expressions, source):
+    # Match the expressions the kernel returned, including each protocol, field
+    # and literal operand. nft may report an implicit protocol dependency.
+    rendered = []
+    for expr in expressions:
+        match = expr.get("match", {})
+        left, right = match.get("left", {}), match.get("right")
+        require((match.get("op") == "==" or "ct" in left and match.get("op") == "in")
+                and len(left) == 1, "nft-match")
+        if "meta" in left:
+            rendered.append(f'{left["meta"]["key"]} "{right}"')
+        elif "payload" in left:
+            field = left["payload"]
+            rendered.append(f'{field["protocol"]} {field["field"]} {right}')
+        elif "ct" in left:
+            rendered.append(f'ct {left["ct"]["key"]} {right}')
+        else:
+            raise Refusal("nft-expression")
+    require(" ".join(rendered) == source, "nft-match-drift")
+
+
+def stable_rules(before, after):
+    require(before.keys() == after.keys() and all(before[key][:2] == after[key][:2]
+                                                for key in before), "nft-handle-drift")
+
+
+def counter_delta(before, after, *, required=None):
+    stable_rules(before, after)
+    if required is None:
+        required = {"peer", "peer-return", "enrollment", "enrollment-return", "forbidden", "outside-to-host",
+                    "outside", "link-local", "ipv6", "dns-tcp", "dns-udp", "synthetic-local", "local"}
+    require(required <= before.keys(), "nft-missing-counter")
+    result = {}
+    for name, (_table, handle, packets, size) in after.items():
+        delta = packets - before[name][2]
+        byte_delta = size - before[name][3]
+        require(0 <= delta <= 32 and (byte_delta == 0 if delta == 0 else 20*delta <= byte_delta <= 2000*delta),
+                "nft-counter-drift")
+        if name in required:
+            require(delta > 0, "nft-missing-hit")
+            result[name] = {"handle": handle, "packets": delta}
+    return result
+
+
+def check_security_status(status, caps, uid):
+    fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+    caps_value = f"{caps:016x}"
+    for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+        require(fields.get(key, "").strip() == caps_value, "process-capabilities")
+    for key in ("Uid", "Gid"):
+        require(fields.get(key, "").split() == [str(uid)] * 4, "process-role")
+    require(fields.get("NoNewPrivs", "").strip() == "1" and fields.get("Umask", "").strip() == "0077"
+            and "Groups" in fields and not fields["Groups"].strip(), "process-locks")
+
+
+def check_mount_inventory(contents, broker):
+    cgroup = "/sys/fs/cgroup"
+    expected = {
+        "/": ("ext4", "/", "ro"), "/data": ("ext4", "/", "rw"), "/proc": ("proc", "/", "rw"),
+        "/run": ("tmpfs", "/", "rw"), "/tmp": ("tmpfs", "/", "rw"), "/dev": ("tmpfs", "/", "rw"),
+        "/dev/pts": ("devpts", "/", "rw"), cgroup: ("cgroup2", "/", "ro"),
+    }
+    if broker:
+        expected[cgroup + "/system.slice/arxd.service"] = ("cgroup2", "/system.slice/arxd.service", "rw")
+    observed = {}
+    ids = set()
+    for line in contents.splitlines():
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        tail = right.split()
+        require(separator and len(fields) == 6 and len(tail) == 3, "mount-propagation")
+        ident, _, _, source, target, options = fields
+        require(ident.isdecimal() and ident not in ids and target not in observed, "mount-instance")
+        ids.add(ident)
+        observed[target] = (tail[0], source, options.split(",")[0])
+    require_same(observed, expected, "mount-inventory")
