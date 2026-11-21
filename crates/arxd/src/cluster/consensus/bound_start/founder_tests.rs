@@ -246,6 +246,8 @@ mod hosted {
                 wrap,
                 store,
                 custody: None,
+                slot: None,
+                history: None,
                 transport: Arc::new(tokio::sync::Mutex::new(transport)),
                 fixture: None,
             });

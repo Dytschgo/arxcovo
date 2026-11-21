@@ -78,6 +78,7 @@ pub(super) mod linux {
         issuance_publication,
         join_receipt::Origin,
         pki::{ca::ClusterCa, csr::ProvenCsr, custody::FounderCustody},
+        restart_history::{self, Fresh, Slot},
         startup_plan::Mode,
     };
     use checked_clock::HostClock;
@@ -104,6 +105,8 @@ pub(super) mod linux {
         wrap: PathBuf,
         store: PathBuf,
         custody: Option<FounderCustody>,
+        slot: Option<Slot>,
+        history: Option<Fresh>,
         transport: Arc<tokio::sync::Mutex<TransportOwner>>,
         #[cfg(test)]
         fixture: Option<HostedFixture>,
@@ -129,9 +132,22 @@ pub(super) mod linux {
     }
 
     // Created only from the sealed result of the one call on this job.
-    struct Issuance {
+    pub struct Issuance {
         expected: ExpectedIdentity,
         leaf: Vec<u8>,
+    }
+
+    impl restart_history::FounderProof for FounderCustody {
+        type Publication = Issuance;
+    }
+
+    impl restart_history::PublishedFounder for Issuance {
+        fn expected(&self) -> &ExpectedIdentity {
+            &self.expected
+        }
+        fn leaf(&self) -> &[u8] {
+            &self.leaf
+        }
     }
 
     struct TlsClock(Arc<HostClock>);
@@ -165,6 +181,48 @@ pub(super) mod linux {
         store: PathBuf,
         #[cfg(test)] fixture: HostedFixture,
     ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
+        dispatch_with_slot(
+            plan,
+            intent,
+            params,
+            wrap,
+            store,
+            None,
+            #[cfg(test)]
+            Some(fixture),
+        )
+    }
+
+    pub(in crate::cluster::consensus::bound_start) fn dispatch_history_founder(
+        plan: Plan,
+        intent: StartIntent,
+        params: Params,
+        wrap: PathBuf,
+        store: PathBuf,
+        slot: Slot,
+    ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
+        dispatch_with_slot(
+            plan.with_history_intent(Mode::CreateFounder),
+            intent,
+            params,
+            wrap,
+            store,
+            Some(slot),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_with_slot(
+        plan: Plan,
+        intent: StartIntent,
+        params: Params,
+        wrap: PathBuf,
+        store: PathBuf,
+        slot: Option<Slot>,
+        #[cfg(test)] fixture: Option<HostedFixture>,
+    ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
         if plan.mode != Mode::CreateFounder
             || intent.mode != Mode::CreateFounder
             || intent.node != FOUNDER
@@ -177,9 +235,11 @@ pub(super) mod linux {
             wrap,
             store,
             custody: None,
+            slot,
+            history: None,
             transport: Arc::new(tokio::sync::Mutex::new(transport)),
             #[cfg(test)]
-            fixture: Some(fixture),
+            fixture,
         });
         Ok(dispatch_on(
             job,
@@ -239,12 +299,19 @@ pub(super) mod linux {
         let address = intent.peer.to_string();
         peer_transport::endpoint(&address).map_err(|_| Error::Address)?;
 
+        let operation = state.founder.as_mut().ok_or(Error::Preparation)?;
+        if let Some(slot) = operation.slot.take() {
+            operation.history = Some(
+                slot.check_fresh(owner, &operation.wrap, &operation.store)
+                    .map_err(|_| Error::Custody)?,
+            );
+        }
+
         // The offline journal/inventory check still applies here. Engine has not
         // received the retained stores. Only proved untouched genesis gets floor zero.
         issuance_publication::reserve(owner).map_err(Error::Publication)?;
         let clock = Arc::new(HostClock::new(0));
         let now = clock.sample_ms().map_err(|_| Error::Clock)?;
-        let operation = state.founder.as_mut().ok_or(Error::Preparation)?;
         operation.custody = Some(
             FounderCustody::create(owner, &operation.wrap, &operation.store)
                 .map_err(|_| Error::Custody)?,
@@ -255,6 +322,11 @@ pub(super) mod linux {
             .unwrap()
             .seal(intent.cluster, now)
             .map_err(|_| Error::Custody)?;
+        if let Some(history) = operation.history.as_mut() {
+            history
+                .bind(operation.custody.as_ref().unwrap().history_auth())
+                .map_err(|_| Error::Custody)?;
+        }
         let key = ProvenCsr::parse(&csr).map_err(|_| Error::Custody)?.digest();
         Ok(Prepared {
             cluster: intent.cluster,
@@ -391,10 +463,8 @@ pub(super) mod linux {
         }
         let State { owner, founder, .. } = &mut *state;
         let owner = owner.as_mut().ok_or(Error::Preparation)?;
-        let custody = founder
-            .as_ref()
-            .and_then(|op| op.custody.as_ref())
-            .ok_or(Error::Custody)?;
+        let operation = founder.as_mut().ok_or(Error::Custody)?;
+        let custody = operation.custody.as_ref().ok_or(Error::Custody)?;
         let member = custody.member().map_err(|_| Error::Custody)?;
         let now = clock.sample_ms().map_err(|_| Error::Clock)?;
         let expected = Some(&issuance.expected);
@@ -415,6 +485,11 @@ pub(super) mod linux {
         let key = member
             .tls_key(&issuance.expected, &root, &issuance.leaf, now)
             .map_err(|_| Error::Custody)?;
+        if let Some(history) = &mut operation.history {
+            history
+                .founder(owner, custody, &issuance)
+                .map_err(|_| Error::Publication(issuance_publication::Error::Unconfirmed))?;
+        }
         Ok(Credentials {
             root: root.into(),
             leaf: issuance.leaf.into(),
