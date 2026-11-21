@@ -360,6 +360,23 @@ impl Activity {
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let tx = db.transaction()?;
+        let changed =
+            Self::update_completion(&tx, id, outcome, metadata, "outcome='started'", &[])?;
+        if changed != 1 {
+            anyhow::bail!("activity completion refused");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn update_completion(
+        tx: &rusqlite::Transaction<'_>,
+        id: i64,
+        outcome: Outcome,
+        metadata: &Metadata,
+        predicate: &str,
+        predicate_values: &[rusqlite::types::Value],
+    ) -> Result<usize> {
         // The mode recorded at start is authoritative; completion cannot relabel it.
         if let Some(mode) = metadata.identity_mode {
             let current: Option<String> = tx
@@ -383,6 +400,7 @@ impl Activity {
             values.push(sql_value(&value[name])?);
         }
         values.push(id.into());
+        values.extend_from_slice(predicate_values);
         let assignments = FIELDS
             .iter()
             .map(|(n, _)| {
@@ -394,14 +412,53 @@ impl Activity {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let changed = tx.execute(&format!("UPDATE activity SET outcome=?,finished_at_ms=?,class=CASE WHEN ?1='rejected' THEN 'read' ELSE class END,{assignments} WHERE id=? AND outcome='started'"), rusqlite::params_from_iter(values))?;
-        if changed != 1 {
+        let changed = tx.execute(&format!("UPDATE activity SET outcome=?,finished_at_ms=?,class=CASE WHEN ?1='rejected' THEN 'read' ELSE class END,{assignments} WHERE id=? AND {predicate}"), rusqlite::params_from_iter(values))?;
+        if changed == 1 {
+            tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build)", [])?;
+            check_size(tx)?;
+        }
+        Ok(changed)
+    }
+
+    /// Returns false if the matching forwarded row was already resolved.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_forwarded_build(
+        &self,
+        id: i64,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        outcome: Outcome,
+        metadata: &Metadata,
+    ) -> Result<bool> {
+        if !matches!(
+            outcome,
+            Outcome::Succeeded | Outcome::Failed | Outcome::Refused
+        ) {
+            anyhow::bail!("invalid completion");
+        }
+        metadata.validate()?;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = Self::update_completion(
+            &tx,
+            id,
+            outcome,
+            metadata,
+            "outcome IN ('started','interrupted') AND EXISTS (
+                SELECT 1 FROM delegated_build d WHERE d.activity_id=activity.id
+                AND d.forwarded=1 AND d.operation=? AND d.scope=?
+            )",
+            &[operation.to_vec().into(), scope.to_vec().into()],
+        )?;
+        let result = Self::read_delegated_build(&tx, operation, scope, true)?;
+        if !result.is_some_and(|row| row.activity_id == id && row.terminal()) {
             anyhow::bail!("activity completion refused");
         }
-        tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build)", [])?;
-        check_size(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(changed == 1)
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn start_delegated_build(
@@ -494,6 +551,16 @@ impl Activity {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        Self::read_delegated_build(&db, operation, scope, forwarded)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_delegated_build(
+        db: &Connection,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarded: bool,
+    ) -> Result<Option<BuildActivity>> {
         let mut query = db.prepare(&format!(
             "SELECT {BUILD_ACTIVITY_FIELDS}
              FROM delegated_build d JOIN activity a ON a.id=d.activity_id
@@ -510,8 +577,9 @@ impl Activity {
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let mut query = db.prepare(
-            "SELECT operation FROM delegated_build WHERE scope=?1 AND forwarded=1
-             AND typeof(operation)='blob' AND length(operation)=32 ORDER BY activity_id DESC LIMIT 32",
+            "SELECT d.operation FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+             WHERE d.scope=?1 AND d.forwarded=1 AND a.outcome IN ('started','interrupted')
+             AND typeof(d.operation)='blob' AND length(d.operation)=32 ORDER BY a.id DESC LIMIT 32",
         )?;
         let rows = query.query_map([scope], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

@@ -476,6 +476,334 @@ async fn broker_busy_drain_and_revocation_refuse_before_activity() {
     execution.drain().await.unwrap();
 }
 
+const STATUS_TEST_CLUSTER: [u8; 16] = [8; 16];
+
+struct StatusPeer {
+    node: NodeId,
+    bindings: [[u8; 32]; 2],
+    client: Option<Arc<rustls::ClientConfig>>,
+    server: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl Authority for StatusPeer {
+    fn identity(&self) -> Option<([u8; 16], NodeId)> {
+        Some((STATUS_TEST_CLUSTER, self.node))
+    }
+
+    fn binding(&self, cluster: [u8; 16], node: NodeId) -> Option<[u8; 32]> {
+        if cluster != STATUS_TEST_CLUSTER {
+            return None;
+        }
+        self.bindings.get((node.get() - 1) as usize).copied()
+    }
+
+    fn client(&self, _: NodeId) -> Option<Arc<rustls::ClientConfig>> {
+        self.client.clone()
+    }
+
+    fn server(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.server.clone()
+    }
+}
+
+// The server certificate names a cluster URI. Pin it in this fixture while
+// exercising the real handshake and the transport's URI/SPKI checks.
+#[derive(Debug)]
+struct StatusServerPin(rustls::pki_types::CertificateDer<'static>);
+
+impl rustls::client::danger::ServerCertVerifier for StatusServerPin {
+    fn verify_server_cert(
+        &self,
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if *cert == self.0 && intermediates.is_empty() {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("fixture requires TLS 1.3".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+fn status_peers() -> [Arc<StatusPeer>; 2] {
+    use crate::cluster::{enrollment::KeyDigest, pki::node_uri};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
+    };
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root = ca.self_signed(&ca_key).unwrap().der().clone();
+    let issuer = Issuer::new(ca, ca_key);
+    let keys = std::array::from_fn::<_, 2, _>(|_| KeyPair::generate().unwrap());
+    let bindings = keys.each_ref().map(|key| {
+        *KeyDigest::of_spki(&key.subject_public_key_info())
+            .unwrap()
+            .as_bytes()
+    });
+    let [source_cert, target_cert] = std::array::from_fn(|i| {
+        let mut leaf = CertificateParams::default();
+        leaf.distinguished_name = DistinguishedName::new();
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        leaf.subject_alt_names = vec![SanType::URI(
+            node_uri(STATUS_TEST_CLUSTER, node(i as u64 + 1))
+                .try_into()
+                .unwrap(),
+        )];
+        leaf.signed_by(&keys[i], &issuer).unwrap().der().clone()
+    });
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(root).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .unwrap();
+    let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(StatusServerPin(target_cert.clone())))
+        .with_client_auth_cert(
+            vec![source_cert],
+            PrivatePkcs8KeyDer::from(keys[0].serialize_der()).into(),
+        )
+        .unwrap();
+    let mut server = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![target_cert],
+            PrivatePkcs8KeyDer::from(keys[1].serialize_der()).into(),
+        )
+        .unwrap();
+    client.alpn_protocols = vec![b"arxcovo-build/1".to_vec()];
+    server.alpn_protocols = client.alpn_protocols.clone();
+    [
+        Arc::new(StatusPeer {
+            node: node(1),
+            bindings,
+            client: Some(Arc::new(client)),
+            server: None,
+        }),
+        Arc::new(StatusPeer {
+            node: node(2),
+            bindings,
+            client: None,
+            server: Some(Arc::new(server)),
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn authenticated_forwarded_status_resolves_reopened_activity() {
+    let (source_dir, source_db, _, _, _) = fixture(false);
+    let (_target_dir, target_db, _, _, _) = fixture(false);
+    let [source_peer, target_peer] = status_peers();
+    let source = source_peer.node;
+    let target = target_peer.node;
+    let scope = forward_scope("fixture", target);
+    let operation = [1; 32];
+    let missing = [2; 32];
+    let id = source_db
+        .start_delegated_build(operation, scope, Some("fixture"))
+        .unwrap();
+    source_db
+        .start_delegated_build(missing, scope, Some("fixture"))
+        .unwrap();
+    drop(source_db);
+    let source_db = Arc::new(Activity::open(source_dir.path()).unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let source_key = source_peer.binding(STATUS_TEST_CLUSTER, source).unwrap();
+    let target_key = target_peer.binding(STATUS_TEST_CLUSTER, target).unwrap();
+    let settings = |routes, grants| Settings {
+        socket: PathBuf::new(),
+        activity: PathBuf::new(),
+        peer: address,
+        agent_group: 1002,
+        agents: vec![LocalAgent {
+            uid: 1001,
+            principal: "fixture".into(),
+            token_sha256: "a".repeat(64),
+            agent: "fixture".into(),
+        }],
+        routes,
+        grants,
+    };
+    let source_service = BuildService::new(
+        settings(
+            vec![Route {
+                node: target,
+                address,
+            }],
+            vec![],
+        ),
+        source_db.clone(),
+        None,
+        || true,
+        Shutdown::default(),
+    );
+    source_service.set_authority(source_peer);
+    let stop = Shutdown::default();
+    let target_service = BuildService::new(
+        settings(
+            vec![],
+            vec![Grant {
+                source,
+                key: source_key,
+                agent: "fixture".into(),
+                commands: vec![descriptor("bin")],
+            }],
+        ),
+        target_db.clone(),
+        None,
+        || true,
+        stop.clone(),
+    );
+    target_service.set_authority(target_peer.clone());
+    let (_, inbound_scope) = target_service
+        .checked_grant(&Access {
+            authority: target_peer,
+            peer: Identity {
+                cluster: STATUS_TEST_CLUSTER,
+                node: source,
+                key: source_key,
+            },
+            target,
+            target_key,
+            agent: "fixture".into(),
+        })
+        .unwrap();
+    let target_id = target_db
+        .start_delegated_build(operation, inbound_scope, None)
+        .unwrap();
+    let server = tokio::spawn(target_service.serve(listener));
+
+    let local = |operation| {
+        source_db
+            .delegated_build(operation, scope, true)
+            .unwrap()
+            .unwrap()
+    };
+    for unresolved in [operation, missing] {
+        assert_eq!(local(unresolved).outcome, Outcome::Interrupted);
+        assert_eq!(
+            source_service
+                .forwarded_status("fixture", target, Some(unresolved))
+                .await,
+            json!({"operation_id": hex::encode(unresolved), "outcome": "unknown"}),
+        );
+        assert_eq!(local(unresolved).outcome, Outcome::Interrupted);
+    }
+    target_db
+        .finish_typed(
+            target_id,
+            Outcome::Succeeded,
+            &Metadata {
+                exit_code: Some(0),
+                cleanup_confirmed: Some(true),
+                observed_kind: Some(ObservedKind::UnixUid),
+                observed_id: Some("21002".into()),
+                observed_gid: Some(21003),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let target_activity = target_db
+        .delegated_build(operation, inbound_scope, false)
+        .unwrap()
+        .unwrap();
+    let expected = json!({
+        "operation_id": hex::encode(operation), "outcome": "succeeded",
+        "target_activity": target_activity, "output": null,
+    });
+    assert_eq!(
+        source_service
+            .forwarded_status("fixture", target, Some(operation))
+            .await,
+        expected
+    );
+    assert_eq!(
+        source_service
+            .forwarded_status("fixture", target, None)
+            .await,
+        json!({"operations": [hex::encode(missing)]}),
+    );
+    stop.cancel();
+    tokio::time::timeout(IO_BUDGET, server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(source_service);
+    drop(source_db);
+
+    let reopened = Activity::open(source_dir.path()).unwrap();
+    let result = reopened
+        .delegated_build(operation, scope, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.activity_id, id);
+    assert_eq!(result.outcome, target_activity.outcome);
+    assert_eq!(result.exit_code, target_activity.exit_code);
+    assert_eq!(result.cleanup_confirmed, target_activity.cleanup_confirmed);
+    assert_eq!(result.uid, target_activity.uid);
+    assert_eq!(result.gid, target_activity.gid);
+    assert!(result.terminal());
+    assert_eq!(
+        reopened
+            .delegated_build(missing, scope, true)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        Outcome::Interrupted,
+    );
+}
+
 #[tokio::test]
 async fn authenticated_http_inventory_cannot_submit_an_explicit_target() {
     use rmcp::{

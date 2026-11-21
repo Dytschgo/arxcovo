@@ -588,7 +588,7 @@ impl BuildService {
             _ = closed.cancelled() => None,
             reply = self.remote(principal, target, Query::Spend { operation, lease, descriptor: offer }, budget) => reply,
         };
-        self.forward_result(operation, id, reply).await
+        self.forward_result(operation, scope, id, reply).await
     }
 
     pub(crate) async fn forwarded_status(
@@ -620,22 +620,20 @@ impl BuildService {
         };
         let reply = self
             .remote(principal, target, Query::Status { operation }, IO_BUDGET)
-            .await;
-        if !matches!(local.outcome, Outcome::Started) {
-            return public_result(operation, reply.filter(|r| !matches!(r, Response::Refused)));
+            .await
+            // An aged-out or unavailable remote status cannot prove no execution.
+            .filter(|r| !matches!(r, Response::Refused));
+        if !matches!(local.outcome, Outcome::Started | Outcome::Interrupted) {
+            return public_result(operation, reply);
         }
-        // An aged-out or unavailable remote status cannot prove no execution.
-        self.forward_result(
-            operation,
-            local.activity_id,
-            reply.filter(|r| !matches!(r, Response::Refused)),
-        )
-        .await
+        self.forward_result(operation, scope, local.activity_id, reply)
+            .await
     }
 
     async fn forward_result(
         &self,
         operation: Operation,
+        scope: [u8; 32],
         id: i64,
         reply: Option<Response>,
     ) -> Value {
@@ -669,10 +667,10 @@ impl BuildService {
                     tree_boundary: result.uid.map(|_| TreeBoundary::LinuxCgroup),
                     ..Default::default()
                 };
-                activity.finish_typed(id, result.outcome, &metadata)
+                activity.finish_forwarded_build(id, operation, scope, result.outcome, &metadata)
             })
             .await;
-            if !matches!(terminal, Ok(Ok(()))) {
+            if !matches!(terminal, Ok(Ok(_))) {
                 return public_result(operation, None);
             }
         }
