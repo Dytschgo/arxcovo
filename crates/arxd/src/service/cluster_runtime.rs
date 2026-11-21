@@ -698,33 +698,63 @@ impl Lifecycle {
         }));
         let routes = Arc::new(checked.routes);
         let issuer = checked.issuer;
+        let owner = checked.roles.owner;
         let dispatch = {
             let work = work.clone();
             let stop = stop.clone();
             let fence = fence.clone();
             let status = status.clone();
-            move |operator, request| {
+            move |operator: cluster_owner::Operator, request| {
                 let work = work.clone();
                 let stop = stop.clone();
                 let fence = fence.clone();
                 let status = status.clone();
                 let routes = routes.clone();
                 async move {
-                    let mut work = work.lock().await;
-                    if stop.is_cancelled() || work.first.is_some() {
-                        return cluster_owner::Reply::Refused;
-                    }
                     use cluster_owner::{Reply, Request};
+                    let deadline = tokio::time::Instant::now() + cluster_owner::PRIVATE_WORK_WAIT;
+                    let private =
+                        matches!(request, Request::MintReceipt | Request::ObserveLedger(_));
+                    let mut work = if private {
+                        let Ok(work) = tokio::time::timeout_at(deadline, work.lock()).await else {
+                            return Reply::Refused.into();
+                        };
+                        work
+                    } else {
+                        work.lock().await
+                    };
+                    if operator.uid() != owner || stop.is_cancelled() || work.first.is_some() {
+                        return Reply::Refused.into();
+                    }
                     match request {
                         Request::Mint => match &work.running {
-                            Some(running) => running.mint(operator).await,
-                            None => Reply::Refused,
+                            Some(running) => running.mint(operator).await.into(),
+                            None => Reply::Refused.into(),
                         },
+                        Request::MintReceipt => {
+                            let Some(running) = &work.running else {
+                                return Reply::Refused.into();
+                            };
+                            tokio::time::timeout_at(deadline, running.mint_receipt(operator))
+                                .await
+                                .unwrap_or_else(|_| Reply::Unknown.into())
+                        }
+                        Request::ObserveLedger(slots) => {
+                            let Some(running) = &work.running else {
+                                return Reply::Refused.into();
+                            };
+                            let code = status.borrow().code();
+                            let reply = running.observe_ledger(&slots, code);
+                            if stop.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                                return Reply::Refused.into();
+                            }
+                            reply
+                        }
                         Request::Join(paste) => {
                             let (Some(installation), Some(issuer)) = (work.waiting.take(), issuer)
                             else {
                                 record("owner-join", "refused");
-                                return Reply::Refused;
+                                return Reply::Refused.into();
                             };
                             status.send_replace(Status::Starting);
                             match Running::join(installation, paste, &routes, &fence).await {
@@ -733,7 +763,7 @@ impl Lifecycle {
                                     record("join-start", "refused");
                                     work.first = Some(reason);
                                     status.send_replace(Status::Refused);
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 }
                             }
                             let running = work.running.as_ref().unwrap();
@@ -741,7 +771,7 @@ impl Lifecycle {
                                 biased;
                                 _ = stop.cancelled() => {
                                     record("join-attach", "closed");
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 },
                                 result = running.attached() => result,
                             };
@@ -749,7 +779,7 @@ impl Lifecycle {
                                 Ok(()) if !stop.is_cancelled() => running.admit(issuer).await,
                                 Ok(()) => {
                                     record("join-attach", "closed");
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 }
                                 Err(reason) => {
                                     record("join-attach", "refused");
@@ -757,11 +787,11 @@ impl Lifecycle {
                                 }
                             };
                             match result {
-                                Ok(()) => Reply::Joined,
+                                Ok(()) => Reply::Joined.into(),
                                 Err(reason) => {
                                     work.first = Some(reason);
                                     status.send_replace(Status::Refused);
-                                    Reply::Unknown
+                                    Reply::Unknown.into()
                                 }
                             }
                         }

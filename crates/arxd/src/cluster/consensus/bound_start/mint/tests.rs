@@ -54,12 +54,59 @@ fn owner_mint_accepts_only_first_result_from_exact_epoch_above_floor() {
             view(),
             FLOOR,
             MINT,
+            Some(Outcome::Rejected(
+                crate::cluster::enrollment::Reject::CodeIdCollision
+            )),
+        ),
+        None,
+    );
+    assert_eq!(
+        first_expiry(
+            view(),
+            FLOOR,
+            MINT,
             Some(Outcome::Minted {
                 replay: true,
                 expires_ms: EXPIRES
             })
         ),
         None
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mint_result_modes_only_release_the_requested_representation() {
+    use crate::{
+        cluster::enrollment::{Command, JoinCode, MintReceiptInput},
+        service::cluster_owner::{DispatchReply, Paste, Reply},
+    };
+    let code = JoinCode::generate([1; 16], [2; 32], anchor(9), |buffer| {
+        buffer.fill(7);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let mint = Command::Mint {
+        cluster: [1; 16],
+        actor: [3; 16],
+        request: [4; 16],
+        code: code.code_id(),
+        verifier: code.verifier(),
+        proposed_at_ms: 100,
+    };
+    let input = MintReceiptInput::new(&mint);
+    let protected = || Paste::copy(b"test-only protected bytes").unwrap();
+    let result = linux::mint_result(protected(), Some(&input), MINT, EXPIRES);
+    let DispatchReply::MintReceipt(receipt) = result else {
+        panic!("receipt mode returned a different representation");
+    };
+    assert_eq!(receipt.position, MINT);
+    assert_eq!(Some(receipt.digest), input.digest(MINT, EXPIRES));
+    assert_ne!(Some(receipt.digest), input.digest(FLOOR, EXPIRES));
+    let result = linux::mint_result(protected(), None, MINT, EXPIRES);
+    assert!(
+        matches!(result, DispatchReply::Control(Reply::Minted(paste))
+        if paste.bytes() == b"test-only protected bytes")
     );
 }
 

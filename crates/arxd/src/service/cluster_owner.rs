@@ -2,6 +2,7 @@
 #![allow(dead_code)] // The daemon does not bind this endpoint in 13c.
 
 use super::Shutdown;
+use crate::cluster::state_store::LogPos;
 use std::{
     ffi::CString,
     future::Future,
@@ -25,9 +26,19 @@ const MAGIC: &[u8; 4] = b"ARXO";
 const HEADER: usize = 7;
 const HANDSHAKE: Duration = Duration::from_secs(2);
 pub(super) const REPLY_WAIT: Duration = Duration::from_secs(16);
+pub(super) const PRIVATE_WORK_WAIT: Duration = REPLY_WAIT.saturating_sub(HANDSHAKE);
 const MAX_CONNECTIONS: usize = 4;
 const TIME_EVIDENCE: u8 = 5;
 const TIME_REPLY: u8 = 16;
+const MINT_RECEIPT: u8 = 6;
+const OBSERVE_LEDGER: u8 = 7;
+const MINT_RECEIPT_REPLY: u8 = 17;
+const LEDGER_REPLY: u8 = 18;
+pub(crate) const LEDGER_VERSION: u8 = 1;
+const SLOT_LEN: usize = 56;
+const SLOT_COUNT: usize = 4;
+const LEDGER_REQUEST_LEN: usize = 2 + SLOT_COUNT * SLOT_LEN;
+pub(crate) const LEDGER_REPLY_LEN: usize = 164;
 pub(crate) const TIME_EVIDENCE_LEN: usize = 53;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,11 +73,35 @@ impl Paste {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.0[..self.1]
     }
+
+    fn clear(&mut self) {
+        wipe(self.0.as_mut_slice());
+        self.1 = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_probe_pipe(
+        mut pipe: impl tokio::io::AsyncRead + Unpin,
+    ) -> io::Result<Self> {
+        let mut paste = Self::empty();
+        while paste.1 < MAX_PASTE {
+            let read = pipe.read(&mut paste.0[paste.1..]).await?;
+            if read == 0 {
+                return Ok(paste);
+            }
+            paste.1 += read;
+        }
+        let mut trailing = InputHeader([0; HEADER]);
+        if pipe.read(&mut trailing.0[..1]).await? != 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(paste)
+    }
 }
 
 impl Drop for Paste {
     fn drop(&mut self) {
-        wipe(self.0.as_mut_slice());
+        self.clear();
     }
 }
 
@@ -80,6 +115,8 @@ pub(super) fn wipe(bytes: &mut [u8]) {
 pub(crate) enum Request {
     Mint,
     Join(Paste),
+    MintReceipt,
+    ObserveLedger(Box<LedgerSlots>),
 }
 
 pub(crate) enum Reply {
@@ -87,6 +124,101 @@ pub(crate) enum Reply {
     Joined,
     Refused,
     Unknown,
+}
+
+// Keep the owner CLI's original reply type closed over its two operations.
+pub(crate) enum DispatchReply {
+    Control(Reply),
+    MintReceipt(MintReceipt),
+    Ledger([u8; LEDGER_REPLY_LEN]),
+}
+
+impl From<Reply> for DispatchReply {
+    fn from(reply: Reply) -> Self {
+        Self::Control(reply)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MintReceipt {
+    pub(crate) position: LogPos,
+    pub(crate) digest: [u8; 32],
+}
+
+pub(crate) fn position_bytes(position: LogPos) -> [u8; 24] {
+    let mut bytes = [0; 24];
+    bytes[..8].copy_from_slice(&position.term.to_be_bytes());
+    bytes[8..16].copy_from_slice(&position.leader.to_be_bytes());
+    bytes[16..].copy_from_slice(&position.index.to_be_bytes());
+    bytes
+}
+
+impl MintReceipt {
+    fn encode(self) -> [u8; SLOT_LEN] {
+        let mut bytes = [0; SLOT_LEN];
+        bytes[..24].copy_from_slice(&position_bytes(self.position));
+        bytes[24..].copy_from_slice(&self.digest);
+        bytes
+    }
+
+    fn decode(bytes: &[u8; SLOT_LEN]) -> Self {
+        let word = |start| u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
+        Self {
+            position: LogPos {
+                term: word(0),
+                leader: word(8),
+                index: word(16),
+            },
+            digest: bytes[24..].try_into().unwrap(),
+        }
+    }
+}
+
+pub(crate) struct LedgerSlots {
+    slots: [MintReceipt; SLOT_COUNT],
+    count: usize,
+}
+
+impl LedgerSlots {
+    pub(crate) fn receipts(&self) -> &[MintReceipt] {
+        &self.slots[..self.count]
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; LEDGER_REQUEST_LEN] = bytes.try_into().ok()?;
+        let count = usize::from(bytes[1]);
+        if bytes[0] != LEDGER_VERSION || !matches!(count, 2 | 4) {
+            return None;
+        }
+        let slots = std::array::from_fn(|i| {
+            let offset = 2 + i * SLOT_LEN;
+            MintReceipt::decode(bytes[offset..offset + SLOT_LEN].try_into().unwrap())
+        });
+        for (i, slot) in slots[..count].iter().enumerate() {
+            let index = slot.position.index;
+            if !(1..=i64::MAX as u64).contains(&index)
+                || index.checked_add(1).is_none()
+                || (i > 0 && slots[i - 1].position.index >= index)
+                || slots[..i].iter().any(|p| p.digest == slot.digest)
+            {
+                return None;
+            }
+        }
+        if bytes[2 + count * SLOT_LEN..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Some(Self { slots, count })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(receipts: &[MintReceipt]) -> Self {
+        let mut bytes = [0; LEDGER_REQUEST_LEN];
+        bytes[..2].copy_from_slice(&[LEDGER_VERSION, receipts.len().try_into().unwrap()]);
+        for (slot, receipt) in bytes[2..].chunks_exact_mut(SLOT_LEN).zip(receipts) {
+            slot.copy_from_slice(&receipt.encode());
+        }
+        Self::decode(&bytes).unwrap()
+    }
 }
 
 /// Constructed only from a checked, kernel-authenticated connection.
@@ -327,7 +459,10 @@ impl Server {
         Work: Future<Output = Reply> + Send,
     {
         self.start_with_stop(
-            dispatch,
+            move |operator, request| {
+                let work = dispatch(operator, request);
+                async move { work.await.into() }
+            },
             || [0; 29],
             || [0; TIME_EVIDENCE_LEN],
             Shutdown::default(),
@@ -343,7 +478,7 @@ impl Server {
     ) -> Control
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
-        Work: Future<Output = Reply> + Send,
+        Work: Future<Output = DispatchReply> + Send,
         S: Fn() -> [u8; 29] + Clone + Send + 'static,
         T: Fn() -> [u8; TIME_EVIDENCE_LEN] + Clone + Send + 'static,
     {
@@ -368,7 +503,7 @@ impl Server {
     ) -> Result<(), Failure>
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
-        Work: Future<Output = Reply> + Send,
+        Work: Future<Output = DispatchReply> + Send,
         S: Fn() -> [u8; 29] + Clone + Send + 'static,
         T: Fn() -> [u8; TIME_EVIDENCE_LEN] + Clone + Send + 'static,
     {
@@ -480,7 +615,7 @@ where
         stream,
         uid,
         stop,
-        dispatch,
+        |operator, request| async move { dispatch(operator, request).await.into() },
         || [0; 29],
         || [0; TIME_EVIDENCE_LEN],
     )
@@ -496,7 +631,7 @@ async fn connection_with_status<F, Work, S, T>(
     time_evidence: T,
 ) where
     F: FnOnce(Operator, Request) -> Work,
-    Work: Future<Output = Reply>,
+    Work: Future<Output = DispatchReply>,
     S: FnOnce() -> [u8; 29],
     T: FnOnce() -> [u8; TIME_EVIDENCE_LEN],
 {
@@ -516,23 +651,44 @@ async fn connection_with_status<F, Work, S, T>(
             let _ = timeout(HANDSHAKE, send(&mut stream, TIME_REPLY, &time_evidence())).await;
             return;
         }
-        Ok(Ok((tag, body))) if !stop.is_cancelled() => match decode_request(tag, body) {
-            Ok(request) => dispatch(Operator(uid), request).await,
-            Err(_) => Reply::Refused,
-        },
-        _ => Reply::Refused,
+        Ok(Ok((tag, body)))
+            if !stop.is_cancelled()
+                && (!matches!(tag, MINT_RECEIPT | OBSERVE_LEDGER)
+                    || peer(&stream, uid).is_ok()) =>
+        {
+            match decode_request(tag, body) {
+                Ok(request) => dispatch(Operator(uid), request).await,
+                Err(_) => Reply::Refused.into(),
+            }
+        }
+        _ => Reply::Refused.into(),
     };
     // A transport failure cannot resubmit any command or release a paste elsewhere.
-    let _ = timeout(HANDSHAKE, send_reply(&mut stream, reply)).await;
+    let _ = timeout(HANDSHAKE, async {
+        match reply {
+            DispatchReply::Control(reply) => send_reply(&mut stream, reply).await,
+            DispatchReply::MintReceipt(receipt) => {
+                let mut bytes = [LEDGER_VERSION; 1 + SLOT_LEN];
+                bytes[1..].copy_from_slice(&receipt.encode());
+                send(&mut stream, MINT_RECEIPT_REPLY, &bytes).await
+            }
+            DispatchReply::Ledger(bytes) => send(&mut stream, LEDGER_REPLY, &bytes).await,
+        }
+    })
+    .await;
 }
 
 fn peer(stream: &UnixStream, expected: u32) -> Result<(), Failure> {
     // Tokio's Linux peer_cred uses SO_PEERCRED on the connected AF_UNIX socket.
     let credentials = stream.peer_cred().map_err(|_| Failure::Refused)?;
-    if credentials.uid() != expected || credentials.pid().is_none_or(|pid| pid <= 0) {
+    if !peer_matches(credentials.uid(), credentials.pid(), expected) {
         return Err(Failure::Refused);
     }
     Ok(())
+}
+
+fn peer_matches(uid: u32, pid: Option<i32>, expected: u32) -> bool {
+    uid == expected && pid.is_some_and(|pid| pid > 0)
 }
 
 pub(super) async fn connect(path: &Path, daemon: u32) -> Result<UnixStream, Failure> {
@@ -562,6 +718,7 @@ pub(super) async fn request(mut stream: UnixStream, request: Request) -> Result<
     let (tag, body) = match &request {
         Request::Mint => (1, &[][..]),
         Request::Join(paste) => (2, paste.bytes()),
+        Request::MintReceipt | Request::ObserveLedger(_) => return Err(Failure::Refused),
     };
     timeout(HANDSHAKE, send(&mut stream, tag, body))
         .await
@@ -591,6 +748,11 @@ fn decode_request(tag: u8, body: Paste) -> io::Result<Request> {
     match tag {
         1 if body.bytes().is_empty() => Ok(Request::Mint),
         2 if paste_shape(body.bytes()) => Ok(Request::Join(body)),
+        MINT_RECEIPT if body.bytes().is_empty() => Ok(Request::MintReceipt),
+        OBSERVE_LEDGER => LedgerSlots::decode(body.bytes())
+            .map(Box::new)
+            .map(Request::ObserveLedger)
+            .ok_or_else(|| io::ErrorKind::InvalidData.into()),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }

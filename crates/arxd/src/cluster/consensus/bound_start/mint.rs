@@ -59,9 +59,11 @@ mod linux {
                 bound_start::{Job, Status, enrollment_ingress::ReadyIssuer},
                 *,
             },
-            enrollment::{ActorId, BoundVoters, CODE_TTL_MS, CodeId, JoinCode, transfer},
+            enrollment::{
+                ActorId, BoundVoters, CODE_TTL_MS, CodeId, JoinCode, MintReceiptInput, transfer,
+            },
         },
-        service::cluster_owner::{Operator, Paste, Reply},
+        service::cluster_owner::{DispatchReply, MintReceipt, Operator, Paste, Reply},
     };
     use checked_clock::CheckedClock;
     use openraft::type_config::async_runtime::watch::WatchReceiver;
@@ -70,6 +72,12 @@ mod linux {
     use tokio::time::timeout;
 
     const MINT_WAIT: Duration = Duration::from_secs(10);
+
+    #[derive(Clone, Copy)]
+    enum ResultMode {
+        Paste,
+        Receipt,
+    }
 
     fn actor(owner: &Operator, installation: [u8; 16], cluster: [u8; 16]) -> ActorId {
         let bytes = Sha256::new()
@@ -136,26 +144,50 @@ mod linux {
             owner: Operator,
             installation: [u8; 16],
         ) -> Reply {
+            match self
+                .mint_owner_mode(owner, installation, ResultMode::Paste)
+                .await
+            {
+                DispatchReply::Control(reply) => reply,
+                _ => unreachable!("paste result mode"),
+            }
+        }
+
+        pub(in crate::cluster::consensus) async fn mint_owner_receipt(
+            &self,
+            owner: Operator,
+            installation: [u8; 16],
+        ) -> DispatchReply {
+            self.mint_owner_mode(owner, installation, ResultMode::Receipt)
+                .await
+        }
+
+        async fn mint_owner_mode(
+            &self,
+            owner: Operator,
+            installation: [u8; 16],
+            mode: ResultMode,
+        ) -> DispatchReply {
             let Ok(_lease) = self.mint_lease.try_lock() else {
-                return Reply::Refused;
+                return Reply::Refused.into();
             };
             let (serving, node) = {
                 let Ok(s) = self.state.lock() else {
-                    return Reply::Refused;
+                    return Reply::Refused.into();
                 };
                 if s.close_requested
                     || !matches!(s.status, Status::FounderReady | Status::LearnerReady)
                     || s.ingress.is_none()
                 {
-                    return Reply::Refused;
+                    return Reply::Refused.into();
                 }
                 let (Some(issuer), Some(node), Some(listener)) =
                     (&s.issuer, &s.node, s.serving_enrollment)
                 else {
-                    return Reply::Refused;
+                    return Reply::Refused.into();
                 };
                 if !listener.active() {
-                    return Reply::Refused;
+                    return Reply::Refused.into();
                 }
                 (
                     Serving {
@@ -167,9 +199,9 @@ mod linux {
                 )
             };
             let Ok(node) = node.try_lock() else {
-                return Reply::Refused;
+                return Reply::Refused.into();
             };
-            mint(self, &node, &serving, &owner, installation).await
+            mint(self, &node, &serving, &owner, installation, mode).await
         }
 
         fn still_serving(&self, serving: &Serving) -> bool {
@@ -259,29 +291,30 @@ mod linux {
         serving: &Serving,
         owner: &Operator,
         installation: [u8; 16],
-    ) -> Reply {
+        mode: ResultMode,
+    ) -> DispatchReply {
         let Some((before, floor, proposed_at_ms)) = serving.view(node, None).await else {
-            return Reply::Refused;
+            return Reply::Refused.into();
         };
         let (command, code_id, paste) = {
             let (cluster, root, _) = serving.issuer.transfer_identity();
             let Ok(code) = JoinCode::generate(cluster, root, before.anchor, getrandom::fill) else {
-                return Reply::Refused;
+                return Reply::Refused.into();
             };
             let mut request = [0; 16];
             if getrandom::fill(&mut request).is_err() {
-                return Reply::Refused;
+                return Reply::Refused.into();
             }
             // Prepare the protected value before the irreversible boundary, including
             // ADR0040's fixed endpoint and root checks.
             let Ok(value) = transfer::encode(before.endpoint, serving.issuer.mint_root(), &code)
             else {
-                return Reply::Refused;
+                return Reply::Refused.into();
             };
             let paste = Paste::copy(value.expose_for_owner_transfer().as_bytes());
             drop(value);
             let Some(paste) = paste else {
-                return Reply::Refused;
+                return Reply::Refused.into();
             };
             let code_id = code.code_id();
             let command = Command::Mint {
@@ -298,21 +331,22 @@ mod linux {
             || !is_current(node, before)
             || serving.issuer.available(node).is_err()
         {
-            return Reply::Refused;
+            return Reply::Refused.into();
         }
+        let receipt = matches!(mode, ResultMode::Receipt).then(|| MintReceiptInput::new(&command));
         let (position, outcome) = match timeout(MINT_WAIT, node.propose(command)).await {
-            Ok(Ok((_, Some(Outcome::Rejected(_))))) => return Reply::Refused,
+            Ok(Ok((_, Some(Outcome::Rejected(_))))) => return Reply::Refused.into(),
             Ok(Ok(result)) => result,
             Ok(Err(ProposeError::Busy | ProposeError::Stopped | ProposeError::NotLeader(_))) => {
-                return Reply::Refused;
+                return Reply::Refused.into();
             }
-            _ => return Reply::Unknown,
+            _ => return Reply::Unknown.into(),
         };
         let Some(expiry) = first_expiry(before, floor, position, outcome) else {
-            return Reply::Unknown;
+            return Reply::Unknown.into();
         };
         let Some((after, applied, now)) = serving.view(node, Some(code_id)).await else {
-            return Reply::Unknown;
+            return Reply::Unknown.into();
         };
         if proposed_at_ms
             .checked_add(CODE_TTL_MS)
@@ -321,9 +355,25 @@ mod linux {
             || !job.still_serving(serving)
             || !is_current(node, after)
         {
-            return Reply::Unknown;
+            return Reply::Unknown.into();
         }
-        Reply::Minted(paste)
+        mint_result(paste, receipt.as_ref(), position, expiry)
+    }
+
+    pub(super) fn mint_result(
+        paste: Paste,
+        receipt: Option<&MintReceiptInput>,
+        position: LogPos,
+        expiry: u64,
+    ) -> DispatchReply {
+        let Some(receipt) = receipt else {
+            return Reply::Minted(paste).into();
+        };
+        drop(paste); // Paste::drop scrubs its complete allocation.
+        match receipt.digest(position, expiry) {
+            Some(digest) => DispatchReply::MintReceipt(MintReceipt { position, digest }),
+            None => Reply::Unknown.into(),
+        }
     }
 }
 

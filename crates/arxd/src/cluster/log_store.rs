@@ -402,6 +402,28 @@ impl VoteLogStore {
         if !(1..=MAX_LIVE).contains(&limit) {
             return Err(StoreError::TooLarge);
         }
+        let result = self.read_entries(start, end_excl, limit);
+        self.checked(result)
+    }
+
+    /// Read one retained index using the ordinary integrity checks, without
+    /// changing store health when an observer encounters a read error.
+    #[cfg(target_os = "linux")]
+    pub(super) fn observe_entry(&self, index: u64) -> Result<Option<(LogPos, Entry)>, StoreError> {
+        self.healthy()?;
+        if !(1..=i64::MAX as u64).contains(&index) {
+            return Err(StoreError::TooLarge);
+        }
+        let end = index.checked_add(1).ok_or(StoreError::TooLarge)?;
+        Ok(self.read_entries(index, end, 1)?.pop())
+    }
+
+    fn read_entries(
+        &self,
+        start: u64,
+        end_excl: u64,
+        limit: usize,
+    ) -> Result<Vec<(LogPos, Entry)>, StoreError> {
         let Some((first, last)) = self.meta.tail else {
             return Ok(Vec::new());
         };
@@ -410,22 +432,19 @@ impl VoteLogStore {
         if start >= end {
             return Ok(Vec::new());
         }
-        let r = (|| {
-            let rows = Self::select(&self.db, start, end, limit)?;
-            if rows.len() != ((end - start) as usize).min(limit)
-                || rows.first().is_none_or(|(p, _)| p.index != start)
-                || rows
-                    .iter()
-                    .any(|(p, _)| *p > last || self.meta.purged.is_some_and(|q| *p <= q))
-                || rows
-                    .last()
-                    .is_some_and(|(p, _)| p.index == last.index && *p != last)
-            {
-                return Err(StoreError::Corrupt);
-            }
-            Ok(rows)
-        })();
-        self.checked(r)
+        let rows = Self::select(&self.db, start, end, limit)?;
+        if rows.len() != ((end - start) as usize).min(limit)
+            || rows.first().is_none_or(|(p, _)| p.index != start)
+            || rows
+                .iter()
+                .any(|(p, _)| *p > last || self.meta.purged.is_some_and(|q| *p <= q))
+            || rows
+                .last()
+                .is_some_and(|(p, _)| p.index == last.index && *p != last)
+        {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(rows)
     }
     fn persist(
         &mut self,
@@ -602,3 +621,44 @@ impl VoteLogStore {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn observational_corruption_preserves_health_and_contents() {
+    let dir = crate::service::application::tests::private_temp();
+    let mut store = VoteLogStore::open(dir.path(), [1; 16]).unwrap();
+    let position = LogPos {
+        term: 2,
+        leader: 1,
+        index: 1,
+    };
+    store
+        .append(&[
+            (
+                LogPos {
+                    index: 0,
+                    ..position
+                },
+                Entry::Blank,
+            ),
+            (position, Entry::Blank),
+        ])
+        .unwrap();
+    assert_eq!(store.observe_entry(1), Ok(Some((position, Entry::Blank))));
+    assert_eq!(store.observe_entry(2), Ok(None));
+    store
+        .db
+        .execute("UPDATE log SET body=x'00' WHERE idx=1", [])
+        .unwrap();
+    let log_state = store.log_state().unwrap();
+    assert_eq!(store.observe_entry(1), Err(StoreError::Corrupt));
+    assert_eq!(store.log_state(), Ok(log_state));
+    let raw: Vec<u8> = store
+        .db
+        .query_row("SELECT body FROM log WHERE idx=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw, [0]);
+    assert_eq!(store.entries(1, 2, 1), Err(StoreError::Corrupt));
+    assert_eq!(store.log_state(), Err(StoreError::Poisoned));
+    assert_eq!(store.observe_entry(1), Err(StoreError::Poisoned));
+}
