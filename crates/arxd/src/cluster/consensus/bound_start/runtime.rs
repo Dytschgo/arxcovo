@@ -2,6 +2,7 @@
 use super::*;
 use crate::{
     cluster::{
+        c13_diagnostics::record,
         enrollment::{
             ClusterId, NodeId,
             durable_join::{self, Destination},
@@ -329,11 +330,19 @@ impl Running {
         let learner = self.learner.as_ref().ok_or(Error::Admission)?;
         learner
             .set_authenticated_admission_route(issuer)
-            .map_err(|_| Error::Admission)?;
-        if !matches!(
-            learner.admit().await,
-            learner_admission::Reply::Applied(_, _)
-        ) {
+            .map_err(|reason| {
+                record(
+                    "admission-route",
+                    match reason {
+                        Refusal::Unavailable => "unavailable",
+                        Refusal::Identity | Refusal::Provenance => "identity",
+                        _ => "refused",
+                    },
+                );
+                Error::Admission
+            })?;
+        if let Some(category) = learner.admit().await.refusal_category() {
+            record("join-admission", category);
             return Err(Error::Admission);
         }
         Ok(())
@@ -589,12 +598,20 @@ async fn publish(
         &routes,
         Arc::new(FreshTime(HostClock::new(0))),
     )
-    .map_err(|_| Error::Admission)?;
+    .map_err(|_| {
+        record("join-publication", "refused");
+        Error::Admission
+    })?;
     drop(paste);
-    if observer.terminal().await != durable_join::Status::Published {
-        return Err(Error::Admission);
-    }
-    Ok(join)
+    use durable_join::Status;
+    let category = match observer.terminal().await {
+        Status::Published => return Ok(join),
+        Status::Refused => "refused",
+        Status::Incomplete => "incomplete",
+        Status::Joining | Status::Unconfirmed => "unconfirmed",
+    };
+    record("join-publication", category);
+    Err(Error::Admission)
 }
 
 #[cfg(all(test, target_os = "linux"))]
