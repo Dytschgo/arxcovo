@@ -623,6 +623,10 @@ impl Lifecycle {
                     evidence
                 }
             },
+            {
+                let fence = fence.clone();
+                move || fence.time_evidence()
+            },
             stop.clone(),
         );
         if work.lock().await.waiting.is_some() {
