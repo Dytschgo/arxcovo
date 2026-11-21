@@ -65,6 +65,21 @@ impl EnrollmentState {
             Some(_) => Ok(()),
         }
     }
+    /// Exact local binding under the caller's applied-store observation.
+    pub(in crate::cluster) fn bound_key(
+        &self,
+        cluster: ClusterId,
+        node: NodeId,
+    ) -> Result<KeyDigest, PeerRefusal> {
+        if cluster != self.cluster {
+            return Err(PeerRefusal::WrongCluster);
+        }
+        self.members
+            .get(&node)
+            .copied()
+            .ok_or(PeerRefusal::NotMember)
+    }
+
     pub(super) fn found(&mut self, pairs: &FoundMembers) -> Outcome {
         let pairs = pairs.as_slice();
         if !(1..=MAX_MEMBERS).contains(&pairs.len())

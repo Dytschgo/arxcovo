@@ -183,6 +183,27 @@ impl Job {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    async fn observe_promotion(&self, cluster: crate::cluster::enrollment::ClusterId) {
+        let (node, controller) = {
+            let mut state = self.state();
+            if state.close_requested {
+                return;
+            }
+            let Some(node) = state.node.clone() else {
+                return;
+            };
+            if state.status == Status::LearnerReady && state.admission.is_none() {
+                state.admission = Some(learner_admission::Controller::new(&node));
+            }
+            let Some(controller) = state.admission.clone() else {
+                return;
+            };
+            (node, controller)
+        };
+        initial_promotion::observe(cluster, node, controller).await;
+    }
+
     fn prepare(&self, plan: Plan, intent: &StartIntent, expected: Option<&ExpectedIdentity>) {
         #[cfg(test)]
         let gate = self.gate.lock().unwrap().take();
@@ -409,6 +430,8 @@ where
         let node_id = intent.node.get();
         #[cfg(target_os = "linux")]
         let intent_after_start = intent.peer;
+        #[cfg(target_os = "linux")]
+        let intent_after_start_cluster = intent.cluster;
         let prepared = tokio::task::spawn_blocking(move || {
             if let Some(plan) = plan {
                 job.prepare(plan, &intent, expected.as_ref());
@@ -552,6 +575,13 @@ where
                 learner::attach(job, &intent_after_start).await;
             }
         }
+        #[cfg(target_os = "linux")]
+        tokio::select! {
+            biased;
+            () = job.close.notified() => {}
+            () = job.observe_promotion(intent_after_start_cluster) => job.close.notified().await,
+        }
+        #[cfg(not(target_os = "linux"))]
         job.close.notified().await;
         if !job.begin_close() {
             return;

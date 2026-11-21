@@ -9,19 +9,50 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
 };
-struct Intent(Arc<AtomicBool>);
+#[derive(Default)]
+pub(super) struct IntentSlot {
+    occupied: Arc<AtomicBool>,
+    released: Arc<tokio::sync::Notify>,
+}
 
+impl IntentSlot {
+    pub(super) async fn notified(&self) {
+        self.released.notified().await;
+    }
+
+    #[cfg(test)]
+    fn load(&self, order: Ordering) -> bool {
+        self.occupied.load(order)
+    }
+}
+
+pub(super) struct Intent {
+    occupied: Arc<AtomicBool>,
+    released: Option<Arc<tokio::sync::Notify>>,
+}
 impl Intent {
     fn reserve(slot: &Arc<AtomicBool>) -> Result<Self, Reply> {
         slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Reply::Pending)?;
-        Ok(Self(slot.clone()))
+        Ok(Self {
+            occupied: slot.clone(),
+            released: None,
+        })
+    }
+
+    pub(super) fn waking(slot: &IntentSlot) -> Result<Self, Reply> {
+        let mut intent = Self::reserve(&slot.occupied)?;
+        intent.released = Some(slot.released.clone());
+        Ok(intent)
     }
 }
 
 impl Drop for Intent {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.occupied.store(false, Ordering::Release);
+        if let Some(released) = &self.released {
+            released.notify_one();
+        }
     }
 }
 
@@ -47,7 +78,7 @@ type RetainedNode = tokio::sync::Mutex<ConsensusNode>;
 pub(super) struct Controller {
     node: Weak<RetainedNode>,
     closed: Mutex<bool>,
-    intent: Arc<AtomicBool>,
+    intent: Arc<IntentSlot>,
     #[cfg(test)]
     pub(super) hooks: Hooks,
 }
@@ -67,6 +98,28 @@ impl Controller {
         if let Ok(mut closed) = self.closed.lock() {
             *closed = true;
         }
+    }
+
+    pub(super) fn open(&self) -> bool {
+        self.closed.lock().is_ok_and(|closed| !*closed)
+    }
+
+    pub(super) async fn intent_released(&self) {
+        self.intent.notified().await;
+    }
+
+    pub(super) fn register_promotion(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<oneshot::Receiver<()>, Reply> {
+        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
+        if *closed {
+            return Err(Reply::Refused);
+        }
+        let intent = Intent::waking(&self.intent)?;
+        let node = self.node.upgrade().ok_or(Reply::Refused)?;
+        let node = node.try_lock().map_err(|_| Reply::Refused)?;
+        node.register_admission(intent, work)
     }
 
     pub(super) fn progress(&self, learner: u64) -> Option<(LogPos, Option<LogPos>)> {
@@ -118,7 +171,7 @@ impl Controller {
         if *closed || Instant::now() >= deadline {
             return Err(Reply::Refused);
         }
-        let intent = Intent::reserve(&self.intent)?;
+        let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
         let node = node.try_lock().map_err(|_| Reply::Refused)?;
         let controller = self.clone();
@@ -238,11 +291,11 @@ impl Controller {
 }
 
 impl ConsensusNode {
-    fn register_admission(
+    fn register_admission<T: Send + 'static>(
         &self,
         intent: Intent,
-        run: impl std::future::Future<Output = Reply> + Send + 'static,
-    ) -> Result<oneshot::Receiver<Reply>, Reply> {
+        run: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> Result<oneshot::Receiver<T>, Reply> {
         let permit = self
             .permits
             .clone()
@@ -277,6 +330,7 @@ pub(super) struct Hooks {
     pub(super) suppress_success: AtomicBool,
     pub(super) lost_reply: Mutex<Option<Reply>>,
     pub(super) barrier: Mutex<Option<Barrier>>,
+    pub(super) promotion: super::initial_promotion::Hooks,
 }
 
 #[cfg(test)]
