@@ -212,7 +212,13 @@ async fn start_learner(
 async fn admit(run: &Run, address: SocketAddr) -> Check<LogPos> {
     match run.admit().await {
         Reply::Applied(position, actual) if actual == address => Ok(position),
-        reply => {
+        Reply::Applied(..) => Err("learner admission applied at a different address"),
+        Reply::Revoked(..) => Err("learner admission revoked"),
+        reply @ (Reply::Pending
+        | Reply::AddressConflict
+        | Reply::StaleTail
+        | Reply::Refused
+        | Reply::Unknown) => {
             eprintln!("C11 frozen admission did not confirm apply: {reply:?}");
             Err("learner admission refused")
         }
@@ -266,29 +272,33 @@ async fn match_through(raft: &Engine, node: u64, minimum: LogPos) -> Check<()> {
     .map_err(|_| "match observation elapsed")?
 }
 
-// The transport events have no connection ID. Require a single uninterrupted
-// event sequence on the second learner, through the gated RPC's terminal event.
+// Enforce the uninterrupted event sequence on the selected caller's socket.
 async fn transport_event(
-    events: &mut tokio::sync::mpsc::Receiver<Event>,
+    trace: &GatedCallTrace,
+    cursor: &mut usize,
     boundary: &str,
     expected: impl FnOnce(Event) -> bool,
-) -> Check<()> {
-    match events.recv().await {
-        Some(Event::Refused(reason) | Event::Finished(Some(reason))) => {
+) -> Check<(SocketAddr, Instant)> {
+    let (peer, at, event) = trace.next_server_event(cursor).await?;
+    match event {
+        Event::Refused(reason) | Event::Finished(Some(reason)) => {
             eprintln!("C11 frozen gated replication refused at {boundary}: {reason:?}");
             Err("gated peer replication refused")
         }
-        Some(event) if expected(event) => Ok(()),
-        Some(event) => {
+        event if expected(event) => Ok((peer, at)),
+        event => {
             eprintln!("C11 unexpected event at gated replication {boundary}: {event:?}");
             Err("gated peer replication event sequence differed")
         }
-        None => Err("gated transport observation closed"),
     }
 }
 
-async fn stage(events: &mut tokio::sync::mpsc::Receiver<Event>, target: Stage) -> Check<()> {
-    transport_event(events, "transport stage", |event| {
+async fn stage(
+    trace: &GatedCallTrace,
+    cursor: &mut usize,
+    target: Stage,
+) -> Check<(SocketAddr, Instant)> {
+    transport_event(trace, cursor, "transport stage", |event| {
         event == Event::Stage(target)
     })
     .await
@@ -331,9 +341,8 @@ async fn admit_below_target(
     caller: oneshot::Receiver<GatedCallerOutcome>,
     trace: &GatedCallTrace,
 ) -> Check<LogPos> {
-    let mut events = run.dispatch_observer().await;
-    let mut dispatch = run.observe_gated_dispatch().await;
-    run.before_dispatch_gate(true).await;
+    let mut cursor = 0;
+    run.arm_before_dispatch_gate().await;
     let mut gate_held = true;
     let mut request = std::pin::pin!(admit(run, address));
     let evidence = timeout(OBSERVE, async {
@@ -343,59 +352,72 @@ async fn admit_below_target(
             async {
                 // Poll real admission while waiting for its first replication RPC.
                 let (arrival, already_admitted) = tokio::select! {
-                    result = stage_start(&mut events) => (result?, None),
+                    result = stage(trace, &mut cursor, Stage::ServerHandshake) => (result?.1, None),
                     result = &mut request => {
                         let admitted = result?;
-                        (stage_start(&mut events).await?, Some(admitted))
+                        (stage(trace, &mut cursor, Stage::ServerHandshake).await?.1, Some(admitted))
                     }
                 };
-                let (admitted, server_peer) = timeout_at(arrival + GATE_OBSERVE, async {
-                    stage(&mut events, Stage::ServerAuthenticated).await?;
-                    stage(&mut events, Stage::RequestRead).await?;
-                    stage(&mut events, Stage::BeforeDispatch).await?;
-                    let server_peer = dispatch.try_recv().ok().flatten()
-                        .ok_or("gated RPC server peer was unavailable")?;
-                    let admitted = match already_admitted {
-                        Some(admitted) => admitted,
-                        None => request.await?,
-                    };
-                    let metrics = raft.metrics();
-                    let current = metrics.borrow_watched();
-                    let committed = current
-                        .cluster_committed
-                        .map(pos)
-                        .ok_or("fresh target missing")?;
-                    let matched = current
-                        .replication
-                        .as_ref()
-                        .and_then(|r| r.get(&run.binding().0.get()))
-                        .copied()
-                        .flatten()
-                        .map(pos);
-                    if *current.committed_membership_config.log_id() != Some(id(admitted))
-                        || !current
-                            .committed_membership_config
-                            .membership()
-                            .voter_ids()
-                            .eq([FOUNDER.get()])
-                        || !covers(committed, admitted)
-                        || matched.is_some_and(|matched| covers(matched, committed))
-                        || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
-                        || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
-                    {
-                        return Err("gated second learner did not prove the below-target state");
+                let deadline = arrival + GATE_OBSERVE;
+                let (admitted, server_peer) = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err("short transport gate observation elapsed");
                     }
-                    Ok((admitted, server_peer))
-                }).await.map_err(|_| "short transport gate observation elapsed")??;
+                    result = async {
+                        stage(trace, &mut cursor, Stage::ServerAuthenticated).await?;
+                        stage(trace, &mut cursor, Stage::RequestRead).await?;
+                        let (server_peer, _) = stage(trace, &mut cursor, Stage::BeforeDispatch).await?;
+                        let admitted = match already_admitted {
+                            Some(admitted) => admitted,
+                            None => request.await?,
+                        };
+                        {
+                            let metrics = raft.metrics();
+                            let current = metrics.borrow_watched();
+                            let committed = current
+                                .cluster_committed
+                                .map(pos)
+                                .ok_or("fresh target missing")?;
+                            let matched = current
+                                .replication
+                                .as_ref()
+                                .and_then(|r| r.get(&run.binding().0.get()))
+                                .copied()
+                                .flatten()
+                                .map(pos);
+                            if *current.committed_membership_config.log_id() != Some(id(admitted))
+                                || !current
+                                    .committed_membership_config
+                                    .membership()
+                                    .voter_ids()
+                                    .eq([FOUNDER.get()])
+                                || !covers(committed, admitted)
+                                || matched.is_some_and(|matched| covers(matched, committed))
+                                || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
+                                || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
+                            {
+                                return Err("gated second learner did not prove the below-target state");
+                            }
+                        }
+                        let released = run.release_before_dispatch_gate().await
+                            .ok_or("gated dispatch gate was unavailable")?;
+                        gate_held = false;
+                        trace.caller("gate release observed", None);
+                        // A buffered branch can finish in one poll even after the timer was polled.
+                        if released > deadline {
+                            eprintln!("C11 gate released after {:?}", released.duration_since(arrival));
+                            return Err("short transport gate released after deadline");
+                        }
+                        Ok((admitted, server_peer))
+                    } => result?,
+                };
 
-                run.before_dispatch_gate(false).await;
-                trace.caller("gate release observed", None);
-                gate_held = false;
-                transport_event(&mut events, "dispatch", |event| {
+                transport_event(trace, &mut cursor, "dispatch", |event| {
                     matches!(event, Event::LearnerDispatch(_))
                 }).await?;
-                stage(&mut events, Stage::BeforeReply).await?;
-                transport_event(&mut events, "reply result", |event| {
+                stage(trace, &mut cursor, Stage::BeforeReply).await?;
+                transport_event(trace, &mut cursor, "reply result", |event| {
                     event == Event::Finished(None)
                 }).await?;
                 Ok((admitted, server_peer))
@@ -406,11 +428,11 @@ async fn admit_below_target(
     .map_err(|_| "gated replication observation elapsed");
 
     if gate_held {
-        run.before_dispatch_gate(false).await;
+        let _ = run.release_before_dispatch_gate().await;
         trace.caller("cleanup gate release observed", None);
     }
     eprintln!(
-        "C11 first call (soft TTL, caller stages, matched inbound stages) from caller entry: {:?}",
+        "C11 first call (soft TTL, caller stages, matched inbound stages, unrelated inbound events, omitted unrelated count) from caller entry: {:?}",
         trace.summary()
     );
     let (caller_source, (admitted, server_peer)) = evidence??;
@@ -418,11 +440,6 @@ async fn admit_below_target(
         return Err("gated dispatch and caller result came from different RPC connections");
     }
     Ok(admitted)
-}
-
-async fn stage_start(events: &mut tokio::sync::mpsc::Receiver<Event>) -> Check<Instant> {
-    stage(events, Stage::ServerHandshake).await?;
-    Ok(Instant::now())
 }
 
 async fn applied(
