@@ -4708,3 +4708,294 @@ async fn issuer_channel_uses_mutual_tls13_exporters_bound_to_session_and_challen
         previous = Some(from_client);
     }
 }
+
+mod issuer_refusals {
+    use super::*;
+    use crate::cluster::{
+        consensus::issuer_transfer::{Claim, Offer},
+        pki::custody::voter_transfer::{self as custody, Completion, Wipe},
+    };
+    use control::issuer as wire;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        path::PathBuf,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct Seal {
+        peers: Arc<Fixture>,
+        packages: Arc<AtomicUsize>,
+    }
+
+    impl issuer_channel::Sender for Seal {
+        async fn seal<'a>(
+            &'a self,
+            _: Offer,
+            key: &'a [u8; 32],
+            transcript: &'a [u8],
+        ) -> Result<Vec<u8>, Refusal> {
+            self.packages.fetch_add(1, Ordering::SeqCst);
+            custody::fixture_seal(
+                key,
+                transcript,
+                self.peers.root.as_ref(),
+                self.peers.issuer.key(),
+            )
+            .map_err(|_| Refusal::Identity)
+        }
+    }
+
+    struct Receiver {
+        peers: Arc<Fixture>,
+        offer: Offer,
+        file: PathBuf,
+        revoke_before_readback: AtomicBool,
+        completed: Mutex<Completion<()>>,
+        writes: AtomicUsize,
+    }
+
+    impl issuer_channel::Receiver for Receiver {
+        fn check(&self, claim: Claim, _: AuthenticatedPeer) -> Result<Offer, Refusal> {
+            if self.offer.claim != claim {
+                return Err(Refusal::Identity);
+            }
+            self.peers
+                .sm
+                .0
+                .lock()
+                .unwrap()
+                .state()
+                .authorize_peer(CLUSTER, claim.receiver.0, self.peers.server.digest())
+                .map_err(|_| Refusal::Identity)?;
+            Ok(self.offer)
+        }
+
+        fn install(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            (key, transcript, package): (&[u8; 32], &[u8], Vec<u8>),
+        ) -> Result<(), Refusal> {
+            self.check(claim, sender)?;
+            let mut completion = self.completed.lock().unwrap();
+            completion.available().map_err(|_| Refusal::Identity)?;
+            custody::fixture_authenticate(
+                key,
+                transcript,
+                package.clone(),
+                self.peers.root.as_ref(),
+            )
+            .map_err(|_| Refusal::Identity)?;
+            completion.spend().map_err(|_| Refusal::Identity)?;
+            if self.revoke_before_readback.swap(false, Ordering::SeqCst) {
+                assert!(self.peers.remove(claim.receiver.0.get()));
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.file)
+                .map_err(|_| Refusal::Dispatch)?;
+            output.write_all(&package).map_err(|_| Refusal::Dispatch)?;
+            output.sync_all().map_err(|_| Refusal::Dispatch)?;
+            assert!(fs::read(&self.file).unwrap() == package);
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            completion
+                .confirm((), || {
+                    self.check(claim, sender)
+                        .map(|_| ())
+                        .map_err(|_| crate::cluster::pki::custody::Error::Ownership)
+                })
+                .map_err(|_| Refusal::Identity)
+        }
+    }
+
+    struct TransferFixture {
+        outbound: TransportOwner,
+        inbound: TransportOwner,
+        sender: Seal,
+        receiver: Arc<Receiver>,
+    }
+
+    impl TransferFixture {
+        async fn new() -> Self {
+            let peers = Arc::new(Fixture::new());
+            let outbound = peers.owner(1, Spy::exact(None));
+            let mut inbound = peers.owner(2, Spy::exact(None));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let position = LogPos {
+                term: 6,
+                leader: 1,
+                index: 5,
+            };
+            let offer = Offer {
+                claim: Claim {
+                    cluster: CLUSTER,
+                    root: crate::cluster::pki::ca::fingerprint_of(peers.root.as_ref()),
+                    sender: (node(1), *peers.client.digest().as_bytes()),
+                    receiver: (node(2), *peers.server.digest().as_bytes()),
+                    epoch: log_id(7, 1, 6).leader_id,
+                    membership: position,
+                },
+                sender_address: address,
+                receiver_address: address,
+            };
+            let receiver = Arc::new(Receiver {
+                offer,
+                file: peers._dir.path().join("wire-install"),
+                peers: peers.clone(),
+                revoke_before_readback: AtomicBool::new(false),
+                completed: Mutex::default(),
+                writes: AtomicUsize::new(0),
+            });
+            inbound.shared.state.lock().unwrap().voter_receiver = Some(receiver.clone());
+            inbound.listen_on(listener).unwrap();
+            Self {
+                outbound,
+                inbound,
+                sender: Seal {
+                    peers,
+                    packages: Arc::default(),
+                },
+                receiver,
+            }
+        }
+
+        async fn connect(&self) -> tokio_rustls::client::TlsStream<TcpStream> {
+            let peers = &self.sender.peers;
+            connect(
+                peers.client_config(&peers.client, 2),
+                self.receiver.offer.receiver_address,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn send(&self) -> TransferOutcome {
+            self.outbound
+                .send_issuer_transfer(self.sender.clone(), self.receiver.offer)
+                .unwrap()
+                .outcome()
+                .await
+        }
+
+        async fn close(mut self) {
+            self.outbound.close().await.unwrap();
+            self.inbound.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn issuer_transfer_revocation_before_unwrap_and_during_install_never_confirms() {
+        let fixture = TransferFixture::new().await;
+        let mut client = fixture.connect().await;
+        assert!(fixture.sender.peers.remove(2));
+        wire::hello(&mut client, fixture.receiver.offer.claim)
+            .await
+            .unwrap();
+        assert!(
+            timeout(OBSERVE, wire::read_challenge(&mut client))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(!fixture.receiver.file.exists());
+        assert!(fixture.receiver.completed.lock().unwrap().get().is_err());
+        drop(client);
+        fixture.close().await;
+
+        let fixture = TransferFixture::new().await;
+        fixture
+            .receiver
+            .revoke_before_readback
+            .store(true, Ordering::SeqCst);
+        assert_eq!(fixture.send().await, TransferOutcome::Unknown);
+        assert_eq!(fixture.receiver.writes.load(Ordering::SeqCst), 1);
+        assert!(fixture.receiver.file.is_file());
+        {
+            let mut completion = fixture.receiver.completed.lock().unwrap();
+            assert!(completion.get().is_err());
+            assert!(completion.available().is_err());
+            assert!(completion.confirm((), || Ok(())).is_err());
+        }
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn issuer_transfer_refuses_sealed_package_replayed_on_another_tls_session() {
+        let fixture = TransferFixture::new().await;
+        let claim = fixture.receiver.offer.claim;
+        let mut original = fixture.connect().await;
+        wire::hello(&mut original, claim).await.unwrap();
+        let challenge = timeout(OBSERVE, wire::read_challenge(&mut original))
+            .await
+            .unwrap()
+            .unwrap();
+        let transcript = claim.transcript(&challenge);
+        let mut key = Wipe([0; 32]);
+        original
+            .get_ref()
+            .1
+            .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
+            .unwrap();
+        let package = custody::fixture_seal(
+            &key.0,
+            &transcript,
+            fixture.sender.peers.root.as_ref(),
+            fixture.sender.peers.issuer.key(),
+        )
+        .unwrap();
+        drop(key);
+        original.shutdown().await.unwrap();
+        drop(original);
+
+        let mut replay = fixture.connect().await;
+        wire::hello(&mut replay, claim).await.unwrap();
+        let new_challenge = timeout(OBSERVE, wire::read_challenge(&mut replay))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_challenge, challenge);
+        wire::sealed(&mut replay, &package).await.unwrap();
+        assert!(
+            timeout(
+                OBSERVE,
+                wire::read_acknowledgement(&mut replay, &new_challenge)
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(fixture.receiver.writes.load(Ordering::SeqCst), 0);
+        assert!(!fixture.receiver.file.exists());
+        assert_eq!(fixture.send().await, TransferOutcome::Installed);
+        assert_eq!(fixture.receiver.writes.load(Ordering::SeqCst), 1);
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn issuer_transfer_lost_acknowledgement_is_unknown_and_single_install() {
+        let fixture = TransferFixture::new().await;
+        fixture
+            .inbound
+            .shared
+            .hooks
+            .drop_issuer_ack
+            .store(true, Ordering::SeqCst);
+        assert_eq!(fixture.send().await, TransferOutcome::Unknown);
+        assert!(fixture.receiver.completed.lock().unwrap().get().is_ok());
+        let envelope = fs::read(&fixture.receiver.file).unwrap();
+        assert!(matches!(
+            fixture
+                .outbound
+                .send_issuer_transfer(fixture.sender.clone(), fixture.receiver.offer),
+            Err(Refusal::Identity),
+        ));
+        assert_eq!(fixture.sender.packages.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.receiver.writes.load(Ordering::SeqCst), 1);
+        assert!(fs::read(&fixture.receiver.file).unwrap() == envelope);
+        fixture.close().await;
+    }
+}

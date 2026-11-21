@@ -22,7 +22,6 @@ pub(super) struct Claim {
     pub(super) membership: LogPos,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct Offer {
     pub(super) claim: Claim,

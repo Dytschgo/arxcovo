@@ -10,7 +10,7 @@ mod hosted_probe;
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, target_os = "linux"))]
-mod voter_transfer;
+pub(in crate::cluster) mod voter_transfer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::cluster) enum Error {
@@ -830,15 +830,20 @@ mod linux {
             owner.inventory()?;
             Ok(owner)
         }
-        pub(super) fn inventory(&self) -> Result<Vec<String>, Error> {
+        pub(super) fn checked_inventory(&self) -> Result<Vec<String>, Error> {
             self.wrap.recheck()?;
             self.store.recheck()?;
             if self.wrap.entries(2)? != ["install-context", "seal-key"] {
                 return Err(Error::Layout);
             }
-            if codec::installation(&self.wrap.read("install-context", 25)?)? != self.installation
-                || codec::wrapping(&self.wrap.read("seal-key", 32)?)? != self.key
-            {
+            if codec::installation(&self.wrap.read("install-context", 25)?)? != self.installation {
+                return Err(Error::Context);
+            }
+            let wrapping = voter_transfer::Wipe(self.wrap.read("seal-key", 32)?);
+            if wrapping.0.len() != 32 {
+                return Err(Error::Corrupt);
+            }
+            if wrapping.0.as_slice() != self.key {
                 return Err(Error::Context);
             }
             let current = self.store.file("custody-lock", false)?;
@@ -849,7 +854,10 @@ mod linux {
                 return Err(Error::Ownership);
             }
             codec::lock(&self.store.read("custody-lock", 0)?)?;
-            let entries = self.store.entries(3)?;
+            self.store.entries(3)
+        }
+        pub(super) fn inventory(&self) -> Result<Vec<String>, Error> {
+            let entries = self.checked_inventory()?;
             for name in &entries {
                 match name.as_str() {
                     "custody-lock" => (),

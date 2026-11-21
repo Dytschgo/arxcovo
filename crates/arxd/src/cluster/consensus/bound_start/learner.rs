@@ -595,16 +595,34 @@ impl Job {
         if state.close_requested {
             return Err(peer_transport::Refusal::Closed);
         }
+        let node = state.node.clone().ok_or(refused)?;
         let State { owner, learner, .. } = &mut *state;
         let owner = owner.as_ref().ok_or(refused)?;
         let op = learner.as_mut().ok_or(refused)?;
+        let gate = op.gate.as_ref().ok_or(refused)?;
         let member = op.member.as_mut().ok_or(refused)?;
         let clock = op.clock.as_ref().ok_or(refused)?;
         let tls = member.credentials(owner, clock).map_err(|_| refused)?;
         let now = clock.sample_ms().map_err(|_| refused)?;
         member
             .custody
-            .receive_voter_ca(owner, claim.cluster, tls.root.as_ref(), now, channel)
+            .receive_voter_ca(
+                owner,
+                claim.cluster,
+                tls.root.as_ref(),
+                now,
+                channel,
+                || {
+                    use crate::cluster::pki::custody::Error;
+                    let node = node.try_lock().map_err(|_| Error::Unavailable)?;
+                    if gate.phase() != Ok(Phase::Strict) {
+                        return Err(Error::Ownership);
+                    }
+                    node.verify_issuer_offer(claim, sender)
+                        .map_err(|_| Error::Ownership)?;
+                    Ok(())
+                },
+            )
             .map_err(|_| refused)?;
         op.issuer_membership = Some(claim.membership);
         Ok(())

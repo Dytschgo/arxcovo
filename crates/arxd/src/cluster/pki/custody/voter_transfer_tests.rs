@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn transfer_package_is_bound_to_exporter_challenge_and_claim() {
     let key = [1; 32];
-    let payload = codec::Secret(vec![2; 48]);
+    let payload = Wipe(vec![2; 48]);
     let claim = [3; 192];
     let package = seal_channel(&key, &claim, payload).unwrap();
     assert_eq!(
@@ -25,7 +25,7 @@ fn transfer_package_is_bound_to_exporter_challenge_and_claim() {
 fn custody_channel_rejects_truncation_and_empty_payload() {
     let key = [1; 32];
     let claim = [3; 192];
-    let package = seal_channel(&key, &claim, codec::Secret(vec![4; 48])).unwrap();
+    let package = seal_channel(&key, &claim, Wipe(vec![4; 48])).unwrap();
     for len in 0..package.len() {
         assert!(open_channel(&key, &claim, package[..len].to_vec()).is_err());
     }
@@ -96,6 +96,7 @@ mod installation {
                 &self.root,
                 now,
                 (key, &CONTEXT, self.sealed.clone()),
+                || Ok(()),
             )
         }
 
@@ -127,9 +128,9 @@ mod installation {
         let mut f = Fixture::new();
         assert!(f.receive(NOW, &[7; 32]).is_err());
         let (other, key) = ClusterCa::generate(NOW).unwrap();
-        let key = codec::Secret(key);
+        let key = Wipe(key);
         assert!(other.cert_der() != f.root);
-        let swapped = codec::Secret(codec::payload(Kind::Ca, &key.0, &f.root).unwrap());
+        let swapped = Wipe(codec::payload(Kind::Ca, &key.0, &f.root).unwrap());
         let swapped = seal_channel(&CHANNEL, &CONTEXT, swapped).unwrap();
         let original = std::mem::replace(&mut f.sealed, swapped);
         assert_eq!(f.receive(NOW, &CHANNEL), Err(Error::KeyMismatch));
@@ -157,5 +158,31 @@ mod installation {
             assert!(f.receive(NOW, &CHANNEL).is_err());
             assert!(f.learner.member().is_ok());
         }
+    }
+
+    #[test]
+    fn refused_fresh_proof_keeps_real_durable_voter_custody_terminal() {
+        let mut f = Fixture::new();
+        let result = f.learner.receive_voter_ca(
+            &f.owner,
+            CLUSTER,
+            &f.root,
+            NOW,
+            (&CHANNEL, &CONTEXT, f.sealed.clone()),
+            || {
+                assert!(
+                    f.receiver
+                        .root
+                        .path()
+                        .join("voter-custody/ca-key")
+                        .is_file()
+                );
+                Err(Error::Ownership)
+            },
+        );
+        assert_eq!(result, Err(Error::Ownership));
+        assert!(f.load().is_err());
+        assert_eq!(f.receive(NOW, &CHANNEL), Err(Error::Ownership));
+        assert!(f.learner.member().is_ok());
     }
 }

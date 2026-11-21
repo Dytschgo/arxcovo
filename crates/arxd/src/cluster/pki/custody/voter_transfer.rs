@@ -2,6 +2,66 @@
 use super::*;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 
+/// Own every temporary transfer buffer, including the TLS exporter output.
+pub(in crate::cluster) struct Wipe<T: AsMut<[u8]>>(pub(in crate::cluster) T);
+
+impl<T: AsMut<[u8]>> Drop for Wipe<T> {
+    fn drop(&mut self) {
+        for byte in self.0.as_mut() {
+            // SAFETY: Each byte is exclusively borrowed from the owned live buffer.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A spent installation only becomes usable if the fresh proof succeeds after readback.
+#[derive(Default)]
+pub(in crate::cluster) enum Completion<T> {
+    #[default]
+    Fresh,
+    Pending,
+    Refused,
+    Confirmed(T),
+}
+
+impl<T> Completion<T> {
+    pub(in crate::cluster) fn available(&self) -> Result<(), Error> {
+        if matches!(self, Self::Fresh) {
+            Ok(())
+        } else {
+            Err(Error::Ownership)
+        }
+    }
+
+    pub(in crate::cluster) fn spend(&mut self) -> Result<(), Error> {
+        self.available()?;
+        *self = Self::Pending;
+        Ok(())
+    }
+
+    pub(in crate::cluster) fn confirm(
+        &mut self,
+        durable: T,
+        eligible: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !matches!(self, Self::Pending) {
+            return Err(Error::Ownership);
+        }
+        *self = Self::Refused;
+        eligible()?;
+        *self = Self::Confirmed(durable);
+        Ok(())
+    }
+
+    pub(in crate::cluster) fn get(&self) -> Result<&T, Error> {
+        match self {
+            Self::Confirmed(value) => Ok(value),
+            _ => Err(Error::Ownership),
+        }
+    }
+}
+
 fn cipher(key: &[u8; 32]) -> Result<LessSafeKey, Error> {
     UnboundKey::new(&aead::CHACHA20_POLY1305, key)
         .map(LessSafeKey::new)
@@ -11,7 +71,7 @@ fn cipher(key: &[u8; 32]) -> Result<LessSafeKey, Error> {
 fn seal_channel(
     key: &[u8; 32],
     context: &[u8],
-    mut plaintext: codec::Secret,
+    mut plaintext: Wipe<Vec<u8>>,
 ) -> Result<Vec<u8>, Error> {
     // TLS exports a distinct key for the one receiver challenge and package.
     let tag = cipher(key)?
@@ -26,11 +86,20 @@ fn seal_channel(
     Ok(sealed)
 }
 
-fn open_channel(key: &[u8; 32], context: &[u8], sealed: Vec<u8>) -> Result<codec::Secret, Error> {
-    let mut plaintext = codec::Secret(sealed);
+fn open_channel(key: &[u8; 32], context: &[u8], sealed: Vec<u8>) -> Result<Wipe<Vec<u8>>, Error> {
+    open(key, context, [0; 12], sealed)
+}
+
+fn open(
+    key: &[u8; 32],
+    context: &[u8],
+    nonce: [u8; 12],
+    sealed: Vec<u8>,
+) -> Result<Wipe<Vec<u8>>, Error> {
+    let mut plaintext = Wipe(sealed);
     let len = cipher(key)?
         .open_in_place(
-            Nonce::assume_unique_for_key([0; 12]),
+            Nonce::assume_unique_for_key(nonce),
             Aad::from(context),
             &mut plaintext.0,
         )
@@ -38,6 +107,39 @@ fn open_channel(key: &[u8; 32], context: &[u8], sealed: Vec<u8>) -> Result<codec
         .len();
     plaintext.0.truncate(len);
     Ok(plaintext)
+}
+
+#[cfg(test)]
+pub(in crate::cluster) fn fixture_seal(
+    key: &[u8; 32],
+    transcript: &[u8],
+    original: &[u8],
+    private: &KeyPair,
+) -> Result<Vec<u8>, Error> {
+    seal_channel(
+        key,
+        transcript,
+        Wipe(codec::payload(
+            Kind::Ca,
+            private.serialized_der(),
+            original,
+        )?),
+    )
+}
+
+#[cfg(test)]
+pub(in crate::cluster) fn fixture_authenticate(
+    key: &[u8; 32],
+    transcript: &[u8],
+    package: Vec<u8>,
+    original: &[u8],
+) -> Result<(), Error> {
+    let decrypted = open_channel(key, transcript, package)?;
+    let (_, root) = codec::parts(Kind::Ca, &decrypted.0)?;
+    if root != original {
+        return Err(Error::Context);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -58,10 +160,9 @@ pub(super) mod disk {
 
     #[derive(Default)]
     pub(in crate::cluster::pki::custody) struct Installation {
-        attempted: bool,
         #[cfg(test)]
         pub(in crate::cluster::pki::custody) fault: Option<Fault>,
-        complete: Option<Complete>,
+        complete: Completion<Complete>,
     }
 
     #[cfg(test)]
@@ -117,17 +218,93 @@ pub(super) mod disk {
         })
     }
 
-    fn load(
-        payload: &codec::Secret,
-        context: Context,
-        original: &[u8],
-        now: u64,
-    ) -> Result<ClusterCa, Error> {
+    fn open_installation(
+        custody: &Custody,
+        expected: Context,
+        bytes: &[u8],
+    ) -> Result<Wipe<Vec<u8>>, Error> {
+        let (context, nonce) = codec::frame(bytes)?;
+        if context != expected {
+            return Err(Error::Context);
+        }
+        open(
+            &custody.key,
+            &bytes[..codec::HEADER],
+            nonce,
+            bytes[codec::HEADER..].to_vec(),
+        )
+    }
+
+    // Validate the retained root and its key without constructing a throwaway
+    // rcgen signer with an owned serialized copy of the private key.
+    fn validate(payload: &Wipe<Vec<u8>>, original: &[u8], now: u64) -> Result<(), Error> {
+        use ring::{
+            rand::SystemRandom,
+            signature::{self, KeyPair as _},
+        };
+        use x509_parser::prelude::*;
+
+        checked_time(Some(now))?;
         let (key, der) = codec::parts(Kind::Ca, &payload.0)?;
         if der != original {
             return Err(Error::Context);
         }
-        ClusterCa::load(key, der, context.root, context.spki, now)
+        let (rest, cert) = X509Certificate::from_der(der).map_err(|_| Error::Corrupt)?;
+        let constraints = cert
+            .basic_constraints()
+            .map_err(|_| Error::Corrupt)?
+            .ok_or(Error::Corrupt)?;
+        let usage = cert
+            .key_usage()
+            .map_err(|_| Error::Corrupt)?
+            .ok_or(Error::Corrupt)?;
+        let algorithm = &cert.public_key().algorithm;
+        if !rest.is_empty()
+            || cert.subject() != cert.issuer()
+            || !constraints.value.ca
+            || constraints.value.path_len_constraint != Some(0)
+            || usage.value.flags != 0x60
+            || cert.signature_algorithm.algorithm.to_id_string() != "1.2.840.10045.4.3.2"
+            || cert.signature_algorithm.parameters.is_some()
+            || cert.tbs_certificate.signature != cert.signature_algorithm
+            || algorithm.algorithm.to_id_string() != "1.2.840.10045.2.1"
+            || algorithm
+                .parameters
+                .as_ref()
+                .and_then(|p| p.as_oid().ok())
+                .is_none_or(|oid| oid.to_id_string() != "1.2.840.10045.3.1.7")
+            || cert
+                .subject_alternative_name()
+                .map_err(|_| Error::Corrupt)?
+                .is_some()
+        {
+            return Err(Error::Corrupt);
+        }
+        let public = cert.public_key().subject_public_key.data.as_ref();
+        signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public)
+            .verify(cert.tbs_certificate.as_ref(), &cert.signature_value.data)
+            .map_err(|_| Error::Corrupt)?;
+        let (rest, _) = x509_parser::der_parser::der::parse_der(key).map_err(|_| Error::Corrupt)?;
+        if !rest.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        let key = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            key,
+            &SystemRandom::new(),
+        )
+        .map_err(|_| Error::Corrupt)?;
+        if key.public_key().as_ref() != public {
+            return Err(Error::KeyMismatch);
+        }
+        let leaf_start = i64::try_from(now / 1000).map_err(|_| Error::Clock)? - 60;
+        let leaf_end = leaf_start + 30 * 86400;
+        if leaf_start < cert.validity().not_before.timestamp()
+            || leaf_end > cert.validity().not_after.timestamp()
+        {
+            return Err(Error::CaExpiring);
+        }
+        Ok(())
     }
 
     impl FounderCustody {
@@ -146,13 +323,24 @@ pub(super) mod disk {
                 super::super::super::ca::fingerprint_of(original),
                 original,
             )?;
-            custody.common_context(context.cluster, context.root)?;
-            if custody.inventory()? != ["ca-key", "custody-lock", "member-key"] {
+            if custody.checked_inventory()? != ["ca-key", "custody-lock", "member-key"] {
                 return Err(Error::Layout);
             }
+            let member = custody.store.read("member-key", FILE_MAX)?;
+            let (member_context, _) = codec::frame(&member)?;
+            if member_context.kind != Kind::Member
+                || member_context.cluster != cluster
+                || member_context.root != context.root
+                || member_context.install != custody.installation
+            {
+                return Err(Error::Context);
+            }
+            let member = open_installation(custody, member_context, &member)?;
+            codec::parts(Kind::Member, &member.0)?;
+            drop(member);
             let bytes = custody.store.read("ca-key", FILE_MAX)?;
-            let plaintext = codec::open(&custody.key, context, &bytes)?;
-            load(&plaintext, context, original, now)?;
+            let plaintext = open_installation(custody, context, &bytes)?;
+            validate(&plaintext, original, now)?;
             seal_channel(key, transcript, plaintext)
         }
     }
@@ -165,10 +353,9 @@ pub(super) mod disk {
             original: &[u8],
             now: u64,
             channel: (&[u8; 32], &[u8], Vec<u8>),
+            recheck: impl FnOnce() -> Result<(), Error>,
         ) -> Result<(), Error> {
-            if self.voter.attempted {
-                return Err(Error::Ownership);
-            }
+            self.voter.complete.available()?;
             self.member()?;
             let custody = &self.custody;
             let context = ca_context(
@@ -180,8 +367,8 @@ pub(super) mod disk {
             custody.common_context(cluster, context.root)?;
             let (key, transcript, sealed) = channel;
             let plaintext = open_channel(key, transcript, sealed)?;
-            load(&plaintext, context, original, now)?;
-            self.voter.attempted = true;
+            validate(&plaintext, original, now)?;
+            self.voter.complete.spend()?;
             let bytes = seal_installation(&custody.key, context, plaintext)?;
             let root = create_root(custody, owner)?;
             let reservation = root.file(RESERVATION, true)?;
@@ -209,9 +396,8 @@ pub(super) mod disk {
             };
             #[cfg(test)]
             self.voter.check(Fault::Readback)?;
-            complete.load(custody, context, original, now)?;
-            self.voter.complete = Some(complete);
-            Ok(())
+            validate(&complete.read(custody, context)?, original, now)?;
+            self.voter.complete.confirm(complete, recheck)
         }
 
         pub(in crate::cluster) fn load_voter_ca(
@@ -229,11 +415,10 @@ pub(super) mod disk {
                 original,
             )?;
             custody.common_context(cluster, context.root)?;
-            self.voter
-                .complete
-                .as_ref()
-                .ok_or(Error::Ownership)?
-                .load(custody, context, original, now)
+            let plaintext = self.voter.complete.get()?.read(custody, context)?;
+            validate(&plaintext, original, now)?;
+            let (key, der) = codec::parts(Kind::Ca, &plaintext.0)?;
+            ClusterCa::load(key, der, context.root, context.spki, now)
         }
     }
 
@@ -266,7 +451,7 @@ pub(super) mod disk {
     fn seal_installation(
         key: &[u8; 32],
         context: Context,
-        mut plaintext: codec::Secret,
+        mut plaintext: Wipe<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         let mut nonce = [0; 12];
         getrandom::fill(&mut nonce).map_err(|_| Error::Unavailable)?;
@@ -284,13 +469,7 @@ pub(super) mod disk {
     }
 
     impl Complete {
-        fn load(
-            &self,
-            custody: &Custody,
-            context: Context,
-            original: &[u8],
-            now: u64,
-        ) -> Result<ClusterCa, Error> {
+        fn read(&self, custody: &Custody, context: Context) -> Result<Wipe<Vec<u8>>, Error> {
             if self.context != context || self.root.entries(2)? != [ENVELOPE, RESERVATION] {
                 return Err(Error::Context);
             }
@@ -308,12 +487,7 @@ pub(super) mod disk {
             if ciphertext != self.bytes {
                 return Err(Error::Ownership);
             }
-            load(
-                &codec::open(&custody.key, context, &ciphertext)?,
-                context,
-                original,
-                now,
-            )
+            open_installation(custody, context, &ciphertext)
         }
     }
 }

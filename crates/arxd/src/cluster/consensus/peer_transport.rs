@@ -163,8 +163,10 @@ struct State {
     closed: bool,
     resources: Option<Arc<Resources>>,
     admission: Option<Arc<Controller>>,
-    #[cfg(target_os = "linux")]
-    voter_receiver: Option<&'static super::bound_start::Job>,
+    #[cfg(any(test, target_os = "linux"))]
+    voter_receiver: Option<Arc<dyn issuer_channel::Receiver>>,
+    #[cfg(any(test, target_os = "linux"))]
+    voter_transfers: [Option<NodeId>; 2],
     keeper: Option<SmAdapter>,
     tasks: JoinSet<()>,
     // <=32 task results plus the single accept-loop result during close.
@@ -265,8 +267,10 @@ impl TransportOwner {
                     closed: false,
                     resources: Some(resources),
                     admission: None,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(test, target_os = "linux"))]
                     voter_receiver: None,
+                    #[cfg(any(test, target_os = "linux"))]
+                    voter_transfers: [None; 2],
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -648,7 +652,7 @@ async fn inbound(
         .read_exact(&mut magic)
         .await
         .map_err(|_| Refusal::Frame)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(test, target_os = "linux"))]
     if magic == control::issuer::MAGIC {
         return issuer_channel::receive(
             shared,
@@ -1009,6 +1013,7 @@ pub(super) struct GatedCallerOutcome {
 #[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
+    drop_issuer_ack: std::sync::atomic::AtomicBool,
     events: Mutex<Option<tokio::sync::mpsc::Sender<Event>>>,
     gates: Mutex<std::collections::BTreeMap<Stage, Arc<Semaphore>>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -1461,8 +1466,10 @@ impl TransportOwner {
                 closed: false,
                 resources: None,
                 admission: None,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(test, target_os = "linux"))]
                 voter_receiver: None,
+                #[cfg(any(test, target_os = "linux"))]
+                voter_transfers: [None; 2],
                 keeper: None,
                 tasks: JoinSet::new(),
                 join_errors: Vec::new(),
@@ -1932,25 +1939,63 @@ async fn outbound_admission(
     Ok(reply)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 mod issuer_channel {
     use super::*;
     use crate::cluster::{
-        consensus::{
-            bound_start::Job,
-            issuer_transfer::{Claim, Offer},
-        },
-        pki::ca::fingerprint_of,
+        consensus::issuer_transfer::{Claim, Offer},
+        pki::{ca::fingerprint_of, custody::voter_transfer::Wipe},
     };
     use control::issuer as wire;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_rustls::server::TlsStream;
 
-    struct ChannelKey([u8; 32]);
+    pub(super) trait Receiver: Send + Sync {
+        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> Result<Offer, Refusal>;
+        fn install(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            channel: (&[u8; 32], &[u8], Vec<u8>),
+        ) -> Result<(), Refusal>;
+    }
 
-    impl Drop for ChannelKey {
-        fn drop(&mut self) {
-            self.0.fill(0);
+    pub(in crate::cluster::consensus) trait Sender:
+        Send + Sync
+    {
+        fn seal<'a>(
+            &'a self,
+            offer: Offer,
+            key: &'a [u8; 32],
+            transcript: &'a [u8],
+        ) -> impl Future<Output = Result<Vec<u8>, Refusal>> + Send + 'a;
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Receiver for &'static super::super::bound_start::Job {
+        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> Result<Offer, Refusal> {
+            self.check_issuer_transfer(claim, sender)
+        }
+
+        fn install(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            channel: (&[u8; 32], &[u8], Vec<u8>),
+        ) -> Result<(), Refusal> {
+            self.install_voter_custody(claim, sender, channel)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Sender for &'static super::super::bound_start::Job {
+        async fn seal<'a>(
+            &'a self,
+            offer: Offer,
+            key: &'a [u8; 32],
+            transcript: &'a [u8],
+        ) -> Result<Vec<u8>, Refusal> {
+            self.seal_voter_transfer(offer, key, transcript).await
         }
     }
 
@@ -1970,10 +2015,13 @@ mod issuer_channel {
         deadline: Instant,
     ) -> Result<(), Refusal> {
         let claim = wire::read_hello(&mut stream).await?;
-        let gate = resources.learner.as_ref().ok_or(Refusal::Identity)?;
+        let peer = sender
+            .authenticated_identity()
+            .map_err(|_| Refusal::Identity)?;
         if claim.root != fingerprint_of(resources.credentials.root.as_ref())
             || claim.receiver.0 != resources.node
-            || gate.phase().map_err(|_| Refusal::Identity)? != peer_registry::Phase::Strict
+            || (peer.0, peer.1, *peer.2.as_bytes())
+                != (claim.cluster, claim.sender.0, claim.sender.1)
         {
             return Err(Refusal::Identity);
         }
@@ -1982,12 +2030,13 @@ mod issuer_channel {
             .lock()
             .map_err(|_| Refusal::Closed)?
             .voter_receiver
+            .clone()
             .ok_or(Refusal::NotReady)?;
-        check_receiver(shared, deadline, receiver, claim, sender, source)?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(|_| Refusal::Tls)?;
         let transcript = claim.transcript(&challenge);
-        let mut key = ChannelKey([0; 32]);
+        let mut key = Wipe([0; 32]);
         stream
             .get_ref()
             .1
@@ -1995,23 +2044,27 @@ mod issuer_channel {
             .map_err(|_| Refusal::Tls)?;
         wire::challenge(&mut stream, &challenge).await?;
         let sealed = wire::read_sealed(&mut stream).await?;
-        check_receiver(shared, deadline, receiver, claim, sender, source)?;
-        receiver.install_voter_custody(claim, sender, (&key.0, &transcript, sealed))?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
+        receiver.install(claim, sender, (&key.0, &transcript, sealed))?;
         drop(key);
-        check_receiver(shared, deadline, receiver, claim, sender, source)?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
+        #[cfg(test)]
+        if shared.hooks.drop_issuer_ack.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
         wire::acknowledge(&mut stream, &challenge).await
     }
 
     fn check_receiver(
         shared: &Shared,
         deadline: Instant,
-        receiver: &Job,
+        receiver: &dyn Receiver,
         claim: Claim,
         sender: AuthenticatedPeer,
         source: SocketAddr,
     ) -> Result<(), Refusal> {
         before_dispatch(shared, deadline)?;
-        let offer = receiver.check_issuer_transfer(claim, sender)?;
+        let offer = receiver.check(claim, sender)?;
         if source.ip() != offer.sender_address.ip() {
             return Err(Refusal::Address);
         }
@@ -2035,21 +2088,29 @@ mod issuer_channel {
     }
 
     impl TransportOwner {
+        #[cfg(target_os = "linux")]
         pub(in crate::cluster::consensus) fn receive_issuer_transfer(
             &mut self,
-            receiver: &'static Job,
+            receiver: &'static super::super::bound_start::Job,
         ) -> Result<(), Refusal> {
             let mut state = self.shared.state.lock().map_err(|_| Refusal::Closed)?;
             if state.closed || state.voter_receiver.is_some() {
                 return Err(Refusal::Closed);
             }
-            state.voter_receiver = Some(receiver);
+            if state
+                .resources
+                .as_ref()
+                .is_none_or(|resources| resources.learner.is_none())
+            {
+                return Err(Refusal::NotReady);
+            }
+            state.voter_receiver = Some(Arc::new(receiver));
             Ok(())
         }
 
         pub(in crate::cluster::consensus) fn send_issuer_transfer(
             &self,
-            sender: &'static Job,
+            sender: impl Sender + 'static,
             offer: Offer,
         ) -> Result<Transfer, Refusal> {
             let shared = &self.shared;
@@ -2057,6 +2118,15 @@ mod issuer_channel {
             let deadline = Instant::now() + INBOUND_BUDGET;
             let sent = Arc::new(AtomicBool::new(false));
             let mut state = shared.state.lock().map_err(|_| Refusal::Closed)?;
+            let target = Some(offer.claim.receiver.0);
+            if state.voter_transfers.contains(&target) {
+                return Err(Refusal::Identity);
+            }
+            let free = state
+                .voter_transfers
+                .iter()
+                .position(Option::is_none)
+                .ok_or(Refusal::Busy)?;
             let admission = shared.admission(&mut state);
             let join_errors = if state.closed {
                 Vec::new()
@@ -2064,6 +2134,7 @@ mod issuer_channel {
                 std::mem::take(&mut state.join_errors)
             };
             if let Ok(admission) = admission {
+                state.voter_transfers[free] = target;
                 let shared = shared.clone();
                 let sent = sent.clone();
                 state.tasks.spawn(async move {
@@ -2094,7 +2165,7 @@ mod issuer_channel {
     async fn send(
         shared: &Shared,
         admission: Admission,
-        sender: &'static Job,
+        sender: impl Sender,
         offer: Offer,
         deadline: Instant,
         sent: &AtomicBool,
@@ -2142,16 +2213,14 @@ mod issuer_channel {
         wire::hello(&mut stream, claim).await?;
         let challenge = wire::read_challenge(&mut stream).await?;
         let transcript = claim.transcript(&challenge);
-        let mut key = ChannelKey([0; 32]);
+        let mut key = Wipe([0; 32]);
         stream
             .get_ref()
             .1
             .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
             .map_err(|_| Refusal::Tls)?;
         before_dispatch(shared, deadline)?;
-        let sealed = sender
-            .seal_voter_transfer(offer, &key.0, &transcript)
-            .await?;
+        let sealed = sender.seal(offer, &key.0, &transcript).await?;
         drop(key);
         before_dispatch(shared, deadline)?;
         sent.store(true, Ordering::SeqCst);
@@ -2161,5 +2230,5 @@ mod issuer_channel {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 pub(super) use issuer_channel::Outcome as TransferOutcome;

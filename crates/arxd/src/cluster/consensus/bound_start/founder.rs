@@ -501,19 +501,11 @@ pub(super) mod linux {
     > {
         use peer_transport::Refusal as R;
         let (offer, _) = retained_issuer(job, target).await?;
-        let mut state = job.state();
+        let state = job.state();
         if state.close_requested {
             return Err(R::Closed);
         }
         let transport = state.founder.as_ref().ok_or(R::NotReady)?.transport.clone();
-        if state.voter_transfers.contains(&Some(target)) {
-            return Err(R::Identity);
-        }
-        *state
-            .voter_transfers
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .ok_or(R::Identity)? = Some(target);
         Ok((offer, transport))
     }
 
