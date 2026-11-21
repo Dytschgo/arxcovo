@@ -37,6 +37,7 @@ struct Settings {
     custody: PathBuf,
     history: PathBuf,
     owner_socket: PathBuf,
+    executor_socket: Option<PathBuf>,
     peer: String,
     enrollment: String,
     issuer_peer: Option<String>,
@@ -54,6 +55,7 @@ struct Checked {
     routes: Vec<Route>,
     issuer: Option<std::net::SocketAddr>,
     socket: PathBuf,
+    executor_socket: Option<PathBuf>,
     roles: cluster_owner::Roles,
 }
 
@@ -344,6 +346,7 @@ impl Settings {
             routes,
             issuer,
             socket: settings.owner_socket,
+            executor_socket: settings.executor_socket,
             roles: cluster_owner::Roles {
                 owner: settings.owner_uid,
                 daemon: settings.daemon_uid,
@@ -659,9 +662,7 @@ impl Lifecycle {
             tokio::time::timeout(CLOSE, &mut self.supervisor),
         );
         self.joined = owner.is_ok() && matches!(observer, Ok(Ok(())));
-        (owner.is_ok() && matches!(observer, Ok(Ok(()))))
-            .then_some(())
-            .ok_or(())
+        self.joined.then_some(()).ok_or(())
     }
 
     // Ok records a confirmed owned close and whether work had already refused.
@@ -969,7 +970,19 @@ async fn process(
             .map_err(|_| ())?;
         expected = Some(stamp);
     }
-    let checked = Settings::checked(path, intent, expected).map_err(|_| ())?;
+    let mut checked = Settings::checked(path, intent, expected).map_err(|_| ())?;
+    let build_uid = checked.roles.build;
+    let executor = match checked.executor_socket.take() {
+        Some(socket) => Some(
+            tokio::task::spawn_blocking(move || {
+                super::cluster_build_executor::connect(socket, build_uid)
+            })
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?,
+        ),
+        None => None,
+    };
     let signal_fence = fence.clone();
     let signal_stop = tokio::spawn(async move {
         saw_signal.cancelled().await;
@@ -979,7 +992,7 @@ async fn process(
     let lifecycle = Lifecycle::start(checked, intent, fence)
         .await
         .map_err(|_| ())?;
-    let result = run_lifecycle(lifecycle, stop, parent).await;
+    let result = run_lifecycle_with_executor(lifecycle, stop, parent, executor).await;
     signal_stop.abort();
     forwarding.abort();
     result
@@ -1037,10 +1050,20 @@ impl Drop for ParentControl {
     }
 }
 
+#[cfg(test)]
 async fn run_lifecycle(
+    lifecycle: Lifecycle,
+    stop: Shutdown,
+    parent: Option<ParentControl>,
+) -> Result<(), LifecycleFailure> {
+    run_lifecycle_with_executor(lifecycle, stop, parent, None).await
+}
+
+async fn run_lifecycle_with_executor(
     mut lifecycle: Lifecycle,
     stop: Shutdown,
     mut parent: Option<ParentControl>,
+    executor: Option<Arc<super::executor::Execution>>,
 ) -> Result<(), LifecycleFailure> {
     use tokio::io::AsyncWriteExt;
 
@@ -1072,7 +1095,16 @@ async fn run_lifecycle(
         let notice = parent.writer.write_u8(FAILED).await.map_err(|_| ());
         result = result.and(notice);
     }
-    let joined = lifecycle.quiesce().await;
+    let (joined, execution_closed) = tokio::join!(lifecycle.quiesce(), async {
+        match executor {
+            Some(execution) => matches!(
+                tokio::time::timeout(CLOSE, execution.drain()).await,
+                Ok(Ok(()))
+            ),
+            None => true,
+        }
+    });
+    let joined = joined.and_then(|()| execution_closed.then_some(()).ok_or(()));
     let authorized = match &mut parent {
         Some(parent) => parent.authorize_close(joined.is_ok()).await,
         None => joined,
@@ -1085,6 +1117,51 @@ async fn run_lifecycle(
     result
         .and((!failed).then_some(()).ok_or(()))
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+pub(super) async fn broker_refusal_close_control(
+    executor: Arc<super::executor::Execution>,
+    execute_received: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fence = Arc::new(Admission::default());
+    let (_status, receiver) = watch::channel(Status::Pending);
+    let lifecycle = Lifecycle {
+        work: Arc::new(Mutex::new(Work {
+            waiting: None,
+            running: None,
+            first: None,
+        })),
+        fence: fence.clone(),
+        joined: false,
+        status: receiver,
+        control: cluster_owner::Control::observe_task(tokio::spawn(async { Ok(()) })),
+        supervisor: tokio::spawn(async {}),
+    };
+    let (mut parent, worker) = tokio::net::UnixStream::pair().unwrap();
+    let stop = fence.signal();
+    let worker = ParentControl::new(worker, fence);
+    let run = tokio::spawn(run_lifecycle_with_executor(
+        lifecycle,
+        stop,
+        Some(worker),
+        Some(executor),
+    ));
+    tokio::time::timeout(CLOSE, async {
+        assert_eq!(parent.read_u8().await.unwrap(), READY);
+        execute_received.await.unwrap();
+        parent.write_u8(STOP).await.unwrap();
+        assert_eq!(parent.read_u8().await.unwrap(), UNJOINED);
+        assert_eq!(parent.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(
+            run.await.unwrap(),
+            Err(LifecycleFailure::RefusedOrUnconfirmed)
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[derive(Clone, Copy)]

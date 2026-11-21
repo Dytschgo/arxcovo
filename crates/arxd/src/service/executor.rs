@@ -14,6 +14,7 @@ use std::sync::{
 };
 
 #[derive(Clone, Deserialize)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub tool: Option<String>,
@@ -115,6 +116,14 @@ pub fn schema() -> Value {
 /// identity withholds both captures unread, independently of cleanup or outcome.
 pub trait Executor: Send + Sync + 'static {
     fn preflight(&self) -> Result<(), Unavailable>;
+    #[cfg(target_os = "linux")]
+    fn requires_broker_drain(&self) -> bool {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    fn confirm_cleanup(&self) -> bool {
+        false
+    }
     fn run(
         &self,
         request: Option<&Request>,
@@ -262,6 +271,29 @@ impl Execution {
         }
         execution
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cluster_broker(
+        backend: Arc<dyn Executor>,
+        uid: u32,
+        gid: u32,
+        limit: u8,
+    ) -> Arc<Self> {
+        let mut execution = Self::native(
+            None,
+            Pin::new(
+                Platform::Linux,
+                uid.to_string(),
+                Some(gid),
+                Rights::Standard,
+            ),
+            Some(Rights::Standard),
+            usize::from(limit),
+        );
+        Arc::get_mut(&mut execution)
+            .expect("sole construction owner")
+            .backend = backend;
+        execution
+    }
     #[cfg(test)]
     pub(super) fn inactive_native_for_test(
         platform: Platform,
@@ -348,6 +380,14 @@ impl Execution {
                 remaining: workers.len(),
                 completed: true,
             };
+        }
+        #[cfg(target_os = "linux")]
+        if self.backend.requires_broker_drain() {
+            let backend = self.backend.clone();
+            let confirmed = tokio::task::spawn_blocking(move || backend.confirm_cleanup()).await;
+            if !matches!(confirmed, Ok(true)) || self.quarantined.load(Ordering::Acquire) {
+                return Err(Reason::CleanupUnconfirmed);
+            }
         }
         if failed || self.audit_failed.load(Ordering::Acquire) {
             Err(Reason::ExecutionFailed)
@@ -599,6 +639,7 @@ pub struct ToolVersion {
     pub version: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
 pub enum Creation {
     NotInvoked,
     ProvenNone,

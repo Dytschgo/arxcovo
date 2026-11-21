@@ -1,4 +1,4 @@
-//! Inactive ADR0019 adapter. Construction and injection exist only in tests.
+//! Standard Linux execution adapter for the private build broker.
 #![allow(dead_code)]
 use super::executor::{Creation, Evidence, Executor, Observation, Report, Request, ToolVersion};
 use super::{
@@ -17,12 +17,162 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use super::cluster_build_executor::{BrokerRefusal, PolicyCheck};
 #[cfg(test)]
 use crate::exec::hierarchy::locate;
 
 mod readiness;
 use crate::exec::hierarchy::parse::{Hardening, RightsFact, classify_rights, rights_line};
 use readiness::{Cause, Readiness};
+
+#[cfg(target_os = "linux")]
+pub(super) fn broker(
+    paths: (PathBuf, PathBuf),
+    config: &ServiceConfig,
+    check: impl Fn() -> PolicyCheck + Send + Sync + 'static,
+) -> Result<UnixBridge, BrokerRefusal> {
+    use crate::exec::hierarchy::{
+        linux::LinuxFs,
+        parse,
+        setup::{self, CgroupFs, PROC_MAGIC, SetupOutcome},
+    };
+    struct Monotonic(std::time::Instant);
+    impl setup::Clock for Monotonic {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+        fn sleep(&self, duration: Duration) {
+            std::thread::sleep(duration);
+        }
+    }
+    let fs = LinuxFs::system();
+    let proc = fs.proc_cgroup().map_err(|_| BrokerRefusal::Membership)?;
+    let location = parse::locate(&proc.bytes)
+        .filter(|_| proc.magic == PROC_MAGIC)
+        .ok_or(BrokerRefusal::Membership)?;
+    let readiness = Readiness::pending();
+    let layout = Layout::system().map_err(|_| BrokerRefusal::Layout)?;
+    let mut bridge = UnixBridge::with_paths(
+        (paths.0, vec![paths.1]),
+        &layout,
+        config,
+        Some(location.runs()),
+        |owner| {
+            exec::Runner::new(owner)
+                .map(|runner| Box::new(runner) as Box<dyn RunnerPort>)
+                .map_err(|_| Unavailable::PreflightFailed)
+        },
+        Box::new(|| Err(Unavailable::PreflightFailed)),
+        readiness.clone(),
+    );
+    bridge
+        .runner
+        .as_ref()
+        .map_err(|_| BrokerRefusal::RunnerConstruction)?;
+    check().map_err(|(category, _)| category)?;
+    // Refuse pre-existing residue before setup's janitor can change it.
+    let runs = location.runs();
+    if !runs.parent().is_some_and(cgroup_mounts) {
+        return Err(BrokerRefusal::HierarchyWritableView);
+    }
+    match runs.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(BrokerRefusal::PreExistingRuns),
+    }
+    match setup::setup(
+        &fs,
+        &location,
+        &Monotonic(std::time::Instant::now()),
+        &Cancellation::default(),
+    ) {
+        SetupOutcome::Ready(_) => readiness.set_ready(),
+        SetupOutcome::Unavailable(failure) => {
+            readiness.fail(failure.into());
+            return Err(BrokerRefusal::HierarchySetup);
+        }
+    }
+    if !cgroup_mounts(&runs) {
+        return Err(BrokerRefusal::HierarchyWritableView);
+    }
+    let chain = cgroup_chain(&runs).ok_or(BrokerRefusal::HierarchyPin)?;
+    bridge.check = Box::new(move || {
+        check().map_err(|(_, unavailable)| unavailable)?;
+        if !cgroup_mounts(&runs) || cgroup_chain(&runs).as_ref() != Some(&chain) {
+            return Err(Unavailable::MechanismUnavailable);
+        }
+        Ok(())
+    });
+    Ok(bridge)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_mounts(runs: &std::path::Path) -> bool {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let read_only = |path: &std::path::Path| {
+        let name = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: statvfs initializes the pointed-to record on success.
+        unsafe {
+            (libc::statvfs(name.as_ptr(), stat.as_mut_ptr()) == 0)
+                .then(|| stat.assume_init().f_flag & libc::ST_RDONLY != 0)
+        }
+    };
+    read_only(std::path::Path::new("/sys/fs/cgroup")) == Some(true)
+        && read_only(runs) == Some(false)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_chain(path: &std::path::Path) -> Option<Vec<(u64, u64, u32, u32)>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut ancestors = Vec::new();
+    for path in path.ancestors() {
+        let metadata = path.symlink_metadata().ok()?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return None;
+        }
+        ancestors.push((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.mode(),
+        ));
+    }
+    Some(ancestors)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn drained(bridge: &UnixBridge) -> bool {
+    use crate::exec::hierarchy::{
+        linux::LinuxFs,
+        parse::{self, Entry},
+        setup::CgroupFs,
+    };
+    let fs = LinuxFs::system();
+    let inspect = || {
+        let location = parse::locate(&fs.proc_cgroup().ok()?.bytes)?;
+        let mut directory = fs.open_root().ok()?;
+        for component in location.unit_components() {
+            directory = fs.open_child(&directory, component.as_bytes()).ok()?;
+        }
+        let runs = fs.open_child(&directory, b"runs").ok()?;
+        let events = fs.read(&runs, "cgroup.events", 4096).ok()?;
+        Some(
+            parse::events(std::str::from_utf8(&events).ok()?) == Some(false)
+                && fs.list(&runs, 512).ok()?.iter().all(|entry| {
+                    matches!(
+                        parse::classify_entry(&entry.name, entry.d_type, entry.fstatat_mode),
+                        Entry::Dot | Entry::Control
+                    )
+                }),
+        )
+    };
+    bridge
+        .runner
+        .as_ref()
+        .is_ok_and(|runner| !runner.cleanup_residue())
+        && inspect() == Some(true)
+}
 
 trait RunnerPort: Send + Sync {
     fn cleanup_residue(&self) -> bool;
@@ -46,7 +196,7 @@ impl RunnerPort for exec::Runner {
         self.run_phased(spec, cancel, shutdown)
     }
 }
-struct UnixBridge {
+pub(super) struct UnixBridge {
     binary: PathBuf,
     runner: Result<Box<dyn RunnerPort>, Unavailable>,
     check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
@@ -64,15 +214,38 @@ impl UnixBridge {
         check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
         readiness: Readiness,
     ) -> Self {
+        Self::with_paths(
+            (layout.binary().into(), layout.private_dirs().to_vec()),
+            layout,
+            config,
+            parent,
+            factory,
+            check,
+            readiness,
+        )
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn with_paths(
+        paths: (PathBuf, Vec<PathBuf>),
+        layout: &Layout,
+        config: &ServiceConfig,
+        parent: Option<PathBuf>,
+        factory: impl FnOnce(exec::OwnerConfig) -> Result<Box<dyn RunnerPort>, Unavailable>,
+        check: Box<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
+        readiness: Readiness,
+    ) -> Self {
+        let (binary, protected_directories) = paths;
         let runner = parent
             .ok_or(Unavailable::MechanismUnavailable)
-            .and_then(|parent| derive(layout, config, parent))
+            .and_then(|parent| derive_with_roots(layout, config, parent, protected_directories))
             .and_then(factory);
         Self {
-            binary: layout.binary().into(),
+            binary,
             runner,
             check,
             readiness,
+            #[cfg(test)]
             seam: 0,
         }
     }
@@ -140,6 +313,11 @@ impl UnixBridge {
     }
 }
 impl Executor for UnixBridge {
+    #[cfg(target_os = "linux")]
+    fn confirm_cleanup(&self) -> bool {
+        (self.check)().is_ok() && drained(self)
+    }
+
     fn preflight(&self) -> Result<(), Unavailable> {
         (self.check)()?;
         self.runner.as_ref().map_err(|r| *r)?;
@@ -169,10 +347,20 @@ impl Executor for UnixBridge {
     }
 }
 // No filesystem or environment observation: constraints match Runner's owner policy.
+#[cfg(test)]
 fn derive(
     layout: &Layout,
     config: &ServiceConfig,
     parent: PathBuf,
+) -> Result<exec::OwnerConfig, Unavailable> {
+    derive_with_roots(layout, config, parent, layout.private_dirs().to_vec())
+}
+
+fn derive_with_roots(
+    layout: &Layout,
+    config: &ServiceConfig,
+    parent: PathBuf,
+    protected_directories: Vec<PathBuf>,
 ) -> Result<exec::OwnerConfig, Unavailable> {
     if layout.platform() != Platform::Linux || config.rights() != Rights::Standard {
         return Err(Unavailable::MechanismUnavailable);
@@ -204,7 +392,7 @@ fn derive(
         uid,
         gid,
         workspace: workspace.into(),
-        protected_directories: layout.private_dirs().to_vec(),
+        protected_directories,
         environment: config.environment().clone(),
         admin: false,
         cgroup_parent: Some(parent),

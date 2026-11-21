@@ -798,30 +798,34 @@ fn e7_non_test_tokens(source: &str) -> Vec<String> {
     out
 }
 
+const E7_UNIX_BRIDGE_ALLOWANCES: &[&str] = &[
+    "use crate::exec::hierarchy::parse::{Hardening, RightsFact, classify_rights, rights_line};",
+    // 14a/A12 permits only the broker's setup, Runner factory and drain imports.
+    "use crate::exec::hierarchy::{linux::LinuxFs, parse, setup::{self, CgroupFs, PROC_MAGIC, SetupOutcome},};",
+    "|owner| { exec::Runner::new(owner)
+        .map(|runner| Box::new(runner) as Box<dyn RunnerPort>)
+        .map_err(|_| Unavailable::PreflightFailed) }",
+    "use crate::exec::hierarchy::{linux::LinuxFs, parse::{self, Entry}, setup::CgroupFs,};",
+];
+
 fn e7_inactive_source_allowed(path: &str, source: &str) -> bool {
     let mut production = e7_non_test_tokens(source);
-    // The other reviewed pure imports are cfg(test) locate and the E6 test
-    // SetupFailure import. Those are covered by test-only context below.
     let allowed = match path {
-        "service/unix_bridge.rs" => Some(
-            "use crate::exec::hierarchy::parse::{Hardening, RightsFact, classify_rights, rights_line};",
-        ),
-        "service/unix_bridge/readiness.rs" => {
-            Some("use crate::exec::hierarchy::setup::SetupFailure;")
-        }
-        _ => None,
+        "service/unix_bridge.rs" => E7_UNIX_BRIDGE_ALLOWANCES,
+        "service/unix_bridge/readiness.rs" => &["use crate::exec::hierarchy::setup::SetupFailure;"],
+        _ => &[],
     };
-    if let Some(import) = allowed {
-        let import = tokens(import);
+    for site in allowed {
+        let pattern = tokens(site);
         let hits: Vec<_> = production
-            .windows(import.len())
+            .windows(pattern.len())
             .enumerate()
-            .filter_map(|(i, v)| (v == import).then_some(i))
+            .filter_map(|(i, v)| (v == pattern).then_some(i))
             .collect();
         if hits.len() != 1 {
             return false;
         }
-        production.drain(hits[0]..hits[0] + import.len());
+        production.drain(hits[0]..hits[0] + pattern.len());
     }
     for forbidden in [
         "Runner::new(",
@@ -836,6 +840,23 @@ fn e7_inactive_source_allowed(path: &str, source: &str) -> bool {
         }
     }
     true
+}
+
+#[test]
+fn w8_e7_broker_allowances_are_path_exact_and_single_use() {
+    let source = E7_UNIX_BRIDGE_ALLOWANCES.join("\n");
+    assert!(e7_inactive_source_allowed(
+        "service/unix_bridge.rs",
+        &source
+    ));
+    for site in E7_UNIX_BRIDGE_ALLOWANCES {
+        assert!(!e7_inactive_source_allowed("service/unlisted.rs", site));
+        let duplicate = format!("{source}\n{site}");
+        assert!(!e7_inactive_source_allowed(
+            "service/unix_bridge.rs",
+            &duplicate
+        ));
+    }
 }
 
 #[test]
