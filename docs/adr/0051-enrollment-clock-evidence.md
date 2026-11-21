@@ -144,3 +144,67 @@ resume-visible and frozen-wall refusal, floor and range after a shift, a
 latched first refusal that survives advancing, overflow, source poison, and
 contention. Installed-service and physical multi-host paths remain
 **unverified on real hardware**.
+
+## A16. Private production observation for elapsed qualification
+
+The coordinator approved the R6 amendment after the source audit found that
+owner status could count AnchorQuery dispatches but could not distinguish a
+checked policy refusal from clock failure, permit pressure or timeout. The
+Linux production issuer retains one last-Query observation at the existing
+ingress call site. The slot holds the existing dispatch ordinal, a SHA-256
+digest of the 32-byte Query body under the D5 domain
+`arxcovo-d5-query-v1\0`, the captured checked sample and the typed outcome.
+A forwarding CheckedClock returns the source result unchanged and captures
+its first result. Slot publication and readback use try-locks. A busy or
+stale slot withholds evidence while Query dispatch continues.
+
+The existing authenticated owner socket accepts an empty request with tag
+5 and replies on tag 16. Its version-1 body is 53 bytes. The first five
+bytes are version, ordinal, outcome, Query sample status and checkpoint
+sample status. Two big-endian 64-bit timestamp fields follow, then the
+32-byte digest. Sample statuses are absent, accepted and failed. Outcome
+codes are absent, accepted, policy refusal, busy and unavailable, in that
+order. An absent or failed sample has zero in its timestamp field. The
+request takes a checked checkpoint with the same retained issuer clock
+without taking the node's admission lock. The harness serializes these
+samples with client exchanges because they share the checked clock. Existing tag-4 status, public enrollment framing, TTL, clock
+policy, proposal and worker code, and all deadlines stay unchanged.
+
+The harness reads the fixture's bounded SQLite snapshots and retained log
+using the C13 observation pattern. It correlates the acknowledged Mint to its
+original full log position and committed expiry, then brackets the late
+Query with equal applied views. Those views must show the same full applied
+and membership positions, enrollment floor, pending record and allocation
+counter. A16 must identify the late Query and its successful checked sample
+past expiry with a typed policy refusal. The TLS client must receive the
+uniform Anchor refusal and authenticated close before proof. Owner status
+must show the additional Query and unchanged Redeem count.
+
+Tests cover exact owner authentication, malformed requests, the legacy
+status reply, checked source success and failure, ordinal and contention,
+and the existing public framing. The A13 and E7 source guards and the
+workflow and Windows quarantine guards pass with their existing allowlists.
+
+## W1. Coordinator-approved hosted UTC reference
+
+The two fixed reference origins are `https://www.google.com/generate_204`
+and `https://www.cloudflare.com/cdn-cgi/trace`. This implementation uses
+one verified HTTPS HEAD at each origin per checkpoint. A missing Date ends
+the observation. Every request uses a generic User-Agent and sends no
+repository, owner or personal data, cookies, credentials or query
+parameters. The client follows no redirects, reads no response body and
+performs no retries. The origins see ordinary HTTPS connection metadata.
+
+Each Date needs a bounded, unambiguous fresh response. An Age header or an
+indication of caching fails the check. Within each before/after bracket
+from the retained issuer's checked clock, the complete offset range must
+fit ±30 s after adding ±1 s for Date resolution and the approved ±1 s
+source accuracy. Each origin passes separately. The five checkpoints cover
+the initial Mint and Query, both sides of the dwell, the late refusal and
+the fresh positive. The qualification artifacts contain relative clock
+readings and reference offset bounds.
+
+W1 supports the conditional premise in ADR 0030 for the sampled hosted
+Linux profile. C13 supplies the restart evidence at the recovered applied
+floor. C15 supplies the controlled rollback and resume-visible controls.
+Physical suspend and other OSes remain **unverified on real hardware**.
