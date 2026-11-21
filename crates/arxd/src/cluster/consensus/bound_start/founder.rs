@@ -115,6 +115,12 @@ pub(super) mod linux {
     }
 
     impl Operation {
+        pub(in crate::cluster::consensus::bound_start) fn delegated_build(
+            &self,
+        ) -> Option<peer_transport::BuildPeer> {
+            Some(self.transport.try_lock().ok()?.build_peer())
+        }
+
         pub(in crate::cluster::consensus::bound_start) fn installation_id(
             &self,
         ) -> Option<[u8; 16]> {

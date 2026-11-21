@@ -187,6 +187,11 @@ test('Rust retains every native, Python and package validation with exact comman
         env:
           ARX_EXEC_QUALIFICATION_MODE: build
         run: python3 -I -B tools/ci/m3-containers/executor-probe.py`,
+    `name: Hosted C14 target-authorized delegated build
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
@@ -246,6 +251,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
   assert.deepEqual(workflow.match(/^.*\btimeout-minutes['"]?\s*:.*$/gm), [
     '    timeout-minutes: 12',
     '        timeout-minutes: 3',
+    '        timeout-minutes: 2',
     '        timeout-minutes: 2',
     '    timeout-minutes: 12',
     '    timeout-minutes: 12',

@@ -242,6 +242,147 @@ struct Shared {
 pub(super) struct TransportOwner {
     shared: Arc<Shared>,
 }
+#[cfg(target_os = "linux")]
+pub(super) struct BuildPeer(Weak<Shared>);
+
+#[cfg(target_os = "linux")]
+fn build_lock<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    // Rustls verification is synchronous. Bound contention without changing
+    // the Raft verifier's asynchronous STORE_WAIT or transport deadlines.
+    let end = std::time::Instant::now() + Duration::from_millis(4);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) if std::time::Instant::now() < end => return Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < end => {
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const BUILD_LEARNER_WAIT: Duration = Duration::from_millis(4);
+
+#[cfg(target_os = "linux")]
+fn build_learner_ready(
+    mut observe: impl FnMut(Instant) -> Result<(), peer_registry::ObservationRefusal>,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> bool {
+    let deadline = now() + BUILD_LEARNER_WAIT;
+    while now() < deadline {
+        match observe(deadline) {
+            Ok(()) => return true,
+            Err(peer_registry::ObservationRefusal::StoreBusy) => {
+                pause(Duration::from_micros(250).min(deadline.saturating_duration_since(now())));
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+impl BuildPeer {
+    fn shared(&self) -> Option<Arc<Shared>> {
+        let shared = self.0.upgrade()?;
+        (!shared.failed.load(AtomicOrdering::Acquire)).then_some(shared)
+    }
+
+    pub(super) fn identity(&self) -> Option<(ClusterId, NodeId)> {
+        let shared = self.shared()?;
+        Some((shared.cluster, shared.node))
+    }
+
+    fn resources(&self) -> Option<Arc<Resources>> {
+        let shared = self.shared()?;
+        let state = build_lock(&shared.state)?;
+        if state.closed {
+            return None;
+        }
+        let resources = state.resources.clone()?;
+        drop(state);
+        if let Some(gate) = &resources.learner
+            && !build_learner_ready(
+                |deadline| gate.inspect_strict(Some(deadline), |_| ()),
+                Instant::now,
+                std::thread::sleep,
+            )
+        {
+            return None;
+        }
+        Some(resources)
+    }
+
+    fn key(
+        &self,
+        cluster: ClusterId,
+        node: NodeId,
+    ) -> Option<crate::cluster::enrollment::KeyDigest> {
+        let shared = self.shared()?;
+        let state = build_lock(&shared.state)?;
+        if state.closed || shared.cluster != cluster {
+            return None;
+        }
+        let sm = state.keeper.clone()?;
+        drop(state);
+        let store = build_lock(&sm.0)?;
+        crate::cluster::delegated_build::applied_binding(&store, cluster, node)
+    }
+
+    pub(super) fn binding(&self, cluster: ClusterId, node: NodeId) -> Option<[u8; 32]> {
+        self.key(cluster, node).map(|key| *key.as_bytes())
+    }
+
+    fn verifier(&self) -> Registry {
+        let weak = self.0.clone();
+        Arc::new(move |cluster, node, key| {
+            let current = BuildPeer(weak.clone()).key(cluster, node);
+            if current == Some(key) {
+                Ok(())
+            } else {
+                Err(verify::VerifyRefusal::NotMember)
+            }
+        })
+    }
+
+    pub(super) fn build_client(&self, target: NodeId) -> Option<Arc<ClientConfig>> {
+        let resources = self.resources()?;
+        self.key(resources.cluster, resources.node)?;
+        let mut client = resources
+            .client_with_registry(target, self.verifier())
+            .ok()?;
+        Arc::get_mut(&mut client)?.alpn_protocols = vec![b"arxcovo-build/1".to_vec()];
+        Some(client)
+    }
+
+    pub(super) fn build_server(&self) -> Option<Arc<ServerConfig>> {
+        let resources = self.resources()?;
+        self.key(resources.cluster, resources.node)?;
+        let creds = &resources.credentials;
+        let verifier = PeerVerifier::new(creds.root.clone(), resources.cluster, self.verifier())
+            .ok()?
+            .server();
+        let mut config = verify::server_config(
+            verifier,
+            creds.leaf.clone(),
+            creds.key.clone_key(),
+            creds.time.clone(),
+        )
+        .ok()?;
+        config.alpn_protocols = vec![b"arxcovo-build/1".to_vec()];
+        Some(Arc::new(config))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TransportOwner {
+    pub(super) fn build_peer(&self) -> BuildPeer {
+        BuildPeer(Arc::downgrade(&self.shared))
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct AppendClient {
     shared: Weak<Shared>,
@@ -2919,3 +3060,57 @@ mod issuer_channel {
 
 #[cfg(any(test, target_os = "linux"))]
 pub(super) use issuer_channel::Outcome as TransferOutcome;
+
+#[cfg(all(test, target_os = "linux"))]
+mod build_learner_readiness_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // Hold a real mutex for the busy sample. Advance a controlled monotonic
+    // clock during each pause so the 4 ms result is independent of scheduling.
+    fn contended_readiness(release_after: Duration) -> (bool, Duration, usize) {
+        let state = Mutex::new(());
+        let mut held = Some(state.lock().unwrap());
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut samples = 0;
+        let ready = build_learner_ready(
+            |deadline| {
+                assert_eq!(deadline, start + Duration::from_millis(4));
+                samples += 1;
+                match state.try_lock() {
+                    Ok(_) => Ok(()),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(peer_registry::ObservationRefusal::StoreBusy)
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => panic!("fixture poisoned"),
+                }
+            },
+            || start + elapsed.get(),
+            |duration| {
+                elapsed.set(elapsed.get() + duration);
+                if elapsed.get() >= release_after {
+                    drop(held.take());
+                }
+            },
+        );
+        (ready, elapsed.get(), samples)
+    }
+
+    #[test]
+    fn readiness_recovers_when_contention_clears_inside_budget() {
+        let release_after = Duration::from_millis(1);
+        let (ready, elapsed, samples) = contended_readiness(release_after);
+        assert!(ready);
+        assert_eq!(elapsed, release_after);
+        assert!(samples > 1);
+    }
+
+    #[test]
+    fn readiness_refuses_if_contention_persists_at_deadline() {
+        let (ready, elapsed, samples) = contended_readiness(Duration::MAX);
+        assert!(!ready);
+        assert_eq!(elapsed, Duration::from_millis(4));
+        assert!(samples > 1);
+    }
+}

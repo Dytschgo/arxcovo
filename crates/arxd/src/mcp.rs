@@ -14,6 +14,125 @@ pub struct Inventory {
 }
 #[derive(Clone)]
 pub struct Principal(pub String);
+#[cfg(target_os = "linux")]
+pub(crate) struct DelegatedInventory {
+    pub(crate) local: Inventory,
+    pub(crate) build: Arc<crate::service::cluster_build::BuildService>,
+    pub(crate) closed: crate::service::Shutdown,
+}
+
+#[cfg(target_os = "linux")]
+impl ServerHandler for DelegatedInventory {
+    fn get_info(&self) -> ServerConfig {
+        self.local.get_info()
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut result = self.local.list_tools(request, context).await?;
+        if let Some(run) = result.tools.iter_mut().find(|t| t.name == "run_command") {
+            let schema = Arc::make_mut(&mut run.input_schema);
+            schema.get_mut("properties").unwrap()["target"] = json!({"type":"integer","minimum":1});
+            schema.get_mut("properties").unwrap()["workspace"] =
+                json!({"type":"string","maxLength":48});
+        }
+        for (name, description, schema) in [
+            (
+                "discover_build_targets",
+                "Show enrolled delegated Standard build targets",
+                json!({"type":"object","additionalProperties":false}),
+            ),
+            (
+                "delegated_build_status",
+                "Find your forwarded operations or resolve one by ID",
+                json!({"type":"object","required":["target"],"additionalProperties":false,
+                    "properties":{"target":{"type":"integer","minimum":1},
+                                  "operation_id":{"type":"string","pattern":"^[a-f0-9]{64}$"}}}),
+            ),
+        ] {
+            result.tools.push(Tool::new(
+                name,
+                description,
+                Arc::new(schema.as_object().unwrap().clone()),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn call_tool(
+        &self,
+        mut request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        use crate::cluster::{delegated_build::wire::Descriptor, enrollment::NodeId};
+        let invalid = || ErrorData::invalid_params("invalid delegated build arguments", None);
+        let principal = &self.local.principal.as_ref().ok_or_else(invalid)?.0;
+        let args = request.arguments.get_or_insert_with(Default::default);
+        let value = match request.name.as_ref() {
+            "run_command" if args.contains_key("target") => {
+                let target = args
+                    .remove("target")
+                    .and_then(|t| NodeId::new(t.as_u64()?))
+                    .ok_or_else(invalid)?;
+                let workspace = args
+                    .remove("workspace")
+                    .and_then(|w| w.as_str().map(str::to_owned))
+                    .ok_or_else(invalid)?;
+                let command: crate::service::executor::Request =
+                    serde_json::from_value(serde_json::Value::Object(std::mem::take(args)))
+                        .map_err(|_| invalid())?;
+                let tool = command
+                    .tool
+                    .filter(|_| command.executable.is_none() && command.cwd.is_empty())
+                    .ok_or_else(invalid)?;
+                self.build
+                    .forward(
+                        principal,
+                        target,
+                        Descriptor {
+                            workspace,
+                            tool,
+                            args: command.args,
+                            timeout_s: command.timeout_s,
+                            output_bytes: command.output_bytes,
+                        },
+                        &self.closed,
+                    )
+                    .await
+            }
+            "discover_build_targets" if args.is_empty() => {
+                json!({"targets": self.build.targets(principal)})
+            }
+            "delegated_build_status" => {
+                let target = args
+                    .remove("target")
+                    .and_then(|t| NodeId::new(t.as_u64()?))
+                    .ok_or_else(invalid)?;
+                let operation = args
+                    .remove("operation_id")
+                    .map(|id| {
+                        let mut bytes = [0; 32];
+                        let id = id.as_str().ok_or_else(invalid)?;
+                        hex::decode_to_slice(id, &mut bytes).map_err(|_| invalid())?;
+                        Ok::<_, ErrorData>(bytes)
+                    })
+                    .transpose()?;
+                if !args.is_empty() {
+                    return Err(invalid());
+                }
+                self.build
+                    .forwarded_status(principal, target, operation)
+                    .await
+            }
+            _ => return self.local.call_tool(request, context).await,
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(value.to_string())]).into())
+    }
+}
+
 fn unavailable() -> ErrorData {
     ErrorData::internal_error("activity unavailable", None)
 }

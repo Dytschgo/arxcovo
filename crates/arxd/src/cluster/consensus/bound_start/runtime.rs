@@ -366,6 +366,26 @@ impl Running {
         }
     }
 
+    pub(crate) fn delegated_build(
+        &self,
+    ) -> Option<Arc<dyn crate::cluster::delegated_build::Authority>> {
+        let state = self.job.state();
+        if state.close_requested {
+            return None;
+        }
+        let peer = match state.status {
+            Status::FounderReady => state.founder.as_ref()?.delegated_build()?,
+            Status::LearnerReady if self.strict_written => {
+                state.learner.as_ref()?.delegated_build()?
+            }
+            _ => return None,
+        };
+        Some(Arc::new(BuildAuthority {
+            job: self.job,
+            peer,
+        }))
+    }
+
     fn start_error(&self) -> Error {
         let state = self.job.state();
         if state.recovery_hold.is_some() {
@@ -560,6 +580,67 @@ impl Running {
             .learner
             .as_ref()
             .is_some_and(learner::Operation::voter_custody)
+    }
+}
+
+struct BuildAuthority {
+    job: &'static Job,
+    peer: peer_transport::BuildPeer,
+}
+
+impl BuildAuthority {
+    fn checked(&self) -> Option<()> {
+        let state = self.job.state();
+        if state.close_requested
+            || !matches!(state.status, Status::FounderReady | Status::LearnerReady)
+        {
+            return None;
+        }
+        let node = state.node.clone()?;
+        drop(state);
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(4);
+        let node = loop {
+            if std::time::Instant::now() >= end {
+                return None;
+            }
+            if let Ok(locked) = node.try_lock() {
+                break locked;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(250));
+        };
+        let raft = node.raft.as_ref()?;
+        let metrics = raft.metrics();
+        let m = metrics.borrow_watched();
+        let membership = (*m.committed_membership_config.log_id())?;
+        (m.running_state.is_ok()
+            && m.current_leader.is_some()
+            && m.vote.committed
+            && m.committed_membership_config == m.membership_config
+            && m.last_applied
+                .is_some_and(|applied| covers_log(applied, membership)))
+        .then_some(())
+    }
+}
+
+impl crate::cluster::delegated_build::Authority for BuildAuthority {
+    fn identity(&self) -> Option<(ClusterId, NodeId)> {
+        self.checked()?;
+        self.peer.identity()
+    }
+
+    fn binding(&self, cluster: ClusterId, node: NodeId) -> Option<[u8; 32]> {
+        self.checked()?;
+        self.peer.binding(cluster, node)
+    }
+
+    fn client(&self, target: NodeId) -> Option<Arc<rustls::ClientConfig>> {
+        self.checked()?;
+        self.peer.build_client(target)
+    }
+
+    fn server(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.checked()?;
+        self.peer.build_server()
     }
 }
 

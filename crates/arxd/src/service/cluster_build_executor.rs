@@ -12,6 +12,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     ffi::{CString, OsString},
     fs::{self, File, Metadata, OpenOptions, Permissions},
     io::{self, Read, Write},
@@ -25,7 +26,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -44,6 +45,9 @@ const MAX_FRAME: usize = 448 * 1024;
 const MAX_CONNECTIONS: usize = 8;
 const SOCKET: &str = "executor.sock";
 const CANCEL: u8 = 1;
+const BUILD_EXECUTE: u8 = 2;
+const WORKSPACE_TTL: Duration = Duration::from_secs(30);
+const MAX_WORKSPACE_TICKETS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BrokerRefusal {
@@ -319,6 +323,14 @@ enum Operation {
     Status,
     Drain,
     Execute(Request),
+    CheckWorkspace {
+        slot: String,
+    },
+    PrepareBuild {
+        slot: String,
+        ticket: [u8; 32],
+        request: Request,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -326,6 +338,8 @@ enum Operation {
 enum Reply {
     Ready(Pin),
     Drained,
+    Workspace([u8; 32]),
+    Prepared,
     Unavailable(String),
     Cancelled,
     Failed(Creation),
@@ -421,9 +435,11 @@ impl Reply {
                 stdout: stdout.into(),
                 stderr: stderr.into(),
             },
-            Self::Ready(_) | Self::Drained => Report::Failed {
-                creation: Creation::Unknown,
-            },
+            Self::Ready(_) | Self::Drained | Self::Workspace(_) | Self::Prepared => {
+                Report::Failed {
+                    creation: Creation::Unknown,
+                }
+            }
         }
     }
 }
@@ -600,10 +616,18 @@ fn exchange(
     budget: Duration,
     stopping: impl Fn() -> bool,
 ) -> io::Result<Reply> {
-    stream.set_read_timeout(Some(POLL))?;
     stream.set_write_timeout(Some(HANDSHAKE))?;
-    let deadline = Instant::now() + budget;
     stream.write_all(&frame(operation)?)?;
+    receive_reply(stream, budget, stopping)
+}
+
+fn receive_reply(
+    mut stream: &UnixStream,
+    budget: Duration,
+    stopping: impl Fn() -> bool,
+) -> io::Result<Reply> {
+    stream.set_read_timeout(Some(POLL))?;
+    let deadline = Instant::now() + budget;
     let mut cancelled = false;
     let mut receive = |target: &mut [u8]| -> io::Result<()> {
         let mut offset = 0;
@@ -650,6 +674,13 @@ fn status(reply: io::Result<Reply>) -> Result<Pin, Unavailable> {
 /// Authenticate the local broker and bind the existing single admission owner
 /// to the installation's build UID before the daemon exposes any route.
 pub(super) fn connect(socket: PathBuf, build_uid: u32) -> Result<Arc<Execution>, Unavailable> {
+    connect_build(socket, build_uid).map(|(execution, _)| execution)
+}
+
+pub(super) fn connect_build(
+    socket: PathBuf,
+    build_uid: u32,
+) -> Result<(Arc<Execution>, BuildBroker), Unavailable> {
     if !canonical_path(&socket) || socket.file_name().is_none_or(|n| n != SOCKET) {
         return Err(Unavailable::PreflightFailed);
     }
@@ -662,17 +693,119 @@ pub(super) fn connect(socket: PathBuf, build_uid: u32) -> Result<Arc<Execution>,
     if pin.uid != build_uid || pin.uid == 0 || pin.gid == 0 || !(1..=4).contains(&pin.slots) {
         return Err(Unavailable::PreflightFailed);
     }
-    Ok(Execution::cluster_broker(
-        Arc::new(Client {
-            socket,
-            pin,
-            peer,
-            cleanup_unknown: AtomicBool::new(false),
-        }),
-        pin.uid,
-        pin.gid,
-        pin.slots,
-    ))
+    let client = Arc::new(Client {
+        socket,
+        pin,
+        peer,
+        cleanup_unknown: AtomicBool::new(false),
+    });
+    let execution = Execution::cluster_broker(client.clone(), pin.uid, pin.gid, pin.slots);
+    Ok((execution, BuildBroker(client)))
+}
+
+#[derive(Clone)]
+pub(super) struct BuildBroker(Arc<Client>);
+
+pub(super) struct PreparedBuild {
+    client: Arc<Client>,
+    stream: UnixStream,
+    budget: Duration,
+}
+
+fn build_reply(reply: &Reply) -> Unavailable {
+    match reply {
+        Reply::Unavailable(reason) => unavailable(reason).unwrap_or(Unavailable::PreflightFailed),
+        _ => Unavailable::PreflightFailed,
+    }
+}
+
+impl BuildBroker {
+    fn connection(&self) -> Result<UnixStream, Unavailable> {
+        let stream = open_socket(&self.0.socket).map_err(|_| Unavailable::MechanismUnavailable)?;
+        if credentials(&stream).ok() != Some(self.0.peer) {
+            return Err(Unavailable::PreflightFailed);
+        }
+        Ok(stream)
+    }
+
+    pub(super) fn check(&self, slot: String) -> Result<[u8; 32], Unavailable> {
+        let stream = self.connection()?;
+        let reply = exchange(
+            &stream,
+            &Operation::CheckWorkspace { slot },
+            HANDSHAKE,
+            || false,
+        )
+        .map_err(|_| Unavailable::MechanismUnavailable)?;
+        match reply {
+            Reply::Workspace(ticket) => Ok(ticket),
+            _ => Err(build_reply(&reply)),
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        slot: String,
+        ticket: [u8; 32],
+        request: Request,
+    ) -> Result<PreparedBuild, Unavailable> {
+        let stream = self.connection()?;
+        let budget = Duration::from_secs(request.timeout_s + 6);
+        let reply = exchange(
+            &stream,
+            &Operation::PrepareBuild {
+                slot,
+                ticket,
+                request,
+            },
+            HANDSHAKE,
+            || false,
+        )
+        .map_err(|_| Unavailable::MechanismUnavailable)?;
+        if !matches!(reply, Reply::Prepared) {
+            return Err(build_reply(&reply));
+        }
+        Ok(PreparedBuild {
+            client: self.0.clone(),
+            stream,
+            budget,
+        })
+    }
+}
+
+impl PreparedBuild {
+    pub(super) fn execute(mut self, cancel: &Cancellation, shutdown: &Cancellation) -> Report {
+        if cancel.is_cancelled() || shutdown.is_cancelled() {
+            return Report::CancelledBeforeSpawn;
+        }
+        let reply = self.stream.write_all(&[BUILD_EXECUTE]).and_then(|()| {
+            receive_reply(&self.stream, self.budget, || {
+                cancel.is_cancelled() || shutdown.is_cancelled()
+            })
+        });
+        let confirmed = match &reply {
+            Ok(Reply::Completed {
+                uid,
+                gid,
+                cleanup: true,
+                ..
+            }) => (*uid, *gid) == (self.client.pin.uid, self.client.pin.gid),
+            Ok(Reply::Unavailable(reason)) => unavailable(reason).is_some(),
+            Ok(Reply::Cancelled | Reply::Failed(Creation::NotInvoked | Creation::ProvenNone)) => {
+                true
+            }
+            _ => false,
+        };
+        if !confirmed {
+            self.client.cleanup_unknown.store(true, Ordering::Release);
+        }
+        reply.map_or(
+            Report::Failed {
+                creation: Creation::Unknown,
+            },
+            Reply::into_report,
+        )
+    }
 }
 
 impl Executor for Client {
@@ -722,6 +855,18 @@ impl Executor for Client {
     }
 }
 
+async fn read_operation(stream: &mut ServerStream) -> io::Result<Operation> {
+    timeout(HANDSHAKE, async {
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).await?;
+        let mut body = vec![0; frame_len(header)?];
+        stream.read_exact(&mut body).await?;
+        serde_json::from_slice::<Operation>(&body).map_err(|_| bad())
+    })
+    .await?
+}
+
+#[cfg(test)]
 async fn serve(
     mut stream: ServerStream,
     bridge: Arc<impl Executor>,
@@ -729,19 +874,30 @@ async fn serve(
     shutdown: Cancellation,
     capacity: Arc<Semaphore>,
 ) {
-    let operation = timeout(HANDSHAKE, async {
-        let mut header = [0; 4];
-        stream.read_exact(&mut header).await?;
-        let mut body = vec![0; frame_len(header)?];
-        stream.read_exact(&mut body).await?;
-        serde_json::from_slice::<Operation>(&body).map_err(|_| bad())
-    })
-    .await;
-    let Ok(Ok(operation)) = operation else { return };
+    if let Ok(operation) = read_operation(&mut stream).await {
+        serve_operation(stream, bridge, pin, shutdown, capacity, operation).await;
+    }
+}
+
+async fn serve_operation(
+    mut stream: ServerStream,
+    bridge: Arc<impl Executor>,
+    pin: Pin,
+    shutdown: Cancellation,
+    capacity: Arc<Semaphore>,
+    operation: Operation,
+) {
     let reply = if matches!(operation, Operation::Drain) {
         // Seal admission before inspecting the live Runner inventory. The
         // worker owns its permit through cleanup, even after connection loss.
         capacity.close();
+        let deadline = tokio::time::Instant::now() + HANDSHAKE - POLL * 2;
+        while capacity.available_permits() != usize::from(pin.slots)
+            && !shutdown.is_cancelled()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         if !shutdown.is_cancelled()
             && capacity.available_permits() == usize::from(pin.slots)
             && bridge.confirm_cleanup()
@@ -787,11 +943,335 @@ async fn serve(
             }
             (Ok(()), Operation::Execute(_)) => Reply::Failed(Creation::NotInvoked),
             (Ok(()), Operation::Drain) => unreachable!("handled before admission"),
+            (Ok(()), Operation::CheckWorkspace { .. } | Operation::PrepareBuild { .. }) => {
+                Reply::Failed(Creation::NotInvoked)
+            }
         }
     };
     if let Ok(record) = frame(&reply) {
         let _ = timeout(HANDSHAKE, stream.write_all(&record)).await;
     }
+}
+
+struct Workspace {
+    files: Vec<File>,
+    identity: Vec<Fingerprint>,
+}
+
+fn slot_name(slot: &str) -> bool {
+    (1..=48).contains(&slot.len())
+        && slot
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+impl Workspace {
+    fn open(root: &Path, slot: &str) -> io::Result<Self> {
+        if !canonical_path(root) || !slot_name(slot) {
+            return Err(bad());
+        }
+        let path = root.join(slot);
+        let names: Vec<_> = path.as_os_str().as_bytes()[1..]
+            .split(|&b| b == b'/')
+            .collect();
+        if names.len() > 32 {
+            return Err(bad());
+        }
+        let slot_index = names.len() - 1;
+        let mut files = vec![File::open("/")?];
+        for (i, name) in names.into_iter().enumerate() {
+            let name = CString::new(name)?;
+            // SAFETY: openat2 receives a live dirfd and this fixed ABI record.
+            let how = [
+                u64::try_from(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC).unwrap(),
+                0,
+                (if i == slot_index { 0x01 } else { 0 }) | 0x04 | 0x08,
+            ]; // NO_XDEV below workspace root, NO_SYMLINKS | BENEATH throughout
+            let raw = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    files.last().unwrap().as_raw_fd(),
+                    name.as_ptr(),
+                    &how,
+                    std::mem::size_of_val(&how),
+                )
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a successful open returned a new owned descriptor.
+            files.push(unsafe { File::from_raw_fd(raw as i32) });
+        }
+        let mut identity = Vec::with_capacity(files.len());
+        for (i, file) in files.iter().enumerate() {
+            super::native::os::local(file).map_err(|_| bad())?;
+            let m = file.metadata()?;
+            let access = if i >= slot_index { 0o005 } else { 0o001 };
+            if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 || m.mode() & access != access {
+                return Err(bad());
+            }
+            // With no ACL, the other read/search bits really apply to the build account.
+            // SAFETY: only the existence of the named attribute is queried.
+            for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+                let acl = unsafe {
+                    libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0)
+                };
+                if acl != -1
+                    || !matches!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENODATA | libc::EOPNOTSUPP)
+                    )
+                {
+                    return Err(bad());
+                }
+            }
+            identity.push(m.into());
+        }
+        Ok(Self { files, identity })
+    }
+
+    fn matches(&self, root: &Path, slot: &str) -> bool {
+        Self::open(root, slot).is_ok_and(|now| now.identity == self.identity)
+            && self
+                .files
+                .iter()
+                .zip(&self.identity)
+                .all(|(file, id)| file.metadata().is_ok_and(|m| &Fingerprint::from(m) == id))
+    }
+}
+
+#[derive(Default)]
+struct WorkspaceTickets(Mutex<HashMap<[u8; 32], (Instant, String, Workspace)>>);
+
+impl WorkspaceTickets {
+    fn issue(&self, root: &Path, slot: String) -> Result<[u8; 32], Unavailable> {
+        let workspace = Workspace::open(root, &slot).map_err(|_| Unavailable::PreflightFailed)?;
+        let mut ticket = [0; 32];
+        getrandom::fill(&mut ticket).map_err(|_| Unavailable::PreflightFailed)?;
+        let now = Instant::now();
+        let mut entries = self.0.lock().map_err(|_| Unavailable::PreflightFailed)?;
+        entries.retain(|_, (expiry, _, _)| *expiry > now);
+        if entries.len() >= MAX_WORKSPACE_TICKETS || entries.contains_key(&ticket) {
+            return Err(Unavailable::Busy);
+        }
+        entries.insert(ticket, (now + WORKSPACE_TTL, slot, workspace));
+        Ok(ticket)
+    }
+
+    fn take(&self, root: &Path, slot: &str, ticket: [u8; 32]) -> Result<Workspace, Unavailable> {
+        let entry = self
+            .0
+            .lock()
+            .map_err(|_| Unavailable::PreflightFailed)?
+            .remove(&ticket);
+        let (expiry, selected, workspace) = entry.ok_or(Unavailable::PreflightFailed)?;
+        (expiry > Instant::now() && selected == slot && workspace.matches(root, slot))
+            .then_some(workspace)
+            .ok_or(Unavailable::PreflightFailed)
+    }
+}
+
+async fn send_reply(stream: &mut ServerStream, reply: Reply) -> io::Result<()> {
+    let record = frame(&reply)?;
+    timeout(HANDSHAKE, stream.write_all(&record)).await?
+}
+
+fn build_available(
+    shutdown: &Cancellation,
+    capacity: &Semaphore,
+    preflight: impl FnOnce() -> Result<(), Unavailable>,
+) -> Result<(), Unavailable> {
+    if shutdown.is_cancelled() || capacity.is_closed() {
+        Err(Unavailable::Stopping)
+    } else {
+        preflight()
+    }
+}
+
+fn prepare_workspace(
+    workspaces: &WorkspaceTickets,
+    root: &Path,
+    slot: &str,
+    ticket: [u8; 32],
+    capacity: &Arc<Semaphore>,
+) -> Result<(Workspace, tokio::sync::OwnedSemaphorePermit), Unavailable> {
+    let workspace = workspaces.take(root, slot, ticket)?;
+    let permit = capacity
+        .clone()
+        .try_acquire_owned()
+        .map_err(|err| match err {
+            tokio::sync::TryAcquireError::Closed => Unavailable::Stopping,
+            tokio::sync::TryAcquireError::NoPermits => Unavailable::Busy,
+        })?;
+    Ok((workspace, permit))
+}
+
+#[cfg(test)]
+pub(super) fn workspace_controls(root: &Path) {
+    let pinned = Workspace::open(root, "ws").unwrap();
+    assert!(pinned.matches(root, "ws"));
+    assert!(Workspace::open(root, "replacement").is_ok());
+    assert!(!pinned.matches(root, "replacement"));
+    assert_eq!(
+        Workspace::open(root, "ws-link")
+            .err()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::ELOOP),
+    );
+    assert_eq!(
+        Workspace::open(&root.join("writable"), "ws")
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidData,
+    );
+}
+
+#[cfg(test)]
+pub(super) fn refusal_fixture(
+    directory: &Path,
+    workspace: PathBuf,
+    executions: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) -> (BuildBroker, Arc<Semaphore>, tokio::task::JoinHandle<()>) {
+    let socket = directory.join("broker-fixture.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let peer = credentials(&open_socket(&socket).unwrap()).unwrap();
+    let capacity = Arc::new(Semaphore::new(1));
+    let pin = Pin {
+        uid: 21002,
+        gid: 21002,
+        slots: 1,
+    };
+    let broker = BuildBroker(Arc::new(Client {
+        socket,
+        pin,
+        peer,
+        cleanup_unknown: AtomicBool::new(false),
+    }));
+    let fixture_capacity = capacity.clone();
+    let worker = tokio::spawn(async move {
+        let tickets = WorkspaceTickets::default();
+        let stopping = Cancellation::default();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Ok(request) = read_operation(&mut stream).await else {
+                continue;
+            };
+            let available = || build_available(&stopping, &fixture_capacity, || Ok(()));
+            let result = match request {
+                Operation::CheckWorkspace { slot } => available()
+                    .and_then(|()| tickets.issue(&workspace, slot))
+                    .map(Reply::Workspace),
+                Operation::PrepareBuild { slot, ticket, .. } => {
+                    match available().and_then(|()| {
+                        prepare_workspace(&tickets, &workspace, &slot, ticket, &fixture_capacity)
+                    }) {
+                        Err(reason) => Err(reason),
+                        Ok((_workspace, _permit)) => {
+                            let executions = executions.as_ref().expect("unexpected prepare");
+                            send_reply(&mut stream, Reply::Prepared).await.unwrap();
+                            if matches!(
+                                timeout(HANDSHAKE, stream.read_u8()).await,
+                                Ok(Ok(BUILD_EXECUTE))
+                            ) {
+                                executions.fetch_add(1, Ordering::SeqCst);
+                                Ok(Reply::Cancelled)
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                _ => panic!("unexpected refusal fixture command"),
+            };
+            let reply = result.unwrap_or_else(|reason| Reply::Unavailable(reason.as_str().into()));
+            send_reply(&mut stream, reply).await.unwrap();
+        }
+    });
+    (broker, capacity, worker)
+}
+
+async fn serve_broker(
+    mut stream: ServerStream,
+    bridge: Arc<super::unix_bridge::UnixBridge>,
+    policy: Arc<Policy>,
+    shutdown: Cancellation,
+    capacity: Arc<Semaphore>,
+    workspaces: Arc<WorkspaceTickets>,
+) {
+    let Ok(operation) = read_operation(&mut stream).await else {
+        return;
+    };
+    let root = Path::new(policy.service.workspace());
+    let available = || build_available(&shutdown, &capacity, || bridge.preflight());
+    let reply = match operation {
+        Operation::CheckWorkspace { slot } => available()
+            .and_then(|()| workspaces.issue(root, slot))
+            .map(Reply::Workspace),
+        Operation::PrepareBuild {
+            slot,
+            ticket,
+            request,
+        } => {
+            let prepared = (|| {
+                available()?;
+                if request.tool.is_none() || !request.cwd.is_empty() || !request.validate() {
+                    return Err(Unavailable::PreflightFailed);
+                }
+                prepare_workspace(&workspaces, root, &slot, ticket, &capacity)
+            })();
+            match prepared {
+                Err(reason) => Err(reason),
+                Ok((workspace, permit)) => {
+                    if send_reply(&mut stream, Reply::Prepared).await.is_err()
+                        || !matches!(
+                            timeout(HANDSHAKE, stream.read_u8()).await,
+                            Ok(Ok(BUILD_EXECUTE))
+                        )
+                    {
+                        return;
+                    }
+                    let recheck = available().and_then(|()| {
+                        workspace
+                            .matches(root, &slot)
+                            .then_some(())
+                            .ok_or(Unavailable::PreflightFailed)
+                    });
+                    match recheck {
+                        Err(reason) => Err(reason),
+                        Ok(()) => {
+                            let cancel = Cancellation::default();
+                            let child_cancel = cancel.clone();
+                            let mut work = tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                let _workspace = workspace;
+                                bridge.run_build(
+                                    &request,
+                                    Path::new(&slot),
+                                    &child_cancel,
+                                    &shutdown,
+                                )
+                            });
+                            let result = tokio::select! {
+                                biased;
+                                _ = stream.read_u8() => { cancel.cancel(); work.await }
+                                result = &mut work => result,
+                            };
+                            Ok(result.map_or(Reply::Failed(Creation::Unknown), Reply::from_report))
+                        }
+                    }
+                }
+            }
+        }
+        other => {
+            return serve_operation(stream, bridge, policy.pin, shutdown, capacity, other).await;
+        }
+    };
+    let _ = send_reply(
+        &mut stream,
+        reply.unwrap_or_else(|r| Reply::Unavailable(r.as_str().into())),
+    )
+    .await;
 }
 
 struct Endpoint {
@@ -857,6 +1337,7 @@ async fn broker(policy: Arc<Policy>, binary: PathBuf) -> Result<(), BrokerRefusa
         Endpoint::bind(&policy.socket, policy.daemon.1).map_err(|_| BrokerRefusal::Bind)?;
     println!("ARX_EXEC_SETUP ready");
     let mut work = JoinSet::new();
+    let workspaces = Arc::new(WorkspaceTickets::default());
     let capacity = Arc::new(Semaphore::new(usize::from(policy.pin.slots)));
     let shutdown = Cancellation::default();
     let mut failed = false;
@@ -876,7 +1357,10 @@ async fn broker(policy: Arc<Policy>, binary: PathBuf) -> Result<(), BrokerRefusa
                     break;
                 };
                 if stream.peer_cred().is_ok_and(|cred| (cred.uid(), cred.gid()) == policy.daemon) {
-                    work.spawn(serve(stream, bridge.clone(), policy.pin, shutdown.clone(), capacity.clone()));
+                    work.spawn(serve_broker(
+                        stream, bridge.clone(), policy.clone(), shutdown.clone(),
+                        capacity.clone(), workspaces.clone(),
+                    ));
                 }
             }
         }

@@ -262,6 +262,9 @@ pub(crate) mod cluster_runtime;
 mod cluster_build_executor;
 
 #[cfg(target_os = "linux")]
+pub(crate) mod cluster_build;
+
+#[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub fn cluster_broker_entry(args: &[std::ffi::OsString]) -> Option<i32> {
     cluster_build_executor::entry(args)

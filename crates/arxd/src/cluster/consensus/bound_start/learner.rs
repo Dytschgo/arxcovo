@@ -53,6 +53,12 @@ struct Member {
     history: Option<Box<(Fresh, Live)>>,
 }
 
+impl Operation {
+    pub(super) fn delegated_build(&self) -> Option<peer_transport::BuildPeer> {
+        Some(self.transport.try_lock().ok()?.build_peer())
+    }
+}
+
 struct ReopenSeed {
     plan: Plan,
     objects: ReopenObjects,

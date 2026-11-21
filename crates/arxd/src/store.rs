@@ -7,6 +7,8 @@ use std::{path::Path, sync::Mutex, time::Duration};
 mod account_choice_tests;
 #[cfg(all(test, windows))]
 mod crash_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod delegated_build_tests;
 
 /// Memory-only cache of released discovery response metadata.
 #[derive(Clone)]
@@ -16,6 +18,47 @@ pub(crate) struct ToolCache {
     pub(crate) observed_identity: serde_json::Value,
     pub(crate) observed_at_ms: u64,
 }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildActivity {
+    pub(crate) activity_id: i64,
+    pub(crate) outcome: Outcome,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) cleanup_confirmed: Option<bool>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+const BUILD_ACTIVITY_FIELDS: &str = "a.id, CASE WHEN length(a.outcome)<=16 THEN a.outcome END,
+    a.exit_code, a.cleanup_confirmed,
+    CASE WHEN a.observed_kind='unix_uid' AND length(a.observed_id)<=10
+              THEN CAST(a.observed_id AS INTEGER) END,
+    a.observed_gid";
+
+#[cfg(target_os = "linux")]
+impl BuildActivity {
+    fn decode(row: &rusqlite::Row<'_>) -> Result<Self> {
+        Ok(Self {
+            activity_id: row.get(0)?,
+            outcome: Outcome::parse(&row.get::<_, String>(1)?)?,
+            exit_code: row.get(2)?,
+            cleanup_confirmed: row.get(3)?,
+            uid: row.get(4)?,
+            gid: row.get(5)?,
+        })
+    }
+
+    pub(crate) fn terminal(&self) -> bool {
+        (matches!(self.outcome, Outcome::Succeeded | Outcome::Failed)
+            && self.cleanup_confirmed == Some(true)
+            && self.uid.is_some()
+            && self.gid.is_some())
+            || self.outcome == Outcome::Refused
+    }
+}
+
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     tool_cache: Mutex<Option<ToolCache>>,
@@ -159,6 +202,14 @@ impl Activity {
             let columns = columns.join(",");
             tx.execute_batch(&format!("INSERT INTO activity({columns}) SELECT {columns} FROM activity_v3; INSERT INTO sqlite_sequence(name,seq) SELECT 'activity',seq FROM sqlite_sequence WHERE name='activity_v3' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity'); UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_v3'),0)) WHERE name='activity'; DROP TABLE activity_v3; PRAGMA user_version=4;"))?;
         }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS delegated_build(
+                operation BLOB PRIMARY KEY NOT NULL CHECK(typeof(operation)='blob' AND length(operation)=32),
+                scope BLOB NOT NULL CHECK(typeof(scope)='blob' AND length(scope)=32),
+                activity_id INTEGER NOT NULL UNIQUE CHECK(activity_id>0),
+                forwarded INTEGER NOT NULL CHECK(forwarded IN (0,1))
+            ) WITHOUT ROWID;",
+        )?;
         tx.execute(
             "UPDATE activity SET outcome='interrupted',finished_at_ms=?1 WHERE outcome='started'",
             [now_ms()?],
@@ -289,7 +340,7 @@ impl Activity {
         let tx = db.transaction()?;
         tx.execute("INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode) VALUES (?1,?2,'started',?3,?4,?5,?6)", params![principal,tool.as_str(),if daemon {"daemon"} else {"agent"},tool.class(),now_ms()?,mode.map(IdentityMode::as_str)])?;
         let id = tx.last_insert_rowid();
-        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' ORDER BY id DESC LIMIT 200); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' ORDER BY id DESC LIMIT 1000);")?;
+        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 1000) AND id NOT IN (SELECT activity_id FROM delegated_build);")?;
         check_size(&tx)?;
         tx.commit()?;
         Ok(id)
@@ -309,6 +360,23 @@ impl Activity {
             .lock()
             .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
         let tx = db.transaction()?;
+        let changed =
+            Self::update_completion(&tx, id, outcome, metadata, "outcome='started'", &[])?;
+        if changed != 1 {
+            anyhow::bail!("activity completion refused");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn update_completion(
+        tx: &rusqlite::Transaction<'_>,
+        id: i64,
+        outcome: Outcome,
+        metadata: &Metadata,
+        predicate: &str,
+        predicate_values: &[rusqlite::types::Value],
+    ) -> Result<usize> {
         // The mode recorded at start is authoritative; completion cannot relabel it.
         if let Some(mode) = metadata.identity_mode {
             let current: Option<String> = tx
@@ -332,6 +400,7 @@ impl Activity {
             values.push(sql_value(&value[name])?);
         }
         values.push(id.into());
+        values.extend_from_slice(predicate_values);
         let assignments = FIELDS
             .iter()
             .map(|(n, _)| {
@@ -343,15 +412,179 @@ impl Activity {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let changed = tx.execute(&format!("UPDATE activity SET outcome=?,finished_at_ms=?,class=CASE WHEN ?1='rejected' THEN 'read' ELSE class END,{assignments} WHERE id=? AND outcome='started'"), rusqlite::params_from_iter(values))?;
-        if changed != 1 {
+        let changed = tx.execute(&format!("UPDATE activity SET outcome=?,finished_at_ms=?,class=CASE WHEN ?1='rejected' THEN 'read' ELSE class END,{assignments} WHERE id=? AND {predicate}"), rusqlite::params_from_iter(values))?;
+        if changed == 1 {
+            tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build)", [])?;
+            check_size(tx)?;
+        }
+        Ok(changed)
+    }
+
+    /// Returns false if the matching forwarded row was already resolved.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_forwarded_build(
+        &self,
+        id: i64,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        outcome: Outcome,
+        metadata: &Metadata,
+    ) -> Result<bool> {
+        if !matches!(
+            outcome,
+            Outcome::Succeeded | Outcome::Failed | Outcome::Refused
+        ) {
+            anyhow::bail!("invalid completion");
+        }
+        metadata.validate()?;
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = Self::update_completion(
+            &tx,
+            id,
+            outcome,
+            metadata,
+            "outcome IN ('started','interrupted') AND EXISTS (
+                SELECT 1 FROM delegated_build d WHERE d.activity_id=activity.id
+                AND d.forwarded=1 AND d.operation=? AND d.scope=?
+            )",
+            &[operation.to_vec().into(), scope.to_vec().into()],
+        )?;
+        let result = Self::read_delegated_build(&tx, operation, scope, true)?;
+        if !result.is_some_and(|row| row.activity_id == id && row.terminal()) {
             anyhow::bail!("activity completion refused");
         }
-        tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' ORDER BY id DESC LIMIT 200)", [])?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_delegated_build(
+        &self,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarder: Option<&str>,
+    ) -> Result<i64> {
+        self.start_delegated_build_checked(operation, scope, forwarder, || true)?
+            .ok_or_else(|| anyhow::anyhow!("delegated activity refused"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_delegated_build_checked(
+        &self,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarder: Option<&str>,
+        authorized: impl FnOnce() -> bool,
+    ) -> Result<Option<i64>> {
+        if let Some(principal) = forwarder {
+            validate_principal(principal)?;
+        }
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let forwarded = forwarder.is_some();
+        let count: u32 = tx.query_row(
+            "SELECT count(*) FROM delegated_build WHERE forwarded=?1",
+            [forwarded],
+            |row| row.get(0),
+        )?;
+        let evict = match count {
+            0..128 => None,
+            128 => {
+                let mut query = tx.prepare(&format!(
+                    "SELECT {BUILD_ACTIVITY_FIELDS}
+                     FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+                     WHERE d.forwarded=?1 ORDER BY a.id LIMIT 128"
+                ))?;
+                let mut rows = query.query([forwarded])?;
+                let mut terminal = None;
+                while let Some(row) = rows.next()? {
+                    let activity = BuildActivity::decode(row)?;
+                    if activity.terminal() {
+                        terminal = Some(activity.activity_id);
+                        break;
+                    }
+                }
+                if terminal.is_none() {
+                    return Ok(None);
+                }
+                terminal
+            }
+            _ => return Ok(None),
+        };
+        let started = now_ms()?;
+        if !authorized() {
+            return Ok(None);
+        }
+        if let Some(id) = evict {
+            tx.execute("DELETE FROM delegated_build WHERE activity_id=?1", [id])?;
+            tx.execute("DELETE FROM activity WHERE id=?1", [id])?;
+        }
+        tx.execute(
+            "INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode)
+             VALUES (?1,'run_command','started',?2,'action',?3,'dedicated_account')",
+            params![forwarder.unwrap_or("arxd"), if forwarded { "agent" } else { "daemon" }, started],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO delegated_build VALUES(?1,?2,?3,?4)",
+            params![operation, scope, id, forwarded],
+        )?;
         check_size(&tx)?;
         tx.commit()?;
-        Ok(())
+        Ok(Some(id))
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn delegated_build(
+        &self,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarded: bool,
+    ) -> Result<Option<BuildActivity>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        Self::read_delegated_build(&db, operation, scope, forwarded)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_delegated_build(
+        db: &Connection,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarded: bool,
+    ) -> Result<Option<BuildActivity>> {
+        let mut query = db.prepare(&format!(
+            "SELECT {BUILD_ACTIVITY_FIELDS}
+             FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+             WHERE d.operation=?1 AND d.scope=?2 AND d.forwarded=?3"
+        ))?;
+        let mut rows = query.query(params![operation, scope, forwarded])?;
+        rows.next()?.map(BuildActivity::decode).transpose()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn forwarded_builds(&self, scope: [u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let mut query = db.prepare(
+            "SELECT d.operation FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+             WHERE d.scope=?1 AND d.forwarded=1 AND a.outcome IN ('started','interrupted')
+             AND typeof(d.operation)='blob' AND length(d.operation)=32 ORDER BY a.id DESC LIMIT 32",
+        )?;
+        let rows = query.query_map([scope], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Caller must use its own committed read id; SQL bounds both rows and values.
     pub fn list(&self, principal: &str, read_id: i64, args: &ListActivity) -> Result<ActivityPage> {
         self.list_filtered(principal, read_id, args, None)
