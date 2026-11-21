@@ -859,6 +859,16 @@ merged, as listed under "Merged this session".
   dispatch, zero consensus invocations and confirmed cleanup. That run also passed C15 as
   standing inventory from merged PR234. The A10 step is now standing inventory in the Ubuntu
   Rust job. Its build-mode step took about 2 s in run 44907529544.
+  The non-required **S2b native evidence** workflow failed on every PR #233 head: runs
+  44902560563 (`8423b778`), 44904837568 (`80f94ab6`), 44906689513 (`b343f9a1`), 44907529515
+  (`170dd152`) and 44908926610 (`a6edfb68`). Its harness failed closed with reason `source_pin`
+  before any native step: its historical exact-source pins do not match the 14a source
+  (`service/unix_bridge.rs` and related). This was a known, expected refusal (pre-push re-check 2
+  noted it; the workflow is PR-only and outside the required checks), not a product failure, but
+  it means **no S2b native run covers the 14a source**. 14a's qualification is the hosted A10
+  probe only; it is not natively qualified, and the native execution paths S2b would exercise for
+  this source are **unverified on real hardware** until an S2b run with reviewed updated pins
+  passes. Follow-up: re-pin S2b to the reviewed 14a source in a separate reviewed PR.
 - **Process note.** The coordinator's instruction to run the complete QEMU suite led the 14a
   builder to run the existing C11/C12 Engine campaigns locally under emulation, beyond 14a's
   zero-Engine local brief. The 14a and 15a builders also ran the requested complete native
