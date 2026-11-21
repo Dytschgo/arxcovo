@@ -1,4 +1,5 @@
 import contextlib
+from decimal import Decimal
 import io
 import os
 from pathlib import Path
@@ -165,6 +166,7 @@ class QualificationTests(unittest.TestCase):
 
     def test_each_reference_budget_includes_accuracy_and_resolution(self):
         self.assertEqual(run.utc_bounds(100_000, 100_100, 102_000), (-4000, 100))
+        self.assertEqual(run.utc_bounds(100_000, 100_100, Decimal("102000.000900")), (-4001, 100))
         self.assertEqual(run.utc_bounds(100_000, 100_100, 128_000), (-30000, -25900))
         for sample in ((100_000, 100_100, 128_001), (100_000, 107_000, 102_000),
                        (100_100, 100_000, 102_000), (100_000, 100_100, None)):
@@ -214,6 +216,8 @@ class QualificationTests(unittest.TestCase):
             (good_status, date + date + length, ts_line, "utc-missing-or-ambiguous"),
             (good_status, date + b"Content-Length: 1025\r\n", ts_line, "utc-trace-bound"),
             (good_status, date + length, ts_line[:-1], "utc-trace-bound"),
+            (good_status, date + length, ts_line + b"\0", "utc-trace-trailing-data"),
+            (good_status, date + length, ts_line + b"ts=1795262401\n", "utc-trace-trailing-data"),
         ):
             with self.subTest(status=status, headers=headers), self.assertRaisesRegex(run.Failure, error):
                 run.reference_response(io.BytesIO(status + headers + b"\r\n" + body), good_status)
@@ -228,26 +232,48 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaisesRegex(run.Failure, error):
                 run.trace_agreement(body, 1_795_262_400_000)
 
-    def test_cross_origin_agreement_is_required_at_checkpoints(self):
+    def test_reference_helper_round_trips_fractional_milliseconds(self):
+        stamp = run.trace_agreement(b"ts=1795262400.000900123\n", 1_795_262_400_000)
+        stream = io.StringIO()
+        with patch.object(run.sys, "platform", "linux"), \
+                patch.object(run, "reference_request", return_value=stamp), \
+                contextlib.redirect_stdout(stream):
+            self.assertEqual(run.main(["--reference", "1"]), 0)
+        self.assertEqual(stream.getvalue(), "1795262400000.900123\n")
+        with patch.object(run, "run_helper", return_value=(0, stream.getvalue().encode("ascii"))), \
+                patch.object(run, "emit"):
+            self.assertEqual(run.reference_at(1, "mock-stage", 5), stamp)
+
+    def test_cross_origin_agreement_is_required_at_sub_millisecond_boundary(self):
         timestamp = 1_795_262_400_000
-        self.assertEqual(run.origin_agreement(timestamp, timestamp + 5000), 5000)
         founder = Mock()
         founder.evidence.return_value.checkpoint_ms = timestamp
-        trace = run.trace_agreement(b"ts=1795262407\n", timestamp + 5000)
-        with patch.object(run, "reference_at", side_effect=[timestamp, trace]), \
-                patch.object(run, "emit"):
-            with self.assertRaisesRegex(run.Failure, "utc-origin-mismatch"):
-                run.utc_witness(founder, "mock-stage", 5)
+        for fraction in (b"", b".000001", b".000900"):
+            trace = run.trace_agreement(b"ts=1795262405" + fraction + b"\n", timestamp + 5000)
+            with self.subTest(fraction=fraction), \
+                    patch.object(run, "reference_at", side_effect=[timestamp, trace]), \
+                    patch.object(run, "emit"):
+                if fraction:
+                    with self.assertRaisesRegex(run.Failure, "utc-origin-mismatch"):
+                        run.utc_witness(founder, "mock-stage", 5)
+                else:
+                    self.assertEqual(run.utc_witness(founder, "mock-stage", 5), (timestamp, timestamp))
 
-    def test_local_bracket_checks_trace_even_when_cloudflare_date_fits(self):
+    def test_local_bracket_checks_sub_millisecond_trace_when_cloudflare_date_fits(self):
         checked = 1_795_262_400_000
-        run.utc_bounds(checked, checked, checked + 28_000)
-        trace = run.trace_agreement(b"ts=1795262428.001\n", checked + 28_000)
+        date = checked + 28_000
+        self.assertEqual(run.utc_bounds(checked, checked, date), (-30_000, -26_000))
         founder = Mock()
         founder.evidence.return_value.checkpoint_ms = checked
-        with patch.object(run, "reference_at", side_effect=[checked, trace]), patch.object(run, "emit"):
-            with self.assertRaisesRegex(run.Failure, "utc-outside-premise"):
-                run.utc_witness(founder, "mock-stage", 5)
+        for fraction in (b"", b".000001", b".000900"):
+            trace = run.trace_agreement(b"ts=1795262428" + fraction + b"\n", date)
+            with self.subTest(fraction=fraction), \
+                    patch.object(run, "reference_at", side_effect=[date, trace]), patch.object(run, "emit"):
+                if fraction:
+                    with self.assertRaisesRegex(run.Failure, "utc-outside-premise"):
+                        run.utc_witness(founder, "mock-stage", 5)
+                else:
+                    self.assertEqual(run.utc_witness(founder, "mock-stage", 5), (checked, checked))
 
     def test_preflight_failure_stops_before_telemetry_without_retry(self):
         with patch.object(run, "qualified_source", return_value=("sha", "image", "run")), \

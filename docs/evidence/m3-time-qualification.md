@@ -69,13 +69,14 @@ identifiers. There are no redirects or retries. The origins receive routine
 HTTPS connection metadata, including the runner's public egress IP. The
 Cloudflare body is bounded to 1024 bytes. The harness reads only `ts=` from
 that body and requires it to agree with the Date header within 2 s.
-Google's Date and Cloudflare's millisecond timestamp must agree within
+Google's Date and Cloudflare's exact trace timestamp must agree within
 5 s. Each response must have the exact HTTP/1.1 status line and one Date.
 The trace requires one Content-Length and the client refuses transfer
-encoding. A missing, cached, ambiguous, failed or over-budget sample ends
-the qualification. Both reference values must fit the ±30 s premise
-within the local checked bracket, using ±1 s for resolution and ±1 s for
-assumed source accuracy.
+encoding and bytes after the declared body. A missing, cached, ambiguous,
+failed or over-budget sample ends the qualification. Both reference
+values must fit the ±30 s premise within the local checked bracket, using
+±1 s for resolution and ±1 s for assumed source accuracy. Bounds are
+enforced at full precision before the artifact rounds offsets outward.
 
 Both sources and their agreement must pass a shared three-second preflight
 before Cargo builds. Read-only `chronyc tracking` or `adjtimex --print`

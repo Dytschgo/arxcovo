@@ -174,6 +174,7 @@ it against that copy. Busy or stale publication, a changing generation,
 poison or validation failure withholds evidence. The checkpoint holds
 neither the production clock mutex nor the node admission lock and
 writes no clock state. It cannot advance the clock or latch a failure.
+The coordinator approved this read-only checkpoint seam in `checked_clock.rs` as an A16 extension.
 
 The harness copies each bounded SQLite image from one verified no-follow
 descriptor while holding SQLite's shared rollback-journal lock range.
@@ -200,9 +201,10 @@ The coordinator approved one verified HTTPS HEAD to
 certificate against its host name or IP address. It reads at most 1024
 bytes of the trace response, using only its `ts=` field and the Date
 header. Both must be present and agree within 2 s. The Google Date and
-Cloudflare millisecond timestamp must agree within 5 s. The client
+the exact Cloudflare timestamp must agree within 5 s. The client
 requires exact HTTP/1.1 status lines, a single Date per response and one
-unambiguous Content-Length for the trace. Transfer-Encoding is refused.
+unambiguous Content-Length for the trace. The client refuses
+Transfer-Encoding and any bytes after the declared trace body.
 Every request uses a generic User-Agent and sends
 no repository, owner or personal data, cookies, credentials or query
 parameters. The client follows no redirects and performs no retries.
@@ -212,9 +214,10 @@ runner's public egress IP.
 Each reference needs a bounded, unambiguous fresh response. An Age header or an
 indication of caching fails the check. Within each before/after bracket
 from the retained issuer's checked clock, the complete offset range must
-fit ±30 s. Both the Google Date and the millisecond trace timestamp use
+fit ±30 s. Both the Google Date and the exact trace timestamp use
 the conservative allowance of ±1 s for Date resolution and ±1 s for
-source accuracy. The five checkpoints cover
+source accuracy. Comparisons retain sub-millisecond precision and the
+artifact rounds reported offset bounds outward. The five checkpoints cover
 the initial Mint and Query, both sides of the dwell, the late refusal and
 the fresh positive. The qualification artifacts contain relative clock
 readings and reference offset bounds. A shared three-second W1b preflight

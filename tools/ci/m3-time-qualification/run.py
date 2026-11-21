@@ -4,6 +4,7 @@ import email.utils
 import hashlib
 import importlib.util
 import json
+from math import ceil, floor
 import os
 from pathlib import Path
 import re
@@ -373,25 +374,25 @@ def trace_agreement(body, date_ms):
     matches = [line[3:] for line in body.splitlines() if line.startswith(b"ts=")]
     require(len(matches) == 1 and re.fullmatch(rb"[0-9]{1,12}(?:\.[0-9]{1,9})?", matches[0]),
             "utc-trace-timestamp")
-    trace_ms = Decimal(matches[0].decode("ascii")) * 1000
+    trace_ms = Decimal(matches[0].decode("ascii")).scaleb(3)
     require(abs(trace_ms - date_ms) <= 2000, "utc-trace-date-mismatch")
-    return int(trace_ms)
+    return trace_ms
 
 
 def origin_agreement(first, second):
     delta = abs(first - second)
     require(delta <= 5000, "utc-origin-mismatch")
-    return delta
+    return ceil(delta)
 
 
 def utc_bounds(before, after, reference):
-    require(type(reference) is int and 0 < reference <= MAX_TIME
+    require(type(reference) in (int, Decimal) and 0 < reference <= MAX_TIME
             and 0 < before <= after <= MAX_TIME and after - before <= 6000, "utc-bracket")
     # Conservatively apply Date resolution and source accuracy (each +/-1 s)
-    # to both references, including the millisecond trace timestamp.
+    # to both references, including the exact trace timestamp.
     low, high = before - (reference + 2000), after - (reference - 2000)
     require(low >= -SKEW and high <= SKEW, "utc-outside-premise")
-    return low, high
+    return floor(low), ceil(high)
 
 
 def reference_response(response, expected):
@@ -418,6 +419,7 @@ def reference_response(response, expected):
     require(size <= TRACE_LIMIT, "utc-trace-bound")
     body = response.read(size)
     require(len(body) == size, "utc-trace-bound")
+    require(response.read(1) == b"", "utc-trace-trailing-data")
     return trace_agreement(body, date_ms)
 
 
@@ -686,10 +688,12 @@ def reference_at(index, stage, deadline):
     emit("utc-source", stage=stage, source=ORIGINS[index][0])
     code, data = run_helper(
         ["/usr/bin/python3", "-I", "-B", str(SCRIPT), "--reference", str(index)],
-        deadline, 4, limit=16,
+        deadline, 4, limit=23,
     )
-    require(code == 0 and re.fullmatch(rb"[0-9]{1,15}\n", data), "utc-reference-failed")
-    return int(data)
+    require(code == 0 and re.fullmatch(rb"[0-9]{1,15}(?:\.[0-9]{1,6})?\n", data), "utc-reference-failed")
+    reference = Decimal(data.decode("ascii").strip())
+    require(0 < reference <= MAX_TIME, "utc-reference-failed")
+    return reference
 
 
 def utc_preflight(deadline):
@@ -1065,7 +1069,7 @@ def main(args):
         return 0
     if len(args) == 2 and args[0] == "--reference":
         require(args[1] in ("0", "1") and sys.platform == "linux", "reference-helper")
-        print(reference_request(int(args[1])))
+        print(format(reference_request(int(args[1])), "f"))
         return 0
     if args and args[0] == "--staged":
         try:
