@@ -18,7 +18,7 @@ merged, as listed under "Merged this session".
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below);
   a second, the 13d pre-push review 3, fell back to an Opus 5.5/high reviewer.
-- **Main:** `be64f8db` (PR229); push CI 44896780073 recorded in the next checkpoint.
+- **Main:** `be64f8db` (PR229); push CI 44896780073 was in progress at this checkpoint.
   `e0f3ddc1` (PR228) push CI 44877277057 green; `851472bc` (PR227) 44876064810 green.
   `5f6fcef4` (PR225) push CI 44875428857 green; `ddc950db` (PR224) 44873617369 green;
   `f3c4b149` (PR226) 44872586418 green; `79ad98b2` (PR223) 44868467745 green;
@@ -82,7 +82,8 @@ merged, as listed under "Merged this session".
   `5f6fcef4` (13c), PR227 `851472bc` (CI gate test in one pwsh process), PR228 `e0f3ddc1`
   (docs), PR229 `be64f8db` (13d, daemon activation). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
-  merge; green main was rechecked immediately before each merge except the three red-main repairs:
+  merge; the parent main runs for PR228 and PR229 had already passed. Through PR227, green main was
+  rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
   push run 44608721122 restored green), PR206 (main `c10fff18` red; push run
   44800339696 restored green) and PR209 (main `9bfaedb5` red; push run 44813492071
@@ -752,31 +753,38 @@ merged, as listed under "Merged this session".
     exhausted; builder 4 ended its last round at 1/2.
   - **Counting rulings (coordinator).** The static Windows quarantine gate is lint-class
     and exempt; one E0277 defect seen on two platforms at the same revision counts once;
-    the Windows temp-dir ACL preflight is environment setup; from builder 4 onward a
-    one-line, compile-only test adaptation to an API change is trivial-class like a
-    missing import (two earlier compile errors, E0277 and E0283, had been counted).
+    the Windows temp-dir ACL preflight is environment setup; the coordinator
+    classified builder 4's stale test-only `.is_some()` call after the API change as a
+    one-line mechanical fix and exempted it. The earlier E0277 and E0283 failures remained
+    counted.
   - **Reviews before push.** Pre-push review 3 by Sol was provider-blocked; the Opus
-    fallback (SHA256 `a6a37846…f70c`) confirmed every earlier finding fixed and held on one
-    launcher P1: hosted ubuntu-26.04 has a NO-CARRIER `docker0`, which made the address
-    selection ambiguous. Re-check 4 PASS (SHA256 `e7ff72fb…d919`): default-route source on a
+    fallback (SHA256 `a6a37846…f70c`) confirmed the earlier blocking findings were
+    resolved and held on one launcher P1. The address check would treat the expected
+    NO-CARRIER `docker0` on hosted ubuntu-26.04 as a second eligible private address. Re-check 4 PASS (SHA256 `e7ff72fb…d919`): default-route source on a
     carrier link, runner facts passed explicitly through `sudo env`, retained learner lock
     recorded distinctly.
-  - **Hosted CI.** Run 44892006978 failed two existing Linux issuer-readiness tests broken
-    by the issuer-deferral change (log SHA256 `85145327…fecf`; counted); the fixtures now supply
-    the quorum epoch, and re-check 5 PASS (SHA256 `7f3774a0…dca1`) traced the production path
-    for C13's surviving issuers. Run 44894368929 passed all 1,029 workspace tests but the
+  - **Hosted CI.** Run 44892006978 failed two existing Linux issuer-readiness tests after the
+    new epoch bracket tried to read a live Raft handle from fixtures without one (log
+    SHA256 `85145327…fecf`, counted in the launcher round). The fixtures already supplied a
+    synthetic quorum epoch. They now inject separate epoch observations before and after
+    the guarded publication proof. Re-check 5 PASS (SHA256 `7f3774a0…dca1`) traced the production path
+    for C13's surviving issuers. Run 44894368929 passed all 1,029 Ubuntu workspace tests selected
+    by nextest, with 27 skipped, but the
     #199 custody qualification refused with MissingOracle (log SHA256 `5f35042d…bff7`): its
     parser allowed three digits for libtest's "filtered out" count, which 13d raised from
     980 to 1,005. This pre-existing parser defect was not counted; `e2799079` accepts four
     digits with tests. Neither failed run reached the C13 step.
-  - **C13 (single grant, spent once, passed)** in run 44895687254 (log SHA256 `86e67212…f9cd`):
+  - **C13 passed on PR #229** in run 44895687254 (log SHA256 `86e67212…f9cd`):
     starts 6, closes 6, Found 1, owner Mint 3, AnchorQuery 3, Redeem 3, admissions 2,
     AddNodes 2, joint 1, flatten 1, CA transfers 2, enrollment proposals 7; each original
     node restarted once and recovered node 3 issued node 4's enrollment after founder
-    close; 6 of 6 processes and 93 of 93 helpers reaped; 8 disposable roles removed.
+    close; 6 of 6 processes and 93 of 93 helpers reaped; four disposable users and four groups removed. The 13d grant covered one hosted C13
+    case; once merged, C13 is a standing Ubuntu Rust-job step like C9–C12. The workflow ran
+    it again on main push 44896780073 and docs PR #230 run 44896977694, and both executions
+    passed.
     Exact-head review PASS (`D:/Temp/arx-pr229-review/review.md`, SHA256 `0089737d…7241`),
     agent-review status 59546396014; all gates green. Residual P3: C13 stages the
-    debug-profile `arxd` under A6, not a release-shaped binary. Engine Sol 3/3 and Opus 0/2
+    production `arxd` binary built with the existing CI debug profile under A6. Engine Sol 3/3 and Opus 0/2
     unchanged.
 - **13e and 14a (in progress):** the plan's proposed 13e grant (P1 first-error-preserving
   owned close; one J4 hosted-Linux lost-reply case) and 14a grant (preflight-gated Linux
