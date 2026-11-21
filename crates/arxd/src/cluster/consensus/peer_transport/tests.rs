@@ -6136,7 +6136,7 @@ mod issuer_refusals {
                 sample,
                 clock,
             );
-            job.set_receiver_fixture_history(slot, live);
+            job.set_receiver_fixture_history(slot, live, &sm).await;
             assert!(base.join("history/strict").is_file());
             let fault = match case {
                 "temp-sync" => Some(TestFault::FileSync),

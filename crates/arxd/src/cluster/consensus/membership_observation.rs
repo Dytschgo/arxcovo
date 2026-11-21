@@ -1110,32 +1110,42 @@ mod issuer_proof {
     }
 
     impl ConsensusNode {
-        pub(in crate::cluster::consensus) async fn issuer_offer(
+        pub(in crate::cluster::consensus) fn issuer_offer(
             &self,
             cluster: ClusterId,
             root: [u8; 32],
             target: NodeId,
-        ) -> Result<Offer, MembershipReadError> {
+        ) -> Result<
+            impl std::future::Future<Output = Result<Offer, MembershipReadError>> + use<>,
+            MembershipReadError,
+        > {
             let raft = self.raft.as_ref().ok_or(MembershipReadError::Unavailable)?;
             let before = Sample::capture(raft)?;
+            let raft = raft.clone();
             let sample = before.clone();
+            let leader = self.id;
+            if before.current_leader != Some(leader) {
+                return Err(MembershipReadError::NotLeader);
+            }
             let sender = NodeId::new(self.id).ok_or(MembershipReadError::PeerRefused)?;
-            let (epoch, outcome) = self
-                .fresh_read(move |store| {
+            let read = self
+                .start_fresh_read(move |store| {
                     Ok(locked(store, &sample, sender.get())
                         .and_then(|view| offer(store, &view, cluster, root, sender, target)))
                 })
-                .await
-                .map_err(|error| match error {
-                    ReadError::Busy => MembershipReadError::Busy,
-                    ReadError::NotLeader => MembershipReadError::NotLeader,
-                    _ => MembershipReadError::Unavailable,
-                })?;
-            let offer = outcome?;
-            if offer.claim.epoch != epoch || Sample::capture(raft)? != before {
-                return Err(MembershipReadError::RetryLater);
-            }
-            Ok(offer)
+                .map_err(issuer_read_error)?;
+            Ok(async move {
+                let (epoch, outcome) = read.await.map_err(issuer_read_error)?;
+                let offer = outcome?;
+                let after = Sample::capture(&raft)?;
+                if after.current_leader != Some(leader) {
+                    return Err(MembershipReadError::NotLeader);
+                }
+                if offer.claim.epoch != epoch || after != before {
+                    return Err(MembershipReadError::RetryLater);
+                }
+                Ok(offer)
+            })
         }
 
         pub(in crate::cluster::consensus) fn recheck_issuer_offer(
@@ -1153,7 +1163,7 @@ mod issuer_proof {
                     claim.receiver.0,
                 )?;
                 if current != previous {
-                    return Err(MembershipReadError::RetryLater);
+                    return Err(MembershipReadError::PeerRefused);
                 }
                 Ok(())
             })
@@ -1194,13 +1204,28 @@ mod issuer_proof {
             let unavailable = MembershipReadError::Unavailable;
             let raft = self.raft.as_ref().ok_or(unavailable)?;
             let before = Sample::capture(raft)?;
+            if before.current_leader != Some(leader) {
+                return Err(MembershipReadError::NotLeader);
+            }
             let store = acquire(self)?;
             let view = locked(&store, &before, leader)?;
             let result = inspect(&store, &view)?;
-            if Sample::capture(raft)? != before {
+            let after = Sample::capture(raft)?;
+            if after.current_leader != Some(leader) {
+                return Err(MembershipReadError::NotLeader);
+            }
+            if after != before {
                 return Err(MembershipReadError::RetryLater);
             }
             Ok(result)
+        }
+    }
+
+    fn issuer_read_error(error: ReadError) -> MembershipReadError {
+        match error {
+            ReadError::Busy => MembershipReadError::Busy,
+            ReadError::NotLeader => MembershipReadError::NotLeader,
+            _ => MembershipReadError::Unavailable,
         }
     }
     #[cfg(test)]

@@ -24,6 +24,13 @@ pub(super) enum ActivationError {
     Refused,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AvailabilityError {
+    Busy,
+    NotReady,
+    Refused,
+}
+
 impl From<crate::cluster::consensus::ReadError> for ActivationError {
     fn from(error: crate::cluster::consensus::ReadError) -> Self {
         use crate::cluster::consensus::ReadError;
@@ -131,11 +138,19 @@ impl ReadyIssuer {
     // This is a local refusal check. Only the existing enroll guards establish
     // proposal and issuance authority.
     pub(super) fn available(&self, node: &ConsensusNode) -> Result<(), Refused> {
-        self.activation_available(node).map_err(|_| Refused)
+        self.availability(node).map_err(|_| Refused)
     }
 
     fn activation_available(&self, node: &ConsensusNode) -> Result<(), ActivationError> {
-        use ActivationError::{Deferred, Refused};
+        self.availability(node).map_err(|error| match error {
+            AvailabilityError::Busy | AvailabilityError::NotReady => ActivationError::Deferred,
+            AvailabilityError::Refused => ActivationError::Refused,
+        })
+    }
+
+    pub(super) fn availability(&self, node: &ConsensusNode) -> Result<(), AvailabilityError> {
+        use AvailabilityError::{Busy, NotReady, Refused};
+        use membership_observation::MembershipReadError;
         let raft = node.raft.as_ref().ok_or(Refused)?;
         let metrics = raft.metrics();
         let leader = {
@@ -152,16 +167,20 @@ impl ReadyIssuer {
             return Err(Refused);
         }
         if !leader {
-            return Err(Deferred);
+            return Err(NotReady);
         }
         if let Some((voter, installed_at)) = self.promoted {
             return node
                 .issuer_voter(self.cluster, voter, installed_at, true)
-                .map_err(Into::into);
+                .map_err(|error| match error {
+                    MembershipReadError::Busy => Busy,
+                    MembershipReadError::NotLeader | MembershipReadError::RetryLater => NotReady,
+                    MembershipReadError::Unavailable | MembershipReadError::PeerRefused => Refused,
+                });
         }
         let sm = node.sm.as_ref().ok_or(Refused)?;
         let store = sm.0.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => Deferred,
+            std::sync::TryLockError::WouldBlock => Busy,
             std::sync::TryLockError::Poisoned(_) => Refused,
         })?;
         if store.is_poisoned() {
@@ -201,20 +220,41 @@ struct Issuer {
 }
 
 impl Issuer {
-    fn admit(&self, deadline: Instant) -> Result<MutexGuard<'_, ConsensusNode>, Refused> {
-        // No queue behind another dispatch or the retained node's owner.
-        let node = self.node.try_lock().map_err(|_| Refused)?;
-        self.ready.available(&node)?;
-        if Instant::now() >= deadline {
-            return Err(Refused);
-        }
-        Ok(node)
+    async fn admit(&self, deadline: Instant) -> Result<MutexGuard<'_, ConsensusNode>, Refused> {
+        wait_for_available(&self.node, None, deadline, |node| {
+            self.ready.availability(node)
+        })
+        .await
     }
+}
+
+async fn wait_for_available<'a, N>(
+    node: &'a tokio::sync::Mutex<N>,
+    mut held: Option<MutexGuard<'a, N>>,
+    deadline: Instant,
+    check: impl Fn(&N) -> Result<(), AvailabilityError>,
+) -> Result<MutexGuard<'a, N>, Refused> {
+    let retry_until = (Instant::now() + peer_registry::STORE_WAIT).min(deadline);
+    while Instant::now() < retry_until {
+        // There is no queue behind a retained node owner. Drop the node
+        // before yielding when either it or the applied store is busy.
+        if let Some(node) = held.take().or_else(|| node.try_lock().ok()) {
+            match check(&node) {
+                Ok(()) if Instant::now() < retry_until => return Ok(node),
+                Err(AvailabilityError::Busy) => {}
+                _ => return Err(Refused),
+            }
+        }
+        if !peer_registry::poll_store_until(retry_until).await {
+            break;
+        }
+    }
+    Err(Refused)
 }
 
 impl Backend for Issuer {
     async fn anchor(&self, query: Query, deadline: Instant) -> Result<BoundVoters, Refused> {
-        let node = self.admit(deadline)?;
+        let node = self.admit(deadline).await?;
         if let Some(exchange) = &self.exchange {
             ExchangeCounts::count(&exchange.anchors);
         }
@@ -242,13 +282,18 @@ impl Backend for Issuer {
         if !voters.contains(self.ready.member(), self.ready.key) {
             return Err(Refused);
         }
-        self.ready.available(&node)?;
+        drop(
+            wait_for_available(&self.node, Some(node), deadline, |node| {
+                self.ready.availability(node)
+            })
+            .await?,
+        );
         Ok(voters)
     }
 
     async fn redeem(&self, request: Redeem, deadline: Instant) -> Result<Reply, Refused> {
         let (input, csr) = request.into_issuer();
-        let node = self.admit(deadline)?;
+        let node = self.admit(deadline).await?;
         if let Some(exchange) = &self.exchange {
             ExchangeCounts::count(&exchange.redeems);
         }
@@ -273,6 +318,67 @@ impl Backend for Issuer {
                 .await;
         }
         result.map(Reply::issued).map_err(|_| Refused)
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use std::sync::{Mutex, TryLockError};
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_retries_a_busy_store_and_releases_the_node_between_attempts() {
+        let node = tokio::sync::Mutex::new(());
+        let store = Mutex::new(());
+        let deadline = Instant::now() + peer_registry::STORE_WAIT;
+        let check = |_: &()| {
+            store.try_lock().map(drop).map_err(|error| match error {
+                TryLockError::WouldBlock => AvailabilityError::Busy,
+                TryLockError::Poisoned(_) => AvailabilityError::Refused,
+            })
+        };
+        let mut query_recheck = std::pin::pin!(wait_for_available(
+            &node,
+            Some(node.try_lock().unwrap()),
+            deadline,
+            check,
+        ));
+        {
+            let _store_guard = store.lock().unwrap();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(query_recheck.as_mut(), &mut cx).is_pending());
+            assert!(node.try_lock().is_ok());
+        }
+        assert!(query_recheck.await.is_ok());
+
+        let deadline = Instant::now() + peer_registry::STORE_WAIT;
+        let mut admission = std::pin::pin!(wait_for_available(&node, None, deadline, check));
+        {
+            let _node_guard = node.try_lock().unwrap();
+            assert!(futures_util::poll!(&mut admission).is_pending());
+        }
+        assert!(admission.await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_refuses_on_leadership_loss_or_the_outer_deadline() {
+        let node = tokio::sync::Mutex::new(());
+        let deadline = Instant::now() + std::time::Duration::from_millis(2);
+        let mut not_leader = std::pin::pin!(wait_for_available(&node, None, deadline, |_| {
+            Err(AvailabilityError::NotReady)
+        }));
+        assert!(matches!(
+            futures_util::poll!(&mut not_leader),
+            std::task::Poll::Ready(Err(_))
+        ));
+        let held = node.try_lock().unwrap();
+        let mut expired = std::pin::pin!(wait_for_available(&node, None, deadline, |_| {
+            panic!("availability queried at expiry")
+        }));
+        assert!(futures_util::poll!(&mut expired).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        drop(held);
+        assert!(expired.await.is_err());
     }
 }
 

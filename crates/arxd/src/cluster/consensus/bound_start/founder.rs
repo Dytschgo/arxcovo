@@ -722,41 +722,89 @@ pub(super) mod linux {
                 .is_some_and(|node| node == address))
     }
 
+    use membership_observation::MembershipReadError;
+    use peer_transport::Refusal as TransferRefusal;
+
+    fn retryable_offer(error: MembershipReadError) -> bool {
+        matches!(
+            error,
+            MembershipReadError::Busy | MembershipReadError::RetryLater
+        )
+    }
+
+    type TransferIdentity = (ClusterId, [u8; 32], KeyDigest);
+    type TransferNode = Arc<tokio::sync::Mutex<ConsensusNode>>;
+
+    fn transfer_binding(job: &Job) -> Result<(TransferNode, TransferIdentity), TransferRefusal> {
+        use TransferRefusal as R;
+        let state = job.state.lock().map_err(|_| R::Identity)?;
+        if state.close_requested || state.status != Status::FounderReady {
+            return Err(R::Closed);
+        }
+        let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
+        Ok((
+            state.node.clone().ok_or(R::NotReady)?,
+            ready.transfer_identity(),
+        ))
+    }
+
     async fn retained_issuer(
         job: &Job,
         target: NodeId,
     ) -> Result<
         (
             crate::cluster::consensus::issuer_transfer::Offer,
-            Arc<tokio::sync::Mutex<ConsensusNode>>,
+            TransferNode,
         ),
         peer_transport::Refusal,
     > {
         use peer_transport::Refusal as R;
-        let (node, cluster, root, key) = {
-            let state = job.state();
-            if state.close_requested || state.status != Status::FounderReady {
-                return Err(R::Closed);
+        let (node, identity @ (cluster, root, key)) = transfer_binding(job)?;
+        let retry_until = Instant::now() + peer_registry::STORE_WAIT;
+        let mut retrying = false;
+        loop {
+            let (live, current) = transfer_binding(job)?;
+            if !Arc::ptr_eq(&node, &live) || identity != current {
+                return Err(R::Identity);
             }
-            let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
-            let (cluster, root, key) = ready.transfer_identity();
-            (state.node.clone().ok_or(R::NotReady)?, cluster, root, key)
-        };
-        let offer = {
-            let node = node.try_lock().map_err(|_| R::Busy)?;
-            node.issuer_offer(cluster, root, target)
-                .await
-                .map_err(|error| {
-                    #[cfg(test)]
-                    eprintln!("issuer transfer fresh membership refused: {error:?}");
-                    let _ = error;
-                    R::Identity
-                })?
-        };
-        if offer.claim.sender.1 != *key.as_bytes() {
-            return Err(R::Identity);
+            let read = node.try_lock().map(|node| {
+                if retrying && Instant::now() >= retry_until {
+                    return Err(MembershipReadError::Unavailable);
+                }
+                node.issuer_offer(cluster, root, target)
+            });
+            let refusal = match read {
+                Ok(Ok(read)) => {
+                    // Once admitted, the fresh read keeps its existing budget.
+                    match read.await {
+                        Ok(offer) => {
+                            let (live, current) = transfer_binding(job)?;
+                            if offer.claim.sender.1 != *key.as_bytes()
+                                || !Arc::ptr_eq(&node, &live)
+                                || identity != current
+                            {
+                                return Err(R::Identity);
+                            }
+                            return Ok((offer, node));
+                        }
+                        Err(error) if retryable_offer(error) => R::Identity,
+                        Err(error) => {
+                            #[cfg(test)]
+                            eprintln!("issuer transfer fresh membership refused: {error:?}");
+                            let _ = error;
+                            return Err(R::Identity);
+                        }
+                    }
+                }
+                Ok(Err(error)) if retryable_offer(error) => R::Identity,
+                Ok(Err(_)) => return Err(R::Identity),
+                Err(_) => R::Busy,
+            };
+            if !peer_registry::poll_store_until(retry_until).await {
+                return Err(refusal);
+            }
+            retrying = true;
         }
-        Ok((offer, node))
     }
 
     pub(super) async fn voter_offer(
@@ -771,7 +819,7 @@ pub(super) mod linux {
     > {
         use peer_transport::Refusal as R;
         let (offer, _) = retained_issuer(job, target).await?;
-        let state = job.state();
+        let state = job.state.lock().map_err(|_| R::Identity)?;
         if state.close_requested {
             return Err(R::Closed);
         }
@@ -790,11 +838,80 @@ pub(super) mod linux {
         if current != offer {
             return Err(R::Identity);
         }
-        let node = node.try_lock().map_err(|_| R::Busy)?;
-        let state = job.state();
+        seal_with_retry(
+            &node,
+            || check_transfer_open(job),
+            |node| seal_once(job, node, offer, key, context),
+        )
+        .await
+    }
+
+    enum SealError {
+        Retry(TransferRefusal),
+        Refused(TransferRefusal),
+    }
+
+    impl From<TransferRefusal> for SealError {
+        fn from(error: TransferRefusal) -> Self {
+            Self::Refused(error)
+        }
+    }
+
+    fn check_transfer_open(job: &Job) -> Result<(), TransferRefusal> {
+        let state = job.state.lock().map_err(|_| TransferRefusal::Identity)?;
+        if state.close_requested || state.status != Status::FounderReady {
+            return Err(TransferRefusal::Closed);
+        }
+        Ok(())
+    }
+
+    async fn seal_with_retry<N, T>(
+        node: &tokio::sync::Mutex<N>,
+        check_open: impl Fn() -> Result<(), TransferRefusal>,
+        seal: impl Fn(&N) -> Result<T, SealError>,
+    ) -> Result<T, TransferRefusal> {
+        let retry_until = Instant::now() + peer_registry::STORE_WAIT;
+        loop {
+            check_open()?;
+            let refusal = match node.try_lock() {
+                Ok(node) => match seal(&node) {
+                    Ok(sealed) => return Ok(sealed),
+                    Err(SealError::Refused(error)) => return Err(error),
+                    Err(SealError::Retry(error)) => error,
+                },
+                Err(_) => TransferRefusal::Busy,
+            };
+            if !peer_registry::poll_store_until(retry_until).await {
+                return Err(refusal);
+            }
+        }
+    }
+
+    fn seal_once(
+        job: &Job,
+        node: &ConsensusNode,
+        offer: issuer_transfer::Offer,
+        key: &[u8; 32],
+        context: &[u8],
+    ) -> Result<Vec<u8>, SealError> {
+        use TransferRefusal as R;
+        let state = job.state.lock().map_err(|_| R::Identity)?;
+        if state.close_requested || state.status != Status::FounderReady {
+            return Err(R::Closed.into());
+        }
         let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
-        if state.close_requested || ready.available(&node).is_err() {
-            return Err(R::Identity);
+        let (cluster, root, sender_key) = ready.transfer_identity();
+        if (cluster, root, *sender_key.as_bytes())
+            != (offer.claim.cluster, offer.claim.root, offer.claim.sender.1)
+        {
+            return Err(R::Identity.into());
+        }
+        match ready.availability(node) {
+            Ok(()) => {}
+            Err(enrollment_ingress::AvailabilityError::Busy) => {
+                return Err(SealError::Retry(R::Identity));
+            }
+            Err(_) => return Err(R::Identity.into()),
         }
         let custody = state
             .founder
@@ -805,7 +922,13 @@ pub(super) mod linux {
         let sealed = custody
             .seal_for_voter(cluster, root, now, key, context)
             .map_err(|_| R::Identity)?;
-        node.recheck_issuer_offer(offer).map_err(|_| R::Identity)?;
+        node.recheck_issuer_offer(offer).map_err(|error| {
+            if retryable_offer(error) {
+                SealError::Retry(R::Identity)
+            } else {
+                R::Identity.into()
+            }
+        })?;
         Ok(sealed)
     }
 
@@ -823,6 +946,83 @@ pub(super) mod linux {
     mod tests {
         use super::*;
         include!("founder_tests.rs");
+
+        #[tokio::test(start_paused = true)]
+        async fn sealing_waits_for_node_and_apply_contention_without_retaining_the_node() {
+            let node = tokio::sync::Mutex::new(());
+            let mut seal = std::pin::pin!(seal_with_retry(&node, || Ok(()), |_| Ok(42)));
+            {
+                let _node = node.try_lock().unwrap();
+                assert!(futures_util::poll!(&mut seal).is_pending());
+            }
+            assert_eq!(seal.await, Ok(42));
+
+            let store = std::sync::Mutex::new(());
+            let mut seal = std::pin::pin!(seal_with_retry(
+                &node,
+                || Ok(()),
+                |_| match store.try_lock() {
+                    Ok(_store) => Ok(42),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        Err(SealError::Retry(TransferRefusal::Identity))
+                    }
+                    Err(_) => Err(TransferRefusal::Identity.into()),
+                },
+            ));
+            {
+                let _store = store.lock().unwrap();
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(seal.as_mut(), &mut cx).is_pending());
+                assert!(node.try_lock().is_ok());
+            }
+            assert_eq!(seal.await, Ok(42));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sealing_refuses_when_contention_outlasts_the_window_or_closure_wins() {
+            let node = tokio::sync::Mutex::new(());
+            let held = node.try_lock().unwrap();
+            let mut timed_out = std::pin::pin!(seal_with_retry(&node, || Ok(()), |_| Ok(())));
+            assert!(futures_util::poll!(&mut timed_out).is_pending());
+            tokio::time::advance(peer_registry::STORE_WAIT).await;
+            drop(held);
+            assert_eq!(timed_out.await, Err(TransferRefusal::Busy));
+
+            let job = Job::anchor();
+            job.state().status = Status::FounderReady;
+            let held = node.try_lock().unwrap();
+            let mut closing = std::pin::pin!(seal_with_retry(
+                &node,
+                || check_transfer_open(job),
+                |_| panic!("closed transfer sealed"),
+            ));
+            assert!(futures_util::poll!(&mut closing).is_pending());
+            job.state().close_requested = true;
+            drop(held);
+            assert_eq!(closing.await, Err::<(), _>(TransferRefusal::Closed));
+        }
+
+        #[test]
+        fn offer_refusals_are_terminal_for_poison_leadership_loss_and_mismatch() {
+            for terminal in [
+                MembershipReadError::Unavailable,
+                MembershipReadError::NotLeader,
+                MembershipReadError::PeerRefused,
+            ] {
+                assert!(!retryable_offer(terminal));
+            }
+            assert!(retryable_offer(MembershipReadError::Busy));
+            assert!(retryable_offer(MembershipReadError::RetryLater));
+            let job = Job::anchor();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _state = job.state.lock().unwrap();
+                    panic!("deliberate transfer state poison");
+                }))
+                .is_err()
+            );
+            assert_eq!(check_transfer_open(job), Err(TransferRefusal::Identity));
+        }
     }
 }
 
