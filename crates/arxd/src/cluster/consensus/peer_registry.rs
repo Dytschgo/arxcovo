@@ -1,11 +1,56 @@
-//! Local applied authorization without waiting for the store mutex.
+//! Local applied authorization. Inbound learner authorization can wait briefly for the store.
 //! Temporary ownership can run store destructors; this is not TLS task ownership.
 use super::adapter::SmAdapter;
 use crate::cluster::{
     enrollment::PeerRefusal,
     pki::verify::{Registry, VerifyRefusal},
 };
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    time::{Duration, Instant},
+};
+
+type AppliedStore = Mutex<super::StateStore>;
+type StoreLock<'a> = Result<MutexGuard<'a, super::StateStore>, VerifyRefusal>;
+
+fn try_applied_store(store: &AppliedStore) -> StoreLock<'_> {
+    store.try_lock().map_err(|_| VerifyRefusal::Unavailable)
+}
+
+fn lock_inbound_store(store: &AppliedStore) -> StoreLock<'_> {
+    wait_for_applied_store(store, Instant::now, std::thread::sleep)
+}
+
+// Two inbound checks can each spend at most 4 ms acquiring the store, a small
+// share of the 75 ms replication deadline. Sleep only after WouldBlock.
+const LEARNER_STORE_WAIT: Duration = Duration::from_millis(4);
+const LEARNER_STORE_POLL: Duration = Duration::from_micros(250);
+
+fn wait_for_applied_store(
+    store: &AppliedStore,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> StoreLock<'_> {
+    let deadline = now() + LEARNER_STORE_WAIT;
+    let mut waited = false;
+    loop {
+        match store.try_lock() {
+            Ok(guard) if !waited || now() < deadline => return Ok(guard),
+            Err(TryLockError::WouldBlock) if !store.is_poisoned() => {}
+            _ => return Err(VerifyRefusal::Unavailable),
+        }
+
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(VerifyRefusal::Unavailable);
+        }
+        pause(LEARNER_STORE_POLL.min(remaining));
+        if now() >= deadline {
+            return Err(VerifyRefusal::Unavailable);
+        }
+        waited = true;
+    }
+}
 
 pub(super) fn registry(sm: &SmAdapter) -> Registry {
     let store = Arc::downgrade(&sm.0);
@@ -43,7 +88,7 @@ pub(super) enum Phase {
 }
 
 pub(super) struct LearnerGate {
-    store: std::sync::Weak<std::sync::Mutex<super::StateStore>>,
+    store: std::sync::Weak<AppliedStore>,
     identity: Arc<crate::cluster::join_receipt::ExpectedIdentity>,
     address: std::net::SocketAddr,
     clock: Arc<dyn super::checked_clock::CheckedClock>,
@@ -79,15 +124,16 @@ impl LearnerGate {
     }
 
     pub(super) fn phase(&self) -> Result<Phase, VerifyRefusal> {
-        self.observe(|_, phase| Ok(phase))
+        self.observe(try_applied_store, |_, phase| Ok(phase))
     }
 
     fn observe<T>(
         &self,
+        acquire: impl for<'a> FnOnce(&'a AppliedStore) -> StoreLock<'a>,
         f: impl FnOnce(&super::StateStore, Phase) -> Result<T, VerifyRefusal>,
     ) -> Result<T, VerifyRefusal> {
         let store = self.store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
-        let store = store.try_lock().map_err(|_| VerifyRefusal::Unavailable)?;
+        let store = acquire(&store)?;
         if store.is_poisoned() || self.clock.sample_ms().is_err() {
             return Err(VerifyRefusal::Unavailable);
         }
@@ -123,7 +169,9 @@ impl LearnerGate {
     pub(super) fn admission_progress(
         &self,
     ) -> Result<(Phase, Option<super::LogPos>), VerifyRefusal> {
-        self.observe(|store, phase| Ok((phase, store.applied())))
+        self.observe(try_applied_store, |store, phase| {
+            Ok((phase, store.applied()))
+        })
     }
 
     pub(super) fn admission_anchor(
@@ -150,7 +198,8 @@ impl LearnerGate {
         if cluster != self.identity.cluster || self.admission_anchor()? != (node, key.as_bytes()) {
             return Err(VerifyRefusal::NotMember);
         }
-        self.authorize(cluster, node, key, true).map(|_| ())
+        self.authorize_with(cluster, node, key, true, try_applied_store)
+            .map(|_| ())
     }
 
     /// Applied history may pass E between observations. Check any copy of
@@ -175,7 +224,18 @@ impl LearnerGate {
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
-        self.observe(|store, phase| {
+        self.authorize_with(cluster, node, key, bootstrap_allowed, lock_inbound_store)
+    }
+
+    fn authorize_with(
+        &self,
+        cluster: crate::cluster::enrollment::ClusterId,
+        node: crate::cluster::enrollment::NodeId,
+        key: crate::cluster::enrollment::KeyDigest,
+        bootstrap_allowed: bool,
+        acquire: impl for<'a> FnOnce(&'a AppliedStore) -> StoreLock<'a>,
+    ) -> Result<Lane, VerifyRefusal> {
+        self.observe(acquire, |store, phase| {
             if phase == Phase::Refused || (phase == Phase::Bootstrap && !bootstrap_allowed) {
                 return Err(VerifyRefusal::Unavailable);
             }
@@ -243,11 +303,7 @@ mod tests {
         state_store::{Entry, Init, LogPos, StateStore},
     };
     use crate::service::application::tests::private_temp;
-    use std::{
-        sync::{Mutex, mpsc},
-        thread,
-        time::Duration,
-    };
+    use std::{cell::Cell, sync::mpsc, thread};
 
     fn node(n: u64) -> NodeId {
         NodeId::new(n).unwrap()
@@ -284,6 +340,71 @@ mod tests {
             .unwrap();
         assert!(matches!(result, Some(Outcome::Founded { replay: false })));
         (dir, SmAdapter(Arc::new(Mutex::new(store))))
+    }
+
+    fn learner_gate(sm: &SmAdapter) -> Arc<LearnerGate> {
+        use crate::cluster::join_receipt::{ExpectedIdentity, Origin};
+        LearnerGate::new(
+            sm,
+            Arc::new(ExpectedIdentity {
+                cluster: [1; 16],
+                node: node(2),
+                key: key(2),
+                ca: [0; 32],
+                origin: Origin::Redeem {
+                    term: 1,
+                    leader: 1,
+                    index: 1,
+                    anchors: vec![(1, *key(1).as_bytes())],
+                },
+            }),
+            "192.168.0.2:7001".parse().unwrap(),
+            Arc::new(super::super::checked_clock::HostClock::new(0)),
+            true,
+        )
+    }
+
+    #[test]
+    fn learner_inbound_authorizes_when_applied_store_is_released_within_budget() {
+        let (_dir, sm) = fixture();
+        let gate = learner_gate(&sm);
+        let mut held = Some(sm.0.lock().unwrap());
+        let clock = Cell::new(Instant::now());
+        // Drive only time and sleep. The first try-lock hits the held mutex,
+        // then the simulated pause releases it before the next attempt.
+        let result = gate.authorize_with([1; 16], node(1), key(1), true, |store| {
+            wait_for_applied_store(
+                store,
+                || clock.get(),
+                |delay| {
+                    clock.set(clock.get() + delay);
+                    drop(held.take().expect("one contention pause"));
+                },
+            )
+        });
+        assert_eq!(result, Ok(Lane::Strict));
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn learner_inbound_refuses_when_applied_store_outlasts_budget() {
+        let (_dir, sm) = fixture();
+        let gate = learner_gate(&sm);
+        let held = sm.0.lock().unwrap();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let result = gate.authorize_with([1; 16], node(1), key(1), true, |store| {
+            wait_for_applied_store(
+                store,
+                || clock.get(),
+                |delay| {
+                    clock.set(clock.get() + delay);
+                },
+            )
+        });
+        assert_eq!(result, Err(VerifyRefusal::Unavailable));
+        assert_eq!(clock.get().duration_since(start), Duration::from_millis(4));
+        drop(held);
     }
 
     #[test]
