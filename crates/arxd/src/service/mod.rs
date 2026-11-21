@@ -258,6 +258,15 @@ pub(crate) mod cluster_owner;
 #[cfg(target_os = "linux")]
 pub(crate) mod cluster_runtime;
 
+#[cfg(target_os = "linux")]
+mod cluster_build_executor;
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn cluster_broker_entry(args: &[std::ffi::OsString]) -> Option<i32> {
+    cluster_build_executor::entry(args)
+}
+
 pub fn cluster_entry(args: &[std::ffi::OsString]) -> Option<i32> {
     crate::cluster::consensus::activation::entry(args)
 }

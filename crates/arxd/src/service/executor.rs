@@ -14,6 +14,7 @@ use std::sync::{
 };
 
 #[derive(Clone, Deserialize)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub tool: Option<String>,
@@ -260,6 +261,29 @@ impl Execution {
         if let Some(inner) = Arc::get_mut(&mut execution) {
             inner.backend = backend;
         }
+        execution
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cluster_broker(
+        backend: Arc<dyn Executor>,
+        uid: u32,
+        gid: u32,
+        limit: u8,
+    ) -> Arc<Self> {
+        let mut execution = Self::native(
+            None,
+            Pin::new(
+                Platform::Linux,
+                uid.to_string(),
+                Some(gid),
+                Rights::Standard,
+            ),
+            Some(Rights::Standard),
+            usize::from(limit),
+        );
+        Arc::get_mut(&mut execution)
+            .expect("sole construction owner")
+            .backend = backend;
         execution
     }
     #[cfg(test)]
@@ -599,6 +623,7 @@ pub struct ToolVersion {
     pub version: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
 pub enum Creation {
     NotInvoked,
     ProvenNone,
