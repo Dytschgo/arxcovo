@@ -18,7 +18,7 @@ const STORE_POLL: Duration = Duration::from_micros(250);
 
 type AppliedStore = Weak<Mutex<super::StateStore>>;
 
-enum ObservationRefusal {
+pub(super) enum ObservationRefusal {
     StoreBusy,
     Refused(VerifyRefusal),
 }
@@ -59,7 +59,7 @@ fn observe_store<T>(
     observe(&guard)
 }
 
-async fn wait_for_store<T>(
+pub(super) async fn wait_for_store<T>(
     mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, VerifyRefusal> {
     let deadline = Instant::now() + STORE_WAIT;
@@ -226,6 +226,20 @@ impl LearnerGate {
                 }
             }
             f(store, *phase).map_err(Into::into)
+        })
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn inspect_strict<T>(
+        &self,
+        deadline: Option<Instant>,
+        inspect: impl FnOnce(&super::StateStore) -> T,
+    ) -> Result<T, ObservationRefusal> {
+        self.observe(deadline, |store, phase| {
+            if phase != Phase::Strict {
+                return Err(VerifyRefusal::NotMember);
+            }
+            Ok(inspect(store))
         })
     }
 
@@ -480,6 +494,44 @@ mod tests {
         );
         drop(release);
         holder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strict_observation_waits_for_store_and_guards_the_operation() {
+        use super::super::{BasicNode, Members, encode};
+        let (_dir, sm) = fixture();
+        let membership = Members::new(
+            vec![[1, 2].into()],
+            std::collections::BTreeMap::from([
+                (1, BasicNode::new("192.168.0.1:7001")),
+                (2, BasicNode::new("192.168.0.2:7001")),
+            ]),
+        )
+        .unwrap();
+        sm.0.lock()
+            .unwrap()
+            .apply(
+                position(1),
+                &Entry::Membership(encode(&membership).unwrap()),
+            )
+            .unwrap();
+        let gate = learner_gate(&sm);
+        let mut observation = std::pin::pin!(wait_for_store(|deadline| {
+            gate.inspect_strict(deadline, |store| {
+                assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
+                store.applied()
+            })
+        }));
+        {
+            let _held = sm.0.lock().unwrap();
+            assert!(
+                observation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        assert_eq!(observation.await, Ok(Some(position(1))));
     }
 
     #[test]

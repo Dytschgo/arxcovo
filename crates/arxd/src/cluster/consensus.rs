@@ -150,6 +150,7 @@ mod bound_start;
 mod checked_clock;
 mod initial_promotion;
 pub(in crate::cluster) mod issue;
+mod issuer_transfer;
 mod learner_admission;
 pub(in crate::cluster) mod membership_observation;
 mod peer_control_wire;

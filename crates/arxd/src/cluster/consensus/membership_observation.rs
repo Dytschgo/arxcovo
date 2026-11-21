@@ -50,7 +50,7 @@ impl ObservedMembership {
 
 // No registry, store, TLS or permit ownership; validate bounds before cloning.
 #[derive(Clone, PartialEq, Eq)]
-struct Sample {
+pub(super) struct Sample {
     vote: Vote<LeaderId>,
     current_leader: Option<u64>,
     effective: (Option<Id>, Members),
@@ -1028,3 +1028,343 @@ mod promotion_observation_tests {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+mod issuer_proof {
+    use super::*;
+    use crate::cluster::consensus::issuer_transfer::{
+        Claim, Offer, Voter, bound_voter, promoted_targets,
+    };
+
+    fn voter(
+        store: &StateStore,
+        view: &ObservedMembership,
+        cluster: ClusterId,
+        node: NodeId,
+    ) -> Result<Voter, MembershipReadError> {
+        bound_voter(view.membership(), store.state(), cluster, node)
+            .ok_or(MembershipReadError::PeerRefused)
+    }
+
+    // Mirrors peer_registry::observe_store without waiting: a held store is
+    // Busy, while an absent store or a poisoned mutex is Unavailable.
+    fn acquire(
+        node: &ConsensusNode,
+    ) -> Result<std::sync::MutexGuard<'_, StateStore>, MembershipReadError> {
+        let sm = node.sm.as_ref().ok_or(MembershipReadError::Unavailable)?;
+        match sm.0.try_lock() {
+            Ok(store) => Ok(store),
+            Err(std::sync::TryLockError::WouldBlock) if !sm.0.is_poisoned() => {
+                Err(MembershipReadError::Busy)
+            }
+            Err(_) => Err(MembershipReadError::Unavailable),
+        }
+    }
+
+    // A failed persist keeps the last good image readable. Refuse it before
+    // any applied field authorizes an issuer operation.
+    fn locked(
+        store: &StateStore,
+        sample: &Sample,
+        leader: u64,
+    ) -> Result<ObservedMembership, MembershipReadError> {
+        if store.is_poisoned() {
+            return Err(MembershipReadError::Unavailable);
+        }
+        uniform(
+            leader,
+            sample,
+            store.applied().ok_or(MembershipReadError::RetryLater)?,
+            store.membership(),
+        )
+    }
+
+    fn offer(
+        store: &StateStore,
+        view: &ObservedMembership,
+        cluster: ClusterId,
+        root: [u8; 32],
+        sender: NodeId,
+        target: NodeId,
+    ) -> Result<Offer, MembershipReadError> {
+        let membership = pos(view.membership_id());
+        if promoted_targets(view.membership(), sender)
+            .is_none_or(|voters| !voters.contains(&target.get()))
+        {
+            return Err(MembershipReadError::PeerRefused);
+        }
+        let sender = voter(store, view, cluster, sender)?;
+        let target = voter(store, view, cluster, target)?;
+        Ok(Offer {
+            claim: Claim {
+                cluster,
+                root,
+                sender: (sender.node, *sender.key.as_bytes()),
+                receiver: (target.node, *target.key.as_bytes()),
+                epoch: view.leader(),
+                membership,
+            },
+            sender_address: sender.address,
+            receiver_address: target.address,
+        })
+    }
+
+    impl ConsensusNode {
+        pub(in crate::cluster::consensus) async fn issuer_offer(
+            &self,
+            cluster: ClusterId,
+            root: [u8; 32],
+            target: NodeId,
+        ) -> Result<Offer, MembershipReadError> {
+            let raft = self.raft.as_ref().ok_or(MembershipReadError::Unavailable)?;
+            let before = Sample::capture(raft)?;
+            let sample = before.clone();
+            let sender = NodeId::new(self.id).ok_or(MembershipReadError::PeerRefused)?;
+            let (epoch, outcome) = self
+                .fresh_read(move |store| {
+                    Ok(locked(store, &sample, sender.get())
+                        .and_then(|view| offer(store, &view, cluster, root, sender, target)))
+                })
+                .await
+                .map_err(|error| match error {
+                    ReadError::Busy => MembershipReadError::Busy,
+                    ReadError::NotLeader => MembershipReadError::NotLeader,
+                    _ => MembershipReadError::Unavailable,
+                })?;
+            let offer = outcome?;
+            if offer.claim.epoch != epoch || Sample::capture(raft)? != before {
+                return Err(MembershipReadError::RetryLater);
+            }
+            Ok(offer)
+        }
+
+        pub(in crate::cluster::consensus) fn recheck_issuer_offer(
+            &self,
+            previous: Offer,
+        ) -> Result<(), MembershipReadError> {
+            let claim = previous.claim;
+            self.with_issuer_view(self.id, |store, view| {
+                let current = offer(
+                    store,
+                    view,
+                    claim.cluster,
+                    claim.root,
+                    claim.sender.0,
+                    claim.receiver.0,
+                )?;
+                if current != previous {
+                    return Err(MembershipReadError::RetryLater);
+                }
+                Ok(())
+            })
+        }
+
+        pub(in crate::cluster::consensus) fn issuer_membership(&self) -> IssuerMembership<'_> {
+            IssuerMembership {
+                node: self,
+                #[cfg(test)]
+                sample: None,
+                #[cfg(test)]
+                before_proof: None,
+            }
+        }
+
+        pub(in crate::cluster::consensus) fn issuer_voter(
+            &self,
+            cluster: ClusterId,
+            local: Voter,
+            installed_at: LogPos,
+            require_leader: bool,
+        ) -> Result<(), MembershipReadError> {
+            drop(self.issuer_membership().voter_proof(
+                cluster,
+                local,
+                installed_at,
+                require_leader,
+                None,
+            )?);
+            Ok(())
+        }
+
+        fn with_issuer_view<T>(
+            &self,
+            leader: u64,
+            inspect: impl FnOnce(&StateStore, &ObservedMembership) -> Result<T, MembershipReadError>,
+        ) -> Result<T, MembershipReadError> {
+            let unavailable = MembershipReadError::Unavailable;
+            let raft = self.raft.as_ref().ok_or(unavailable)?;
+            let before = Sample::capture(raft)?;
+            let store = acquire(self)?;
+            let view = locked(&store, &before, leader)?;
+            let result = inspect(&store, &view)?;
+            if Sample::capture(raft)? != before {
+                return Err(MembershipReadError::RetryLater);
+            }
+            Ok(result)
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::cluster::consensus) type BeforeProof = Arc<dyn Fn() + Send + Sync>;
+
+    pub(in crate::cluster::consensus) struct IssuerMembership<'a> {
+        node: &'a ConsensusNode,
+        #[cfg(test)]
+        sample: Option<Sample>,
+        #[cfg(test)]
+        before_proof: Option<BeforeProof>,
+    }
+
+    // Retain the exact applied image until the guarded use has finished.
+    #[must_use]
+    pub(in crate::cluster::consensus) struct IssuerProof<'a>(std::sync::MutexGuard<'a, StateStore>);
+
+    impl IssuerProof<'_> {
+        pub(in crate::cluster::consensus) fn covers_member(
+            &self,
+            expected: &crate::cluster::join_receipt::ExpectedIdentity,
+            address: std::net::SocketAddr,
+        ) -> bool {
+            let store = &self.0;
+            store.applied().is_some_and(|applied| {
+                super::super::peer_registry::crossed(
+                    expected,
+                    address,
+                    applied,
+                    store.membership(),
+                    store.state(),
+                )
+            })
+        }
+    }
+
+    impl<'a> IssuerMembership<'a> {
+        #[cfg(test)]
+        pub(in crate::cluster::consensus) fn with_sample(mut self, sample: Option<Sample>) -> Self {
+            self.sample = sample;
+            self
+        }
+
+        // Runs after the preliminary checks and before the final store observation.
+        #[cfg(test)]
+        pub(in crate::cluster::consensus) fn with_before_proof(
+            mut self,
+            hook: Option<BeforeProof>,
+        ) -> Self {
+            self.before_proof = hook;
+            self
+        }
+
+        fn sample(&self) -> Result<Sample, MembershipReadError> {
+            #[cfg(test)]
+            if let Some(sample) = &self.sample {
+                return Ok(sample.clone());
+            }
+            Sample::capture(
+                self.node
+                    .raft
+                    .as_ref()
+                    .ok_or(MembershipReadError::Unavailable)?,
+            )
+        }
+
+        fn lock_view(
+            &self,
+            before: &Sample,
+            leader: u64,
+        ) -> Result<(IssuerProof<'a>, ObservedMembership), MembershipReadError> {
+            let store = acquire(self.node)?;
+            let view = locked(&store, before, leader)?;
+            Ok((IssuerProof(store), view))
+        }
+
+        pub(in crate::cluster::consensus) fn offer_in(
+            &self,
+            store: &StateStore,
+            claim: Claim,
+            peer: AuthenticatedPeer,
+        ) -> Result<Offer, MembershipReadError> {
+            let refused = MembershipReadError::PeerRefused;
+            let peer = identity(peer)?;
+            if (peer.0, peer.1, *peer.2.as_bytes())
+                != (claim.cluster, claim.sender.0, claim.sender.1)
+                || self.node.id != claim.receiver.0.get()
+            {
+                return Err(refused);
+            }
+
+            let before = self.sample()?;
+            let view = locked(store, &before, claim.sender.0.get())?;
+            let observed = offer(
+                store,
+                &view,
+                claim.cluster,
+                claim.root,
+                claim.sender.0,
+                claim.receiver.0,
+            )?;
+            if observed.claim != claim {
+                return Err(refused);
+            }
+            if self.sample()? != before {
+                return Err(MembershipReadError::RetryLater);
+            }
+            Ok(observed)
+        }
+
+        pub(in crate::cluster::consensus) fn voter_proof(
+            &self,
+            cluster: ClusterId,
+            local: Voter,
+            installed_at: LogPos,
+            require_leader: bool,
+            epoch: Option<LeaderId>,
+        ) -> Result<IssuerProof<'a>, MembershipReadError> {
+            let before = self.sample()?;
+            let leader = before
+                .current_leader
+                .ok_or(MembershipReadError::NotLeader)?;
+            if local.node.get() != self.node.id || (require_leader && leader != self.node.id) {
+                return Err(MembershipReadError::NotLeader);
+            }
+            #[cfg(test)]
+            if let Some(hook) = &self.before_proof {
+                hook();
+            }
+            let (proof, view) = self.lock_view(&before, leader)?;
+            if pos(view.membership_id()) != installed_at
+                || epoch.is_some_and(|epoch| epoch != view.leader())
+                || voter(&proof.0, &view, cluster, local.node)? != local
+            {
+                return Err(MembershipReadError::PeerRefused);
+            }
+            if self.sample()? != before {
+                return Err(MembershipReadError::RetryLater);
+            }
+            Ok(proof)
+        }
+    }
+
+    #[cfg(test)]
+    impl Sample {
+        pub(in crate::cluster::consensus) fn issuer_fixture(
+            epoch: LeaderId,
+            position: Id,
+            members: Members,
+        ) -> Self {
+            Self {
+                vote: Vote {
+                    leader_id: epoch,
+                    committed: true,
+                },
+                current_leader: Some(epoch.node_id),
+                effective: (Some(position), members.clone()),
+                committed: (Some(position), members),
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use issuer_proof::BeforeProof;
+#[cfg(target_os = "linux")]
+pub(super) use issuer_proof::{IssuerMembership, IssuerProof};

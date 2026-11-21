@@ -9,6 +9,8 @@ mod codec;
 mod hosted_probe;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, target_os = "linux"))]
+pub(in crate::cluster) mod voter_transfer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::cluster) enum Error {
@@ -134,6 +136,7 @@ fn native() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::voter_transfer::disk::Installation;
     use super::*;
     use std::{
         fs::{self, File},
@@ -144,11 +147,11 @@ mod linux {
         },
         path::{Component, Path, PathBuf},
     };
-    struct Root {
-        path: PathBuf,
-        dir: File,
+    pub(super) struct Root {
+        pub(super) path: PathBuf,
+        pub(super) dir: File,
     }
-    fn same(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    pub(super) fn same(a: &fs::Metadata, b: &fs::Metadata) -> bool {
         a.dev() == b.dev() && a.ino() == b.ino()
     }
     fn privacy(m: &fs::Metadata, directory: bool) -> Result<(), Error> {
@@ -169,7 +172,7 @@ mod linux {
         fn open(path: &Path) -> Result<Self, Error> {
             Self::open_checked(path, |_, _| Ok(()))
         }
-        fn open_checked(
+        pub(super) fn open_checked(
             path: &Path,
             mut check: impl FnMut(&fs::Metadata, bool) -> Result<(), Error>,
         ) -> Result<Self, Error> {
@@ -215,7 +218,7 @@ mod linux {
                 dir,
             })
         }
-        fn recheck(&self) -> Result<(), Error> {
+        pub(super) fn recheck(&self) -> Result<(), Error> {
             let current = Self::open(&self.path)?;
             if !same(
                 &self.dir.metadata().map_err(|_| Error::Layout)?,
@@ -225,7 +228,7 @@ mod linux {
             }
             Ok(())
         }
-        fn file(&self, name: &str, create: bool) -> Result<File, Error> {
+        pub(super) fn file(&self, name: &str, create: bool) -> Result<File, Error> {
             self.recheck()?;
             let name = std::ffi::CString::new(name).map_err(|_| Error::Layout)?;
             let flags = libc::O_NOFOLLOW
@@ -246,25 +249,36 @@ mod linux {
             privacy(&file.metadata().map_err(|_| Error::Layout)?, false)?;
             Ok(file)
         }
-        fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, Error> {
+        pub(super) fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, Error> {
+            self.read_wiped(name, max)
+                .map(|mut bytes| std::mem::take(&mut bytes.0))
+        }
+        /// Error paths wipe partial bytes. One bounded allocation avoids
+        /// leaving unwiped copies behind when the buffer grows.
+        pub(super) fn read_wiped(
+            &self,
+            name: &str,
+            max: usize,
+        ) -> Result<voter_transfer::Wipe<Vec<u8>>, Error> {
             let mut f = self.file(name, false)?;
             let before = f.metadata().map_err(|_| Error::Layout)?;
             if before.len() > max as u64 {
                 return Err(Error::Corrupt);
             }
-            let mut bytes = Vec::new();
+            let mut bytes = voter_transfer::Wipe(Vec::with_capacity(max + 1));
             (&mut f)
                 .take(max as u64 + 1)
-                .read_to_end(&mut bytes)
+                .read_to_end(&mut bytes.0)
                 .map_err(|_| Error::Unavailable)?;
             let current = self.file(name, false)?;
-            if bytes.len() > max || !same(&before, &current.metadata().map_err(|_| Error::Layout)?)
+            if bytes.0.len() > max
+                || !same(&before, &current.metadata().map_err(|_| Error::Layout)?)
             {
                 return Err(Error::Ownership);
             }
             Ok(bytes)
         }
-        fn entries(&self, max: usize) -> Result<Vec<String>, Error> {
+        pub(super) fn entries(&self, max: usize) -> Result<Vec<String>, Error> {
             self.recheck()?;
             let mut names = Vec::new();
             for e in fs::read_dir(&self.path)
@@ -287,11 +301,11 @@ mod linux {
         }
     }
     pub(in crate::cluster) struct Custody {
-        wrap: Root,
-        store: Root,
+        pub(super) wrap: Root,
+        pub(super) store: Root,
         lock: File,
-        installation: [u8; 16],
-        key: [u8; 32],
+        pub(super) installation: [u8; 16],
+        pub(super) key: [u8; 32],
         failure: Option<Error>,
         #[cfg(test)]
         pub(super) fail_at: Option<usize>,
@@ -400,13 +414,13 @@ mod linux {
         }
         Ok(copy)
     }
-    struct FounderLayout {
+    pub(super) struct FounderLayout {
         roots: Vec<fs::Metadata>,
         ancestors: Vec<fs::Metadata>,
     }
 
     impl FounderLayout {
-        fn checked(owner: &crate::cluster::startup_plan::Owner) -> Result<Self, Error> {
+        pub(super) fn checked(owner: &crate::cluster::startup_plan::Owner) -> Result<Self, Error> {
             let metadata = |path: &Path| -> Result<fs::Metadata, Error> {
                 // An absolute path selects this exact guard from the original
                 // Owner. The loan rechecks the current name against its descriptor.
@@ -434,7 +448,7 @@ mod linux {
             Ok(layout)
         }
 
-        fn check(&self, private: &fs::Metadata, leaf: bool) -> Result<(), Error> {
+        pub(super) fn check(&self, private: &fs::Metadata, leaf: bool) -> Result<(), Error> {
             // Shared ancestors are expected. Reject a private leaf that
             // aliases a checked ancestor, or any private component that
             // aliases a checked root.
@@ -448,7 +462,7 @@ mod linux {
     }
 
     /// Installation owner for the fresh-founder role only.
-    pub(in crate::cluster) struct FounderCustody(Custody);
+    pub(in crate::cluster) struct FounderCustody(pub(super) Custody);
 
     impl FounderCustody {
         pub(in crate::cluster) fn create(
@@ -502,8 +516,9 @@ mod linux {
 
     /// Staging for the learner role. This facade has no CA creation or load lane.
     pub(in crate::cluster) struct LearnerCustody {
-        custody: Custody,
+        pub(super) custody: Custody,
         sealed: Option<SealedLearner>,
+        pub(super) voter: Installation,
     }
 
     struct SealedLearner {
@@ -553,6 +568,7 @@ mod linux {
             Ok(LearnerCustody {
                 custody,
                 sealed: Some(SealedLearner { key, source, bytes }),
+                voter: Installation::default(),
             })
         }
     }
@@ -583,6 +599,7 @@ mod linux {
             Ok(Self {
                 custody: Custody::create_fresh_in_roots(wrap, store)?,
                 sealed: None,
+                voter: Installation::default(),
             })
         }
 
@@ -818,21 +835,26 @@ mod linux {
             if id != expected {
                 return Err(Error::Context);
             }
-            let secret = codec::Secret(wrap.read("seal-key", 32)?);
+            let secret = wrap.read_wiped("seal-key", 32)?;
             let key = codec::wrapping(&secret.0)?;
             let owner = Self::owner(wrap, store, lock, id, key);
             owner.inventory()?;
             Ok(owner)
         }
-        fn inventory(&self) -> Result<Vec<String>, Error> {
+        pub(super) fn checked_inventory(&self) -> Result<Vec<String>, Error> {
             self.wrap.recheck()?;
             self.store.recheck()?;
             if self.wrap.entries(2)? != ["install-context", "seal-key"] {
                 return Err(Error::Layout);
             }
-            if codec::installation(&self.wrap.read("install-context", 25)?)? != self.installation
-                || codec::wrapping(&self.wrap.read("seal-key", 32)?)? != self.key
-            {
+            if codec::installation(&self.wrap.read("install-context", 25)?)? != self.installation {
+                return Err(Error::Context);
+            }
+            let wrapping = self.wrap.read_wiped("seal-key", 32)?;
+            if wrapping.0.len() != 32 {
+                return Err(Error::Corrupt);
+            }
+            if wrapping.0.as_slice() != self.key {
                 return Err(Error::Context);
             }
             let current = self.store.file("custody-lock", false)?;
@@ -843,7 +865,10 @@ mod linux {
                 return Err(Error::Ownership);
             }
             codec::lock(&self.store.read("custody-lock", 0)?)?;
-            let entries = self.store.entries(3)?;
+            self.store.entries(3)
+        }
+        pub(super) fn inventory(&self) -> Result<Vec<String>, Error> {
+            let entries = self.checked_inventory()?;
             for name in &entries {
                 match name.as_str() {
                     "custody-lock" => (),
@@ -883,7 +908,11 @@ mod linux {
             }
             Ok(entries)
         }
-        fn common_context(&self, cluster: ClusterId, root: [u8; 32]) -> Result<(), Error> {
+        pub(super) fn common_context(
+            &self,
+            cluster: ClusterId,
+            root: [u8; 32],
+        ) -> Result<(), Error> {
             for name in self.inventory()? {
                 if name == "custody-lock" {
                     continue;

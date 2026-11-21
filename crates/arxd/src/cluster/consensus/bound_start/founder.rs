@@ -1,4 +1,6 @@
 //! One founder operation on the process-retained bound-start job.
+#[cfg(target_os = "linux")]
+use super::peer_transport;
 use super::{checked_clock, issue};
 use crate::cluster::enrollment::MAX_TIME_MS;
 use checked_clock::{CheckedClock, ClockError};
@@ -72,7 +74,7 @@ pub(super) mod linux {
     use super::*;
     use crate::cluster::consensus::bound_start::*;
     use crate::cluster::{
-        enrollment::{BoundVoters, ClusterId, KeyDigest},
+        enrollment::{BoundVoters, ClusterId, KeyDigest, NodeId},
         issuance_publication,
         join_receipt::Origin,
         pki::{ca::ClusterCa, csr::ProvenCsr, custody::FounderCustody},
@@ -450,6 +452,93 @@ pub(super) mod linux {
                 .is_some_and(|node| node == address))
     }
 
+    async fn retained_issuer(
+        job: &Job,
+        target: NodeId,
+    ) -> Result<
+        (
+            crate::cluster::consensus::issuer_transfer::Offer,
+            Arc<tokio::sync::Mutex<ConsensusNode>>,
+        ),
+        peer_transport::Refusal,
+    > {
+        use peer_transport::Refusal as R;
+        let (node, cluster, root, key) = {
+            let state = job.state();
+            if state.close_requested || state.status != Status::FounderReady {
+                return Err(R::Closed);
+            }
+            let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
+            let (cluster, root, key) = ready.transfer_identity();
+            (state.node.clone().ok_or(R::NotReady)?, cluster, root, key)
+        };
+        let offer = {
+            let node = node.try_lock().map_err(|_| R::Busy)?;
+            node.issuer_offer(cluster, root, target)
+                .await
+                .map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!("issuer transfer fresh membership refused: {error:?}");
+                    let _ = error;
+                    R::Identity
+                })?
+        };
+        if offer.claim.sender.1 != *key.as_bytes() {
+            return Err(R::Identity);
+        }
+        Ok((offer, node))
+    }
+
+    pub(super) async fn voter_offer(
+        job: &Job,
+        target: NodeId,
+    ) -> Result<
+        (
+            crate::cluster::consensus::issuer_transfer::Offer,
+            Arc<tokio::sync::Mutex<TransportOwner>>,
+        ),
+        peer_transport::Refusal,
+    > {
+        use peer_transport::Refusal as R;
+        let (offer, _) = retained_issuer(job, target).await?;
+        let state = job.state();
+        if state.close_requested {
+            return Err(R::Closed);
+        }
+        let transport = state.founder.as_ref().ok_or(R::NotReady)?.transport.clone();
+        Ok((offer, transport))
+    }
+
+    pub(super) async fn seal_voter_transfer(
+        job: &Job,
+        offer: crate::cluster::consensus::issuer_transfer::Offer,
+        key: &[u8; 32],
+        context: &[u8],
+    ) -> Result<Vec<u8>, peer_transport::Refusal> {
+        use peer_transport::Refusal as R;
+        let (current, node) = retained_issuer(job, offer.claim.receiver.0).await?;
+        if current != offer {
+            return Err(R::Identity);
+        }
+        let node = node.try_lock().map_err(|_| R::Busy)?;
+        let state = job.state();
+        let ready = state.issuer.as_ref().ok_or(R::NotReady)?;
+        if state.close_requested || ready.available(&node).is_err() {
+            return Err(R::Identity);
+        }
+        let custody = state
+            .founder
+            .as_ref()
+            .and_then(|op| op.custody.as_ref())
+            .ok_or(R::NotReady)?;
+        let (cluster, root, now) = ready.transfer_context()?;
+        let sealed = custody
+            .seal_for_voter(cluster, root, now, key, context)
+            .map_err(|_| R::Identity)?;
+        node.recheck_issuer_offer(offer).map_err(|_| R::Identity)?;
+        Ok(sealed)
+    }
+
     pub(in super::super) async fn close_transport(job: &Job) -> bool {
         let transport = job.state().founder.as_ref().map(|op| op.transport.clone());
         if let Some(transport) = transport {
@@ -470,3 +559,32 @@ pub(super) mod linux {
 #[cfg(all(test, not(target_os = "linux")))]
 #[path = "founder_tests.rs"]
 mod tests;
+
+#[cfg(target_os = "linux")]
+impl super::Job {
+    pub(super) async fn transfer_issuer_to(
+        &'static self,
+        target: crate::cluster::enrollment::NodeId,
+    ) -> peer_transport::TransferOutcome {
+        use peer_transport::TransferOutcome;
+        let transfer = async {
+            let (offer, transport) = linux::voter_offer(self, target).await?;
+            let owner = transport.lock().await;
+            owner.send_issuer_transfer(self, offer)
+        }
+        .await;
+        match transfer {
+            Ok(transfer) => transfer.outcome().await,
+            Err(_) => TransferOutcome::Refused,
+        }
+    }
+
+    pub(in crate::cluster::consensus) async fn seal_voter_transfer(
+        &self,
+        offer: super::issuer_transfer::Offer,
+        key: &[u8; 32],
+        context: &[u8],
+    ) -> Result<Vec<u8>, peer_transport::Refusal> {
+        linux::seal_voter_transfer(self, offer, key, context).await
+    }
+}
