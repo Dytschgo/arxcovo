@@ -1217,6 +1217,82 @@ async fn verified_continuation_completes_one_synthetic_redeem() {
     .await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_loss_is_post_completion_once_and_per_listener() {
+    within(async {
+        let f = fixture();
+        let mut backend = synthetic(&f);
+        let hold = Gate::new();
+        backend.redeem_work = Some(hold.clone());
+        let (mut armed, address) = start(&f, backend).await;
+        let loss = armed.arm_terminal_loss().unwrap();
+        assert!(armed.arm_terminal_loss().is_err());
+        let connector = raw_client(&f);
+        let csr = signed_csr(false);
+
+        let run = |address, csr: Vec<u8>| {
+            let connector = &connector;
+            let f = &f;
+            async move {
+                let mut tls = raw_connect(connector, address).await;
+                let challenge = query_raw(&mut tls, f).await;
+                tls.write_all(&redeem_wire(&f.code, &challenge, &csr))
+                    .await
+                    .unwrap();
+                tls.shutdown().await.unwrap();
+                tls
+            }
+        };
+
+        // A backend refusal still writes its Result and authenticated end.
+        let mut refused = run(address, vec![0x30, 0x01, 0x00]).await;
+        hold.arrived.acquire().await.unwrap().forget();
+        assert!(loss.observed().is_none());
+        hold.release.add_permits(1);
+        assert_eq!(read_frame(&mut refused, Kind::Result).await.unwrap(), [1]);
+        clean_end(&mut refused).await.unwrap();
+        assert!(loss.observed().is_none());
+
+        // A different listener still sends a successful terminal reply.
+        let (mut ordinary, other) = start(&f, synthetic(&f)).await;
+        let mut untouched = run(other, csr.clone()).await;
+        let body = read_frame(&mut untouched, Kind::Result).await.unwrap();
+        assert!(Reply::decode(&body).unwrap() == reply());
+        clean_end(&mut untouched).await.unwrap();
+        assert!(loss.observed().is_none());
+
+        let mut dropped = run(address, csr.clone()).await;
+        hold.arrived.acquire().await.unwrap().forget();
+        assert!(loss.observed().is_none());
+        let mut byte = [0_u8; 1];
+        let read = dropped.read(&mut byte);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        hold.release.add_permits(1);
+        let error = read.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let expected = SuppressedReply {
+            request: REQUEST,
+            key: Some(ProvenCsr::parse(&csr).unwrap().digest()),
+            node: reply().node,
+            original: reply().original,
+        };
+        assert_eq!(loss.observed(), Some(expected));
+
+        let mut subsequent = run(address, csr).await;
+        hold.arrived.acquire().await.unwrap().forget();
+        hold.release.add_permits(1);
+        let body = read_frame(&mut subsequent, Kind::Result).await.unwrap();
+        assert!(Reply::decode(&body).unwrap() == reply());
+        clean_end(&mut subsequent).await.unwrap();
+        assert_eq!(loss.observed(), Some(expected));
+        assert_eq!(ordinary.close(WATCHDOG).await, Close::Joined);
+        assert_eq!(armed.close(WATCHDOG).await, Close::Joined);
+    })
+    .await;
+}
+
 #[test]
 fn fresh_join_owner_requires_the_original_lock_only_state() {
     use crate::cluster::startup_plan::{Owner, Refusal, tests::Layout};

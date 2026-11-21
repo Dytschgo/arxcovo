@@ -425,10 +425,12 @@ mod hosted {
         startup_plan::tests::Layout,
     };
     use founder::linux::{HostedFixture, dispatch_founder};
+    use futures_util::FutureExt;
     use std::{
         fs,
         net::{TcpListener as StdListener, UdpSocket},
         os::unix::fs::PermissionsExt,
+        panic::AssertUnwindSafe,
         sync::atomic::{AtomicUsize, Ordering::Relaxed},
     };
     use tokio::time::timeout;
@@ -439,6 +441,7 @@ mod hosted {
     #[cfg(test)]
     mod durable_join_campaign;
     mod issuer_transfer_campaign;
+    mod lost_reply_campaign;
     mod promotion_campaign;
 
     #[derive(Default)]
@@ -499,6 +502,272 @@ mod hosted {
         .expect("retained issuer observation elapsed");
     }
 
+    async fn observe_retained_status(
+        observer: &mut Observer,
+        wanted: Status,
+        job: &Job,
+    ) -> Result<(), String> {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let status = observer.status();
+                if status == wanted {
+                    return Ok(());
+                }
+                if !matches!(
+                    status,
+                    Status::Preparing
+                        | Status::Prepared
+                        | Status::EngineMayExist
+                        | Status::Running
+                        | Status::Founding
+                        | Status::FounderReady
+                ) {
+                    return Err(format!(
+                        "waiting for {wanted:?}, stopped at {status:?}: {:?}",
+                        job.state().founder_failure
+                    ));
+                }
+                observer.changed().await.ok_or("retained observer closed")?;
+            }
+        })
+        .await
+        .map_err(|_| format!("retained {wanted:?} observation elapsed"))?
+    }
+
+    async fn observe_enroll(observation: &Observation) -> Result<(), String> {
+        timeout(Duration::from_secs(10), observation.finished.notified())
+            .await
+            .map_err(|_| "enrollment observation elapsed")?;
+        match *observation.result.lock().unwrap() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(reason)) => Err(format!("actual enroll refused: {reason:?}")),
+            None => Err("enrollment completion missing".into()),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum CloseObservation {
+        Joined(Status),
+        SupervisorFailed,
+        TimedOut,
+    }
+
+    // A driver may already have requested close to assert the in-flight hold.
+    // The failure stays owned here across the separate bounded close observation.
+    async fn finish_attempt<E, O>(
+        first: Result<(), E>,
+        close: &mut Option<O>,
+        release: impl FnOnce(),
+        request: impl FnOnce() -> O,
+        observe: impl AsyncFnOnce(&mut O) -> CloseObservation,
+    ) -> (Result<(), E>, CloseObservation) {
+        if first.is_err() {
+            release();
+        }
+        let observed = observe(close.get_or_insert_with(request)).await;
+        (first, observed)
+    }
+
+    fn observe_or_request_close(job: &Job, before_request: impl FnOnce()) -> Observer {
+        let mut state = job.state();
+        let already_owned = state.close_requested
+            || state.close_notified
+            || state.close_dispatched
+            // The hosted founder publishes the refusal just before requesting close.
+            || (state.status == Status::FounderRefused && !state.process_owned);
+        if !already_owned {
+            before_request();
+            // Claim and signal the same slot as Job::request_close under its state mutex.
+            Job::stop_admission(&mut state);
+            state.close_notified = true;
+            job.close.notify_one();
+        }
+        job.observe()
+    }
+
+    async fn observe_close(
+        supervisor: tokio::task::JoinHandle<()>,
+        observer: &Observer,
+    ) -> CloseObservation {
+        match timeout(Duration::from_secs(10), supervisor).await {
+            Ok(Ok(())) => CloseObservation::Joined(observer.status()),
+            Ok(Err(_)) => CloseObservation::SupervisorFailed,
+            Err(_) => CloseObservation::TimedOut,
+        }
+    }
+
+    enum FirstFailure {
+        Event(String),
+        Assertion(Box<dyn std::any::Any + Send>),
+    }
+
+    fn latch_attempt(
+        case: &str,
+        attempt: std::thread::Result<Result<(), String>>,
+    ) -> Result<(), FirstFailure> {
+        match attempt {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
+                eprintln!("{case} first failure: {reason}");
+                Err(FirstFailure::Event(reason))
+            }
+            // The panic hook already reported the assertion.
+            Err(panic) => Err(FirstFailure::Assertion(panic)),
+        }
+    }
+
+    fn require_attempt(
+        case: &str,
+        first: Result<(), FirstFailure>,
+        close: &CloseObservation,
+        job: &Job,
+    ) {
+        eprintln!(
+            "{case} owned close: {close:?}; shutdown: {:?}",
+            job.state().close_failure
+        );
+        match first {
+            Ok(()) => {}
+            Err(FirstFailure::Event(reason)) => panic!("{case} first failure: {reason}"),
+            Err(FirstFailure::Assertion(panic)) => std::panic::resume_unwind(panic),
+        }
+        assert_eq!(*close, CloseObservation::Joined(Status::Clean));
+    }
+
+    #[tokio::test]
+    async fn first_found_refusal_survives_owned_close() {
+        let job = Job::anchor();
+        founder::linux::refuse(job, founder::Error::Preparation);
+        assert!(job.state().close_requested);
+        let first = observe_retained_status(&mut job.observe(), Status::FounderReady, job).await;
+        let supervisor = tokio::spawn(async move {
+            job.close.notified().await;
+            assert!(job.begin_close());
+            job.finish_close(None, true, false);
+        });
+        let released = std::cell::Cell::new(false);
+        let (first, close) = finish_attempt(
+            first,
+            &mut None,
+            || released.set(true),
+            || observe_or_request_close(job, || panic!("founder already requested close")),
+            async |observer| {
+                assert!(released.get());
+                observe_close(supervisor, observer).await
+            },
+        )
+        .await;
+        assert_eq!(
+            first.unwrap_err(),
+            "waiting for FounderReady, stopped at FounderRefused: Some(Preparation)"
+        );
+        assert_eq!(
+            close,
+            CloseObservation::Joined(Status::ClosedAfterFounderRefusal)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_timeout_serializes_the_fixture_request_with_founder_refusal() {
+        let job = Job::anchor();
+        let first = observe_retained_status(&mut job.observe(), Status::FounderReady, job).await;
+        let founder_entered_gap = std::cell::Cell::new(false);
+        let fixture_requests = std::cell::Cell::new(0);
+        let close_observations = std::cell::Cell::new(0);
+        let (first, close) = finish_attempt(
+            first,
+            &mut None,
+            || {},
+            || {
+                observe_or_request_close(job, || {
+                    // Attempt the founder's first lock exactly in the old gap.
+                    // If it can enter, execute the frozen publication and request there.
+                    let access = job.state.try_lock();
+                    let founder_can_enter = access.is_ok();
+                    drop(access);
+                    if founder_can_enter {
+                        founder::linux::refuse(job, founder::Error::Preparation);
+                        founder_entered_gap.set(true);
+                    }
+                    fixture_requests.set(fixture_requests.get() + 1);
+                })
+            },
+            async |observer| {
+                close_observations.set(close_observations.get() + 1);
+                let gap_opened = founder_entered_gap.get();
+                let supervisor = tokio::spawn(async move {
+                    assert!(job.close.notified().now_or_never().is_some());
+                    if !gap_opened {
+                        // Release the founder after consuming the first permit so that
+                        // an extra notification would be visible rather than coalesced.
+                        founder::linux::refuse(job, founder::Error::Preparation);
+                    }
+                    assert!(job.close.notified().now_or_never().is_none());
+                    assert!(job.begin_close());
+                    job.finish_close(None, true, false);
+                });
+                observe_close(supervisor, observer).await
+            },
+        )
+        .await;
+        assert!(
+            !founder_entered_gap.get(),
+            "founder entered during the fixture claim"
+        );
+        assert_eq!(fixture_requests.get(), 1);
+        assert_eq!(close_observations.get(), 1);
+        assert_eq!(
+            first.unwrap_err(),
+            "retained FounderReady observation elapsed"
+        );
+        assert_eq!(
+            close,
+            CloseObservation::Joined(Status::ClosedAfterFounderRefusal)
+        );
+    }
+
+    #[tokio::test]
+    async fn first_enroll_refusal_survives_unconfirmed_owned_close() {
+        let observation = Observation::default();
+        observation
+            .complete(Err(issue::IssueError::Unavailable))
+            .await;
+        let first = observe_enroll(&observation).await;
+        let (first, close) = finish_attempt(
+            first,
+            &mut None,
+            || observation.release.notify_one(),
+            || Status::Unconfirmed,
+            async |status| CloseObservation::Joined(*status),
+        )
+        .await;
+        assert_eq!(first.unwrap_err(), "actual enroll refused: Unavailable");
+        assert_eq!(close, CloseObservation::Joined(Status::Unconfirmed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elapsed_enroll_observation_releases_hold_without_requesting_close_twice() {
+        let observation = Observation::default();
+        let armed_hold = observation.release.notified();
+        tokio::pin!(armed_hold);
+        assert!(futures_util::poll!(&mut armed_hold).is_pending());
+        let first = observe_enroll(&observation).await;
+        let mut already_requested = Some(armed_hold);
+        let (first, close) = finish_attempt(
+            first,
+            &mut already_requested,
+            || observation.release.notify_one(),
+            || panic!("close was already requested"),
+            async |hold| {
+                assert!(futures_util::poll!(hold).is_ready());
+                CloseObservation::TimedOut
+            },
+        )
+        .await;
+        assert_eq!(first.unwrap_err(), "enrollment observation elapsed");
+        assert_eq!(close, CloseObservation::TimedOut);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retained_issuer_serves_actual_enrollment_and_joins_before_shutdown() {
         let layout = Layout::new();
@@ -528,7 +797,7 @@ mod hosted {
         });
         drop(peer);
         drop(enrollment);
-        let (job, mut observer, mut supervisor) = dispatch_founder(
+        let (job, mut observer, supervisor) = dispatch_founder(
             plan,
             intent,
             Params::default(),
@@ -538,9 +807,56 @@ mod hosted {
         )
         .expect("retained founder dispatch");
         let observation = Arc::new(Observation::default());
+        let mut close = None;
+        let first = AssertUnwindSafe(drive_p1(
+            job,
+            &mut observer,
+            &supervisor,
+            &mut close,
+            &observation,
+            enrollment_addr,
+            cluster,
+        ))
+        .catch_unwind()
+        .await;
+        let (first, close) = finish_attempt(
+            latch_attempt("P1", first),
+            &mut close,
+            || observation.release.notify_one(),
+            || observe_or_request_close(job, || {}),
+            async |observer| observe_close(supervisor, observer).await,
+        )
+        .await;
+        if !matches!(
+            close,
+            CloseObservation::Joined(Status::Clean | Status::ClosedAfterFounderRefusal)
+        ) {
+            let _ = layout.root.keep();
+        }
+        require_attempt("P1", first, &close, job);
+        {
+            let state = job.state();
+            assert!(state.ingress.is_none() && state.node.is_none() && state.owner.is_none());
+        }
+        assert_eq!(observation.anchor_calls.load(Relaxed), 1);
+        assert_eq!(observation.redeem_calls.load(Relaxed), 1);
+        for address in [enrollment_addr, peer_addr] {
+            let _released = TcpListener::bind(address).await.expect("listener released");
+        }
+    }
+
+    async fn drive_p1(
+        job: &Job,
+        observer: &mut Observer,
+        supervisor: &tokio::task::JoinHandle<()>,
+        close: &mut Option<Observer>,
+        observation: &Arc<Observation>,
+        enrollment_addr: SocketAddr,
+        cluster: ClusterId,
+    ) -> Result<(), String> {
         assert!(job.start_enrollment(Some(observation.clone())).is_err());
         assert!(job.state().ingress.is_none());
-        wait_for(&mut observer, Status::FounderReady, job).await;
+        observe_retained_status(observer, Status::FounderReady, job).await?;
 
         let (node, founder_key, root, clock, time) = {
             let state = job.state();
@@ -608,20 +924,17 @@ mod hosted {
             SocketLimits::default(),
         ));
         tokio::select! {
-            outcome = &mut client => panic!("P1 exchange ended before dispatch witness: {:?}", outcome.err()),
-            _ = timeout(Duration::from_secs(10), observation.finished.notified()) => {
-                assert_eq!(
-                    *observation.result.lock().unwrap(),
-                    Some(Ok(())),
-                    "P1 actual enroll refused or did not complete"
-                );
+            biased;
+            result = observe_enroll(observation) => result?,
+            outcome = &mut client => {
+                return Err(format!("exchange ended before dispatch witness: {:?}", outcome.err()));
             }
         }
         assert_eq!(observation.anchor_calls.load(Relaxed), 1);
         assert_eq!(observation.redeem_calls.load(Relaxed), 1);
 
-        let mut observer = job.request_close();
-        wait_for(&mut observer, Status::Closing, job).await;
+        let observer = close.get_or_insert_with(|| observe_or_request_close(job, || {}));
+        observe_retained_status(observer, Status::Closing, job).await?;
         assert!(job.start_enrollment(None).is_err());
         assert!(
             !supervisor.is_finished(),
@@ -687,7 +1000,9 @@ mod hosted {
         };
         drop(node);
         observation.release.notify_one();
-        let completed = client.await.expect("P1 real TLS enrollment failed");
+        let completed = client
+            .await
+            .map_err(|reason| format!("real TLS enrollment failed: {reason:?}"))?;
         assert_eq!(completed.voters().encode(), voters.encode());
         let (learner, e, leaf) = completed.reply().parts();
         assert_eq!(learner, NodeId::new(2).unwrap());
@@ -707,24 +1022,6 @@ mod hosted {
             [GeneralName::URI(&node_uri(cluster, learner))]
         );
 
-        timeout(Duration::from_secs(10), &mut supervisor)
-            .await
-            .expect("owned close elapsed")
-            .unwrap();
-        assert_eq!(
-            observer.status(),
-            Status::Clean,
-            "shutdown: {:?}",
-            job.state().close_failure
-        );
-        {
-            let state = job.state();
-            assert!(state.ingress.is_none() && state.node.is_none() && state.owner.is_none());
-        }
-        assert_eq!(observation.anchor_calls.load(Relaxed), 1);
-        assert_eq!(observation.redeem_calls.load(Relaxed), 1);
-        for address in [enrollment_addr, peer_addr] {
-            let _released = TcpListener::bind(address).await.expect("listener released");
-        }
+        Ok(())
     }
 }
