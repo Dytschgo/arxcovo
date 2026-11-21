@@ -225,6 +225,133 @@ struct Shared {
 pub(super) struct TransportOwner {
     shared: Arc<Shared>,
 }
+#[cfg(target_os = "linux")]
+pub(super) struct BuildPeer(Weak<Shared>);
+
+#[cfg(target_os = "linux")]
+fn build_lock<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    // Rustls verification is synchronous. Bound contention without changing
+    // the Raft verifier's asynchronous STORE_WAIT or transport deadlines.
+    let end = std::time::Instant::now() + Duration::from_millis(4);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) if std::time::Instant::now() < end => return Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < end => {
+                std::thread::sleep(Duration::from_micros(250));
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BuildPeer {
+    fn shared(&self) -> Option<Arc<Shared>> {
+        let shared = self.0.upgrade()?;
+        (!shared.failed.load(AtomicOrdering::Acquire)).then_some(shared)
+    }
+
+    pub(super) fn identity(&self) -> Option<(ClusterId, NodeId)> {
+        let shared = self.shared()?;
+        Some((shared.cluster, shared.node))
+    }
+
+    fn resources(&self) -> Option<Arc<Resources>> {
+        let shared = self.shared()?;
+        let state = build_lock(&shared.state)?;
+        if state.closed {
+            return None;
+        }
+        let resources = state.resources.clone()?;
+        drop(state);
+        if resources
+            .learner
+            .as_ref()
+            .is_some_and(|gate| gate.phase().ok() != Some(peer_registry::Phase::Strict))
+        {
+            return None;
+        }
+        Some(resources)
+    }
+
+    fn key(
+        &self,
+        cluster: ClusterId,
+        node: NodeId,
+    ) -> Option<crate::cluster::enrollment::KeyDigest> {
+        let shared = self.shared()?;
+        let state = build_lock(&shared.state)?;
+        if state.closed || shared.cluster != cluster {
+            return None;
+        }
+        let sm = state.keeper.clone()?;
+        drop(state);
+        let store = build_lock(&sm.0)?;
+        let (position, membership) = store.membership()?;
+        let applied = store.applied()?;
+        let members = crate::cluster::membership::Membership::decode(membership.bytes()).ok()?;
+        if store.is_poisoned()
+            || (applied != *position && applied.index <= position.index)
+            || members.configs().len() != 1
+            || !members.nodes().contains_key(&node.get())
+        {
+            return None;
+        }
+        store.state().bound_key(cluster, node).ok()
+    }
+
+    pub(super) fn binding(&self, cluster: ClusterId, node: NodeId) -> Option<[u8; 32]> {
+        self.key(cluster, node).map(|key| *key.as_bytes())
+    }
+
+    fn verifier(&self) -> Registry {
+        let weak = self.0.clone();
+        Arc::new(move |cluster, node, key| {
+            let current = BuildPeer(weak.clone()).key(cluster, node);
+            if current == Some(key) {
+                Ok(())
+            } else {
+                Err(verify::VerifyRefusal::NotMember)
+            }
+        })
+    }
+
+    pub(super) fn build_client(&self, target: NodeId) -> Option<Arc<ClientConfig>> {
+        let resources = self.resources()?;
+        self.key(resources.cluster, resources.node)?;
+        let mut client = resources
+            .client_with_registry(target, self.verifier())
+            .ok()?;
+        Arc::get_mut(&mut client)?.alpn_protocols = vec![b"arxcovo-build/1".to_vec()];
+        Some(client)
+    }
+
+    pub(super) fn build_server(&self) -> Option<Arc<ServerConfig>> {
+        let resources = self.resources()?;
+        self.key(resources.cluster, resources.node)?;
+        let creds = &resources.credentials;
+        let verifier = PeerVerifier::new(creds.root.clone(), resources.cluster, self.verifier())
+            .ok()?
+            .server();
+        let mut config = verify::server_config(
+            verifier,
+            creds.leaf.clone(),
+            creds.key.clone_key(),
+            creds.time.clone(),
+        )
+        .ok()?;
+        config.alpn_protocols = vec![b"arxcovo-build/1".to_vec()];
+        Some(Arc::new(config))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TransportOwner {
+    pub(super) fn build_peer(&self) -> BuildPeer {
+        BuildPeer(Arc::downgrade(&self.shared))
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct AppendClient {
     shared: Weak<Shared>,

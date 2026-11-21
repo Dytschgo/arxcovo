@@ -1,5 +1,7 @@
 mod bound_open;
 pub mod consensus;
+#[cfg(target_os = "linux")]
+pub(crate) mod delegated_build;
 pub mod enrollment;
 mod issuance_publication;
 mod join_receipt;

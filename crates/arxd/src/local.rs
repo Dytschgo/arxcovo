@@ -42,6 +42,25 @@ pub struct ClientConfig {
     // Kept in the private configuration, never accepted through argv or environment.
     token: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientFile {
+    address: String,
+    expected_server_identity: String,
+    token: String,
+    #[cfg(target_os = "linux")]
+    delegated: Option<platform::delegated::Profile>,
+}
+
+pub struct LoadedClient {
+    ordinary: ClientConfig,
+    #[cfg(target_os = "linux")]
+    delegated: Option<platform::delegated::Profile>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use platform::delegated::{AgentListener, Profile, group_member};
+
 fn private_file(path: &Path) -> Result<Vec<u8>> {
     crate::config::checked_path(path)?;
     crate::security::private(path)?;
@@ -64,9 +83,20 @@ fn private_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl ClientConfig {
-    pub fn load(path: &Path) -> Result<Self> {
-        let value: Self = serde_json::from_slice(&private_file(path)?)
+    pub fn load(path: &Path) -> Result<LoadedClient> {
+        let file: ClientFile = serde_json::from_slice(&private_file(path)?)
             .map_err(|_| anyhow::anyhow!("invalid client configuration"))?;
+        let value = Self {
+            address: file.address,
+            expected_server_identity: file.expected_server_identity,
+            token: file.token,
+        };
+        #[cfg(target_os = "linux")]
+        match &file.delegated {
+            Some(profile) => platform::delegated::validate(&value, profile)?,
+            None => platform::validate_address(&value.address)?,
+        }
+        #[cfg(not(target_os = "linux"))]
         platform::validate_address(&value.address)?;
         platform::validate_identity(&value.expected_server_identity)?;
         if value.token.len() != 64
@@ -77,7 +107,11 @@ impl ClientConfig {
         {
             bail!("invalid credential");
         }
-        Ok(value)
+        Ok(LoadedClient {
+            ordinary: value,
+            #[cfg(target_os = "linux")]
+            delegated: file.delegated,
+        })
     }
 }
 
@@ -161,11 +195,52 @@ async fn run_listener(
     )
     .await
 }
+#[derive(Clone, Default)]
+struct ConnectionProfile {
+    #[cfg(target_os = "linux")]
+    build: Option<Arc<crate::service::cluster_build::BuildService>>,
+}
+
 async fn run_listener_until(
+    listener: impl Acceptor,
+    config: Arc<crate::config::Config>,
+    activity: Arc<crate::store::Activity>,
+    stop: crate::service::Shutdown,
+) -> Result<()> {
+    run_listener_with(
+        listener,
+        config,
+        activity,
+        stop,
+        ConnectionProfile::default(),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn run_delegated(
+    listener: AgentListener,
+    config: Arc<crate::config::Config>,
+    activity: Arc<crate::store::Activity>,
+    stop: crate::service::Shutdown,
+    build: Arc<crate::service::cluster_build::BuildService>,
+) -> Result<()> {
+    run_listener_with(
+        listener,
+        config,
+        activity,
+        stop,
+        ConnectionProfile { build: Some(build) },
+    )
+    .await
+}
+
+async fn run_listener_with(
     mut listener: impl Acceptor,
     config: Arc<crate::config::Config>,
     activity: Arc<crate::store::Activity>,
     stop: crate::service::Shutdown,
+    profile: ConnectionProfile,
 ) -> Result<()> {
     let capacity = Arc::new(tokio::sync::Semaphore::new(8));
     let mut tasks = tokio::task::JoinSet::new();
@@ -192,9 +267,10 @@ async fn run_listener_until(
                 };
                 let config = config.clone();
                 let activity = activity.clone();
+                let profile = profile.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _ = connection(stream, config, activity).await;
+                    let _ = connection(stream, config, activity, profile).await;
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -206,10 +282,21 @@ async fn run_listener_until(
     Ok(())
     // ServiceApplication cancels and joins dedicated workers after connections stop.
 }
+#[cfg(target_os = "linux")]
+struct CloseDelegated(crate::service::Shutdown);
+
+#[cfg(target_os = "linux")]
+impl Drop for CloseDelegated {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     config: Arc<crate::config::Config>,
     activity: Arc<crate::store::Activity>,
+    profile: ConnectionProfile,
 ) -> Result<()> {
     let principal = tokio::time::timeout(AUTH_TIMEOUT, async {
         let mut preamble = [0u8; 70]; // "ARX1 " + exactly 64 hex + newline
@@ -235,14 +322,28 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (sdk, pump) = tokio::io::duplex(FRAME_LIMIT);
     let (sdk_read, sdk_write) = tokio::io::split(sdk);
     let (pump_read, pump_write) = tokio::io::split(pump);
+    #[cfg(target_os = "linux")]
+    let close = profile.build.as_ref().map(|_| CloseDelegated(crate::service::Shutdown::default()));
     let protocol = async {
-        let service = tokio::time::timeout(
-            AUTH_TIMEOUT,
-            handler.serve(
-                AsyncRwTransport::new_server(sdk_read, sdk_write).with_max_line_length(FRAME_LIMIT),
-            ),
-        )
-        .await??;
+        let transport =
+            AsyncRwTransport::new_server(sdk_read, sdk_write).with_max_line_length(FRAME_LIMIT);
+        #[cfg(target_os = "linux")]
+        if let (Some(build), Some(close)) = (profile.build, &close) {
+            let service = tokio::time::timeout(
+                AUTH_TIMEOUT,
+                crate::mcp::DelegatedInventory {
+                    local: handler,
+                    build,
+                    closed: close.0.clone(),
+                }
+                .serve(transport),
+            )
+            .await??;
+            service.waiting().await?;
+            return Ok::<_, anyhow::Error>(());
+        }
+        let _ = profile;
+        let service = tokio::time::timeout(AUTH_TIMEOUT, handler.serve(transport)).await??;
         service.waiting().await?;
         Ok::<_, anyhow::Error>(())
     };
@@ -255,8 +356,25 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// No credential bytes are written until connect() has verified kernel identity.
-pub async fn bridge(config: ClientConfig) -> Result<()> {
-    bridge_io(config, tokio::io::stdin(), tokio::io::stdout()).await
+pub async fn bridge(config: LoadedClient) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(profile) = config.delegated {
+        let stream = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            platform::delegated::connect(&config.ordinary, &profile),
+        )
+        .await
+        .context("peer-connect-timeout")?
+        .context("peer-connect-or-identity")?;
+        return bridge_connected(
+            stream,
+            config.ordinary,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        )
+        .await;
+    }
+    bridge_io(config.ordinary, tokio::io::stdin(), tokio::io::stdout()).await
 }
 /// The stdio bridge over any byte streams; tests drive it with in-memory pipes.
 async fn bridge_io<I: AsyncRead + Unpin, O: AsyncWrite + Unpin>(
@@ -264,10 +382,19 @@ async fn bridge_io<I: AsyncRead + Unpin, O: AsyncWrite + Unpin>(
     input: I,
     output: O,
 ) -> Result<()> {
-    let mut stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config))
+    let stream = tokio::time::timeout(AUTH_TIMEOUT, platform::connect(&config))
         .await
         .context("peer-connect-timeout")?
         .context("peer-connect-or-identity")?;
+    bridge_connected(stream, config, input, output).await
+}
+
+async fn bridge_connected(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    config: ClientConfig,
+    input: impl AsyncRead + Unpin,
+    output: impl AsyncWrite + Unpin,
+) -> Result<()> {
     tokio::time::timeout(AUTH_TIMEOUT, async {
         stream.write_all(b"ARX1 ").await?;
         stream.write_all(config.token.as_bytes()).await?;

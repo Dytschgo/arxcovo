@@ -196,6 +196,22 @@ pub struct Failure {
     pub reason: Reason,
     pub execution_reason: Option<Unavailable>,
 }
+#[cfg(target_os = "linux")]
+pub(super) struct BuildReservation(Arc<Execution>);
+
+#[cfg(target_os = "linux")]
+impl Drop for BuildReservation {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) enum BuildAdmissionError {
+    Unavailable(Unavailable),
+    Storage,
+}
+
 struct CancelOnDrop(Cancellation);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -395,6 +411,17 @@ impl Execution {
             Ok(())
         }
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn reserve_build(self: &Arc<Self>) -> Result<BuildReservation, Unavailable> {
+        self.preflight()?;
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .map_err(|_| Unavailable::Busy)?;
+        Ok(BuildReservation(self.clone()))
+    }
+
     /// Called synchronously after the started transaction; worker owns finish.
     pub(crate) fn dispatch(
         self: &Arc<Self>,
@@ -464,6 +491,56 @@ impl Execution {
             })?
         }
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn dispatch_build(
+        reservation: BuildReservation,
+        activity: Arc<Activity>,
+        request: Request,
+        persist: impl FnOnce(&Activity) -> anyhow::Result<i64>,
+        prepared: impl FnOnce(&Cancellation, &Cancellation) -> Report + Send + 'static,
+    ) -> Result<
+        (
+            i64,
+            impl std::future::Future<Output = Result<Value, Failure>> + Send + 'static,
+        ),
+        BuildAdmissionError,
+    > {
+        let execution = reservation.0.clone();
+        let mut workers = execution.workers.lock().unwrap();
+        while let Some(result) = workers.try_join_next() {
+            if result.is_err() {
+                execution.quarantined.store(true, Ordering::Release);
+            }
+        }
+        if execution.shutdown.is_cancelled() || execution.quarantined.load(Ordering::Acquire) {
+            return Err(BuildAdmissionError::Unavailable(Unavailable::Stopping));
+        }
+        // Drain seals admission before taking this same set. A committed row is
+        // handed to its owner before the set can move, even across shutdown.
+        let id = persist(&activity).map_err(|_| BuildAdmissionError::Storage)?;
+        let cancel = Cancellation::default();
+        let guard = CancelOnDrop(cancel.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let this = execution.clone();
+        workers.spawn_blocking(move || {
+            let report = if this.shutdown.is_cancelled() {
+                Report::Unavailable(Unavailable::Stopping)
+            } else {
+                prepared(&cancel, &this.shutdown)
+            };
+            drop(reservation);
+            let result = this.complete(report, Some(&request), &activity, id);
+            let _ = send.send(result);
+        });
+        Ok((id, async move {
+            let _guard = guard;
+            receive.await.map_err(|_| Failure {
+                reason: Reason::ExecutionFailed,
+                execution_reason: None,
+            })?
+        }))
+    }
+
     /// Shared terminal persistence for accepted workers and synchronous refusals.
     fn complete(
         &self,

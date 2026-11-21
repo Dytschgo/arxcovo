@@ -7,6 +7,8 @@ use std::{path::Path, sync::Mutex, time::Duration};
 mod account_choice_tests;
 #[cfg(all(test, windows))]
 mod crash_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod delegated_build_tests;
 
 /// Memory-only cache of released discovery response metadata.
 #[derive(Clone)]
@@ -16,6 +18,18 @@ pub(crate) struct ToolCache {
     pub(crate) observed_identity: serde_json::Value,
     pub(crate) observed_at_ms: u64,
 }
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuildActivity {
+    pub(crate) activity_id: i64,
+    pub(crate) outcome: Outcome,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) cleanup_confirmed: Option<bool>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+}
+
 /// Private local identity and bounded activity; no credentials or host paths.
 pub struct Activity {
     tool_cache: Mutex<Option<ToolCache>>,
@@ -159,6 +173,14 @@ impl Activity {
             let columns = columns.join(",");
             tx.execute_batch(&format!("INSERT INTO activity({columns}) SELECT {columns} FROM activity_v3; INSERT INTO sqlite_sequence(name,seq) SELECT 'activity',seq FROM sqlite_sequence WHERE name='activity_v3' AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='activity'); UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='activity_v3'),0)) WHERE name='activity'; DROP TABLE activity_v3; PRAGMA user_version=4;"))?;
         }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS delegated_build(
+                operation BLOB PRIMARY KEY NOT NULL CHECK(typeof(operation)='blob' AND length(operation)=32),
+                scope BLOB NOT NULL CHECK(typeof(scope)='blob' AND length(scope)=32),
+                activity_id INTEGER NOT NULL UNIQUE CHECK(activity_id>0),
+                forwarded INTEGER NOT NULL CHECK(forwarded IN (0,1))
+            ) WITHOUT ROWID;",
+        )?;
         tx.execute(
             "UPDATE activity SET outcome='interrupted',finished_at_ms=?1 WHERE outcome='started'",
             [now_ms()?],
@@ -289,7 +311,7 @@ impl Activity {
         let tx = db.transaction()?;
         tx.execute("INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode) VALUES (?1,?2,'started',?3,?4,?5,?6)", params![principal,tool.as_str(),if daemon {"daemon"} else {"agent"},tool.class(),now_ms()?,mode.map(IdentityMode::as_str)])?;
         let id = tx.last_insert_rowid();
-        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' ORDER BY id DESC LIMIT 200); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' ORDER BY id DESC LIMIT 1000);")?;
+        tx.execute_batch("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build); DELETE FROM activity WHERE class<>'read' AND id NOT IN (SELECT id FROM activity WHERE class<>'read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 1000) AND id NOT IN (SELECT activity_id FROM delegated_build);")?;
         check_size(&tx)?;
         tx.commit()?;
         Ok(id)
@@ -347,11 +369,121 @@ impl Activity {
         if changed != 1 {
             anyhow::bail!("activity completion refused");
         }
-        tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' ORDER BY id DESC LIMIT 200)", [])?;
+        tx.execute("DELETE FROM activity WHERE class='read' AND id NOT IN (SELECT id FROM activity WHERE class='read' AND id NOT IN (SELECT activity_id FROM delegated_build) ORDER BY id DESC LIMIT 200) AND id NOT IN (SELECT activity_id FROM delegated_build)", [])?;
         check_size(&tx)?;
         tx.commit()?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_delegated_build(
+        &self,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarder: Option<&str>,
+    ) -> Result<i64> {
+        if let Some(principal) = forwarder {
+            validate_principal(principal)?;
+        }
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let tx = db.transaction()?;
+        let forwarded = forwarder.is_some();
+        let count: u32 = tx.query_row(
+            "SELECT count(*) FROM delegated_build WHERE forwarded=?1",
+            [forwarded],
+            |row| row.get(0),
+        )?;
+        if count >= 128 {
+            let id: Option<i64> = tx
+                .query_row(
+                    "SELECT a.id FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+                 WHERE d.forwarded=?1 AND (a.cleanup_confirmed=1 OR a.outcome='refused')
+                 ORDER BY a.id LIMIT 1",
+                    [forwarded],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let id = id.ok_or_else(|| anyhow::anyhow!("delegated activity full"))?;
+            tx.execute("DELETE FROM delegated_build WHERE activity_id=?1", [id])?;
+            tx.execute("DELETE FROM activity WHERE id=?1", [id])?;
+        }
+        tx.execute(
+            "INSERT INTO activity(principal,tool,outcome,actor_kind,class,started_at_ms,identity_mode)
+             VALUES (?1,'run_command','started',?2,'action',?3,'dedicated_account')",
+            params![forwarder.unwrap_or("arxd"), if forwarded { "agent" } else { "daemon" }, now_ms()?],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO delegated_build VALUES(?1,?2,?3,?4)",
+            params![operation, scope, id, forwarded],
+        )?;
+        check_size(&tx)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn delegated_build(
+        &self,
+        operation: [u8; 32],
+        scope: [u8; 32],
+        forwarded: bool,
+    ) -> Result<Option<BuildActivity>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let record = db
+            .query_row(
+                "SELECT a.id, CASE WHEN length(a.outcome)<=16 THEN a.outcome END,
+                    a.exit_code, a.cleanup_confirmed,
+                    CASE WHEN a.observed_kind='unix_uid' AND length(a.observed_id)<=10
+                              THEN CAST(a.observed_id AS INTEGER) END,
+                    a.observed_gid
+             FROM delegated_build d JOIN activity a ON a.id=d.activity_id
+             WHERE d.operation=?1 AND d.scope=?2 AND d.forwarded=?3",
+                params![operation, scope, forwarded],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((activity_id, outcome, exit_code, cleanup_confirmed, uid, gid)) = record else {
+            return Ok(None);
+        };
+        Ok(Some(BuildActivity {
+            activity_id,
+            outcome: Outcome::parse(&outcome)?,
+            exit_code,
+            cleanup_confirmed,
+            uid,
+            gid,
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn forwarded_builds(&self, scope: [u8; 32]) -> Result<Vec<[u8; 32]>> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("activity unavailable"))?;
+        let mut query = db.prepare(
+            "SELECT operation FROM delegated_build WHERE scope=?1 AND forwarded=1
+             AND typeof(operation)='blob' AND length(operation)=32 ORDER BY activity_id DESC LIMIT 32",
+        )?;
+        let rows = query.query_map([scope], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Caller must use its own committed read id; SQL bounds both rows and values.
     pub fn list(&self, principal: &str, read_id: i64, args: &ListActivity) -> Result<ActivityPage> {
         self.list_filtered(principal, read_id, args, None)

@@ -1,5 +1,5 @@
 //! Linux ownership of the cluster worker and owner-local endpoint.
-use super::{Shutdown, cluster_owner};
+use super::{Shutdown, cluster_build, cluster_owner};
 use crate::cluster::consensus::activation::{
     self as activation, Admission, InheritedListeners, Installation, Intent, Route, Running,
 };
@@ -38,6 +38,7 @@ struct Settings {
     history: PathBuf,
     owner_socket: PathBuf,
     executor_socket: Option<PathBuf>,
+    delegated_build: Option<cluster_build::Settings>,
     peer: String,
     enrollment: String,
     issuer_peer: Option<String>,
@@ -56,6 +57,8 @@ struct Checked {
     issuer: Option<std::net::SocketAddr>,
     socket: PathBuf,
     executor_socket: Option<PathBuf>,
+    delegated_build: Option<cluster_build::Settings>,
+    stamp: ConfigStamp,
     roles: cluster_owner::Roles,
 }
 
@@ -272,6 +275,29 @@ impl Settings {
                 }
             }
         }
+        if let Some(build) = &settings.delegated_build {
+            if !pass.open(&build.activity, false)?
+                || paths.iter().any(|other| {
+                    overlaps(other, &build.activity)
+                        || object(&pass.0[&build.activity].1) == object(&pass.0[*other].1)
+                })
+            {
+                return Err(refusal());
+            }
+            let metadata = &pass.0[&build.activity].1;
+            if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
+                return Err(refusal());
+            }
+            for ancestor in build.activity.ancestors() {
+                let metadata = &pass.0[ancestor].1;
+                if ![0, uid].contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+                    return Err(refusal());
+                }
+            }
+            for root in ordinary {
+                pass.ordinary_disjoint(root, &[&build.activity])?;
+            }
+        }
         let stamp = pass.stamp(&data);
         if expected.is_some_and(|expected| expected != stamp) {
             return Err(refusal());
@@ -289,7 +315,7 @@ impl Settings {
     ) -> anyhow::Result<Checked> {
         // SAFETY: these identity getters take no pointers.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let (settings, _) = Self::vetted(path, uid, &[], expected)?;
+        let (settings, stamp) = Self::vetted(path, uid, &[], expected)?;
         if settings.daemon_gid != gid {
             return Err(refusal());
         }
@@ -330,6 +356,19 @@ impl Settings {
         {
             return Err(refusal());
         }
+        if let Some(build) = &settings.delegated_build
+            && (!build.valid(peer, enrollment)
+                || build.agent_group == settings.owner_gid
+                || build.agent_group == settings.daemon_gid
+                || !build.agents.iter().any(|a| a.uid == settings.agent_uid)
+                || build.agents.iter().any(|a| {
+                    [settings.owner_uid, settings.daemon_uid, settings.build_uid].contains(&a.uid)
+                })
+                || build.socket == settings.owner_socket
+                || settings.executor_socket.as_ref() == Some(&build.socket))
+        {
+            return Err(refusal());
+        }
         Ok(Checked {
             installation: Installation {
                 config: path.into(),
@@ -347,6 +386,8 @@ impl Settings {
             issuer,
             socket: settings.owner_socket,
             executor_socket: settings.executor_socket,
+            delegated_build: settings.delegated_build,
+            stamp,
             roles: cluster_owner::Roles {
                 owner: settings.owner_uid,
                 daemon: settings.daemon_uid,
@@ -514,6 +555,93 @@ struct Work {
     first: Option<activation::Error>,
 }
 
+struct BuildRuntime {
+    service: Arc<cluster_build::BuildService>,
+    tasks: tokio::task::JoinSet<Result<(), ()>>,
+    failed: bool,
+}
+
+impl BuildRuntime {
+    async fn bind(
+        settings: cluster_build::Settings,
+        roles: &cluster_owner::Roles,
+        execution: Option<Arc<super::executor::Execution>>,
+        broker: Option<super::cluster_build_executor::BuildBroker>,
+        policy: (PathBuf, ConfigStamp),
+        stop: Shutdown,
+    ) -> anyhow::Result<Self> {
+        let ordinary = settings.activity.clone();
+        let mut activity =
+            tokio::task::spawn_blocking(move || crate::store::Activity::open(&ordinary))
+                .await
+                .map_err(|_| refusal())?
+                .map_err(|_| refusal())?;
+        activity.dedicated = execution;
+        let activity = Arc::new(activity);
+        let agents = settings
+            .agents
+            .iter()
+            .map(|agent| crate::config::Agent {
+                principal: agent.principal.clone(),
+                token_sha256: agent.token_sha256.clone(),
+            })
+            .collect();
+        let profile = crate::local::Profile {
+            owner_uid: roles.owner,
+            daemon_uid: roles.daemon,
+            agent_group: settings.agent_group,
+        };
+        if crate::local::group_member(roles.owner, profile.agent_group)
+            || crate::local::group_member(roles.build, profile.agent_group)
+        {
+            return Err(refusal());
+        }
+        let local = crate::local::AgentListener::bind(
+            settings.socket.clone(),
+            profile,
+            settings.agents.iter().map(|a| a.uid).collect(),
+        )?;
+        let config = Arc::new(crate::config::Config {
+            agents,
+            state_dir: settings.activity.clone(),
+            ..Default::default()
+        });
+        let peer = tokio::net::TcpListener::bind(settings.peer)
+            .await
+            .map_err(|_| refusal())?;
+        let uid = roles.daemon;
+        let (file, stamp) = policy;
+        let service = cluster_build::BuildService::new(
+            settings,
+            activity.clone(),
+            broker,
+            move || Settings::vetted(&file, uid, &[], Some(stamp)).is_ok(),
+            stop.clone(),
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        let build = service.clone();
+        tasks.spawn(async move {
+            crate::local::run_delegated(local, config, activity, stop, build)
+                .await
+                .map_err(|_| ())
+        });
+        let build = service.clone();
+        tasks.spawn(async move { build.serve(peer).await.map_err(|_| ()) });
+        Ok(Self {
+            service,
+            tasks,
+            failed: false,
+        })
+    }
+
+    async fn join(&mut self) -> Result<(), ()> {
+        while let Some(result) = self.tasks.join_next().await {
+            self.failed |= !matches!(result, Ok(Ok(())));
+        }
+        (!self.failed).then_some(()).ok_or(())
+    }
+}
+
 pub(crate) struct Lifecycle {
     work: Arc<Mutex<Work>>,
     fence: Arc<Admission>,
@@ -528,6 +656,7 @@ impl Lifecycle {
         checked: Checked,
         intent: Intent,
         fence: Arc<Admission>,
+        build: Option<Arc<cluster_build::BuildService>>,
     ) -> anyhow::Result<Self> {
         if !fence.check_addresses(checked.installation.peer, checked.installation.enrollment) {
             return Err(refusal());
@@ -628,7 +757,7 @@ impl Lifecycle {
         if work.lock().await.waiting.is_some() {
             status.send_replace(Status::Pending);
         }
-        let supervisor = tokio::spawn(hold(work.clone(), status, stop.clone()));
+        let supervisor = tokio::spawn(hold(work.clone(), status, stop.clone(), build));
         Ok(Self {
             work,
             fence,
@@ -684,7 +813,12 @@ impl Lifecycle {
     }
 }
 
-async fn hold(work: Arc<Mutex<Work>>, status: watch::Sender<Status>, stop: Shutdown) {
+async fn hold(
+    work: Arc<Mutex<Work>>,
+    status: watch::Sender<Status>,
+    stop: Shutdown,
+    build: Option<Arc<cluster_build::BuildService>>,
+) {
     let attach = {
         let work = work.lock().await;
         if let Some(running) = &work.running {
@@ -720,6 +854,12 @@ async fn hold(work: Arc<Mutex<Work>>, status: watch::Sender<Status>, stop: Shutd
         if let Some(running) = work.running.as_mut() {
             match running.observe().await {
                 Ok(ready) => {
+                    if ready.strict
+                        && let Some(build) = &build
+                        && let Some(authority) = running.delegated_build()
+                    {
+                        build.set_authority(authority);
+                    }
                     let phase = if ready.issuer && ready.transferred {
                         Status::Transferred
                     } else if ready.issuer {
@@ -972,13 +1112,38 @@ async fn process(
     }
     let mut checked = Settings::checked(path, intent, expected).map_err(|_| ())?;
     let build_uid = checked.roles.build;
-    let executor = match checked.executor_socket.take() {
-        Some(socket) => Some(
-            tokio::task::spawn_blocking(move || {
+    let (executor, broker) = match checked.executor_socket.take() {
+        Some(socket) if checked.delegated_build.is_some() => {
+            let (execution, broker) = tokio::task::spawn_blocking(move || {
+                super::cluster_build_executor::connect_build(socket, build_uid)
+            })
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+            (Some(execution), Some(broker))
+        }
+        Some(socket) => {
+            let execution = tokio::task::spawn_blocking(move || {
                 super::cluster_build_executor::connect(socket, build_uid)
             })
             .await
             .map_err(|_| ())?
+            .map_err(|_| ())?;
+            (Some(execution), None)
+        }
+        None => (None, None),
+    };
+    let build = match checked.delegated_build.take() {
+        Some(settings) => Some(
+            BuildRuntime::bind(
+                settings,
+                &checked.roles,
+                executor.clone(),
+                broker,
+                (checked.installation.config.clone(), checked.stamp),
+                stop.clone(),
+            )
+            .await
             .map_err(|_| ())?,
         ),
         None => None,
@@ -989,10 +1154,15 @@ async fn process(
         signal_fence.stop();
     });
     let parent = parent.map(|stream| ParentControl::new(stream, fence.clone()));
-    let lifecycle = Lifecycle::start(checked, intent, fence)
-        .await
-        .map_err(|_| ())?;
-    let result = run_lifecycle_with_executor(lifecycle, stop, parent, executor).await;
+    let lifecycle = Lifecycle::start(
+        checked,
+        intent,
+        fence,
+        build.as_ref().map(|b| b.service.clone()),
+    )
+    .await
+    .map_err(|_| ())?;
+    let result = run_lifecycle_owned(lifecycle, stop, parent, executor, build).await;
     signal_stop.abort();
     forwarding.abort();
     result
@@ -1059,11 +1229,22 @@ async fn run_lifecycle(
     run_lifecycle_with_executor(lifecycle, stop, parent, None).await
 }
 
+#[cfg(test)]
 async fn run_lifecycle_with_executor(
+    lifecycle: Lifecycle,
+    stop: Shutdown,
+    parent: Option<ParentControl>,
+    executor: Option<Arc<super::executor::Execution>>,
+) -> Result<(), LifecycleFailure> {
+    run_lifecycle_owned(lifecycle, stop, parent, executor, None).await
+}
+
+async fn run_lifecycle_owned(
     mut lifecycle: Lifecycle,
     stop: Shutdown,
     mut parent: Option<ParentControl>,
     executor: Option<Arc<super::executor::Execution>>,
+    mut build: Option<BuildRuntime>,
 ) -> Result<(), LifecycleFailure> {
     use tokio::io::AsyncWriteExt;
 
@@ -1086,6 +1267,12 @@ async fn run_lifecycle_with_executor(
             biased;
             _ = stop.cancelled() => Ok(()),
             _ = lifecycle.stopped_or_failed() => Err(()),
+            _ = async {
+                match &mut build {
+                    Some(build) => { let _ = build.tasks.join_next().await; build.failed = true; }
+                    None => std::future::pending().await,
+                }
+            } => Err(()),
         };
     }
     lifecycle.fence.stop();
@@ -1095,16 +1282,27 @@ async fn run_lifecycle_with_executor(
         let notice = parent.writer.write_u8(FAILED).await.map_err(|_| ());
         result = result.and(notice);
     }
-    let (joined, execution_closed) = tokio::join!(lifecycle.quiesce(), async {
-        match executor {
-            Some(execution) => matches!(
-                tokio::time::timeout(CLOSE, execution.drain()).await,
-                Ok(Ok(()))
-            ),
-            None => true,
+    let (joined, execution_closed, builds_closed) = tokio::join!(
+        lifecycle.quiesce(),
+        async {
+            match executor {
+                Some(execution) => matches!(
+                    tokio::time::timeout(CLOSE, execution.drain()).await,
+                    Ok(Ok(()))
+                ),
+                None => true,
+            }
+        },
+        async {
+            match &mut build {
+                Some(build) => {
+                    matches!(tokio::time::timeout(CLOSE, build.join()).await, Ok(Ok(())))
+                }
+                None => true,
+            }
         }
-    });
-    let joined = joined.and_then(|()| execution_closed.then_some(()).ok_or(()));
+    );
+    let joined = joined.and_then(|()| (execution_closed && builds_closed).then_some(()).ok_or(()));
     let authorized = match &mut parent {
         Some(parent) => parent.authorize_close(joined.is_ok()).await,
         None => joined,

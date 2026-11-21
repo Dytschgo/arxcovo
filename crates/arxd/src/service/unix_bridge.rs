@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -254,6 +254,7 @@ impl UnixBridge {
         request: Option<&Request>,
         cancel: &Cancellation,
         shutdown: &Cancellation,
+        slot: Option<&Path>,
     ) -> Report {
         let runner = match &self.runner {
             Ok(r) => r,
@@ -265,7 +266,11 @@ impl UnixBridge {
         if let Err(token) = self.readiness.check() {
             return Report::Unavailable(token);
         }
-        let spec = spec(&self.binary, request);
+        let mut spec = spec(&self.binary, request);
+        if let Some(slot) = slot {
+            spec.cwd = slot.into();
+            spec.arguments[3].clear();
+        }
         let outcome = runner.run(&spec, cancel, shutdown);
         if runner.cleanup_residue()
             || matches!(
@@ -329,7 +334,32 @@ impl Executor for UnixBridge {
         cancel: &Cancellation,
         shutdown: &Cancellation,
     ) -> Report {
-        match catch_unwind(AssertUnwindSafe(|| self.body(request, cancel, shutdown))) {
+        self.run_at(request, cancel, shutdown, None)
+    }
+}
+
+impl UnixBridge {
+    #[cfg(target_os = "linux")]
+    pub(super) fn run_build(
+        &self,
+        request: &Request,
+        slot: &Path,
+        cancel: &Cancellation,
+        shutdown: &Cancellation,
+    ) -> Report {
+        self.run_at(Some(request), cancel, shutdown, Some(slot))
+    }
+
+    fn run_at(
+        &self,
+        request: Option<&Request>,
+        cancel: &Cancellation,
+        shutdown: &Cancellation,
+        slot: Option<&Path>,
+    ) -> Report {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.body(request, cancel, shutdown, slot)
+        })) {
             Ok(report) => report,
             Err(_payload) => {
                 if self
