@@ -6,49 +6,33 @@ use crate::cluster::{
     pki::verify::{Registry, VerifyRefusal},
 };
 use std::{
-    sync::{Arc, Mutex, MutexGuard, TryLockError},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, TryLockError},
+    time::Duration,
 };
+use tokio::time::{Instant, sleep_until};
 
-type AppliedStore = Mutex<super::StateStore>;
-type StoreLock<'a> = Result<MutexGuard<'a, super::StateStore>, VerifyRefusal>;
-
-fn try_applied_store(store: &AppliedStore) -> StoreLock<'_> {
-    store.try_lock().map_err(|_| VerifyRefusal::Unavailable)
-}
-
-fn lock_inbound_store(store: &AppliedStore) -> StoreLock<'_> {
-    wait_for_applied_store(store, Instant::now, std::thread::sleep)
-}
-
-// Two inbound checks can each spend at most 4 ms acquiring the store, a small
-// share of the 75 ms replication deadline. Sleep only after WouldBlock.
+// The incoming handshake and dispatch checks each have a 4 ms acquisition
+// budget, against a 75 ms AppendEntries caller deadline.
 const LEARNER_STORE_WAIT: Duration = Duration::from_millis(4);
 const LEARNER_STORE_POLL: Duration = Duration::from_micros(250);
 
-fn wait_for_applied_store(
-    store: &AppliedStore,
-    now: impl Fn() -> Instant,
-    mut pause: impl FnMut(Duration),
-) -> StoreLock<'_> {
-    let deadline = now() + LEARNER_STORE_WAIT;
-    let mut waited = false;
-    loop {
-        match store.try_lock() {
-            Ok(guard) if !waited || now() < deadline => return Ok(guard),
-            Err(TryLockError::WouldBlock) if !store.is_poisoned() => {}
-            _ => return Err(VerifyRefusal::Unavailable),
-        }
+enum ObservationRefusal {
+    StoreBusy,
+    Refused(VerifyRefusal),
+}
 
-        let remaining = deadline.saturating_duration_since(now());
-        if remaining.is_zero() {
-            return Err(VerifyRefusal::Unavailable);
+impl From<VerifyRefusal> for ObservationRefusal {
+    fn from(reason: VerifyRefusal) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<ObservationRefusal> for VerifyRefusal {
+    fn from(reason: ObservationRefusal) -> Self {
+        match reason {
+            ObservationRefusal::StoreBusy => Self::Unavailable,
+            ObservationRefusal::Refused(reason) => reason,
         }
-        pause(LEARNER_STORE_POLL.min(remaining));
-        if now() >= deadline {
-            return Err(VerifyRefusal::Unavailable);
-        }
-        waited = true;
     }
 }
 
@@ -88,7 +72,7 @@ pub(super) enum Phase {
 }
 
 pub(super) struct LearnerGate {
-    store: std::sync::Weak<AppliedStore>,
+    store: std::sync::Weak<Mutex<super::StateStore>>,
     identity: Arc<crate::cluster::join_receipt::ExpectedIdentity>,
     address: std::net::SocketAddr,
     clock: Arc<dyn super::checked_clock::CheckedClock>,
@@ -124,18 +108,27 @@ impl LearnerGate {
     }
 
     pub(super) fn phase(&self) -> Result<Phase, VerifyRefusal> {
-        self.observe(try_applied_store, |_, phase| Ok(phase))
+        self.observe(None, |_, phase| Ok(phase)).map_err(Into::into)
     }
 
     fn observe<T>(
         &self,
-        acquire: impl for<'a> FnOnce(&'a AppliedStore) -> StoreLock<'a>,
+        acquisition_deadline: Option<Instant>,
         f: impl FnOnce(&super::StateStore, Phase) -> Result<T, VerifyRefusal>,
-    ) -> Result<T, VerifyRefusal> {
+    ) -> Result<T, ObservationRefusal> {
         let store = self.store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
-        let store = acquire(&store)?;
-        if store.is_poisoned() || self.clock.sample_ms().is_err() {
-            return Err(VerifyRefusal::Unavailable);
+        let store = match store.try_lock() {
+            Ok(store) => store,
+            Err(TryLockError::WouldBlock) if !store.is_poisoned() => {
+                return Err(ObservationRefusal::StoreBusy);
+            }
+            Err(_) => return Err(VerifyRefusal::Unavailable.into()),
+        };
+        if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || store.is_poisoned()
+            || self.clock.sample_ms().is_err()
+        {
+            return Err(VerifyRefusal::Unavailable.into());
         }
         let mut phase = self
             .phase
@@ -163,15 +156,14 @@ impl LearnerGate {
                 *phase = Phase::Refused;
             }
         }
-        f(&store, *phase)
+        f(&store, *phase).map_err(Into::into)
     }
 
     pub(super) fn admission_progress(
         &self,
     ) -> Result<(Phase, Option<super::LogPos>), VerifyRefusal> {
-        self.observe(try_applied_store, |store, phase| {
-            Ok((phase, store.applied()))
-        })
+        self.observe(None, |store, phase| Ok((phase, store.applied())))
+            .map_err(Into::into)
     }
 
     pub(super) fn admission_anchor(
@@ -198,8 +190,9 @@ impl LearnerGate {
         if cluster != self.identity.cluster || self.admission_anchor()? != (node, key.as_bytes()) {
             return Err(VerifyRefusal::NotMember);
         }
-        self.authorize_with(cluster, node, key, true, try_applied_store)
+        self.try_authorize(cluster, node, key, true, None)
             .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Applied history may pass E between observations. Check any copy of
@@ -217,25 +210,42 @@ impl LearnerGate {
             .all(|position| position.index != original.index || position == original)
     }
 
-    pub(super) fn authorize(
+    pub(super) async fn authorize(
         &self,
         cluster: crate::cluster::enrollment::ClusterId,
         node: crate::cluster::enrollment::NodeId,
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
-        self.authorize_with(cluster, node, key, bootstrap_allowed, lock_inbound_store)
+        let deadline = Instant::now() + LEARNER_STORE_WAIT;
+        let mut acquisition_deadline = None;
+        loop {
+            match self.try_authorize(cluster, node, key, bootstrap_allowed, acquisition_deadline) {
+                Err(ObservationRefusal::StoreBusy) => {}
+                result => return result.map_err(Into::into),
+            }
+            // The synchronous observation returned with neither lock held.
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(VerifyRefusal::Unavailable);
+            }
+            sleep_until((now + LEARNER_STORE_POLL).min(deadline)).await;
+            if Instant::now() >= deadline {
+                return Err(VerifyRefusal::Unavailable);
+            }
+            acquisition_deadline = Some(deadline);
+        }
     }
 
-    fn authorize_with(
+    fn try_authorize(
         &self,
         cluster: crate::cluster::enrollment::ClusterId,
         node: crate::cluster::enrollment::NodeId,
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
-        acquire: impl for<'a> FnOnce(&'a AppliedStore) -> StoreLock<'a>,
-    ) -> Result<Lane, VerifyRefusal> {
-        self.observe(acquire, |store, phase| {
+        acquisition_deadline: Option<Instant>,
+    ) -> Result<Lane, ObservationRefusal> {
+        self.observe(acquisition_deadline, |store, phase| {
             if phase == Phase::Refused || (phase == Phase::Bootstrap && !bootstrap_allowed) {
                 return Err(VerifyRefusal::Unavailable);
             }
@@ -303,7 +313,12 @@ mod tests {
         state_store::{Entry, Init, LogPos, StateStore},
     };
     use crate::service::application::tests::private_temp;
-    use std::{cell::Cell, sync::mpsc, thread};
+    use std::{
+        future::Future,
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+        thread,
+    };
 
     fn node(n: u64) -> NodeId {
         NodeId::new(n).unwrap()
@@ -364,47 +379,51 @@ mod tests {
         )
     }
 
-    #[test]
-    fn learner_inbound_authorizes_when_applied_store_is_released_within_budget() {
+    #[tokio::test(start_paused = true)]
+    async fn learner_inbound_authorizes_when_applied_store_is_released_within_budget() {
         let (_dir, sm) = fixture();
         let gate = learner_gate(&sm);
-        let mut held = Some(sm.0.lock().unwrap());
-        let clock = Cell::new(Instant::now());
-        // Drive only time and sleep. The first try-lock hits the held mutex,
-        // then the simulated pause releases it before the next attempt.
-        let result = gate.authorize_with([1; 16], node(1), key(1), true, |store| {
-            wait_for_applied_store(
-                store,
-                || clock.get(),
-                |delay| {
-                    clock.set(clock.get() + delay);
-                    drop(held.take().expect("one contention pause"));
-                },
-            )
-        });
-        assert_eq!(result, Ok(Lane::Strict));
-        assert!(held.is_none());
+        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
+        {
+            let _held = sm.0.lock().unwrap();
+            assert!(
+                authorization
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        assert_eq!(authorization.await, Ok(Lane::Strict));
     }
 
-    #[test]
-    fn learner_inbound_refuses_when_applied_store_outlasts_budget() {
+    #[tokio::test(start_paused = true)]
+    async fn learner_inbound_refuses_when_applied_store_outlasts_budget() {
         let (_dir, sm) = fixture();
         let gate = learner_gate(&sm);
-        let held = sm.0.lock().unwrap();
-        let start = Instant::now();
-        let clock = Cell::new(start);
-        let result = gate.authorize_with([1; 16], node(1), key(1), true, |store| {
-            wait_for_applied_store(
-                store,
-                || clock.get(),
-                |delay| {
-                    clock.set(clock.get() + delay);
-                },
-            )
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held = sm.0.lock().unwrap();
+            entered.send(()).unwrap();
+            let _ = wait.recv();
         });
-        assert_eq!(result, Err(VerifyRefusal::Unavailable));
-        assert_eq!(clock.get().duration_since(start), Duration::from_millis(4));
-        drop(held);
+        ready.await.unwrap();
+        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
+        assert!(
+            authorization
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_millis(4)).await;
+        assert_eq!(
+            authorization
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(VerifyRefusal::Unavailable))
+        );
+        drop(release);
+        holder.await.unwrap();
     }
 
     #[test]

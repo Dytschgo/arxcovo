@@ -3996,6 +3996,82 @@ fn add_learner_membership(sm: &SmAdapter) {
 }
 
 #[tokio::test]
+async fn learner_dispatch_yields_to_runtime_while_applied_store_is_busy() {
+    use std::task::{Context, Waker};
+
+    let f = Fixture::new();
+    add_learner_membership(&f.sm);
+    let learner = learner_image(&f, 1, true, &f.sm);
+    let spy = rpc_spy(false);
+    let credentials = Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let resources = make_resources_for_learner(
+        CLUSTER,
+        node(2),
+        &f.sm,
+        credentials,
+        spy.clone(),
+        Some(learner),
+    )
+    .unwrap();
+    let (mut owner, _) = TransportOwner::pending_founder(CLUSTER, node(2));
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut events = events(&owner);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handshake = owner.shared.handshakes.clone().try_acquire_owned().unwrap();
+    let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+
+    {
+        let mut server = std::pin::pin!(async {
+            let (socket, _) = listener.accept().await.unwrap();
+            inbound(
+                &owner.shared,
+                resources,
+                socket,
+                handshake,
+                Instant::now() + INBOUND_BUDGET,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+        });
+        let mut client = std::pin::pin!(exchange_learner_for_test(
+            address,
+            f.client_config(&f.client, 2),
+            &frame,
+        ));
+        tokio::select! {
+            result = &mut server => panic!("server finished before dispatch gate: {result:?}"),
+            result = &mut client => panic!("client finished before dispatch gate: {result:?}"),
+            reached = observe(&mut events, Event::Stage(Stage::BeforeDispatch)) => assert!(reached),
+        }
+
+        tokio::time::pause();
+        {
+            let _held = f.sm.0.lock().unwrap();
+            release(&owner, Stage::BeforeDispatch, &hold);
+            assert!(
+                server
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(spy.calls.lock().unwrap().is_empty());
+        }
+        let (server_result, client_result) = tokio::join!(server, client);
+        assert_eq!(server_result, Ok(()));
+        assert!(client_result.is_ok());
+    }
+    assert_eq!(spy.calls.lock().unwrap().as_slice(), &[frame]);
+    assert!(bounded_close(&mut owner).await.is_ok());
+}
+
+#[tokio::test]
 async fn learner_refuses_old_matching_image_after_actual_sql_persistence_failure() {
     let f = Fixture::new();
     add_learner_membership(&f.sm);
@@ -4068,7 +4144,13 @@ async fn learner_refuses_old_matching_image_after_actual_sql_persistence_failure
             .await
             .is_err()
     );
-    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    // The cryptographic handshake starts, but a poisoned store refuses
+    // before the application-authenticated stage and before RequestRead.
+    assert_eq!(rx.try_recv(), Ok(Event::Stage(Stage::ServerHandshake)));
+    assert_eq!(
+        timeout(OBSERVE, rx.recv()).await.unwrap(),
+        Some(Event::Finished(Some(Refusal::Tls)))
+    );
     assert!(spy.calls.lock().unwrap().is_empty());
     assert!(bounded_close(&mut owner).await.is_ok());
 }
@@ -4217,8 +4299,8 @@ async fn learner_removed_anchor_valid_leaf_is_denied_after_strict_cutover() {
     assert!(bounded_close(&mut owner).await.is_ok());
 }
 
-#[test]
-fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed() {
+#[tokio::test]
+async fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed() {
     let f = Fixture::new();
     add_learner_membership(&f.sm);
     let learner = learner_image(&f, 1, true, &f.sm);
@@ -4243,7 +4325,9 @@ fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed()
     ));
     assert_eq!(learner.phase(), Ok(peer_registry::Phase::Refused));
     assert_eq!(
-        learner.authorize(CLUSTER, node(1), f.client.digest(), true),
+        learner
+            .authorize(CLUSTER, node(1), f.client.digest(), true)
+            .await,
         Err(verify::VerifyRefusal::Unavailable)
     );
 }

@@ -651,11 +651,11 @@ async fn inbound(
     if let Some((trace, peer)) = trace {
         trace.inbound(
             peer,
-            "TLS client authorization",
+            "TLS client handshake",
             stream
                 .as_ref()
                 .err()
-                .map(|error| handshake_error(error, "learner gate unavailable")),
+                .map(|error| handshake_error(error, "inbound registry unavailable")),
         );
     }
     let mut stream = stream.map_err(|_| Refusal::Tls)?;
@@ -664,6 +664,23 @@ async fn inbound(
     let peer = authenticated
         .authenticated_identity()
         .map_err(|_| Refusal::Identity)?;
+    if let Some(learner) = &resources.learner {
+        // TLS proved the certificate and possession of its key. Establish
+        // learner authority here, before any application bytes are read.
+        let authorized = learner.authorize(peer.0, peer.1, peer.2, true).await;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some((trace, peer)) = trace {
+            trace.inbound(
+                peer,
+                "learner pre-frame authorization",
+                authorized
+                    .as_ref()
+                    .err()
+                    .map(|reason| format!("{reason:?}")),
+            );
+        }
+        authorized.map_err(|_| Refusal::Tls)?;
+    }
     drop(handshake);
     stage(shared, Stage::ServerAuthenticated).await;
     before_dispatch(shared, deadline)?;
@@ -738,7 +755,9 @@ async fn inbound(
             return Err(Refusal::Identity);
         }
         let bootstrap_allowed = matches!(request, Request::Append(_) | Request::Snapshot(..));
-        let authorized = learner.authorize(peer.0, peer.1, peer.2, bootstrap_allowed);
+        let authorized = learner
+            .authorize(peer.0, peer.1, peer.2, bootstrap_allowed)
+            .await;
         #[cfg(all(test, target_os = "linux"))]
         if let Some((trace, peer)) = trace {
             trace.inbound(
@@ -1117,8 +1136,8 @@ impl GatedCallTrace {
         {
             let elapsed = entry.elapsed();
             let mut inbound = self.inbound.lock().unwrap();
-            // At most seven observations per accepted connection.
-            if inbound.len() < 7 * CONNECTIONS {
+            // At most eight observations per accepted connection.
+            if inbound.len() < 8 * CONNECTIONS {
                 inbound.push((peer, (elapsed, stage, error)));
             }
         }
@@ -1513,12 +1532,12 @@ fn make_resources_for_learner(
     learner: Option<Arc<peer_registry::LearnerGate>>,
 ) -> Result<Arc<Resources>, Refusal> {
     let registry = peer_registry::registry(sm);
-    let inbound: Registry = match &learner {
-        Some(gate) => {
-            let gate = gate.clone();
-            Arc::new(move |cluster, node, key| gate.authorize(cluster, node, key, true).map(|_| ()))
-        }
-        None => registry.clone(),
+    let inbound: Registry = if learner.is_some() {
+        // PeerVerifier still checks the chain and cluster identity. Inbound
+        // learner authorization is asynchronous and runs before framing.
+        Arc::new(|_, _, _| Ok(()))
+    } else {
+        registry.clone()
     };
     let verifier = PeerVerifier::new(credentials.root.clone(), cluster, inbound)
         .map_err(|_| Refusal::Tls)?

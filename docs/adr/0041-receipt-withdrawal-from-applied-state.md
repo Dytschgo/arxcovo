@@ -8,10 +8,11 @@ proposed rewriting the receipt to remove its anchors after catch-up. Step 9
 keeps the publication intact and derives withdrawal from the learner's
 durable applied position, canonical membership and exact local binding.
 
-Only the published learner's inbound TLS verifier can provisionally accept
+Only the published learner's incoming transport can provisionally accept
 an original cluster, node and key tuple absent from the applied registry.
-The transport repeats authorization under a fresh checked observation after
-framing and grants this exception to AppendEntries and full snapshots.
+It checks authority after TLS and before reading application bytes, then
+repeats the checked observation before dispatch. The final check grants
+this exception to AppendEntries and full snapshots.
 A conflicting applied key, unavailable store, store poison or failed clock
 sample refuses. The outgoing verifier uses applied bindings.
 
@@ -35,17 +36,21 @@ multi-host paths are **unverified on real hardware**.
 
 ## Inbound applied-store contention, 2026-11-21
 
-Incoming learner TLS verification and final dispatch each allow up to 4 ms
-to acquire a busy applied-store mutex, with short synchronous pauses between
-try-locks. The two acquisition budgets total at most 8 ms within the existing
-75 ms AppendEntries caller deadline. The acquisition loop stops when its
-monotonic budget expires. Thread scheduling can delay the return, and the
-transport still enforces its existing deadline.
+Rustls verifies the learner's incoming certificate chain, cluster identity
+and proof of key possession. Immediately after the handshake and before
+reading any application bytes, the transport checks learner authority.
+Refusal closes the connection before framing. Final dispatch repeats the
+authorization using the same policy and a new store observation.
+
+Each boundary allows up to 4 ms to acquire a busy applied-store mutex.
+The task awaits short Tokio timer intervals between try-locks, so other
+tasks on the same executor can run. Acquisition after the budget expires
+refuses. The two budgets total up to 8 ms within the existing 75 ms
+AppendEntries caller deadline, which the transport continues to enforce.
 
 The store guard still covers the internal poison check, checked-clock
 sample, phase evaluation and binding authorization. Mutex poison or a dropped
-store refuses directly. An unhealthy store or clock is refused as soon as the
+store refuses directly. An unhealthy store or clock refuses as soon as the
 guarded observation detects it. The phase lock is still a try-lock. Admission
 reply authorization and the applied registry callback in ADR0027 keep their
-immediate try-lock behavior. The bounded acquisition holds no phase guard
-while waiting and holds no store guard across an await.
+immediate try-lock behavior. The acquisition wait holds neither lock.
