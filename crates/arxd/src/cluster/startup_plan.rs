@@ -306,6 +306,92 @@ impl Owner {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Plan {
+    /// The private lane selects the operation without rewriting the pinned config.
+    pub(super) fn with_history_intent(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Owner {
+    pub(super) fn history_config_digest(&self) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let guard = self.history_guard(&self.plan.config)?;
+        use std::os::unix::fs::FileExt;
+        let file = guard.file();
+        let len = file.metadata().map_err(|_| Refusal::Layout)?.len();
+        if len > 16384 {
+            return Err(Refusal::Plan);
+        }
+        let mut bytes = super::pki::custody::voter_transfer::Wipe(vec![0; len as usize]);
+        file.read_exact_at(&mut bytes.0, 0)
+            .map_err(|_| Refusal::Plan)?;
+        guard.recheck()?;
+        if file.metadata().map_err(|_| Refusal::Layout)?.len() != len {
+            return Err(Refusal::Plan);
+        }
+        Ok(Sha256::digest(&bytes.0).into())
+    }
+
+    pub(super) fn history_base_objects(&self) -> Result<[[u64; 2]; 5]> {
+        let path = self.plan.state.join("cluster-owner.lock");
+        let outer = self.history_guard(&path)?;
+        if outer.id != object(&self.lock)? || !outer.read_at(0)?.is_empty() {
+            return Err(Refusal::Ownership);
+        }
+        let mut identities = [[0; 2]; 5];
+        for (identity, path) in identities.iter_mut().zip([
+            &self.plan.config,
+            &self.plan.state,
+            &self.plan.credentials,
+            &self.plan.workspace,
+            &path,
+        ]) {
+            let id = self.history_guard(path)?.id;
+            *identity = [id.0, id.1];
+        }
+        Ok(identities)
+    }
+
+    pub(super) fn history_objects(&self, include_stores: bool) -> Result<Vec<[u64; 2]>> {
+        let mut identities = self.history_base_objects()?.to_vec();
+        let mut paths = vec![
+            self.plan.credentials.join("identity.json"),
+            self.plan.credentials.join("ca.der"),
+            self.plan.credentials.join("member-key"),
+        ];
+        if include_stores {
+            paths.extend([
+                self.plan.state.join("cluster-state.lock"),
+                self.plan.state.join("cluster-log.lock"),
+                self.plan.state.join("cluster-state.sqlite3"),
+                self.plan.state.join("cluster-log.sqlite3"),
+            ]);
+        }
+        for path in paths {
+            let id = self.history_guard(&path)?.id;
+            identities.push([id.0, id.1]);
+        }
+        Ok(identities)
+    }
+
+    fn history_guard(&self, path: &Path) -> Result<&Guard> {
+        let guard = self
+            .guards
+            .iter()
+            .find(|guard| guard.path == path)
+            .ok_or(Refusal::Layout)?;
+        guard.recheck()?;
+        if path != self.plan.workspace {
+            crate::security::private(path).map_err(|_| Refusal::Layout)?;
+        }
+        Ok(guard)
+    }
+}
+
 const STATE: &[&str] = &[
     "cluster-owner.lock",
     "cluster-state.lock",

@@ -653,6 +653,211 @@ pub(super) fn prepare_strict_joiner(
     (stores, inspected.and_then(|_| sample.into_inner()))
 }
 
+/// The terminal result owns the original outer lock, reopened installation
+/// and every acquired store slot regardless of the validation disposition.
+#[cfg(target_os = "linux")]
+pub(super) struct ProcessRecovery {
+    owner: Owner,
+    history: Option<crate::cluster::restart_history::Recovering>,
+    stores: Option<crate::cluster::bound_open::OwnedStores>,
+    ready: Result<HostClock>,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct HistoryReady {
+    pub(super) owner: Owner,
+    pub(super) history: crate::cluster::restart_history::Recovering,
+    pub(super) stores: crate::cluster::bound_open::OwnedStores,
+    pub(super) clock: HostClock,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessRecovery {
+    #[cfg(test)]
+    pub(super) fn sqlite_opens(&self) -> usize {
+        self.stores
+            .as_ref()
+            .map_or(0, |stores| stores.io_counts().1)
+    }
+
+    pub(super) fn into_ready(self) -> std::result::Result<HistoryReady, Box<Self>> {
+        if self.ready.is_err() {
+            return Err(Box::new(self));
+        }
+        let Self {
+            owner,
+            history,
+            stores,
+            ready,
+        } = self;
+        Ok(HistoryReady {
+            owner,
+            history: history.expect("validated history retained"),
+            stores: stores.expect("validated pair retained"),
+            clock: ready.expect("checked clock retained"),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recover_process(
+    mut owner: Owner,
+    slot: crate::cluster::restart_history::Slot,
+    wrap: &Path,
+    custody: &Path,
+    require_applied_route: bool,
+) -> ProcessRecovery {
+    use crate::cluster::restart_history::Recovering;
+    let mut history = match Recovering::open(&owner, slot, wrap, custody) {
+        Ok(history) => history,
+        Err(e) => {
+            return ProcessRecovery {
+                owner,
+                history: None,
+                stores: None,
+                ready: Err(e),
+            };
+        }
+    };
+    let (stores, ready) = match history.authenticate(&owner) {
+        Err(e) => (None, Err(e)),
+        Ok(()) => {
+            let (stores, ready) = historical_pair(&mut owner, &mut history, require_applied_route);
+            (Some(stores), ready)
+        }
+    };
+    ProcessRecovery {
+        owner,
+        history: Some(history),
+        stores,
+        ready,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn historical_pair(
+    owner: &mut Owner,
+    history: &mut crate::cluster::restart_history::Recovering,
+    require_applied_route: bool,
+) -> (crate::cluster::bound_open::OwnedStores, Result<HostClock>) {
+    use crate::cluster::bound_open::{BoundFailure, BoundIntent, BoundStores};
+    let cluster = history.verified().unwrap().expected.cluster;
+    let address = owner.plan.peer.parse().expect("validated owner peer");
+    let (stores, inspected) = BoundStores::operational(
+        owner,
+        BoundIntent::Recovery(cluster),
+        |stores| {
+            let (state, log) = stores.inspect_for_start(cluster, |s, sf, l, lf| {
+                inspect_connections(s, sf, l, lf, cluster).map_err(|_| StoreError::Corrupt)
+            })?;
+            let image = snapshot_state(&state.snapshot).map_err(BoundFailure::Init)?;
+            let evidence = history.verified().map_err(BoundFailure::Inspection)?;
+            check_history_state(
+                evidence,
+                address,
+                require_applied_route,
+                state.applied,
+                state.membership.as_ref(),
+                &image,
+                &log,
+            )
+            .map_err(BoundFailure::Inspection)?;
+            let clock = HostClock::new(image.committed_ms());
+            let now = clock
+                .sample_ms()
+                .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?;
+            stores.validate_owner_for_start(|owner| history.validate_credentials(owner, now))?;
+            Ok((state, log, clock))
+        },
+        |(inspected, inspected_log, clock), state, log| {
+            preflight(log, state).map_err(BoundFailure::Init)?;
+            let live = log.log_state().map_err(BoundFailure::Init)?;
+            let rows = log
+                .entries(0, i64::MAX as u64 + 1, MAX_LIVE)
+                .map_err(BoundFailure::Init)?;
+            if state.is_poisoned()
+                || state.snapshot() != inspected.snapshot
+                || state.applied() != inspected.applied
+                || state.membership() != inspected.membership.as_ref()
+                || live.last != inspected_log.last
+                || live.purged != inspected_log.purged
+                || !rows
+                    .iter()
+                    .map(|(position, _)| position)
+                    .eq(&inspected_log.rows)
+            {
+                return Err(BoundFailure::Inspection(Refusal::Provenance));
+            }
+            clock
+                .sample_ms()
+                .map_err(|_| BoundFailure::Inspection(Refusal::Clock))?;
+            Ok(())
+        },
+    );
+    let result = match inspected {
+        Some((_, _, clock)) => clock
+            .sample_ms()
+            .map_err(|_| Refusal::Clock)
+            .and_then(|now| history.validate_credentials(owner, now))
+            .map(|()| clock),
+        None => Err(stores.first_failure_for_learner()),
+    };
+    (stores, result)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn check_history_state(
+    history: &crate::cluster::restart_history::Verified,
+    address: std::net::SocketAddr,
+    require_applied_route: bool,
+    applied: Option<LogPos>,
+    membership: Option<&(LogPos, MembershipBlob)>,
+    state: &crate::cluster::enrollment::EnrollmentState,
+    log: &LogInspection,
+) -> Result<()> {
+    use crate::cluster::restart_history::covers;
+    let expected = &history.expected;
+    let applied = applied.ok_or(Refusal::Provenance)?;
+    let original = expected.origin.position();
+    for required in [
+        Some(original),
+        history.strict_position(),
+        history.voter_position(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !covers(applied, required)
+            || log.rows.iter().chain(log.purged.iter()).any(|p| {
+                if p.index < required.index {
+                    !covers(required, *p)
+                } else {
+                    !covers(*p, required)
+                }
+            })
+        {
+            return Err(Refusal::Provenance);
+        }
+    }
+    // The canonical state image was decoded as a whole and validated with
+    // preflight. A truncated retained log must still be compatible with it.
+    if !super::peer_registry::crossed(expected, address, applied, membership, state) {
+        return Err(Refusal::Identity);
+    }
+    if expected.origin.founder() || require_applied_route {
+        let (_, blob) = membership.ok_or(Refusal::Identity)?;
+        let members = super::decode(blob).map_err(|_| Refusal::Identity)?;
+        if members
+            .get_node(&expected.node.get())
+            .is_none_or(|n| n.addr != address.to_string())
+        {
+            return Err(Refusal::Identity);
+        }
+    }
+    Ok(())
+}
+
 fn readonly(db: &Connection, file: &File, max_pages: u64, schema: &[(&str, &str)]) -> Result<()> {
     let len = file.metadata().map_err(|_| Refusal::Store)?.len();
     if len < 4096 || len > max_pages * 4096 {
@@ -1046,6 +1251,259 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    #[cfg(target_os = "linux")]
+    mod process_history {
+        use super::*;
+        use crate::cluster::restart_history::{TestFault, tests as fixture};
+
+        fn run(base: &Path, founder: bool, require_route: bool, expected_opens: usize) {
+            let plan = fixture::plan(
+                base,
+                if founder {
+                    Mode::CreateFounder
+                } else {
+                    Mode::Join
+                },
+            )
+            .with_history_intent(if founder {
+                Mode::RecoverFounder
+            } else {
+                Mode::RecoverJoiner
+            });
+            let owner = Owner::acquire(plan).unwrap();
+            let result = recover_process(
+                owner,
+                fixture::slot(base),
+                &base.join("wrap"),
+                &base.join("custody"),
+                require_route,
+            );
+            assert_eq!(result.sqlite_opens(), expected_opens);
+            let external = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(base.join("state/cluster-owner.lock"))
+                .unwrap();
+            assert!(
+                external.try_lock().is_err(),
+                "outer lock remains owned by the terminal result"
+            );
+            if expected_opens == 4 {
+                let Ok(ready) = result.into_ready() else {
+                    panic!("original pair must qualify")
+                };
+                let evidence = ready.history.verified().unwrap();
+                assert_eq!(evidence.expected.origin.position(), fixture::E);
+                assert!(ready.clock.sample_ms().unwrap() >= 100);
+                assert_eq!(ready.stores.io_counts().1, 4);
+            } else {
+                assert!(result.into_ready().is_err());
+            }
+        }
+
+        const POSITIVE: &str = "cluster::consensus::startup_recovery::tests::process_history::process_history_exact_pair_reopens_in_other_process";
+        #[test]
+        fn process_history_exact_pair_reopens_in_other_process() {
+            if let Some((parent, case)) = fixture::probe() {
+                return run(&parent, case == "founder", false, 4);
+            }
+            for founder in [true, false] {
+                let mut f = fixture::Fixture::new(founder, true, None);
+                let route = f.owner.plan.peer.clone();
+                f.seed(fixture::E, fixture::E, founder.then_some(route.as_str()));
+                if !founder {
+                    f.strict(fixture::E);
+                }
+                let layout = f.release();
+                fixture::subprocess(
+                    POSITIVE,
+                    layout.root.path(),
+                    if founder { "founder" } else { "learner" },
+                );
+            }
+        }
+
+        const BOUNDARY: &str = "cluster::consensus::startup_recovery::tests::process_history::process_history_temporary_and_final_boundaries";
+        #[test]
+        fn process_history_temporary_and_final_boundaries() {
+            if let Some((parent, case)) = fixture::probe() {
+                return run(&parent, true, true, if case == "final" { 4 } else { 0 });
+            }
+            for (case, fault, file) in [
+                ("temporary", TestFault::FileSync, "history/.issuance.tmp"),
+                ("final", TestFault::DirectorySync, "history/issuance"),
+            ] {
+                let mut f = fixture::Fixture::new(true, true, Some(fault));
+                let route = f.owner.plan.peer.clone();
+                f.seed(fixture::E, fixture::E, Some(&route));
+                let layout = f.release();
+                assert!(layout.root.path().join(file).is_file());
+                fixture::subprocess(BOUNDARY, layout.root.path(), case);
+                assert!(layout.root.path().join(file).is_file());
+            }
+        }
+
+        #[test]
+        fn process_history_receipt_only_and_partial_objects_open_no_stores() {
+            let e = fixture::E;
+            let mut receipt = fixture::Fixture::new(false, false, None);
+            receipt.seed(e, e, None);
+            let receipt = receipt.release();
+            run(receipt.root.path(), false, false, 0);
+
+            for entry in [".voter.tmp", "unknown", ".strict.tmp"] {
+                let mut f = fixture::Fixture::new(false, true, None);
+                f.seed(e, e, None);
+                f.strict(e);
+                let layout = f.release();
+                let name = format!("history/{entry}");
+                layout.write(&name, b"partial");
+                run(layout.root.path(), false, false, 0);
+                assert!(layout.root.path().join(name).is_file());
+            }
+            let mut orphan = fixture::Fixture::new(false, true, None);
+            orphan.seed(e, e, None);
+            orphan.strict(e);
+            let orphan = orphan.release();
+            fixture::private_dir(orphan.root.path(), "voter-custody");
+            run(orphan.root.path(), false, false, 0);
+        }
+
+        #[test]
+        fn process_history_refuses_pre_e_conflicting_position_and_missing_route_readonly() {
+            let e = fixture::E;
+            let later = LogPos {
+                index: e.index + 1,
+                term: e.term + 2,
+                ..e
+            };
+            for (applied, row, strict, route_required) in [
+                (
+                    LogPos {
+                        index: e.index - 1,
+                        ..e
+                    },
+                    e,
+                    e,
+                    false,
+                ),
+                (
+                    LogPos {
+                        term: e.term + 1,
+                        ..e
+                    },
+                    LogPos {
+                        term: e.term + 1,
+                        ..e
+                    },
+                    e,
+                    false,
+                ),
+                (
+                    LogPos {
+                        leader: e.leader + 1,
+                        ..e
+                    },
+                    LogPos {
+                        leader: e.leader + 1,
+                        ..e
+                    },
+                    e,
+                    false,
+                ),
+                (
+                    later,
+                    LogPos {
+                        leader: e.leader + 1,
+                        ..e
+                    },
+                    e,
+                    false,
+                ),
+                (e, e, later, false),
+                (e, e, e, true),
+            ] {
+                let mut f = fixture::Fixture::new(false, true, None);
+                f.seed(applied, row, None);
+                f.strict(strict);
+                let layout = f.release();
+                let before = layout.snapshot();
+                run(layout.root.path(), false, route_required, 2);
+                assert_eq!(layout.snapshot(), before);
+            }
+        }
+
+        #[test]
+        fn process_history_reopens_after_same_term_leader_succession() {
+            use crate::cluster::membership::Membership;
+            let e = fixture::E;
+            let promoted = LogPos {
+                index: e.index + 1,
+                ..e
+            };
+            let mut f = fixture::Fixture::new(false, true, None);
+            let local = f.expected.node.get();
+            let successor = LogPos {
+                leader: local,
+                index: promoted.index + 1,
+                ..e
+            };
+            f.seed(e, e, None);
+            let members = Membership::new(
+                vec![[e.leader, local].into()],
+                [
+                    (e.leader, "127.0.0.1:7991".into()),
+                    (local, f.owner.plan.peer.clone()),
+                ]
+                .into(),
+            )
+            .unwrap();
+            let entries = [
+                (
+                    promoted,
+                    Entry::Membership(MembershipBlob::new(members.encode().unwrap()).unwrap()),
+                ),
+                (successor, Entry::Blank),
+            ];
+            let state = f.state.as_mut().unwrap();
+            for (position, entry) in &entries {
+                state.apply(*position, entry).unwrap();
+            }
+            assert_eq!(state.applied(), Some(successor));
+            f.log.as_mut().unwrap().append(&entries).unwrap();
+            f.strict(successor);
+            let layout = f.release();
+            run(layout.root.path(), false, true, 4);
+        }
+
+        #[test]
+        fn process_history_validated_snapshot_above_e_and_hot_sidecar_refusal() {
+            let e = fixture::E;
+            let later = LogPos {
+                index: e.index + 1,
+                term: e.term + 1,
+                ..e
+            };
+            let mut f = fixture::Fixture::new(false, true, None);
+            let peer = f.owner.plan.peer.clone();
+            f.seed(later, e, Some(&peer));
+            f.strict(e);
+            f.log.as_mut().unwrap().purge(later).unwrap();
+            let layout = f.release();
+            run(layout.root.path(), false, true, 4);
+            layout.write("state/cluster-log.sqlite3-journal", b"nonzero");
+            assert!(matches!(
+                Owner::acquire(fixture::plan(layout.root.path(), Mode::RecoverJoiner)),
+                Err(Refusal::Store)
+            ));
+            assert_eq!(
+                std::fs::read(layout.root.path().join("state/cluster-log.sqlite3-journal"))
+                    .unwrap(),
+                b"nonzero"
+            );
+        }
+    }
+
     thread_local! {
         static SCHEMA_PROBE: std::cell::RefCell<Option<Arc<AtomicUsize>>> = const { std::cell::RefCell::new(None) };
         static MUTABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
