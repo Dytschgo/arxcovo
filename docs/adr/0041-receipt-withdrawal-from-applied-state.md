@@ -38,7 +38,7 @@ multi-host paths are **unverified on real hardware**.
 
 Rustls verifies the learner's incoming certificate chain, cluster identity
 and proof of key possession. Immediately after the handshake and before
-reading any application bytes, the transport checks learner authority.
+reading any Arxcovo frame, the transport checks learner authority.
 Refusal closes the connection before framing. Final dispatch repeats the
 authorization using the same policy and a new store observation.
 
