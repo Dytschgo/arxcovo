@@ -460,7 +460,45 @@ pub(in crate::cluster) trait Backend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Reply, Refused>> + Send;
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::cluster) struct SuppressedReply {
+    pub request: RequestId,
+    pub key: Option<super::KeyDigest>,
+    pub node: NodeId,
+    pub original: LogPos,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+pub(in crate::cluster) struct TerminalLoss(Mutex<Option<SuppressedReply>>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl TerminalLoss {
+    pub(in crate::cluster) fn observed(&self) -> Option<SuppressedReply> {
+        *self.0.lock().unwrap()
+    }
+
+    fn suppress(&self, request: RequestId, csr: &[u8], reply: &Reply) -> bool {
+        let mut observed = self.0.lock().unwrap();
+        if observed.is_some() {
+            return false;
+        }
+        *observed = Some(SuppressedReply {
+            request,
+            key: crate::cluster::pki::csr::ProvenCsr::parse(csr)
+                .ok()
+                .map(|csr| csr.digest()),
+            node: reply.node,
+            original: reply.original,
+        });
+        true
+    }
+}
+
 struct Control {
+    #[cfg(all(test, target_os = "linux"))]
+    terminal_loss: std::sync::OnceLock<Arc<TerminalLoss>>,
     admission: Mutex<()>,
     closing: watch::Sender<bool>,
     sessions: Arc<Semaphore>,
@@ -522,6 +560,8 @@ impl ListenerOwner {
     ) -> Result<Self, Refused> {
         let config = server_config(leaf, key, time.clone())?;
         let control = Arc::new(Control {
+            #[cfg(all(test, target_os = "linux"))]
+            terminal_loss: std::sync::OnceLock::new(),
             admission: Mutex::new(()),
             closing: watch::channel(false).0,
             sessions: Arc::new(Semaphore::new(SESSIONS)),
@@ -539,6 +579,16 @@ impl ListenerOwner {
             supervisor,
             outcome: None,
         })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::cluster) fn arm_terminal_loss(&self) -> Result<Arc<TerminalLoss>, Refused> {
+        let witness = Arc::new(TerminalLoss::default());
+        self.control
+            .terminal_loss
+            .set(witness.clone())
+            .map_err(|_| Refused)?;
+        Ok(witness)
     }
 
     pub(in crate::cluster) fn stop(&self) {
@@ -733,13 +783,29 @@ async fn serve(
         Ok(request)
     })
     .await?;
+    #[cfg(all(test, target_os = "linux"))]
+    let witness = control
+        .terminal_loss
+        .get()
+        .filter(|loss| loss.observed().is_none())
+        .map(|loss| (loss, request.request, request.csr.clone()));
     let work = control.admit(deadline, move |until| async move {
         backend.redeem(request, until).await
     })?;
     let (socket, reply) = join_work(socket, deadline, work).await?;
-    let reply = reply
-        .and_then(|reply| reply.frame())
-        .unwrap_or_else(|_| frame(Kind::Result, &[1]));
+    let reply = match reply.and_then(|reply| Ok((reply.frame()?, reply))) {
+        Ok((frame, _reply)) => {
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some((loss, request, csr)) = witness
+                && loss.suppress(request, &csr, &_reply)
+            {
+                // Dropping the socket here sends neither Result nor TLS close-notify.
+                return Ok(());
+            }
+            frame
+        }
+        Err(_) => frame(Kind::Result, &[1]),
+    };
     Ok(send_terminal(socket, deadline, &reply).await?)
 }
 
