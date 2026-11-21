@@ -1310,8 +1310,9 @@ assert sockets.call_count == 2
                     ])
 
         def test_lost_oracle_rejects_invalid_forwarded_lists_before_status(self):
+            stale_list = {"operations":[self.lost_operation, self.ordinary_operation]}
             invalid_lists = (
-                {"operations":[self.lost_operation, self.ordinary_operation]},
+                stale_list,
                 {"operations":[self.lost_operation, self.lost_operation]},
                 {"operations":["c" * 64]},
                 {"operations":self.lost_operation},
@@ -1327,6 +1328,11 @@ assert sockets.call_count == 2
             )
             cases = [(listed, self.pending_source) for listed in invalid_lists]
             cases.extend((self.pending_list, source) for source in invalid_sources)
+            cases.extend([
+                (stale_list, self.completed_source),
+                ({"outcome":"unknown"}, self.completed_source),
+                ({"operations":[]}, [ordinary, (lost[0], 22, "succeeded")]),
+            ])
             for listed, after_list in cases:
                 with self.subTest(listed=listed, after_list=after_list):
                     self.check_lost_script([
@@ -1349,6 +1355,8 @@ assert sockets.call_count == 2
                            (self.list_call, self.pending_list), (self.read_source, self.pending_source)]
             after_foreign = before_list + [(self.foreign_by_id, {"outcome":"refused"})]
             after_status = after_foreign + [(self.by_id, self.scoped_result)]
+            ordinary, lost = self.completed_source
+            changed_ordinary = [(*ordinary[:2], "started"), lost]
             cases = (
                 ("prior-spend", [(self.read_target, extra)], ("terminal", "invalid")),
                 ("precompleted-source", [(self.read_target, self.spent), (self.read_source, self.completed_source)],
@@ -1364,6 +1372,8 @@ assert sockets.call_count == 2
                 ("changed-a-terminal", after_status + [(self.read_target, self.spent),
                     (self.read_source, [self.completed_source[0], (self.lost_operation.upper(), 22, "succeeded")])],
                  ("terminal", "invalid")),
+                ("changed-a-ordinary", after_status + [(self.read_target, self.spent),
+                    (self.read_source, changed_ordinary)], ("terminal", "invalid")),
             )
             for name, script, fault in cases:
                 with self.subTest(name=name):
