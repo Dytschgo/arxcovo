@@ -3995,6 +3995,249 @@ fn add_learner_membership(sm: &SmAdapter) {
         .unwrap();
 }
 
+// Poll the actual socket future with the store held. Paused Tokio time
+// places release on the chosen side of the acquisition deadline.
+async fn poll_while_store_is_held<F: Future>(
+    sm: &SmAdapter,
+    mut exchange: Pin<&mut F>,
+    release_stage: impl FnOnce(),
+    expire: bool,
+) -> Option<F::Output> {
+    use std::task::{Context, Waker};
+    let sm = sm.clone();
+    let (locked, ready) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let holder = tokio::task::spawn_blocking(move || {
+        let _store = sm.0.lock().unwrap();
+        locked.send(()).unwrap();
+        let _ = wait.recv();
+    });
+    ready.await.unwrap();
+
+    tokio::time::pause();
+    release_stage();
+    assert!(
+        exchange
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "contended authorization must yield before returning"
+    );
+    let result = if expire {
+        tokio::time::advance(Duration::from_millis(4)).await;
+        match exchange.poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => panic!("authorization did not refuse at its deadline"),
+        }
+    } else {
+        None
+    };
+    drop(release);
+    holder.await.unwrap();
+    result
+}
+
+async fn strict_client_waits_for_applied_store(expire: bool) {
+    let f = Fixture::new();
+    let dir = private_temp();
+    let mut local_store = StateStore::open(
+        dir.path(),
+        Init {
+            cluster: CLUSTER,
+            first_free: node(3),
+        },
+    )
+    .unwrap();
+    local_store
+        .install(&f.sm.0.lock().unwrap().snapshot())
+        .unwrap();
+    let sm = SmAdapter(Arc::new(Mutex::new(local_store)));
+    let mut sender = TransportOwner::new(
+        CLUSTER,
+        node(1),
+        &sm,
+        Credentials {
+            root: f.root.clone(),
+            leaf: f.client.cert.clone(),
+            key: f.client.private_key(),
+            time: Arc::new(pki::FixedTime(1001)),
+        },
+        rpc_spy(false),
+    )
+    .unwrap();
+    let spy = rpc_spy(false);
+    let mut receiver = f.owner(2, spy.clone());
+    let mut receiver_events = events(&receiver);
+    let address = listening(&mut receiver).await;
+    let mut sender_events = events(&sender);
+    let boundary = Stage::BeforeClientAuthorization;
+    let hold = gate(&sender, boundary);
+    {
+        let resources = sender
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .resources
+            .clone()
+            .unwrap();
+        let handshake = sender
+            .shared
+            .handshakes
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let (caller, _reply) = oneshot::channel();
+        let mut exchange = std::pin::pin!(outbound(
+            &sender.shared,
+            resources,
+            address,
+            node(2),
+            Request::Append(heartbeat()),
+            handshake,
+            Instant::now() + OBSERVE,
+            &caller,
+            #[cfg(target_os = "linux")]
+            None,
+        ));
+        tokio::select! {
+            _ = &mut exchange => panic!("outbound finished before its authorization boundary"),
+            reached = observe(&mut sender_events, Event::Stage(boundary)) => assert!(reached),
+        }
+        let expired = poll_while_store_is_held(
+            &sm,
+            exchange.as_mut(),
+            || release(&sender, boundary, &hold),
+            expire,
+        )
+        .await;
+        let result = match expired {
+            Some(result) => result,
+            None => exchange.await,
+        };
+        if expire {
+            assert!(matches!(result, Err(Refusal::Tls)));
+        } else {
+            assert!(matches!(result, Ok(Reply::Append(Ok(_)))));
+        }
+    }
+    let mut request_read = false;
+    let finished = timeout(OBSERVE, async {
+        while let Some(event) = receiver_events.recv().await {
+            request_read |= event == Event::Stage(Stage::RequestRead);
+            if let Event::Finished(reason) = event {
+                return reason;
+            }
+        }
+        panic!("receiver observation closed")
+    })
+    .await
+    .unwrap();
+    assert_eq!(request_read, !expire);
+    assert_eq!(finished, expire.then_some(Refusal::Frame));
+    assert_eq!(spy.calls.lock().unwrap().len(), usize::from(!expire));
+    assert!(bounded_close(&mut sender).await.is_ok());
+    assert!(bounded_close(&mut receiver).await.is_ok());
+}
+
+#[tokio::test]
+async fn strict_client_authorizes_after_store_release_within_budget() {
+    strict_client_waits_for_applied_store(false).await;
+}
+
+#[tokio::test]
+async fn strict_client_refuses_before_writing_when_store_outlasts_budget() {
+    strict_client_waits_for_applied_store(true).await;
+}
+
+async fn dispatch_waits_for_applied_store(learner: bool, expire: bool) {
+    let f = Fixture::new();
+    let learner = learner.then(|| {
+        add_learner_membership(&f.sm);
+        learner_image(&f, 1, true, &f.sm)
+    });
+    let spy = rpc_spy(false);
+    let credentials = Credentials {
+        root: f.root.clone(),
+        leaf: f.server.cert.clone(),
+        key: f.server.private_key(),
+        time: Arc::new(pki::FixedTime(1001)),
+    };
+    let resources =
+        make_resources_for_learner(CLUSTER, node(2), &f.sm, credentials, spy.clone(), learner)
+            .unwrap();
+    let (mut owner, _) = TransportOwner::pending_founder(CLUSTER, node(2));
+    let hold = gate(&owner, Stage::BeforeDispatch);
+    let mut events = events(&owner);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handshake = owner.shared.handshakes.clone().try_acquire_owned().unwrap();
+    let frame = peer_wire::encode_request(route(), &heartbeat()).unwrap();
+
+    {
+        let mut server = std::pin::pin!(async {
+            let (socket, _) = listener.accept().await.unwrap();
+            inbound(
+                &owner.shared,
+                resources,
+                socket,
+                handshake,
+                Instant::now() + INBOUND_BUDGET,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+        });
+        let mut client = std::pin::pin!(exchange_learner_for_test(
+            address,
+            f.client_config(&f.client, 2),
+            &frame,
+        ));
+        tokio::select! {
+            result = &mut server => panic!("server finished before dispatch gate: {result:?}"),
+            result = &mut client => panic!("client finished before dispatch gate: {result:?}"),
+            reached = observe(&mut events, Event::Stage(Stage::BeforeDispatch)) => assert!(reached),
+        }
+
+        let expired = poll_while_store_is_held(
+            &f.sm,
+            server.as_mut(),
+            || release(&owner, Stage::BeforeDispatch, &hold),
+            expire,
+        )
+        .await;
+        if let Some(refusal) = expired {
+            assert_eq!(refusal, Err(Refusal::Identity));
+            assert!(client.await.is_err());
+        } else {
+            let (server_result, client_result) = tokio::join!(server, client);
+            assert_eq!(server_result, Ok(()));
+            assert!(client_result.is_ok());
+        }
+    }
+    if expire {
+        assert!(spy.calls.lock().unwrap().is_empty());
+    } else {
+        assert_eq!(spy.calls.lock().unwrap().as_slice(), &[frame]);
+    }
+    assert!(bounded_close(&mut owner).await.is_ok());
+}
+
+#[tokio::test]
+async fn learner_dispatch_yields_to_runtime_while_applied_store_is_busy() {
+    dispatch_waits_for_applied_store(true, false).await;
+}
+
+#[tokio::test]
+async fn strict_dispatch_authorizes_after_store_release_within_budget() {
+    dispatch_waits_for_applied_store(false, false).await;
+}
+
+#[tokio::test]
+async fn strict_dispatch_refuses_when_store_outlasts_budget() {
+    dispatch_waits_for_applied_store(false, true).await;
+}
+
 #[tokio::test]
 async fn learner_refuses_old_matching_image_after_actual_sql_persistence_failure() {
     let f = Fixture::new();
@@ -4068,7 +4311,13 @@ async fn learner_refuses_old_matching_image_after_actual_sql_persistence_failure
             .await
             .is_err()
     );
-    assert!(observe(&mut rx, Event::Finished(Some(Refusal::Tls))).await);
+    // The cryptographic handshake starts, but a poisoned store refuses
+    // before the application-authenticated stage and before RequestRead.
+    assert_eq!(rx.try_recv(), Ok(Event::Stage(Stage::ServerHandshake)));
+    assert_eq!(
+        timeout(OBSERVE, rx.recv()).await.unwrap(),
+        Some(Event::Finished(Some(Refusal::Tls)))
+    );
     assert!(spy.calls.lock().unwrap().is_empty());
     assert!(bounded_close(&mut owner).await.is_ok());
 }
@@ -4217,8 +4466,8 @@ async fn learner_removed_anchor_valid_leaf_is_denied_after_strict_cutover() {
     assert!(bounded_close(&mut owner).await.is_ok());
 }
 
-#[test]
-fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed() {
+#[tokio::test]
+async fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed() {
     let f = Fixture::new();
     add_learner_membership(&f.sm);
     let learner = learner_image(&f, 1, true, &f.sm);
@@ -4243,7 +4492,9 @@ fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_removed()
     ));
     assert_eq!(learner.phase(), Ok(peer_registry::Phase::Refused));
     assert_eq!(
-        learner.authorize(CLUSTER, node(1), f.client.digest(), true),
+        learner
+            .authorize(CLUSTER, node(1), f.client.digest(), true)
+            .await,
         Err(verify::VerifyRefusal::Unavailable)
     );
 }

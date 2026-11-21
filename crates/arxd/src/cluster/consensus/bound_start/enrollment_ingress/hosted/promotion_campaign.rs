@@ -9,7 +9,7 @@ use crate::cluster::{
 use learner::{HostedCatchUp, Run};
 use learner_admission::{Controller, Reply, covers};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
-use peer_transport::{Event, GatedCallerOutcome, Stage};
+use peer_transport::{Event, GatedCallTrace, GatedCallerOutcome, Stage};
 use std::collections::BTreeSet;
 
 type Check<T> = std::result::Result<T, &'static str>;
@@ -297,6 +297,7 @@ async fn stage(events: &mut tokio::sync::mpsc::Receiver<Event>, target: Stage) -
 fn issuer_caller_observer(
     job: &Job,
     target: NodeId,
+    trace: Arc<GatedCallTrace>,
 ) -> Check<oneshot::Receiver<GatedCallerOutcome>> {
     let state = job.state();
     let transport = state
@@ -306,7 +307,7 @@ fn issuer_caller_observer(
         .transport_for_test()
         .try_lock()
         .map_err(|_| "issuer transport busy")?;
-    Ok(transport.observe_gated_caller(target))
+    Ok(transport.observe_gated_caller(target, trace))
 }
 
 async fn caller_outcome(receiver: oneshot::Receiver<GatedCallerOutcome>) -> Check<SocketAddr> {
@@ -328,6 +329,7 @@ async fn admit_below_target(
     raft: &Engine,
     controller: &Controller,
     caller: oneshot::Receiver<GatedCallerOutcome>,
+    trace: &GatedCallTrace,
 ) -> Check<LogPos> {
     let mut events = run.dispatch_observer().await;
     let mut dispatch = run.observe_gated_dispatch().await;
@@ -387,6 +389,7 @@ async fn admit_below_target(
                 }).await.map_err(|_| "short transport gate observation elapsed")??;
 
                 run.before_dispatch_gate(false).await;
+                trace.caller("gate release observed", None);
                 gate_held = false;
                 transport_event(&mut events, "dispatch", |event| {
                     matches!(event, Event::LearnerDispatch(_))
@@ -404,7 +407,12 @@ async fn admit_below_target(
 
     if gate_held {
         run.before_dispatch_gate(false).await;
+        trace.caller("cleanup gate release observed", None);
     }
+    eprintln!(
+        "C11 first call (soft TTL, caller stages, matched inbound stages) from caller entry: {:?}",
+        trace.summary()
+    );
     let (caller_source, (admitted, server_peer)) = evidence??;
     if caller_source != server_peer {
         return Err("gated dispatch and caller result came from different RPC connections");
@@ -535,8 +543,10 @@ async fn campaign(
     match_through(&issuer, learner1, second.original()).await?;
     let second_id = second.binding().0;
     let learner2 = second_id.get();
-    let caller = issuer_caller_observer(job, second_id)?;
-    let l2 = admit_below_target(second, addr2, &issuer, &controller, caller).await?;
+    let trace = Arc::new(GatedCallTrace::default());
+    second.observe_gated_inbound(&trace).await;
+    let caller = issuer_caller_observer(job, second_id, trace.clone())?;
+    let l2 = admit_below_target(second, addr2, &issuer, &controller, caller, &trace).await?;
 
     timeout(OBSERVE, hooks.finished.notified())
         .await

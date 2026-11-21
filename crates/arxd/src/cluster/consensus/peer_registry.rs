@@ -1,32 +1,140 @@
-//! Local applied authorization without waiting for the store mutex.
+//! Local applied authorization for owned peer transport.
 //! Temporary ownership can run store destructors; this is not TLS task ownership.
 use super::adapter::SmAdapter;
 use crate::cluster::{
-    enrollment::PeerRefusal,
-    pki::verify::{Registry, VerifyRefusal},
+    enrollment::{ClusterId, KeyDigest, NodeId, PeerRefusal},
+    pki::verify::VerifyRefusal,
 };
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex, TryLockError, Weak},
+    time::Duration,
+};
+use tokio::time::{Instant, sleep_until};
 
-pub(super) fn registry(sm: &SmAdapter) -> Registry {
-    let store = Arc::downgrade(&sm.0);
-    Arc::new(move |cluster, node, key| {
-        let store = store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
-        let result = {
-            let store = store.try_lock().map_err(|_| VerifyRefusal::Unavailable)?;
+// Each transport check can wait 4 ms. The caller's 75 ms absolute
+// AppendEntries deadline still applies across the entire exchange.
+const STORE_WAIT: Duration = Duration::from_millis(4);
+const STORE_POLL: Duration = Duration::from_micros(250);
+
+type AppliedStore = Weak<Mutex<super::StateStore>>;
+
+enum ObservationRefusal {
+    StoreBusy,
+    Refused(VerifyRefusal),
+}
+
+impl From<VerifyRefusal> for ObservationRefusal {
+    fn from(reason: VerifyRefusal) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<ObservationRefusal> for VerifyRefusal {
+    fn from(reason: ObservationRefusal) -> Self {
+        match reason {
+            ObservationRefusal::StoreBusy => Self::Unavailable,
+            ObservationRefusal::Refused(reason) => reason,
+        }
+    }
+}
+
+fn observe_store<T>(
+    store: &AppliedStore,
+    acquisition_deadline: Option<Instant>,
+    observe: impl FnOnce(&super::StateStore) -> Result<T, ObservationRefusal>,
+) -> Result<T, ObservationRefusal> {
+    let store = store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
+    let guard = match store.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) if !store.is_poisoned() => {
+            return Err(ObservationRefusal::StoreBusy);
+        }
+        Err(_) => return Err(VerifyRefusal::Unavailable.into()),
+    };
+    if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        || guard.is_poisoned()
+    {
+        return Err(VerifyRefusal::Unavailable.into());
+    }
+    observe(&guard)
+}
+
+async fn wait_for_store<T>(
+    mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
+) -> Result<T, VerifyRefusal> {
+    let deadline = Instant::now() + STORE_WAIT;
+    let mut acquisition_deadline = None;
+    loop {
+        match observe(acquisition_deadline) {
+            Err(ObservationRefusal::StoreBusy) => {}
+            result => return result.map_err(Into::into),
+        }
+        // The synchronous observation returned with neither lock held.
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(VerifyRefusal::Unavailable);
+        }
+        sleep_until((now + STORE_POLL).min(deadline)).await;
+        if Instant::now() >= deadline {
+            return Err(VerifyRefusal::Unavailable);
+        }
+        acquisition_deadline = Some(deadline);
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct AppliedRegistry(AppliedStore);
+
+impl AppliedRegistry {
+    pub(super) fn new(sm: &SmAdapter) -> Self {
+        Self(Arc::downgrade(&sm.0))
+    }
+
+    pub(super) async fn authorize(
+        &self,
+        cluster: ClusterId,
+        node: NodeId,
+        key: KeyDigest,
+    ) -> Result<(), VerifyRefusal> {
+        wait_for_store(|deadline| self.observe(cluster, node, key, deadline)).await
+    }
+
+    fn observe(
+        &self,
+        cluster: ClusterId,
+        node: NodeId,
+        key: KeyDigest,
+        deadline: Option<Instant>,
+    ) -> Result<(), ObservationRefusal> {
+        observe_store(&self.0, deadline, |store| {
             store
                 .state()
                 .authorize_peer(cluster, node, key)
-                .map_err(|refusal| match refusal {
-                    PeerRefusal::WrongCluster => VerifyRefusal::WrongCluster,
-                    PeerRefusal::NotMember => VerifyRefusal::NotMember,
-                    PeerRefusal::KeyMismatch => VerifyRefusal::KeyMismatch,
+                .map_err(|reason| {
+                    match reason {
+                        PeerRefusal::WrongCluster => VerifyRefusal::WrongCluster,
+                        PeerRefusal::NotMember => VerifyRefusal::NotMember,
+                        PeerRefusal::KeyMismatch => VerifyRefusal::KeyMismatch,
+                    }
+                    .into()
                 })
-        };
-        // Guard first, then temporary owner. If this is the last owner, dropping
-        // it may run SQLite/file destructors; no hard wall-time claim follows.
-        drop(store);
-        result
-    })
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn immediate(&self) -> crate::cluster::pki::verify::Registry {
+        let registry = self.clone();
+        Arc::new(move |cluster, node, key| {
+            registry
+                .observe(cluster, node, key, None)
+                .map_err(Into::into)
+        })
+    }
+}
+
+#[cfg(test)]
+pub(super) fn registry(sm: &SmAdapter) -> crate::cluster::pki::verify::Registry {
+    AppliedRegistry::new(sm).immediate()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +151,7 @@ pub(super) enum Phase {
 }
 
 pub(super) struct LearnerGate {
-    store: std::sync::Weak<std::sync::Mutex<super::StateStore>>,
+    store: AppliedStore,
     identity: Arc<crate::cluster::join_receipt::ExpectedIdentity>,
     address: std::net::SocketAddr,
     clock: Arc<dyn super::checked_clock::CheckedClock>,
@@ -79,51 +187,53 @@ impl LearnerGate {
     }
 
     pub(super) fn phase(&self) -> Result<Phase, VerifyRefusal> {
-        self.observe(|_, phase| Ok(phase))
+        self.observe(None, |_, phase| Ok(phase)).map_err(Into::into)
     }
 
     fn observe<T>(
         &self,
+        acquisition_deadline: Option<Instant>,
         f: impl FnOnce(&super::StateStore, Phase) -> Result<T, VerifyRefusal>,
-    ) -> Result<T, VerifyRefusal> {
-        let store = self.store.upgrade().ok_or(VerifyRefusal::Unavailable)?;
-        let store = store.try_lock().map_err(|_| VerifyRefusal::Unavailable)?;
-        if store.is_poisoned() || self.clock.sample_ms().is_err() {
-            return Err(VerifyRefusal::Unavailable);
-        }
-        let mut phase = self
-            .phase
-            .try_lock()
-            .map_err(|_| VerifyRefusal::Unavailable)?;
-        let original = self.identity.origin.position();
-        if *phase != Phase::Refused {
-            if let Some(applied) = store.applied().filter(|p| p.index >= original.index) {
-                *phase = if crossed(
-                    &self.identity,
-                    self.address,
-                    applied,
-                    store.membership(),
-                    store.state(),
-                ) {
-                    Phase::Strict
-                } else {
-                    Phase::Refused
-                };
-            } else if *phase == Phase::Strict
-                || store.membership().is_some_and(|(_, membership)| {
-                    !matches_address(&self.identity, self.address, membership)
-                })
-            {
-                *phase = Phase::Refused;
+    ) -> Result<T, ObservationRefusal> {
+        observe_store(&self.store, acquisition_deadline, |store| {
+            if self.clock.sample_ms().is_err() {
+                return Err(VerifyRefusal::Unavailable.into());
             }
-        }
-        f(&store, *phase)
+            let mut phase = self
+                .phase
+                .try_lock()
+                .map_err(|_| VerifyRefusal::Unavailable)?;
+            let original = self.identity.origin.position();
+            if *phase != Phase::Refused {
+                if let Some(applied) = store.applied().filter(|p| p.index >= original.index) {
+                    *phase = if crossed(
+                        &self.identity,
+                        self.address,
+                        applied,
+                        store.membership(),
+                        store.state(),
+                    ) {
+                        Phase::Strict
+                    } else {
+                        Phase::Refused
+                    };
+                } else if *phase == Phase::Strict
+                    || store.membership().is_some_and(|(_, membership)| {
+                        !matches_address(&self.identity, self.address, membership)
+                    })
+                {
+                    *phase = Phase::Refused;
+                }
+            }
+            f(store, *phase).map_err(Into::into)
+        })
     }
 
     pub(super) fn admission_progress(
         &self,
     ) -> Result<(Phase, Option<super::LogPos>), VerifyRefusal> {
-        self.observe(|store, phase| Ok((phase, store.applied())))
+        self.observe(None, |store, phase| Ok((phase, store.applied())))
+            .map_err(Into::into)
     }
 
     pub(super) fn admission_anchor(
@@ -150,7 +260,9 @@ impl LearnerGate {
         if cluster != self.identity.cluster || self.admission_anchor()? != (node, key.as_bytes()) {
             return Err(VerifyRefusal::NotMember);
         }
-        self.authorize(cluster, node, key, true).map(|_| ())
+        self.try_authorize(cluster, node, key, true, None)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Applied history may pass E between observations. Check any copy of
@@ -168,14 +280,28 @@ impl LearnerGate {
             .all(|position| position.index != original.index || position == original)
     }
 
-    pub(super) fn authorize(
+    pub(super) async fn authorize(
         &self,
         cluster: crate::cluster::enrollment::ClusterId,
         node: crate::cluster::enrollment::NodeId,
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
-        self.observe(|store, phase| {
+        wait_for_store(|deadline| {
+            self.try_authorize(cluster, node, key, bootstrap_allowed, deadline)
+        })
+        .await
+    }
+
+    fn try_authorize(
+        &self,
+        cluster: crate::cluster::enrollment::ClusterId,
+        node: crate::cluster::enrollment::NodeId,
+        key: crate::cluster::enrollment::KeyDigest,
+        bootstrap_allowed: bool,
+        acquisition_deadline: Option<Instant>,
+    ) -> Result<Lane, ObservationRefusal> {
+        self.observe(acquisition_deadline, |store, phase| {
             if phase == Phase::Refused || (phase == Phase::Bootstrap && !bootstrap_allowed) {
                 return Err(VerifyRefusal::Unavailable);
             }
@@ -244,9 +370,10 @@ mod tests {
     };
     use crate::service::application::tests::private_temp;
     use std::{
-        sync::{Mutex, mpsc},
+        future::Future,
+        sync::mpsc,
+        task::{Context, Poll, Waker},
         thread,
-        time::Duration,
     };
 
     fn node(n: u64) -> NodeId {
@@ -284,6 +411,75 @@ mod tests {
             .unwrap();
         assert!(matches!(result, Some(Outcome::Founded { replay: false })));
         (dir, SmAdapter(Arc::new(Mutex::new(store))))
+    }
+
+    fn learner_gate(sm: &SmAdapter) -> Arc<LearnerGate> {
+        use crate::cluster::join_receipt::{ExpectedIdentity, Origin};
+        LearnerGate::new(
+            sm,
+            Arc::new(ExpectedIdentity {
+                cluster: [1; 16],
+                node: node(2),
+                key: key(2),
+                ca: [0; 32],
+                origin: Origin::Redeem {
+                    term: 1,
+                    leader: 1,
+                    index: 1,
+                    anchors: vec![(1, *key(1).as_bytes())],
+                },
+            }),
+            "192.168.0.2:7001".parse().unwrap(),
+            Arc::new(super::super::checked_clock::HostClock::new(0)),
+            true,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn learner_inbound_authorizes_when_applied_store_is_released_within_budget() {
+        let (_dir, sm) = fixture();
+        let gate = learner_gate(&sm);
+        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
+        {
+            let _held = sm.0.lock().unwrap();
+            assert!(
+                authorization
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        assert_eq!(authorization.await, Ok(Lane::Strict));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn learner_inbound_refuses_when_applied_store_outlasts_budget() {
+        let (_dir, sm) = fixture();
+        let gate = learner_gate(&sm);
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held = sm.0.lock().unwrap();
+            entered.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        ready.await.unwrap();
+        let mut authorization = std::pin::pin!(gate.authorize([1; 16], node(1), key(1), true));
+        assert!(
+            authorization
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_millis(4)).await;
+        assert_eq!(
+            authorization
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(VerifyRefusal::Unavailable))
+        );
+        drop(release);
+        holder.await.unwrap();
     }
 
     #[test]
