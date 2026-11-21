@@ -787,3 +787,244 @@ impl ConsensusNode {
         result
     }
 }
+
+/// A bounded wake projection. The watcher treats this as a hint, then takes a
+/// separate fresh observation under the shared membership intent.
+#[derive(PartialEq, Eq)]
+pub(super) struct PromotionTrigger {
+    sample: Sample,
+    committed: Id,
+    applied: Id,
+    last_log_index: Option<u64>,
+    matched: BTreeMap<u64, Option<Id>>,
+}
+
+impl PromotionTrigger {
+    pub(super) fn from_metrics(m: &openraft::RaftMetrics<Arx>) -> Option<Self> {
+        if m.running_state.is_err() || !local_leader(m.id, m.vote, m.current_leader) {
+            return None;
+        }
+        let sample = Sample::from_metrics(m).ok()?;
+        let membership = &sample.effective.1;
+        let committed = m.cluster_committed?;
+        let applied = m.last_applied?;
+        if sample.effective != sample.committed
+            || !covers(pos(applied), pos(committed))
+            || !covers(pos(committed), pos(sample.effective.0?))
+            || committed.leader_id != m.vote.leader_id
+        {
+            return None;
+        }
+        let replication = m.replication.as_ref()?;
+        let matched: BTreeMap<_, _> = membership
+            .non_write_voter_ids()
+            .map(|node| (node, replication.get(&node).copied().flatten()))
+            .collect();
+        if membership.get_joint_config().len() == 1
+            && (!membership.voter_ids().eq([1])
+                || matched
+                    .values()
+                    .filter(|matched| {
+                        matched.is_some_and(|matched| covers(pos(matched), pos(committed)))
+                    })
+                    .count()
+                    < 2)
+        {
+            return None;
+        }
+        Some(Self {
+            sample,
+            committed,
+            applied,
+            last_log_index: m.last_log_index,
+            matched,
+        })
+    }
+}
+
+fn local_leader(local: u64, vote: Vote<LeaderId>, current_leader: Option<u64>) -> bool {
+    vote.committed && vote.leader_id.node_id == local && current_leader == Some(local)
+}
+
+fn stable_promotion(
+    leader: LeaderId,
+    before: &Sample,
+    before_progress: &Progress,
+    after: &Sample,
+    after_progress: &Progress,
+) -> Result<(), MembershipReadError> {
+    if leader != before.vote.leader_id || before != after || before_progress != after_progress {
+        return Err(MembershipReadError::RetryLater);
+    }
+    Ok(())
+}
+
+pub(super) struct PromotionView {
+    pub(super) leader: LeaderId,
+    pub(super) watermark: Id,
+    pub(super) members: Members,
+    pub(super) committed: LogPos,
+    pub(super) tail: Id,
+    pub(super) matched: BTreeMap<u64, Option<LogPos>>,
+    pub(super) bindings: BTreeMap<u64, KeyDigest>,
+}
+
+fn promotion_view(
+    store: &StateStore,
+    cluster: ClusterId,
+    local: u64,
+    sample: &Sample,
+    progress: &Progress,
+) -> Result<PromotionView, MembershipReadError> {
+    let retry = MembershipReadError::RetryLater;
+    if store.is_poisoned() {
+        return Err(MembershipReadError::Unavailable);
+    }
+    let (position, blob) = store.membership().ok_or(retry)?;
+    let watermark = id(*position);
+    let members = decode(blob).map_err(|_| MembershipReadError::Unavailable)?;
+    if !local_leader(local, sample.vote, sample.current_leader)
+        || sample.effective.0 != Some(watermark)
+        || sample.committed.0 != Some(watermark)
+        || sample.effective.1 != members
+        || sample.committed.1 != members
+        || !store
+            .applied()
+            .is_some_and(|applied| covers(applied, progress.committed))
+        || !covers(progress.committed, *position)
+        || id(progress.committed).leader_id != sample.vote.leader_id
+    {
+        return Err(retry);
+    }
+    let mut bindings = BTreeMap::new();
+    for (id, _) in members.nodes() {
+        let node = NodeId::new(*id).ok_or(retry)?;
+        match store.state().bound_key(cluster, node) {
+            Ok(key) => {
+                bindings.insert(*id, key);
+            }
+            Err(PeerRefusal::NotMember) => {}
+            Err(_) => return Err(MembershipReadError::PeerRefused),
+        }
+    }
+    Ok(PromotionView {
+        leader: sample.vote.leader_id,
+        watermark,
+        members,
+        committed: progress.committed,
+        tail: id(progress.tail),
+        matched: progress.matched.clone(),
+        bindings,
+    })
+}
+
+impl ConsensusNode {
+    pub(super) async fn promotion_observation(
+        &self,
+        cluster: ClusterId,
+    ) -> Result<PromotionView, MembershipReadError> {
+        let unavailable = MembershipReadError::Unavailable;
+        let raft = self.raft.as_ref().ok_or(unavailable)?;
+        let before = Sample::capture(raft)?;
+        if !local_leader(self.id, before.vote, before.current_leader) {
+            return Err(MembershipReadError::NotLeader);
+        }
+        let progress = Progress::capture(self, &before)?;
+        let initial = before.clone();
+        let initial_progress = progress.clone();
+        let local = self.id;
+        let (leader, view) = self
+            .fresh_read(move |store| {
+                Ok(promotion_view(
+                    store,
+                    cluster,
+                    local,
+                    &initial,
+                    &initial_progress,
+                ))
+            })
+            .await
+            .map_err(|error| match error {
+                ReadError::Busy => MembershipReadError::Busy,
+                ReadError::NotLeader => MembershipReadError::NotLeader,
+                ReadError::NoQuorum | ReadError::Unavailable => unavailable,
+            })?;
+        let after = Sample::capture(raft)?;
+        let after_progress = Progress::capture(self, &after)?;
+        stable_promotion(leader, &before, &progress, &after, &after_progress)?;
+        view
+    }
+}
+
+#[cfg(test)]
+mod promotion_observation_tests {
+    use super::*;
+
+    #[test]
+    fn lost_epoch_or_changed_full_tail_refuses_submission_view() {
+        let leader = id(LogPos {
+            term: 2,
+            leader: 1,
+            index: 8,
+        })
+        .leader_id;
+        let members = Members::new(
+            vec![[1].into()],
+            BTreeMap::from([(1, BasicNode::new("192.168.0.1:9000"))]),
+        )
+        .unwrap();
+        let mut sample = Sample {
+            vote: Vote {
+                committed: true,
+                leader_id: leader,
+            },
+            current_leader: Some(1),
+            effective: (None, members.clone()),
+            committed: (None, members),
+        };
+        let progress = Progress {
+            committed: LogPos {
+                term: 2,
+                leader: 1,
+                index: 8,
+            },
+            tail: LogPos {
+                term: 2,
+                leader: 1,
+                index: 9,
+            },
+            matched: BTreeMap::new(),
+        };
+        assert!(stable_promotion(leader, &sample, &progress, &sample, &progress).is_ok());
+        let changed_tail = Progress {
+            tail: LogPos {
+                term: 3,
+                ..progress.tail
+            },
+            ..progress.clone()
+        };
+        assert_eq!(
+            stable_promotion(leader, &sample, &progress, &sample, &changed_tail),
+            Err(MembershipReadError::RetryLater),
+        );
+        let before = sample.clone();
+        sample.current_leader = Some(3);
+        assert_eq!(
+            stable_promotion(leader, &before, &progress, &sample, &progress),
+            Err(MembershipReadError::RetryLater),
+        );
+        assert_eq!(
+            stable_promotion(
+                openraft::impls::leader_id_adv::LeaderId {
+                    term: 3,
+                    node_id: 1
+                },
+                &before,
+                &progress,
+                &before,
+                &progress
+            ),
+            Err(MembershipReadError::RetryLater),
+        );
+    }
+}

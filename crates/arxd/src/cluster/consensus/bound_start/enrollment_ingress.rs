@@ -220,6 +220,7 @@ mod hosted {
     mod catch_up_campaign;
     #[cfg(test)]
     mod durable_join_campaign;
+    mod promotion_campaign;
 
     #[derive(Default)]
     pub(in crate::cluster::consensus::bound_start) struct Observation {

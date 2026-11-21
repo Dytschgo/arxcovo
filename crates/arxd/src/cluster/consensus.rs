@@ -148,6 +148,7 @@ mod adapter;
 pub(in crate::cluster) mod anchor_query;
 mod bound_start;
 mod checked_clock;
+mod initial_promotion;
 pub(in crate::cluster) mod issue;
 mod learner_admission;
 pub(in crate::cluster) mod membership_observation;
