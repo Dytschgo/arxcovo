@@ -1,16 +1,31 @@
 # ADR 0048 · Hosted Linux cluster build executor preflight
 
-Status: Blocked at preflight (2026-11-21). Review draft.
+Status: accepted with A10 (2026-11-21). Hosted qualification pending.
 
 ## Decision
 
-Hold M3 14a implementation and the dependent C14/C16 campaigns. The hosted
-Docker and UID-staging profiles established by #199 and #229 cannot supply
-the broker with the Standard executor's required cgroup namespace, placement
-and writable delegation together. The missing facility is a trusted
-provisioner that establishes and confines that hierarchy before the broker
-starts. Qualifying such a facility requires a separate owner decision under
-the D4 feasibility disposition.
+A10 adopts the disposable GitHub-hosted Ubuntu VM as the isolated Linux
+facility for M3 14a and C14. The runner's existing sudo starts the broker
+as the transient systemd unit named exactly `arxd.service`. The unit uses
+the packaged delegation shape `Delegate=memory pids` and
+`DelegateSubgroup=supervisor`. A private mount view gives the broker
+read-only access to the cgroup hierarchy and a writable exception for its
+own unit. A full `ProtectControlGroups` would prevent setup. The independent
+Candidate H review preceded this equivalence decision. Its SHA256 is
+`d2ea8190a6a8c71d8978e3722a93f5a294ff564699d7cf7095d9ed46516c91c6`.
+
+A10 accepts build-UID read-only visibility of this job VM's cgroup
+metadata. The job contains no owner data or secrets, and the layout follows
+the packaged native delegation model. The build UID must still be denied
+writes to outside cgroup controls and access to custody, broker roots,
+history, control sockets, other processes and their descriptors. Fixed
+distinct UID/GID accounts and a protected root-owned staging parent under
+`/var/lib` carry those boundaries. The build UID has its own primary group
+and no supplementary groups. The existing Runner, product privilege
+contract and native packaging are frozen.
+
+C16's three-container boundary remains open for 16a. A10 grants no
+container equivalence, installed-service or physical-host qualification.
 
 This preflight reviewed base `be64f8db29dae9b58ffdd35380cb966ddd94025c`, the
 adopted 14a grant and the plan amendments. R5 concerns later C14 admission
@@ -43,7 +58,7 @@ inaccessible to the build child and is a separate boundary.
 [Runner cgroup controls](../../crates/arxd/src/exec/cgroup.rs) ·
 [Runner identity and child transition](../../crates/arxd/src/exec/unix.rs)
 
-## Evidence and blocker
+## Original preflight evidence
 
 | Route examined | Finding |
 | --- | --- |
@@ -73,16 +88,27 @@ remain unverified.
 [Moby cgroup placement](https://github.com/moby/moby/blob/v28.0.4/daemon/oci_linux.go#L729-L757) ·
 [Kernel cgroup v2 delegation and namespaces](https://docs.kernel.org/admin-guide/cgroup-v2.html#namespace)
 
-## Resumption condition
+## A10 qualification
 
-An owner-approved isolated Linux facility would need to provide a private
-view rooted strictly above the matching delegated unit and strictly below
-the host hierarchy root, place the broker in the unit's sole-process
-`supervisor` leaf, and make only the subordinate delegation writable.
-It must also demonstrate the dedicated build account, independent daemon
-identity and protected state, the broker's narrow capabilities, and actual
-leaf migration and cleanup. A dedicated host-side namespace/placement
-provisioner or a change to the frozen cgroup qualification contract
-requires separate authority. The adopted one-build allowance is unused.
-Actual hosted executor and installed-service or physical paths are
-**unverified on real hardware**.
+The Linux Rust worker reuses existing compiled artifacts. Leg 1 checks
+provenance, kernel and manager versions, account and mount protection,
+the broker's exact capabilities and membership, effective memory/PID
+delegation and the raw marker. An explicit build-UID identity process
+checks read visibility and attempts to open cgroup controls for writing
+without issuing any write. The daemon-UID client exercises the credential
+check, refusal on changed file protection and build account drift, and
+restored readiness. The transient broker drains and stops before
+the first leg can pass. Setup, identity and drain perform zero Runner
+dispatches and zero consensus invocations.
+
+Leg 2 restarts the same broker profile in the same job and consumes the
+one granted Standard execution only after the first leg passes. The
+daemon UID authenticates the root broker and submits the fixed read-only
+`cargo --version` witness through normal admission. The actual build
+child demonstrates the denial set and workspace access. An independent
+observer confirms cgroup migration, configured limits and credential
+drop. The daemon owns admission and terminal persistence. The probe
+checks the leaf's removal and reports cleanup separately from the first
+failure. Hosted timing and the observed profile
+are pending the reviewed hosted run. Installed-service and physical paths
+are **unverified on real hardware**.
