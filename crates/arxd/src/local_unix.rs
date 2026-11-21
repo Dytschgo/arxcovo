@@ -445,10 +445,15 @@ pub(super) mod delegated {
         drop(replacement);
         std::fs::remove_file(&path).unwrap();
 
+        // Move a real socket entry between qualified directories. Holding
+        // the leaf inode constant isolates the parent-directory pin.
+        let moved = AgentListener::bind(path.clone(), profile.clone(), vec![1003]).unwrap();
         let other = root.join("other/socket");
-        let new = AgentListener::bind(other.clone(), profile.clone(), vec![1003]).unwrap();
-        assert!(new.bound.same(&other, &profile));
-        assert!(!endpoint.bound.same(&other, &profile));
+        std::fs::rename(&path, &other).unwrap();
+        let replacement = Bound::read(&other, &profile).unwrap();
+        assert!(replacement.pins.last() == moved.bound.pins.last());
+        assert!(!moved.bound.same(&other, &profile));
+        std::fs::remove_file(&other).unwrap();
         assert!(AgentListener::bind(root.join("link/socket"), profile, vec![1003]).is_err());
     }
 
