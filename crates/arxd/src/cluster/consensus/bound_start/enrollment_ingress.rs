@@ -149,6 +149,14 @@ impl ReadyIssuer {
     }
 
     pub(super) fn availability(&self, node: &ConsensusNode) -> Result<(), AvailabilityError> {
+        self.availability_before(node, None)
+    }
+
+    pub(super) fn availability_before(
+        &self,
+        node: &ConsensusNode,
+        acquisition_deadline: Option<Instant>,
+    ) -> Result<(), AvailabilityError> {
         use AvailabilityError::{Busy, NotReady, Refused};
         use membership_observation::MembershipReadError;
         let raft = node.raft.as_ref().ok_or(Refused)?;
@@ -183,7 +191,9 @@ impl ReadyIssuer {
             std::sync::TryLockError::WouldBlock => Busy,
             std::sync::TryLockError::Poisoned(_) => Refused,
         })?;
-        if store.is_poisoned() {
+        if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || store.is_poisoned()
+        {
             return Err(Refused);
         }
         store

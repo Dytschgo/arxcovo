@@ -1151,9 +1151,10 @@ mod issuer_proof {
         pub(in crate::cluster::consensus) fn recheck_issuer_offer(
             &self,
             previous: Offer,
+            acquisition_deadline: Option<Instant>,
         ) -> Result<(), MembershipReadError> {
             let claim = previous.claim;
-            self.with_issuer_view(self.id, |store, view| {
+            self.with_issuer_view(self.id, acquisition_deadline, |store, view| {
                 let current = offer(
                     store,
                     view,
@@ -1199,6 +1200,7 @@ mod issuer_proof {
         fn with_issuer_view<T>(
             &self,
             leader: u64,
+            acquisition_deadline: Option<Instant>,
             inspect: impl FnOnce(&StateStore, &ObservedMembership) -> Result<T, MembershipReadError>,
         ) -> Result<T, MembershipReadError> {
             let unavailable = MembershipReadError::Unavailable;
@@ -1208,6 +1210,9 @@ mod issuer_proof {
                 return Err(MembershipReadError::NotLeader);
             }
             let store = acquire(self)?;
+            if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(unavailable);
+            }
             let view = locked(&store, &before, leader)?;
             let result = inspect(&store, &view)?;
             let after = Sample::capture(raft)?;
