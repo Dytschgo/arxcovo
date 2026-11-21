@@ -80,7 +80,8 @@ with socket.socket(fileno=3) as control:
             &expected_gid.to_string(),
             &inherited.as_raw_fd().to_string(),
             behavior,
-            &usize::from(uid != 0).to_string(),
+            // Only the dedicated identity transition clears supplementary groups.
+            &usize::from(uid == 0).to_string(),
         ])
         .arg(root.join("lock"));
     Child::spawn_worker(command, identity, None).unwrap()

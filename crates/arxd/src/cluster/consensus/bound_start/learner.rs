@@ -994,13 +994,26 @@ impl Job {
         let node = node.try_lock().map_err(|_| ActivationError::Deferred)?;
         // The unchanged quorum read establishes leadership before publishing readiness.
         let (epoch, ()) = node.fresh_read(|_| Ok(())).await?;
-        self.publish_promoted_issuer(&node, epoch)
+        self.publish_promoted_issuer(&node, epoch, || {
+            use openraft::type_config::async_runtime::watch::WatchReceiver;
+            let raft = node.raft.as_ref().ok_or(ActivationError::Refused)?;
+            let metrics = raft.metrics();
+            let current = metrics.borrow_watched();
+            if current.running_state.is_err() {
+                return Err(ActivationError::Refused);
+            }
+            let local_leader = current.vote.committed
+                && current.current_leader == Some(node.id)
+                && current.state == openraft::ServerState::Leader;
+            Ok(local_leader.then_some(current.vote.leader_id))
+        })
     }
 
     fn publish_promoted_issuer(
         &self,
         node: &ConsensusNode,
         epoch: LeaderId,
+        observe_epoch: impl Fn() -> Result<Option<LeaderId>, ActivationError>,
     ) -> Result<(), ActivationError> {
         let mut state = self.state();
         let (_, local, clock) = voter_context(&state)?;
@@ -1022,7 +1035,12 @@ impl Job {
             .unwrap()
             .expected
             .cluster;
-        let (ca, tls, installed_at, _proof) = load_promoted(&state, node, Some(epoch))?;
+        let check_epoch = || {
+            (observe_epoch()? == Some(epoch))
+                .then_some(())
+                .ok_or(ActivationError::Deferred)
+        };
+        let (ca, tls, installed_at, _proof) = load_promoted(&state, node, Some(&check_epoch))?;
         state.issuer = Some(Arc::new(enrollment_ingress::ReadyIssuer::promoted(
             endpoint,
             cluster,
@@ -1140,7 +1158,7 @@ fn activation_proof<T>(
 fn load_promoted<'a>(
     state: &State,
     node: &'a ConsensusNode,
-    epoch: Option<LeaderId>,
+    check_epoch: Option<&dyn Fn() -> Result<(), ActivationError>>,
 ) -> Result<
     (
         crate::cluster::pki::ca::ClusterCa,
@@ -1151,7 +1169,6 @@ fn load_promoted<'a>(
     ActivationError,
 > {
     use crate::cluster::pki::custody::Error;
-    use openraft::type_config::async_runtime::watch::WatchReceiver;
     let (_, local, clock) = voter_context(state)?;
     let op = state.learner.as_ref().ok_or(ActivationError::Refused)?;
     let installed_at = op.issuer_membership.ok_or(ActivationError::Refused)?;
@@ -1169,37 +1186,21 @@ fn load_promoted<'a>(
         .load_voter_ca(cluster, tls.root.as_ref(), now, || {
             // Bracket the guarded identity proof with the same quorum epoch.
             // A proof refusal retains its own cause even if the vote changes.
-            let check_epoch = || {
-                let Some(epoch) = epoch else { return Ok(()) };
-                let raft = node.raft.as_ref().ok_or(ActivationError::Refused)?;
-                let metrics = raft.metrics();
-                let current = metrics.borrow_watched();
-                if current.running_state.is_err() {
-                    return Err(ActivationError::Refused);
-                }
-                if current.vote.leader_id != epoch
-                    || !current.vote.committed
-                    || current.current_leader != Some(node.id)
-                    || current.state != openraft::ServerState::Leader
-                {
-                    return Err(ActivationError::Deferred);
-                }
-                Ok(())
-            };
-            let before = check_epoch();
+            let check = || check_epoch.map_or(Ok(()), |observe| observe());
+            let before = check();
             if before == Err(ActivationError::Refused) {
                 return Err(Error::Ownership);
             }
             let proof = activation_proof(
                 membership
-                    .voter_proof(cluster, local, installed_at, epoch.is_some(), None)
+                    .voter_proof(cluster, local, installed_at, check_epoch.is_some(), None)
                     .and_then(|proof| {
                         proof
                             .covers_member(&member.expected, local.address)
                             .then_some(proof)
                             .ok_or(membership_observation::MembershipReadError::PeerRefused)
                     }),
-                || check_epoch().and(before),
+                || check().and(before),
             )
             .map_err(|error| {
                 activation_error = error;
@@ -1369,9 +1370,18 @@ impl Job {
             load_promoted(&self.state(), &live, None).is_ok(),
             confirmed_at.is_some()
         );
-        // Exercise the production readiness transition after a synthetic quorum epoch.
+        // This fixture has no Engine. Model the quorum read and the subsequent
+        // local epoch observations independently of its guarded membership sample.
+        if confirmed_at.is_some() {
+            assert_eq!(
+                self.publish_promoted_issuer(&live, survivor.1, || Ok(None)),
+                Err(ActivationError::Deferred)
+            );
+            assert!(self.state().issuer.is_none());
+        }
         assert_eq!(
-            self.publish_promoted_issuer(&live, survivor.1).is_ok(),
+            self.publish_promoted_issuer(&live, survivor.1, || Ok(Some(survivor.1)))
+                .is_ok(),
             confirmed_at.is_some()
         );
         assert_eq!(self.state().issuer.is_some(), confirmed_at.is_some());
@@ -1429,7 +1439,10 @@ impl Job {
                 }
             })
         });
-        assert!(self.publish_promoted_issuer(&live, survivor.1).is_err());
+        assert_eq!(
+            self.publish_promoted_issuer(&live, survivor.1, || Ok(Some(survivor.1))),
+            Err(ActivationError::Refused)
+        );
         // The failure reached the final proof and refused before signer load.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(self.state().issuer.is_none());
