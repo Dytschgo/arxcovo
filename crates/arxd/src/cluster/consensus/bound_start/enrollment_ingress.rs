@@ -441,6 +441,7 @@ mod hosted {
     #[cfg(test)]
     mod durable_join_campaign;
     mod issuer_transfer_campaign;
+    mod lost_reply_campaign;
     mod promotion_campaign;
 
     #[derive(Default)]
