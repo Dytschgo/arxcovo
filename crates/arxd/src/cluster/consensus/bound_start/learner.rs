@@ -1,7 +1,7 @@
 //! Retained published learner composition and same-process reopen.
 use super::*;
 use crate::cluster::{
-    enrollment::durable_join::{HistoryJoin, PublishedJoin, RetainedJoin},
+    enrollment::durable_join::{HistoryJoin, PublishedJoin, RedeemIssuer, RetainedJoin},
     issuance_publication::check_retained,
     join_receipt::PublicIdentity,
     pki::custody::{LearnerCustody, LearnerReopen},
@@ -33,13 +33,16 @@ pub(super) struct Operation {
     #[cfg(test)]
     issuer_before_proof: Option<membership_observation::BeforeProof>,
     recovered: bool,
+    process_recovered: bool,
+    redeem_issuer: Option<RedeemIssuer>,
     #[cfg(test)]
     fixture: Option<HostedCatchUp>,
 }
 
 enum Input {
-    Published(Box<PublishedJoin>, Option<Box<(Fresh, Live)>>),
+    Published(Box<PublishedJoin>, Option<Box<(Fresh, Live, RedeemIssuer)>>),
     Reopen(Box<Reopen>),
+    Process(Box<startup_recovery::HistoryReady>),
 }
 
 struct Member {
@@ -122,6 +125,7 @@ pub(super) fn start_published(
     Ok(start(
         Input::Published(Box::new(join.consume()?), None),
         params,
+        None,
         #[cfg(test)]
         fixture,
     ))
@@ -131,10 +135,19 @@ pub(super) fn start_history_join(
     join: HistoryJoin,
     params: Params,
 ) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
-    let (published, slot, issuance) = join.consume()?;
+    start_history(join, params, None)
+}
+
+pub(super) fn start_history(
+    join: HistoryJoin,
+    params: Params,
+    fence: Option<&super::runtime::Admission>,
+) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
+    let (published, slot, issuance, peer) = join.consume()?;
     Ok(start(
-        Input::Published(Box::new(published), Some(Box::new((slot, issuance)))),
+        Input::Published(Box::new(published), Some(Box::new((slot, issuance, peer)))),
         params,
+        fence,
         #[cfg(test)]
         None,
     ))
@@ -148,15 +161,43 @@ pub(super) fn recover(
     start(
         Input::Reopen(Box::new(expectation)),
         params,
+        None,
         #[cfg(test)]
         fixture,
     )
 }
 
-fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchUp>) -> Run {
+pub(super) fn recover_process(
+    ready: startup_recovery::HistoryReady,
+    params: Params,
+    fence: &super::runtime::Admission,
+) -> Run {
+    start(
+        Input::Process(Box::new(ready)),
+        params,
+        Some(fence),
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn start(
+    input: Input,
+    params: Params,
+    fence: Option<&super::runtime::Admission>,
+    #[cfg(test)] fixture: Option<HostedCatchUp>,
+) -> Run {
     let (plan, expected) = match &input {
         Input::Published(p, _) => (&p.owner.plan, &p.expected),
         Input::Reopen(r) => (&r.0.plan, r.0.expected.as_ref()),
+        Input::Process(ready) => (
+            &ready.owner.plan,
+            &ready
+                .history
+                .verified()
+                .expect("authenticated input")
+                .expected,
+        ),
     };
     let intent = StartIntent {
         mode: plan.mode,
@@ -166,7 +207,8 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         peer: plan.peer.parse().expect("checked peer address"),
         enrollment: plan.enrollment.parse().expect("checked enrollment address"),
     };
-    let recovered = matches!(input, Input::Reopen(_));
+    let process_recovered = matches!(input, Input::Process(_));
+    let recovered = process_recovered || matches!(input, Input::Reopen(_));
     let (transport, factory) = TransportOwner::pending_founder(intent.cluster, intent.node);
     let job = Job::anchor();
     let mut state = job.state();
@@ -188,10 +230,15 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         #[cfg(test)]
         issuer_before_proof: None,
         recovered,
+        process_recovered,
+        redeem_issuer: None,
         #[cfg(test)]
         fixture,
     });
     drop(state);
+    if let Some(fence) = fence {
+        fence.register(job);
+    }
     let (_, observer, supervisor) = drive(
         job,
         None,
@@ -248,6 +295,11 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
                 time,
             } = *published;
             state.owner = Some(owner);
+            let history = history.map(|history| {
+                let (slot, live, peer) = *history;
+                op.redeem_issuer = Some(peer);
+                Box::new((slot, live))
+            });
             op.member = Some(Member {
                 expected: Arc::new(expected),
                 leaf,
@@ -302,6 +354,34 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
             state.stores = Some(stores);
             Arc::new(clock.ok_or(failure)?)
         }
+        Input::Process(ready) => {
+            let startup_recovery::HistoryReady {
+                owner,
+                history,
+                stores,
+                clock,
+            } = *ready;
+            state.owner = Some(owner);
+            state.stores = Some(stores);
+            let (custody, evidence) = history.into_learner().map_err(|history| {
+                state.recovery_hold = Some(super::runtime::RecoveryHold::Custody(history));
+                Refusal::Identity
+            })?;
+            op.issuer_membership = evidence.voter_position();
+            let owner = state.owner.as_ref().unwrap();
+            // Install custody before any fallible artifact read so a refusal
+            // retains the same ownership until the process exits.
+            let member = op.member.insert(Member {
+                expected: Arc::new(evidence.expected),
+                leaf: Vec::new(),
+                custody,
+                history: None,
+            });
+            let record = PublicIdentity::decode(&owner.read("identity.json", 8192)?)
+                .map_err(|_| Refusal::Identity)?;
+            member.leaf = record.leaf().to_vec();
+            clock
+        }
     };
     let member = op.member.as_ref().unwrap();
     op.credentials = Some(member.credentials(state.owner.as_ref().unwrap(), &clock)?);
@@ -337,6 +417,16 @@ pub(super) async fn attach(job: &'static Job, address: &SocketAddr) {
         }
     };
     let result = result.and_then(|()| {
+        if job
+            .state()
+            .learner
+            .as_ref()
+            .is_some_and(|op| op.process_recovered)
+        {
+            // A restarted installation can use its authenticated completion.
+            // It cannot receive a new installation through the legacy lane.
+            return Ok(());
+        }
         transport
             .receive_issuer_transfer(job)
             .map_err(|_| Refusal::Ownership)
@@ -393,6 +483,26 @@ pub(super) async fn close_transport(job: &Job) -> bool {
 }
 
 impl Run {
+    pub(super) fn set_authenticated_admission_route(
+        &self,
+        issuer: SocketAddr,
+    ) -> Result<(), Refusal> {
+        {
+            let state = self.job.state();
+            let op = state.learner.as_ref().ok_or(Refusal::Ownership)?;
+            if op.recovered {
+                return Err(Refusal::Provenance);
+            }
+            let gate = op.gate.as_ref().ok_or(Refusal::Unavailable)?;
+            let peer = op.redeem_issuer.as_ref().ok_or(Refusal::Provenance)?;
+            let expect = gate.admission_anchor().map_err(|_| Refusal::Identity)?;
+            if expect != (peer.node, peer.key.as_bytes()) {
+                return Err(Refusal::Identity);
+            }
+        }
+        self.set_admission_route(issuer)
+    }
+
     pub(super) fn set_admission_route(&self, issuer: SocketAddr) -> Result<(), Refusal> {
         let mut state = self.job.state();
         if state.status != Status::LearnerReady || state.close_requested {
@@ -516,9 +626,7 @@ impl Run {
 
     pub(super) async fn close(self, retain_reopen: bool) -> Result<Option<Reopen>, Refusal> {
         let seed = retain_reopen.then(|| self.pin_for_reopen()).transpose();
-        if !self.job.state().close_requested {
-            drop(self.job.request_close());
-        }
+        drop(self.job.request_close());
         self.supervisor.await.map_err(|_| Refusal::Ownership)?;
         let state = self.job.state();
         if state.status != Status::Clean || state.owner.is_some() || state.learner.is_some() {
@@ -600,7 +708,12 @@ impl Job {
         if state.close_requested || state.status != Status::LearnerReady {
             return Err(Refusal::Ownership);
         }
-        let State { owner, learner, .. } = &mut *state;
+        let State {
+            owner,
+            learner,
+            process_owned,
+            ..
+        } = &mut *state;
         let op = learner.as_mut().ok_or(Refusal::Unavailable)?;
         let gate = op.gate.as_ref().ok_or(Refusal::Unavailable)?;
         let (Phase::Strict, Some(position)) = gate
@@ -611,12 +724,11 @@ impl Job {
         };
         let member = op.member.as_mut().ok_or(Refusal::Identity)?;
         let (slot, live) = member.history.as_deref_mut().ok_or(Refusal::Provenance)?;
-        slot.persist_strict(
-            owner.as_ref().ok_or(Refusal::Ownership)?,
-            &member.custody,
-            live,
-            StrictWitness(position),
-        )
+        let owner = owner.as_ref().ok_or(Refusal::Ownership)?;
+        if *process_owned && live.links().is_ok() {
+            return slot.confirm_strict(owner, &member.custody.history_auth(), live);
+        }
+        slot.persist_strict(owner, &member.custody, live, StrictWitness(position))
     }
 
     pub(in crate::cluster::consensus) async fn check_issuer_transfer(
@@ -624,6 +736,33 @@ impl Job {
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
     ) -> Result<super::issuer_transfer::Offer, peer_transport::Refusal> {
+        let activation = {
+            let state = self.state();
+            state.process_owned.then(|| state.node.clone()).flatten()
+        };
+        if let Some(node) = activation {
+            use openraft::type_config::async_runtime::watch::WatchReceiver;
+            let refused = peer_transport::Refusal::Identity;
+            let mut metrics = node.lock().await.raft.as_ref().ok_or(refused)?.metrics();
+            // Within the already bounded transport check, wait for local
+            // apply rather than treating replicated bytes as confirmation.
+            loop {
+                let applied = metrics.borrow_watched().last_applied;
+                if let Some(applied) = applied
+                    && applied.index >= claim.membership.index
+                {
+                    if applied.index == claim.membership.index
+                        && (applied.leader_id.term, applied.leader_id.node_id)
+                            != (claim.membership.term, claim.membership.leader)
+                    {
+                        return Err(refused);
+                    }
+                    break;
+                }
+                metrics.changed().await.map_err(|_| refused)?;
+            }
+            self.persist_strict_history().map_err(|_| refused)?;
+        }
         self.with_receiver_proof(claim, sender, |_, offer| offer)
             .await
     }
@@ -742,7 +881,6 @@ impl Job {
             let mut state = self.state();
             let (owner, op) = receiver_parts(&mut state)?;
             let member = op.member.as_mut().ok_or(refused)?;
-            member.custody.spend_voter_history().map_err(|_| refused)?;
             let links = member
                 .history
                 .as_deref()
@@ -750,6 +888,7 @@ impl Job {
                 .1
                 .links()
                 .map_err(|_| refused)?;
+            member.custody.spend_voter_history().map_err(|_| refused)?;
             let clock = op.clock.as_ref().ok_or(refused)?;
             let tls = member.credentials(owner, clock).map_err(|_| refused)?;
             let now = clock.sample_ms().map_err(|_| refused)?;
@@ -878,6 +1017,14 @@ impl Job {
 }
 
 impl Operation {
+    pub(super) fn voter_custody(&self) -> bool {
+        self.issuer_membership.is_some()
+    }
+
+    pub(super) fn installation_id(&self) -> Option<[u8; 16]> {
+        Some(self.member.as_ref()?.custody.installation())
+    }
+
     fn issuer_membership_view<'a>(&self, node: &'a ConsensusNode) -> IssuerMembership<'a> {
         let membership = node.issuer_membership();
         #[cfg(test)]
@@ -1061,6 +1208,8 @@ impl Job {
             issuer_sample: Some(sample),
             issuer_before_proof: None,
             recovered: false,
+            process_recovered: false,
+            redeem_issuer: None,
             fixture: None,
         });
         state.status = Status::LearnerReady;

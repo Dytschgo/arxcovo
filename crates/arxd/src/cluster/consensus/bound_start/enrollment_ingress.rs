@@ -67,6 +67,15 @@ impl ReadyIssuer {
         self.promoted.map_or(FOUNDER, |(voter, _)| voter.node)
     }
 
+    pub(super) fn peer_credentials(&self) -> Credentials {
+        Credentials {
+            root: self.tls.root.clone(),
+            leaf: self.tls.leaf.clone(),
+            key: self.tls.key.clone_key(),
+            time: self.tls.time.clone(),
+        }
+    }
+
     pub(super) fn mint_root(&self) -> &[u8] {
         self.ca.cert_der()
     }
@@ -123,8 +132,27 @@ impl ReadyIssuer {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ExchangeCounts {
+    anchors: std::sync::atomic::AtomicU8,
+    redeems: std::sync::atomic::AtomicU8,
+}
+
+impl ExchangeCounts {
+    pub(super) fn observe(&self) -> [u8; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [self.anchors.load(Relaxed), self.redeems.load(Relaxed)]
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicU8) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    }
+}
+
 struct Issuer {
     ready: Arc<ReadyIssuer>,
+    exchange: Option<Arc<ExchangeCounts>>,
     node: Arc<tokio::sync::Mutex<ConsensusNode>>,
     #[cfg(test)]
     observation: Option<Arc<hosted::Observation>>,
@@ -145,6 +173,9 @@ impl Issuer {
 impl Backend for Issuer {
     async fn anchor(&self, query: Query, deadline: Instant) -> Result<BoundVoters, Refused> {
         let node = self.admit(deadline)?;
+        if let Some(exchange) = &self.exchange {
+            ExchangeCounts::count(&exchange.anchors);
+        }
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
@@ -176,6 +207,9 @@ impl Backend for Issuer {
     async fn redeem(&self, request: Redeem, deadline: Instant) -> Result<Reply, Refused> {
         let (input, csr) = request.into_issuer();
         let node = self.admit(deadline)?;
+        if let Some(exchange) = &self.exchange {
+            ExchangeCounts::count(&exchange.redeems);
+        }
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
@@ -247,6 +281,22 @@ fn socket_option<T: Default>(fd: RawFd, option: libc::c_int) -> Option<T> {
 }
 
 impl Job {
+    pub(super) fn issuer_serving(&self) -> bool {
+        let state = self.state();
+        if state.close_requested || state.ingress.is_none() {
+            return false;
+        }
+        let (Some(listener), Some(issuer), Some(node)) =
+            (state.serving_enrollment, &state.issuer, &state.node)
+        else {
+            return false;
+        };
+        listener.active()
+            && node
+                .try_lock()
+                .is_ok_and(|node| issuer.available(&node).is_ok())
+    }
+
     // An explicit private activation on the enrollment endpoint from the
     // retained startup intent. The job registers it under the close gate.
     pub(super) fn start_enrollment(
@@ -277,6 +327,7 @@ impl Job {
             ready.tls.time.clone(),
             Issuer {
                 ready: ready.clone(),
+                exchange: state.process_owned.then(|| state.exchange.clone()),
                 node: node.clone(),
                 #[cfg(test)]
                 observation,

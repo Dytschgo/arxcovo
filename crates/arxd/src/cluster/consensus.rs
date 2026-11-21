@@ -146,7 +146,7 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 mod adapter;
 pub(in crate::cluster) mod anchor_query;
-mod bound_start;
+pub(crate) mod bound_start;
 mod checked_clock;
 mod initial_promotion;
 pub(in crate::cluster) mod issue;

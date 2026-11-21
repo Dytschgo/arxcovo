@@ -175,6 +175,11 @@ test('Rust retains every native, Python and package validation with exact comman
         if: runner.os == 'Linux'
         shell: bash
         run: python3 -I -B tools/ci/custody/run.py`,
+    `name: Hosted C13 cluster process activation
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: python3 -I -B tools/ci/m3-c13/run.py`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
@@ -228,7 +233,15 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
   const concurrency = workflow.match(/^concurrency:\n((?:[ \t]+[^\n]*\n)+)/m)?.[1];
   assert.equal(concurrency, "  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n");
   assert.equal((workflow.match(/^\s*concurrency:/gm) ?? []).length, 1);
-  assert.deepEqual(workflow.match(/^\s*timeout-minutes:.*$/gm)?.map(line => line.trim()), Array(3).fill('timeout-minutes: 12'));
+  for (const name of ['rust', 'ui', 'verify']) {
+    assert.deepEqual(jobs[name].match(/^ {4}timeout-minutes:.*$/gm), ['    timeout-minutes: 12'], name);
+  }
+  assert.deepEqual(workflow.match(/^.*\btimeout-minutes['"]?\s*:.*$/gm), [
+    '    timeout-minutes: 12',
+    '        timeout-minutes: 3',
+    '    timeout-minutes: 12',
+    '    timeout-minutes: 12',
+  ]);
 });
 
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {

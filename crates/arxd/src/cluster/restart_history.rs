@@ -3,6 +3,7 @@
 #![allow(dead_code)] // The owner-local runtime consumes this lane in step 13d.
 
 use super::{
+    consensus::bound_start::{CheckedClock, RecoveryComplete},
     enrollment::{ClusterId, KeyDigest, NodeId},
     join_receipt::{ExpectedIdentity, Origin, PublicIdentity},
     pki::custody::{
@@ -20,6 +21,7 @@ use std::{
     net::SocketAddr,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 type Result<T> = std::result::Result<T, Refusal>;
@@ -432,6 +434,24 @@ impl Fresh {
         Ok(())
     }
 
+    pub(super) fn confirm_strict(
+        &self,
+        owner: &Owner,
+        auth: &HistoryAuth<'_>,
+        live: &Live,
+    ) -> Result<()> {
+        self.check_issuance(owner, auth, live)?;
+        let strict = live.strict.as_ref().ok_or(Refusal::Provenance)?;
+        let current = read_record::<Strict>(&self.roots, auth, &STRICT)?;
+        if current.digest != strict.digest
+            || object(&current.pin)? != object(&strict.pin)?
+            || store_objects(owner)? != strict.record.stores
+        {
+            return Err(Refusal::Ownership);
+        }
+        Ok(())
+    }
+
     pub(super) fn commit_voter(
         &self,
         owner: &Owner,
@@ -439,15 +459,8 @@ impl Fresh {
         live: &Live,
         candidate: &super::pki::custody::voter_transfer::HistoryCandidate,
     ) -> Result<DurableVoter> {
-        self.check_issuance(owner, &auth, live)?;
+        self.confirm_strict(owner, &auth, live)?;
         let strict = live.strict.as_ref().ok_or(Refusal::Provenance)?;
-        let current = read_record::<Strict>(&self.roots, &auth, &STRICT)?;
-        if current.digest != strict.digest
-            || object(&current.pin)? != object(&strict.pin)?
-            || store_objects(owner)? != strict.record.stores
-        {
-            return Err(Refusal::Ownership);
-        }
         #[cfg(test)]
         if self.fault == Some(TestFault::VoterSubstitution) {
             let path = owner.plan.config.parent().ok_or(Refusal::Layout)?;
@@ -659,6 +672,75 @@ impl Recovering {
             custody(custody_owner.reopen_voter_history(owner, &root, now, voter))?;
         }
         Ok(())
+    }
+
+    pub(super) fn complete(
+        self,
+        _complete: RecoveryComplete,
+        clock: Arc<dyn CheckedClock>,
+    ) -> RecoveredHistory {
+        RecoveredHistory {
+            roots: self.roots,
+            custody: self.custody.expect("original custody retained"),
+            evidence: self.verified.expect("authenticated evidence retained"),
+            clock,
+        }
+    }
+}
+
+/// Move-only original custody certified by the typed recovery reader. A
+/// successful transition does not acquire a second custody lock.
+pub(super) struct RecoveredHistory {
+    roots: HistoryRoots,
+    custody: HistoryCustody,
+    evidence: Verified,
+    clock: Arc<dyn CheckedClock>,
+}
+
+impl std::fmt::Debug for RecoveredHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveredHistory")
+    }
+}
+
+impl RecoveredHistory {
+    pub(super) fn verified(&self) -> Result<&Verified> {
+        Ok(&self.evidence)
+    }
+
+    pub(super) fn founder(&self) -> Option<&FounderCustody> {
+        match &self.custody {
+            HistoryCustody::Founder(custody) => Some(custody),
+            HistoryCustody::Learner(_) => None,
+        }
+    }
+
+    pub(super) fn into_learner(self) -> std::result::Result<(LearnerCustody, Verified), Box<Self>> {
+        if !matches!(self.custody, HistoryCustody::Learner(_)) {
+            return Err(Box::new(self));
+        }
+        let HistoryCustody::Learner(custody) = self.custody else {
+            unreachable!("learner role checked")
+        };
+        Ok((*custody, self.evidence))
+    }
+
+    pub(super) fn founder_context(
+        &self,
+        installed: &FounderCustody,
+        owner: &Owner,
+    ) -> std::result::Result<(ClusterId, Digest32, u64), Error> {
+        let original = self.founder().ok_or(Error::Context)?;
+        if owner.plan.mode != Mode::RecoverFounder || !std::ptr::eq(original, installed) {
+            return Err(Error::Ownership);
+        }
+        let auth = installed.history_auth();
+        let evidence = &self.evidence.issuance;
+        same_record(&self.roots, &auth, &ISSUANCE, evidence).map_err(|_| Error::Ownership)?;
+        let expected =
+            validate_issuance(&self.roots, owner, &auth, evidence).map_err(|_| Error::Ownership)?;
+        let now = self.clock.sample_ms().map_err(|_| Error::Clock)?;
+        Ok((expected.cluster, expected.ca, now))
     }
 }
 

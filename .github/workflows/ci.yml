@@ -121,6 +121,11 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: python3 -I -B tools/ci/custody/run.py
+      - name: Hosted C13 cluster process activation
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: python3 -I -B tools/ci/m3-c13/run.py
       - name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py
       - name: Pure Windows probe guards (no provisioning)

@@ -663,12 +663,17 @@ pub(super) struct ProcessRecovery {
     ready: Result<HostClock>,
 }
 
+/// The constructor stays in the typed startup verifier. Authentication of
+/// history alone does not certify the original installed store pair.
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) struct RecoveryComplete(());
+
 #[cfg(target_os = "linux")]
 pub(super) struct HistoryReady {
     pub(super) owner: Owner,
-    pub(super) history: crate::cluster::restart_history::Recovering,
+    pub(super) history: crate::cluster::restart_history::RecoveredHistory,
     pub(super) stores: crate::cluster::bound_open::OwnedStores,
-    pub(super) clock: HostClock,
+    pub(super) clock: std::sync::Arc<HostClock>,
 }
 
 #[cfg(target_os = "linux")]
@@ -690,11 +695,15 @@ impl ProcessRecovery {
             stores,
             ready,
         } = self;
+        let clock = std::sync::Arc::new(ready.expect("checked clock retained"));
+        let history = history
+            .expect("validated history retained")
+            .complete(RecoveryComplete(()), clock.clone());
         Ok(HistoryReady {
             owner,
-            history: history.expect("validated history retained"),
+            history,
             stores: stores.expect("validated pair retained"),
-            clock: ready.expect("checked clock retained"),
+            clock,
         })
     }
 }
@@ -1320,6 +1329,111 @@ mod tests {
                     layout.root.path(),
                     if founder { "founder" } else { "learner" },
                 );
+            }
+        }
+
+        fn prepared_fixture(
+            founder: bool,
+            history: bool,
+        ) -> crate::cluster::startup_plan::tests::Layout {
+            let mut install = fixture::Fixture::new(founder, history, None);
+            let address = install.owner.plan.peer.clone();
+            install.seed(fixture::E, fixture::E, founder.then_some(address.as_str()));
+            if !founder && history {
+                install.strict(fixture::E);
+            }
+            install.release()
+        }
+
+        fn start_fixture(base: &Path, mode: Mode) -> ProcessRecovery {
+            recover_process(
+                Owner::acquire(fixture::plan(base, mode)).unwrap(),
+                fixture::slot(base),
+                &base.join("wrap"),
+                &base.join("custody"),
+                false,
+            )
+        }
+
+        fn assert_lock_retained(base: &Path, name: &str) {
+            let check = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(base.join(name))
+                .unwrap();
+            assert!(
+                check.try_lock().is_err(),
+                "original installation lock was released"
+            );
+        }
+
+        #[test]
+        fn authenticated_custody_moves_original_learner_with_its_lock() {
+            let layout = prepared_fixture(false, true);
+            let base = layout.root.path();
+            let Ok(ready) = start_fixture(base, Mode::RecoverJoiner).into_ready() else {
+                panic!("original learner recovery refused");
+            };
+            assert_eq!(format!("{:?}", &ready.history), "RecoveredHistory");
+            assert!(ready.history.founder().is_none());
+            let (custody, evidence) = ready.history.into_learner().unwrap();
+            assert_eq!(evidence.expected.origin.position(), fixture::E);
+            assert!(custody.member().is_ok());
+            assert_lock_retained(base, "state/cluster-owner.lock");
+            assert_lock_retained(base, "custody/custody-lock");
+        }
+
+        #[test]
+        fn original_founder_signer_requires_matching_authenticated_installation() {
+            use crate::cluster::pki::custody::Error;
+            let first = prepared_fixture(true, true);
+            let other = prepared_fixture(true, true);
+            let base = first.root.path();
+            let Ok(ready) = start_fixture(base, Mode::RecoverFounder).into_ready() else {
+                panic!("original founder recovery refused");
+            };
+            let Ok(other) = start_fixture(other.root.path(), Mode::RecoverFounder).into_ready()
+            else {
+                panic!("second founder recovery refused");
+            };
+            let signer = ready.history.founder().unwrap();
+            assert!(matches!(
+                signer.load_recovered_ca(&other.history, &other.owner),
+                Err(Error::Ownership)
+            ));
+            assert!(matches!(
+                signer.load_recovered_ca(&ready.history, &other.owner),
+                Err(Error::Ownership)
+            ));
+            let root = ready.owner.read("ca.der", 4096).unwrap();
+            let reopened = signer
+                .load_recovered_ca(&ready.history, &ready.owner)
+                .unwrap();
+            assert_eq!(reopened.cert_der(), root);
+            let Err(history) = ready.history.into_learner() else {
+                panic!("founder custody was downgraded to learner");
+            };
+            assert_eq!(format!("{history:?}"), "RecoveredHistory");
+            assert_lock_retained(base, "state/cluster-owner.lock");
+            assert_lock_retained(base, "custody/custody-lock");
+        }
+
+        #[test]
+        fn unauthenticated_history_issues_no_custody_capability() {
+            for founder in [true, false] {
+                let layout = prepared_fixture(founder, false);
+                let base = layout.root.path();
+                let mode = if founder {
+                    Mode::RecoverFounder
+                } else {
+                    Mode::RecoverJoiner
+                };
+                let Err(failure) = start_fixture(base, mode).into_ready() else {
+                    panic!("missing history yielded custody authority");
+                };
+                assert_lock_retained(base, "state/cluster-owner.lock");
+                assert_lock_retained(base, "custody/custody-lock");
+                drop(failure);
             }
         }
 

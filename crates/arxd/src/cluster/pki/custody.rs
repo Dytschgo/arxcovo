@@ -778,6 +778,31 @@ mod linux {
             Ok((ca, csr))
         }
 
+        pub(in crate::cluster) fn load_recovered_ca(
+            &self,
+            history: &crate::cluster::restart_history::RecoveredHistory,
+            owner: &crate::cluster::startup_plan::Owner,
+        ) -> Result<ClusterCa, Error> {
+            let (cluster, root, now) = history.founder_context(self, owner)?;
+            let der = owner.read("ca.der", 4096).map_err(|_| Error::Context)?;
+            if super::super::ca::fingerprint_of(&der) != root {
+                return Err(Error::Context);
+            }
+            let (remaining, cert) =
+                x509_parser::parse_x509_certificate(&der).map_err(|_| Error::Corrupt)?;
+            if !remaining.is_empty() {
+                return Err(Error::Corrupt);
+            }
+            let expected = Context {
+                kind: Kind::Ca,
+                install: self.installation(),
+                cluster,
+                root,
+                spki: super::super::ca::fingerprint_of(cert.public_key().raw),
+            };
+            self.0.load_ca(expected, Some(now))
+        }
+
         pub(in crate::cluster) fn installation(&self) -> [u8; 16] {
             self.0.installation
         }

@@ -176,7 +176,7 @@ struct State {
     #[cfg(any(test, target_os = "linux"))]
     voter_receiver: Option<Arc<dyn issuer_channel::Receiver>>,
     #[cfg(any(test, target_os = "linux"))]
-    voter_transfers: [Option<NodeId>; 2],
+    voter_transfers: [Option<(NodeId, Arc<issuer_channel::AttemptState>)>; 2],
     keeper: Option<SmAdapter>,
     tasks: JoinSet<()>,
     // <=32 task results plus the single accept-loop result during close.
@@ -280,7 +280,7 @@ impl TransportOwner {
                     #[cfg(any(test, target_os = "linux"))]
                     voter_receiver: None,
                     #[cfg(any(test, target_os = "linux"))]
-                    voter_transfers: [None; 2],
+                    voter_transfers: [const { None }; 2],
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -1822,7 +1822,7 @@ impl TransportOwner {
                 #[cfg(any(test, target_os = "linux"))]
                 voter_receiver: None,
                 #[cfg(any(test, target_os = "linux"))]
-                voter_transfers: [None; 2],
+                voter_transfers: [const { None }; 2],
                 keeper: None,
                 tasks: JoinSet::new(),
                 join_errors: Vec::new(),
@@ -2405,7 +2405,7 @@ mod issuer_channel {
         pki::{ca::fingerprint_of, custody::voter_transfer::Wipe},
     };
     use control::issuer as wire;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
     use tokio_rustls::server::TlsStream;
 
     pub(super) type ReceiveFuture<'a, T> =
@@ -2535,9 +2535,59 @@ mod issuer_channel {
         Ok(())
     }
 
+    const CHECKING: u8 = 0;
+    const UNSPENT: u8 = 1;
+    const RESERVED: u8 = 2;
+
+    pub(super) struct AttemptState {
+        disposition: AtomicU8,
+    }
+
+    impl AttemptState {
+        fn available(&self) -> bool {
+            self.disposition.load(Ordering::SeqCst) == UNSPENT
+        }
+
+        fn reserved(&self) -> bool {
+            self.disposition.load(Ordering::SeqCst) == RESERVED
+        }
+    }
+
+    struct ChallengeCheck(Arc<AttemptState>);
+
+    impl ChallengeCheck {
+        fn new() -> Self {
+            Self(Arc::new(AttemptState {
+                disposition: AtomicU8::new(CHECKING),
+            }))
+        }
+
+        async fn build_once<T>(
+            self,
+            build: impl Future<Output = Result<T, Refusal>>,
+        ) -> Result<T, Refusal> {
+            self.0
+                .disposition
+                .compare_exchange(CHECKING, RESERVED, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| Refusal::Identity)?;
+            build.await
+        }
+    }
+
+    impl Drop for ChallengeCheck {
+        fn drop(&mut self) {
+            let _ = self.0.disposition.compare_exchange(
+                CHECKING,
+                UNSPENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
     pub(in crate::cluster::consensus) struct Transfer {
         reply: oneshot::Receiver<Result<(), Refusal>>,
-        sent: Arc<AtomicBool>,
+        attempt: Arc<AttemptState>,
         deadline: Instant,
     }
 
@@ -2545,10 +2595,38 @@ mod issuer_channel {
         pub(in crate::cluster::consensus) async fn outcome(self) -> Outcome {
             match timeout_at(self.deadline, self.reply).await {
                 Ok(Ok(Ok(()))) if Instant::now() < self.deadline => Outcome::Installed,
-                _ if self.sent.load(Ordering::SeqCst) => Outcome::Unknown,
+                _ if self.attempt.reserved() => Outcome::Unknown,
                 _ => Outcome::Refused,
             }
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn c13_challenge_refusal_is_unspent_and_reserved_failure_is_terminal() {
+        let check = ChallengeCheck::new();
+        let state = check.0.clone();
+        let mut built = 0;
+        // The transport returns before it can call build_once on a failed check.
+        drop(check);
+        assert!(state.available());
+        assert!(!state.reserved());
+        assert_eq!(built, 0);
+
+        let check = ChallengeCheck::new();
+        let state = check.0.clone();
+        assert_eq!(
+            check
+                .build_once(async {
+                    built += 1;
+                    Err::<(), _>(Refusal::Tls)
+                })
+                .await,
+            Err(Refusal::Tls),
+        );
+        assert!(!state.available());
+        assert!(state.reserved());
+        assert_eq!(built, 1);
     }
 
     impl TransportOwner {
@@ -2580,10 +2658,21 @@ mod issuer_channel {
             let shared = &self.shared;
             let (tx, reply) = oneshot::channel();
             let deadline = Instant::now() + INBOUND_BUDGET;
-            let sent = Arc::new(AtomicBool::new(false));
+            let check = ChallengeCheck::new();
+            let attempt = check.0.clone();
             let mut state = shared.state.lock().map_err(|_| Refusal::Closed)?;
-            let target = Some(offer.claim.receiver.0);
-            if state.voter_transfers.contains(&target) {
+            for slot in &mut state.voter_transfers {
+                if slot.as_ref().is_some_and(|(_, state)| state.available()) {
+                    *slot = None;
+                }
+            }
+            let target = offer.claim.receiver.0;
+            if state
+                .voter_transfers
+                .iter()
+                .flatten()
+                .any(|(id, _)| *id == target)
+            {
                 return Err(Refusal::Identity);
             }
             let free = state
@@ -2598,13 +2687,12 @@ mod issuer_channel {
                 std::mem::take(&mut state.join_errors)
             };
             if let Ok(admission) = admission {
-                state.voter_transfers[free] = target;
+                state.voter_transfers[free] = Some((target, attempt.clone()));
                 let shared = shared.clone();
-                let sent = sent.clone();
                 state.tasks.spawn(async move {
                     let result = timeout_at(
                         deadline,
-                        send(&shared, admission, sender, offer, deadline, &sent),
+                        send(&shared, admission, sender, offer, deadline, check),
                     )
                     .await
                     .unwrap_or(Err(Refusal::Deadline));
@@ -2620,7 +2708,7 @@ mod issuer_channel {
             drop(join_errors);
             Ok(Transfer {
                 reply,
-                sent,
+                attempt,
                 deadline,
             })
         }
@@ -2632,7 +2720,7 @@ mod issuer_channel {
         sender: impl Sender,
         offer: Offer,
         deadline: Instant,
-        sent: &AtomicBool,
+        check: ChallengeCheck,
     ) -> Result<(), Refusal> {
         let Admission {
             resources,
@@ -2690,10 +2778,11 @@ mod issuer_channel {
             .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
             .map_err(|_| Refusal::Tls)?;
         before_dispatch(shared, deadline)?;
-        let sealed = sender.seal(offer, &key.0, &transcript).await?;
+        let sealed = check
+            .build_once(async { sender.seal(offer, &key.0, &transcript).await })
+            .await?;
         drop(key);
         before_dispatch(shared, deadline)?;
-        sent.store(true, Ordering::SeqCst);
         wire::sealed(&mut stream, &sealed).await?;
         wire::read_acknowledgement(&mut stream, &challenge).await?;
         resources

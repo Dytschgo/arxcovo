@@ -112,6 +112,14 @@ pub(super) mod linux {
         fixture: Option<HostedFixture>,
     }
 
+    impl Operation {
+        pub(in crate::cluster::consensus::bound_start) fn installation_id(
+            &self,
+        ) -> Option<[u8; 16]> {
+            Some(self.custody.as_ref()?.installation())
+        }
+    }
+
     #[cfg(test)]
     impl Operation {
         pub(in crate::cluster::consensus::bound_start) fn transport_for_test(
@@ -188,6 +196,7 @@ pub(super) mod linux {
             wrap,
             store,
             None,
+            None,
             #[cfg(test)]
             Some(fixture),
         )
@@ -201,6 +210,19 @@ pub(super) mod linux {
         store: PathBuf,
         slot: Slot,
     ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
+        dispatch_history(plan, intent, params, wrap, store, slot, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::cluster::consensus::bound_start) fn dispatch_history(
+        plan: Plan,
+        intent: StartIntent,
+        params: Params,
+        wrap: PathBuf,
+        store: PathBuf,
+        slot: Slot,
+        fence: Option<&super::super::runtime::Admission>,
+    ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
         dispatch_with_slot(
             plan.with_history_intent(Mode::CreateFounder),
             intent,
@@ -208,6 +230,7 @@ pub(super) mod linux {
             wrap,
             store,
             Some(slot),
+            fence,
             #[cfg(test)]
             None,
         )
@@ -221,6 +244,7 @@ pub(super) mod linux {
         wrap: PathBuf,
         store: PathBuf,
         slot: Option<Slot>,
+        fence: Option<&super::super::runtime::Admission>,
         #[cfg(test)] fixture: Option<HostedFixture>,
     ) -> Result<(&'static Job, Observer, tokio::task::JoinHandle<()>), Error> {
         if plan.mode != Mode::CreateFounder
@@ -241,6 +265,9 @@ pub(super) mod linux {
             #[cfg(test)]
             fixture,
         });
+        if let Some(fence) = fence {
+            fence.register(job);
+        }
         Ok(dispatch_on(
             job,
             plan,
@@ -251,6 +278,164 @@ pub(super) mod linux {
             #[cfg(test)]
             None,
         ))
+    }
+
+    pub(in crate::cluster::consensus::bound_start) fn dispatch_recovered(
+        ready: startup_recovery::HistoryReady,
+        params: Params,
+        fence: &super::super::runtime::Admission,
+    ) -> (&'static Job, Observer, Option<tokio::task::JoinHandle<()>>) {
+        let job = Job::anchor();
+        fence.register(job);
+        let observer = job.observe();
+        match recovered_issuer(&ready) {
+            Ok((intent, issuer)) => {
+                let (transport, factory) = TransportOwner::pending_founder(intent.cluster, FOUNDER);
+                let startup_recovery::HistoryReady {
+                    owner,
+                    history,
+                    stores,
+                    clock: _,
+                } = ready;
+                let mut state = job.state();
+                state.owner = Some(owner);
+                state.stores = Some(stores);
+                state.founder_recovered = Some(history);
+                state.founder_recovered_issuer = Some(issuer);
+                state.founder = Some(Operation {
+                    wrap: PathBuf::new(),
+                    store: PathBuf::new(),
+                    custody: None,
+                    slot: None,
+                    history: None,
+                    transport: Arc::new(tokio::sync::Mutex::new(transport)),
+                    #[cfg(test)]
+                    fixture: None,
+                });
+                drop(state);
+                job.set(Status::Prepared);
+                let (_, _, supervisor) = drive(
+                    job,
+                    None,
+                    intent,
+                    None,
+                    params,
+                    factory.clone(),
+                    Some(factory),
+                    #[cfg(test)]
+                    None,
+                );
+                (job, observer, Some(supervisor))
+            }
+            Err(reason) => {
+                let mut state = job.state();
+                state.recovery_hold =
+                    Some(super::super::runtime::RecoveryHold::Ready(Box::new(ready)));
+                state.founder_failure = Some(reason);
+                drop(state);
+                job.set(Status::Unconfirmed);
+                (job, observer, None)
+            }
+        }
+    }
+
+    fn recovered_issuer(
+        ready: &startup_recovery::HistoryReady,
+    ) -> Result<(StartIntent, enrollment_ingress::ReadyIssuer), Error> {
+        let owner = &ready.owner;
+        if owner.plan.mode != Mode::RecoverFounder {
+            return Err(Error::Preparation);
+        }
+        let evidence = ready.history.verified().map_err(|_| Error::Preparation)?;
+        let expected = &evidence.expected;
+        if expected.node != FOUNDER || !expected.origin.founder() {
+            return Err(Error::Eligibility);
+        }
+        let custody = ready.history.founder().ok_or(Error::Custody)?;
+        let ca = custody
+            .load_recovered_ca(&ready.history, owner)
+            .map_err(|_| Error::Custody)?;
+        let now = ready.clock.sample_ms().map_err(|_| Error::Clock)?;
+        let root = owner.read("ca.der", 4096).map_err(|_| Error::Custody)?;
+        let public = crate::cluster::join_receipt::PublicIdentity::decode(
+            &owner
+                .read("identity.json", 8192)
+                .map_err(|_| Error::Custody)?,
+        )
+        .map_err(|_| Error::Custody)?;
+        let key = custody
+            .member()
+            .map_err(|_| Error::Custody)?
+            .tls_key(expected, &root, public.leaf(), now)
+            .map_err(|_| Error::Custody)?;
+        let intent = StartIntent {
+            mode: owner.plan.mode,
+            cluster: expected.cluster,
+            node: FOUNDER,
+            peer: peer_transport::endpoint(&owner.plan.peer).map_err(|_| Error::Address)?,
+            enrollment: peer_transport::endpoint(&owner.plan.enrollment)
+                .map_err(|_| Error::Address)?,
+        };
+        let issuer = enrollment_ingress::ReadyIssuer::new(
+            intent.enrollment,
+            expected.cluster,
+            ca,
+            ready.clock.clone(),
+            expected.key,
+            Credentials {
+                root: root.into(),
+                leaf: public.leaf().to_vec().into(),
+                key,
+                time: Arc::new(TlsClock(ready.clock.clone())),
+            },
+        );
+        Ok((intent, issuer))
+    }
+
+    pub(in super::super) fn has_recovered_issuer(job: &Job) -> bool {
+        job.state().founder_recovered.is_some()
+    }
+
+    pub(in super::super) async fn attach_recovered(
+        job: &'static Job,
+        address: std::net::SocketAddr,
+    ) -> Result<(), Error> {
+        let (node, transport) = {
+            let state = job.state();
+            (
+                state.node.clone().ok_or(Error::Preparation)?,
+                state
+                    .founder
+                    .as_ref()
+                    .ok_or(Error::Preparation)?
+                    .transport
+                    .clone(),
+            )
+        };
+        let node = node.lock().await;
+        let mut transport = transport.lock().await;
+        let mut state = job.state();
+        if state.close_requested || state.status != Status::Running {
+            return Err(Error::Closing);
+        }
+        state.status = Status::Founding;
+        job.changed.send_replace(Status::Founding);
+        let issuer = state
+            .founder_recovered_issuer
+            .take()
+            .ok_or(Error::Preparation)?;
+        transport
+            .attach_founder(
+                node.sm.as_ref().ok_or(Error::Eligibility)?,
+                Arc::new(EngineDispatch {
+                    raft: node.raft.clone().ok_or(Error::Eligibility)?,
+                }),
+                &address.to_string(),
+                issuer.peer_credentials(),
+            )
+            .map_err(Error::Attach)?;
+        state.issuer = Some(Arc::new(issuer));
+        Ok(())
     }
 
     #[cfg(test)]

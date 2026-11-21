@@ -57,6 +57,7 @@ struct Retained {
     live: Option<LiveMember>,
     history: Option<Fresh>,
     history_live: Option<Live>,
+    history_peer: Option<RedeemIssuer>,
 }
 
 struct Job {
@@ -137,6 +138,11 @@ pub(in crate::cluster) fn start_retained(
 
 pub(in crate::cluster) struct HistoryJoin(RetainedJoin);
 
+pub(in crate::cluster) struct RedeemIssuer {
+    pub(in crate::cluster) node: crate::cluster::enrollment::NodeId,
+    pub(in crate::cluster) key: crate::cluster::enrollment::KeyDigest,
+}
+
 pub(in crate::cluster) fn start_history_join(
     destination: Destination,
     slot: Slot,
@@ -160,7 +166,9 @@ pub(in crate::cluster) fn start_history_join(
 }
 
 impl HistoryJoin {
-    pub(in crate::cluster) fn consume(self) -> Result<(PublishedJoin, Fresh, Live), Status> {
+    pub(in crate::cluster) fn consume(
+        self,
+    ) -> Result<(PublishedJoin, Fresh, Live, RedeemIssuer), Status> {
         let RetainedJoin(job) = self.0;
         let mut retained = job.retained();
         if *job.status.borrow() != Status::Published {
@@ -168,7 +176,8 @@ impl HistoryJoin {
         }
         let history = retained.history.take().ok_or(Status::Refused)?;
         let live = retained.history_live.take().ok_or(Status::Refused)?;
-        Ok((job.consume(&mut retained)?, history, live))
+        let peer = retained.history_peer.take().ok_or(Status::Refused)?;
+        Ok((job.consume(&mut retained)?, history, live, peer))
     }
 }
 
@@ -422,6 +431,7 @@ impl Job {
             live,
             history,
             history_live,
+            history_peer,
             ..
         } = &mut *retained;
         let owner = owner.as_mut().unwrap();
@@ -458,6 +468,8 @@ impl Job {
                     .learner(owner, custody, &proof)
                     .map_err(|_| Status::Unconfirmed)?,
             );
+            let (node, key) = verified.peer();
+            *history_peer = Some(RedeemIssuer { node, key });
         }
         *live = Some(LiveMember {
             expected,

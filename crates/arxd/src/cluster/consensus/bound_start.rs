@@ -9,6 +9,11 @@ use crate::cluster::{
 use startup_recovery::{Observation, StartIntent};
 use tokio::sync::{Notify, watch};
 
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) use super::{
+    checked_clock::CheckedClock, startup_recovery::RecoveryComplete,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Status {
     Preparing,
@@ -42,6 +47,11 @@ struct State {
     node: Option<Arc<tokio::sync::Mutex<ConsensusNode>>>,
     status: Status,
     close_requested: bool,
+    close_notified: bool,
+    #[cfg(target_os = "linux")]
+    process_owned: bool,
+    #[cfg(target_os = "linux")]
+    exchange: Arc<enrollment_ingress::ExchangeCounts>,
     close_dispatched: bool,
     close_failure: Option<ShutdownReport>,
     engine_may_exist: bool,
@@ -50,6 +60,10 @@ struct State {
     founder: Option<founder::Operation>,
     #[cfg(target_os = "linux")]
     founder_failure: Option<founder::Error>,
+    #[cfg(target_os = "linux")]
+    founder_recovered: Option<crate::cluster::restart_history::RecoveredHistory>,
+    #[cfg(target_os = "linux")]
+    founder_recovered_issuer: Option<enrollment_ingress::ReadyIssuer>,
     #[cfg(target_os = "linux")]
     issuer: Option<Arc<enrollment_ingress::ReadyIssuer>>,
     #[cfg(target_os = "linux")]
@@ -60,6 +74,8 @@ struct State {
     admission: Option<Arc<learner_admission::Controller>>,
     #[cfg(target_os = "linux")]
     learner: Option<learner::Operation>,
+    #[cfg(target_os = "linux")]
+    recovery_hold: Option<runtime::RecoveryHold>,
 }
 #[cfg(test)]
 struct PreparationPause {
@@ -104,6 +120,11 @@ impl Job {
                 node: None,
                 status: Status::Preparing,
                 close_requested: false,
+                close_notified: false,
+                #[cfg(target_os = "linux")]
+                process_owned: false,
+                #[cfg(target_os = "linux")]
+                exchange: Arc::default(),
                 close_dispatched: false,
                 close_failure: None,
                 engine_may_exist: false,
@@ -112,6 +133,10 @@ impl Job {
                 founder: None,
                 #[cfg(target_os = "linux")]
                 founder_failure: None,
+                #[cfg(target_os = "linux")]
+                founder_recovered: None,
+                #[cfg(target_os = "linux")]
+                founder_recovered_issuer: None,
                 #[cfg(target_os = "linux")]
                 issuer: None,
                 #[cfg(target_os = "linux")]
@@ -122,6 +147,8 @@ impl Job {
                 admission: None,
                 #[cfg(target_os = "linux")]
                 learner: None,
+                #[cfg(target_os = "linux")]
+                recovery_hold: None,
             }),
             changed,
             close: Notify::new(),
@@ -161,18 +188,25 @@ impl Job {
     pub(super) fn observe(&self) -> Observer {
         Observer(self.changed.subscribe())
     }
+    fn stop_admission(s: &mut State) {
+        if s.close_requested {
+            return;
+        }
+        s.close_requested = true;
+        #[cfg(target_os = "linux")]
+        if let Some(ingress) = &s.ingress {
+            ingress.stop();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(admission) = &s.admission {
+            admission.stop();
+        }
+    }
     pub(super) fn request_close(&self) -> Observer {
-        let mut s = self.state();
-        if !s.close_requested {
-            s.close_requested = true;
-            #[cfg(target_os = "linux")]
-            if let Some(ingress) = &s.ingress {
-                ingress.stop();
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(admission) = &s.admission {
-                admission.stop();
-            }
+        let mut state = self.state();
+        Self::stop_admission(&mut state);
+        if !state.close_notified {
+            state.close_notified = true;
             self.close.notify_one();
         }
         self.observe()
@@ -260,6 +294,16 @@ impl Job {
         ));
         Ok(())
     }
+    fn process_stop_requested(&self, state: &State) -> bool {
+        #[cfg(target_os = "linux")]
+        return state.process_owned && state.close_requested;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = state;
+            false
+        }
+    }
+
     fn begin_close(&self) -> bool {
         let mut s = self.state();
         if s.close_dispatched || matches!(s.status, Status::Unconfirmed | Status::Clean) {
@@ -277,7 +321,13 @@ impl Job {
             Err(reason) => {
                 self.state().refusal.get_or_insert(reason);
                 self.set(Status::LearnerRefused);
-                drop(self.request_close());
+                #[cfg(target_os = "linux")]
+                let process_owned = self.state().process_owned;
+                #[cfg(not(target_os = "linux"))]
+                let process_owned = false;
+                if !process_owned {
+                    drop(self.request_close());
+                }
             }
         }
     }
@@ -308,6 +358,8 @@ impl Job {
                 s.issuer = None;
                 s.admission = None;
                 s.founder = None;
+                s.founder_recovered = None;
+                s.founder_recovered_issuer = None;
                 if s.founder_failure.is_some() {
                     s.status = Status::ClosedAfterFounderRefusal;
                 }
@@ -441,6 +493,10 @@ where
         #[cfg(target_os = "linux")]
         let intent_after_start_cluster = intent.cluster;
         let prepared = tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            if founder::linux::has_recovered_issuer(job) {
+                return None;
+            }
             if let Some(plan) = plan {
                 job.prepare(plan, &intent, expected.as_ref());
             } else {
@@ -473,7 +529,11 @@ where
         } else {
             None
         };
-        if job.state().status == Status::Prepared {
+        let prepared_to_start = {
+            let state = job.state();
+            state.status == Status::Prepared && !job.process_stop_requested(&state)
+        };
+        if prepared_to_start {
             let config = match params.config() {
                 Ok(c) => Arc::new(c),
                 Err(_) => {
@@ -568,15 +628,23 @@ where
                 job.state().adapters = None; // release startup clones before shutdown
                 job.set(Status::Running);
                 #[cfg(target_os = "linux")]
-                if let Some(prepared) = _prepared {
-                    match prepared.run(job).await {
-                        Ok(()) => {
+                {
+                    let outcome = if let Some(prepared) = _prepared {
+                        Some(prepared.run(job).await)
+                    } else if founder::linux::has_recovered_issuer(job) {
+                        Some(founder::linux::attach_recovered(job, intent_after_start).await)
+                    } else {
+                        None
+                    };
+                    match outcome {
+                        Some(Ok(())) => {
                             if let Some(network) = issuer_network {
                                 job.install_learner_admission(&network);
                             }
                             job.set(Status::FounderReady);
                         }
-                        Err(reason) => founder::refuse(job, reason),
+                        Some(Err(reason)) => founder::refuse(job, reason),
+                        None => {}
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -696,3 +764,6 @@ mod tests;
 
 #[cfg(any(test, target_os = "linux"))]
 mod mint;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod runtime;
