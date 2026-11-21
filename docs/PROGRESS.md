@@ -861,9 +861,11 @@ merged, as listed under "Merged this session".
 - **Process note.** The coordinator's instruction to run the complete QEMU suite led the 14a
   builder to run the existing C11/C12 Engine campaigns locally under emulation, beyond 14a's
   zero-Engine local brief; These local runs spent no hosted grant. Earlier coordinator briefs also asked for the
-  complete native Windows lib suite, which includes two standing tests that start a real Engine
-  and call Found (`bound_start_real_engine_start_close`, `founder_joiner_mutual_tls_real_identities`);
-  the 14b builder identified this conflict. Later local briefs require zero Engine invocations.
+  complete native Windows lib suite, which includes standing tests that start a real Engine or
+  call Found (for example `bound_start_real_engine_start_close` and
+  `founder_joiner_mutual_tls_real_identities`; the 14b design check lists about a dozen such groups
+  under `cluster::consensus`). The 14b builder identified this conflict; these are standing CI
+  inventory, and no campaign grant was spent. Later local briefs require zero Engine invocations.
 - **14b and 15b (in progress):** the plan's proposed grants are adopted verbatim under the
   pre-approval. The Sol 6.2/high builders were assigned in parallel with three counted failures
   allowed each. Before any dispatch, 15b must resolve R6 and obtain coordinator approval for the
