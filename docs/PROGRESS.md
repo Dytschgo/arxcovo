@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-21 01:02 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-21 04:16 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,9 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `12c21292` (PR218), push CI 44846740760 green. `80a71cf6` (PR217) push CI
+- **Main:** `b035ab21` (PR220); push CI 44865096894 recorded in the next checkpoint.
+  `123dab63` (PR221) push CI 44861802922 green. `863ac6cc` (PR219) push CI 44848531876
+  green. `12c21292` (PR218), push CI 44846740760 green. `80a71cf6` (PR217) push CI
   44840557829 green. `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
   44836270187 green. `4f139cd8` (PR214), push CI 44834437714 green. `5393900d` (PR213) push CI
   44829635662 green. `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
@@ -67,7 +69,10 @@ merged, as listed under "Merged this session".
   retained durable join before replication), PR213 `5393900d` (docs), PR214 `4f139cd8`
   (step 9, receipt-scoped learner catch-up), PR215 `2d97a26e` (docs), PR216 `2e1375ed`
   (step 10, authenticated learner self-admission), PR217 `80a71cf6` (docs), PR218
-  `12c21292` (step 11, initial three-voter promotion). Every merge had an independent exact-head Sol
+  `12c21292` (step 11, initial three-voter promotion), PR219 `863ac6cc` (docs), PR221
+  `123dab63` (strict and learner TLS authorization moved after the handshake with a
+  bounded non-blocking wait; C11 diagnostics), PR220 `b035ab21` (step 12, sealed issuer
+  custody transfer to promoted voters). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -569,7 +574,83 @@ merged, as listed under "Merged this session".
   and no Engine on the last join destination. Keep Engine, workers, Owners, stores,
   founder and issuance internals and deadlines frozen. Stop and preserve the first
   unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or budget
-  reset." Sol 6.2/high builder, fresh 3-attempt budget, in progress.
+  reset." The first Sol 6.2/high builder opened PR #220 (16 files, ADR 0044) at 2/3
+  counted failures (report `D:/Temp/arx-m3-step12/report.md` SHA256 `d1614f2b…706b`); hosted
+  C12 `issuer_transfer_campaign::promoted_voter_issues_after_founder_close` passed (2.819 s).
+  Review 1 HOLD on three P2s (`D:/Temp/arx-pr220-review/review.md`, SHA256 `de13c63d…6fe8`): a
+  revocation window between guard release and unwrap, PKCS#8 copies in ordinary heap, and
+  no production-TLS tests for revocation, replay and lost acknowledgement. Builder attempt
+  3 (`71292f7e`) addressed them; review 2 HOLD on two P2s
+  (`D:/Temp/arx-pr220-review2/review.md`, SHA256 `f18ad013…c474`): the applied guard was still
+  released before unwrap and confirmation, and the revocation test substituted the
+  receiver. On that head the unchanged C11 failed on Ubuntu (run 44851523898, "gated RPC
+  caller refused: Tls"; log `D:/Temp/arx-pr220-c11-failure/ubuntu-rust.log` SHA256
+  `aa7e3d06…cb08`); no rerun. A stuck-rule diagnosis
+  (`D:/Temp/arx-pr220-diagnosis/diagnosis.md`, SHA256 `76a283e2…4658`) counted it as the first
+  builder's 3/3 and found a likely pre-existing transport sensitivity. **Owner decisions
+  (2026-11-21):** a separate C11 investigation and repair grant, and a fresh step 12
+  builder for the two P2s.
+- **PR #221 (C11 cause and fix) merged** as `123dab63`. Linux-test-only C11 diagnostics
+  located the refusal: during the handshake the issuer's outbound strict-registry check of
+  the learner's server certificate took the applied-store lock with a non-waiting
+  try-lock and failed closed when the issuer's own store was momentarily busy (run
+  44858188771: "TLS server authorization" refused "founder registry unavailable" at
+  3.66 ms; log `D:/Temp/arx-pr221-fail/ubuntu-rust.log` SHA256 `55998d64…462b`). **Owner decision
+  (2026-11-21):** a narrow production fix, a short bounded wait instead of instant refusal
+  on contention, keeping instant fail-closed refusal for poison, an unavailable store and
+  clock failure. Final design: rustls keeps full chain, cluster and possession checks;
+  strict clients authorize after TLS and before their first frame write, strict servers
+  and learners before their first frame read; final dispatch and client reply validation
+  recheck; each check waits at most 4 ms on Tokio timers with no guard across await. ADR
+  0041 records the residual that rustls can decrypt a bounded amount of application data
+  (16 KiB plaintext backpressure, record-deframer caps) before the binding check, which
+  Arxcovo never parses and refusal drops. Reviews: 1 HOLD (blocking `thread::sleep` on a
+  Tokio worker; `D:/Temp/arx-pr221-review/review.md`, SHA256 `d6cb99e5…3ae5`); 2 cancelled as
+  superseded; 3 (`D:/Temp/arx-pr221-review3/review.md`, SHA256 `9568520f…5586`) resolved its
+  security P2 after the coordinator clarified the intended property (no application data
+  parsed or acted on before authorization, bounded buffering acceptable) and asked for ADR
+  wording; the coordinator made two docs-only ADR edits; 4 HOLD on one sentence
+  (`D:/Temp/arx-pr221-review4/review.md`, SHA256 `a664eed6…6ae5`); 5 PASS
+  (`D:/Temp/arx-pr221-review5/review.md`, SHA256 `f1725fc7…4c1b`), agent-review status
+  59534006830. Builder counted failures 1/3 (C11 still failed after the learner-only
+  change); report `D:/Temp/arx-c11-fixture/report.md` SHA256 `1d446df7…b216`. Hosted run
+  44860863540 green with 942 tests; C11, C9, C10, the J tests, 7b P1 and O1 all passed.
+  An unrelated UI Node test (`scripts/ci-workflow.test.mjs` "required gates accept only
+  both successful matrices") timed out once at 10 s on run 44855233311 and has passed since.
+- **PR #220 merged** as `b035ab21` (step 12). The second step 12 builder (fresh 3) fixed
+  the two P2s after #221 merged (`2e034968`; report `D:/Temp/arx-m3-step12-b2/report.md`
+  SHA256 `4c390d9c…3afb`): the receiver holds the applied guard through unwrap, readback and both
+  confirmations, with disk I/O between guarded steps; three Linux production-receiver mTLS
+  tests. Review 3 HOLD (`D:/Temp/arx-pr220-review3/review.md`, SHA256 `fad71a6a…b7c6`): the final
+  promoted-voter proof could accept a stale image after store poison. **Provider block
+  (2026-11-21):** the Sol fix delegate was refused ("flagged for possible cybersecurity
+  risk") before any change; per the fallback chain a Claude Opus 5.5/high builder continued
+  the same budget and added the store-health check to the final proof and its shared
+  callers plus zeroizing wrapping-key reads (`f05fbcd6`; report
+  `D:/Temp/arx-m3-step12-opus/report.md` SHA256 `ec2acf07…0d87`); the coordinator counted its
+  borrow-check compile fix as a build failure (1/3). Review 4 PASS
+  (`D:/Temp/arx-pr220-review4/review.md`, SHA256 `9d9833fe…2be1`), agent-review status
+  59535244820. Hosted run 44864169368 green with 964 tests; C12, C11, the new poison
+  regression and all Linux voter-custody tests passed. Follow-ups: the zero-wait busy check
+  in the synchronous final proof can refuse briefly contended healthy requests and spend a
+  one-shot transfer slot; the pre-existing founder-ingress `ReadyIssuer::available` lacks
+  the poison-latch check; a private `peer_registry.rs` wrapper outside the named files is a
+  coordinator fence note. Cross-process restart activation remains step 13. Engine Sol 3/3
+  and Opus 0/2 unchanged.
+- **Owner pre-approval (2026-11-21):** "For now every other action you take, just run it.
+  It's auto-approved. I just want to get this app done so do whatever it takes." The
+  coordinator now adopts reviewed recommendations, grants and fence amendments without
+  asking, recording each here; independent review, green required checks, D: scratch,
+  protected-resource, owner-admin and secret rules are unchanged.
+- **Steps 13–16 plan:** Sol 6.2/high design `D:/Temp/arx-m3-steps13to16/plan.md` (SHA256
+  `c1d1dc7b…86b2`): 13a restart history, 13b admission fixes, 13c owner Mint, 13d activation, 13e
+  lost-reply evidence; 14 A-to-B build; 15 ingress and elapsed-time evidence; 16
+  three-container acceptance. Independent review NO-GO for 13a
+  (`D:/Temp/arx-m3-steps13to16-review/review.md`, SHA256 `1d710a22…d70b`) on B1 (pin merged #220
+  and #221), B2 (history capability through real issuance with a typed recovery reader)
+  and B3 (two-stage D11 completion), plus R1–R8. Under the pre-approval the coordinator
+  adopted every replacement verbatim (`D:/Temp/arx-m3-steps13to16/plan-amendments.md`,
+  SHA256 `7e672af8…1641`); 13a waits for an independent recheck against the merged tree.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
