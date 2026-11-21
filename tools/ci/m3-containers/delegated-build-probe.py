@@ -1059,26 +1059,52 @@ assert sockets.call_count == 2
                                     observe(root, "ordinary", 42, helper)
 
         def test_witness_reader_rejects_unsafe_files(self):
-            # Use the standing A10 reader with an injected POSIX open/fstat
-            # seam so the same flags and metadata checks run on Windows.
-            for kind in ("oversized", "unowned", "symlink", "hardlink", "fifo"):
+            # Check the A10 reader directly so a later observation fault
+            # cannot mask an unsafe read. Inject POSIX file operations on Windows.
+            frame = b"25 arx-42-0\n"
+            path = Path("fixture/workspace/ordinary/out/observed")
+            cases = (
+                ("valid", None),
+                ("oversized", "read-bound"),
+                ("unowned", "report-owner"),
+                ("hardlink", "report-owner"),
+                ("fifo", "read-type"),
+                ("symlink", None),
+            )
+            for kind, refusal in cases:
                 with self.subTest(kind=kind):
-                    data = b"x" * 65 if kind == "oversized" else b"25 arx-42-0\n"
+                    data = frame.ljust(65, b" ") if kind == "oversized" else frame
                     metadata = SimpleNamespace(st_uid=0 if kind == "unowned" else BUILD,
                                                st_nlink=2 if kind == "hardlink" else 1,
                                                st_mode=stat.S_IFIFO if kind == "fifo" else stat.S_IFREG)
+
+                    def open_witness(_path, flags):
+                        if kind == "symlink" and flags & os.O_NOFOLLOW:
+                            raise OSError(errno.ELOOP, "refused symlink")
+                        return 7
+
+                    stream_read = Mock(wraps=BytesIO(data).read)
                     with patch.object(os, "O_NOFOLLOW", 0x20000, create=True), \
                          patch.object(os, "O_NONBLOCK", 0x800, create=True), \
                          patch.object(os, "O_CLOEXEC", 0x80000, create=True), \
-                         patch.object(os, "open", return_value=7) as opened, \
+                         patch.object(os, "open", side_effect=open_witness), \
                          patch.object(os, "fdopen", return_value=MagicMock()) as wrapped, \
-                         patch.object(os, "fstat", return_value=metadata):
+                         patch.object(os, "fstat", return_value=metadata) as fstat:
+                        wrapped.return_value.__enter__.return_value.read = stream_read
                         if kind == "symlink":
-                            opened.side_effect = OSError(errno.ELOOP, "private")
-                        wrapped.return_value.__enter__.return_value.read = BytesIO(data).read
-                        with self.assertRaisesRegex(Fault, "witness"):
-                            observe(Path("fixture"), "ordinary", 42, a10)
-                        self.assertTrue(opened.call_args.args[1] & os.O_NOFOLLOW)
+                            with self.assertRaises(OSError) as caught:
+                                a10["read"](path, 64, BUILD)
+                            self.assertEqual(caught.exception.errno, errno.ELOOP)
+                            fstat.assert_not_called()
+                        elif refusal:
+                            with self.assertRaisesRegex(a10["Refusal"], f"^{refusal}$"):
+                                a10["read"](path, 64, BUILD)
+                        else:
+                            self.assertEqual(a10["read"](path, 64, BUILD), frame.decode("ascii"))
+                        if kind in ("valid", "oversized"):
+                            stream_read.assert_called_once_with(65)
+                        else:
+                            stream_read.assert_not_called()
 
         def test_both_gates_reject_early_pipe_results_before_witness(self):
             sentinel = "redaction-sentinel"
