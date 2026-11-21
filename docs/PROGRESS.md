@@ -19,10 +19,10 @@ merged, as listed under "Merged this session".
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below);
   a second, the 13d pre-push review 3, fell back to an Opus 5.5/high reviewer; a third,
   the 15a builder, fell back to an Opus 5.5/high builder with Sol reviewers.
-- **Main:** `aaa26b9c` (PR233); push CI recorded in the next checkpoint.
+- **Main:** `aaa26b9c` (PR233); push CI 44909755993 was in progress at this checkpoint.
   `7297d530` (PR234) push CI 44908581138 green; `58604520` (PR232) 44902174731 green;
-  `61542cae` (PR231) 44900706992 red on attempt 1 (macOS UI budget-test timeout, repaired by
-  PR232), green on attempt 2; `fb48a878` (PR230) 44898661842 green; `be64f8db` (PR229)
+  `61542cae` (PR231) 44900706992 red on attempt 1 (macOS UI budget-test timeout), green on
+  attempt 2 before PR232 merged. PR232 removed nested subprocesses from the partial-jobs case; `fb48a878` (PR230) 44898661842 green; `be64f8db` (PR229)
   44896780073 green.
   `e0f3ddc1` (PR228) push CI 44877277057 green; `851472bc` (PR227) 44876064810 green.
   `5f6fcef4` (PR225) push CI 44875428857 green; `ddc950db` (PR224) 44873617369 green;
@@ -806,8 +806,8 @@ merged, as listed under "Merged this session".
   SHA256 `7e533752…c2ca`); J4 passed in 0.168 s with its counts enforced by the test, not printed.
   Exact-head review PASS (SHA256 `56dd57d4…6851`), agent-review status 59547708049.
 - **PR #232 merged** as `58604520` (test-only): the `partial-jobs` CI budget case timed out at
-  30 s on main's macOS UI job (log SHA256 `b3734321…8d6e`); its fixture no longer nests Node
-  subprocesses. Builder 0/3 (report SHA256 `52a6c9db…cccb`); review PASS (SHA256 `a294f084…7669`),
+  30 s on main's macOS UI job (log SHA256 `b3734321…8d6e`); the partial-jobs case no longer nests
+  Node subprocesses. The large-buffer scenarios still exercise the real piped transport. Builder 0/3 (report SHA256 `52a6c9db…cccb`); review PASS (SHA256 `a294f084…7669`),
   agent-review status 59548210460.
 - **PR #234 merged** as `7297d530` (15a, test-only; ADR 0051). Checked-clock offsets exist only
   in Linux test builds, ahead of the unchanged checks; the wiring audit found no caller gap.
@@ -820,43 +820,54 @@ merged, as listed under "Merged this session".
   quarantine-guard update; A15, 15a may merge before 14b because their paths do not overlap.
   Ruling: C15's selection on any Linux host matches the standing campaigns and was not changed.
   **C15 passed** in run 44907466173 (log SHA256 `2eb490f3…463f`): original E LogPos{1,1,4}, replay
-  log ID LogPos{1,1,5}, node 2, same key, one allocation; R8 window margin 6,985 of 7,000 ms;
-  the consumed reconnect (distinct attempt) and expired B received uniform refusals over full
-  TLS with clean close and no Redeem; owner Mints 3, AnchorQuery 5, Redeem 3; owned close
+  log ID LogPos{1,1,5}, node 2, same key, one allocation across the two A continuations and two
+  allocations across the campaign (A and fresh C). R8 window margin was 6,985 of 7,000 ms. The
+  consumed-code reconnect and expired B received uniform Anchor refusals over full TLS with clean
+  close and sent no Redeem frame. The reconnect's distinct local attempt was prepared and
+  withheld; owner Mints 3, AnchorQuery 5, Redeem 3; owned close
   Joined(Clean). Exact-head review PASS (SHA256 `c086e63c…1c7e`), agent-review status 59550423252.
 - **PR #233 merged** as `aaa26b9c` (14a; ADR 0048). The first builder's preflight found the
   hosted Docker and UID profiles cannot give the root broker the frozen executor's
   `arxd.service/supervisor` placement with writable delegation. After an independent design
   review (SHA256 `d2ea8190…91c6`), which recommended escalating the equivalence question, the
   coordinator adopted **A10** under the pre-approval: the disposable hosted VM is the facility,
-  the unchanged broker runs as transient `arxd.service` (`Delegate=memory pids`,
+  the new root broker uses the unchanged Runner and runs as transient `arxd.service` (`Delegate=memory pids`,
   `DelegateSubgroup=supervisor`, NoNewPrivileges, CapBnd `0xc1`), daemon and build use separate
   nonroot UIDs, and the build UID's read-only view of the VM's cgroup metadata is accepted for
   14a/C14 only; C16's container boundary stays open. A11 allowed minimal workflow-pin test edits
   and the S2b exact-source pin; A12 allowed exactly three broker token sequences in
   `service/unix_bridge.rs` through the E7 inactive-source fence (a static policy fence, ruled
-  lint-class). Builder 1 reached 3/3 (report SHA256 `637d5963…3189`); pre-push reviews HOLD
-  (SHA256 `ef447f6a…94b5`), HOLD (SHA256 `a189d559…3fcc`), PASS (SHA256 `0562719f…4b8e`), A12 re-check PASS
-  (SHA256 `de9b5049…687f`). The first hosted preflight refused at broker start (log SHA256
+  lint-class). The Sol 6.2/high builder reported 2/3 through A12 (report SHA256 `637d5963…3189`). Initial
+  pre-push reviews were HOLD (SHA256 `ef447f6a…94b5`), HOLD (SHA256 `a189d559…3fcc`), PASS (SHA256 `0562719f…4b8e`).
+  Hosted run 44902560531 failed the E7 source fence before reaching A10. The A12 re-check
+  passed for push (SHA256 `de9b5049…687f`). Run 44904837476, the first to reach A10, refused at broker
+  start and brought builder 1 to 3/3 (log SHA256
   `4d85d02a…789c`): the probe gave fixture accounts `/usr/sbin/nologin`, which the resolver rejects
   (stuck review SHA256 `7496214c…e106`). Builder 2 (2/2; report SHA256 `c9fd1be9…f4c2`; review PASS
   SHA256 `ec826866…b576`) used a compatible shell with locked credentials, an allowlisted refusal
   subcategory and an explicit preflight-only mode. Preflight-only run 44906689524 (log SHA256
-  `29cf97ee…dc0e`): setup ready, delegation marker 1, root-owned ancestors, the build UID denied
-  4,296 control writes, drain confirmed, zero dispatches. The coordinator then switched the step
-  to build mode; run 44907529544 (log SHA256 `707ce247…88f9`) ran the single granted build once in
+  `29cf97ee…dc0e`): setup ready, delegation marker 1, root-owned ancestors, the probe observed
+  4,296 denied attempts by the build UID to open cgroup controls for writing, drain confirmed, zero dispatches. The coordinator then switched the step
+  to build mode; run 44907529544 (log SHA256 `707ce247…88f9`) ran one Standard build witness in
   leaf `runs/arx-12336-0` as UID 21072 with memory 128 MiB, PIDs 32, swap 0 and
   no_new_privs 1, zero consensus invocations and confirmed cleanup; the probe's success requires
   the denial set, workspace access, `cargo --version` output and one owned terminal record.
   Exact-head review PASS (SHA256 `3d9bc913…9370`), status 59550542962; after a refresh onto main
   (3,144 changed lines identical), re-verification PASS (SHA256 `ff454f75…f755`), status
-  59550842472. The A10 step is now standing per-CI inventory (about 2 s).
+  59550842472. The refreshed pre-merge run 44908926575 ran the A10 witness again, with one
+  dispatch, zero consensus invocations and confirmed cleanup. That run also passed C15 as
+  standing inventory from merged PR234. The A10 step is now standing inventory in the Ubuntu
+  Rust job. Its build-mode step took about 2 s in run 44907529544.
 - **Process note.** The coordinator's instruction to run the complete QEMU suite led the 14a
   builder to run the existing C11/C12 Engine campaigns locally under emulation, beyond 14a's
-  zero-Engine local brief; no hosted grant was spent. Later briefs exclude Engine campaigns.
+  zero-Engine local brief; These local runs spent no hosted grant. Earlier coordinator briefs also asked for the
+  complete native Windows lib suite, which includes two standing tests that start a real Engine
+  and call Found (`bound_start_real_engine_start_close`, `founder_joiner_mutual_tls_real_identities`);
+  the 14b builder identified this conflict. Later local briefs require zero Engine invocations.
 - **14b and 15b (in progress):** the plan's proposed grants are adopted verbatim under the
-  pre-approval. Sol 6.2/high builders run in parallel with a fresh 3 each; 15b settles R6 and
-  proposes the UTC-health witness for coordinator approval before any dispatch.
+  pre-approval. The Sol 6.2/high builders were assigned in parallel with three counted failures
+  allowed each. Before any dispatch, 15b must resolve R6 and obtain coordinator approval for the
+  UTC-health witness.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
