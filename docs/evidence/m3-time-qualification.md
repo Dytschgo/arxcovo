@@ -1,7 +1,12 @@
 # M3 elapsed-time qualification
 
-Status: source prepared for independent review. The workflow has not been
-dispatched. D5 remains open pending the approved first hosted attempt.
+**Status — first-attempt PASS.** The single authorized `workflow_dispatch`
+ran on reviewed `main` at `44dd7a021a875ec4b49d7fc41f7df092fd260e0b`
+(PR #237), on `ubuntu-24.04` with `ImageVersion=20261116.376.1`.
+Independent Sol 6.2/high review passed and closed **M3 step 15b / D5 for
+conditional hosted Linux elapsed-time qualification**. Review
+`D:/Temp/arx-d5-44945822915/review.md` has SHA256 `408f285d…13ee`.
+[GitHub Actions run 44945822915, job 136972784258](https://github.com/Dytschgo/arxcovo/actions/runs/44945822915/job/136972784258)
 
 ## Authorized run
 
@@ -58,6 +63,34 @@ raw output from the founder. An incomplete witness earns no qualification.
 Early sudo and privileged-entry failures record a bounded, redacted
 failure category. The grant authorizes a single dispatch.
 
+The independent review recorded these SHA256 digests. The JSONL and job
+log were checked against their local copies in `D:/Temp/arx-d5-44945822915/`.
+The archive digest comes from verified upload evidence. The build and
+privileged launch reported the same executable digest.
+
+| Evidence | SHA256 |
+| --- | --- |
+| `m3-time-first.jsonl` | `308eb19e8a6d4d67cb2f4712d310e44898dcdacecf9a03c282f6d6dfa8d6c211` |
+| `job-136972784258.log` | `c200e556d3b3055542df4751c82cc05f72aea7c9e26a05e7fbe1bfa0240d08f5` |
+| Uploaded archive `14723843666` | `a3516d13aba8ba31aade52c93ee4ebff7e1943914e647b1a0a71181f574a9609` |
+| Built and privileged-launch `arxd` | `f64a54c8e20032dfd09ee8967595dfda37b2137ae12c86c609387c050627d061` |
+
+The issuer remained up for `901.675592285 s` of monotonic time
+(`901675592285 ns`) from the observed original Mint commit to the pre-Query
+mark. At the 900,000 ms TTL, the late Query had `expiry_margin_ms=-1737`.
+It returned uniform `policy-refused` before proof
+(`proof_sent=false`, `allocations=0`, `redeems=0`, `pending=true`).
+The same issuer completed a fresh Mint and Redeem with `issued` and
+`allocations=1`.
+
+The exact totals were `engine_starts=1`, `owned_closes=1`, `found=1`,
+`committed_mints=2`, `anchor_dispatches=3`, `redeem_dispatches=1`,
+`enrollment_proposals=4` and `allocations=1`. Membership stayed at
+`[0,1,0]` after initialization. Retained positions were Found `[1,1,2]`,
+Mints `[1,1,3]` and `[1,1,4]`, and Redeem `[1,1,5]`. Teardown recorded
+`child_reaped=true`, `close_signalled=true`, `owned_close=true` and
+`fixture_retained=false`.
+
 ## UTC witness and restart
 
 The coordinator approved W1b for this run. The harness sends one HTTPS HEAD
@@ -84,9 +117,14 @@ status is recorded as telemetry only. Artifacts record source, bracket
 duration, offset bounds and the first result. There were no reference
 requests during local validation.
 
+W1b preflight passed with 0 ms reported disagreement. All five UTC
+checkpoints passed within the ±30 s premise. `chronyc tracking` reported
+`Not synchronised`, which ADR 0051 W1b treats as informational. UTC health
+rests on the sampled HTTPS reference comparisons and brackets.
+
 Existing C13 restart evidence at the persisted committed floor and C15
 controlled clock tests support the conditional hosted interpretation.
 This is one elapsed qualification on one continuously retained issuer.
-Native suspend, physical multi-host behavior and other OSes remain
-**unverified on real hardware**. D5 and full M3 acceptance remain open if
-the hosted reference, provenance or elapsed observation is unavailable.
+Native suspend/resume, physical multi-host operation and Windows/macOS
+issuance remain **unverified on real hardware**. Full M3 acceptance
+remains pending steps 14b/C14 and 16a/C16.

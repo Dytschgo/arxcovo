@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-21 13:39 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-21, coordinator Gemini 4 Neon / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -9,17 +9,33 @@ entries for named PRs (#196–#204) that say "this PR", "review pending" or "bui
 has N attempts left" are historical checkpoints for those PRs; all of them have
 merged, as listed under "Merged this session".
 
-- **Routing (owner, 2026-11-19):** coordination moved to Claude Opus 5.5/high
-  because the provider rejected every Sol coordinator turn. Since 2026-11-20,
-  Sol 6.2/high is the route for engineering, architecture, security and independent
-  reviews; Claude for UI; one independent reviewer per PR; at most two builders and
-  one reviewer; coordinator-only merge.
+- **Routing (owner, 2026-11-19 and 2026-11-20).** `AGENTS.md` specifies Claude
+  Opus 5.5/high for coordination. The observed coordinator for this 2026-11-21
+  checkpoint was Gemini 4 Neon / high.
+  Sol 6.2/high handles engineering, architecture, security and independent
+  reviews. Claude handles UI. Each PR has an independent reviewer, with at most
+  two builders and one reviewer active. Only the coordinator merges.
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below);
   a second, the 13d pre-push review 3, fell back to an Opus 5.5/high reviewer; a third,
   the 15a builder, fell back to an Opus 5.5/high builder with Sol reviewers.
-- **Main:** `aaa26b9c` (PR233); push CI 44909755993 was in progress at this checkpoint.
+- **Main:** `44dd7a02` (PR237, M3 step 15b), push CI 44944852898 green
+  (9/9 jobs, wall 469 s, charged 465 s). `c9bb8771` (PR241, A22), push CI
+  44943528473 green. `c65bbf47` (PR239, C13 diagnostics), push CI 44941931613
+  restored green main (9/9 jobs, wall 469 s, charged 464 s).
+  `3122af3d` (PR240, A21), push CI 44940294254 **red**. Ubuntu Rust C11
+  `promotion_campaign` failed at outbound authorization 8.323 ms after caller entry,
+  4.089 ms after the TLS handshake, with 66.6 ms left on the 75 ms soft TTL
+  when the caller returned. The 4 ms `STORE_WAIT` expired under SQLite
+  `FULL`/`fullfsync` contention. Log `D:/Temp/arx-coordinator/job-44940294254.log` (SHA256 `3bf80896…d1cd`).
+  `a1ad45e5` (PR236, strict-dispatch macOS flake), push CI 44928644899 **red**
+  in both attempts. C13 failed at `join` (0.702 s) in attempt 1 and
+  `publication` (3.542 s) in attempt 2. PR236 changed only a test unrelated
+  to C13. Logs `D:/Temp/arx-main-a1ad45e5/ubuntu-rust.log` (SHA256 `2df71389…4da2`)
+  and `D:/Temp/arx-main-a1ad45e5/ubuntu-rust-attempt2.log` (SHA256 `965b4a26…903b`).
+  `ebcd63fc` (PR235, docs), push CI 44913627602 green. `aaa26b9c`
+  (PR233, 14a), push CI 44909755993 green.
   `7297d530` (PR234) push CI 44908581138 green; `58604520` (PR232) 44902174731 green;
   `61542cae` (PR231) 44900706992 red on attempt 1 (macOS UI budget-test timeout), green on
   attempt 2 before PR232 merged. PR232 removed nested subprocesses from the partial-jobs case.
@@ -88,7 +104,14 @@ merged, as listed under "Merged this session".
   `5f6fcef4` (13c), PR227 `851472bc` (CI gate test in one pwsh process), PR228 `e0f3ddc1`
   (docs), PR229 `be64f8db` (13d, daemon activation), PR230 `fb48a878` (docs), PR231
   `61542cae` (13e), PR232 `58604520` (CI budget fixture), PR234 `7297d530` (15a), PR233
-  `aaa26b9c` (14a). Every merge had an independent exact-head Sol
+  `aaa26b9c` (14a), PR235 `ebcd63fc` (docs), PR236 `a1ad45e5`
+  (strict-dispatch flake), PR240 `3122af3d` (A21 C13 contention races), PR239
+  `c65bbf47` (C13 diagnostics and role reclamation), PR241 `c9bb8771`
+  (A22, 20 ms `STORE_WAIT` capped at the RPC deadline), PR237 `44dd7a02`
+  (step 15b, D5 elapsed-time qualification harness and owner query evidence).
+  PR240 and PR239 merged as red-main repairs for standing C13 and C11 failures.
+  PR239's main push run 44941931613 restored green main, followed by green main
+  runs for PR241 and PR237. Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; the parent main runs for PR228 and PR229 had already passed. Through PR227, green main was
   rechecked immediately before each merge except the three red-main repairs:
@@ -878,14 +901,114 @@ merged, as listed under "Merged this session".
   no-Engine/no-Found instruction and skipped the unfiltered Windows run. The 14b design check
   lists exclusions under `cluster::consensus` for live Engine and Found tests, startup-refusal
   tests and opt-in diagnostic controls. Later local briefs require zero Engine invocations.
-- **14b and 15b (in progress):** the plan's proposed grants are adopted verbatim under the
-  pre-approval. The Sol 6.2/high builders were assigned in parallel with three counted failures
-  allowed each. Before any dispatch, 15b must resolve R6 and obtain coordinator approval for the
-  UTC-health witness.
-- **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
-  host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
-  dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
-  **unverified on real hardware**.
+- **PR #235 merged** as `ebcd63fc` (docs for 13e, 14a, 15a, PR232 and A10–A15).
+  Reviews 1–5 HOLD, review 6 PASS, agent-review status 59552242294.
+- **Owner-requested Gemini 4 Neon consult.** The consult flagged 14b path,
+  retention, lock-contention, framing and staging risks, plus 15b observation
+  ordering and locking risks. It prompted the W1b UTC witness upgrade, identified
+  literal-Docker blockers for C16 and called for dry-tracing seams and
+  preconditions before setting implementation fences. Report `D:/Temp/arx-gemini-consult/report.md` (SHA256 `a7a07b46…98df`).
+- **PR #236 merged** as `a1ad45e5` (strict-dispatch macOS test flake). Sol
+  6.2/high builder 0/3, `D:/Temp/arx-strictflake/report.md` (SHA256 `e9a4dc4e…e1d2`).
+  Review PASS, `D:/Temp/arx-pr236-review2/review.md` (SHA256 `2c16290f…4bb4`), status 59557708871.
+  The babysitter flagged that reviewer 1 and 15b builder 1 were stuck on
+  unanswerable shell approval prompts. Both were cancelled as infrastructure
+  stalls with no counted attempts and relaunched with instructions to use file
+  edit tools for writes.
+- **Standing C13/C11 regression and resolution.** C13 failed 4/4 times across
+  `join`, `publication` and `promotion-transfer` on `main` at `a1ad45e5`
+  (the two attempts above) and PRs #239 and #238. PR logs
+  `D:/Temp/arx-coordinator/job-44930664442.log` (SHA256 `1bd93d88…7bca`) and
+  `D:/Temp/arx-coordinator/job-44930534269.log` (SHA256 `1ef63455…b4cf`). Four consecutive hosted
+  Ubuntu runs after A21, diagnostics and A22 passed both C11 and C13.
+  - **PR #240 merged** as `3122af3d`. Amendment A21 fixed four zero-wait
+    contention and registration races across `learner_admission.rs` and
+    `bound_start/{founder,learner,enrollment_ingress}.rs` and updated ADR 0044.
+    Deadlines and D6 frozen boundaries were preserved. Sol 6.2/high builder 3/3,
+    `D:/Temp/arx-c13-fix/report.md` (SHA256 `ba8e2619…0e7d`).
+    R1 HOLD, `D:/Temp/arx-pr240-review/review.md` (SHA256 `cb88f6a7…b864`).
+    R2 PASS, `D:/Temp/arx-pr240-review2/review.md` (SHA256 `e6ccf7aa…c020`), status 59561937143.
+    PR CI 44939452248 green, `D:/Temp/arx-coordinator/job-44939452248.log` (SHA256 `1b9763d4…f921`).
+  - **PR #239 merged** as `c65bbf47`. Added bounded, threadless, nonblocking
+    FIFO diagnostics outside locks, launcher role reclamation and exit-1
+    propagation. Sol 6.2/high builder 1 stopped at 3/3 on Linux `E0509`.
+    Stuck review `D:/Temp/arx-pr239-stuck-review/review.md` (SHA256 `27102f17…5863`).
+    Fresh scoped Sol 6.2/high builder 2 finished at 1/3,
+    `D:/Temp/arx-pr239-scoped-builder/report.md` (SHA256 `5da54f10…6da3`).
+    R1–R3 HOLD, R4 PASS, refresh PASS, `D:/Temp/arx-pr239-refresh-review/review.md` (SHA256 `f0fd0063…6e0f`),
+    status 59562512688. PR CI 44940847436 green. Main push CI 44941931613
+    restored green main.
+  - **PR #241 merged** as `c9bb8771`. Amendment A22 raised `STORE_WAIT`
+    from 4 ms to 20 ms and clamps it to `min(now + STORE_WAIT, outer_deadline)`.
+    `STORE_POLL` stays at 250 µs and all outer deadlines stay fixed. Added
+    paused-time tests and updated ADR 0041. Sol 6.2/high builder 2/3,
+    `D:/Temp/arx-store-wait-a22/report.md` (SHA256 `656adc47…bb71`).
+    R1 HOLD, `D:/Temp/arx-pr241-review/review.md` (SHA256 `4f6afcb3…0f76`).
+    R2 PASS, `D:/Temp/arx-pr241-review2/review.md` (SHA256 `f76708a5…4468`), status 59563105140.
+    PR CI 44942623872 and main push CI 44943528473 green.
+- **PR #237 merged** as `44dd7a02` (M3 step 15b, D5 harness and owner query
+  evidence). A16 and its extension cover the side-effect-free
+  `checked_clock.rs` snapshot. W1b defines the UTC witness. Sol 6.2/high
+  builder 2 finished at 1/3 after three tooling and environment misfires were
+  ruled exempt, `D:/Temp/arx-m3-step15b-b2/report.md` (SHA256 `a64456ad…f6f0`).
+  R1 HOLD, `D:/Temp/arx-pr237-review/review.md` (SHA256 `9f9cafe1…ad8f`).
+  R2 HOLD, `D:/Temp/arx-pr237-review2/review.md` (SHA256 `b57d33ff…f402`).
+  R3 PASS, `D:/Temp/arx-pr237-review3/review.md` (SHA256 `ccee3515…41cb`).
+  Refresh 1 PASS, `D:/Temp/arx-pr237-refresh-review/review.md` (SHA256 `da33a0ce…4677`).
+  Refresh 2 confirmation PASS, `D:/Temp/arx-pr237-refresh-review2/review.md` (SHA256 `e5688e6f…6439`),
+  status 59563593738. Main push CI 44944852898 green.
+- **D5 elapsed-time qualification CLOSED for conditional hosted Linux.** The
+  single dispatch on `main` at `44dd7a02` ran on `ubuntu-24.04` with
+  `ImageVersion=20261116.376.1` (run 44945822915, job 136972784258).
+  First-attempt PASS. After 901.675592285 s monotonic elapsed, the late Query
+  returned `policy-refused` before proof and the fresh Mint and Redeem returned
+  `issued`. All five UTC checkpoints, exact effect counts and teardown passed.
+  Artifacts `D:/Temp/arx-d5-44945822915/m3-time-first.jsonl` (SHA256 `308eb19e…c211`)
+  and `D:/Temp/arx-d5-44945822915/job-136972784258.log` (SHA256 `c200e556…08f5`).
+  Independent Sol 6.2/high review PASS, `D:/Temp/arx-d5-44945822915/review.md` (SHA256 `408f285d…13ee`).
+  Native suspend/resume, physical multi-host operation and Windows/macOS
+  issuance remain **unverified on real hardware**. [Qualification evidence](evidence/m3-time-qualification.md)
+- **PR #238 (M3 step 14b / C14) remains open.** Amendments A17–A20 are
+  pre-approved. S2b lexical order, the workflow timeout pin and S2b digest pins
+  were ruled lint-class static policy fences and exempt from the count.
+  Pre-push reviews R1 HOLD, R2 HOLD, R3 PASS. Run 44930534269 failed standing
+  C13 before C14, so the grant was unspent. The PR refreshed cleanly onto
+  `44dd7a02` at `5bff621c` (Sol 6.2/high builder 1 report
+  `D:/Temp/arx-m3-step14b-b1/report.md` (SHA256 `eeadd736…78a8`)).
+  Pre-push check 4 PASS, `D:/Temp/arx-m3-step14b-prepush4/review.md` (SHA256 `637ce576…cec8`).
+  The first hosted C14 run, 44945838517, passed C13, A10 and C14 cluster setup
+  (`found=1 mint=1 query=1 redeem=1 proposals=3 add_nodes=1 applied=1 strict_learner=2 membership=1/1/5`).
+  The first build phase reported `C14 first phase=ordinary category=refused`
+  (0.13 s). Teardown confirmed daemon and broker process closes
+  (`starts=2 closes=2 broker=1`). Failure handling skipped disposal of
+  disposable fixture accounts and directories. The archive has no removal evidence.
+  Log `D:/Temp/arx-coordinator/job-44945838517.log` (SHA256 `6a0f275d…dbbb`).
+  The independent stuck-rule diagnosis is complete
+  (`D:/Temp/arx-pr238-c14-stuck/review.md`, SHA256 `1787c75b…7915`).
+  The fixture directs the unprivileged build child (UID 21072) to read
+  `memory.max` beneath the root-owned `0700` cgroup `runs/<leaf>` path.
+  The archived log confirms the protected mode, which makes that read a
+  code-level blocker before Cargo. The probe collapses exceptions into
+  `category=refused`, leaving the exact branch reached in that run
+  undetermined. The diagnosis also found that the lost-reply path can mask
+  early responses.
+  Builder 1 stopped at **3/3 exhausted**. Fresh fixture-only builder 2 is in
+  progress at 0/3 under the 2026-11-21 owner pre-approval. The repair is fenced
+  to `tools/ci/m3-containers/delegated-build-probe.py`, outside D6, and
+  requires no amendment. The non-required S2b `native-evidence` run failed on
+  historical source pins as expected. A separate re-pin PR is planned.
+- **M3 step 16a / C16 upfront dry-trace completed.** The read-only Sol 6.2/high
+  design check confirmed literal-Docker blockers on hosted Ubuntu and traced
+  Proposal A for planned ADR 0052. It uses native namespaces, a sealed `ext4`
+  rootfs, per-node 256 MiB `ext4` data images, transient `systemd` units and an
+  `nft` bridge. The check traced the R7 four-Mint ledger observer seam and calls
+  for a zero-daemon R2 dry run first. Implementation waits for 14b/C14 to land.
+  Design `D:/Temp/arx-m3-step16a-design/design.md` (SHA256 `7d66e7e1…de98`).
+- **Owner items unchanged.** The M2 Claude journey awaits owner OAuth and host
+  setup ([dev-host-setup](dev-host-setup.md)). Linux A7/A11/A12 need a dedicated
+  host. M2 is OPEN and M3 is in progress. Step 15b/D5 is conditionally closed.
+  Steps 14b/C14 and 16a/C16 remain. Native and multi-host paths are
+  **unverified on real hardware**. Engine Sol 3/3 and Opus 0/2 are unchanged.
 
 ## Main 92003177: E7 A8 timeout diagnosis (2026-11-19)
 
