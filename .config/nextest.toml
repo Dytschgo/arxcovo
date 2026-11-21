@@ -7,3 +7,10 @@ max-threads = 2
 platform = 'cfg(windows)'
 filter = 'test(/^service::unix_bridge::tests::e6::/) | test(/^service::unix_bridge::tests::e7::/) | test(/^service::executor::tests::/)'
 test-group = 'windows-heavy-service'
+
+# C15 keeps its bounded transcript in the hosted log on success (amendment
+# A14). Output only: no timing, retry, group or concurrency setting.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'test(=cluster::consensus::bound_start::enrollment_ingress::hosted::clock_reuse_campaign::retained_issuer_replays_exact_request_and_refuses_controlled_expiry)'
+success-output = "final"

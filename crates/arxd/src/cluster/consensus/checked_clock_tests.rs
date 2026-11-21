@@ -281,3 +281,159 @@ fn error_labels_are_static_and_do_not_contain_observations() {
         assert_eq!(error.to_string(), label);
     }
 }
+
+/// Per-instance test source controls. Each case uses its own clock instances and
+/// never changes the host wall clock or environment.
+#[cfg(target_os = "linux")]
+mod test_source {
+    use super::*;
+    use crate::cluster::enrollment::CODE_TTL_MS;
+
+    // Real samples taken microseconds apart; a generous bound that is still far
+    // below every offset asserted against it.
+    const JITTER_MS: u64 = 5_000;
+
+    #[test]
+    fn coherent_advance_is_isolated_and_keeps_the_original_baseline() {
+        let advanced = HostClock::new(0);
+        let untouched = HostClock::new(0);
+        let a0 = advanced.sample_ms().unwrap();
+        let u0 = untouched.sample_ms().unwrap();
+        let baseline = advanced.state.lock().unwrap().baseline;
+        assert_eq!(
+            advanced.advance_for_test(CODE_TTL_MS),
+            Ok(TestShift {
+                wall_ms: CODE_TTL_MS,
+                elapsed_ms: CODE_TTL_MS
+            })
+        );
+        let a1 = advanced.sample_ms().unwrap();
+        let u1 = untouched.sample_ms().unwrap();
+        assert!((a0 + CODE_TTL_MS..a0 + CODE_TTL_MS + JITTER_MS).contains(&a1));
+        assert!((u0..u0 + JITTER_MS).contains(&u1));
+        let state = advanced.state.lock().unwrap();
+        assert_eq!(state.baseline, baseline);
+        assert_eq!(state.failure, None);
+        let last = state.last.unwrap();
+        let base = baseline.unwrap();
+        assert!(last.elapsed_ms >= base.elapsed_ms + CODE_TTL_MS);
+        assert!(last.bracket_ms <= SKEW_MS);
+        assert_eq!(untouched.state.lock().unwrap().failure, None);
+    }
+
+    #[test]
+    fn wall_skew_within_envelope_passes_and_resume_visible_skew_latches() {
+        let within = HostClock::new(0);
+        let w0 = within.sample_ms().unwrap();
+        within.shift_for_test(SKEW_MS, 0).unwrap();
+        let w1 = within.sample_ms().unwrap();
+        assert!((w0 + SKEW_MS..w0 + SKEW_MS + JITTER_MS).contains(&w1));
+
+        // Wall advanced past 2*SKEW plus two maximal brackets while elapsed did not.
+        let resumed = HostClock::new(0);
+        resumed.sample_ms().unwrap();
+        resumed.shift_for_test(4 * SKEW_MS + 10, 0).unwrap();
+        assert_eq!(resumed.sample_ms(), Err(ClockError::Anomaly));
+        assert_eq!(
+            resumed.observe_with(|| panic!("latched clock resampled")),
+            Err(ClockError::Anomaly)
+        );
+
+        // Elapsed advanced while the wall did not: a frozen wall is also refused.
+        let frozen = HostClock::new(0);
+        frozen.sample_ms().unwrap();
+        frozen.shift_for_test(0, 4 * SKEW_MS + 10).unwrap();
+        assert_eq!(frozen.sample_ms(), Err(ClockError::Anomaly));
+    }
+
+    #[test]
+    fn first_sample_floor_and_range_checks_see_the_shifted_source() {
+        let now = HostClock::new(0).sample_ms().unwrap();
+        let floor = now + 10 * SKEW_MS;
+        let behind = HostClock::new(floor);
+        assert_eq!(behind.sample_ms(), Err(ClockError::Behind));
+
+        let caught_up = HostClock::new(floor);
+        caught_up.advance_for_test(10 * SKEW_MS).unwrap();
+        assert!(caught_up.sample_ms().unwrap() >= floor);
+
+        let out_of_range = HostClock::new(0);
+        out_of_range.sample_ms().unwrap();
+        out_of_range.advance_for_test(MAX_TIME_MS).unwrap();
+        assert_eq!(out_of_range.sample_ms(), Err(ClockError::InvalidTime));
+        assert_eq!(out_of_range.sample_ms(), Err(ClockError::InvalidTime));
+    }
+
+    #[test]
+    fn a_latched_first_refusal_is_not_cleared_by_advancing() {
+        for error in [
+            ClockError::Rollback,
+            ClockError::Anomaly,
+            ClockError::Behind,
+        ] {
+            let clock = HostClock::new(0);
+            clock.sample_ms().unwrap();
+            assert_eq!(clock.observe_with(|| Err(error)), Err(error));
+            clock.advance_for_test(SKEW_MS).unwrap();
+            assert_eq!(clock.sample_ms(), Err(error));
+        }
+    }
+
+    #[test]
+    fn overflowing_or_poisoned_test_source_refuses_without_wrapping() {
+        let clock = HostClock::new(0);
+        clock.shift_for_test(u64::MAX, 0).unwrap();
+        assert_eq!(
+            clock.shift_for_test(1, 0),
+            Err(ClockError::InvalidTime),
+            "accumulated offset wrapped"
+        );
+        assert_eq!(
+            *clock.test_source.lock().unwrap(),
+            TestShift {
+                wall_ms: u64::MAX,
+                elapsed_ms: 0
+            }
+        );
+        assert_eq!(clock.sample_ms(), Err(ClockError::InvalidTime));
+
+        // After a baseline, an elapsed offset of u64::MAX ms either overflows the
+        // millisecond conversion or leaves the envelope; both latch. (A first
+        // sample has no baseline, so elapsed alone is not judged there.)
+        let elapsed = HostClock::new(0);
+        elapsed.sample_ms().unwrap();
+        elapsed.shift_for_test(0, u64::MAX).unwrap();
+        let refused = elapsed.sample_ms();
+        assert!(
+            matches!(refused, Err(ClockError::InvalidTime | ClockError::Anomaly)),
+            "{refused:?}"
+        );
+        assert_eq!(elapsed.sample_ms(), refused);
+
+        let poisoned = HostClock::new(0);
+        poisoned.sample_ms().unwrap();
+        let poison = std::panic::catch_unwind(|| {
+            let _guard = poisoned.test_source.lock().unwrap();
+            panic!("synthetic test source poison");
+        });
+        assert!(poison.is_err());
+        assert_eq!(poisoned.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(poisoned.shift_for_test(1, 1), Err(ClockError::Unavailable));
+        assert_eq!(
+            poisoned.state.lock().unwrap().failure,
+            Some(ClockError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn state_contention_refuses_before_reading_the_test_source() {
+        let clock = HostClock::new(0);
+        clock.sample_ms().unwrap();
+        let held = clock.state.lock().unwrap();
+        clock.advance_for_test(SKEW_MS).unwrap();
+        assert_eq!(clock.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(held.failure, None);
+        drop(held);
+        assert!(clock.sample_ms().is_ok());
+    }
+}

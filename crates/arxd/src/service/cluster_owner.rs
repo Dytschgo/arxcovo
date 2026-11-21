@@ -93,6 +93,13 @@ impl Operator {
     pub(crate) fn uid(&self) -> u32 {
         self.0
     }
+
+    /// Linux in-process campaigns only. Outside tests the checked connection
+    /// remains the sole constructor.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_campaign(uid: u32) -> Self {
+        Self(uid)
+    }
 }
 
 #[derive(Clone, Copy)]

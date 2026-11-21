@@ -257,6 +257,7 @@ impl Backend for Issuer {
             observation
                 .redeem_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            observation.record_intent(input.request, &csr);
         }
         // Join through the operation's own deadline. An outer socket timeout
         // cannot cancel admitted work. All failures have one wire status and
@@ -438,6 +439,7 @@ mod hosted {
 
     mod admission_campaign;
     mod catch_up_campaign;
+    mod clock_reuse_campaign;
     #[cfg(test)]
     mod durable_join_campaign;
     mod issuer_transfer_campaign;
@@ -452,11 +454,51 @@ mod hosted {
         anchor_outcomes:
             Mutex<Vec<Result<Vec<u8>, crate::cluster::consensus::anchor_query::AnchorQueryError>>>,
         result: Mutex<Option<Result<(), issue::IssueError>>>,
+        // Opt-in for C15 only: dispatched attempt ID and public CSR, never the
+        // proof or code. Standing campaigns leave it absent.
+        redeem_intents: Option<Mutex<Vec<RedeemIntent>>>,
         finished: Notify,
         release: Notify,
     }
 
+    type RedeemIntent = (crate::cluster::enrollment::RequestId, Vec<u8>);
+    // C15 dispatches three Redeems; a fourth slot exposes an unexpected extra.
+    const REDEEM_INTENT_CAP: usize = 4;
+
     impl Observation {
+        pub(super) fn recording_intents() -> Self {
+            Self {
+                redeem_intents: Some(Mutex::new(Vec::with_capacity(REDEEM_INTENT_CAP))),
+                ..Self::default()
+            }
+        }
+
+        pub(super) fn record_intent(
+            &self,
+            request: crate::cluster::enrollment::RequestId,
+            csr: &[u8],
+        ) {
+            let Some(intents) = &self.redeem_intents else {
+                return;
+            };
+            let mut intents = intents.lock().unwrap();
+            if intents.len() < REDEEM_INTENT_CAP {
+                intents.push((request, csr.to_vec()));
+            }
+        }
+
+        pub(super) fn intent(&self, index: usize) -> Option<RedeemIntent> {
+            self.redeem_intents
+                .as_ref()?
+                .lock()
+                .unwrap()
+                .get(index)
+                .cloned()
+        }
+
+        pub(super) fn intent_count(&self) -> Option<usize> {
+            Some(self.redeem_intents.as_ref()?.lock().unwrap().len())
+        }
         #[cfg(test)]
         pub(super) fn record_anchor(
             &self,

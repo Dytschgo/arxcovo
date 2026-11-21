@@ -610,16 +610,25 @@ HEAVY_FILTER = (
 )
 
 
+C15_FILTER = ('test(=cluster::consensus::bound_start::enrollment_ingress::hosted::'
+              'clock_reuse_campaign::retained_issuer_replays_exact_request_and_refuses_controlled_expiry)')
+
+
 def assert_heavy_service_group(source):
     import tomllib
     # Exact semantic shape forbids retries, timeout/fail-fast/default-slot changes,
     # widened platform scope, extra overrides and accidental extra membership.
+    # Amendment A14 admits only the Linux C15 success-output override.
     assert tomllib.loads(source) == {
         'test-groups': {'windows-heavy-service': {'max-threads': 2}},
         'profile': {'default': {'overrides': [{
             'platform': 'cfg(windows)',
             'filter': HEAVY_FILTER,
             'test-group': 'windows-heavy-service',
+        }, {
+            'platform': 'cfg(target_os = "linux")',
+            'filter': C15_FILTER,
+            'success-output': 'final',
         }]}},
     }
 
@@ -639,7 +648,16 @@ class HeavyServiceGroupTests(unittest.TestCase):
             source + '\nretries = 1\n',
             source + '\n[profile.ci]\nretries = 1\n',
             source.replace("[[profile.default.overrides]]",
-                           "[profile.default]\nretries = 1\n\n[[profile.default.overrides]]"),
+                           "[profile.default]\nretries = 1\n\n[[profile.default.overrides]]", 1),
+            source.replace('success-output = "final"', 'success-output = "immediate"'),
+            source.replace('success-output = "final"\n', ''),
+            source.replace('success-output = "final"', 'success-output = "final"\nretries = 2'),
+            source.replace('success-output = "final"',
+                           'success-output = "final"\nslow-timeout = "5m"'),
+            source.replace('success-output = "final"',
+                           'success-output = "final"\nthreads-required = 2'),
+            source.replace('cfg(target_os = "linux")', 'cfg(unix)'),
+            source.replace(C15_FILTER, 'test(clock_reuse_campaign)'),
         ]
         filters = HEAVY_FILTER.split(' | ')
         for item in filters:
