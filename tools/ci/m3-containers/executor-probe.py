@@ -25,6 +25,14 @@ if sys.platform == "linux":
 
 ROOT = Path(__file__).resolve().parents[3]
 PARENT = Path("/var/lib")
+PROVENANCE_FIELDS = ("run", "attempt", "head", "image", "image_version", "job")
+DAEMON_OBJECTS = (
+    ("daemon/wrap", stat.S_ISREG),
+    ("daemon/custody/object", stat.S_ISREG),
+    ("daemon/history", stat.S_ISDIR),
+    ("daemon/control.sock", stat.S_ISSOCK),
+)
+CONTROL_LIMITS = ("memory.max", "memory.swap.max", "pids.max")
 CGROUP = Path("/sys/fs/cgroup")
 UNIT_NAME = "arxd.service"
 UNIT = CGROUP / "system.slice" / UNIT_NAME
@@ -110,6 +118,16 @@ def ancestry(path):
     return results
 
 
+def provenance(values):
+    require(len(values) == len(PROVENANCE_FIELDS), "provenance")
+    run, attempt, head, image, version, job = values
+    require(ID.fullmatch(run) and ID.fullmatch(attempt)
+            and re.fullmatch(r"[a-f0-9]{40}", head)
+            and SAFE_VALUE.fullmatch(image) and SAFE_VALUE.fullmatch(version)
+            and job == "rust", "provenance")
+    return dict(zip(PROVENANCE_FIELDS, values))
+
+
 def hosted(values):
     require(sys.platform == "linux" and all(
         os.environ.get(key) == expected for key, expected in {
@@ -120,11 +138,7 @@ def hosted(values):
             "GITHUB_REPOSITORY": "Dytschgo/arxcovo",
         }.items()
     ), "hosted-runner")
-    run, attempt, head, image, version = values
-    require(ID.fullmatch(run) and ID.fullmatch(attempt)
-            and re.fullmatch(r"[a-f0-9]{40}", head)
-            and SAFE_VALUE.fullmatch(image) and SAFE_VALUE.fullmatch(version), "provenance")
-    return PARENT / f"arx-a10-{run}-{attempt}"
+    return provenance(values)
 
 
 def role_unused(name, uid):
@@ -216,6 +230,41 @@ def journal(root, deadline):
     )]
 
 
+def control_mode(path, owner_permission):
+    m = path.lstat()
+    require(stat.S_ISREG(m.st_mode) and m.st_uid == 0
+            and not m.st_mode & 0o022 and m.st_mode & owner_permission,
+            "cgroup-control-protection")
+    return {"uid": m.st_uid, "mode": format(stat.S_IMODE(m.st_mode), "04o")}
+
+
+def cgroup_facts():
+    evidence = {}
+    for name, group in (("unit", UNIT), ("runs", RUNS)):
+        domain = read(group / "cgroup.type").strip()
+        processes = read(group / "cgroup.procs").split()
+        controllers = read(group / "cgroup.controllers").split()
+        enabled = read(group / "cgroup.subtree_control").split()
+        require(domain == "domain" and not processes, "cgroup-domain-state")
+        require(all({"memory", "pids"}.issubset(tokens) for tokens in (controllers, enabled)),
+                "controllers")
+        files = {}
+        for filename in CONTROL_LIMITS:
+            path = group / filename
+            facts = control_mode(path, stat.S_IRUSR)
+            value = read(path, 32).strip()
+            require(re.fullmatch(r"(?:max|[0-9]{1,20})", value), "cgroup-control-value")
+            files[filename] = {**facts, "value": value}
+        evidence[name] = {
+            "type": domain, "procs": processes, "available": controllers,
+            "readback": enabled, "controls": files,
+        }
+    evidence["runs"]["controls"]["cgroup.kill"] = control_mode(RUNS / "cgroup.kill", stat.S_IWUSR)
+    require(read(RUNS / "cgroup.events").splitlines().count("populated 0") == 1, "runs-populated")
+    evidence["runs"]["populated"] = 0
+    return evidence
+
+
 def wait_ready(root, deadline):
     pid = live_pid(root, min(deadline, time.monotonic() + 8))
     state = proc_status(pid)
@@ -224,19 +273,16 @@ def wait_ready(root, deadline):
     require(state["NoNewPrivs"] == ["1"] and state["CapBnd"] == [CAPS], "broker-hardening")
     require(membership == PLACEMENT, "broker-membership")
     require(read(UNIT / "supervisor/cgroup.procs").split() == [str(pid)], "broker-placement")
-    initial = read(UNIT / "cgroup.controllers").split()
-    enabled = [read(group / "cgroup.subtree_control").split() for group in (UNIT, RUNS)]
-    require(all({"memory", "pids"}.issubset(tokens) for tokens in [initial, *enabled]), "controllers")
+    groups = cgroup_facts()
     marker = os.getxattr(UNIT, "user.delegate", follow_symlinks=False)
     require(marker == b"1", "delegation-marker")
     mounts = Path("/proc") / str(pid) / "root/sys/fs/cgroup"
     require(os.statvfs(mounts).f_flag & os.ST_RDONLY
             and not os.statvfs(mounts / UNIT.relative_to(CGROUP)).f_flag & os.ST_RDONLY,
             "broker-cgroup-writability")
-    require(read(RUNS / "cgroup.events").splitlines().count("populated 0") == 1, "runs-populated")
     emit("setup", pid=pid, uid=state["Uid"], no_new_privs=1, cap_bnd=CAPS,
          membership=membership, ancestor=ancestry(UNIT / "supervisor"),
-         runs=ancestry(RUNS)[-1], available=initial, readback=enabled,
+         runs=ancestry(RUNS)[-1], groups=groups,
          delegate_raw=marker.decode("ascii"), outside_readonly=True, setup="ready")
     return pid
 
@@ -281,10 +327,10 @@ def cgroup_denials(leaf=None):
     return controls, private
 
 
-def socket_denied(root):
+def socket_denied(path):
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(1)
-        denied(lambda: conn.connect(str(root / "control/executor.sock")))
+        denied(lambda: conn.connect(str(path)))
 
 
 def identity(root):
@@ -294,7 +340,7 @@ def identity(root):
     require({"memory", "pids"}.issubset(read(CGROUP / "cgroup.controllers").split()), "visibility")
     denied(lambda: open_probe(root / "broker/settings.json", os.O_RDONLY))
     denied(lambda: open_probe(root / "daemon/wrap", os.O_RDONLY))
-    socket_denied(root)
+    socket_denied(root / "control/executor.sock")
     controls, private = cgroup_denials()
     emit("identity", probes=1, uid=BUILD, gid=BUILD, groups=[], visible=True,
          denied_controls=controls, inaccessible_directories=private)
@@ -355,6 +401,38 @@ def peer_controls(root, deadline, probe_peer):
     probe_peer("ready")
 
 
+def daemon_evidence(root, pid):
+    for name, correct_kind in DAEMON_OBJECTS:
+        m = (root / name).lstat()
+        require(correct_kind(m.st_mode) and (m.st_uid, m.st_gid) == (DAEMON, DAEMON)
+                and not m.st_mode & 0o077, "daemon-fixture-" + Path(name).name)
+    fd = read(root / "daemon/wrap.fd", 16, DAEMON)
+    require(ID.fullmatch(fd) and 3 <= int(fd) <= 2**31 - 1, "wrap-fd-number")
+    wrapping = (root / "daemon/wrap").lstat()
+    held = (Path("/proc") / str(pid) / "fd" / fd).stat()
+    require(stat.S_ISREG(held.st_mode) and (held.st_dev, held.st_ino) == (wrapping.st_dev, wrapping.st_ino),
+            "wrap-fd-target")
+    return fd
+
+
+def verify_child_fds():
+    with os.scandir("/proc/self/fd") as directory:
+        names = [item.name for item in itertools.islice(directory, 4097)]
+    require(len(names) <= 4096 and all(re.fullmatch(r"[0-9]{1,10}", name) for name in names)
+            and {"0", "1", "2"}.issubset(names), "fd-inventory")
+    # The scan's own FD is now closed. A still-open numbered entry above
+    # the standard streams is an inherited descriptor anywhere in the table.
+    for fd in map(int, names):
+        if fd <= 2:
+            continue
+        try:
+            fcntl.fcntl(fd, fcntl.F_GETFD)
+        except OSError as error:
+            require(error.errno == errno.EBADF, "unexpected-fd-condition")
+        else:
+            raise Refusal("inherited-descriptor")
+
+
 def child(root):
     require(sys.argv[1:] == ["--version"], "witness-arguments")
     require(os.getuid() == BUILD and os.getgid() == BUILD and os.getgroups() == [], "child-identity")
@@ -362,9 +440,16 @@ def child(root):
     relative = membership.removeprefix("0::/system.slice/arxd.service/runs/")
     require(LEAF.fullmatch(relative), "leaf")
     leaf = RUNS / relative
-    for name in ("broker/settings.json", "daemon/wrap", "daemon/history"):
+    for name in ("broker/settings.json", "daemon/custody/object", "daemon/wrap", "daemon/history"):
         denied(lambda: open_probe(root / name, os.O_RDONLY))
-    socket_denied(root)
+    socket_denied(root / "control/executor.sock")
+    socket_denied(root / "daemon/control.sock")
+    daemon_pid = read(root / "daemon.pid", 16)
+    wrap_fd = read(root / "wrap.fd", 16)
+    require(ID.fullmatch(daemon_pid) and ID.fullmatch(wrap_fd) and int(wrap_fd) >= 3, "wrap-fd-oracle")
+    # This is an actual procfs descriptor link. Do not use O_NOFOLLOW to
+    # manufacture a denial that would also happen for an authorized opener.
+    denied(lambda: (Path("/proc") / daemon_pid / "fd" / wrap_fd).open("rb").close())
     for name in ("daemon.pid", "broker.pid"):
         pid = read(root / name, 16).strip()
         require(ID.fullmatch(pid), "fixture-pid")
@@ -372,13 +457,7 @@ def child(root):
         denied(lambda: open_probe(Path("/proc") / pid / "fd/0", os.O_RDONLY))
     require(Path.cwd() == root / "workspace" and read(Path("visible"), 16) == "workspace\n", "workspace")
     cgroup_denials(leaf)
-    for fd in range(3, 128):
-        try:
-            fcntl.fcntl(fd, fcntl.F_GETFD)
-        except OSError as error:
-            require(error.errno == errno.EBADF, "unexpected-fd-condition")
-        else:
-            raise Refusal("inherited-descriptor")
+    verify_child_fds()
     descendant = subprocess.Popen(
         ["/usr/bin/sleep", "30"], env=ENV, stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -440,14 +519,18 @@ def stage_tree(root, stage, copy, deadline):
     (root / "broker").mkdir(mode=0o700)
     (root / "control").mkdir(mode=0o710)
     os.chown(root / "control", 0, DAEMON)
-    for directory, uid in (("daemon", DAEMON), ("daemon/history", DAEMON), ("workspace", BUILD)):
+    for directory, uid in (
+        ("daemon", DAEMON), ("daemon/history", DAEMON),
+        ("daemon/custody", DAEMON), ("workspace", BUILD),
+    ):
         path = root / directory
         path.mkdir(mode=0o700)
         os.chown(path, uid, uid)
-    with (root / "daemon/wrap").open("xb"):
-        pass
-    os.chown(root / "daemon/wrap", DAEMON, DAEMON)
-    (root / "daemon/wrap").chmod(0o600)
+    for name in ("daemon/wrap", "daemon/custody/object"):
+        with (root / name).open("xb") as witness:
+            witness.write(b"disposable fixture\n")
+        os.chown(root / name, DAEMON, DAEMON)
+        (root / name).chmod(0o600)
     (root / "workspace/visible").write_text("workspace\n", encoding="ascii")
     (root / "tools").mkdir(mode=0o755)
     script = Path(__file__)
@@ -508,7 +591,14 @@ def prove_build(root, pid, deadline):
                     process.kill()
                     process.wait(timeout=3)
             with restore_after(reap):
+                end = min(deadline, time.monotonic() + 2)
+                while not (root / "daemon/wrap.fd").is_file():
+                    require(process.poll() is None and time.monotonic() < end, "daemon-evidence-timeout")
+                    time.sleep(0.025)
+                fd = daemon_evidence(root, process.pid)
+                (root / "wrap.fd").write_text(fd, encoding="ascii")
                 (root / "daemon.pid").write_text(str(process.pid), encoding="ascii")
+                emit("fixtures", custody=True, history=True, daemon_control=True, wrapping_fd=int(fd))
                 descendant = observe_child(root, process, deadline, pid)
                 require(process.wait(timeout=remaining(deadline, 5)) == 0, "build-result")
         output.seek(0)
@@ -527,8 +617,10 @@ def prove_build(root, pid, deadline):
     print(BUILD_PASS, flush=True)
 
 
-def qualify(root, stage, copy, deadline):
+def qualify(root, stage, copy, deadline, receipt):
     """Track the first refusal independently of cleanup and dispatch count."""
+    receipt = provenance(tuple(receipt.get(field, "") for field in PROVENANCE_FIELDS))
+    emit("provenance", **receipt)
     phase, owned, created, state, stop_expected = "stage", [], False, False, 0
     close_requested = []
     first, cleanup, identity_probes, daemon_probe_attempts, dispatch_attempts = None, "not-started", 0, 0, 0
@@ -622,22 +714,21 @@ def qualify(root, stage, copy, deadline):
             cleanup = str(error) if isinstance(error, Refusal) else type(error).__name__
         emit("result", first=first, cleanup=cleanup, identity_probes=identity_probes,
              daemon_identity_probes=daemon_probe_attempts, dispatch_attempts=dispatch_attempts,
-             consensus_invocations=0)
+             consensus_invocations=0, **receipt)
     return int(first is not None or cleanup != "confirmed")
 
 
 def privileged(stage, values):
-    root = hosted(values)
+    receipt = hosted(values)
+    root = PARENT / f"arx-a10-{receipt['run']}-{receipt['attempt']}"
     require(os.getuid() == os.geteuid() == 0, "staging-identity")
     owner = os.environ.get("SUDO_UID", "")
     m = stage.lstat()
     require(stage.parent == Path("/tmp") and re.fullmatch(r"arx-a10-[a-z0-9_]{8}", stage.name)
             and stat.S_ISDIR(m.st_mode) and stat.S_IMODE(m.st_mode) == 0o700
             and ID.fullmatch(owner) and m.st_uid == int(owner), "staging-ownership")
-    emit("provenance", run=values[0], attempt=values[1], head=values[2],
-         image=values[3], image_version=values[4])
     precedent = runpy.run_path(str(ROOT / "tools/ci/m3-c13/run.py"))
-    return qualify(root, stage, precedent["stage_binary"], time.monotonic() + TOTAL - CLEANUP)
+    return qualify(root, stage, precedent["stage_binary"], time.monotonic() + TOTAL - CLEANUP, receipt)
 
 
 def main():
@@ -649,13 +740,18 @@ def main():
         return 0
     if Path(sys.argv[0]).name == "cargo":
         child(Path(sys.argv[0]).parent.parent)
-    if len(sys.argv) == 8 and sys.argv[1] == "--staged":
+    if len(sys.argv) == 9 and sys.argv[1] == "--staged":
         return privileged(Path(sys.argv[2]), sys.argv[3:])
     require(len(sys.argv) == 1 and os.geteuid() != 0, "arguments")
     values = [os.environ.get(name, "") for name in (
-        "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "ImageOS", "ImageVersion"
+        "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "ImageOS", "ImageVersion", "GITHUB_JOB"
     )]
-    hosted(values)
+    receipt = hosted(values)
+    actual_head = command(
+        ["/usr/bin/git", "-C", ROOT, "rev-parse", "HEAD"],
+        time.monotonic() + 3, "checkout-head",
+    ).strip()
+    require(actual_head == receipt["head"], "checkout-head")
     suite = unittest.defaultTestLoader.discover(str(Path(__file__).parent), pattern="test_executor_probe.py")
     require(unittest.TextTestRunner().run(suite).wasSuccessful(), "probe-unittests")
     start_time = time.monotonic()

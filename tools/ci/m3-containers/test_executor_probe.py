@@ -2,6 +2,8 @@
 import errno
 import importlib.util
 import io
+import stat
+from types import SimpleNamespace
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +13,8 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("executor_probe", Path(__file__).with_name("executor-probe.py"))
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
+
+RECEIPT = dict(zip(probe.PROVENANCE_FIELDS, ("42", "1", "a" * 40, "ubuntu26", "20261121", "rust")))
 
 
 class ExecutorProbeTests(unittest.TestCase):
@@ -25,6 +29,104 @@ class ExecutorProbeTests(unittest.TestCase):
         ):
             self.assertIn(option, argv)
         self.assertNotIn("--property=ProtectControlGroups=yes", argv)
+
+    def test_each_required_provenance_field_refuses_before_staging(self):
+        for field in probe.PROVENANCE_FIELDS:
+            with self.subTest(field=field), patch.object(probe, "stage_tree") as stage:
+                receipt = {key: value for key, value in RECEIPT.items() if key != field}
+                with self.assertRaisesRegex(probe.Refusal, "provenance"):
+                    probe.qualify(Path("unused"), Path("unused"), None, 0, receipt)
+                stage.assert_not_called()
+
+    def test_cgroup_setup_requires_each_control_and_group_observation(self):
+        values = {}
+        for group in (probe.UNIT, probe.RUNS):
+            values.update({
+                group / "cgroup.type": "domain\n", group / "cgroup.procs": "",
+                group / "cgroup.controllers": "memory pids\n",
+                group / "cgroup.subtree_control": "memory pids\n",
+                **{group / item: "max\n" for item in probe.CONTROL_LIMITS},
+            })
+        values[probe.RUNS / "cgroup.events"] = "populated 0\n"
+        controls = {group / item for group in (probe.UNIT, probe.RUNS) for item in probe.CONTROL_LIMITS}
+        controls.add(probe.RUNS / "cgroup.kill")
+
+        def read(path, *_args):
+            if path not in values:
+                raise FileNotFoundError
+            return values[path]
+
+        def show_facts(missing_control=None):
+            def control_mode(path, *_args):
+                self.assertIn(path, controls)
+                if path == missing_control:
+                    raise FileNotFoundError
+                return {"uid": 0, "mode": "0644"}
+
+            with patch.object(probe, "read", side_effect=read), patch.object(probe, "control_mode", side_effect=control_mode):
+                return probe.cgroup_facts()
+
+        facts = show_facts()
+        self.assertEqual(facts["unit"]["procs"], [])
+        self.assertEqual(facts["runs"]["populated"], 0)
+        self.assertIn("cgroup.kill", facts["runs"]["controls"])
+        for path in list(values):
+            with self.subTest(missing=str(path)):
+                original = values.pop(path)
+                with self.assertRaises(FileNotFoundError):
+                    show_facts()
+                values[path] = original
+        for path in controls:
+            with self.subTest(missing_control=str(path)), self.assertRaises(FileNotFoundError):
+                show_facts(path)
+        for file, value in (("cgroup.type", "threaded"), ("cgroup.procs", "123\n")):
+            with self.subTest(invalid=file), patch.dict(values, {probe.UNIT / file: value}):
+                with self.assertRaisesRegex(probe.Refusal, "cgroup-domain-state"):
+                    show_facts()
+
+    def test_missing_daemon_objects_and_wrap_descriptor_refuse(self):
+        root = Path("/fixture")
+        file = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=probe.DAEMON,
+                               st_gid=probe.DAEMON, st_dev=2, st_ino=3)
+        objects = {root / name: SimpleNamespace(
+            st_uid=probe.DAEMON, st_gid=probe.DAEMON, st_dev=file.st_dev, st_ino=file.st_ino,
+            st_mode=mode | 0o600,
+        ) for (name, _), mode in zip(probe.DAEMON_OBJECTS, (
+            stat.S_IFREG, stat.S_IFREG, stat.S_IFDIR, stat.S_IFSOCK,
+        ))}
+        def lstat(path):
+            if path not in objects:
+                raise FileNotFoundError
+            return objects[path]
+
+        with patch.object(Path, "lstat", lstat), patch.object(Path, "stat", autospec=True, return_value=file) as follow:
+            with patch.object(probe, "read", return_value="200"):
+                self.assertEqual(probe.daemon_evidence(root, 42), "200")
+                follow.assert_called_once_with(Path("/proc") / "42/fd/200")
+                for path in list(objects):
+                    with self.subTest(missing=str(path)):
+                        original = objects.pop(path)
+                        with self.assertRaises(FileNotFoundError):
+                            probe.daemon_evidence(root, 42)
+                        objects[path] = original
+                follow.return_value = SimpleNamespace(st_mode=stat.S_IFREG, st_dev=2, st_ino=99)
+                with self.assertRaisesRegex(probe.Refusal, "wrap-fd-target"):
+                    probe.daemon_evidence(root, 42)
+                follow.side_effect = FileNotFoundError
+                with self.assertRaises(FileNotFoundError):
+                    probe.daemon_evidence(root, 42)
+            with patch.object(probe, "read", side_effect=FileNotFoundError), self.assertRaises(FileNotFoundError):
+                probe.daemon_evidence(root, 42)
+
+    def test_whole_fd_inventory_requires_standard_streams_and_checks_high_fds(self):
+        from contextlib import nullcontext
+        for names, failure in (("0 1", "fd-inventory"), ("0 1 2 200", "inherited-descriptor")):
+            with self.subTest(names=names):
+                scan = nullcontext(iter(SimpleNamespace(name=name) for name in names.split()))
+                fcntl = SimpleNamespace(F_GETFD=1, fcntl=lambda *_: 0)
+                with patch.object(probe.os, "scandir", return_value=scan), patch.object(probe, "fcntl", fcntl, create=True):
+                    with self.assertRaisesRegex(probe.Refusal, failure):
+                        probe.verify_child_fds()
 
     def test_cargo_witness_does_not_require_python_on_runner_path(self):
         with Path(probe.__file__).open(encoding="utf-8") as source:
@@ -89,7 +191,7 @@ class ExecutorProbeTests(unittest.TestCase):
                 stack.enter_context(patch.object(probe, name, value))
             stack.enter_context(patch.object(probe.os, "uname", return_value=type("Uname", (), {"release": "6.17.0"})(), create=True))
             stack.enter_context(redirect_stdout(out))
-            result = probe.qualify(Path(scratch) / "owned", Path(scratch), None, 0)
+            result = probe.qualify(Path(scratch) / "owned", Path(scratch), None, 0, RECEIPT)
         records = [probe.json.loads(line.removeprefix("A10 ")) for line in out.getvalue().splitlines()]
         return result, log, records
 
@@ -125,6 +227,8 @@ class ExecutorProbeTests(unittest.TestCase):
         self.assertEqual(preflight["runner_dispatches"], 0)
         self.assertEqual(preflight["identity_probes"], 1)
         self.assertEqual(records[-1]["dispatch_attempts"], 1)
+        for field, value in RECEIPT.items():
+            self.assertEqual(records[-1][field], value)
 
     def test_preflight_failures_submit_no_build(self):
         for stage in ("stage", "start", "ready", "identity", "peer", "stop"):
