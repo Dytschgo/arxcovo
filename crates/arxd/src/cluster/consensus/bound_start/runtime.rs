@@ -186,6 +186,14 @@ impl Admission {
         bytes
     }
 
+    pub(crate) fn time_evidence(&self) -> [u8; crate::service::cluster_owner::TIME_EVIDENCE_LEN] {
+        let job = self.job.try_lock().ok().and_then(|slot| *slot);
+        let Some(job) = job else {
+            return enrollment_ingress::ExchangeCounts::absent_time_evidence();
+        };
+        job.time_evidence()
+    }
+
     pub(crate) fn stop(&self) {
         let registered = self.job.lock().unwrap();
         self.stop.cancel();

@@ -144,3 +144,88 @@ resume-visible and frozen-wall refusal, floor and range after a shift, a
 latched first refusal that survives advancing, overflow, source poison, and
 contention. Installed-service and physical multi-host paths remain
 **unverified on real hardware**.
+
+## A16. Private production observation for elapsed qualification
+
+The coordinator approved the R6 amendment after the source audit found that
+owner status could count AnchorQuery dispatches but could not distinguish a
+checked policy refusal from clock failure, permit pressure or timeout. The
+Linux production issuer retains one last-Query observation at the existing
+ingress call site. The slot holds the existing dispatch ordinal, a SHA-256
+digest of the 32-byte Query body under the D5 domain
+`arxcovo-d5-query-v1\0`, the captured checked sample and the typed outcome.
+A forwarding CheckedClock returns the source result unchanged and captures
+its first result. Slot publication and readback use try-locks. The reader
+acquires the dispatch ordinal while holding the slot lock and withholds a
+busy or stale slot while Query dispatch continues.
+
+The existing authenticated owner socket accepts an empty request with tag
+5 and replies on tag 16. Its version-1 body is 53 bytes. The first five
+bytes are version, ordinal, outcome, Query sample status and checkpoint
+sample status. Two big-endian 64-bit timestamp fields follow, then the
+32-byte digest. Sample statuses are absent, accepted and failed. Outcome
+codes are absent, accepted, policy refusal, busy and unavailable, in that
+order. An absent or failed sample has zero in its timestamp field.
+Production samples publish a generation-tagged copy of the clock
+validation state to a separate slot. Publication uses a try-lock and
+contention cannot fail a production sample. The checkpoint takes one
+fresh raw bracket on the retained clock's elapsed anchor and validates
+it against that copy. Busy or stale publication, a changing generation,
+poison or validation failure withholds evidence. The checkpoint holds
+neither the production clock mutex nor the node admission lock and
+writes no clock state. It cannot advance the clock or latch a failure.
+The coordinator approved this read-only checkpoint seam in `checked_clock.rs` as an A16 extension.
+
+The harness copies each bounded SQLite image from one verified no-follow
+descriptor while holding SQLite's shared rollback-journal lock range.
+It requires an absent or empty rollback journal and opens the copy only
+in memory. It correlates the acknowledged Mint to its
+original full log position and committed expiry, then brackets the late
+Query with equal applied views. Those views must show the same full applied
+and membership positions, enrollment floor, pending record and allocation
+counter. A16 must identify the late Query and its successful checked sample
+past expiry with a typed policy refusal. The TLS client must receive the
+uniform Anchor refusal and authenticated close before proof. Owner status
+must show the additional Query and unchanged Redeem count.
+
+Tests cover exact owner authentication, malformed requests, the legacy
+status reply, checked source success and failure, ordinal and contention,
+and the existing public framing. The A13 and E7 source guards and the
+workflow and Windows quarantine guards pass with their existing allowlists.
+
+## W1b. Coordinator-approved hosted UTC reference
+
+The coordinator approved one verified HTTPS HEAD to
+`https://www.google.com/generate_204` and one verified HTTPS GET to
+`https://1.1.1.1/cdn-cgi/trace` per checkpoint. The client validates each
+certificate against its host name or IP address. It reads at most 1024
+bytes of the trace response, using only its `ts=` field and the Date
+header. Both must be present and agree within 2 s. The Google Date and
+the exact Cloudflare timestamp must agree within 5 s. The client
+requires exact HTTP/1.1 status lines, a single Date per response and one
+unambiguous Content-Length for the trace. The client refuses
+Transfer-Encoding and any bytes after the declared trace body.
+Every request uses a generic User-Agent and sends
+no repository, owner or personal data, cookies, credentials or query
+parameters. The client follows no redirects and performs no retries.
+Both origins see ordinary HTTPS connection metadata, including the
+runner's public egress IP.
+
+Each reference needs a bounded, unambiguous fresh response. An Age header or an
+indication of caching fails the check. Within each before/after bracket
+from the retained issuer's checked clock, the complete offset range must
+fit ±30 s. Both the Google Date and the exact trace timestamp use
+the conservative allowance of ±1 s for Date resolution and ±1 s for
+source accuracy. Comparisons retain sub-millisecond precision and the
+artifact rounds reported offset bounds outward. The five checkpoints cover
+the initial Mint and Query, both sides of the dwell, the late refusal and
+the fresh positive. The qualification artifacts contain relative clock
+readings and reference offset bounds. A shared three-second W1b preflight
+checks both sources and their agreement before Cargo builds. Read-only
+`chronyc tracking` or `adjtimex --print` status is informational. The
+manual workflow has a 30-minute cap and runs outside required CI.
+
+W1 supports the conditional premise in ADR 0030 for the sampled hosted
+Linux profile. C13 supplies the restart evidence at the recovered applied
+floor. C15 supplies the controlled rollback and resume-visible controls.
+Physical suspend and other OSes remain **unverified on real hardware**.

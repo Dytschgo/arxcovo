@@ -1,0 +1,64 @@
+name: M3 time qualification (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: m3-time-qualification
+  cancel-in-progress: false
+jobs:
+  qualification:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'Dytschgo/arxcovo' &&
+      github.actor == 'Dytschgo' && github.triggering_actor == 'Dytschgo' &&
+      github.ref == 'refs/heads/main' && github.run_attempt == 1 &&
+      vars.M3_TIME_REVIEWED_SHA != '' && vars.M3_TIME_REVIEWED_IMAGE != '' &&
+      github.sha == vars.M3_TIME_REVIEWED_SHA &&
+      github.workflow_sha == vars.M3_TIME_REVIEWED_SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      M3_TIME_REVIEWED_SHA: ${{ vars.M3_TIME_REVIEWED_SHA }}
+      M3_TIME_REVIEWED_IMAGE: ${{ vars.M3_TIME_REVIEWED_IMAGE }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+      - name: Qualify the reviewed source and image
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B tools/ci/m3-time-qualification/run.py --preflight | tee "$RUNNER_TEMP/m3-time-first.jsonl"
+          python3 -I -B -m unittest discover -s tools/ci/m3-time-qualification -p test_run.py
+      - name: Build the production binary within the build reserve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if timeout --kill-after=5s 385s cargo build --locked -p arxd --bin arxd; then
+            printf '%s\n' '{"event":"build-complete"}' >> "$RUNNER_TEMP/m3-time-first.jsonl"
+          else
+            result=$?
+            printf '{"event":"first-failure","stage":"build","exit":%d}\n' "$result" >> "$RUNNER_TEMP/m3-time-first.jsonl"
+            exit "$result"
+          fi
+      - name: Observe one elapsed qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          python3 -I -B tools/ci/m3-time-qualification/run.py | tee -a "$RUNNER_TEMP/m3-time-first.jsonl"
+      - name: Preserve bounded first-attempt evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: m3-time-first-attempt
+          path: ${{ runner.temp }}/m3-time-first.jsonl
+          if-no-files-found: ignore
+          retention-days: 14

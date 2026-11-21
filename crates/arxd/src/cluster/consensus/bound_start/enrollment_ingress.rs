@@ -7,14 +7,18 @@ use crate::cluster::{
     },
     pki::{ca::ClusterCa, preproof::Refused},
 };
-use checked_clock::{CheckedClock, HostClock};
+use crate::service::cluster_owner::TIME_EVIDENCE_LEN;
+use anchor_query::AnchorQueryError;
+use checked_clock::{CheckedClock, ClockError, HostClock};
 use issue::found::FOUNDER;
 use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use peer_transport::Credentials;
+use sha2::{Digest, Sha256};
 use std::{
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
+    sync::{Mutex, OnceLock},
 };
 use tokio::{net::TcpListener, sync::MutexGuard};
 
@@ -207,6 +211,7 @@ impl ReadyIssuer {
 pub(super) struct ExchangeCounts {
     anchors: std::sync::atomic::AtomicU8,
     redeems: std::sync::atomic::AtomicU8,
+    last_query: Mutex<Option<LastQuery>>,
 }
 
 impl ExchangeCounts {
@@ -215,10 +220,96 @@ impl ExchangeCounts {
         [self.anchors.load(Relaxed), self.redeems.load(Relaxed)]
     }
 
-    fn count(counter: &std::sync::atomic::AtomicU8) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    fn count(counter: &std::sync::atomic::AtomicU8) -> u8 {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let previous = counter.fetch_update(Release, Relaxed, |n| Some(n.saturating_add(1)));
+        previous.unwrap_or_else(|n| n).saturating_add(1)
     }
+
+    pub(super) fn absent_time_evidence() -> [u8; TIME_EVIDENCE_LEN] {
+        let mut body = [0; TIME_EVIDENCE_LEN];
+        body[0] = 1;
+        body
+    }
+
+    fn time_evidence(
+        &self,
+        checkpoint: Option<Result<u64, ClockError>>,
+    ) -> [u8; TIME_EVIDENCE_LEN] {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut body = Self::absent_time_evidence();
+        if let Ok(last) = self.last_query.try_lock()
+            && let Some(last) = last
+                .as_ref()
+                .filter(|last| last.ordinal == self.anchors.load(Acquire))
+        {
+            body[1] = last.ordinal;
+            body[2] = match last.outcome {
+                Ok(()) => 1,
+                Err(AnchorQueryError::Refused) => 2,
+                Err(AnchorQueryError::Busy) => 3,
+                Err(AnchorQueryError::Unavailable) => 4,
+            };
+            body[3] = put_sample(last.sample, &mut body[5..13]);
+            body[21..].copy_from_slice(&last.handle);
+        }
+        body[4] = put_sample(checkpoint, &mut body[13..21]);
+        body
+    }
+}
+
+fn put_sample(sample: Option<Result<u64, ClockError>>, bytes: &mut [u8]) -> u8 {
+    match sample {
+        None => 0,
+        Some(Ok(ms)) => {
+            bytes.copy_from_slice(&ms.to_be_bytes());
+            1
+        }
+        Some(Err(_)) => 2,
+    }
+}
+
+struct LastQuery {
+    ordinal: u8,
+    handle: [u8; 32],
+    sample: Option<Result<u64, ClockError>>,
+    outcome: Result<(), AnchorQueryError>,
+}
+
+struct QueryClock<'a> {
+    source: &'a dyn CheckedClock,
+    sample: OnceLock<Result<u64, ClockError>>,
+}
+
+impl CheckedClock for QueryClock<'_> {
+    fn sample_ms(&self) -> Result<u64, ClockError> {
+        let result = self.source.sample_ms();
+        let _ = self.sample.set(result);
+        result
+    }
+}
+
+impl Job {
+    pub(super) fn time_evidence(&self) -> [u8; TIME_EVIDENCE_LEN] {
+        let Ok(state) = self.state.try_lock() else {
+            return ExchangeCounts::absent_time_evidence();
+        };
+        let exchange = state.exchange.clone();
+        let issuer = state.issuer.clone();
+        drop(state);
+        // A checkpoint uses the retained clock without taking the node's
+        // admission lock. The campaign serializes it with client exchanges.
+        let sample = issuer.map(|issuer| issuer.clock.sample_checkpoint());
+        exchange.time_evidence(sample)
+    }
+}
+
+fn query_handle(query: &[u8; 32]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"arxcovo-d5-query-v1\0")
+        .chain_update(query)
+        .finalize()
+        .into()
 }
 
 struct Issuer {
@@ -265,18 +356,37 @@ async fn wait_for_available<'a, N>(
 impl Backend for Issuer {
     async fn anchor(&self, query: Query, deadline: Instant) -> Result<BoundVoters, Refused> {
         let node = self.admit(deadline).await?;
-        if let Some(exchange) = &self.exchange {
-            ExchangeCounts::count(&exchange.anchors);
-        }
+        let ordinal = self
+            .exchange
+            .as_ref()
+            .map(|exchange| ExchangeCounts::count(&exchange.anchors));
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
                 .anchor_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let result = node
-            .anchor_query(&query.body(), self.ready.clock.as_ref())
-            .await;
+        let body = query.body();
+        let result = if let Some((exchange, ordinal)) = self.exchange.as_ref().zip(ordinal) {
+            let clock = QueryClock {
+                source: self.ready.clock.as_ref(),
+                sample: OnceLock::new(),
+            };
+            let result = node.anchor_query(&body, &clock).await;
+            if ordinal < u8::MAX
+                && let Ok(mut slot) = exchange.last_query.try_lock()
+            {
+                *slot = Some(LastQuery {
+                    ordinal,
+                    handle: query_handle(&body),
+                    sample: clock.sample.into_inner(),
+                    outcome: result.as_ref().map(|_| ()).map_err(|error| *error),
+                });
+            }
+            result
+        } else {
+            node.anchor_query(&body, self.ready.clock.as_ref()).await
+        };
         #[cfg(test)]
         if let Err(error) = &result
             && self.observation.is_some()
@@ -1181,5 +1291,76 @@ mod hosted {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod time_evidence_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    struct Source(AtomicUsize);
+
+    impl CheckedClock for Source {
+        fn sample_ms(&self) -> Result<u64, ClockError> {
+            match self.0.fetch_add(1, Relaxed) {
+                0 => Ok(123),
+                _ => Err(ClockError::Unavailable),
+            }
+        }
+    }
+
+    #[test]
+    fn forwarding_preserves_each_result_and_captures_the_first() {
+        let source = Source(AtomicUsize::new(0));
+        let clock = QueryClock {
+            source: &source,
+            sample: OnceLock::new(),
+        };
+        assert_eq!(clock.sample_ms(), Ok(123));
+        assert_eq!(clock.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(clock.sample.into_inner(), Some(Ok(123)));
+        let clock = QueryClock {
+            source: &source,
+            sample: OnceLock::new(),
+        };
+        assert_eq!(clock.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(
+            clock.sample.into_inner(),
+            Some(Err(ClockError::Unavailable))
+        );
+        assert_eq!(source.0.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn time_evidence_rejects_busy_and_stale_slots() {
+        let exchange = ExchangeCounts::default();
+        let ordinal = ExchangeCounts::count(&exchange.anchors);
+        let handle = query_handle(&[8; 32]);
+        assert_ne!(handle, query_handle(&[9; 32]));
+        {
+            let mut slot = exchange.last_query.lock().unwrap();
+            *slot = Some(LastQuery {
+                ordinal,
+                handle,
+                sample: Some(Ok(900_001)),
+                outcome: Err(AnchorQueryError::Refused),
+            });
+            assert_eq!(
+                exchange.time_evidence(None),
+                ExchangeCounts::absent_time_evidence()
+            );
+        }
+
+        let body = exchange.time_evidence(Some(Ok(900_002)));
+        assert_eq!(&body[..5], &[1, 1, 2, 1, 1]);
+        assert_eq!(&body[5..13], &900_001_u64.to_be_bytes());
+        assert_eq!(&body[13..21], &900_002_u64.to_be_bytes());
+        assert_eq!(&body[21..], &handle);
+        assert_eq!(ExchangeCounts::count(&exchange.anchors), 2);
+        assert_eq!(
+            exchange.time_evidence(None),
+            ExchangeCounts::absent_time_evidence()
+        );
     }
 }
