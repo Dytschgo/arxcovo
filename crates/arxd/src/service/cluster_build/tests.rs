@@ -183,7 +183,7 @@ async fn commit_racing_shutdown_has_one_terminal_row_and_no_escaped_run() {
                 let id = activity.start_delegated_build([8; 32], [9; 32], None)?;
                 committed.send(id).unwrap();
                 wait.recv_timeout(Duration::from_secs(5)).unwrap();
-                Ok(id)
+                Ok(Some(id))
             },
             |_, _| panic!("a worker entered the prepared broker after shutdown"),
         )
@@ -227,6 +227,7 @@ async fn protected_agent_endpoint_checks_kernel_identity_group_and_pins() {
 
 struct Applied {
     revoked: std::sync::atomic::AtomicBool,
+    target_key: std::sync::atomic::AtomicU8,
 }
 
 impl Authority for Applied {
@@ -236,6 +237,9 @@ impl Authority for Applied {
     fn binding(&self, cluster: [u8; 16], id: NodeId) -> Option<[u8; 32]> {
         if cluster != [8; 16] || id == node(1) && self.revoked.load(Ordering::SeqCst) {
             return None;
+        }
+        if id == node(2) {
+            return Some([self.target_key.load(Ordering::SeqCst); 32]);
         }
         Some([id.get() as u8; 32])
     }
@@ -263,7 +267,7 @@ fn descriptor(workspace: &str) -> Descriptor {
 }
 
 async fn ask(
-    service: &BuildService,
+    service: &Arc<BuildService>,
     authority: &Arc<Applied>,
     source: u64,
     query: Query,
@@ -293,23 +297,28 @@ fn spend(operation: Operation, lease: Secret, workspace: &str) -> Query {
     Query::Spend {
         operation,
         lease,
-        descriptor: descriptor(workspace),
+        descriptor: descriptor(workspace).offer().unwrap(),
     }
 }
 
-#[tokio::test]
-async fn broker_busy_drain_and_revocation_refuse_before_activity() {
-    use super::super::cluster_build_executor::refusal_fixture;
-    let (temp, activity, execution, backend, _) = fixture(false);
-    let (broker, capacity, task) = refusal_fixture(temp.path(), "/usr".into());
+fn test_service(
+    activity: Arc<Activity>,
+    execution: Arc<Execution>,
+    broker: BuildBroker,
+) -> (
+    Arc<BuildService>,
+    Arc<Applied>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
     let applied = Arc::new(Applied {
         revoked: false.into(),
+        target_key: 2.into(),
     });
     let policy = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let current = policy.clone();
-    let service = BuildService {
+    let service = Arc::new(BuildService {
         activity,
-        execution: Some(execution.clone()),
+        execution: Some(execution),
         broker: Some(broker),
         grants: vec![
             Grant {
@@ -331,8 +340,78 @@ async fn broker_busy_drain_and_revocation_refuse_before_activity() {
         policy_current: Arc::new(move || current.load(Ordering::SeqCst)),
         leases: Leases::default(),
         stop: Shutdown::default(),
-    };
-    let grant = |slot| Query::Grant(descriptor(slot));
+    });
+    (service, applied, policy)
+}
+
+#[tokio::test]
+async fn stale_authority_under_admission_refuses_before_writes_or_execute() {
+    use super::super::cluster_build_executor::refusal_fixture;
+    let (temp, activity, execution, backend, _) = fixture(false);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (broker, _, task) = refusal_fixture(temp.path(), "/usr".into(), Some(starts.clone()));
+    let (service, authority, policy) = test_service(activity, execution.clone(), broker);
+    let db = rusqlite::Connection::open(temp.path().join("activity.sqlite3")).unwrap();
+    let changes: [&dyn Fn(); 3] = [
+        &|| authority.revoked.store(true, Ordering::SeqCst),
+        &|| policy.store(false, Ordering::SeqCst),
+        &|| authority.target_key.store(9, Ordering::SeqCst),
+    ];
+    for change in changes {
+        let offer = descriptor("bin").offer().unwrap();
+        let Response::Granted { operation, lease } =
+            ask(&service, &authority, 1, Query::Grant(offer)).await
+        else {
+            panic!("fresh grant refused");
+        };
+        let (entered, barrier) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        execution.admission_barrier_for_test(Arc::new(move || {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let owner = service.clone();
+        let applied = authority.clone();
+        let request =
+            tokio::spawn(
+                async move { ask(&owner, &applied, 1, spend(operation, lease, "bin")).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), barrier)
+            .await
+            .unwrap()
+            .unwrap();
+        change();
+        release.send(()).unwrap();
+        assert!(matches!(request.await.unwrap(), Response::Refused));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.starts.load(Ordering::SeqCst), 0);
+        for sql in [
+            "SELECT count(*) FROM activity",
+            "SELECT count(*) FROM delegated_build",
+        ] {
+            assert_eq!(db.query_row::<u64, _, _>(sql, [], |r| r.get(0)).unwrap(), 0);
+        }
+        authority.revoked.store(false, Ordering::SeqCst);
+        policy.store(true, Ordering::SeqCst);
+        authority.target_key.store(2, Ordering::SeqCst);
+    }
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    execution.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn broker_busy_drain_and_revocation_refuse_before_activity() {
+    use super::super::cluster_build_executor::refusal_fixture;
+    let (temp, activity, execution, backend, _) = fixture(false);
+    let (broker, capacity, task) = refusal_fixture(temp.path(), "/usr".into(), None);
+    let (service, applied, policy) = test_service(activity, execution.clone(), broker);
+    let grant = |slot| Query::Grant(descriptor(slot).offer().unwrap());
     assert!(matches!(
         ask(&service, &applied, 3, grant("lib")).await,
         Response::Granted { .. }

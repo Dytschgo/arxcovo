@@ -5,6 +5,7 @@ use crate::{
     store::BuildActivity,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -27,7 +28,38 @@ pub(crate) struct Descriptor {
     pub(crate) output_bytes: usize,
 }
 
+// Command input stays local on A. B stores its own descriptors in grants.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Offer {
+    pub(crate) workspace: String,
+    command_sha256: [u8; 32],
+    profile: Profile,
+    pub(crate) timeout_s: u64,
+    output_bytes: usize,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Profile {
+    StandardRun,
+}
+
 impl Descriptor {
+    pub(crate) fn offer(&self) -> Option<Offer> {
+        self.request()?;
+        let mut hash = Sha256::new();
+        hash.update(b"arxcovo/d4/standard-run/v1\0");
+        hash.update(serde_json::to_vec(self).ok()?);
+        Some(Offer {
+            workspace: self.workspace.clone(),
+            command_sha256: hash.finalize().into(),
+            profile: Profile::StandardRun,
+            timeout_s: self.timeout_s,
+            output_bytes: self.output_bytes,
+        })
+    }
+
     pub(crate) fn request(&self) -> Option<Request> {
         let request = Request {
             tool: Some(self.tool.clone()),
@@ -55,11 +87,11 @@ pub(crate) fn selector(value: &str) -> bool {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Query {
-    Grant(Descriptor),
+    Grant(Offer),
     Spend {
         operation: Operation,
         lease: Secret,
-        descriptor: Descriptor,
+        descriptor: Offer,
     },
     Status {
         operation: Operation,

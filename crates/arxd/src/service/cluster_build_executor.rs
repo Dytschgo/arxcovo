@@ -1132,6 +1132,7 @@ pub(super) fn workspace_controls(root: &Path) {
 pub(super) fn refusal_fixture(
     directory: &Path,
     workspace: PathBuf,
+    executions: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> (BuildBroker, Arc<Semaphore>, tokio::task::JoinHandle<()>) {
     let socket = directory.join("broker-fixture.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -1161,10 +1162,26 @@ pub(super) fn refusal_fixture(
                 Operation::CheckWorkspace { slot } => available()
                     .and_then(|()| tickets.issue(&workspace, slot))
                     .map(Reply::Workspace),
-                Operation::PrepareBuild { slot, ticket, .. } => available().and_then(|()| {
-                    prepare_workspace(&tickets, &workspace, &slot, ticket, &fixture_capacity)
-                        .map(|_| panic!("refusal fixture unexpectedly prepared an execution"))
-                }),
+                Operation::PrepareBuild { slot, ticket, .. } => {
+                    match available().and_then(|()| {
+                        prepare_workspace(&tickets, &workspace, &slot, ticket, &fixture_capacity)
+                    }) {
+                        Err(reason) => Err(reason),
+                        Ok((_workspace, _permit)) => {
+                            let executions = executions.as_ref().expect("unexpected prepare");
+                            send_reply(&mut stream, Reply::Prepared).await.unwrap();
+                            if matches!(
+                                timeout(HANDSHAKE, stream.read_u8()).await,
+                                Ok(Ok(BUILD_EXECUTE))
+                            ) {
+                                executions.fetch_add(1, Ordering::SeqCst);
+                                Ok(Reply::Cancelled)
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 _ => panic!("unexpected refusal fixture command"),
             };
             let reply = result.unwrap_or_else(|reason| Reply::Unavailable(reason.as_str().into()));

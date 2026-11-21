@@ -496,7 +496,7 @@ impl Execution {
         reservation: BuildReservation,
         activity: Arc<Activity>,
         request: Request,
-        persist: impl FnOnce(&Activity) -> anyhow::Result<i64>,
+        persist: impl FnOnce(&Activity) -> anyhow::Result<Option<i64>>,
         prepared: impl FnOnce(&Cancellation, &Cancellation) -> Report + Send + 'static,
     ) -> Result<
         (
@@ -517,7 +517,13 @@ impl Execution {
         }
         // Drain seals admission before taking this same set. A committed row is
         // handed to its owner before the set can move, even across shutdown.
-        let id = persist(&activity).map_err(|_| BuildAdmissionError::Storage)?;
+        #[cfg(test)]
+        if let Some(barrier) = execution.admission_barrier.lock().unwrap().clone() {
+            barrier();
+        }
+        let id = persist(&activity)
+            .map_err(|_| BuildAdmissionError::Storage)?
+            .ok_or(BuildAdmissionError::Unavailable(Unavailable::Stopping))?;
         let cancel = Cancellation::default();
         let guard = CancelOnDrop(cancel.clone());
         let (send, receive) = tokio::sync::oneshot::channel();

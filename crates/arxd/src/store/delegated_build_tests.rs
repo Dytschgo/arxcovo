@@ -41,3 +41,56 @@ fn mapped_start_and_dedup_are_atomic_and_scoped() {
         .unwrap();
     assert_eq!(old.outcome, Outcome::Interrupted);
 }
+
+#[test]
+fn full_retention_protects_cleanup_confirmed_rows_without_identity() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Activity::open(root.path()).unwrap();
+    let scope = [7; 32];
+    let mut last = 0;
+    for i in 1..=128 {
+        last = store.start_delegated_build([i; 32], scope, None).unwrap();
+        if i != 128 {
+            store
+                .finish_typed(
+                    last,
+                    Outcome::Failed,
+                    &Metadata {
+                        cleanup_confirmed: Some(true),
+                        ..Metadata::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+    assert!(
+        store
+            .start_delegated_build_checked([129; 32], scope, None, || true)
+            .unwrap()
+            .is_none()
+    );
+    let first = store
+        .delegated_build([1; 32], scope, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.cleanup_confirmed, Some(true));
+    assert_eq!(first.uid, None);
+    assert!(!first.terminal());
+    store
+        .finish_typed(last, Outcome::Refused, &Metadata::default())
+        .unwrap();
+    store.start_delegated_build([129; 32], scope, None).unwrap();
+    assert!(
+        store
+            .delegated_build([128; 32], scope, false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .delegated_build([1; 32], scope, false)
+            .unwrap()
+            .is_some()
+    );
+}

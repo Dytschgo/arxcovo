@@ -202,8 +202,25 @@ pub(crate) struct BuildService {
     stop: Shutdown,
 }
 
-fn descriptor_hash(descriptor: &Descriptor) -> [u8; 32] {
-    digest(b"arxcovo/d4/descriptor/1", &[&encoded(descriptor)])
+struct Access {
+    authority: Arc<dyn Authority>,
+    peer: Identity,
+    target: NodeId,
+    target_key: [u8; 32],
+    agent: String,
+}
+
+impl Grant {
+    fn resolve(&self, offer: &Offer) -> Option<Descriptor> {
+        self.commands
+            .iter()
+            .find(|command| command.offer().as_ref() == Some(offer))
+            .cloned()
+    }
+}
+
+fn offer_hash(offer: &Offer) -> [u8; 32] {
+    digest(b"arxcovo/d4/offer/1", &[&encoded(offer)])
 }
 
 fn forward_scope(principal: &str, target: NodeId) -> [u8; 32] {
@@ -297,94 +314,97 @@ impl BuildService {
         result
     }
 
-    fn entitled(&self, authority: &dyn Authority, peer: Identity, target: NodeId) -> bool {
-        !self.stop.is_cancelled()
-            && (self.policy_current)()
-            && authority.identity() == Some((peer.cluster, target))
-            && authority.binding(peer.cluster, target).is_some()
-            && authority.binding(peer.cluster, peer.node) == Some(peer.key)
-    }
-
-    async fn handle(
-        &self,
-        authority: Arc<dyn Authority>,
-        peer: Identity,
-        request: Envelope,
-    ) -> Response {
-        let Some(grant) = self
-            .grants
-            .iter()
-            .find(|g| g.source == peer.node && g.key == peer.key && g.agent == request.agent)
-        else {
-            return Response::Refused;
-        };
-        if !self.entitled(&*authority, peer, request.target) {
-            return Response::Refused;
+    fn checked_grant(&self, access: &Access) -> Option<(&Grant, [u8; 32])> {
+        let Access {
+            authority,
+            peer,
+            target,
+            target_key,
+            agent,
+        } = access;
+        if self.stop.is_cancelled()
+            || !(self.policy_current)()
+            || authority.identity() != Some((peer.cluster, *target))
+            || authority.binding(peer.cluster, *target) != Some(*target_key)
+            || authority.binding(peer.cluster, peer.node) != Some(peer.key)
+        {
+            return None;
         }
-        let Some(target_key) = authority.binding(peer.cluster, request.target) else {
-            return Response::Refused;
-        };
+        let grant = self.grants.iter().find(|grant| {
+            grant.source == peer.node && grant.key == peer.key && grant.agent == *agent
+        })?;
         let scope = digest(
             b"arxcovo/d4/target/1",
             &[
                 &peer.cluster,
-                &request.target.get().to_be_bytes(),
-                &target_key,
+                &target.get().to_be_bytes(),
+                target_key,
                 &encoded(grant),
             ],
         );
-        let allowed = |descriptor: &Descriptor| {
-            let hash = descriptor_hash(descriptor);
-            grant
-                .commands
-                .iter()
-                .any(|allowed| descriptor_hash(allowed) == hash)
+        Some((grant, scope))
+    }
+
+    async fn handle(
+        self: &Arc<Self>,
+        authority: Arc<dyn Authority>,
+        peer: Identity,
+        request: Envelope,
+    ) -> Response {
+        let Some(target_key) = authority.binding(peer.cluster, request.target) else {
+            return Response::Refused;
+        };
+        let access = Access {
+            authority,
+            peer,
+            target: request.target,
+            target_key,
+            agent: request.agent,
+        };
+        let Some((grant, scope)) = self.checked_grant(&access) else {
+            return Response::Refused;
         };
         match request.query {
-            Query::Grant(descriptor) if allowed(&descriptor) => {
-                self.grant(peer, request.target, authority, scope, descriptor)
-                    .await
+            Query::Grant(offer) => {
+                if grant.resolve(&offer).is_none() {
+                    return Response::Refused;
+                }
+                self.grant(access, scope, offer).await
             }
             Query::Spend {
                 operation,
                 lease,
-                descriptor,
-            } if allowed(&descriptor) => {
-                let hash = descriptor_hash(&descriptor);
-                let Some(reservation) = self.leases.take(operation, scope, lease, hash) else {
+                descriptor: offer,
+            } => {
+                let Some(descriptor) = grant.resolve(&offer) else {
                     return Response::Refused;
                 };
-                self.spend(
-                    (authority, peer, request.target),
-                    operation,
-                    reservation,
-                    descriptor,
-                )
-                .await
+                let Some(reservation) =
+                    self.leases
+                        .take(operation, scope, lease, offer_hash(&offer))
+                else {
+                    return Response::Refused;
+                };
+                self.spend(access, operation, reservation, offer, descriptor)
+                    .await
             }
             Query::Status { operation } => self.status(operation, scope, None).await,
-            _ => Response::Refused,
         }
     }
 
-    async fn grant(
-        &self,
-        peer: Identity,
-        target: NodeId,
-        authority: Arc<dyn Authority>,
-        scope: [u8; 32],
-        descriptor: Descriptor,
-    ) -> Response {
+    async fn grant(&self, access: Access, scope: [u8; 32], offer: Offer) -> Response {
         let Some(broker) = self.broker.clone() else {
             return Response::Refused;
         };
-        let workspace = descriptor.workspace.clone();
+        let workspace = offer.workspace.clone();
         let Ok(Ok(ticket)) = tokio::task::spawn_blocking(move || broker.check(workspace)).await
         else {
             return Response::Refused;
         };
         let (mut operation, mut secret) = ([0; 32], [0; 32]);
-        if !self.entitled(&*authority, peer, target)
+        if self
+            .checked_grant(&access)
+            .is_none_or(|(_, current)| current != scope)
             || getrandom::fill(&mut operation).is_err()
             || getrandom::fill(&mut secret).is_err()
         {
@@ -392,9 +412,9 @@ impl BuildService {
         }
         let lease = Lease {
             expires: Instant::now() + LEASE_TTL,
-            source: peer.node,
+            source: access.peer.node,
             scope,
-            descriptor: descriptor_hash(&descriptor),
+            descriptor: offer_hash(&offer),
             secret,
             ticket,
         };
@@ -409,10 +429,11 @@ impl BuildService {
     }
 
     async fn spend(
-        &self,
-        auth: (Arc<dyn Authority>, Identity, NodeId),
+        self: &Arc<Self>,
+        access: Access,
         operation: Operation,
         lease: Lease,
+        offer: Offer,
         descriptor: Descriptor,
     ) -> Response {
         let (Some(broker), Some(execution), Some(command)) = (
@@ -423,9 +444,8 @@ impl BuildService {
             return Response::Refused;
         };
         let activity = self.activity.clone();
-        let stop = self.stop.clone();
+        let service = self.clone();
         let scope = lease.scope;
-        let policy_current = self.policy_current.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             let claim = execution
                 .reserve_build()
@@ -433,23 +453,20 @@ impl BuildService {
             let prepared = broker
                 .prepare(descriptor.workspace, lease.ticket, command.clone())
                 .map_err(BuildAdmissionError::Unavailable)?;
-            let (authority, peer, target) = auth;
-            if lease.expires <= Instant::now()
-                || stop.is_cancelled()
-                || !policy_current()
-                || authority.identity() != Some((peer.cluster, target))
-                || authority.binding(peer.cluster, target).is_none()
-                || authority.binding(peer.cluster, peer.node) != Some(peer.key)
-            {
-                return Err(BuildAdmissionError::Unavailable(
-                    super::preflight::ExecutionUnavailable::Stopping,
-                ));
-            }
             Execution::dispatch_build(
                 claim,
                 activity,
                 command,
-                move |activity| activity.start_delegated_build(operation, scope, None),
+                move |activity| {
+                    activity.start_delegated_build_checked(operation, scope, None, || {
+                        lease.expires > Instant::now()
+                            && service
+                                .checked_grant(&access)
+                                .is_some_and(|(grant, current)| {
+                                    current == scope && grant.resolve(&offer).is_some()
+                                })
+                    })
+                },
                 move |cancel, stop| prepared.execute(cancel, stop),
             )
         })
@@ -482,7 +499,7 @@ impl BuildService {
         match tokio::task::spawn_blocking(move || activity.delegated_build(operation, scope, false))
             .await
         {
-            Ok(Ok(Some(activity))) if terminal(activity) => Response::Finished {
+            Ok(Ok(Some(activity))) if activity.terminal() => Response::Finished {
                 operation,
                 activity,
                 output,
@@ -546,16 +563,11 @@ impl BuildService {
         descriptor: Descriptor,
         closed: &Shutdown,
     ) -> Value {
-        if descriptor.request().is_none() || closed.is_cancelled() {
+        let Some(offer) = descriptor.offer().filter(|_| !closed.is_cancelled()) else {
             return json!({"outcome": "refused"});
-        }
+        };
         let Some(Response::Granted { operation, lease }) = self
-            .remote(
-                principal,
-                target,
-                Query::Grant(descriptor.clone()),
-                IO_BUDGET,
-            )
+            .remote(principal, target, Query::Grant(offer.clone()), IO_BUDGET)
             .await
         else {
             return json!({"outcome": "refused"});
@@ -570,11 +582,11 @@ impl BuildService {
         else {
             return json!({"outcome": "refused"});
         };
-        let budget = Duration::from_secs(descriptor.timeout_s + 12);
+        let budget = Duration::from_secs(offer.timeout_s + 12);
         let reply = tokio::select! {
             biased;
             _ = closed.cancelled() => None,
-            reply = self.remote(principal, target, Query::Spend { operation, lease, descriptor }, budget) => reply,
+            reply = self.remote(principal, target, Query::Spend { operation, lease, descriptor: offer }, budget) => reply,
         };
         self.forward_result(operation, id, reply).await
     }
@@ -632,7 +644,7 @@ impl BuildService {
                 operation: echoed,
                 activity,
                 ..
-            }) if *echoed == operation && terminal(*activity) => Some(*activity),
+            }) if *echoed == operation && activity.terminal() => Some(*activity),
             Some(Response::Refused) => Some(BuildActivity {
                 activity_id: 0,
                 outcome: Outcome::Refused,
@@ -668,14 +680,6 @@ impl BuildService {
     }
 }
 
-fn terminal(activity: BuildActivity) -> bool {
-    (matches!(activity.outcome, Outcome::Succeeded | Outcome::Failed)
-        && activity.cleanup_confirmed == Some(true)
-        && activity.uid.is_some()
-        && activity.gid.is_some())
-        || activity.outcome == Outcome::Refused
-}
-
 fn public_result(operation: Operation, response: Option<Response>) -> Value {
     let operation_id = hex::encode(operation);
     match response {
@@ -683,7 +687,7 @@ fn public_result(operation: Operation, response: Option<Response>) -> Value {
             operation: echoed,
             activity,
             output,
-        }) if echoed == operation && terminal(activity) => {
+        }) if echoed == operation && activity.terminal() => {
             json!({"operation_id": operation_id, "outcome": activity.outcome,
                 "target_activity": activity, "output": output})
         }

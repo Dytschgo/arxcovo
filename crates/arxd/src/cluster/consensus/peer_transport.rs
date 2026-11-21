@@ -264,12 +264,19 @@ impl BuildPeer {
         }
         let resources = state.resources.clone()?;
         drop(state);
-        if resources
-            .learner
-            .as_ref()
-            .is_some_and(|gate| gate.phase().ok() != Some(peer_registry::Phase::Strict))
-        {
-            return None;
+        if let Some(gate) = &resources.learner {
+            let deadline = Instant::now() + Duration::from_millis(4);
+            loop {
+                match gate.inspect_strict(Some(deadline), |_| ()) {
+                    Ok(()) => break,
+                    Err(peer_registry::ObservationRefusal::StoreBusy)
+                        if Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_micros(250));
+                    }
+                    Err(_) => return None,
+                }
+            }
         }
         Some(resources)
     }
