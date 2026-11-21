@@ -1,5 +1,8 @@
 #![cfg(all(test, target_os = "linux"))]
 
+#[path = "support/c13_failure.rs"]
+mod c13_failure;
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -29,15 +32,19 @@ fn phase(value: &'static str) {
     *PHASE.lock().unwrap() = value;
 }
 
-fn first_failure(category: &'static str) {
+fn first_failure(category: &'static str, panic: Option<&std::panic::PanicHookInfo<'_>>) {
     if !FIRST.swap(true, std::sync::atomic::Ordering::SeqCst) {
         let phase = *PHASE.lock().unwrap_or_else(|error| error.into_inner());
-        println!("\nC13 first phase={phase} category={category}");
+        if let Some(panic) = panic {
+            c13_failure::report_assertion(phase, file!(), panic);
+        } else {
+            println!("\nC13 first phase={phase} category={category}");
+        }
     }
 }
 
 fn refuse(category: &'static str) -> ! {
-    first_failure(category);
+    first_failure(category, None);
     panic!("C13 refused");
 }
 
@@ -873,7 +880,10 @@ fn publish_final(probe: &Path, node: &Node, paste: &Secret, helpers: &mut Helper
     nonblocking(write.as_raw_fd()).unwrap_or_else(|_| refuse("pipe-io"));
     write_bounded(&mut write, &paste.0, phase_end()).unwrap_or_else(|_| refuse("pipe-io"));
     drop(write);
-    assert!(helpers.finish().1.success());
+    assert!(
+        helpers.finish().1.success(),
+        "C13 publication helper failed"
+    );
     assert!(!node.socket().exists() && !node.root.join("state/cluster-state.sqlite3").exists());
 }
 
@@ -1074,7 +1084,7 @@ fn without_ca(node: &Node) {
 #[test]
 #[ignore = "once-only hosted C13 launcher with disposable runner identities"]
 fn c13_activation_restarts_original_nodes_and_issues_after_founder_close() {
-    std::panic::set_hook(Box::new(|_| first_failure("assertion")));
+    std::panic::set_hook(Box::new(|panic| first_failure("assertion", Some(panic))));
     END.set(Instant::now() + CAMPAIGN).unwrap();
     let mut campaign = Campaign::default();
     assert_eq!(std::env::var("ARX_C13_HOSTED").as_deref(), Ok("1"));

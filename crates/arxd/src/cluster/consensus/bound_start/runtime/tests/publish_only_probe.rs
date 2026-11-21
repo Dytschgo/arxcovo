@@ -6,12 +6,22 @@ use std::{
     os::fd::{FromRawFd, RawFd},
 };
 
+mod c13_failure {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/c13_failure.rs"
+    ));
+}
+
 const PASTE_FD: RawFd = 3;
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "one C13 hosted launch through the fixed inherited pipe"]
 async fn c13_final_publication_only() {
     assert_eq!(std::env::var("ARX_C13_PUBLISH").as_deref(), Ok("1"));
+    std::panic::set_hook(Box::new(|panic| {
+        c13_failure::report_assertion("publication", file!(), panic);
+    }));
     let config = PathBuf::from(std::env::var_os("ARX_C13_CONFIG").expect("fixed C13 input"));
     // SAFETY: the launcher supplies one owned read end at the fixed descriptor.
     let pipe = unsafe { File::from_raw_fd(PASTE_FD) };

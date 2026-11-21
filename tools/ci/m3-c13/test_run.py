@@ -1,5 +1,7 @@
 """Pure tests for the fixed C13 launcher."""
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import unittest
@@ -63,15 +65,58 @@ class LauncherTests(unittest.TestCase):
         stage = Path("/tmp/arx-c13-abcdefgh")
         with (patch.dict(RUN.os.environ, {"RUNNER_OS": "untrusted"}, clear=True),
               patch.object(RUN.time, "monotonic", return_value=10),
-              patch.object(RUN.subprocess, "run") as run):
-            RUN.launch_privileged(stage, 20, 30)
+              patch.object(RUN.subprocess, "run", return_value=MagicMock(returncode=1)) as run):
+            self.assertEqual(RUN.launch_privileged(stage, 20, 30), 1)
         run.assert_called_once_with(
             ["/usr/bin/sudo", "-n", "/usr/bin/env", "GITHUB_ACTIONS=true",
              "RUNNER_ENVIRONMENT=github-hosted", "RUNNER_OS=Linux",
              "/usr/bin/python3", "-I", "-B", Path(RUN.__file__).resolve(),
              "--staged", stage, "20000000"],
-            env=RUN.ENV, stdin=RUN.subprocess.DEVNULL, check=True, timeout=18,
+            env=RUN.ENV, stdin=RUN.subprocess.DEVNULL, check=False, timeout=18,
         )
+
+    def test_failed_campaign_reports_first_record_and_reconciles_roles(self):
+        join = "C13 first phase=join category=assertion"
+        publication = "C13 first phase=publication category=assertion"
+        join_cleanup = "C13 cleanup spawned=3 signaled=2 reaped=3 clean=2 helpers=17 helpers_reaped=17 helper_unknown=0"
+        publication_cleanup = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helpers=93 helpers_reaped=93 helper_unknown=0"
+        for first, cleanup, remove in (
+            (join, join_cleanup, True),
+            (publication, publication_cleanup, True),
+            (join + " at=m3_activation_linux.rs:1155 message=join-refused", join_cleanup, True),
+            (publication + " at=publish_only_probe.rs:34 message=publication-refused",
+             publication_cleanup, True),
+            (join, join_cleanup.replace("reaped=3", "reaped=2"), False),
+        ):
+            with self.subTest(first=first, cleanup=cleanup):
+                capture = RUN.Capture()
+                capture.feed(f"fixture-private-output\n{first}\n{cleanup}\n".encode("ascii"))
+                stage = MagicMock(is_symlink=lambda: False)
+                stage.stat.return_value.st_uid = 23
+                output = io.StringIO()
+                with (patch.object(RUN, "qualify_runner"),
+                      patch.object(RUN.os, "geteuid", return_value=0, create=True),
+                      patch.dict(RUN.os.environ, {"SUDO_UID": "23"}),
+                      patch.object(RUN, "Path", return_value=stage),
+                      patch.object(stage, "parent", stage),
+                      patch.object(stage, "name", "arx-c13-abcdefgh"),
+                      patch.object(RUN, "unused", return_value=True),
+                      patch.object(RUN, "command") as command,
+                      patch.object(RUN.tempfile, "mkdtemp", return_value="/tmp/arx-c13-fixture"),
+                      patch.object(RUN, "stage_tree"),
+                      patch.object(RUN, "stage_binary"),
+                      patch.object(RUN, "primary_ip", return_value="10.1.0.22"),
+                      patch.object(RUN, "bounded_run", return_value=(101, capture)),
+                      patch.object(RUN, "remove_role", return_value="removed") as remove_role,
+                      patch.object(RUN.time, "monotonic", return_value=10),
+                      redirect_stdout(output), redirect_stderr(output)):
+                    self.assertEqual(RUN.privileged("/tmp/arx-c13-abcdefgh", 178), 1)
+                self.assertIn(first + "\n", output.getvalue())
+                self.assertIn(f"roles_removed={8 if remove else 0} "
+                              f"roles_retained={0 if remove else 8}", output.getvalue())
+                self.assertNotIn("fixture-private-output", output.getvalue())
+                self.assertEqual(remove_role.call_count, 8 if remove else 0)
+                self.assertEqual(command.call_count, 9 if remove else 8)
 
     def test_workflow_pins_one_runner_only_step(self):
         workflow = (RUN.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -87,14 +132,18 @@ class LauncherTests(unittest.TestCase):
 
 
 
-    def test_fixture_cleanup_requires_all_owned_children_observed(self):
+    def test_fixture_cleanup_distinguishes_reap_from_graceful_close(self):
         good = "C13 cleanup spawned=6 signaled=6 reaped=6 clean=6 helpers=18 helpers_reaped=18 helper_unknown=0"
-        self.assertTrue(RUN.cleanup_observed([good]))
+        self.assertEqual(RUN.cleanup_disposition([good]), (True, True))
+        unclean = good.replace("clean=6", "clean=5")
+        self.assertEqual(RUN.cleanup_disposition([unclean]), (True, False))
         for lines in (
-            [], [good, good], [good.replace("clean=6", "clean=5")],
-            [good.replace("reaped=6", "reaped=5")], [good.replace("helpers_reaped=18", "helpers_reaped=17")], [good.replace("unknown=0", "unknown=1")],
+            [], [good, good], [good.replace("signaled=6", "signaled=5")],
+            [good.replace("reaped=6", "reaped=5")],
+            [good.replace("helpers_reaped=18", "helpers_reaped=17")],
+            [good.replace("unknown=0", "unknown=1")],
         ):
-            self.assertFalse(RUN.cleanup_observed(lines))
+            self.assertEqual(RUN.cleanup_disposition(lines), (False, False))
 
 
     def test_teardown_reserve_and_redacted_first_failure(self):
@@ -103,14 +152,14 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 RUN.remaining(100, 9)
     def test_first_record_survives_truncation_and_chunk_boundaries(self):
-        first = b"C13 first phase=join category=pipe-io"
+        first = b"C13 first phase=join category=assertion at=m3_activation_linux.rs:1155 message=join-refused"
         next_record = b"C13 first phase=close category=assertion"
         for oversized_prefix in (b"", b"x" * (RUN.OUTPUT_LIMIT + 20)):
             with self.subTest(truncated_before_record=bool(oversized_prefix)):
                 capture = RUN.Capture()
                 capture.feed(oversized_prefix)
                 capture.feed(b"suffix\nC13 first phase=/tmp category=secret\n" + first[:15])
-                capture.feed(first[15:] + b"\n" + next_record + b"\n")
+                capture.feed(first[15:] + b"\r\n" + next_record + b"\n")
                 capture.feed(b"x" * RUN.OUTPUT_LIMIT)
                 self.assertEqual(capture.first, first.decode("ascii"))
                 self.assertTrue(capture.truncated)
@@ -119,11 +168,27 @@ class LauncherTests(unittest.TestCase):
     def test_partial_and_oversized_lines_do_not_produce_records(self):
         capture = RUN.Capture()
         first = b"C13 first phase=join category=pipe-io"
-        capture.feed(b"x" * 97)
+        capture.feed(b"x" * (RUN.FIRST_LIMIT + 1))
         capture.feed(first + b"\n" + first)
         self.assertIsNone(capture.first)
         capture.feed(b"\n")
         self.assertEqual(capture.first, first.decode("ascii"))
+
+    def test_assertion_summary_rejects_unlisted_fields_and_payloads(self):
+        valid = b"C13 first phase=publication category=assertion at=publish_only_probe.rs:34 message=publication-refused"
+        for invalid in (
+            valid.replace(b"publish_only_probe.rs", b"/tmp/publish_only_probe.rs"),
+            valid.replace(b":34", b":99999999999"),
+            valid.replace(b"message=publication-refused", b"message=fixture-private-output"),
+            valid + b" proof=fixture-private-output",
+            valid.replace(b"category=assertion", b"category=pipe-io"),
+        ):
+            with self.subTest(invalid=invalid):
+                capture = RUN.Capture()
+                capture.feed(invalid + b"\n")
+                self.assertIsNone(capture.first)
+                capture.feed(valid + b"\n")
+                self.assertEqual(capture.first, valid.decode("ascii"))
 
     def test_timeout_preserves_first_failure_when_child_cannot_be_reaped(self):
         record = b"C13 first phase=join category=pipe-io\n"
