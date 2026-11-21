@@ -325,6 +325,46 @@ fn expect_anchor(
 // Header "ARXE", version 1, kind Anchor (2), length 1, refusal body 1.
 const REFUSAL_FRAME: [u8; 9] = [b'A', b'R', b'X', b'E', 1, 2, 0, 1, 1];
 
+/// A distinct local Redeem attempt for one connection: its own attempt ID and
+/// its own key and CSR. Only IDs and digests are compared; nothing is printed.
+struct LocalAttempt {
+    request: RequestId,
+    csr: Vec<u8>,
+    key: KeyDigest,
+}
+
+impl LocalAttempt {
+    fn fresh() -> Result<Self, String> {
+        let pair = rcgen::KeyPair::generate().map_err(|_| "attempt key")?;
+        let csr = rcgen::CertificateParams::default()
+            .serialize_request(&pair)
+            .map_err(|_| "attempt CSR")?
+            .der()
+            .to_vec();
+        let key = crate::cluster::pki::csr::ProvenCsr::parse(&csr)
+            .map_err(|_| "attempt CSR refused")?
+            .digest();
+        let mut request = [0; 16];
+        getrandom::fill(&mut request).map_err(|_| "attempt ID")?;
+        let attempt = Self { request, csr, key };
+        attempt.check()?;
+        Ok(attempt)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let parsed = crate::cluster::pki::csr::ProvenCsr::parse(&self.csr)
+            .map_err(|_| "attempt CSR refused")?;
+        if self.request == [0; 16] || parsed.digest() != self.key {
+            return Err("attempt is not a complete local intent".into());
+        }
+        Ok(())
+    }
+
+    fn distinct_from(&self, request: RequestId, key: KeyDigest) -> bool {
+        self.request != request && self.key != key
+    }
+}
+
 /// Test-scoped observation of one refused Query on the production wire. It
 /// uses the production client verifier configuration (fresh, so the handshake
 /// is full), the production Query frame and the unchanged socket budget. It
@@ -337,8 +377,15 @@ async fn refused_query(
     root: &[u8],
     time: Arc<dyn rustls::time_provider::TimeProvider>,
     issuer: (NodeId, KeyDigest),
+    attempt: Option<&LocalAttempt>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A bound attempt must be complete before the connection opens. It would
+    // follow only a positive Anchor; this witness fails on any positive Anchor
+    // before sending, so a refused Query never transmits it.
+    if let Some(attempt) = attempt {
+        attempt.check()?;
+    }
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + SOCKET_BUDGET;
     let config = crate::cluster::pki::preproof::test_config(code, root, time);
@@ -410,7 +457,12 @@ async fn refused_query(
     .await;
     match observed {
         Ok(Ok(())) => Ok(format!(
-            "uniform Anchor refusal received over a full TLS session with the retained issuer, clean close, no Redeem frame sent, +{} ms",
+            "uniform Anchor refusal received over a full TLS session with the retained issuer, clean close, no Redeem frame sent{}, +{} ms",
+            if attempt.is_some() {
+                "; distinct local attempt prepared and withheld"
+            } else {
+                ""
+            },
             started.elapsed().as_millis()
         )),
         Ok(Err(reason)) if reason != DEADLINE => Err(format!(
@@ -763,10 +815,25 @@ async fn drive(
         first_free.get()
     );
 
-    // A new connection on the consumed code is refused at its Query. The
-    // observation client never sends an attempt ID, key or proof.
+    // A new connection on the consumed code, with a distinct local attempt
+    // (new attempt ID, new key and CSR), is refused at its Query. The attempt
+    // and any proof stay local; no Redeem frame is sent.
     evidence.phase = "A consumed reconnect";
-    let reconnect = refused_query(endpoint, &code_a, &root, time.clone(), issuer).await?;
+    let distinct = LocalAttempt::fresh()?;
+    if !distinct.distinct_from(request, key) {
+        return Err(format!(
+            "{CASE} reconnect attempt ID or key repeats the original"
+        ));
+    }
+    let reconnect = refused_query(
+        endpoint,
+        &code_a,
+        &root,
+        time.clone(),
+        issuer,
+        Some(&distinct),
+    )
+    .await?;
     expect_counts(observed, 3, 2, "consumed reconnect")?;
     expect_anchor(
         observed,
@@ -837,7 +904,7 @@ async fn drive(
     );
 
     evidence.phase = "B expired Query";
-    let expired = refused_query(endpoint, &code_b, &root, time.clone(), issuer).await?;
+    let expired = refused_query(endpoint, &code_b, &root, time.clone(), issuer, None).await?;
     // The witness proves the uniform refusal frame arrived over a full TLS
     // session with the retained issuer and a clean close. Refused (not
     // Unavailable or Busy) is the checked policy; the independent readback
@@ -1005,10 +1072,12 @@ async fn stub_issuer(
             }
             Stub::EofBeforeFrame => tls.shutdown().await.is_ok(),
             Stub::AbortAfterFrame => {
-                // Drop the TCP stream after the frame without TLS close-notify.
-                let sent = tls.write_all(&REFUSAL_FRAME).await.is_ok() && tls.flush().await.is_ok();
-                assert!(sent);
-                return 0;
+                // Close only the raw TCP write half after the frame: a FIN with
+                // no TLS close-notify. Keep reading so the shared byte count
+                // below observes what the client sends afterwards.
+                tls.write_all(&REFUSAL_FRAME).await.is_ok()
+                    && tls.flush().await.is_ok()
+                    && tls.get_mut().0.shutdown().await.is_ok()
             }
             Stub::WrongFrame => {
                 tls.write_all(&[b'A', b'R', b'X', b'E', 1, 4, 0, 1, 1])
@@ -1046,9 +1115,24 @@ async fn refusal_witness_requires_the_uniform_frame_over_tls_and_a_clean_close()
         (Stub::WrongFrame, Some("not the uniform Anchor refusal")),
     ] {
         let (addr, server) = stub_issuer(&fixture, stub).await;
-        let result = refused_query(addr, &fixture.code, &fixture.root, probe_time(), issuer).await;
+        let attempt = LocalAttempt::fresh().unwrap();
+        let bound = matches!(stub, Stub::Refuse).then_some(&attempt);
+        let result = refused_query(
+            addr,
+            &fixture.code,
+            &fixture.root,
+            probe_time(),
+            issuer,
+            bound,
+        )
+        .await;
         match expected {
-            None => assert!(result.is_ok(), "{stub:?}: {result:?}"),
+            None => assert!(
+                result
+                    .as_ref()
+                    .is_ok_and(|witness| witness.contains("attempt prepared and withheld")),
+                "{stub:?}: {result:?}"
+            ),
             Some(reason) => assert!(
                 result.as_ref().is_err_and(|e| e.contains(reason)),
                 "{stub:?}: {result:?}"
@@ -1062,7 +1146,15 @@ async fn refusal_witness_requires_the_uniform_frame_over_tls_and_a_clean_close()
         issuer.0,
         KeyDigest::of_spki(&fixture.bad_key.subject_public_key_info()).unwrap(),
     );
-    let result = refused_query(addr, &fixture.code, &fixture.root, probe_time(), impostor).await;
+    let result = refused_query(
+        addr,
+        &fixture.code,
+        &fixture.root,
+        probe_time(),
+        impostor,
+        None,
+    )
+    .await;
     assert!(
         result
             .as_ref()
@@ -1091,6 +1183,7 @@ async fn refusal_witness_reports_a_silent_issuer_as_a_deadline() {
         &fixture.root,
         probe_time(),
         issuer,
+        None,
     )
     .await;
     assert!(
