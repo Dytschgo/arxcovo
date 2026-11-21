@@ -2215,14 +2215,17 @@ mod issuer_channel {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_rustls::server::TlsStream;
 
+    pub(super) type ReceiveFuture<'a, T> =
+        std::pin::Pin<Box<dyn Future<Output = Result<T, Refusal>> + Send + 'a>>;
+
     pub(super) trait Receiver: Send + Sync {
-        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> Result<Offer, Refusal>;
-        fn install(
-            &self,
+        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> ReceiveFuture<'_, Offer>;
+        fn install<'a>(
+            &'a self,
             claim: Claim,
             sender: AuthenticatedPeer,
-            channel: (&[u8; 32], &[u8], Vec<u8>),
-        ) -> Result<(), Refusal>;
+            channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+        ) -> ReceiveFuture<'a, ()>;
     }
 
     pub(in crate::cluster::consensus) trait Sender:
@@ -2238,17 +2241,17 @@ mod issuer_channel {
 
     #[cfg(target_os = "linux")]
     impl Receiver for &'static super::super::bound_start::Job {
-        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> Result<Offer, Refusal> {
-            self.check_issuer_transfer(claim, sender)
+        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> ReceiveFuture<'_, Offer> {
+            Box::pin(self.check_issuer_transfer(claim, sender))
         }
 
-        fn install(
-            &self,
+        fn install<'a>(
+            &'a self,
             claim: Claim,
             sender: AuthenticatedPeer,
-            channel: (&[u8; 32], &[u8], Vec<u8>),
-        ) -> Result<(), Refusal> {
-            self.install_voter_custody(claim, sender, channel)
+            channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+        ) -> ReceiveFuture<'a, ()> {
+            Box::pin(self.install_voter_custody(claim, sender, channel))
         }
     }
 
@@ -2297,7 +2300,7 @@ mod issuer_channel {
             .voter_receiver
             .clone()
             .ok_or(Refusal::NotReady)?;
-        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source).await?;
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(|_| Refusal::Tls)?;
         let transcript = claim.transcript(&challenge);
@@ -2309,10 +2312,12 @@ mod issuer_channel {
             .map_err(|_| Refusal::Tls)?;
         wire::challenge(&mut stream, &challenge).await?;
         let sealed = wire::read_sealed(&mut stream).await?;
-        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
-        receiver.install(claim, sender, (&key.0, &transcript, sealed))?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source).await?;
+        receiver
+            .install(claim, sender, (&key.0, &transcript, sealed))
+            .await?;
         drop(key);
-        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source)?;
+        check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source).await?;
         #[cfg(test)]
         if shared.hooks.drop_issuer_ack.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -2320,7 +2325,7 @@ mod issuer_channel {
         wire::acknowledge(&mut stream, &challenge).await
     }
 
-    fn check_receiver(
+    async fn check_receiver(
         shared: &Shared,
         deadline: Instant,
         receiver: &dyn Receiver,
@@ -2329,7 +2334,8 @@ mod issuer_channel {
         source: SocketAddr,
     ) -> Result<(), Refusal> {
         before_dispatch(shared, deadline)?;
-        let offer = receiver.check(claim, sender)?;
+        let offer = receiver.check(claim, sender).await?;
+        before_dispatch(shared, deadline)?;
         if source.ip() != offer.sender_address.ip() {
             return Err(Refusal::Address);
         }
@@ -2449,7 +2455,7 @@ mod issuer_channel {
             return Err(Refusal::Identity);
         }
         before_dispatch(shared, deadline)?;
-        let config = resources.client_config(claim.receiver.0)?;
+        let config = resources.outbound_tls_config(claim.receiver.0)?;
         let socket = TcpStream::connect(offer.receiver_address)
             .await
             .map_err(|_| Refusal::Tls)?;
@@ -2475,6 +2481,12 @@ mod issuer_channel {
         {
             return Err(Refusal::Identity);
         }
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
+        before_dispatch(shared, deadline)?;
         wire::hello(&mut stream, claim).await?;
         let challenge = wire::read_challenge(&mut stream).await?;
         let transcript = claim.transcript(&challenge);
@@ -2491,6 +2503,11 @@ mod issuer_channel {
         sent.store(true, Ordering::SeqCst);
         wire::sealed(&mut stream, &sealed).await?;
         wire::read_acknowledgement(&mut stream, &challenge).await?;
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)
     }
 }

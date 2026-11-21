@@ -39,6 +39,16 @@ acknowledgement gives the sender Unknown and leaves the admitted
 transfer slot spent. The receiver keeps its confirmed installation when
 the membership proof succeeded.
 
+The owned exchange uses the post-handshake applied authorization in
+ADR 0041. Before writing Hello and after receiving an acknowledgement,
+the sender checks its local strict registry. The receiver checks the
+strict learner gate and exact offer in the same applied-store observation
+before its challenge, installation and acknowledgement. Each store
+acquisition uses the existing 4 ms budget. The receiver serializes
+installation across the unguarded disk and wait phases. Poison, an
+unavailable store, a failed clock and an exhausted acquisition budget
+refuse the observation.
+
 The transfer validates the root, leaf-validity window and matching P-256
 key on borrowed DER, with an optimizer-resistant wipe for temporary
 plaintext and exporter buffers. Validation and readback create no

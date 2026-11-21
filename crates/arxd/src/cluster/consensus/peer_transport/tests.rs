@@ -5008,6 +5008,25 @@ mod issuer_refusals {
     }
 
     impl issuer_channel::Receiver for Receiver {
+        fn check(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+        ) -> issuer_channel::ReceiveFuture<'_, Offer> {
+            Box::pin(async move { self.check(claim, sender) })
+        }
+
+        fn install<'a>(
+            &'a self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+        ) -> issuer_channel::ReceiveFuture<'a, ()> {
+            Box::pin(async move { self.install(claim, sender, channel) })
+        }
+    }
+
+    impl Receiver {
         fn check(&self, claim: Claim, _: AuthenticatedPeer) -> Result<Offer, Refusal> {
             if self.offer.claim != claim {
                 return Err(Refusal::Identity);

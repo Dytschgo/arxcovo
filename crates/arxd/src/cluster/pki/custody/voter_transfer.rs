@@ -54,11 +54,6 @@ impl<T> Completion<T> {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn prove<P>(&mut self, prove: impl FnOnce() -> Result<P, Error>) -> Result<P, Error> {
-        prove().inspect_err(|_| *self = Self::Refused)
-    }
-
     pub(in crate::cluster) fn get(&self) -> Result<&T, Error> {
         match self {
             Self::Confirmed(value) => Ok(value),
@@ -219,6 +214,18 @@ pub(super) mod disk {
         envelope: File,
         context: Context,
         bytes: Vec<u8>,
+    }
+
+    pub(in crate::cluster) struct PreparedVoterCa(Context);
+
+    pub(in crate::cluster) struct SealedVoterCa {
+        context: Context,
+        bytes: Vec<u8>,
+    }
+
+    pub(in crate::cluster) struct WrittenVoterCa {
+        complete: Complete,
+        ciphertext: Vec<u8>,
     }
 
     fn ca_context(
@@ -391,15 +398,11 @@ pub(super) mod disk {
             )
         }
 
-        pub(in crate::cluster) fn receive_voter_ca<P>(
-            &mut self,
-            owner: &Owner,
+        pub(in crate::cluster) fn prepare_voter_ca(
+            &self,
             cluster: ClusterId,
             original: &[u8],
-            now: u64,
-            channel: (&[u8; 32], &[u8], Vec<u8>),
-            (mut prove, installed): (impl FnMut() -> Result<P, Error>, impl FnOnce()),
-        ) -> Result<(), Error> {
+        ) -> Result<PreparedVoterCa, Error> {
             self.voter.complete.available()?;
             self.member()?;
             let custody = &self.custody;
@@ -410,19 +413,40 @@ pub(super) mod disk {
                 original,
             )?;
             custody.common_context(cluster, context.root)?;
-            let (key, transcript, sealed) = channel;
             #[cfg(test)]
             self.voter.observe(ReceiveStage::BeforeUnwrap);
-            let bytes = {
-                let _proof = self.voter.complete.prove(&mut prove)?;
-                #[cfg(test)]
-                self.voter.observe(ReceiveStage::ChannelOpen);
-                let plaintext = open_channel(key, transcript, sealed)?;
-                validate(&plaintext, original, now)?;
-                self.voter.complete.spend()?;
-                seal_installation(&custody.key, context, plaintext)?
-            };
-            let root = create_root(custody, owner)?;
+            Ok(PreparedVoterCa(context))
+        }
+
+        pub(in crate::cluster) fn refuse_voter_ca(&mut self) {
+            if matches!(self.voter.complete, Completion::Fresh | Completion::Pending) {
+                self.voter.complete = Completion::Refused;
+            }
+        }
+
+        pub(in crate::cluster) fn seal_voter_ca(
+            &mut self,
+            PreparedVoterCa(context): PreparedVoterCa,
+            original: &[u8],
+            now: u64,
+            (key, transcript, sealed): (&[u8; 32], &[u8], Vec<u8>),
+        ) -> Result<SealedVoterCa, Error> {
+            self.voter.complete.available()?;
+            #[cfg(test)]
+            self.voter.observe(ReceiveStage::ChannelOpen);
+            let plaintext = open_channel(key, transcript, sealed)?;
+            validate(&plaintext, original, now)?;
+            self.voter.complete.spend()?;
+            let bytes = seal_installation(&self.custody.key, context, plaintext)?;
+            Ok(SealedVoterCa { context, bytes })
+        }
+
+        pub(in crate::cluster) fn write_voter_ca(
+            &self,
+            owner: &Owner,
+            SealedVoterCa { context, bytes }: SealedVoterCa,
+        ) -> Result<WrittenVoterCa, Error> {
+            let root = create_root(&self.custody, owner)?;
             let reservation = root.file(RESERVATION, true)?;
             reservation.sync_all().map_err(|_| Error::Unavailable)?;
             root.dir.sync_all().map_err(|_| Error::Unavailable)?;
@@ -451,10 +475,25 @@ pub(super) mod disk {
             let ciphertext = complete.read_ciphertext(context)?;
             #[cfg(test)]
             self.voter.observe(ReceiveStage::BeforeReadback);
-            let _proof = self.voter.complete.prove(prove)?;
+            Ok(WrittenVoterCa {
+                complete,
+                ciphertext,
+            })
+        }
+
+        pub(in crate::cluster) fn confirm_voter_ca(
+            &mut self,
+            WrittenVoterCa {
+                complete,
+                ciphertext,
+            }: WrittenVoterCa,
+            original: &[u8],
+            now: u64,
+            installed: impl FnOnce(),
+        ) -> Result<(), Error> {
             #[cfg(test)]
             self.voter.observe(ReceiveStage::ReadbackOpen);
-            let plaintext = open_installation(custody, context, &ciphertext)?;
+            let plaintext = open_installation(&self.custody, complete.context, &ciphertext)?;
             validate(&plaintext, original, now)?;
             self.voter.complete.confirm(complete, || Ok(()))?;
             installed();

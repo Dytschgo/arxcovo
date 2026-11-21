@@ -1246,11 +1246,12 @@ mod issuer_proof {
             Ok((IssuerProof(store), view))
         }
 
-        pub(in crate::cluster::consensus) fn offer_proof(
+        pub(in crate::cluster::consensus) fn offer_in(
             &self,
+            store: &StateStore,
             claim: Claim,
             peer: AuthenticatedPeer,
-        ) -> Result<(Offer, IssuerProof<'a>), MembershipReadError> {
+        ) -> Result<Offer, MembershipReadError> {
             let refused = MembershipReadError::PeerRefused;
             let peer = identity(peer)?;
             if (peer.0, peer.1, *peer.2.as_bytes())
@@ -1261,9 +1262,9 @@ mod issuer_proof {
             }
 
             let before = self.sample()?;
-            let (proof, view) = self.lock_view(&before, claim.sender.0.get())?;
+            let view = locked(store, &before, claim.sender.0.get())?;
             let observed = offer(
-                &proof.0,
+                store,
                 &view,
                 claim.cluster,
                 claim.root,
@@ -1276,7 +1277,7 @@ mod issuer_proof {
             if self.sample()? != before {
                 return Err(MembershipReadError::RetryLater);
             }
-            Ok((observed, proof))
+            Ok(observed)
         }
 
         pub(in crate::cluster::consensus) fn voter_proof(
