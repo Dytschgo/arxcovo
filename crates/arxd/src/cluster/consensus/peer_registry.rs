@@ -13,8 +13,18 @@ use tokio::time::{Instant, sleep_until};
 
 // Each transport check can wait 4 ms. The caller's 75 ms absolute
 // AppendEntries deadline still applies across the entire exchange.
-const STORE_WAIT: Duration = Duration::from_millis(4);
+pub(super) const STORE_WAIT: Duration = Duration::from_millis(4);
 const STORE_POLL: Duration = Duration::from_micros(250);
+
+#[cfg(target_os = "linux")]
+pub(super) async fn poll_store_until(deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    sleep_until((now + STORE_POLL).min(deadline)).await;
+    Instant::now() < deadline
+}
 
 type AppliedStore = Weak<Mutex<super::StateStore>>;
 
