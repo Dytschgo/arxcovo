@@ -540,6 +540,17 @@ def child(root):
     os.execve(root / "toolchain/bin/cargo", ["cargo", *COMMAND], os.environ)
 
 
+def stage_child(root, sources):
+    for source, relative, mode in (
+        (sources, "probe.py", 0o644),
+        (sources.with_name("executor-probe.py"), "a10.py", 0o644),
+        (sources, "tools/cargo", 0o755),
+    ):
+        destination = root / relative
+        shutil.copyfile(source, destination)
+        destination.chmod(mode)
+
+
 def stage_workspace(root, a10):
     directory(root / "broker", mode=0o700)
     directory(root / "control", gid=DAEMON, mode=0o710)
@@ -568,8 +579,6 @@ def stage_workspace(root, a10):
         (slot / "src/main.rs").write_text('fn main() {}\n', encoding="ascii")
     (root / "workspace/link").symlink_to("ordinary")
     directory(root / "workspace/writable", mode=0o775)
-    shutil.copyfile(root / "probe.py", root / "tools/cargo")
-    (root / "tools/cargo").chmod(0o755)
     directory(root / "home", BUILD, BUILD, 0o700)
     record(root / "broker/settings.json", {
         "daemon_uid":DAEMON, "daemon_gid":DAEMON, "daemon_roots":[str(root / "b" / x) for x in worker_roots],
@@ -628,8 +637,8 @@ def privileged(stage, sources, a10, c13, receipt, end):
         for name in ("arxd", "campaign"):
             c13["stage_binary"](stage / name, root / name, deadline)
             (root / name).chmod(0o755)
-        shutil.copyfile(sources, root / "probe.py")
         stage_workspace(root, a10)
+        stage_child(root, sources)
         stage_toolchain(stage / "toolchains/fixture-x86_64-unknown-linux-gnu", root / "toolchain")
         ip = c13["primary_ip"](deadline)
         removable = False
@@ -666,6 +675,31 @@ def self_test(workspace):
     import unittest
 
     class ProbeTest(unittest.TestCase):
+        def test_staged_child_loads_helper_and_validates_command_before_build(self):
+            # Intercept the first UID check, which follows the helper import and
+            # command validation. The child cannot reach procfs, cgroups or Cargo.
+            enter = (
+                "import os, runpy, sys; from unittest.mock import patch\n"
+                "sys.argv = sys.argv[1:]\n"
+                "with patch.object(os, 'getuid', side_effect=SystemExit(23), create=True):\n"
+                "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "var/lib/arx-c14-fixture"
+                (root / "tools").mkdir(parents=True)
+                slots = [root / "workspace" / name for name in SLOTS]
+                for slot in slots:
+                    slot.mkdir(parents=True)
+                stage_child(root, Path(__file__).resolve())
+                wrapper = [sys.executable, "-I", "-B", "-c", enter, root / "tools/cargo"]
+                for slot in slots:
+                    accepted = subprocess.run(wrapper + COMMAND, cwd=slot, timeout=5,
+                                              capture_output=True)
+                    self.assertEqual(accepted.returncode, 23, accepted.stderr)
+                refused = subprocess.run(wrapper + ["build"], cwd=slots[0], timeout=5,
+                                         capture_output=True)
+                self.assertEqual(refused.returncode, 1)
+
         def test_frozen_tag_kinds_and_admission_sequence(self):
             tags = frozen_kinds(workspace)
             self.assertEqual(tags, {"Blank": 0, "Mint": 1, "Membership": 3,
