@@ -568,19 +568,21 @@ mod hosted {
         (first, observed)
     }
 
-    fn observe_or_request_close(job: &Job, request: impl FnOnce() -> Observer) -> Observer {
-        let already_owned = {
-            let state = job.state();
-            state.close_requested
-                || state.close_dispatched
-                // The hosted founder publishes the refusal just before requesting close.
-                || (state.status == Status::FounderRefused && !state.process_owned)
-        };
-        if already_owned {
-            job.observe()
-        } else {
-            request()
+    fn observe_or_request_close(job: &Job, before_request: impl FnOnce()) -> Observer {
+        let mut state = job.state();
+        let already_owned = state.close_requested
+            || state.close_notified
+            || state.close_dispatched
+            // The hosted founder publishes the refusal just before requesting close.
+            || (state.status == Status::FounderRefused && !state.process_owned);
+        if !already_owned {
+            before_request();
+            // Claim and signal the same slot as Job::request_close under its state mutex.
+            Job::stop_admission(&mut state);
+            state.close_notified = true;
+            job.close.notify_one();
         }
+        job.observe()
     }
 
     async fn observe_close(
@@ -658,6 +660,65 @@ mod hosted {
         assert_eq!(
             first.unwrap_err(),
             "waiting for FounderReady, stopped at FounderRefused: Some(Preparation)"
+        );
+        assert_eq!(
+            close,
+            CloseObservation::Joined(Status::ClosedAfterFounderRefusal)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_timeout_serializes_the_fixture_request_with_founder_refusal() {
+        let job = Job::anchor();
+        let first = observe_retained_status(&mut job.observe(), Status::FounderReady, job).await;
+        let founder_entered_gap = std::cell::Cell::new(false);
+        let fixture_requests = std::cell::Cell::new(0);
+        let close_observations = std::cell::Cell::new(0);
+        let (first, close) = finish_attempt(
+            first,
+            &mut None,
+            || {},
+            || {
+                observe_or_request_close(job, || {
+                    // Attempt the founder's first lock exactly in the old gap.
+                    // If it can enter, execute the frozen publication and request there.
+                    let access = job.state.try_lock();
+                    let founder_can_enter = access.is_ok();
+                    drop(access);
+                    if founder_can_enter {
+                        founder::linux::refuse(job, founder::Error::Preparation);
+                        founder_entered_gap.set(true);
+                    }
+                    fixture_requests.set(fixture_requests.get() + 1);
+                })
+            },
+            async |observer| {
+                close_observations.set(close_observations.get() + 1);
+                let gap_opened = founder_entered_gap.get();
+                let supervisor = tokio::spawn(async move {
+                    assert!(job.close.notified().now_or_never().is_some());
+                    if !gap_opened {
+                        // Release the founder after consuming the first permit so that
+                        // an extra notification would be visible rather than coalesced.
+                        founder::linux::refuse(job, founder::Error::Preparation);
+                    }
+                    assert!(job.close.notified().now_or_never().is_none());
+                    assert!(job.begin_close());
+                    job.finish_close(None, true, false);
+                });
+                observe_close(supervisor, observer).await
+            },
+        )
+        .await;
+        assert!(
+            !founder_entered_gap.get(),
+            "founder entered during the fixture claim"
+        );
+        assert_eq!(fixture_requests.get(), 1);
+        assert_eq!(close_observations.get(), 1);
+        assert_eq!(
+            first.unwrap_err(),
+            "retained FounderReady observation elapsed"
         );
         assert_eq!(
             close,
@@ -762,7 +823,7 @@ mod hosted {
             latch_attempt("P1", first),
             &mut close,
             || observation.release.notify_one(),
-            || observe_or_request_close(job, || job.request_close()),
+            || observe_or_request_close(job, || {}),
             async |observer| observe_close(supervisor, observer).await,
         )
         .await;
@@ -872,8 +933,7 @@ mod hosted {
         assert_eq!(observation.anchor_calls.load(Relaxed), 1);
         assert_eq!(observation.redeem_calls.load(Relaxed), 1);
 
-        let observer =
-            close.get_or_insert_with(|| observe_or_request_close(job, || job.request_close()));
+        let observer = close.get_or_insert_with(|| observe_or_request_close(job, || {}));
         observe_retained_status(observer, Status::Closing, job).await?;
         assert!(job.start_enrollment(None).is_err());
         assert!(

@@ -471,7 +471,7 @@ async fn retained_issuer_lost_reply_leaves_original_destination_spent() {
         first,
         &mut None,
         || observed.release.notify_one(),
-        || observe_or_request_close(job, || job.request_close()),
+        || observe_or_request_close(job, || {}),
         async |observer| observe_close(supervisor, observer).await,
     )
     .await;
