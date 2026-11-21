@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-20 23:48 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-21 01:02 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,8 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
+- **Main:** `12c21292` (PR218), push CI 44846740760 green. `80a71cf6` (PR217) push CI
+  44840557829 green. `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
   44836270187 green. `4f139cd8` (PR214), push CI 44834437714 green. `5393900d` (PR213) push CI
   44829635662 green. `e342fbf3` (PR212), push CI 44824316285 green. `29e718c6` (PR211) push CI
   44822884767 green. `60ffb68a` (PR210), push CI 44815045807 green. `620a5254` (PR209) push CI
@@ -65,7 +66,8 @@ merged, as listed under "Merged this session".
   and owner-boundary refusals), PR211 `29e718c6` (docs), PR212 `e342fbf3` (step 8b,
   retained durable join before replication), PR213 `5393900d` (docs), PR214 `4f139cd8`
   (step 9, receipt-scoped learner catch-up), PR215 `2d97a26e` (docs), PR216 `2e1375ed`
-  (step 10, authenticated learner self-admission). Every merge had an independent exact-head Sol
+  (step 10, authenticated learner self-admission), PR217 `80a71cf6` (docs), PR218
+  `12c21292` (step 11, initial three-voter promotion). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -519,7 +521,55 @@ merged, as listed under "Merged this session".
   guarded flatten. Keep Engine, workers, Owners, stores and deadlines frozen. Stop and
   preserve the first unexpected frozen-path refusal, with no repair, diagnostic rerun,
   Windows run or budget reset." This revises the base plan's step 11 grant with
-  amendment R3. Sol 6.2/high builder, fresh 3-attempt budget, in progress.
+  amendment R3. The Sol 6.2/high builder first stopped at the source fence (0/3): C11
+  needed to hold the second learner's replication, the existing `BeforeDispatch` gate was
+  private to the transport tests, and the append-completion hook would park the Raft core
+  in the frozen log worker. **Coordinator amendment A4 (2026-11-21):**
+  `cfg(all(test, linux))`-only accessors that arm and release the existing gate, plus a
+  test-only learner forwarding seam; no production change. PR #218 (12 files, ADR 0043
+  exact initial voter promotion) used 1/3 counted failures (an unlinked diagnostics crate
+  on the first Windows compile). The coordinator merged main into the branch (`c637be67`,
+  byte-identical patch); hosted C11
+  `promotion_campaign::retained_joiners_promote_and_reconcile` passed (0.774 s). Review 1
+  HOLD (`D:/Temp/arx-pr218-review/review.md`, SHA256 `290ba8cb…db89`): Spec P2, the promotion worker
+  could contend with its own registration's node mutex and defer without observing after
+  the wake was consumed; Standards P3, C11 stopped observing the gated RPC after release.
+  Builder fix `a32f96d2` (regression
+  `release_wake_observes_joint_once_after_registration_drops_the_node_borrow` failed
+  before the fix); C11 passed (0.762 s). Review 2 (`D:/Temp/arx-pr218-review2/review.md`,
+  SHA256 `61506c7f…de4e`) confirmed the P2 closed and, asked to classify its remaining P3 under the
+  stated standard, judged it blocking: C11's gate window began after the caller's 75 ms
+  deadline started, so a later retry could hide a first refusal. Builder fix `5b192425`
+  requires the same gated AppendEntries call's caller-side success through the unchanged
+  deadline (0 further counted failures; report `D:/Temp/arx-m3-step11/report.md` SHA256
+  `e5c1a4ee…a934`). Review 3 (`D:/Temp/arx-pr218-review3/review.md`, SHA256 `470fe609…2cc4`) found Spec PASS
+  but held on scope: the new caller and dispatch observers exceeded A4's wording.
+  **Coordinator amendment A4b (2026-11-21, in the PR body):** authorizes those
+  `cfg(all(test, linux))`-only observation hooks and the test-only AppendEntries branch,
+  with no production, gate-semantics or deadline change, for C11 only. Hosted run
+  44845354735 green; C11 passed (0.562 s), 935 tests, no unexpected frozen-path refusal.
+  Review 4 PASS with zero findings (`D:/Temp/arx-pr218-review4/review.md`, SHA256 `3d9067ec…4e58`),
+  agent-review status 59527895211. **PR #218 merged** as `12c21292`. Builder counted
+  failures 1/3. Engine Sol 3/3 and Opus 0/2 unchanged.
+- **D11 (owner, 2026-11-21):** approve the plan's closed, versioned peer TLS 1.3 CA
+  transfer (Hello → Challenge → Sealed → Acknowledgement; per-transfer AEAD key from the
+  actual TLS exporter and a fresh receiver challenge; bound to direction, cluster/root,
+  sender and recipient node/SPKI, challenge and exact promotion membership; 16 KiB
+  ceiling) into a separate voter-only ADR 0037 custody location, with signing gated on
+  confirmed local durable completion and an authorized local load. Step 12 proves
+  same-process use only; cross-process restart activation of a transferred CA is settled
+  at step 13 with reviewed independent completion history. A promoted recipient becomes
+  trusted to sign, with no key rollback after compromise.
+- **Step 12 (owner grant, 2026-11-21):** "Authorize the step 12 source fence for
+  membership-qualified sealed CA transfer and a promoted issuer's unchanged fresh-read,
+  AnchorQuery and Redeem callers, and one C12 hosted-Linux case with three retained Engine
+  starts and owned closes, one unchanged Found, three fixture Mints, three actual
+  AnchorQuery/Redeem exchanges, two AddNodes calls, one joint append, one flatten and one
+  custody transfer to each promoted voter, including issuance after orderly founder close
+  and no Engine on the last join destination. Keep Engine, workers, Owners, stores,
+  founder and issuance internals and deadlines frozen. Stop and preserve the first
+  unexpected frozen-path refusal, with no repair, diagnostic rerun, Windows run or budget
+  reset." Sol 6.2/high builder, fresh 3-attempt budget, in progress.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
