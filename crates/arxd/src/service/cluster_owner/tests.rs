@@ -11,22 +11,35 @@ use tokio::sync::Notify;
 
 #[tokio::test]
 async fn owner_protocol_refuses_oversize_extra_and_non_owner_operations_before_dispatch() {
-    for request in [
-        b"ARXO\x01\x22\x61".as_slice(), // 8801 bytes
-        b"ARXO\x01\x00\x00x",
-        b"ARXO\x02\x00\x02x",
-        b"ARXO\x03\x00\x00",
-        b"ARXO\x01\x00\x00ARXO\x01\x00\x00",
-        b"\x16\x03\x01\x00\x03TLS", // No mTLS credential parsing on this endpoint.
+    for (case, request) in [
+        ("oversized Mint", b"ARXO\x01\x22\x61".as_slice()), // 8801 bytes
+        ("trailing Mint byte", b"ARXO\x01\x00\x00x"),
+        ("truncated Join", b"ARXO\x02\x00\x02x"),
+        ("Remove opcode", b"ARXO\x03\x00\x00"),
+        ("concatenated frames", b"ARXO\x01\x00\x00ARXO\x01\x00\x00"),
+        ("TLS prefix", b"\x16\x03\x01\x00\x03TLS"),
     ] {
         let (server, mut client) = UnixStream::pair().unwrap();
         client.write_all(request).await.unwrap();
         client.shutdown().await.unwrap();
-        connection(server, 1, Shutdown::default(), |_, _| async {
-            panic!("malformed owner request dispatched")
+        let mut dispatches = 0;
+        connection(server, 1, Shutdown::default(), |_, _| {
+            dispatches += 1;
+            async { Reply::Unknown }
         })
         .await;
-        assert!(matches!(receive(&mut client).await.unwrap(), (13, _)));
+
+        assert_eq!(dispatches, 0, "{case} reached dispatch");
+        // Closing an AF_UNIX stream with unread input may reset the reply.
+        match receive(&mut client).await {
+            Ok((13, body)) if body.bytes().is_empty() => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                ) => {}
+            _ => panic!("{case} produced an unexpected terminal disposition"),
+        }
     }
 }
 

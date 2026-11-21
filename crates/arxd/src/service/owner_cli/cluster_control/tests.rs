@@ -106,7 +106,7 @@ fn child_case(case: &str) {
     runtime.block_on(async {
         if case == "no-tty" {
             let result = control(Action::Mint, Path::new("/run/arx/control"), 20001).await;
-            assert_eq!(result, Err(Failure::Refused));
+            assert_eq!(result, Err(ControlError::Refused));
             return;
         }
         let mut signals = Signals::new().unwrap();
@@ -115,15 +115,14 @@ fn child_case(case: &str) {
             tty.display(&valid_paste()).await.unwrap();
             return;
         }
-        let outcome = tokio::select! {
-            biased;
-            _ = signals.interrupted() => None,
-            result = timeout(Duration::from_secs(4), tty.read_paste()) => Some(result.unwrap()),
-        };
+        let outcome = tty
+            .acquire_paste(&mut signals, Duration::from_secs(4))
+            .await;
         match case {
-            "valid" => assert!(outcome.unwrap().unwrap().bytes() == valid_paste().bytes()),
-            "signal" => assert!(outcome.is_none()),
-            "overflow" | "extra" | "truncated" => assert!(outcome.unwrap().is_err()),
+            "valid" => assert!(outcome.unwrap().bytes() == valid_paste().bytes()),
+            "signal" | "overflow" | "extra" | "truncated" => {
+                assert!(matches!(outcome, Err(ControlError::Refused)));
+            }
             _ => panic!("unknown fixture"),
         }
     });
@@ -242,6 +241,16 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
                 }
             }
             "backpressure" => send_input(&master, b"invalid\n", deadline, &mut child),
+            "late-suffix" => {
+                // A control byte refuses the frame. Send the remaining bytes
+                // only after the production discard boundary has started.
+                send_input(&master, b"\x00", deadline, &mut child);
+                await_suffix_drain(&mut child, deadline);
+                assert!(noecho(&slave), "suffix arrived outside the protected mode");
+                let suffix = &paste.bytes()[paste.bytes().len() - 64..];
+                send_input(&master, suffix, deadline, &mut child);
+                send_input(&master, b"\n", deadline, &mut child);
+            }
             "signal" => {
                 // SAFETY: the still-owned child PID names the exact fixture.
                 assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
@@ -289,6 +298,30 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
     } else {
         assert!(observed.bytes().is_empty(), "terminal leaked bytes");
     }
+    if case == "late-suffix" {
+        let suffix = &paste.bytes()[paste.bytes().len() - 64..];
+        assert!(
+            !output
+                .stdout
+                .windows(suffix.len())
+                .any(|bytes| bytes == suffix)
+        );
+        assert!(
+            !output
+                .stderr
+                .windows(suffix.len())
+                .any(|bytes| bytes == suffix)
+        );
+        nonblocking(&slave);
+        let mut next_reader = &slave;
+        let mut private = InputChunk([0; 1024]);
+        assert!(
+            next_reader
+                .read(&mut private.0)
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock),
+            "paste suffix remained queued after restoration"
+        );
+    }
     let restored = mode(&slave);
     assert_eq!(restored.c_iflag, original.c_iflag);
     assert_eq!(restored.c_oflag, original.c_oflag);
@@ -297,13 +330,74 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
     assert_eq!(restored.c_cc, original.c_cc);
 }
 
+pub(super) fn observe_suffix_drain() {
+    if std::env::var(CHILD).as_deref() == Ok("late-suffix") {
+        std::io::stderr().write_all(b"D").unwrap();
+    }
+}
+
+fn await_suffix_drain(child: &mut std::process::Child, deadline: Instant) {
+    let witness = child.stderr.as_mut().unwrap();
+    nonblocking(witness);
+    let mut marker = [0];
+    loop {
+        match witness.read(&mut marker) {
+            Ok(1) if marker == *b"D" => return,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    expire(child);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            _ => expire(child),
+        }
+    }
+}
+
+#[test]
+fn owner_terminal_mode_verification_rejects_partial_kernel_update() {
+    // SAFETY: the Linux termios fields are integer flags and byte arrays.
+    let mut intended: libc::termios = unsafe { std::mem::zeroed() };
+    intended.c_iflag = libc::ICRNL;
+    intended.c_cc[libc::VMIN] = 1;
+    verify_mode(&intended, &intended).unwrap();
+
+    let changes: [fn(&mut libc::termios); 12] = [
+        |m| m.c_lflag |= libc::ECHO,
+        |m| m.c_lflag |= libc::ECHONL,
+        |m| m.c_lflag |= libc::ICANON,
+        |m| m.c_lflag |= libc::ISIG,
+        |m| m.c_lflag |= libc::IEXTEN,
+        |m| m.c_iflag ^= libc::ICRNL,
+        |m| m.c_iflag |= libc::ISTRIP,
+        |m| m.c_oflag |= libc::OPOST,
+        |m| m.c_cflag |= libc::PARENB,
+        |m| m.c_line = 1,
+        |m| m.c_cc[libc::VMIN] = 0,
+        |m| m.c_cc[libc::VTIME] = 1,
+    ];
+    for change in changes {
+        let mut effective = intended;
+        change(&mut effective);
+        // The same check rejects a denied raw transition or partial restore.
+        assert_eq!(
+            verify_mode(&effective, &intended).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            verify_mode(&intended, &effective).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}
+
 fn expire(child: &mut std::process::Child) -> ! {
     let _ = child.kill();
     let _ = child.wait();
     panic!("private terminal fixture deadline");
 }
 
-fn nonblocking(file: &File) {
+fn nonblocking(file: &impl AsRawFd) {
     // SAFETY: the owned terminal descriptor accepts these flag operations.
     assert_eq!(
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
@@ -544,6 +638,7 @@ async fn production_pty() {
         "truncated",
         "signal",
         "backpressure",
+        "late-suffix",
         "no-tty",
     ] {
         run_pty(case, Some((&path, DAEMON)));

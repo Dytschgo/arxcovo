@@ -11,10 +11,11 @@ use std::{
 use tokio::{
     io::unix::AsyncFd,
     signal::unix::{Signal, SignalKind, signal},
-    time::timeout,
+    time::{Instant, sleep_until, timeout, timeout_at},
 };
 
 const INPUT_WAIT: Duration = Duration::from_secs(60);
+const DISCARD_WINDOW: Duration = Duration::from_millis(200);
 const DISPLAY_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
@@ -52,6 +53,22 @@ fn parse(args: &[OsString]) -> Option<(Action, PathBuf, u32)> {
     (uid != 0 && uid != u32::MAX).then(|| (action, path.into(), uid))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ControlError {
+    Refused,
+    Unknown,
+    TerminalRestore,
+}
+
+impl From<Failure> for ControlError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Refused => Self::Refused,
+            Failure::Unknown => Self::Unknown,
+        }
+    }
+}
+
 pub(super) fn run(args: &[OsString]) -> i32 {
     let Some((action, path, daemon)) = parse(args) else {
         eprintln!(
@@ -62,51 +79,49 @@ pub(super) fn run(args: &[OsString]) -> i32 {
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| Failure::Refused)
+        .map_err(|_| ControlError::Refused)
         .and_then(|runtime| runtime.block_on(control(action, &path, daemon)));
     match result {
         Ok(()) => 0,
-        Err(Failure::Refused) => {
+        Err(ControlError::Refused) => {
             eprintln!("arxd: cluster-control-refused");
             6
         }
-        Err(Failure::Unknown) => {
+        Err(ControlError::TerminalRestore) => {
+            eprintln!("arxd: cluster-control-terminal-restore-failed");
+            6
+        }
+        Err(ControlError::Unknown) => {
             eprintln!("arxd: cluster-control-unknown");
             8
         }
     }
 }
 
-async fn control(action: Action, path: &Path, daemon: u32) -> Result<(), Failure> {
-    let mut signals = Signals::new().map_err(|_| Failure::Refused)?;
-    let tty = Terminal::open().map_err(|_| Failure::Refused)?;
+async fn control(action: Action, path: &Path, daemon: u32) -> Result<(), ControlError> {
+    let mut signals = Signals::new().map_err(|_| ControlError::Refused)?;
+    let tty = Terminal::open().map_err(|_| ControlError::Refused)?;
+    let request = match action {
+        Action::Mint => Request::Mint,
+        Action::Join => Request::Join(tty.acquire_paste(&mut signals, INPUT_WAIT).await?),
+    };
     let mut submitted = false;
-    let disposition = tokio::select! {
+    tokio::select! {
         biased;
         _ = signals.interrupted() => {
-            Err(if submitted { Failure::Unknown } else { Failure::Refused })
+            Err(if submitted { ControlError::Unknown } else { ControlError::Refused })
         }
-        result = execute(&tty, action, path, daemon, &mut submitted) => result,
-    };
-    disposition
+        result = execute(&tty, request, path, daemon, &mut submitted) => result.map_err(Into::into),
+    }
 }
 
 async fn execute(
     tty: &Terminal,
-    action: Action,
+    request: Request,
     path: &Path,
     daemon: u32,
     submitted: &mut bool,
 ) -> Result<(), Failure> {
-    let request = match action {
-        Action::Mint => Request::Mint,
-        Action::Join => Request::Join(
-            timeout(INPUT_WAIT, tty.read_paste())
-                .await
-                .map_err(|_| Failure::Refused)?
-                .map_err(|_| Failure::Refused)?,
-        ),
-    };
     let stream = cluster_owner::connect(path, daemon).await?;
     tty.foreground().map_err(|_| Failure::Refused)?;
     *submitted = true;
@@ -181,8 +196,52 @@ impl Terminal {
         }
     }
 
+    async fn acquire_paste(
+        &self,
+        signals: &mut Signals,
+        input_wait: Duration,
+    ) -> Result<Paste, ControlError> {
+        // Own the mode outside the cancellable reader. Refusal, timeout and
+        // signals all finish the protected input boundary before returning.
+        let mode = NoEcho::enter(self)?;
+        let paste = tokio::select! {
+            biased;
+            _ = signals.interrupted() => Err(ControlError::Refused),
+            result = timeout(input_wait, self.read_paste()) => {
+                result.map_err(|_| ControlError::Refused)
+                    .and_then(|value| value.map_err(|_| ControlError::Refused))
+            }
+        };
+        if paste.is_err() {
+            self.discard_suffix().await;
+        }
+        mode.restore()?;
+        paste
+    }
+
+    async fn discard_suffix(&self) {
+        let fd = self.0.as_raw_fd();
+        let _ = without_sigttou(|| flush_input(fd));
+        let until = Instant::now() + DISCARD_WINDOW;
+        #[cfg(test)]
+        tests::observe_suffix_drain();
+        let mut chunk = InputChunk([0; 1024]);
+        while Instant::now() < until {
+            let Ok(Ok(mut ready)) = timeout_at(until, self.0.readable()).await else {
+                break;
+            };
+            if let Ok(read) = ready.try_io(|file| file.get_ref().read(&mut chunk.0))
+                && !matches!(read, Ok(1..))
+            {
+                break;
+            }
+        }
+        // Keep the mode protected even if the descriptor reported a read
+        // error before the window ended. The guard attempts the final flush.
+        sleep_until(until).await;
+    }
+
     async fn read_paste(&self) -> io::Result<Paste> {
-        let mut mode = NoEcho::enter(self)?;
         let mut paste = Paste::empty();
         let mut chunk = InputChunk([0; 1024]);
         loop {
@@ -208,7 +267,6 @@ impl Terminal {
                 if !trailing.is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
-                mode.restore()?;
                 return Ok(paste);
             }
             if !paste.extend(bytes) || !bytes.iter().all(u8::is_ascii_graphic) {
@@ -250,48 +308,92 @@ struct NoEcho {
 }
 
 impl NoEcho {
-    fn enter(tty: &Terminal) -> io::Result<Self> {
-        tty.foreground()?;
+    fn enter(tty: &Terminal) -> Result<Self, ControlError> {
+        tty.foreground().map_err(|_| ControlError::Refused)?;
         let fd = tty.0.as_raw_fd();
-        let mut original = std::mem::MaybeUninit::uninit();
-        // SAFETY: tcgetattr initializes the supplied termios on success.
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the successful tcgetattr initialized original.
-        let original: libc::termios = unsafe { original.assume_init() };
+        let original = terminal_mode(fd).map_err(|_| ControlError::Refused)?;
         let mut input = original;
         // SAFETY: input is valid initialized storage.
         unsafe { libc::cfmakeraw(&mut input) };
         input.c_iflag |= libc::ICRNL;
         input.c_cc[libc::VMIN] = 1;
         input.c_cc[libc::VTIME] = 0;
-        // Create the guard first, including if the kernel partially changes settings.
+
         let guard = Self {
             fd,
             original,
             active: true,
         };
-        set_mode(fd, &input, false)?;
+        if set_mode(fd, &input, false).is_err() {
+            guard.restore()?;
+            return Err(ControlError::Refused);
+        }
         Ok(guard)
     }
 
-    fn restore(&mut self) -> io::Result<()> {
-        set_mode(self.fd, &self.original, true)?;
+    fn restore(mut self) -> Result<(), ControlError> {
         self.active = false;
-        Ok(())
+        set_mode(self.fd, &self.original, true).map_err(|_| ControlError::TerminalRestore)
     }
 }
 
 impl Drop for NoEcho {
     fn drop(&mut self) {
-        if self.active {
-            let _ = self.restore();
+        if self.active && set_mode(self.fd, &self.original, true).is_err() {
+            eprintln!("arxd: cluster-control-terminal-restore-failed");
         }
     }
 }
 
+fn terminal_mode(fd: libc::c_int) -> io::Result<libc::termios> {
+    let mut mode = std::mem::MaybeUninit::uninit();
+    // SAFETY: tcgetattr initializes the supplied termios on success.
+    tty_result(unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) })?;
+    // SAFETY: the successful tcgetattr initialized mode.
+    Ok(unsafe { mode.assume_init() })
+}
+
+fn verify_mode(actual: &libc::termios, expected: &libc::termios) -> io::Result<()> {
+    let matches = actual.c_iflag == expected.c_iflag
+        && actual.c_oflag == expected.c_oflag
+        && actual.c_cflag == expected.c_cflag
+        && actual.c_lflag == expected.c_lflag
+        && actual.c_line == expected.c_line
+        && actual.c_cc == expected.c_cc;
+    // SAFETY: both termios arguments are initialized and remain borrowed.
+    let speeds_match = unsafe {
+        libc::cfgetispeed(actual) == libc::cfgetispeed(expected)
+            && libc::cfgetospeed(actual) == libc::cfgetospeed(expected)
+    };
+    if matches && speeds_match {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+fn flush_input(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fd is borrowed from the still-live terminal. Only input is discarded.
+    tty_result(unsafe { libc::tcflush(fd, libc::TCIFLUSH) })
+}
+
 fn set_mode(fd: libc::c_int, mode: &libc::termios, restoring: bool) -> io::Result<()> {
+    without_sigttou(|| {
+        let discarded = flush_input(fd);
+        if !restoring && discarded.is_err() {
+            return discarded;
+        }
+
+        // Attempt restoration even when discard fails. Read back even after an
+        // unsuccessful change, since a driver can apply only part of a request.
+        // SAFETY: fd belongs to the still-live terminal and mode is initialized.
+        let changed = tty_result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) });
+        let verified = terminal_mode(fd).and_then(|actual| verify_mode(&actual, mode));
+        changed.and(verified).and(discarded)
+    })
+}
+
+fn without_sigttou(operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     // Block SIGTTOU on this thread so restoration works even after a job-control
     // foreground change. Neither ioctl waits for the output queue to drain.
     let mut mask = std::mem::MaybeUninit::uninit();
@@ -306,22 +408,7 @@ fn set_mode(fd: libc::c_int, mode: &libc::termios, restoring: bool) -> io::Resul
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    let change = || {
-        // SAFETY: fd belongs to the still-live terminal and mode is initialized.
-        tty_result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) })
-    };
-    let discard = || {
-        // SAFETY: fd belongs to the still-live terminal. Only input is discarded.
-        tty_result(unsafe { libc::tcflush(fd, libc::TCIFLUSH) })
-    };
-    let result = if restoring {
-        // Attempt restoration even if discarding unread input reports an error.
-        let discarded = discard();
-        let restored = change();
-        restored.and(discarded)
-    } else {
-        discard().and_then(|()| change())
-    };
+    let result = operation();
     // SAFETY: successful SIG_BLOCK wrote the previous mask.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut()) };
     result

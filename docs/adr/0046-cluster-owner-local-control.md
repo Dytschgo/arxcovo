@@ -45,7 +45,12 @@ controlling terminal independently of redirected program streams. Mint writes
 only to that terminal. Join reads one canonical envelope terminated by Enter
 with echo and canonical mode disabled. The terminal guard restores settings on
 success, errors, timeout and handled signals. Input discard uses TCIFLUSH
-and mode changes use TCSANOW so neither waits on terminal output. The owner protocol and terminal
+and mode changes use TCSANOW so neither waits on terminal output. The CLI
+reads back effective termios before accepting input and after restoration.
+A refused, timed-out or interrupted paste gets an initial input flush
+and a 200 ms discard window with echo disabled, then a final input flush
+and verified restoration. Bytes sent after the bounded window are new
+terminal input. A restore failure emits a fixed terminal-specific error. The owner protocol and terminal
 buffers use bounded allocation and volatile wiping on drop. ADR0040's durable
 Join consumer owns the checksum, CA pin and local route checks. Temporary
 values internal to the frozen codec retain their existing memory behavior.
