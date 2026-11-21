@@ -309,6 +309,11 @@ impl UnixBridge {
     }
 }
 impl Executor for UnixBridge {
+    #[cfg(target_os = "linux")]
+    fn confirm_cleanup(&self) -> bool {
+        (self.check)().is_ok() && drained(self)
+    }
+
     fn preflight(&self) -> Result<(), Unavailable> {
         (self.check)()?;
         self.runner.as_ref().map_err(|r| *r)?;

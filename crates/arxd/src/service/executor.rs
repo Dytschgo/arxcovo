@@ -116,6 +116,14 @@ pub fn schema() -> Value {
 /// identity withholds both captures unread, independently of cleanup or outcome.
 pub trait Executor: Send + Sync + 'static {
     fn preflight(&self) -> Result<(), Unavailable>;
+    #[cfg(target_os = "linux")]
+    fn requires_broker_drain(&self) -> bool {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    fn confirm_cleanup(&self) -> bool {
+        false
+    }
     fn run(
         &self,
         request: Option<&Request>,
@@ -372,6 +380,14 @@ impl Execution {
                 remaining: workers.len(),
                 completed: true,
             };
+        }
+        #[cfg(target_os = "linux")]
+        if self.backend.requires_broker_drain() {
+            let backend = self.backend.clone();
+            let confirmed = tokio::task::spawn_blocking(move || backend.confirm_cleanup()).await;
+            if !matches!(confirmed, Ok(true)) || self.quarantined.load(Ordering::Acquire) {
+                return Err(Reason::CleanupUnconfirmed);
+            }
         }
         if failed || self.audit_failed.load(Ordering::Acquire) {
             Err(Reason::ExecutionFailed)

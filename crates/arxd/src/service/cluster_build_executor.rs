@@ -24,7 +24,10 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -250,6 +253,7 @@ impl Policy {
 #[serde(deny_unknown_fields)]
 enum Operation {
     Status,
+    Drain,
     Execute(Request),
 }
 
@@ -257,6 +261,7 @@ enum Operation {
 #[serde(deny_unknown_fields)]
 enum Reply {
     Ready(Pin),
+    Drained,
     Unavailable(String),
     Cancelled,
     Failed(Creation),
@@ -347,7 +352,7 @@ impl Reply {
                 stdout: stdout.into(),
                 stderr: stderr.into(),
             },
-            Self::Ready(_) => Report::Failed {
+            Self::Ready(_) | Self::Drained => Report::Failed {
                 creation: Creation::Unknown,
             },
         }
@@ -388,7 +393,14 @@ fn frame_len(header: [u8; 4]) -> io::Result<usize> {
     Ok(n)
 }
 
-fn credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Peer {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+fn credentials(stream: &UnixStream) -> io::Result<Peer> {
     // SAFETY: SO_PEERCRED initializes a ucred when the syscall succeeds.
     unsafe {
         let mut credentials = std::mem::zeroed::<libc::ucred>();
@@ -406,13 +418,19 @@ fn credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
         if size as usize != std::mem::size_of_val(&credentials) || credentials.pid <= 0 {
             return Err(bad());
         }
-        Ok((credentials.uid, credentials.gid))
+        Ok(Peer {
+            pid: credentials.pid,
+            uid: credentials.uid,
+            gid: credentials.gid,
+        })
     }
 }
 
 struct Client {
     socket: PathBuf,
     pin: Pin,
+    peer: Peer,
+    cleanup_unknown: AtomicBool,
 }
 
 fn open_socket(path: &Path) -> io::Result<UnixStream> {
@@ -457,17 +475,19 @@ fn open_socket(path: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-fn transact(
-    socket: &Path,
-    operation: Operation,
-    budget: Duration,
-    stopping: impl Fn() -> bool,
-) -> io::Result<Reply> {
-    let stream = open_socket(socket)?;
-    if credentials(&stream)? != (0, 0) {
-        return Err(bad());
+impl Client {
+    fn transact(
+        &self,
+        operation: Operation,
+        budget: Duration,
+        stopping: impl Fn() -> bool,
+    ) -> io::Result<Reply> {
+        let stream = open_socket(&self.socket)?;
+        if credentials(&stream)? != self.peer {
+            return Err(bad());
+        }
+        exchange(&stream, operation, budget, stopping)
     }
-    exchange(&stream, operation, budget, stopping)
 }
 
 fn exchange(
@@ -513,8 +533,8 @@ fn exchange(
     serde_json::from_slice(&body).map_err(|_| bad())
 }
 
-fn status(path: &Path) -> Result<Pin, Unavailable> {
-    match transact(path, Operation::Status, HANDSHAKE, || false) {
+fn status(reply: io::Result<Reply>) -> Result<Pin, Unavailable> {
+    match reply {
         Ok(Reply::Ready(pin)) => Ok(pin),
         Ok(Reply::Unavailable(reason)) => Err(unavailable(&reason)),
         _ => Err(Unavailable::MechanismUnavailable),
@@ -527,12 +547,22 @@ pub(super) fn connect(socket: PathBuf, build_uid: u32) -> Result<Arc<Execution>,
     if !canonical_path(&socket) || socket.file_name().is_none_or(|n| n != SOCKET) {
         return Err(Unavailable::PreflightFailed);
     }
-    let pin = status(&socket)?;
+    let stream = open_socket(&socket).map_err(|_| Unavailable::MechanismUnavailable)?;
+    let peer = credentials(&stream).map_err(|_| Unavailable::MechanismUnavailable)?;
+    if (peer.uid, peer.gid) != (0, 0) {
+        return Err(Unavailable::PreflightFailed);
+    }
+    let pin = status(exchange(&stream, Operation::Status, HANDSHAKE, || false))?;
     if pin.uid != build_uid || pin.uid == 0 || pin.gid == 0 || !(1..=4).contains(&pin.slots) {
         return Err(Unavailable::PreflightFailed);
     }
     Ok(Execution::cluster_broker(
-        Arc::new(Client { socket, pin }),
+        Arc::new(Client {
+            socket,
+            pin,
+            peer,
+            cleanup_unknown: AtomicBool::new(false),
+        }),
         pin.uid,
         pin.gid,
         pin.slots,
@@ -541,10 +571,27 @@ pub(super) fn connect(socket: PathBuf, build_uid: u32) -> Result<Arc<Execution>,
 
 impl Executor for Client {
     fn preflight(&self) -> Result<(), Unavailable> {
-        if status(&self.socket)? != self.pin {
+        if status(self.transact(Operation::Status, HANDSHAKE, || false))? != self.pin {
             return Err(Unavailable::AccountIdentityChanged);
         }
         Ok(())
+    }
+
+    fn requires_broker_drain(&self) -> bool {
+        true
+    }
+
+    fn confirm_cleanup(&self) -> bool {
+        let acknowledged = matches!(
+            self.transact(Operation::Drain, HANDSHAKE, || false),
+            Ok(Reply::Drained)
+        );
+        // A later empty broker inventory cannot settle an earlier unacknowledged
+        // execute or erase an explicit unconfirmed terminal reply.
+        if !acknowledged {
+            self.cleanup_unknown.store(true, Ordering::Release);
+        }
+        acknowledged && !self.cleanup_unknown.load(Ordering::Acquire)
     }
 
     fn run(
@@ -562,18 +609,34 @@ impl Executor for Client {
             return Report::CancelledBeforeSpawn;
         }
         let budget = Duration::from_secs(request.timeout_s + 6);
-        transact(
-            &self.socket,
-            Operation::Execute(request.clone()),
-            budget,
-            || cancel.is_cancelled() || shutdown.is_cancelled(),
-        )
-        .map_or(
-            Report::Failed {
-                creation: Creation::Unknown,
-            },
-            Reply::into_report,
-        )
+        let report = self
+            .transact(Operation::Execute(request.clone()), budget, || {
+                cancel.is_cancelled() || shutdown.is_cancelled()
+            })
+            .map_or(
+                Report::Failed {
+                    creation: Creation::Unknown,
+                },
+                Reply::into_report,
+            );
+        if !matches!(
+            &report,
+            Report::Unavailable(_)
+                | Report::CancelledBeforeSpawn
+                | Report::Failed {
+                    creation: Creation::NotInvoked | Creation::ProvenNone
+                }
+                | Report::Completed {
+                    evidence: Evidence {
+                        cleanup_confirmed: Some(true),
+                        ..
+                    },
+                    ..
+                }
+        ) {
+            self.cleanup_unknown.store(true, Ordering::Release);
+        }
+        report
     }
 }
 
@@ -593,41 +656,56 @@ async fn serve(
     })
     .await;
     let Ok(Ok(operation)) = operation else { return };
-    let reply = match (bridge.preflight(), operation) {
-        (Err(reason), _) => Reply::Unavailable(reason.as_str().into()),
-        (_, _) if shutdown.is_cancelled() => {
-            Reply::Unavailable(Unavailable::Stopping.as_str().into())
+    let reply = if matches!(operation, Operation::Drain) {
+        // Seal admission before inspecting the live Runner inventory. The
+        // worker owns its permit through cleanup, even after connection loss.
+        capacity.close();
+        if !shutdown.is_cancelled()
+            && capacity.available_permits() == usize::from(pin.slots)
+            && bridge.confirm_cleanup()
+        {
+            Reply::Drained
+        } else {
+            Reply::Failed(Creation::Unknown)
         }
-        (Ok(()), Operation::Status) => Reply::Ready(pin),
-        (Ok(()), Operation::Execute(request)) if request.validate() => {
-            // The daemon owns normal admission. Mirror its exact configured
-            // bound at the privilege boundary for direct socket callers.
-            let Ok(slot) = capacity.try_acquire_owned() else {
-                let reply = Reply::Unavailable(Unavailable::Busy.as_str().into());
-                if let Ok(record) = frame(&reply) {
-                    let _ = timeout(HANDSHAKE, stream.write_all(&record)).await;
-                }
-                return;
-            };
-            let cancel = Cancellation::default();
-            let child_cancel = cancel.clone();
-            let mut run = tokio::task::spawn_blocking(move || {
-                let _slot = slot;
-                bridge.run(Some(&request), &child_cancel, &shutdown)
-            });
-            let result = tokio::select! {
-                biased;
-                _ = stream.read_u8() => {
-                    // Explicit cancellation, malformed extra data and observer
-                    // loss all stop the run. This task still owns its reaping.
-                    cancel.cancel();
-                    run.await
-                }
-                result = &mut run => result,
-            };
-            result.map_or(Reply::Failed(Creation::Unknown), Reply::from_report)
+    } else {
+        match (bridge.preflight(), operation) {
+            (Err(reason), _) => Reply::Unavailable(reason.as_str().into()),
+            (_, _) if shutdown.is_cancelled() || capacity.is_closed() => {
+                Reply::Unavailable(Unavailable::Stopping.as_str().into())
+            }
+            (Ok(()), Operation::Status) => Reply::Ready(pin),
+            (Ok(()), Operation::Execute(request)) if request.validate() => {
+                // The daemon owns normal admission. Mirror its exact configured
+                // bound at the privilege boundary for direct socket callers.
+                let Ok(slot) = capacity.try_acquire_owned() else {
+                    let reply = Reply::Unavailable(Unavailable::Busy.as_str().into());
+                    if let Ok(record) = frame(&reply) {
+                        let _ = timeout(HANDSHAKE, stream.write_all(&record)).await;
+                    }
+                    return;
+                };
+                let cancel = Cancellation::default();
+                let child_cancel = cancel.clone();
+                let mut run = tokio::task::spawn_blocking(move || {
+                    let _slot = slot;
+                    bridge.run(Some(&request), &child_cancel, &shutdown)
+                });
+                let result = tokio::select! {
+                    biased;
+                    _ = stream.read_u8() => {
+                        // Explicit cancellation, malformed extra data and observer
+                        // loss all stop the run. This task still owns its reaping.
+                        cancel.cancel();
+                        run.await
+                    }
+                    result = &mut run => result,
+                };
+                result.map_or(Reply::Failed(Creation::Unknown), Reply::from_report)
+            }
+            (Ok(()), Operation::Execute(_)) => Reply::Failed(Creation::NotInvoked),
+            (Ok(()), Operation::Drain) => unreachable!("handled before admission"),
         }
-        (Ok(()), Operation::Execute(_)) => Reply::Failed(Creation::NotInvoked),
     };
     if let Ok(record) = frame(&reply) {
         let _ = timeout(HANDSHAKE, stream.write_all(&record)).await;

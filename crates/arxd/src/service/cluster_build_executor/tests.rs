@@ -38,7 +38,13 @@ fn wire_bounds_and_shape() {
 fn actual_peer_identity_is_observed() {
     let (a, b) = UnixStream::pair().unwrap();
     // SAFETY: these identity getters take no pointers.
-    let expected = unsafe { (libc::geteuid(), libc::getegid()) };
+    let expected = unsafe {
+        Peer {
+            pid: libc::getpid(),
+            uid: libc::geteuid(),
+            gid: libc::getegid(),
+        }
+    };
     assert_eq!(credentials(&a).unwrap(), expected);
     assert_eq!(credentials(&b).unwrap(), expected);
 }
@@ -156,6 +162,106 @@ async fn observer_loss_and_cancel_are_joined() {
     }
 }
 
+async fn receive_operation(stream: &mut ServerStream) -> Operation {
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    let mut body = vec![0; frame_len(header).unwrap()];
+    stream.read_exact(&mut body).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn lost_and_unconfirmed_execute_replies_cannot_authorize_cluster_close() {
+    use crate::store::Activity;
+
+    for lost in [true, false] {
+        let directory = crate::service::application::tests::private_temp();
+        let socket = directory.path().join(SOCKET);
+        let listener = UnixListener::bind(&socket).unwrap();
+        // SAFETY: the test-only client pins this in-process test listener's kernel identity.
+        let peer = unsafe {
+            Peer {
+                pid: libc::getpid(),
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        };
+        let executor = Execution::cluster_broker(
+            Arc::new(Client {
+                socket,
+                pin: PIN,
+                peer,
+                cleanup_unknown: AtomicBool::new(false),
+            }),
+            PIN.uid,
+            PIN.gid,
+            PIN.slots,
+        );
+        let (started, execute_received) = tokio::sync::oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (mut check, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                receive_operation(&mut check).await,
+                Operation::Status
+            ));
+            check
+                .write_all(&frame(&Reply::Ready(PIN)).unwrap())
+                .await
+                .unwrap();
+
+            let (mut execute, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                receive_operation(&mut execute).await,
+                Operation::Execute(_)
+            ));
+            started.send(()).unwrap();
+            // A real shutdown reaches the broker as cancellation of its in-flight execute.
+            assert_eq!(execute.read_u8().await.unwrap(), CANCEL);
+            if !lost {
+                execute
+                    .write_all(
+                        &frame(&Reply::Completed {
+                            uid: PIN.uid,
+                            gid: PIN.gid,
+                            stop: StopReason::Shutdown,
+                            exit_code: None,
+                            cleanup: false,
+                            stdout: Output(vec![], vec![], 0),
+                            stderr: Output(vec![], vec![], 0),
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(execute);
+            let (mut drain, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                receive_operation(&mut drain).await,
+                Operation::Drain
+            ));
+            // Even a later authenticated drain cannot erase lost terminal evidence.
+            drain
+                .write_all(&frame(&Reply::Drained).unwrap())
+                .await
+                .unwrap();
+        });
+        let activity = Arc::new(Activity::open_service_fixture(directory.path()).unwrap());
+        let id = activity
+            .start_dedicated("qualification", "run_command")
+            .unwrap();
+        let call = executor.dispatch(Some(request()), activity, id);
+        crate::service::cluster_runtime::broker_refusal_close_control(executor, execute_received)
+            .await;
+        assert_eq!(
+            call.await
+                .unwrap_or_else(|_| panic!("missing terminal row"))["cleanup_confirmed"],
+            false
+        );
+        fixture.await.unwrap();
+    }
+}
+
 #[test]
 #[ignore = "root-only refusal in the isolated QEMU validation guest"]
 fn root_refuses_unqualified_runner_profile() {
@@ -184,7 +290,24 @@ async fn hosted_standard_build() {
     // SAFETY: these identity getters take no pointers.
     assert_eq!(unsafe { (libc::getuid(), libc::geteuid()) }, (21071, 21071));
     let socket = base.join("control/executor.sock");
-    let _retained_fd = File::open(base.join("daemon/wrap")).unwrap();
+    let retained_fd = File::open(base.join("daemon/wrap")).unwrap();
+    let _daemon_control =
+        std::os::unix::net::UnixListener::bind(base.join("daemon/control.sock")).unwrap();
+    fs::set_permissions(
+        base.join("daemon/control.sock"),
+        Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(
+        base.join("daemon/wrap.fd.pending"),
+        retained_fd.as_raw_fd().to_string(),
+    )
+    .unwrap();
+    fs::rename(
+        base.join("daemon/wrap.fd.pending"),
+        base.join("daemon/wrap.fd"),
+    )
+    .unwrap();
     let pid = std::process::id();
     timeout(HANDSHAKE, async {
         while fs::read_to_string(base.join("daemon.pid")).as_deref().ok()
@@ -240,6 +363,10 @@ async fn hosted_standard_build() {
     );
     assert!(lines.next().is_some_and(|line| line.starts_with("cargo ")));
     assert!(lines.next().is_none());
+    assert_eq!(
+        retained_fd.metadata().unwrap().ino(),
+        fs::metadata(base.join("daemon/wrap")).unwrap().ino()
+    );
     println!(
         "ARX_EXEC_BUILD dispatches=1 migration=1 limits=1 identity=1 denial=1 workspace=1 terminal=1 cleanup=1"
     );

@@ -1119,6 +1119,51 @@ async fn run_lifecycle_with_executor(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+pub(super) async fn broker_refusal_close_control(
+    executor: Arc<super::executor::Execution>,
+    execute_received: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fence = Arc::new(Admission::default());
+    let (_status, receiver) = watch::channel(Status::Pending);
+    let lifecycle = Lifecycle {
+        work: Arc::new(Mutex::new(Work {
+            waiting: None,
+            running: None,
+            first: None,
+        })),
+        fence: fence.clone(),
+        joined: false,
+        status: receiver,
+        control: cluster_owner::Control::observe_task(tokio::spawn(async { Ok(()) })),
+        supervisor: tokio::spawn(async {}),
+    };
+    let (mut parent, worker) = tokio::net::UnixStream::pair().unwrap();
+    let stop = fence.signal();
+    let worker = ParentControl::new(worker, fence);
+    let run = tokio::spawn(run_lifecycle_with_executor(
+        lifecycle,
+        stop,
+        Some(worker),
+        Some(executor),
+    ));
+    tokio::time::timeout(CLOSE, async {
+        assert_eq!(parent.read_u8().await.unwrap(), READY);
+        execute_received.await.unwrap();
+        parent.write_u8(STOP).await.unwrap();
+        assert_eq!(parent.read_u8().await.unwrap(), UNJOINED);
+        assert_eq!(parent.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(
+            run.await.unwrap(),
+            Err(LifecycleFailure::RefusedOrUnconfirmed)
+        );
+    })
+    .await
+    .unwrap();
+}
+
 #[derive(Clone, Copy)]
 enum WorkerIdentity {
     Dedicated(u32, u32),
