@@ -118,15 +118,22 @@ pub(super) struct Credentials {
 struct Resources {
     cluster: ClusterId,
     node: NodeId,
-    registry: Registry,
+    registry: peer_registry::AppliedRegistry,
     credentials: Credentials,
     learner: Option<Arc<peer_registry::LearnerGate>>,
     server: Arc<ServerConfig>,
     dispatch: Arc<dyn AppendDispatch>,
 }
 impl Resources {
+    // The owned outbound exchange checks applied authority before its first write.
+    fn outbound_tls_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
+        self.client_with_registry(target, Arc::new(|_, _, _| Ok(())))
+    }
+
+    // Raw TLS probes have no owned exchange to perform post-TLS authorization.
+    #[cfg(test)]
     fn client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
-        self.client_with_registry(target, self.registry.clone())
+        self.client_with_registry(target, self.registry.immediate())
     }
 
     fn admission_client_config(&self, target: NodeId) -> Result<Arc<ClientConfig>, Refusal> {
@@ -332,10 +339,16 @@ impl TransportOwner {
                     _ = stop.changed() => return,
                     incoming = listener.accept() => incoming,
                 };
-                let Ok((socket, _)) = incoming else {
+                let Ok((socket, _peer)) = incoming else {
                     return;
                 };
                 let deadline = Instant::now() + INBOUND_BUDGET;
+                #[cfg(all(test, target_os = "linux"))]
+                let trace = shared.hooks.gated_inbound.get().and_then(Weak::upgrade);
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(trace) = &trace {
+                    trace.inbound(_peer, "accepted", None);
+                }
                 let mut state = match shared.state.lock() {
                     Ok(state) => state,
                     Err(_) => return,
@@ -346,6 +359,10 @@ impl TransportOwner {
                 } else {
                     std::mem::take(&mut state.join_errors)
                 };
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(trace) = &trace {
+                    trace.inbound(_peer, "admission", trace_refusal(admitted.as_ref().err()));
+                }
                 let admission = match admitted {
                     Ok(admission) => admission,
                     Err(reason) => {
@@ -364,10 +381,22 @@ impl TransportOwner {
                     } = admission;
                     let result = timeout_at(
                         deadline,
-                        inbound(&task_shared, resources, socket, handshake, deadline),
+                        inbound(
+                            &task_shared,
+                            resources,
+                            socket,
+                            handshake,
+                            deadline,
+                            #[cfg(all(test, target_os = "linux"))]
+                            trace.as_deref().map(|trace| (trace, _peer)),
+                        ),
                     )
                     .await
                     .unwrap_or(Err(Refusal::Deadline));
+                    #[cfg(all(test, target_os = "linux"))]
+                    if let Some(trace) = &trace {
+                        trace.inbound(_peer, "finished", trace_refusal(result.as_ref().err()));
+                    }
                     event(&task_shared, Event::Finished(result.err()));
                 });
                 drop(state);
@@ -613,19 +642,53 @@ async fn inbound(
     socket: TcpStream,
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
+    #[cfg(all(test, target_os = "linux"))] trace: Option<(&GatedCallTrace, SocketAddr)>,
 ) -> Result<(), Refusal> {
     let source = socket.peer_addr();
     stage(shared, Stage::ServerHandshake).await;
     before_dispatch(shared, deadline)?;
-    let mut stream = TlsAcceptor::from(resources.server.clone())
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((trace, peer)) = trace {
+        trace.inbound(peer, "handshake start", None);
+    }
+    let stream = TlsAcceptor::from(resources.server.clone())
         .accept_with(socket, |c| c.set_buffer_limit(Some(SEND_BUFFER)))
-        .await
-        .map_err(|_| Refusal::Tls)?;
+        .await;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((trace, peer)) = trace {
+        trace.inbound(
+            peer,
+            "TLS client handshake",
+            stream.as_ref().err().map(handshake_error),
+        );
+    }
+    let mut stream = stream.map_err(|_| Refusal::Tls)?;
     let authenticated =
         AuthenticatedPeer::from_server(stream.get_ref().1).map_err(|_| Refusal::Identity)?;
     let peer = authenticated
         .authenticated_identity()
         .map_err(|_| Refusal::Identity)?;
+    // TLS proved the certificate and key. Check local authority before
+    // reading any application data, regardless of the peer's lane.
+    let authorized = match &resources.learner {
+        Some(learner) => learner
+            .authorize(peer.0, peer.1, peer.2, true)
+            .await
+            .map(|_| ()),
+        None => resources.registry.authorize(peer.0, peer.1, peer.2).await,
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((trace, peer)) = trace {
+        trace.inbound(
+            peer,
+            "inbound applied pre-frame authorization",
+            authorized
+                .as_ref()
+                .err()
+                .map(|reason| format!("{reason:?}")),
+        );
+    }
+    authorized.map_err(|_| Refusal::Tls)?;
     drop(handshake);
     stage(shared, Stage::ServerAuthenticated).await;
     before_dispatch(shared, deadline)?;
@@ -650,7 +713,11 @@ async fn inbound(
         if resources.learner.is_some() {
             return Err(Refusal::Identity);
         }
-        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
         let controller = shared
             .state
@@ -687,6 +754,10 @@ async fn inbound(
     if let Some(observe) = shared.hooks.gated_dispatch.lock().unwrap().take() {
         let _ = observe.send(source.ok());
     }
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((trace, peer)) = trace {
+        trace.inbound(peer, "before dispatch", None);
+    }
     stage(shared, Stage::BeforeDispatch).await;
     before_dispatch(shared, deadline)?;
     if let Some(learner) = &resources.learner {
@@ -696,14 +767,30 @@ async fn inbound(
             return Err(Refusal::Identity);
         }
         let bootstrap_allowed = matches!(request, Request::Append(_) | Request::Snapshot(..));
-        let _lane = learner
+        let authorized = learner
             .authorize(peer.0, peer.1, peer.2, bootstrap_allowed)
-            .map_err(|_| Refusal::Identity)?;
+            .await;
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some((trace, peer)) = trace {
+            trace.inbound(
+                peer,
+                "learner dispatch authorization",
+                authorized
+                    .as_ref()
+                    .err()
+                    .map(|reason| format!("{reason:?}")),
+            );
+        }
+        let _lane = authorized.map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
         #[cfg(test)]
         event(shared, Event::LearnerDispatch(_lane));
     } else {
-        (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+        resources
+            .registry
+            .authorize(peer.0, peer.1, peer.2)
+            .await
+            .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
     }
     let reply = match request {
@@ -739,11 +826,13 @@ impl AppendClient {
         request: Request,
         option: RPCOption,
         mut cancel: Pin<Box<dyn Future<Output = openraft::errors::ReplicationClosed> + Send>>,
-        #[cfg(all(test, target_os = "linux"))] observed_source: Option<
-            Arc<std::sync::OnceLock<SocketAddr>>,
-        >,
+        #[cfg(all(test, target_os = "linux"))] trace: Option<Arc<GatedCallTrace>>,
     ) -> Result<Reply, ExchangeError> {
         let entry = Instant::now();
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(trace) = &trace {
+            let _ = trace.entry.set(entry);
+        }
         if let Some(reason) = poll_fn(|cx| {
             Poll::Ready(match cancel.as_mut().poll(cx) {
                 Poll::Ready(r) => Some(r),
@@ -761,6 +850,10 @@ impl AppendClient {
             .checked_mul(3)
             .ok_or(ExchangeError::Refused(Refusal::Deadline))?;
         let ttl = option.soft_ttl();
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(trace) = &trace {
+            let _ = trace.soft_ttl.set(ttl);
+        }
         let deadline = entry
             .checked_add(ttl)
             .filter(|_| !ttl.is_zero())
@@ -800,7 +893,7 @@ impl AppendClient {
                     outbound(
                         &shared, resources, address, target, request, handshake, deadline, &tx,
                         #[cfg(all(test, target_os = "linux"))]
-                        observed_source.as_deref(),
+                        trace.as_deref(),
                     ),
                 ) => result.unwrap_or(Err(Refusal::Deadline)).map_err(ExchangeError::Refused),
                 };
@@ -845,9 +938,7 @@ async fn outbound(
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
     caller: &oneshot::Sender<Result<Reply, ExchangeError>>,
-    #[cfg(all(test, target_os = "linux"))] observed_source: Option<
-        &std::sync::OnceLock<SocketAddr>,
-    >,
+    #[cfg(all(test, target_os = "linux"))] trace: Option<&GatedCallTrace>,
 ) -> Result<Reply, Refusal> {
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
@@ -862,37 +953,90 @@ async fn outbound(
         target: target.get(),
     };
     let frame = request.encode(route)?;
-    let config = resources.client_config(target)?;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller("configuration start", None);
+    }
+    let config = resources.outbound_tls_config(target);
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller("configuration", trace_refusal(config.as_ref().err()));
+    }
+    let config = config?;
     stage(shared, Stage::BeforeConnect).await;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    let socket = TcpStream::connect(address)
-        .await
-        .map_err(|_| Refusal::Tls)?;
     #[cfg(all(test, target_os = "linux"))]
-    if let Some(source) = observed_source
-        && let Ok(address) = socket.local_addr()
-    {
-        let _ = source.set(address);
+    if let Some(trace) = trace {
+        trace.caller("connect start", None);
     }
+    let socket = TcpStream::connect(address).await;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        if let Ok(socket) = &socket
+            && let Ok(address) = socket.local_addr()
+        {
+            let _ = trace.source.set(address);
+        }
+        trace.caller(
+            "connect",
+            socket
+                .as_ref()
+                .err()
+                .map(|error| format!("socket {:?}", error.kind())),
+        );
+    }
+    let socket = socket.map_err(|_| Refusal::Tls)?;
     stage(shared, Stage::ClientHandshake).await;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    let mut stream = TlsConnector::from(config)
-        .connect_with(
-            ServerName::try_from(verify::SERVER_NAME).map_err(|_| Refusal::Tls)?,
-            socket,
-            |c| c.set_buffer_limit(Some(SEND_BUFFER)),
-        )
-        .await
-        .map_err(|_| Refusal::Tls)?;
+    let name = ServerName::try_from(verify::SERVER_NAME);
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        if name.is_err() {
+            trace.caller("configuration", Some("server name".into()));
+        } else {
+            trace.caller("handshake start", None);
+        }
+    }
+    let stream = TlsConnector::from(config)
+        .connect_with(name.map_err(|_| Refusal::Tls)?, socket, |c| {
+            c.set_buffer_limit(Some(SEND_BUFFER))
+        })
+        .await;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller(
+            "TLS server handshake",
+            stream.as_ref().err().map(handshake_error),
+        );
+    }
+    let mut stream = stream.map_err(|_| Refusal::Tls)?;
     let peer = AuthenticatedPeer::from_client(stream.get_ref().1)
         .and_then(|peer| peer.authenticated_identity())
         .map_err(|_| Refusal::Identity)?;
+    #[cfg(test)]
+    stage(shared, Stage::BeforeClientAuthorization).await;
+    before_dispatch(shared, deadline)?;
+    if caller.is_closed() {
+        return Err(Refusal::Closed);
+    }
+    let authorized = resources.registry.authorize(peer.0, peer.1, peer.2).await;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller(
+            "outbound applied pre-frame authorization",
+            authorized
+                .as_ref()
+                .err()
+                .map(|reason| format!("{reason:?}")),
+        );
+    }
+    authorized.map_err(|_| Refusal::Tls)?;
     drop(handshake);
     stage(shared, Stage::ClientAuthenticated).await;
     before_dispatch(shared, deadline)?;
@@ -926,6 +1070,10 @@ async fn outbound(
         Some(kind),
     )
     .await?;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(trace) = trace {
+        trace.caller("reply read", None);
+    }
     stage(shared, Stage::ReplyRead).await;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
@@ -938,7 +1086,11 @@ async fn outbound(
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    (resources.registry)(peer.0, peer.1, peer.2).map_err(|_| Refusal::Identity)?;
+    resources
+        .registry
+        .authorize(peer.0, peer.1, peer.2)
+        .await
+        .map_err(|_| Refusal::Identity)?;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
         return Err(Refusal::Closed);
@@ -956,6 +1108,8 @@ pub(super) enum Stage {
     BeforeReply,
     BeforeConnect,
     ClientHandshake,
+    #[cfg(test)]
+    BeforeClientAuthorization,
     ClientAuthenticated,
     ReplyRead,
     #[cfg(test)]
@@ -988,6 +1142,103 @@ pub(super) struct GatedCallerOutcome {
     pub(super) result: Result<(), Refusal>,
 }
 
+// Record only the selected caller. Accept may precede publication of its
+// local endpoint, so keep a bounded buffer and match by endpoint at readout.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+pub(super) struct GatedCallTrace {
+    entry: std::sync::OnceLock<Instant>,
+    soft_ttl: std::sync::OnceLock<Duration>,
+    source: std::sync::OnceLock<SocketAddr>,
+    caller: Mutex<Vec<TimedStage>>,
+    inbound: Mutex<Vec<(SocketAddr, TimedStage)>>,
+}
+#[cfg(all(test, target_os = "linux"))]
+type TimedStage = (Duration, &'static str, Option<String>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl GatedCallTrace {
+    pub(super) fn caller(&self, stage: &'static str, error: Option<String>) {
+        if let Some(entry) = self.entry.get() {
+            self.caller
+                .lock()
+                .unwrap()
+                .push((entry.elapsed(), stage, error));
+        }
+    }
+
+    fn inbound(&self, peer: SocketAddr, stage: &'static str, error: Option<String>) {
+        if let Some(entry) = self.entry.get()
+            && self.source.get().is_none_or(|source| *source == peer)
+        {
+            let elapsed = entry.elapsed();
+            let mut inbound = self.inbound.lock().unwrap();
+            // At most eight observations per accepted connection.
+            if inbound.len() < 8 * CONNECTIONS {
+                inbound.push((peer, (elapsed, stage, error)));
+            }
+        }
+    }
+
+    // Endpoints are only correlation keys and never escape the trace.
+    pub(super) fn summary(&self) -> impl std::fmt::Debug {
+        let inbound = self
+            .inbound
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(peer, _)| Some(peer) == self.source.get())
+            .map(|(_, stage)| stage.clone())
+            .collect::<Vec<_>>();
+        (
+            self.soft_ttl.get().copied(),
+            self.caller.lock().unwrap().clone(),
+            inbound,
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn trace_refusal(reason: Option<&Refusal>) -> Option<String> {
+    reason.map(|reason| format!("{reason:?}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn handshake_error(error: &std::io::Error) -> String {
+    use rustls::{CertificateError, Error};
+    use verify::VerifyRefusal;
+
+    match error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<Error>())
+    {
+        Some(Error::FailedToGetCurrentTime) => "TLS clock unavailable".into(),
+        Some(Error::InvalidCertificate(
+            CertificateError::Expired
+            | CertificateError::ExpiredContext { .. }
+            | CertificateError::NotValidYet
+            | CertificateError::NotValidYetContext { .. },
+        )) => "TLS certificate time".into(),
+        Some(Error::InvalidCertificate(CertificateError::Other(other))) => {
+            match other.0.downcast_ref::<VerifyRefusal>() {
+                Some(reason) => format!("TLS peer verification {reason:?}"),
+                None => "TLS certificate".into(),
+            }
+        }
+        Some(Error::InvalidCertificate(_)) => "TLS certificate".into(),
+        Some(Error::AlertReceived(alert)) => format!("TLS peer alert {alert:?}"),
+        Some(_) => "TLS protocol".into(),
+        None => format!("socket {:?}", error.kind()),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type GatedCaller = (
+    NodeId,
+    Arc<GatedCallTrace>,
+    oneshot::Sender<GatedCallerOutcome>,
+);
+
 #[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
@@ -996,7 +1247,9 @@ struct TestHooks {
     #[cfg(all(test, target_os = "linux"))]
     gated_dispatch: Mutex<Option<oneshot::Sender<Option<SocketAddr>>>>,
     #[cfg(all(test, target_os = "linux"))]
-    gated_caller: Mutex<Option<(NodeId, oneshot::Sender<GatedCallerOutcome>)>>,
+    gated_caller: Mutex<Option<GatedCaller>>,
+    #[cfg(all(test, target_os = "linux"))]
+    gated_inbound: std::sync::OnceLock<Weak<GatedCallTrace>>,
 }
 #[cfg(test)]
 impl TestHooks {
@@ -1004,12 +1257,12 @@ impl TestHooks {
     fn take_gated_caller(
         &self,
         target: Option<NodeId>,
-    ) -> Option<oneshot::Sender<GatedCallerOutcome>> {
+    ) -> Option<(Arc<GatedCallTrace>, oneshot::Sender<GatedCallerOutcome>)> {
         let mut armed = self.gated_caller.lock().unwrap();
-        if target != armed.as_ref().map(|(target, _)| *target) {
+        if target != armed.as_ref().map(|(target, _, _)| *target) {
             return None;
         }
-        armed.take().map(|(_, sender)| sender)
+        armed.take().map(|(_, trace, sender)| (trace, sender))
     }
 
     fn emit(&self, event: Event) {
@@ -1184,18 +1437,17 @@ impl openraft::network::RaftNetworkV2<Arx> for AppendClient {
         o: RPCOption,
     ) -> Result<AppendResult<Arx>, RPCError<Arx>> {
         #[cfg(all(test, target_os = "linux"))]
-        if let Some(observe) = self
+        if let Some((trace, observe)) = self
             .shared
             .upgrade()
             .and_then(|shared| shared.hooks.take_gated_caller(self.target))
         {
-            let source = Arc::new(std::sync::OnceLock::new());
             let result = match self
                 .exchange(
                     Request::Append(r),
                     o,
                     Box::pin(std::future::pending()),
-                    Some(source.clone()),
+                    Some(trace.clone()),
                 )
                 .await
             {
@@ -1205,12 +1457,14 @@ impl openraft::network::RaftNetworkV2<Arx> for AppendClient {
             };
             // This is the original caller's result after exchange checks the
             // RPC deadline. The spawned outbound task can finish earlier.
+            let outcome = result.as_ref().map(|_| ()).map_err(|error| match error {
+                ExchangeError::Refused(reason) => *reason,
+                ExchangeError::Cancelled(_) => Refusal::Closed,
+            });
+            trace.caller("caller returned", trace_refusal(outcome.as_ref().err()));
             let _ = observe.send(GatedCallerOutcome {
-                source: source.get().copied(),
-                result: result.as_ref().map(|_| ()).map_err(|error| match error {
-                    ExchangeError::Refused(reason) => *reason,
-                    ExchangeError::Cancelled(_) => Refusal::Closed,
-                }),
+                source: trace.source.get().copied(),
+                result: outcome,
             });
             return result.map_err(unary_error);
         }
@@ -1313,17 +1567,16 @@ fn make_resources_for_learner(
     dispatch: Arc<dyn AppendDispatch>,
     learner: Option<Arc<peer_registry::LearnerGate>>,
 ) -> Result<Arc<Resources>, Refusal> {
-    let registry = peer_registry::registry(sm);
-    let inbound: Registry = match &learner {
-        Some(gate) => {
-            let gate = gate.clone();
-            Arc::new(move |cluster, node, key| gate.authorize(cluster, node, key, true).map(|_| ()))
-        }
-        None => registry.clone(),
-    };
-    let verifier = PeerVerifier::new(credentials.root.clone(), cluster, inbound)
-        .map_err(|_| Refusal::Tls)?
-        .server();
+    let registry = peer_registry::AppliedRegistry::new(sm);
+    // PeerVerifier still checks the chain and cluster identity. The owned
+    // inbound exchange performs the store-dependent check before framing.
+    let verifier = PeerVerifier::new(
+        credentials.root.clone(),
+        cluster,
+        Arc::new(|_, _, _| Ok(())),
+    )
+    .map_err(|_| Refusal::Tls)?
+    .server();
     let server = Arc::new(
         verify::server_config(
             verifier,
@@ -1651,9 +1904,21 @@ impl TransportOwner {
     }
 
     #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn observe_gated_inbound(&self, trace: &Arc<GatedCallTrace>) {
+        assert!(
+            self.shared
+                .hooks
+                .gated_inbound
+                .set(Arc::downgrade(trace))
+                .is_ok()
+        );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn observe_gated_caller(
         &self,
         target: NodeId,
+        trace: Arc<GatedCallTrace>,
     ) -> oneshot::Receiver<GatedCallerOutcome> {
         let (sender, receiver) = oneshot::channel();
         assert!(
@@ -1662,7 +1927,7 @@ impl TransportOwner {
                 .gated_caller
                 .lock()
                 .unwrap()
-                .replace((target, sender))
+                .replace((target, trace, sender))
                 .is_none()
         );
         receiver
