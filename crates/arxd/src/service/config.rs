@@ -54,6 +54,15 @@ struct Limits {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ServiceLaunch {
+    pub(super) config: std::path::PathBuf,
+    pub(super) intent: String,
+    pub(super) daemon_uid: u32,
+    pub(super) daemon_gid: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Wire {
     schema: String,
     client: Client,
@@ -64,6 +73,8 @@ struct Wire {
     limits: Limits,
     agents: Vec<Agent>,
     granted_batch_right: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cluster: Option<ServiceLaunch>,
 }
 /// No Debug implementation: names, paths and hashes must not appear in errors.
 #[derive(Clone)]
@@ -148,6 +159,7 @@ impl ServiceConfig {
                 })
                 .collect(),
             granted_batch_right: false,
+            cluster: None,
         };
         Self::parse(
             &serde_json::to_vec(&wire).map_err(|_| Error::Config)?,
@@ -161,6 +173,9 @@ impl ServiceConfig {
             return Err(Error::Config);
         }
         let wire: Wire = serde_json::from_slice(bytes).map_err(|_| Error::Config)?;
+        if wire.cluster.is_some() && layout.platform() != Platform::Linux {
+            return Err(Error::Config);
+        }
         // Revision resolution is also native account observation.
         validate_platform_rights(layout.platform(), wire.rights)?;
         let revisions = [
@@ -343,6 +358,11 @@ impl ServiceConfig {
         // that backend exists, the caller always reports execution unavailable.
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn cluster(&self) -> Option<&ServiceLaunch> {
+        self.wire.cluster.as_ref()
+    }
+
     pub fn client_identity(&self) -> &str {
         &self.wire.client.identity
     }

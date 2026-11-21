@@ -18,6 +18,34 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::MutexGuard};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActivationError {
+    Deferred,
+    Refused,
+}
+
+impl From<crate::cluster::consensus::ReadError> for ActivationError {
+    fn from(error: crate::cluster::consensus::ReadError) -> Self {
+        use crate::cluster::consensus::ReadError;
+        match error {
+            ReadError::Busy | ReadError::NotLeader | ReadError::NoQuorum => Self::Deferred,
+            ReadError::Unavailable => Self::Refused,
+        }
+    }
+}
+
+impl From<membership_observation::MembershipReadError> for ActivationError {
+    fn from(error: membership_observation::MembershipReadError) -> Self {
+        use membership_observation::MembershipReadError;
+        match error {
+            MembershipReadError::Busy
+            | MembershipReadError::NotLeader
+            | MembershipReadError::RetryLater => Self::Deferred,
+            MembershipReadError::Unavailable | MembershipReadError::PeerRefused => Self::Refused,
+        }
+    }
+}
+
 pub(super) struct ReadyIssuer {
     endpoint: SocketAddr,
     cluster: ClusterId,
@@ -67,6 +95,15 @@ impl ReadyIssuer {
         self.promoted.map_or(FOUNDER, |(voter, _)| voter.node)
     }
 
+    pub(super) fn peer_credentials(&self) -> Credentials {
+        Credentials {
+            root: self.tls.root.clone(),
+            leaf: self.tls.leaf.clone(),
+            key: self.tls.key.clone_key(),
+            time: self.tls.time.clone(),
+        }
+    }
+
     pub(super) fn mint_root(&self) -> &[u8] {
         self.ca.cert_der()
     }
@@ -94,28 +131,42 @@ impl ReadyIssuer {
     // This is a local refusal check. Only the existing enroll guards establish
     // proposal and issuance authority.
     pub(super) fn available(&self, node: &ConsensusNode) -> Result<(), Refused> {
+        self.activation_available(node).map_err(|_| Refused)
+    }
+
+    fn activation_available(&self, node: &ConsensusNode) -> Result<(), ActivationError> {
+        use ActivationError::{Deferred, Refused};
         let raft = node.raft.as_ref().ok_or(Refused)?;
         let metrics = raft.metrics();
         let leader = {
             let m = metrics.borrow_watched();
-            m.running_state.is_ok()
-                && m.current_leader == Some(node.id)
-                && m.state == openraft::ServerState::Leader
+            if m.running_state.is_err() {
+                return Err(Refused);
+            }
+            m.current_leader == Some(node.id) && m.state == openraft::ServerState::Leader
         };
-        if !leader
-            || !self
-                .ca
-                .leaf_fits(self.clock.sample_ms().map_err(|_| Refused)?)
+        if !self
+            .ca
+            .leaf_fits(self.clock.sample_ms().map_err(|_| Refused)?)
         {
             return Err(Refused);
+        }
+        if !leader {
+            return Err(Deferred);
         }
         if let Some((voter, installed_at)) = self.promoted {
             return node
                 .issuer_voter(self.cluster, voter, installed_at, true)
-                .map_err(|_| Refused);
+                .map_err(Into::into);
         }
         let sm = node.sm.as_ref().ok_or(Refused)?;
-        let store = sm.0.try_lock().map_err(|_| Refused)?;
+        let store = sm.0.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => Deferred,
+            std::sync::TryLockError::Poisoned(_) => Refused,
+        })?;
+        if store.is_poisoned() {
+            return Err(Refused);
+        }
         store
             .state()
             .authorize_peer(self.cluster, self.member(), self.key)
@@ -123,8 +174,27 @@ impl ReadyIssuer {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ExchangeCounts {
+    anchors: std::sync::atomic::AtomicU8,
+    redeems: std::sync::atomic::AtomicU8,
+}
+
+impl ExchangeCounts {
+    pub(super) fn observe(&self) -> [u8; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [self.anchors.load(Relaxed), self.redeems.load(Relaxed)]
+    }
+
+    fn count(counter: &std::sync::atomic::AtomicU8) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    }
+}
+
 struct Issuer {
     ready: Arc<ReadyIssuer>,
+    exchange: Option<Arc<ExchangeCounts>>,
     node: Arc<tokio::sync::Mutex<ConsensusNode>>,
     #[cfg(test)]
     observation: Option<Arc<hosted::Observation>>,
@@ -145,6 +215,9 @@ impl Issuer {
 impl Backend for Issuer {
     async fn anchor(&self, query: Query, deadline: Instant) -> Result<BoundVoters, Refused> {
         let node = self.admit(deadline)?;
+        if let Some(exchange) = &self.exchange {
+            ExchangeCounts::count(&exchange.anchors);
+        }
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
@@ -176,6 +249,9 @@ impl Backend for Issuer {
     async fn redeem(&self, request: Redeem, deadline: Instant) -> Result<Reply, Refused> {
         let (input, csr) = request.into_issuer();
         let node = self.admit(deadline)?;
+        if let Some(exchange) = &self.exchange {
+            ExchangeCounts::count(&exchange.redeems);
+        }
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
@@ -247,12 +323,29 @@ fn socket_option<T: Default>(fd: RawFd, option: libc::c_int) -> Option<T> {
 }
 
 impl Job {
+    pub(super) fn issuer_serving(&self) -> bool {
+        let state = self.state();
+        if state.close_requested || state.ingress.is_none() {
+            return false;
+        }
+        let (Some(listener), Some(issuer), Some(node)) =
+            (state.serving_enrollment, &state.issuer, &state.node)
+        else {
+            return false;
+        };
+        listener.active()
+            && node
+                .try_lock()
+                .is_ok_and(|node| issuer.available(&node).is_ok())
+    }
+
     // An explicit private activation on the enrollment endpoint from the
     // retained startup intent. The job registers it under the close gate.
     pub(super) fn start_enrollment(
         &self,
         #[cfg(test)] observation: Option<Arc<hosted::Observation>>,
-    ) -> Result<(), Refused> {
+    ) -> Result<(), ActivationError> {
+        use ActivationError::{Deferred, Refused};
         let mut state = self.state();
         if !matches!(state.status, Status::FounderReady | Status::LearnerReady)
             || state.close_requested
@@ -260,13 +353,27 @@ impl Job {
         {
             return Err(Refused);
         }
-        let ready = state.issuer.as_ref().ok_or(Refused)?;
-        let node = state.node.as_ref().ok_or(Refused)?;
+        let ready = state.issuer.clone().ok_or(Refused)?;
+        let node = state.node.clone().ok_or(Refused)?;
         {
-            let live = node.try_lock().map_err(|_| Refused)?;
-            ready.available(&live)?;
+            let live = node.try_lock().map_err(|_| Deferred)?;
+            ready.activation_available(&live)?;
         }
-        let listener = std::net::TcpListener::bind(ready.endpoint).map_err(|_| Refused)?;
+        let inherited = state
+            .inherited
+            .as_mut()
+            .and_then(|pair| pair.enrollment.take());
+        let listener = match inherited {
+            Some(listener) => {
+                crate::service::cluster_runtime::listen_inherited(&listener)
+                    .map_err(|_| Refused)?;
+                listener
+            }
+            None => std::net::TcpListener::bind(ready.endpoint).map_err(|_| Refused)?,
+        };
+        if listener.local_addr().ok() != Some(ready.endpoint) {
+            return Err(Refused);
+        }
         listener.set_nonblocking(true).map_err(|_| Refused)?;
         let listener = TcpListener::from_std(listener).map_err(|_| Refused)?;
         let serving = ServingListener::capture(&listener, ready.endpoint);
@@ -276,12 +383,14 @@ impl Job {
             ready.tls.key.clone_key(),
             ready.tls.time.clone(),
             Issuer {
-                ready: ready.clone(),
-                node: node.clone(),
+                ready,
+                exchange: state.process_owned.then(|| state.exchange.clone()),
+                node,
                 #[cfg(test)]
                 observation,
             },
-        )?;
+        )
+        .map_err(|_| Refused)?;
         state.ingress = Some(ingress);
         state.serving_enrollment = serving;
         Ok(())

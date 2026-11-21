@@ -101,6 +101,9 @@ pub trait Application {
     async fn serve(&mut self) -> Result<(), ExitCode>;
     fn stop_accepting(&mut self) -> Result<(), ExitCode>;
     async fn drain(&mut self) -> Result<(), ExitCode>;
+    async fn finish_after_drain(&mut self, _drained: bool) -> Result<(), ExitCode> {
+        Ok(())
+    }
     async fn service_stop(&mut self) -> Result<(), ExitCode>;
     fn release(&mut self) -> Result<(), ExitCode>;
 }
@@ -169,7 +172,18 @@ impl Host {
         )
         .await;
         let drain_returned = drained.is_ok();
+        let drain_succeeded = matches!(drained, Ok(Ok(())));
         retain(&mut result, drained.unwrap_or(Err(ExitCode::Store)));
+        retain(
+            &mut result,
+            pending(
+                app.finish_after_drain(drain_succeeded),
+                &deadline,
+                reporter,
+                State::Stopping,
+            )
+            .await,
+        );
         // A successful late drain must not consume the stop row's budget.
         // If drain never returned, preserve the existing no-stop-row behavior.
         if audit_started && drain_returned {
@@ -240,3 +254,10 @@ mod unix_bridge;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod cluster_owner;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod cluster_runtime;
+
+pub fn cluster_entry(args: &[std::ffi::OsString]) -> Option<i32> {
+    crate::cluster::consensus::activation::entry(args)
+}

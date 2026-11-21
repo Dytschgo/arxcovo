@@ -147,6 +147,7 @@ impl std::error::Error for StartError {}
 mod adapter;
 pub(in crate::cluster) mod anchor_query;
 mod bound_start;
+pub(crate) use bound_start::activation;
 mod checked_clock;
 mod initial_promotion;
 pub(in crate::cluster) mod issue;

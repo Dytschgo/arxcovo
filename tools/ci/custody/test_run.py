@@ -556,14 +556,16 @@ class LauncherTests(unittest.TestCase):
                 run.choose(candidates)
 
     def test_exact_operational_probe_accepts_real_filtered_counts(self):
-        for filtered in (0, 1, 829):
+        for filtered in (0, 1, 829, 999, 1000, 1005, 9999):
             transcript = (f"running 1 test\ntest {run.PROBE} ... ARX_PASS selected=1 passed=1\n"
                           f"ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; {filtered} filtered out; finished in 0.01s\n").encode()
             with self.subTest(filtered=filtered):
                 self.assertEqual(run.terminal(transcript)['filtered'], filtered)
                 for bad in (transcript.replace(b'running 1 test', b'running 0 tests'),
                             transcript.replace(b'ok. 1 passed; 0 failed', b'FAILED. 0 passed; 1 failed'),
-                            transcript.replace(b'ARX_PASS selected=1 passed=1', b'')):
+                            transcript.replace(b'ARX_PASS selected=1 passed=1', b''),
+                            transcript.replace(f'{filtered} filtered out'.encode(),
+                                               b'10000 filtered out')):
                     with self.assertRaisesRegex(run.Refusal, 'MissingOracle'):
                         run.terminal(bad)
 

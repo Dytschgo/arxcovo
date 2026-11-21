@@ -96,6 +96,29 @@ impl std::error::Error for Refusal {}
 pub(super) fn rpc_error(reason: Refusal) -> RPCError<Arx> {
     RPCError::Unreachable(Unreachable::new(&reason))
 }
+#[cfg(any(test, target_os = "linux"))]
+fn activation_listener(
+    address: SocketAddr,
+    inherited: Option<std::net::TcpListener>,
+) -> Result<TcpListener, Refusal> {
+    let listener = match inherited {
+        Some(listener) => {
+            #[cfg(target_os = "linux")]
+            crate::service::cluster_runtime::listen_inherited(&listener)
+                .map_err(|_| Refusal::Address)?;
+            listener
+        }
+        None => std::net::TcpListener::bind(address).map_err(|_| Refusal::Address)?,
+    };
+    if listener.local_addr().ok() != Some(address) {
+        return Err(Refusal::Address);
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| Refusal::Address)?;
+    TcpListener::from_std(listener).map_err(|_| Refusal::Address)
+}
+
 pub(super) fn endpoint(text: &str) -> Result<SocketAddr, Refusal> {
     if text.len() > 200 {
         return Err(Refusal::Address);
@@ -176,7 +199,7 @@ struct State {
     #[cfg(any(test, target_os = "linux"))]
     voter_receiver: Option<Arc<dyn issuer_channel::Receiver>>,
     #[cfg(any(test, target_os = "linux"))]
-    voter_transfers: [Option<NodeId>; 2],
+    voter_transfers: [Option<(NodeId, Arc<issuer_channel::AttemptState>)>; 2],
     keeper: Option<SmAdapter>,
     tasks: JoinSet<()>,
     // <=32 task results plus the single accept-loop result during close.
@@ -280,7 +303,7 @@ impl TransportOwner {
                     #[cfg(any(test, target_os = "linux"))]
                     voter_receiver: None,
                     #[cfg(any(test, target_os = "linux"))]
-                    voter_transfers: [None; 2],
+                    voter_transfers: [const { None }; 2],
                     keeper: Some(sm.clone()),
                     tasks: JoinSet::new(),
                     join_errors: Vec::new(),
@@ -1822,7 +1845,7 @@ impl TransportOwner {
                 #[cfg(any(test, target_os = "linux"))]
                 voter_receiver: None,
                 #[cfg(any(test, target_os = "linux"))]
-                voter_transfers: [None; 2],
+                voter_transfers: [const { None }; 2],
                 keeper: None,
                 tasks: JoinSet::new(),
                 join_errors: Vec::new(),
@@ -1905,13 +1928,25 @@ impl TransportOwner {
             _ => Err(Refusal::NotReady),
         }
     }
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn attach_founder(
         &mut self,
         sm: &SmAdapter,
         dispatch: Arc<dyn AppendDispatch>,
         address: &str,
         credentials: Credentials,
+    ) -> Result<(), Refusal> {
+        self.attach_founder_on(sm, dispatch, address, credentials, None)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn attach_founder_on(
+        &mut self,
+        sm: &SmAdapter,
+        dispatch: Arc<dyn AppendDispatch>,
+        address: &str,
+        credentials: Credentials,
+        inherited: Option<std::net::TcpListener>,
     ) -> Result<(), Refusal> {
         // The caller holds the job's close gate through bind and registration.
         // There is no await (and therefore no unowned listener) under that gate.
@@ -1923,13 +1958,7 @@ impl TransportOwner {
             credentials,
             dispatch,
         )?;
-        let listener = std::net::TcpListener::bind(endpoint(address)?)
-            .and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                Ok(listener)
-            })
-            .and_then(TcpListener::from_std)
-            .map_err(|_| Refusal::Address)?;
+        let listener = activation_listener(endpoint(address)?, inherited)?;
         self.publish(sm, resources, listener)
     }
 
@@ -1980,6 +2009,7 @@ impl TransportOwner {
         address: SocketAddr,
         credentials: Credentials,
         gate: Arc<peer_registry::LearnerGate>,
+        inherited: Option<std::net::TcpListener>,
     ) -> Result<(), Refusal> {
         let credentials = self.take_attach_credentials(Some(credentials))?;
         let resources = make_resources_for_learner(
@@ -1990,13 +2020,7 @@ impl TransportOwner {
             dispatch,
             Some(gate),
         )?;
-        let listener = std::net::TcpListener::bind(endpoint(&address.to_string())?)
-            .and_then(|listener| {
-                listener.set_nonblocking(true)?;
-                Ok(listener)
-            })
-            .and_then(TcpListener::from_std)
-            .map_err(|_| Refusal::Address)?;
+        let listener = activation_listener(endpoint(&address.to_string())?, inherited)?;
         self.publish(sm, resources, listener)
     }
 
@@ -2405,7 +2429,7 @@ mod issuer_channel {
         pki::{ca::fingerprint_of, custody::voter_transfer::Wipe},
     };
     use control::issuer as wire;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
     use tokio_rustls::server::TlsStream;
 
     pub(super) type ReceiveFuture<'a, T> =
@@ -2535,9 +2559,67 @@ mod issuer_channel {
         Ok(())
     }
 
+    const CHECKING: u8 = 0;
+    const UNSPENT: u8 = 1;
+    const RESERVED: u8 = 2;
+
+    pub(super) struct AttemptState {
+        disposition: AtomicU8,
+    }
+
+    impl AttemptState {
+        fn available(&self) -> bool {
+            self.disposition.load(Ordering::SeqCst) == UNSPENT
+        }
+
+        fn refuse_or_unknown(&self) -> Outcome {
+            match self.disposition.compare_exchange(
+                CHECKING,
+                UNSPENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Err(RESERVED) => Outcome::Unknown,
+                _ => Outcome::Refused,
+            }
+        }
+    }
+
+    struct ChallengeCheck(Arc<AttemptState>);
+
+    impl ChallengeCheck {
+        fn new() -> Self {
+            Self(Arc::new(AttemptState {
+                disposition: AtomicU8::new(CHECKING),
+            }))
+        }
+
+        async fn build_once<T>(
+            self,
+            build: impl Future<Output = Result<T, Refusal>>,
+        ) -> Result<T, Refusal> {
+            self.0
+                .disposition
+                .compare_exchange(CHECKING, RESERVED, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| Refusal::Identity)?;
+            build.await
+        }
+    }
+
+    impl Drop for ChallengeCheck {
+        fn drop(&mut self) {
+            let _ = self.0.disposition.compare_exchange(
+                CHECKING,
+                UNSPENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
     pub(in crate::cluster::consensus) struct Transfer {
         reply: oneshot::Receiver<Result<(), Refusal>>,
-        sent: Arc<AtomicBool>,
+        attempt: Arc<AttemptState>,
         deadline: Instant,
     }
 
@@ -2545,10 +2627,66 @@ mod issuer_channel {
         pub(in crate::cluster::consensus) async fn outcome(self) -> Outcome {
             match timeout_at(self.deadline, self.reply).await {
                 Ok(Ok(Ok(()))) if Instant::now() < self.deadline => Outcome::Installed,
-                _ if self.sent.load(Ordering::SeqCst) => Outcome::Unknown,
-                _ => Outcome::Refused,
+                _ => self.attempt.refuse_or_unknown(),
             }
         }
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn c13_challenge_refusal_is_unspent_and_reserved_failure_is_terminal() {
+        let check = ChallengeCheck::new();
+        let (complete, reply) = oneshot::channel();
+        let outcome = Transfer {
+            reply,
+            attempt: check.0.clone(),
+            deadline: Instant::now(),
+        };
+        let mut built = 0;
+        // Hold the sender at the reservation boundary while the caller expires.
+        assert_eq!(outcome.outcome().await, Outcome::Refused);
+        assert!(check.0.available());
+        assert_eq!(
+            check
+                .build_once(async {
+                    built += 1;
+                    Ok(())
+                })
+                .await,
+            Err(Refusal::Identity),
+        );
+        drop(complete);
+        assert_eq!(built, 0);
+
+        let check = ChallengeCheck::new();
+        let state = check.0.clone();
+        let (_complete, reply) = oneshot::channel();
+        let outcome = Transfer {
+            reply,
+            attempt: state.clone(),
+            deadline: Instant::now(),
+        };
+        // The sender wins reservation before the caller observes its deadline.
+        let (started, entered) = oneshot::channel();
+        let build = async {
+            check
+                .build_once(async {
+                    built += 1;
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<(), Refusal>>().await
+                })
+                .await
+        };
+        {
+            tokio::pin!(build);
+            tokio::select! {
+                _ = &mut build => panic!("package construction must be retained"),
+                result = entered => result.unwrap(),
+            }
+            assert_eq!(outcome.outcome().await, Outcome::Unknown);
+        }
+        assert!(!state.available());
+        assert_eq!(built, 1);
     }
 
     impl TransportOwner {
@@ -2580,10 +2718,21 @@ mod issuer_channel {
             let shared = &self.shared;
             let (tx, reply) = oneshot::channel();
             let deadline = Instant::now() + INBOUND_BUDGET;
-            let sent = Arc::new(AtomicBool::new(false));
+            let check = ChallengeCheck::new();
+            let attempt = check.0.clone();
             let mut state = shared.state.lock().map_err(|_| Refusal::Closed)?;
-            let target = Some(offer.claim.receiver.0);
-            if state.voter_transfers.contains(&target) {
+            for slot in &mut state.voter_transfers {
+                if slot.as_ref().is_some_and(|(_, state)| state.available()) {
+                    *slot = None;
+                }
+            }
+            let target = offer.claim.receiver.0;
+            if state
+                .voter_transfers
+                .iter()
+                .flatten()
+                .any(|(id, _)| *id == target)
+            {
                 return Err(Refusal::Identity);
             }
             let free = state
@@ -2598,13 +2747,12 @@ mod issuer_channel {
                 std::mem::take(&mut state.join_errors)
             };
             if let Ok(admission) = admission {
-                state.voter_transfers[free] = target;
+                state.voter_transfers[free] = Some((target, attempt.clone()));
                 let shared = shared.clone();
-                let sent = sent.clone();
                 state.tasks.spawn(async move {
                     let result = timeout_at(
                         deadline,
-                        send(&shared, admission, sender, offer, deadline, &sent),
+                        send(&shared, admission, sender, offer, deadline, check),
                     )
                     .await
                     .unwrap_or(Err(Refusal::Deadline));
@@ -2620,7 +2768,7 @@ mod issuer_channel {
             drop(join_errors);
             Ok(Transfer {
                 reply,
-                sent,
+                attempt,
                 deadline,
             })
         }
@@ -2632,7 +2780,7 @@ mod issuer_channel {
         sender: impl Sender,
         offer: Offer,
         deadline: Instant,
-        sent: &AtomicBool,
+        check: ChallengeCheck,
     ) -> Result<(), Refusal> {
         let Admission {
             resources,
@@ -2690,10 +2838,11 @@ mod issuer_channel {
             .export_keying_material(&mut key.0[..], ISSUER_EXPORTER_LABEL, Some(&transcript))
             .map_err(|_| Refusal::Tls)?;
         before_dispatch(shared, deadline)?;
-        let sealed = sender.seal(offer, &key.0, &transcript).await?;
+        let sealed = check
+            .build_once(async { sender.seal(offer, &key.0, &transcript).await })
+            .await?;
         drop(key);
         before_dispatch(shared, deadline)?;
-        sent.store(true, Ordering::SeqCst);
         wire::sealed(&mut stream, &sealed).await?;
         wire::read_acknowledgement(&mut stream, &challenge).await?;
         resources

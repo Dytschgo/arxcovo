@@ -1,7 +1,7 @@
 //! Retained published learner composition and same-process reopen.
 use super::*;
 use crate::cluster::{
-    enrollment::durable_join::{HistoryJoin, PublishedJoin, RetainedJoin},
+    enrollment::durable_join::{HistoryJoin, PublishedJoin, RedeemIssuer, RetainedJoin},
     issuance_publication::check_retained,
     join_receipt::PublicIdentity,
     pki::custody::{LearnerCustody, LearnerReopen},
@@ -9,6 +9,7 @@ use crate::cluster::{
     startup_plan::{Mode, ReopenObjects},
 };
 use checked_clock::{CheckedClock, HostClock};
+use enrollment_ingress::ActivationError;
 use membership_observation::{IssuerMembership, IssuerProof};
 use peer_network::EngineDispatch;
 use peer_registry::{LearnerGate, Phase};
@@ -33,13 +34,16 @@ pub(super) struct Operation {
     #[cfg(test)]
     issuer_before_proof: Option<membership_observation::BeforeProof>,
     recovered: bool,
+    process_recovered: bool,
+    redeem_issuer: Option<RedeemIssuer>,
     #[cfg(test)]
     fixture: Option<HostedCatchUp>,
 }
 
 enum Input {
-    Published(Box<PublishedJoin>, Option<Box<(Fresh, Live)>>),
+    Published(Box<PublishedJoin>, Option<Box<(Fresh, Live, RedeemIssuer)>>),
     Reopen(Box<Reopen>),
+    Process(Box<startup_recovery::HistoryReady>),
 }
 
 struct Member {
@@ -122,6 +126,7 @@ pub(super) fn start_published(
     Ok(start(
         Input::Published(Box::new(join.consume()?), None),
         params,
+        None,
         #[cfg(test)]
         fixture,
     ))
@@ -131,10 +136,19 @@ pub(super) fn start_history_join(
     join: HistoryJoin,
     params: Params,
 ) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
-    let (published, slot, issuance) = join.consume()?;
+    start_history(join, params, None)
+}
+
+pub(super) fn start_history(
+    join: HistoryJoin,
+    params: Params,
+    fence: Option<&super::runtime::Admission>,
+) -> Result<Run, crate::cluster::enrollment::durable_join::Status> {
+    let (published, slot, issuance, peer) = join.consume()?;
     Ok(start(
-        Input::Published(Box::new(published), Some(Box::new((slot, issuance)))),
+        Input::Published(Box::new(published), Some(Box::new((slot, issuance, peer)))),
         params,
+        fence,
         #[cfg(test)]
         None,
     ))
@@ -148,15 +162,43 @@ pub(super) fn recover(
     start(
         Input::Reopen(Box::new(expectation)),
         params,
+        None,
         #[cfg(test)]
         fixture,
     )
 }
 
-fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchUp>) -> Run {
+pub(super) fn recover_process(
+    ready: startup_recovery::HistoryReady,
+    params: Params,
+    fence: &super::runtime::Admission,
+) -> Run {
+    start(
+        Input::Process(Box::new(ready)),
+        params,
+        Some(fence),
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn start(
+    input: Input,
+    params: Params,
+    fence: Option<&super::runtime::Admission>,
+    #[cfg(test)] fixture: Option<HostedCatchUp>,
+) -> Run {
     let (plan, expected) = match &input {
         Input::Published(p, _) => (&p.owner.plan, &p.expected),
         Input::Reopen(r) => (&r.0.plan, r.0.expected.as_ref()),
+        Input::Process(ready) => (
+            &ready.owner.plan,
+            &ready
+                .history
+                .verified()
+                .expect("authenticated input")
+                .expected,
+        ),
     };
     let intent = StartIntent {
         mode: plan.mode,
@@ -166,7 +208,8 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         peer: plan.peer.parse().expect("checked peer address"),
         enrollment: plan.enrollment.parse().expect("checked enrollment address"),
     };
-    let recovered = matches!(input, Input::Reopen(_));
+    let process_recovered = matches!(input, Input::Process(_));
+    let recovered = process_recovered || matches!(input, Input::Reopen(_));
     let (transport, factory) = TransportOwner::pending_founder(intent.cluster, intent.node);
     let job = Job::anchor();
     let mut state = job.state();
@@ -188,10 +231,15 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         #[cfg(test)]
         issuer_before_proof: None,
         recovered,
+        process_recovered,
+        redeem_issuer: None,
         #[cfg(test)]
         fixture,
     });
     drop(state);
+    if let Some(fence) = fence {
+        fence.register(job);
+    }
     let (_, observer, supervisor) = drive(
         job,
         None,
@@ -248,6 +296,11 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
                 time,
             } = *published;
             state.owner = Some(owner);
+            let history = history.map(|history| {
+                let (slot, live, peer) = *history;
+                op.redeem_issuer = Some(peer);
+                Box::new((slot, live))
+            });
             op.member = Some(Member {
                 expected: Arc::new(expected),
                 leaf,
@@ -267,7 +320,15 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
             }
             let member = op.member.as_ref().unwrap();
             owner.stage_published_join()?;
+            // Credentials checks the exact learner custody inventory, including
+            // the absence of any CA material in the member store.
             op.credentials = Some(member.credentials(owner, &clock)?);
+            if state.process_owned
+                && let Some((slot, _)) = member.history.as_deref()
+            {
+                slot.confirm_learner_without_ca()?;
+                state.join_evidence.without_ca = true;
+            }
             let (stores, ready) = startup_recovery::prepare_published_join(owner, intent);
             let failure = stores.first_failure_for_learner();
             state.stores = Some(stores);
@@ -302,6 +363,34 @@ fn prepare_inner(state: &mut State, intent: &StartIntent) -> Result<(), Refusal>
             state.stores = Some(stores);
             Arc::new(clock.ok_or(failure)?)
         }
+        Input::Process(ready) => {
+            let startup_recovery::HistoryReady {
+                owner,
+                history,
+                stores,
+                clock,
+            } = *ready;
+            state.owner = Some(owner);
+            state.stores = Some(stores);
+            let (custody, evidence) = history.into_learner().map_err(|history| {
+                state.recovery_hold = Some(super::runtime::RecoveryHold::Custody(history));
+                Refusal::Identity
+            })?;
+            op.issuer_membership = evidence.voter_position();
+            let owner = state.owner.as_ref().unwrap();
+            // Install custody before any fallible artifact read so a refusal
+            // retains the same ownership until the process exits.
+            let member = op.member.insert(Member {
+                expected: Arc::new(evidence.expected),
+                leaf: Vec::new(),
+                custody,
+                history: None,
+            });
+            let record = PublicIdentity::decode(&owner.read("identity.json", 8192)?)
+                .map_err(|_| Refusal::Identity)?;
+            member.leaf = record.leaf().to_vec();
+            clock
+        }
     };
     let member = op.member.as_ref().unwrap();
     op.credentials = Some(member.credentials(state.owner.as_ref().unwrap(), &clock)?);
@@ -328,15 +417,27 @@ pub(super) async fn attach(job: &'static Job, address: &SocketAddr) {
         if state.close_requested {
             Err(Refusal::Ownership)
         } else {
+            let listener = state.inherited.as_mut().and_then(|pair| pair.peer.take());
             attach_inner(
                 state.learner.as_mut().unwrap(),
                 &node,
                 &mut transport,
                 *address,
+                listener,
             )
         }
     };
     let result = result.and_then(|()| {
+        if job
+            .state()
+            .learner
+            .as_ref()
+            .is_some_and(|op| op.process_recovered)
+        {
+            // A restarted installation can use its authenticated completion.
+            // It cannot receive a new installation through the legacy lane.
+            return Ok(());
+        }
         transport
             .receive_issuer_transfer(job)
             .map_err(|_| Refusal::Ownership)
@@ -349,6 +450,7 @@ fn attach_inner(
     node: &ConsensusNode,
     transport: &mut TransportOwner,
     address: SocketAddr,
+    listener: Option<std::net::TcpListener>,
 ) -> Result<(), Refusal> {
     let sm = node.sm.as_ref().ok_or(Refusal::Store)?;
     let raft = node.raft.clone().ok_or(Refusal::Store)?;
@@ -376,6 +478,7 @@ fn attach_inner(
             address,
             credentials,
             gate.clone(),
+            listener,
         )
         .map_err(|_| Refusal::Unavailable)?;
     op.gate = Some(gate);
@@ -393,6 +496,26 @@ pub(super) async fn close_transport(job: &Job) -> bool {
 }
 
 impl Run {
+    pub(super) fn set_authenticated_admission_route(
+        &self,
+        issuer: SocketAddr,
+    ) -> Result<(), Refusal> {
+        {
+            let state = self.job.state();
+            let op = state.learner.as_ref().ok_or(Refusal::Ownership)?;
+            if op.recovered {
+                return Err(Refusal::Provenance);
+            }
+            let gate = op.gate.as_ref().ok_or(Refusal::Unavailable)?;
+            let peer = op.redeem_issuer.as_ref().ok_or(Refusal::Provenance)?;
+            let expect = gate.admission_anchor().map_err(|_| Refusal::Identity)?;
+            if expect != (peer.node, peer.key.as_bytes()) {
+                return Err(Refusal::Identity);
+            }
+        }
+        self.set_admission_route(issuer)
+    }
+
     pub(super) fn set_admission_route(&self, issuer: SocketAddr) -> Result<(), Refusal> {
         let mut state = self.job.state();
         if state.status != Status::LearnerReady || state.close_requested {
@@ -414,20 +537,31 @@ impl Run {
 
     pub(super) async fn admit(&self) -> learner_admission::Reply {
         let result = {
-            let state = self.job.state();
+            let mut state = self.job.state();
             if state.status != Status::LearnerReady || state.close_requested {
                 return learner_admission::Reply::Refused;
             }
-            state
+            let request = state
                 .learner
                 .as_ref()
                 .and_then(|op| op.admission.as_ref())
-                .and_then(|client| client.request())
+                .and_then(|client| client.request());
+            if request.is_some() && state.process_owned {
+                state.join_evidence.requests = state.join_evidence.requests.saturating_add(1);
+            }
+            request
         };
-        match result {
-            Some(result) => result.reply().await,
-            None => learner_admission::Reply::Refused,
+        let Some(result) = result else {
+            return learner_admission::Reply::Refused;
+        };
+        let reply = result.reply().await;
+        if let learner_admission::Reply::Applied(position, _) = reply {
+            let mut state = self.job.state();
+            if state.process_owned {
+                state.join_evidence.applied = Some(position);
+            }
         }
+        reply
     }
 
     #[cfg(test)]
@@ -486,7 +620,7 @@ impl Run {
             .ok()
     }
 
-    pub(super) fn persist_strict_history(&self) -> Result<(), Refusal> {
+    pub(super) fn persist_strict_history(&self) -> Result<(), ActivationError> {
         self.job.persist_strict_history()
     }
 
@@ -516,9 +650,7 @@ impl Run {
 
     pub(super) async fn close(self, retain_reopen: bool) -> Result<Option<Reopen>, Refusal> {
         let seed = retain_reopen.then(|| self.pin_for_reopen()).transpose();
-        if !self.job.state().close_requested {
-            drop(self.job.request_close());
-        }
+        drop(self.job.request_close());
         self.supervisor.await.map_err(|_| Refusal::Ownership)?;
         let state = self.job.state();
         if state.status != Status::Clean || state.owner.is_some() || state.learner.is_some() {
@@ -595,28 +727,31 @@ impl restart_history::StrictObservation for StrictWitness {
 }
 
 impl Job {
-    fn persist_strict_history(&self) -> Result<(), Refusal> {
+    fn persist_strict_history(&self) -> Result<(), ActivationError> {
+        use ActivationError::Refused;
         let mut state = self.state();
         if state.close_requested || state.status != Status::LearnerReady {
-            return Err(Refusal::Ownership);
+            return Err(Refused);
         }
-        let State { owner, learner, .. } = &mut *state;
-        let op = learner.as_mut().ok_or(Refusal::Unavailable)?;
-        let gate = op.gate.as_ref().ok_or(Refusal::Unavailable)?;
-        let (Phase::Strict, Some(position)) = gate
-            .admission_progress()
-            .map_err(|_| Refusal::Unavailable)?
-        else {
-            return Err(Refusal::Provenance);
-        };
-        let member = op.member.as_mut().ok_or(Refusal::Identity)?;
-        let (slot, live) = member.history.as_deref_mut().ok_or(Refusal::Provenance)?;
-        slot.persist_strict(
-            owner.as_ref().ok_or(Refusal::Ownership)?,
-            &member.custody,
-            live,
-            StrictWitness(position),
-        )
+        let State {
+            owner,
+            learner,
+            process_owned,
+            ..
+        } = &mut *state;
+        let op = learner.as_mut().ok_or(Refused)?;
+        let gate = op.gate.as_ref().ok_or(Refused)?;
+        let position = observe_strict(gate, StateStore::applied)?.ok_or(Refused)?;
+        let member = op.member.as_mut().ok_or(Refused)?;
+        let (slot, live) = member.history.as_deref_mut().ok_or(Refused)?;
+        let owner = owner.as_ref().ok_or(Refused)?;
+        if *process_owned && live.links().is_ok() {
+            return slot
+                .confirm_strict(owner, &member.custody.history_auth(), live)
+                .map_err(|_| Refused);
+        }
+        slot.persist_strict(owner, &member.custody, live, StrictWitness(position))
+            .map_err(|_| Refused)
     }
 
     pub(in crate::cluster::consensus) async fn check_issuer_transfer(
@@ -624,6 +759,33 @@ impl Job {
         claim: super::issuer_transfer::Claim,
         sender: crate::cluster::pki::verify::AuthenticatedPeer,
     ) -> Result<super::issuer_transfer::Offer, peer_transport::Refusal> {
+        let activation = {
+            let state = self.state();
+            state.process_owned.then(|| state.node.clone()).flatten()
+        };
+        if let Some(node) = activation {
+            use openraft::type_config::async_runtime::watch::WatchReceiver;
+            let refused = peer_transport::Refusal::Identity;
+            let mut metrics = node.lock().await.raft.as_ref().ok_or(refused)?.metrics();
+            // Within the already bounded transport check, wait for local
+            // apply rather than treating replicated bytes as confirmation.
+            loop {
+                let applied = metrics.borrow_watched().last_applied;
+                if let Some(applied) = applied
+                    && applied.index >= claim.membership.index
+                {
+                    if applied.index == claim.membership.index
+                        && (applied.leader_id.term, applied.leader_id.node_id)
+                            != (claim.membership.term, claim.membership.leader)
+                    {
+                        return Err(refused);
+                    }
+                    break;
+                }
+                metrics.changed().await.map_err(|_| refused)?;
+            }
+            self.persist_strict_history().map_err(|_| refused)?;
+        }
         self.with_receiver_proof(claim, sender, |_, offer| offer)
             .await
     }
@@ -742,7 +904,6 @@ impl Job {
             let mut state = self.state();
             let (owner, op) = receiver_parts(&mut state)?;
             let member = op.member.as_mut().ok_or(refused)?;
-            member.custody.spend_voter_history().map_err(|_| refused)?;
             let links = member
                 .history
                 .as_deref()
@@ -750,6 +911,7 @@ impl Job {
                 .1
                 .links()
                 .map_err(|_| refused)?;
+            member.custody.spend_voter_history().map_err(|_| refused)?;
             let clock = op.clock.as_ref().ok_or(refused)?;
             let tls = member.credentials(owner, clock).map_err(|_| refused)?;
             let now = clock.sample_ms().map_err(|_| refused)?;
@@ -827,32 +989,42 @@ impl Job {
         })
     }
 
-    pub(super) async fn activate_promoted_issuer(&'static self) -> Result<(), Refusal> {
-        let (node, ..) = voter_context(&self.state()).ok_or(Refusal::Identity)?;
-        let node = node.try_lock().map_err(|_| Refusal::Ownership)?;
+    pub(super) async fn activate_promoted_issuer(&'static self) -> Result<(), ActivationError> {
+        let (node, ..) = voter_context(&self.state())?;
+        let node = node.try_lock().map_err(|_| ActivationError::Deferred)?;
         // The unchanged quorum read establishes leadership before publishing readiness.
-        let (epoch, ()) = node
-            .fresh_read(|_| Ok(()))
-            .await
-            .map_err(|_| Refusal::Unavailable)?;
-        self.publish_promoted_issuer(&node, epoch)
+        let (epoch, ()) = node.fresh_read(|_| Ok(())).await?;
+        self.publish_promoted_issuer(&node, epoch, || {
+            use openraft::type_config::async_runtime::watch::WatchReceiver;
+            let raft = node.raft.as_ref().ok_or(ActivationError::Refused)?;
+            let metrics = raft.metrics();
+            let current = metrics.borrow_watched();
+            if current.running_state.is_err() {
+                return Err(ActivationError::Refused);
+            }
+            let local_leader = current.vote.committed
+                && current.current_leader == Some(node.id)
+                && current.state == openraft::ServerState::Leader;
+            Ok(local_leader.then_some(current.vote.leader_id))
+        })
     }
 
     fn publish_promoted_issuer(
         &self,
         node: &ConsensusNode,
         epoch: LeaderId,
-    ) -> Result<(), Refusal> {
+        observe_epoch: impl Fn() -> Result<Option<LeaderId>, ActivationError>,
+    ) -> Result<(), ActivationError> {
         let mut state = self.state();
-        let (_, local, clock) = voter_context(&state).ok_or(Refusal::Identity)?;
+        let (_, local, clock) = voter_context(&state)?;
         if epoch.node_id != local.node.get() {
-            return Err(Refusal::Identity);
+            return Err(ActivationError::Refused);
         }
-        let owner = state.owner.as_ref().ok_or(Refusal::Ownership)?;
-        let endpoint =
-            peer_transport::endpoint(&owner.plan.enrollment).map_err(|_| Refusal::Identity)?;
+        let owner = state.owner.as_ref().ok_or(ActivationError::Refused)?;
+        let endpoint = peer_transport::endpoint(&owner.plan.enrollment)
+            .map_err(|_| ActivationError::Refused)?;
         if !peer_control_wire::qualified(endpoint) || state.issuer.is_some() {
-            return Err(Refusal::Identity);
+            return Err(ActivationError::Refused);
         }
         let cluster = state
             .learner
@@ -863,7 +1035,12 @@ impl Job {
             .unwrap()
             .expected
             .cluster;
-        let (ca, tls, installed_at, _proof) = load_promoted(&state, node, Some(epoch))?;
+        let check_epoch = || {
+            (observe_epoch()? == Some(epoch))
+                .then_some(())
+                .ok_or(ActivationError::Deferred)
+        };
+        let (ca, tls, installed_at, _proof) = load_promoted(&state, node, Some(&check_epoch))?;
         state.issuer = Some(Arc::new(enrollment_ingress::ReadyIssuer::promoted(
             endpoint,
             cluster,
@@ -878,6 +1055,14 @@ impl Job {
 }
 
 impl Operation {
+    pub(super) fn voter_custody(&self) -> bool {
+        self.issuer_membership.is_some()
+    }
+
+    pub(super) fn installation_id(&self) -> Option<[u8; 16]> {
+        Some(self.member.as_ref()?.custody.installation())
+    }
+
     fn issuer_membership_view<'a>(&self, node: &'a ConsensusNode) -> IssuerMembership<'a> {
         let membership = node.issuer_membership();
         #[cfg(test)]
@@ -929,30 +1114,51 @@ type VoterContext = (
     Arc<HostClock>,
 );
 
-fn voter_context(state: &State) -> Option<VoterContext> {
+fn observe_strict<T>(
+    gate: &LearnerGate,
+    observe: impl FnOnce(&StateStore) -> T,
+) -> Result<T, ActivationError> {
+    use peer_registry::ObservationRefusal;
+    gate.inspect_strict(None, observe)
+        .map_err(|error| match error {
+            ObservationRefusal::StoreBusy => ActivationError::Deferred,
+            ObservationRefusal::Refused(_) => ActivationError::Refused,
+        })
+}
+
+fn voter_context(state: &State) -> Result<VoterContext, ActivationError> {
+    use ActivationError::Refused;
     if state.close_requested || state.status != Status::LearnerReady {
-        return None;
+        return Err(Refused);
     }
-    let op = state.learner.as_ref()?;
-    let member = op.member.as_ref()?;
-    if op.gate.as_ref()?.phase().ok()? != Phase::Strict {
-        return None;
-    }
-    Some((
-        state.node.clone()?,
+    let op = state.learner.as_ref().ok_or(Refused)?;
+    let member = op.member.as_ref().ok_or(Refused)?;
+    observe_strict(op.gate.as_ref().ok_or(Refused)?, |_| ())?;
+    Ok((
+        state.node.clone().ok_or(Refused)?,
         super::issuer_transfer::Voter {
             node: member.expected.node,
             key: member.expected.key,
-            address: op.advertised?,
+            address: op.advertised.ok_or(Refused)?,
         },
-        op.clock.clone()?,
+        op.clock.clone().ok_or(Refused)?,
     ))
+}
+
+// Check identity before considering whether the quorum epoch is still live.
+fn activation_proof<T>(
+    proof: Result<T, membership_observation::MembershipReadError>,
+    check_epoch: impl FnOnce() -> Result<(), ActivationError>,
+) -> Result<T, ActivationError> {
+    let proof = proof?;
+    check_epoch()?;
+    Ok(proof)
 }
 
 fn load_promoted<'a>(
     state: &State,
     node: &'a ConsensusNode,
-    epoch: Option<LeaderId>,
+    check_epoch: Option<&dyn Fn() -> Result<(), ActivationError>>,
 ) -> Result<
     (
         crate::cluster::pki::ca::ClusterCa,
@@ -960,30 +1166,49 @@ fn load_promoted<'a>(
         LogPos,
         IssuerProof<'a>,
     ),
-    Refusal,
+    ActivationError,
 > {
     use crate::cluster::pki::custody::Error;
-    let (_, local, clock) = voter_context(state).ok_or(Refusal::Identity)?;
-    let op = state.learner.as_ref().ok_or(Refusal::Identity)?;
-    let installed_at = op.issuer_membership.ok_or(Refusal::Identity)?;
-    let member = op.member.as_ref().ok_or(Refusal::Identity)?;
+    let (_, local, clock) = voter_context(state)?;
+    let op = state.learner.as_ref().ok_or(ActivationError::Refused)?;
+    let installed_at = op.issuer_membership.ok_or(ActivationError::Refused)?;
+    let member = op.member.as_ref().ok_or(ActivationError::Refused)?;
     let cluster = member.expected.cluster;
-    let owner = state.owner.as_ref().ok_or(Refusal::Ownership)?;
-    let tls = member.credentials(owner, &clock)?;
-    let now = clock.sample_ms().map_err(|_| Refusal::Clock)?;
+    let owner = state.owner.as_ref().ok_or(ActivationError::Refused)?;
+    let tls = member
+        .credentials(owner, &clock)
+        .map_err(|_| ActivationError::Refused)?;
+    let now = clock.sample_ms().map_err(|_| ActivationError::Refused)?;
     let membership = op.issuer_membership_view(node);
+    let mut activation_error = ActivationError::Refused;
     let (ca, proof) = member
         .custody
         .load_voter_ca(cluster, tls.root.as_ref(), now, || {
-            let proof = membership
-                .voter_proof(cluster, local, installed_at, epoch.is_some(), epoch)
-                .map_err(|_| Error::Ownership)?;
-            if !proof.covers_member(&member.expected, local.address) {
+            // Bracket the guarded identity proof with the same quorum epoch.
+            // A proof refusal retains its own cause even if the vote changes.
+            let check = || check_epoch.map_or(Ok(()), |observe| observe());
+            let before = check();
+            if before == Err(ActivationError::Refused) {
                 return Err(Error::Ownership);
             }
+            let proof = activation_proof(
+                membership
+                    .voter_proof(cluster, local, installed_at, check_epoch.is_some(), None)
+                    .and_then(|proof| {
+                        proof
+                            .covers_member(&member.expected, local.address)
+                            .then_some(proof)
+                            .ok_or(membership_observation::MembershipReadError::PeerRefused)
+                    }),
+                || check().and(before),
+            )
+            .map_err(|error| {
+                activation_error = error;
+                Error::Ownership
+            })?;
             Ok(proof)
         })
-        .map_err(|_| Refusal::Identity)?;
+        .map_err(|_| activation_error)?;
     Ok((ca, tls, installed_at, proof))
 }
 
@@ -991,9 +1216,10 @@ fn load_promoted<'a>(
 impl Run {
     pub(super) fn loaded_voter_root(&self) -> Result<Vec<u8>, Refusal> {
         let state = self.job.state();
-        let (node, ..) = voter_context(&state).ok_or(Refusal::Identity)?;
+        let (node, ..) = voter_context(&state).map_err(|_| Refusal::Identity)?;
         let node = node.try_lock().map_err(|_| Refusal::Ownership)?;
-        let (ca, _, _, _proof) = load_promoted(&state, &node, None)?;
+        let (ca, _, _, _proof) =
+            load_promoted(&state, &node, None).map_err(|_| Refusal::Identity)?;
         Ok(ca.cert_der().to_vec())
     }
 }
@@ -1061,6 +1287,8 @@ impl Job {
             issuer_sample: Some(sample),
             issuer_before_proof: None,
             recovered: false,
+            process_recovered: false,
+            redeem_issuer: None,
             fixture: None,
         });
         state.status = Status::LearnerReady;
@@ -1142,9 +1370,18 @@ impl Job {
             load_promoted(&self.state(), &live, None).is_ok(),
             confirmed_at.is_some()
         );
-        // Exercise the production readiness transition after a synthetic quorum epoch.
+        // This fixture has no Engine. Model the quorum read and the subsequent
+        // local epoch observations independently of its guarded membership sample.
+        if confirmed_at.is_some() {
+            assert_eq!(
+                self.publish_promoted_issuer(&live, survivor.1, || Ok(None)),
+                Err(ActivationError::Deferred)
+            );
+            assert!(self.state().issuer.is_none());
+        }
         assert_eq!(
-            self.publish_promoted_issuer(&live, survivor.1).is_ok(),
+            self.publish_promoted_issuer(&live, survivor.1, || Ok(Some(survivor.1)))
+                .is_ok(),
             confirmed_at.is_some()
         );
         assert_eq!(self.state().issuer.is_some(), confirmed_at.is_some());
@@ -1187,7 +1424,7 @@ impl Job {
         };
 
         // Healthy control: this image loads the signer and passes the final proof.
-        assert!(voter_context(&self.state()).is_some());
+        assert!(voter_context(&self.state()).is_ok());
         let (ca, _, _, proof) = load_promoted(&self.state(), &live, None).unwrap();
         assert_eq!(ca.cert_der(), root);
         drop(proof);
@@ -1202,7 +1439,10 @@ impl Job {
                 }
             })
         });
-        assert!(self.publish_promoted_issuer(&live, survivor.1).is_err());
+        assert_eq!(
+            self.publish_promoted_issuer(&live, survivor.1, || Ok(Some(survivor.1))),
+            Err(ActivationError::Refused)
+        );
         // The failure reached the final proof and refused before signer load.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(self.state().issuer.is_none());
@@ -1229,5 +1469,102 @@ impl Job {
         state.learner.take();
         state.node.take();
         state.owner.take();
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use crate::cluster::enrollment::NodeId;
+    use crate::cluster::join_receipt::{ExpectedIdentity, Origin};
+    use enrollment_ingress::ActivationError::{Deferred, Refused};
+    use membership_observation::MembershipReadError;
+
+    #[test]
+    fn issuer_strict_recheck_defers_only_a_busy_store() {
+        use checked_clock::ClockError;
+
+        struct BrokenClock;
+        impl CheckedClock for BrokenClock {
+            fn sample_ms(&self) -> Result<u64, ClockError> {
+                Err(ClockError::Unavailable)
+            }
+        }
+
+        let dir = crate::service::application::tests::private_temp();
+        let node = NodeId::new(2).unwrap();
+        let key = crate::cluster::enrollment::KeyDigest::of_spki(&[2]).unwrap();
+        let store = StateStore::open(
+            dir.path(),
+            crate::cluster::state_store::Init {
+                cluster: [1; 16],
+                first_free: NodeId::new(3).unwrap(),
+            },
+        )
+        .unwrap();
+        let sm = SmAdapter(Arc::new(std::sync::Mutex::new(store)));
+        let gate = |clock: Arc<dyn CheckedClock>| {
+            LearnerGate::new(
+                &sm,
+                Arc::new(ExpectedIdentity {
+                    cluster: [1; 16],
+                    node,
+                    key,
+                    ca: [0; 32],
+                    origin: Origin::Redeem {
+                        term: 1,
+                        leader: 1,
+                        index: 1,
+                        anchors: vec![],
+                    },
+                }),
+                "192.168.0.2:7001".parse().unwrap(),
+                clock,
+                false,
+            )
+        };
+        let healthy_clock = gate(Arc::new(HostClock::new(0)));
+        let broken_clock = gate(Arc::new(BrokenClock));
+        {
+            let _held = sm.0.lock().unwrap();
+            assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Deferred));
+        }
+        // Failed clock observation must precede even a normal gate callback.
+        assert!(matches!(
+            broken_clock.inspect_strict(None, |_| ()),
+            Err(peer_registry::ObservationRefusal::Refused(
+                crate::cluster::pki::verify::VerifyRefusal::Unavailable
+            ))
+        ));
+        assert_eq!(observe_strict(&broken_clock, |_| ()), Err(Refused));
+        assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Refused));
+        let poison = sm.0.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poison.lock().unwrap();
+                panic!("deliberate activation store mutex poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Refused));
+        drop(sm);
+        assert_eq!(observe_strict(&healthy_clock, |_| ()), Err(Refused));
+    }
+
+    #[test]
+    fn issuer_epoch_change_cannot_mask_an_identity_refusal() {
+        for proof in [
+            MembershipReadError::PeerRefused,
+            MembershipReadError::Unavailable,
+        ] {
+            assert_eq!(
+                activation_proof::<()>(Err(proof), || Err(Deferred)),
+                Err(Refused)
+            );
+        }
+        assert_eq!(activation_proof(Ok(()), || Err(Deferred)), Err(Deferred));
+        assert_eq!(activation_proof(Ok(()), || Err(Refused)), Err(Refused));
+        assert_eq!(activation_proof(Ok(()), || Ok(())), Ok(()));
     }
 }

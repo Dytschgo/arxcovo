@@ -134,6 +134,8 @@ pub(crate) struct ServiceApplication<H = Native> {
     activity: Option<Arc<Activity>>,
     listener: Option<Listener>,
     serving: Option<tokio::task::JoinHandle<Result<(), ExitCode>>>,
+    #[cfg(target_os = "linux")]
+    cluster: Option<super::cluster_runtime::Child>,
     #[cfg(test)]
     discovery: Option<tokio::task::JoinHandle<Result<(), ExitCode>>>,
     #[cfg(test)]
@@ -168,6 +170,8 @@ impl<H: Hooks> ServiceApplication<H> {
             activity: None,
             listener: None,
             serving: None,
+            #[cfg(target_os = "linux")]
+            cluster: None,
             #[cfg(test)]
             discovery: None,
             #[cfg(test)]
@@ -233,6 +237,17 @@ impl<H: Hooks> Application for ServiceApplication<H> {
                 .run(move || hooks.bind(&layout, client))
                 .await?,
         );
+        #[cfg(target_os = "linux")]
+        if let Some(config) = &self.config
+            && let Some(launch) = config.cluster()
+        {
+            self.cluster = Some(super::cluster_runtime::Child::spawn(
+                launch,
+                self.layout.as_ref().ok_or(ExitCode::Layout)?,
+                config,
+            )?);
+            self.cluster.as_mut().unwrap().wait_ready().await?;
+        }
         Ok(())
     }
     async fn preflight(&mut self) {
@@ -340,7 +355,18 @@ impl<H: Hooks> Application for ServiceApplication<H> {
                 .await
                 .map_err(|_| ExitCode::Endpoint)
         }));
-        let returned = self.serving.as_mut().unwrap().await;
+        let task = self.serving.as_mut().unwrap();
+        #[cfg(target_os = "linux")]
+        let returned = if let Some(cluster) = self.cluster.as_mut() {
+            tokio::select! {
+                returned = task => returned,
+                returned = cluster.failed_or_exited() => return returned,
+            }
+        } else {
+            task.await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let returned = task.await;
         self.serving.take();
         returned.map_err(|_| ExitCode::Endpoint)?
     }
@@ -348,14 +374,25 @@ impl<H: Hooks> Application for ServiceApplication<H> {
         if let Some(e) = self.activity.as_ref().and_then(|a| a.dedicated.as_ref()) {
             e.shutdown();
         }
+        #[cfg(target_os = "linux")]
+        if self.cluster.is_some() {
+            return Ok(());
+        }
         self.stop.cancel();
         self.listener.take();
         Ok(())
     }
     async fn drain(&mut self) -> Result<(), ExitCode> {
         let mut result = Ok(());
+        #[cfg(target_os = "linux")]
+        if let Some(cluster) = self.cluster.as_mut() {
+            result = cluster.quiesce().await;
+            self.stop.cancel();
+            self.listener.take();
+        }
         if let Some(task) = self.serving.as_mut() {
-            result = task.await.map_err(|_| ExitCode::Endpoint).and_then(|r| r);
+            let served = task.await.map_err(|_| ExitCode::Endpoint).and_then(|r| r);
+            result = result.and(served);
         }
         self.serving.take();
         if let Some(e) = self.activity.as_ref().and_then(|a| a.dedicated.as_ref()) {
@@ -389,6 +426,14 @@ impl<H: Hooks> Application for ServiceApplication<H> {
             }
         }
         result
+    }
+    async fn finish_after_drain(&mut self, drained: bool) -> Result<(), ExitCode> {
+        #[cfg(target_os = "linux")]
+        if let Some(cluster) = self.cluster.as_mut() {
+            return cluster.finish_after_drain(drained).await;
+        }
+        let _ = drained;
+        Ok(())
     }
     async fn service_stop(&mut self) -> Result<(), ExitCode> {
         self.audit(Lifecycle::Stop).await

@@ -416,7 +416,7 @@ class BuildInput:
 
 def counts(output):
     selected = re.findall(rb'^running ([0-9]{1,3}) tests?\r?$', output, re.M)
-    results = re.findall(rb'^test result: (ok|FAILED)\. ([0-9]{1,3}) passed; ([0-9]{1,3}) failed; ([0-9]{1,3}) ignored; ([0-9]{1,3}) measured; ([0-9]{1,3}) filtered out(?:; finished in [0-9.]+s)?\r?$', output, re.M)
+    results = re.findall(rb'^test result: (ok|FAILED)\. ([0-9]{1,3}) passed; ([0-9]{1,3}) failed; ([0-9]{1,3}) ignored; ([0-9]{1,3}) measured; ([0-9]{1,4}) filtered out(?:; finished in [0-9.]+s)?\r?$', output, re.M)
     if len(selected) != 1 or len(results) != 1:
         return {}
     status, passed, failed, ignored, measured, filtered = results[0]

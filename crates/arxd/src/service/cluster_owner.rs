@@ -310,14 +310,37 @@ impl Server {
             && socket(&self.path, self.roles.daemon).is_ok_and(|object| object == self.object)
     }
 
+    #[cfg(test)]
     pub(crate) fn start<F, Work>(self, dispatch: F) -> Control
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
     {
-        let stop = Shutdown::default();
+        self.start_with_status(dispatch, || [0; 29])
+    }
+
+    pub(crate) fn start_with_status<F, Work, S>(self, dispatch: F, status: S) -> Control
+    where
+        F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
+        Work: Future<Output = Reply> + Send,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
+    {
+        self.start_with_stop(dispatch, status, Shutdown::default())
+    }
+
+    pub(crate) fn start_with_stop<F, Work, S>(
+        self,
+        dispatch: F,
+        status: S,
+        stop: Shutdown,
+    ) -> Control
+    where
+        F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
+        Work: Future<Output = Reply> + Send,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
+    {
         let requested = stop.clone();
-        let supervisor = tokio::spawn(async move { self.serve(requested, dispatch).await });
+        let supervisor = tokio::spawn(async move { self.serve(requested, dispatch, status).await });
         Control {
             stop,
             supervisor,
@@ -325,10 +348,11 @@ impl Server {
         }
     }
 
-    async fn serve<F, Work>(&self, stop: Shutdown, dispatch: F) -> Result<(), Failure>
+    async fn serve<F, Work, S>(&self, stop: Shutdown, dispatch: F, status: S) -> Result<(), Failure>
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
+        S: Fn() -> [u8; 29] + Clone + Send + 'static,
     {
         let mut work = JoinSet::new();
         let mut outcome = Ok(());
@@ -360,8 +384,9 @@ impl Server {
                     let dispatch = dispatch.clone();
                     let stop = stop.clone();
                     let owner = self.roles.owner;
+                    let status = status.clone();
                     work.spawn(async move {
-                        connection(stream, owner, stop, dispatch).await;
+                        connection_with_status(stream, owner, stop, dispatch, status).await;
                     });
                 }
             }
@@ -387,6 +412,15 @@ pub(crate) struct Control {
 impl Control {
     pub(crate) fn stop(&self) {
         self.stop.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_task(supervisor: tokio::task::JoinHandle<Result<(), Failure>>) -> Self {
+        Self {
+            stop: Shutdown::default(),
+            supervisor,
+            outcome: None,
+        }
     }
 
     pub(crate) async fn close(&mut self, observation: Duration) -> Result<(), Failure> {
@@ -417,18 +451,40 @@ impl Drop for Server {
     }
 }
 
-async fn connection<F, Work>(mut stream: UnixStream, uid: u32, stop: Shutdown, dispatch: F)
+#[cfg(test)]
+async fn connection<F, Work>(stream: UnixStream, uid: u32, stop: Shutdown, dispatch: F)
 where
     F: FnOnce(Operator, Request) -> Work,
     Work: Future<Output = Reply>,
 {
+    connection_with_status(stream, uid, stop, dispatch, || [0; 29]).await;
+}
+
+async fn connection_with_status<F, Work, S>(
+    mut stream: UnixStream,
+    uid: u32,
+    stop: Shutdown,
+    dispatch: F,
+    status: S,
+) where
+    F: FnOnce(Operator, Request) -> Work,
+    Work: Future<Output = Reply>,
+    S: FnOnce() -> [u8; 29],
+{
     let request = tokio::select! {
         biased;
         _ = stop.cancelled() => return,
-        request = timeout(HANDSHAKE, read_request(&mut stream)) => request,
+        request = timeout(HANDSHAKE, receive(&mut stream)) => request,
     };
     let reply = match request {
-        Ok(Ok(request)) if !stop.is_cancelled() => dispatch(Operator(uid), request).await,
+        Ok(Ok((4, body))) if body.bytes().is_empty() && !stop.is_cancelled() => {
+            let _ = timeout(HANDSHAKE, send(&mut stream, 15, &status())).await;
+            return;
+        }
+        Ok(Ok((tag, body))) if !stop.is_cancelled() => match decode_request(tag, body) {
+            Ok(request) => dispatch(Operator(uid), request).await,
+            Err(_) => Reply::Refused,
+        },
         _ => Reply::Refused,
     };
     // A transport failure cannot resubmit any command or release a paste elsewhere.
@@ -490,8 +546,13 @@ pub(super) async fn request(mut stream: UnixStream, request: Request) -> Result<
     }
 }
 
+#[cfg(test)]
 async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
     let (tag, body) = receive(stream).await?;
+    decode_request(tag, body)
+}
+
+fn decode_request(tag: u8, body: Paste) -> io::Result<Request> {
     match tag {
         1 if body.bytes().is_empty() => Ok(Request::Mint),
         2 if paste_shape(body.bytes()) => Ok(Request::Join(body)),
