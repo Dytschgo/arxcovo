@@ -1,6 +1,6 @@
 # Arxcovo progress
 
-## Current state (2026-11-21 04:16 UTC, coordinator Claude Opus 5.5 / high)
+## Current state (2026-11-21 06:34 UTC, coordinator Claude Opus 5.5 / high)
 
 Sections below this one are dated checkpoints and are **historical** unless they
 say otherwise; where they describe main as `8bd12b7f`, PR189/PR190 as held, or
@@ -17,7 +17,10 @@ merged, as listed under "Merged this session".
   Fallback chain when the provider blocks a delegate: Sol → Opus → Fable →
   Astra 6.2 → Grok → Muse → Gemini Neon. It resets no counters, and a reviewer
   must stay independent of the builder. One Sol delegate was blocked (step 7a, below).
-- **Main:** `b035ab21` (PR220), push CI 44865096894 green.
+- **Main:** `851472bc` (PR227); push CI 44876064810 recorded in the next checkpoint.
+  `5f6fcef4` (PR225) push CI 44875428857 green; `ddc950db` (PR224) 44873617369 green;
+  `f3c4b149` (PR226) 44872586418 green; `79ad98b2` (PR223) 44868467745 green;
+  `e0648428` (PR222) 44866961566 green. `b035ab21` (PR220), push CI 44865096894 green.
   `123dab63` (PR221) push CI 44861802922 green. `863ac6cc` (PR219) push CI 44848531876
   green. `12c21292` (PR218), push CI 44846740760 green. `80a71cf6` (PR217) push CI
   44840557829 green. `2e1375ed` (PR216), push CI 44838696714 green. `2d97a26e` (PR215) push CI
@@ -72,7 +75,9 @@ merged, as listed under "Merged this session".
   `12c21292` (step 11, initial three-voter promotion), PR219 `863ac6cc` (docs), PR221
   `123dab63` (strict and learner TLS authorization moved after the handshake with a
   bounded non-blocking wait; C11 diagnostics), PR220 `b035ab21` (step 12, sealed issuer
-  custody transfer to promoted voters). Every merge had an independent exact-head Sol
+  custody transfer to promoted voters), PR222 `e0648428` (docs), PR223 `79ad98b2` (13b),
+  PR226 `f3c4b149` (C11 per-connection observation), PR224 `ddc950db` (13a), PR225
+  `5f6fcef4` (13c), PR227 `851472bc` (CI gate test in one pwsh process). Every merge had an independent exact-head Sol
   review (6.1, later 6.2), all five required gates green and a head-guarded squash
   merge; green main was rechecked immediately before each merge except the three red-main repairs:
   PR194, merged with green PR gates while main at `92003177` was red (its first main
@@ -653,6 +658,79 @@ merged, as listed under "Merged this session".
   and B3 (two-stage D11 completion), plus R1–R8. Under the pre-approval the coordinator
   adopted every replacement verbatim (`D:/Temp/arx-m3-steps13to16/plan-amendments.md`,
   SHA256 `7e672af8…1641`); 13a waits for an independent recheck against the merged tree.
+- **13a recheck:** independent recheck against merged main `b035ab21` GO WITH REQUIRED
+  CHANGES (`D:/Temp/arx-m3-13a-recheck/review.md`, SHA256 `432763f1…5231`); its B1–B3 and grant
+  replacements were appended verbatim to the amendments (current SHA256 `b39426a5…dfb0`). The
+  adopted 13a grant has zero live Engine, Found, Mint, AnchorQuery, Redeem or proposal
+  invocations.
+- **PR #224 merged** as `ddc950db` (13a, authenticated restart history; ADR 0045). Sol
+  6.2/high builder; coordinator amendment A5 let the frozen founder test literal fill the
+  two new history fields with legacy empty values. Builder counted failures 2/3 (report
+  `D:/Temp/arx-m3-step13a/report.md` SHA256 `f56be7bc…1090`). Review 1 HOLD
+  (`D:/Temp/arx-pr224-review/review.md`, SHA256 `757ac654…f724`): the history comparison
+  rejected valid same-term higher-ID leader succession at later indices, plus two test P3s;
+  the fix accepts OpenRaft-valid later successors while requiring exact E at the same index.
+  Review 2 (`D:/Temp/arx-pr224-review2/review.md`, SHA256 `6bcebe59…94f9`) passed the source but
+  held on a hosted C11 failure with a new signature (an unrelated connection's handshake on
+  the shared stage stream; log `D:/Temp/arx-pr224-fail/ubuntu-rust.log` SHA256 `a6a6d4cc…8f9c`);
+  the 13a diff had no causal path to it, so the coordinator did not count it. After the C11
+  repair the branch was refreshed (`6a9d02b3`, changed lines identical); review 3 PASS
+  (`D:/Temp/arx-pr224-review3/review.md`, SHA256 `7739f74a…a918`), agent-review status
+  59538292934; all 21 Linux history tests and every campaign passed (989 tests).
+- **PR #223 merged** as `79ad98b2` (13b, the two #216 P3s: the front-door identity test now
+  fails without the check, and a close before the first admission write is a definite
+  refusal while a partial write or lost reply stays Unknown). Review 1 HOLD
+  (`D:/Temp/arx-pr223-review/review.md`, SHA256 `ae609a2a…80f1`): the new write-boundary event
+  reached C11's frozen observer; the fix uses private opt-in probe channels. Builder counted
+  failures 2/3 (report `D:/Temp/arx-m3-step13b/report.md` SHA256 `9936e7f2…0cd7`). Review 2 PASS
+  (`D:/Temp/arx-pr223-review2/review.md`, SHA256 `a12688b6…59ef`), agent-review status 59536464074.
+- **PR #226 merged** as `f3c4b149` (C11 test-only repair under the owner's C11 grant): C11
+  checks only its own gated connection's events, keeps diagnostics endpoint-free and fails
+  a gate release later than 30 ms after that socket's handshake. Report
+  `D:/Temp/arx-c11-fixture2/report.md` SHA256 `4037e056…4240`; review 1 HOLD
+  (`D:/Temp/arx-pr226-review/review.md`, SHA256 `044bc02f…9271`) on endpoint output and a
+  non-strict 30 ms window; review 2 PASS (`D:/Temp/arx-pr226-review2/review.md`, SHA256
+  `8420548a…385a`), agent-review status 59537917810. C11 builder counted failures 1/3.
+- **PR #225 merged** as `5f6fcef4` (13c, owner-local Mint channel; ADR 0046): an
+  OS-identity-authenticated owner socket distinct from agent, build and peer identities, a
+  private retained Mint caller still unexercised (C13), and protected terminal input and
+  display. Hosted failures: the UID fixture failed at bind because Linux silently clears
+  setgid for an unprivileged runner (log `D:/Temp/arx-pr225-fail/ubuntu-rust.log` SHA256
+  `fad74450…934b`; counted); the malformed-frame test hit an AF_UNIX reset (log
+  `D:/Temp/arx-pr225-fail2/ubuntu-rust.log` SHA256 `f2175119…70da`; counted); and the known
+  pre-#226 C11 signature (log `D:/Temp/arx-pr225-fail3/ubuntu-rust.log` SHA256 `b09704e9…a32e`;
+  not counted). Reviews 1–3 HOLD (`D:/Temp/arx-pr225-review/review.md` SHA256 `1aae01f5…d389`,
+  `D:/Temp/arx-pr225-review2/review.md` SHA256 `98fdcaf7…9b13`,
+  `D:/Temp/arx-pr225-review3/review.md` SHA256 `bc520271…7e1e`) on the UID fixture, terminal
+  drain blocking, helper-only tests, the reset oracle, unverified termios flags and the
+  flush/restore handoff. **Coordinator decision (pre-approval):** Linux cannot atomically
+  flush input and restore termios (TCSAFLUSH drops its lock between the two), so the
+  terminal-handoff residual is accepted and documented in ADR 0046: verified echo-off
+  before any secret read, a 200 ms no-echo discard window, then flush, restore and
+  verified readback. Builder counted failures 2/3 (report `D:/Temp/arx-m3-step13c/report.md`
+  SHA256 `ffc15ac1…9c99`). Review 4 PASS (`D:/Temp/arx-pr225-review4/review.md`, SHA256
+  `8e7ed039…9687`), agent-review status 59538971760; all 12 Linux owner tests and every campaign
+  passed (1,003 tests). Follow-up: ADR 0046 source links point slightly above the code.
+- **PR #227 merged** as `851472bc` (test only): the CI gate test spawned pwsh once per case
+  with a 10 s timeout and timed out twice on hosted Ubuntu (runs 44855233311 and
+  44871410157); all 25 cases now run in one pwsh process with a 60 s timeout. Report
+  `D:/Temp/arx-uiflake/report.md` SHA256 `fdae04d9…a60a`; reviews PASS
+  (`D:/Temp/arx-pr227-review/review.md` SHA256 `91fbc74b…b35d`,
+  `D:/Temp/arx-pr227-review2/review.md` SHA256 `34b6c8cf…ccc5`), agent-review status
+  59539195964.
+- **PR #222 merged** as `e0648428` (docs; review 1 HOLD `D:/Temp/arx-pr222-review/review.md`
+  SHA256 `07aeae0e…1a8a`, review 2 PASS `D:/Temp/arx-pr222-review2/review.md` SHA256
+  `63846355…ca8c`, agent-review status 59535912676).
+- **13d (in progress):** grant adopted under the pre-approval (one C13 hosted-Linux
+  activation case: six retained Engine starts and owned closes, one Found, three owner
+  Mints, three AnchorQuery/Redeem, two admissions, one joint append, one flatten, two CA
+  transfers, a restart of each original node and survivor issuance after founder close).
+  Coordinator amendments: A6, one Ubuntu-only bounded step in the Rust job running a
+  reviewed tools/ci/m3-c13 launcher that stages disposable owner, daemon, agent and build
+  UIDs as #199 did, with minimal workflow-pin test updates and no gate, matrix or cache
+  change; A7, a move-only typed handoff of recovered custody from authenticated history
+  and a role-checked founder-recovery caller of the existing sealed CA loader, with
+  pki/ca.rs frozen. Engine Sol 3/3 and Opus 0/2 unchanged.
 - **Owner items unchanged:** M2 actual Claude journey awaits owner OAuth and
   host setup ([dev-host-setup](dev-host-setup.md)); Linux A7/A11/A12 need a
   dedicated host. M2 OPEN / M3 UNCHECKED; native and multi-host paths
