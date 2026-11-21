@@ -1546,6 +1546,34 @@ impl TransportOwner {
         rx
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn arm_before_dispatch(&self) {
+        let gate = Arc::new(Semaphore::new(0));
+        assert!(
+            self.shared
+                .hooks
+                .gates
+                .lock()
+                .unwrap()
+                .insert(Stage::BeforeDispatch, gate)
+                .is_none()
+        );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn release_before_dispatch(&self) {
+        if let Some(gate) = self
+            .shared
+            .hooks
+            .gates
+            .lock()
+            .unwrap()
+            .remove(&Stage::BeforeDispatch)
+        {
+            gate.add_permits(64);
+        }
+    }
+
     pub(super) fn joined(&self) -> bool {
         self.shared.state.lock().is_ok_and(|s| {
             s.finished
