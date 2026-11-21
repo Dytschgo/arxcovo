@@ -728,8 +728,15 @@ impl restart_history::StrictObservation for StrictWitness {
 
 impl Job {
     fn persist_strict_history(&self) -> Result<(), ActivationError> {
+        self.persist_strict_history_before(None)
+    }
+
+    fn persist_strict_history_before(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(), ActivationError> {
         use ActivationError::Refused;
-        let mut state = self.state();
+        let mut state = self.state.lock().map_err(|_| Refused)?;
         if state.close_requested || state.status != Status::LearnerReady {
             return Err(Refused);
         }
@@ -741,7 +748,8 @@ impl Job {
         } = &mut *state;
         let op = learner.as_mut().ok_or(Refused)?;
         let gate = op.gate.as_ref().ok_or(Refused)?;
-        let position = observe_strict(gate, StateStore::applied)?.ok_or(Refused)?;
+        let position =
+            observe_strict_before(gate, deadline, StateStore::applied)?.ok_or(Refused)?;
         let member = op.member.as_mut().ok_or(Refused)?;
         let (slot, live) = member.history.as_deref_mut().ok_or(Refused)?;
         let owner = owner.as_ref().ok_or(Refused)?;
@@ -752,6 +760,20 @@ impl Job {
         }
         slot.persist_strict(owner, &member.custody, live, StrictWitness(position))
             .map_err(|_| Refused)
+    }
+
+    async fn wait_for_strict_history(&self) -> Result<(), peer_transport::Refusal> {
+        use crate::cluster::pki::verify::VerifyRefusal;
+        use peer_registry::ObservationRefusal;
+        peer_registry::wait_for_store(|deadline| {
+            self.persist_strict_history_before(deadline)
+                .map_err(|error| match error {
+                    ActivationError::Deferred => ObservationRefusal::StoreBusy,
+                    ActivationError::Refused => VerifyRefusal::Unavailable.into(),
+                })
+        })
+        .await
+        .map_err(|_| peer_transport::Refusal::Identity)
     }
 
     pub(in crate::cluster::consensus) async fn check_issuer_transfer(
@@ -784,7 +806,7 @@ impl Job {
                 }
                 metrics.changed().await.map_err(|_| refused)?;
             }
-            self.persist_strict_history().map_err(|_| refused)?;
+            self.wait_for_strict_history().await?;
         }
         self.with_receiver_proof(claim, sender, |_, offer| offer)
             .await
@@ -1122,8 +1144,16 @@ fn observe_strict<T>(
     gate: &LearnerGate,
     observe: impl FnOnce(&StateStore) -> T,
 ) -> Result<T, ActivationError> {
+    observe_strict_before(gate, None, observe)
+}
+
+fn observe_strict_before<T>(
+    gate: &LearnerGate,
+    deadline: Option<Instant>,
+    observe: impl FnOnce(&StateStore) -> T,
+) -> Result<T, ActivationError> {
     use peer_registry::ObservationRefusal;
-    gate.inspect_strict(None, observe)
+    gate.inspect_strict(deadline, observe)
         .map_err(|error| match error {
             ObservationRefusal::StoreBusy => ActivationError::Deferred,
             _ => ActivationError::Refused,
@@ -1299,16 +1329,27 @@ impl Job {
         (job, credentials, gate)
     }
 
-    pub(in crate::cluster::consensus) fn set_receiver_fixture_history(
+    pub(in crate::cluster::consensus) async fn set_receiver_fixture_history(
         &self,
         slot: Fresh,
         live: Live,
+        sm: &SmAdapter,
     ) {
-        let mut state = self.state();
-        let member = state.learner.as_mut().unwrap().member.as_mut().unwrap();
-        assert!(member.history.replace(Box::new((slot, live))).is_none());
-        drop(state);
-        self.persist_strict_history().unwrap();
+        {
+            let mut state = self.state();
+            let member = state.learner.as_mut().unwrap().member.as_mut().unwrap();
+            assert!(member.history.replace(Box::new((slot, live))).is_none());
+        }
+        tokio::time::pause();
+        let mut persisted = std::pin::pin!(self.wait_for_strict_history());
+        {
+            let _held = sm.0.lock().unwrap();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(persisted.as_mut(), &mut cx).is_pending());
+            assert!(self.state.try_lock().is_ok());
+        }
+        assert_eq!(persisted.await, Ok(()));
+        tokio::time::resume();
     }
 
     pub(in crate::cluster::consensus) fn fault_receiver_fixture_history(

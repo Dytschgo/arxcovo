@@ -2,6 +2,50 @@ use super::*;
 use crate::cluster::state_store::release_pair;
 use futures_util::FutureExt;
 
+#[tokio::test]
+async fn admission_worker_observes_only_after_registration_unlocks() {
+    let node = tokio::sync::Mutex::new(0);
+    let mut worker = register_with_node(&node, |_, start| {
+        let mut worker = Box::pin(start.after_release(
+            async {
+                *node
+                    .try_lock()
+                    .expect("registration unlocked before observation") += 1;
+                Reply::Pending
+            },
+            Reply::Refused,
+        ));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(worker.as_mut(), &mut cx).is_pending());
+        assert!(node.try_lock().is_err());
+        worker
+    })
+    .unwrap();
+    assert_eq!(*node.try_lock().unwrap(), 0);
+    assert_eq!(worker.as_mut().await, Reply::Pending);
+    assert_eq!(*node.try_lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn lost_admission_start_refuses_without_submission() {
+    let (release, start) = oneshot::channel();
+    drop(release);
+    let submitted = AtomicBool::new(false);
+    assert_eq!(
+        PromotionStart(start)
+            .after_release(
+                async {
+                    submitted.store(true, Ordering::SeqCst);
+                    Reply::Unknown
+                },
+                Reply::Refused,
+            )
+            .await,
+        Reply::Refused
+    );
+    assert!(!submitted.load(Ordering::SeqCst));
+}
+
 #[test]
 fn slot_denies_overlap_and_releases_on_drop() {
     let slot = Arc::new(AtomicBool::new(false));

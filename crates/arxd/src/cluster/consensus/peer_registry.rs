@@ -14,8 +14,18 @@ use tokio::time::{Instant, sleep_until};
 
 // Each transport check can wait 4 ms. The caller's 75 ms absolute
 // AppendEntries deadline still applies across the entire exchange.
-const STORE_WAIT: Duration = Duration::from_millis(4);
+pub(super) const STORE_WAIT: Duration = Duration::from_millis(4);
 const STORE_POLL: Duration = Duration::from_micros(250);
+
+#[cfg(target_os = "linux")]
+pub(super) async fn poll_store_until(deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    sleep_until((now + STORE_POLL).min(deadline)).await;
+    Instant::now() < deadline
+}
 
 type AppliedStore = Weak<Mutex<super::StateStore>>;
 
@@ -75,11 +85,11 @@ fn observe_store<T>(
     observe(&guard)
 }
 
-pub(super) async fn wait_for_store<T>(
+async fn wait_for_store_reporting<T>(
     stage: &'static str,
     observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, VerifyRefusal> {
-    observe_with_wait(observe).await.map_err(|error| {
+    wait_for_store(observe).await.map_err(|error| {
         record(stage, error.diagnostic_category());
         error.into()
     })
@@ -93,7 +103,7 @@ pub(super) async fn wait_for_receiver_store<N, T>(
 ) -> Result<T, VerifyRefusal> {
     let result = {
         let node = node.lock().await;
-        observe_with_wait(|deadline| observe(&node, deadline)).await
+        wait_for_store(|deadline| observe(&node, deadline)).await
     };
     result.map_err(|error| {
         report(error.diagnostic_category());
@@ -101,7 +111,7 @@ pub(super) async fn wait_for_receiver_store<N, T>(
     })
 }
 
-async fn observe_with_wait<T>(
+pub(super) async fn wait_for_store<T>(
     mut observe: impl FnMut(Option<Instant>) -> Result<T, ObservationRefusal>,
 ) -> Result<T, ObservationRefusal> {
     let deadline = Instant::now() + STORE_WAIT;
@@ -141,7 +151,7 @@ impl AppliedRegistry {
         key: KeyDigest,
         stage: &'static str,
     ) -> Result<(), VerifyRefusal> {
-        wait_for_store(stage, |deadline| self.observe(cluster, node, key, deadline)).await
+        wait_for_store_reporting(stage, |deadline| self.observe(cluster, node, key, deadline)).await
     }
 
     fn observe(
@@ -346,7 +356,7 @@ impl LearnerGate {
         key: crate::cluster::enrollment::KeyDigest,
         bootstrap_allowed: bool,
     ) -> Result<Lane, VerifyRefusal> {
-        wait_for_store("learner-authorization", |deadline| {
+        wait_for_store_reporting("learner-authorization", |deadline| {
             self.try_authorize(cluster, node, key, bootstrap_allowed, deadline)
         })
         .await
@@ -590,12 +600,15 @@ mod tests {
             )
             .unwrap();
         let gate = learner_gate(&sm);
-        let mut observation = std::pin::pin!(wait_for_store("learner-authorization", |deadline| {
-            gate.inspect_strict(deadline, |store| {
-                assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
-                store.applied()
-            })
-        }));
+        let mut observation = std::pin::pin!(wait_for_store_reporting(
+            "learner-authorization",
+            |deadline| {
+                gate.inspect_strict(deadline, |store| {
+                    assert!(matches!(sm.0.try_lock(), Err(TryLockError::WouldBlock)));
+                    store.applied()
+                })
+            }
+        ));
         {
             let _held = sm.0.lock().unwrap();
             assert!(
