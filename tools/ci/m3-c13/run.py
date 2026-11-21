@@ -23,6 +23,7 @@ OWNER = 21901
 ARTIFACT = re.compile(r"(?:arxd|m3_activation_linux)-[a-f0-9]{16}")
 ROOT = Path(__file__).resolve().parents[3]
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+HOSTED_ENV = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Linux"}
 TOTAL = 174
 ROOT_TEARDOWN = 14
 OUTER_MARGIN = 6
@@ -247,27 +248,49 @@ def cleanup_observed(lines):
             and helper_unknown == "0")
 
 
-def primary_ip(deadline):
-    run = subprocess.run(["/usr/sbin/ip", "-j", "-4", "addr", "show", "scope", "global"],
+def ip_json(arguments, deadline):
+    run = subprocess.run(["/usr/sbin/ip", "-j", "-4", *arguments],
                          env=ENV, capture_output=True, stdin=subprocess.DEVNULL,
                          check=True, timeout=remaining(deadline, 4))
-    if len(run.stdout) > 32_768:
-        raise ValueError("bounded interface inventory")
+    if len(run.stdout) > OUTPUT_LIMIT:
+        raise ValueError("bounded network inventory")
+    return json.loads(run.stdout)
+
+
+def primary_ip(deadline):
+    # Ask the kernel which source and link it would use for an off-link
+    # destination, as in the hosted admission controls. No packet is sent.
+    routes = ip_json(["route", "get", "192.0.2.1"], deadline)
+    if len(routes) != 1 or not routes[0].get("dev") or not routes[0].get("prefsrc"):
+        raise ValueError("eligible runner route")
+    route = routes[0]
+    source = ipaddress.IPv4Address(route["prefsrc"])
     private = tuple(map(ipaddress.ip_network, ("10.0.0.0/8", "172.16.0.0/12",
                                               "192.168.0.0/16", "100.64.0.0/10")))
-    found = {str(ip) for link in json.loads(run.stdout) if "UP" in link.get("flags", ())
-             for address in link.get("addr_info", ())
-             if any((ip := ipaddress.IPv4Address(address["local"])) in net for net in private)}
-    if len(found) != 1:
+    if not any(source in net for net in private):
         raise ValueError("eligible runner address")
-    return found.pop()
+    links = ip_json(["addr", "show", "scope", "global"], deadline)
+    if not any(link.get("ifname") == route["dev"]
+               and {"UP", "LOWER_UP"}.issubset(link.get("flags", ()))
+               and any(address.get("local") == str(source) for address in link.get("addr_info", ()))
+               for link in links):
+        raise ValueError("eligible runner link")
+    return str(source)
 
 
 def qualify_runner():
-    if (sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true"
-            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
-            or os.environ.get("RUNNER_OS") != "Linux"):
+    if sys.platform != "linux" or any(os.environ.get(name) != value for name, value in HOSTED_ENV.items()):
         raise ValueError("hosted Linux only")
+
+
+def launch_privileged(stage, root_deadline, deadline):
+    # sudo provides SUDO_UID for the ownership check. Pass only the fixed,
+    # already-qualified runner facts as env arguments to the command.
+    facts = [f"{name}={value}" for name, value in HOSTED_ENV.items()]
+    subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", *facts,
+                    "/usr/bin/python3", "-I", "-B", Path(__file__).resolve(),
+                    "--staged", stage, str(int(root_deadline * 1_000_000))],
+                   env=ENV, stdin=subprocess.DEVNULL, check=True, timeout=remaining(deadline - 2, TOTAL))
 
 
 def privileged(stage, deadline):
@@ -405,11 +428,7 @@ def main():
         for name, actual in artifacts:
             digest = stage_binary(actual, stage / name, setup)
             print(f"C13 artifact {name} sha256={digest}", flush=True)
-        authorization = "GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS"
-        subprocess.run(["/usr/bin/sudo", "-n", "--preserve-env=" + authorization,
-                        "/usr/bin/python3", "-I", "-B", Path(__file__).resolve(),
-                        "--staged", stage, str(int(root_deadline * 1_000_000))],
-                       stdin=subprocess.DEVNULL, check=True, timeout=remaining(deadline - 2, TOTAL))
+        launch_privileged(stage, root_deadline, deadline)
     print(f"C13 launcher seconds={time.monotonic()-start:.3f}", flush=True)
 
 

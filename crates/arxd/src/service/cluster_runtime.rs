@@ -475,6 +475,36 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleFailure {
+    RefusedOrUnconfirmed,
+    LearnerLockRetained,
+}
+
+impl LifecycleFailure {
+    fn category(self) -> &'static str {
+        match self {
+            Self::RefusedOrUnconfirmed => "cluster-lifecycle-refused-or-unconfirmed",
+            Self::LearnerLockRetained => "cluster-learner-outer-lock-retained",
+        }
+    }
+}
+
+impl From<()> for LifecycleFailure {
+    fn from(_: ()) -> Self {
+        Self::RefusedOrUnconfirmed
+    }
+}
+
+impl From<activation::Error> for LifecycleFailure {
+    fn from(reason: activation::Error) -> Self {
+        match reason {
+            activation::Error::LearnerLockRetained => Self::LearnerLockRetained,
+            _ => Self::RefusedOrUnconfirmed,
+        }
+    }
+}
+
 struct Work {
     waiting: Option<Installation>,
     running: Option<Running>,
@@ -635,9 +665,9 @@ impl Lifecycle {
     }
 
     // Ok records a confirmed owned close and whether work had already refused.
-    async fn close(self) -> Result<bool, ()> {
+    async fn close(self) -> Result<bool, LifecycleFailure> {
         if !self.joined {
-            return Err(());
+            return Err(LifecycleFailure::RefusedOrUnconfirmed);
         }
         let mut work = self.work.lock().await;
         let running = work.running.take();
@@ -646,8 +676,7 @@ impl Lifecycle {
         let refused = match running {
             Some(running) => tokio::time::timeout(CLOSE, running.close())
                 .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?,
+                .map_err(|_| LifecycleFailure::RefusedOrUnconfirmed)??,
             None => false,
         };
         Ok(failed || refused)
@@ -741,19 +770,18 @@ pub fn entry(args: &[std::ffi::OsString]) -> Option<i32> {
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|_| ())
+        .map_err(|_| LifecycleFailure::RefusedOrUnconfirmed)
         .and_then(|runtime| {
             let result = runtime.block_on(process(Path::new(config), intent, worker, inherited));
             runtime.shutdown_background();
             result
         });
-    if result.is_err() {
-        eprintln!("arxd: cluster-lifecycle-refused-or-unconfirmed");
-    }
-    Some(if result.is_ok() {
-        0
-    } else {
-        super::ExitCode::Store as i32
+    Some(match result {
+        Ok(()) => 0,
+        Err(failure) => {
+            eprintln!("arxd: {}", failure.category());
+            super::ExitCode::Store as i32
+        }
     })
 }
 
@@ -923,7 +951,7 @@ async fn process(
     intent: Intent,
     worker: bool,
     inherited: Option<InheritedListeners>,
-) -> Result<(), ()> {
+) -> Result<(), LifecycleFailure> {
     use tokio::io::AsyncReadExt;
 
     let fence = Arc::new(Admission::with_listeners(inherited));
@@ -1013,7 +1041,7 @@ async fn run_lifecycle(
     mut lifecycle: Lifecycle,
     stop: Shutdown,
     mut parent: Option<ParentControl>,
-) -> Result<(), ()> {
+) -> Result<(), LifecycleFailure> {
     use tokio::io::AsyncWriteExt;
 
     let mut result = Ok(());
@@ -1054,7 +1082,9 @@ async fn run_lifecycle(
     if let Some(parent) = &mut parent {
         parent.writer.write_u8(CLOSED).await.map_err(|_| ())?;
     }
-    result.and((!failed).then_some(()).ok_or(()))
+    result
+        .and((!failed).then_some(()).ok_or(()))
+        .map_err(Into::into)
 }
 
 #[derive(Clone, Copy)]

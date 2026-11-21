@@ -172,6 +172,19 @@ async fn foreground_founder_attach_refusal_waits_for_admitted_owner_task() {
 }
 
 #[test]
+fn lifecycle_records_retained_learner_lock_separately_from_unconfirmed_close() {
+    let retained = LifecycleFailure::from(activation::Error::LearnerLockRetained);
+    let unconfirmed = LifecycleFailure::from(activation::Error::Close);
+    assert_eq!(retained, LifecycleFailure::LearnerLockRetained);
+    assert_eq!(unconfirmed, LifecycleFailure::RefusedOrUnconfirmed);
+    assert_eq!(retained.category(), "cluster-learner-outer-lock-retained");
+    assert_eq!(
+        unconfirmed.category(),
+        "cluster-lifecycle-refused-or-unconfirmed"
+    );
+}
+
+#[test]
 fn inherited_listener_refuses_wrong_address_and_non_listening_descriptors() {
     use std::os::fd::AsRawFd;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -303,7 +316,10 @@ async fn worker_refusal_reports_before_stop_and_waits_for_close_authorization() 
             } else {
                 assert_eq!(parent.read(&mut [0; 1]).await.unwrap(), 0);
             }
-            assert_eq!(task.await.unwrap(), Err(()));
+            assert_eq!(
+                task.await.unwrap(),
+                Err(LifecycleFailure::RefusedOrUnconfirmed)
+            );
         })
         .await
         .unwrap();
@@ -367,7 +383,7 @@ async fn refused_worker_fixture() {
     );
     assert_eq!(
         run_lifecycle(lifecycle, fence.signal(), Some(parent)).await,
-        Err(())
+        Err(LifecycleFailure::RefusedOrUnconfirmed)
     );
     closed.await.unwrap();
     std::process::exit(41);

@@ -1,5 +1,6 @@
 """Pure tests for the fixed C13 launcher."""
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,52 @@ class LauncherTests(unittest.TestCase):
                 with patch.dict(RUN.os.environ, {**env, name: "wrong"}, clear=True):
                     with self.assertRaises(ValueError):
                         RUN.qualify_runner()
+
+    def test_primary_ip_uses_route_source_despite_docker_bridge(self):
+        route = [{"dev": "eth0", "prefsrc": "10.1.0.22"}]
+        eth0 = {"ifname": "eth0", "flags": ["UP", "LOWER_UP"],
+                "addr_info": [{"local": "10.1.0.22"}]}
+        docker0 = {"ifname": "docker0", "flags": ["NO-CARRIER", "UP"],
+                   "addr_info": [{"local": "172.17.0.1"}]}
+        replies = [RUN.subprocess.CompletedProcess([], 0, stdout=json.dumps(data).encode())
+                   for data in (route, [docker0, eth0])]
+        with patch.object(RUN.time, "monotonic", return_value=10):
+            with patch.object(RUN.subprocess, "run", side_effect=replies) as run:
+                self.assertEqual(RUN.primary_ip(20), "10.1.0.22")
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["/usr/sbin/ip", "-j", "-4", "route", "get", "192.0.2.1"],
+            ["/usr/sbin/ip", "-j", "-4", "addr", "show", "scope", "global"],
+        ])
+
+    def test_primary_ip_refuses_route_link_without_carrier(self):
+        route = [{"dev": "eth0", "prefsrc": "10.1.0.22"}]
+        links = [{"ifname": "eth0", "flags": ["NO-CARRIER", "UP"],
+                  "addr_info": [{"local": "10.1.0.22"}]},
+                 {"ifname": "eth1", "flags": ["UP", "LOWER_UP"],
+                  "addr_info": [{"local": "10.1.0.22"}]}]
+        with patch.object(RUN, "ip_json", side_effect=[route, links]):
+            with self.assertRaisesRegex(ValueError, "eligible runner link"):
+                RUN.primary_ip(20)
+
+    def test_primary_ip_refuses_non_private_route_source(self):
+        with patch.object(RUN, "ip_json", return_value=[{"dev": "eth0", "prefsrc": "8.8.4.4"}]) as ip:
+            with self.assertRaisesRegex(ValueError, "eligible runner address"):
+                RUN.primary_ip(20)
+        ip.assert_called_once()
+
+    def test_privileged_launch_passes_fixed_runner_facts_as_arguments(self):
+        stage = Path("/tmp/arx-c13-abcdefgh")
+        with (patch.dict(RUN.os.environ, {"RUNNER_OS": "untrusted"}, clear=True),
+              patch.object(RUN.time, "monotonic", return_value=10),
+              patch.object(RUN.subprocess, "run") as run):
+            RUN.launch_privileged(stage, 20, 30)
+        run.assert_called_once_with(
+            ["/usr/bin/sudo", "-n", "/usr/bin/env", "GITHUB_ACTIONS=true",
+             "RUNNER_ENVIRONMENT=github-hosted", "RUNNER_OS=Linux",
+             "/usr/bin/python3", "-I", "-B", Path(RUN.__file__).resolve(),
+             "--staged", stage, "20000000"],
+            env=RUN.ENV, stdin=RUN.subprocess.DEVNULL, check=True, timeout=18,
+        )
 
     def test_workflow_pins_one_runner_only_step(self):
         workflow = (RUN.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
