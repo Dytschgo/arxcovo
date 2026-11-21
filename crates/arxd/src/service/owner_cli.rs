@@ -239,6 +239,12 @@ fn dispatch(
 
 /// Called only for reserved prefixes, before the foreground Tokio runtime.
 pub fn main(args: &[OsString]) -> i32 {
+    #[cfg(target_os = "linux")]
+    if args.first().is_some_and(|value| value == "service")
+        && args.get(1).is_some_and(|value| value == "cluster-control")
+    {
+        return cluster_control::run(args);
+    }
     let cmd = match parse(args) {
         Ok(c) => c,
         Err(_) => {
@@ -464,3 +470,6 @@ mod tests;
 
 #[cfg(test)]
 mod cluster_enrollment;
+
+#[cfg(target_os = "linux")]
+mod cluster_control;
