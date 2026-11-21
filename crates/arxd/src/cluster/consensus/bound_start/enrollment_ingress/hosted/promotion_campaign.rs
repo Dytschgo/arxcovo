@@ -9,7 +9,7 @@ use crate::cluster::{
 use learner::{HostedCatchUp, Run};
 use learner_admission::{Controller, Reply, covers};
 use openraft::type_config::async_runtime::watch::WatchReceiver;
-use peer_transport::{Event, Stage};
+use peer_transport::{Event, GatedCallerOutcome, Stage};
 use std::collections::BTreeSet;
 
 type Check<T> = std::result::Result<T, &'static str>;
@@ -294,80 +294,121 @@ async fn stage(events: &mut tokio::sync::mpsc::Receiver<Event>, target: Stage) -
     .await
 }
 
+fn issuer_caller_observer(
+    job: &Job,
+    target: NodeId,
+) -> Check<oneshot::Receiver<GatedCallerOutcome>> {
+    let state = job.state();
+    let transport = state
+        .founder
+        .as_ref()
+        .ok_or("retained founder missing")?
+        .transport_for_test()
+        .try_lock()
+        .map_err(|_| "issuer transport busy")?;
+    Ok(transport.observe_gated_caller(target))
+}
+
+async fn caller_outcome(receiver: oneshot::Receiver<GatedCallerOutcome>) -> Check<SocketAddr> {
+    let outcome = receiver
+        .await
+        .map_err(|_| "gated RPC caller observation closed")?;
+    if let Err(reason) = outcome.result {
+        eprintln!("C11 frozen gated RPC caller refused: {reason:?}");
+        return Err("gated RPC caller refused");
+    }
+    outcome
+        .source
+        .ok_or("gated RPC caller source was unavailable")
+}
+
 async fn admit_below_target(
     run: &Run,
     address: SocketAddr,
     raft: &Engine,
     controller: &Controller,
+    caller: oneshot::Receiver<GatedCallerOutcome>,
 ) -> Check<LogPos> {
     let mut events = run.dispatch_observer().await;
+    let mut dispatch = run.observe_gated_dispatch().await;
     run.before_dispatch_gate(true).await;
+    let mut gate_held = true;
     let mut request = std::pin::pin!(admit(run, address));
-    // Poll the real admission while waiting for the resulting peer RPC.
     let evidence = timeout(OBSERVE, async {
-        let (arrival, already_admitted) = tokio::select! {
-            result = stage_start(&mut events) => (result?, None),
-            result = &mut request => {
-                let admitted = result?;
-                (stage_start(&mut events).await?, Some(admitted))
+        tokio::try_join!(
+            biased;
+            caller_outcome(caller),
+            async {
+                // Poll real admission while waiting for its first replication RPC.
+                let (arrival, already_admitted) = tokio::select! {
+                    result = stage_start(&mut events) => (result?, None),
+                    result = &mut request => {
+                        let admitted = result?;
+                        (stage_start(&mut events).await?, Some(admitted))
+                    }
+                };
+                let (admitted, server_peer) = timeout_at(arrival + GATE_OBSERVE, async {
+                    stage(&mut events, Stage::ServerAuthenticated).await?;
+                    stage(&mut events, Stage::RequestRead).await?;
+                    stage(&mut events, Stage::BeforeDispatch).await?;
+                    let server_peer = dispatch.try_recv().ok().flatten()
+                        .ok_or("gated RPC server peer was unavailable")?;
+                    let admitted = match already_admitted {
+                        Some(admitted) => admitted,
+                        None => request.await?,
+                    };
+                    let metrics = raft.metrics();
+                    let current = metrics.borrow_watched();
+                    let committed = current
+                        .cluster_committed
+                        .map(pos)
+                        .ok_or("fresh target missing")?;
+                    let matched = current
+                        .replication
+                        .as_ref()
+                        .and_then(|r| r.get(&run.binding().0.get()))
+                        .copied()
+                        .flatten()
+                        .map(pos);
+                    if *current.committed_membership_config.log_id() != Some(id(admitted))
+                        || !current
+                            .committed_membership_config
+                            .membership()
+                            .voter_ids()
+                            .eq([FOUNDER.get()])
+                        || !covers(committed, admitted)
+                        || matched.is_some_and(|matched| covers(matched, committed))
+                        || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
+                        || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
+                    {
+                        return Err("gated second learner did not prove the below-target state");
+                    }
+                    Ok((admitted, server_peer))
+                }).await.map_err(|_| "short transport gate observation elapsed")??;
+
+                run.before_dispatch_gate(false).await;
+                gate_held = false;
+                transport_event(&mut events, "dispatch", |event| {
+                    matches!(event, Event::LearnerDispatch(_))
+                }).await?;
+                stage(&mut events, Stage::BeforeReply).await?;
+                transport_event(&mut events, "reply result", |event| {
+                    event == Event::Finished(None)
+                }).await?;
+                Ok((admitted, server_peer))
             }
-        };
-        timeout_at(arrival + GATE_OBSERVE, async {
-            stage(&mut events, Stage::ServerAuthenticated).await?;
-            stage(&mut events, Stage::RequestRead).await?;
-            stage(&mut events, Stage::BeforeDispatch).await?;
-            let admitted = match already_admitted {
-                Some(admitted) => admitted,
-                None => request.await?,
-            };
-            let metrics = raft.metrics();
-            let current = metrics.borrow_watched();
-            let committed = current
-                .cluster_committed
-                .map(pos)
-                .ok_or("fresh target missing")?;
-            let matched = current
-                .replication
-                .as_ref()
-                .and_then(|r| r.get(&run.binding().0.get()))
-                .copied()
-                .flatten()
-                .map(pos);
-            if *current.committed_membership_config.log_id() != Some(id(admitted))
-                || !current
-                    .committed_membership_config
-                    .membership()
-                    .voter_ids()
-                    .eq([FOUNDER.get()])
-                || !covers(committed, admitted)
-                || matched.is_some_and(|matched| covers(matched, committed))
-                || controller.hooks.promotion.joint_calls.load(Relaxed) != 0
-                || controller.hooks.promotion.flatten_calls.load(Relaxed) != 0
-            {
-                return Err("gated second learner did not prove the below-target state");
-            }
-            Ok(admitted)
-        })
-        .await
-        .map_err(|_| "short transport gate observation elapsed")?
+        )
     })
     .await
-    .map_err(|_| "replication arrival elapsed");
-    run.before_dispatch_gate(false).await;
-    let admitted = evidence??;
-    timeout(OBSERVE, async {
-        transport_event(&mut events, "dispatch", |event| {
-            matches!(event, Event::LearnerDispatch(_))
-        })
-        .await?;
-        stage(&mut events, Stage::BeforeReply).await?;
-        transport_event(&mut events, "reply result", |event| {
-            event == Event::Finished(None)
-        })
-        .await
-    })
-    .await
-    .map_err(|_| "gated peer replication reply observation elapsed")??;
+    .map_err(|_| "gated replication observation elapsed");
+
+    if gate_held {
+        run.before_dispatch_gate(false).await;
+    }
+    let (caller_source, (admitted, server_peer)) = evidence??;
+    if caller_source != server_peer {
+        return Err("gated dispatch and caller result came from different RPC connections");
+    }
     Ok(admitted)
 }
 
@@ -492,8 +533,10 @@ async fn campaign(
     let (join, addr2) = mint_and_join(job, layouts[1], enrollment, &root, exchange, 2).await?;
     let second = start_learner(second, join, peer).await?;
     match_through(&issuer, learner1, second.original()).await?;
-    let learner2 = second.binding().0.get();
-    let l2 = admit_below_target(second, addr2, &issuer, &controller).await?;
+    let second_id = second.binding().0;
+    let learner2 = second_id.get();
+    let caller = issuer_caller_observer(job, second_id)?;
+    let l2 = admit_below_target(second, addr2, &issuer, &controller, caller).await?;
 
     timeout(OBSERVE, hooks.finished.notified())
         .await

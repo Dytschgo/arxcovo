@@ -418,6 +418,12 @@ impl Run {
     }
 
     #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn observe_gated_dispatch(&self) -> oneshot::Receiver<Option<SocketAddr>> {
+        let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
+        transport.lock().await.observe_gated_dispatch()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) async fn before_dispatch_gate(&self, arm: bool) {
         let transport = self.job.state().learner.as_ref().unwrap().transport.clone();
         let transport = transport.lock().await;

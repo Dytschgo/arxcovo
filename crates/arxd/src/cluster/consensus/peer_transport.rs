@@ -683,6 +683,10 @@ async fn inbound(
     let request = Request::decode(&frame)?;
     request.shape(resources.cluster, peer.1)?;
     let expected = request.expected();
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(observe) = shared.hooks.gated_dispatch.lock().unwrap().take() {
+        let _ = observe.send(source.ok());
+    }
     stage(shared, Stage::BeforeDispatch).await;
     before_dispatch(shared, deadline)?;
     if let Some(learner) = &resources.learner {
@@ -735,6 +739,9 @@ impl AppendClient {
         request: Request,
         option: RPCOption,
         mut cancel: Pin<Box<dyn Future<Output = openraft::errors::ReplicationClosed> + Send>>,
+        #[cfg(all(test, target_os = "linux"))] observed_source: Option<
+            Arc<std::sync::OnceLock<SocketAddr>>,
+        >,
     ) -> Result<Reply, ExchangeError> {
         let entry = Instant::now();
         if let Some(reason) = poll_fn(|cx| {
@@ -792,6 +799,8 @@ impl AppendClient {
                     deadline,
                     outbound(
                         &shared, resources, address, target, request, handshake, deadline, &tx,
+                        #[cfg(all(test, target_os = "linux"))]
+                        observed_source.as_deref(),
                     ),
                 ) => result.unwrap_or(Err(Refusal::Deadline)).map_err(ExchangeError::Refused),
                 };
@@ -836,6 +845,9 @@ async fn outbound(
     handshake: OwnedSemaphorePermit,
     deadline: Instant,
     caller: &oneshot::Sender<Result<Reply, ExchangeError>>,
+    #[cfg(all(test, target_os = "linux"))] observed_source: Option<
+        &std::sync::OnceLock<SocketAddr>,
+    >,
 ) -> Result<Reply, Refusal> {
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
@@ -859,6 +871,12 @@ async fn outbound(
     let socket = TcpStream::connect(address)
         .await
         .map_err(|_| Refusal::Tls)?;
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(source) = observed_source
+        && let Ok(address) = socket.local_addr()
+    {
+        let _ = source.set(address);
+    }
     stage(shared, Stage::ClientHandshake).await;
     before_dispatch(shared, deadline)?;
     if caller.is_closed() {
@@ -964,14 +982,36 @@ async fn stage(shared: &Shared, stage: Stage) {
     #[cfg(test)]
     shared.hooks.wait(stage).await;
 }
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct GatedCallerOutcome {
+    pub(super) source: Option<SocketAddr>,
+    pub(super) result: Result<(), Refusal>,
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct TestHooks {
     events: Mutex<Option<tokio::sync::mpsc::Sender<Event>>>,
     gates: Mutex<std::collections::BTreeMap<Stage, Arc<Semaphore>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    gated_dispatch: Mutex<Option<oneshot::Sender<Option<SocketAddr>>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    gated_caller: Mutex<Option<(NodeId, oneshot::Sender<GatedCallerOutcome>)>>,
 }
 #[cfg(test)]
 impl TestHooks {
+    #[cfg(all(test, target_os = "linux"))]
+    fn take_gated_caller(
+        &self,
+        target: Option<NodeId>,
+    ) -> Option<oneshot::Sender<GatedCallerOutcome>> {
+        let mut armed = self.gated_caller.lock().unwrap();
+        if target != armed.as_ref().map(|(target, _)| *target) {
+            return None;
+        }
+        armed.take().map(|(_, sender)| sender)
+    }
+
     fn emit(&self, event: Event) {
         if let Some(events) = self.events.lock().unwrap().as_ref() {
             let _ = events.try_send(event);
@@ -1143,8 +1183,45 @@ impl openraft::network::RaftNetworkV2<Arx> for AppendClient {
         r: AppendEntriesRequest<Arx>,
         o: RPCOption,
     ) -> Result<AppendResult<Arx>, RPCError<Arx>> {
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(observe) = self
+            .shared
+            .upgrade()
+            .and_then(|shared| shared.hooks.take_gated_caller(self.target))
+        {
+            let source = Arc::new(std::sync::OnceLock::new());
+            let result = match self
+                .exchange(
+                    Request::Append(r),
+                    o,
+                    Box::pin(std::future::pending()),
+                    Some(source.clone()),
+                )
+                .await
+            {
+                Ok(Reply::Append(reply)) => Ok(reply),
+                Ok(_) => Err(ExchangeError::Refused(Refusal::Frame)),
+                Err(error) => Err(error),
+            };
+            // This is the original caller's result after exchange checks the
+            // RPC deadline. The spawned outbound task can finish earlier.
+            let _ = observe.send(GatedCallerOutcome {
+                source: source.get().copied(),
+                result: result.as_ref().map(|_| ()).map_err(|error| match error {
+                    ExchangeError::Refused(reason) => *reason,
+                    ExchangeError::Cancelled(_) => Refusal::Closed,
+                }),
+            });
+            return result.map_err(unary_error);
+        }
         match self
-            .exchange(Request::Append(r), o, Box::pin(std::future::pending()))
+            .exchange(
+                Request::Append(r),
+                o,
+                Box::pin(std::future::pending()),
+                #[cfg(all(test, target_os = "linux"))]
+                None,
+            )
             .await
             .map_err(unary_error)?
         {
@@ -1167,7 +1244,13 @@ impl openraft::network::RaftNetworkV2<Arx> for AppendClient {
     ) -> Result<openraft::raft::SnapshotResponse<Arx>, openraft::errors::StreamingError<Arx>> {
         use openraft::errors::StreamingError;
         match self
-            .exchange(Request::Snapshot(v, s), o, Box::pin(cancel))
+            .exchange(
+                Request::Snapshot(v, s),
+                o,
+                Box::pin(cancel),
+                #[cfg(all(test, target_os = "linux"))]
+                None,
+            )
             .await
         {
             Ok(Reply::Snapshot(r)) => Ok(r),
@@ -1196,7 +1279,13 @@ impl AppendClient {
         o: RPCOption,
     ) -> Result<BallotReply, RPCError<Arx>> {
         match self
-            .exchange(Request::Ballot(r, p), o, Box::pin(std::future::pending()))
+            .exchange(
+                Request::Ballot(r, p),
+                o,
+                Box::pin(std::future::pending()),
+                #[cfg(all(test, target_os = "linux"))]
+                None,
+            )
             .await
             .map_err(unary_error)?
         {
@@ -1544,6 +1633,39 @@ impl TransportOwner {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         *self.shared.hooks.events.lock().unwrap() = Some(tx);
         rx
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn observe_gated_dispatch(&self) -> oneshot::Receiver<Option<SocketAddr>> {
+        let (sender, receiver) = oneshot::channel();
+        assert!(
+            self.shared
+                .hooks
+                .gated_dispatch
+                .lock()
+                .unwrap()
+                .replace(sender)
+                .is_none()
+        );
+        receiver
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn observe_gated_caller(
+        &self,
+        target: NodeId,
+    ) -> oneshot::Receiver<GatedCallerOutcome> {
+        let (sender, receiver) = oneshot::channel();
+        assert!(
+            self.shared
+                .hooks
+                .gated_caller
+                .lock()
+                .unwrap()
+                .replace((target, sender))
+                .is_none()
+        );
+        receiver
     }
 
     #[cfg(all(test, target_os = "linux"))]
