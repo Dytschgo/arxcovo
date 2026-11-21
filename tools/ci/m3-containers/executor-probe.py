@@ -477,6 +477,23 @@ def child(root):
     raise Refusal("observer-timeout")
 
 
+def publish_observer_ack(root, pid):
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="ascii", dir=root, prefix=".confirmed-", delete=False,
+        ) as output:
+            pending = Path(output.name)
+            output.write(pid)
+            output.flush()
+            pending.chmod(0o644)
+            os.fsync(output.fileno())
+        os.replace(pending, root / "confirmed")
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+
+
 def observe_child(root, process, deadline, broker_pid):
     until = min(deadline, time.monotonic() + 6)
     while time.monotonic() < until:
@@ -505,7 +522,7 @@ def observe_child(root, process, deadline, broker_pid):
                 and facts["Groups"] == [] and facts["NoNewPrivs"] == ["1"], "leaf-credentials")
         require(all(facts[key] == ["0" * 16] for key in ("CapEff", "CapPrm", "CapInh", "CapAmb")),
                 "leaf-capabilities")
-        (root / "confirmed").write_text(pid, encoding="ascii")
+        publish_observer_ack(root, pid)
         emit("leaf", membership=membership, uid=BUILD, gid=BUILD,
              memory=MEMORY, swap=0, pids=PIDS, no_new_privs=1, descendant=True)
         return descendant

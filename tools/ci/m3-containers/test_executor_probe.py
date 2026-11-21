@@ -30,6 +30,40 @@ class ExecutorProbeTests(unittest.TestCase):
             self.assertIn(option, argv)
         self.assertNotIn("--property=ProtectControlGroups=yes", argv)
 
+    def test_observer_ack_is_synced_before_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            target = root / "confirmed"
+            durable = False
+            real_fsync = probe.os.fsync
+            real_replace = probe.os.replace
+
+            def sync(fd):
+                nonlocal durable
+                self.assertFalse(target.exists())
+                real_fsync(fd)
+                durable = True
+
+            def publish(source, destination):
+                self.assertTrue(durable)
+                self.assertFalse(target.exists())
+                self.assertEqual(source.parent, root)
+                self.assertEqual(destination, target)
+                self.assertEqual(source.read_text(encoding="ascii"), "412")
+                real_replace(source, destination)
+
+            with patch.object(probe.os, "fsync", side_effect=sync), patch.object(
+                probe.os, "replace", side_effect=publish,
+            ):
+                probe.publish_observer_ack(root, "412")
+            self.assertEqual(target.read_text(encoding="ascii"), "412")
+            self.assertEqual(list(root.iterdir()), [target])
+
+            with patch.object(probe.os, "fsync", side_effect=OSError), self.assertRaises(OSError):
+                probe.publish_observer_ack(root, "413")
+            self.assertEqual(target.read_text(encoding="ascii"), "412")
+            self.assertEqual(list(root.iterdir()), [target])
+
     def test_each_required_provenance_field_refuses_before_staging(self):
         for field in probe.PROVENANCE_FIELDS:
             with self.subTest(field=field), patch.object(probe, "stage_tree") as stage:
