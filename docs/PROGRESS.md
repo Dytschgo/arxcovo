@@ -22,7 +22,8 @@ merged, as listed under "Merged this session".
 - **Main:** `aaa26b9c` (PR233); push CI 44909755993 was in progress at this checkpoint.
   `7297d530` (PR234) push CI 44908581138 green; `58604520` (PR232) 44902174731 green;
   `61542cae` (PR231) 44900706992 red on attempt 1 (macOS UI budget-test timeout), green on
-  attempt 2 before PR232 merged. PR232 removed nested subprocesses from the partial-jobs case; `fb48a878` (PR230) 44898661842 green; `be64f8db` (PR229)
+  attempt 2 before PR232 merged. PR232 removed nested subprocesses from the partial-jobs case.
+  `fb48a878` (PR230) 44898661842 green; `be64f8db` (PR229)
   44896780073 green.
   `e0f3ddc1` (PR228) push CI 44877277057 green; `851472bc` (PR227) 44876064810 green.
   `5f6fcef4` (PR225) push CI 44875428857 green; `ddc950db` (PR224) 44873617369 green;
@@ -824,7 +825,7 @@ merged, as listed under "Merged this session".
   allocations across the campaign (A and fresh C). R8 window margin was 6,985 of 7,000 ms. The
   consumed-code reconnect and expired B received uniform Anchor refusals over full TLS with clean
   close and sent no Redeem frame. The reconnect's distinct local attempt was prepared and
-  withheld; owner Mints 3, AnchorQuery 5, Redeem 3; owned close
+  withheld. Owner Mints 3, AnchorQuery 5, Redeem 3. Owned close
   Joined(Clean). Exact-head review PASS (SHA256 `c086e63c…1c7e`), agent-review status 59550423252.
 - **PR #233 merged** as `aaa26b9c` (14a; ADR 0048). The first builder's preflight found the
   hosted Docker and UID profiles cannot give the root broker the frozen executor's
@@ -860,12 +861,13 @@ merged, as listed under "Merged this session".
   Rust job. Its build-mode step took about 2 s in run 44907529544.
 - **Process note.** The coordinator's instruction to run the complete QEMU suite led the 14a
   builder to run the existing C11/C12 Engine campaigns locally under emulation, beyond 14a's
-  zero-Engine local brief; These local runs spent no hosted grant. Earlier coordinator briefs also asked for the
-  complete native Windows lib suite, which includes standing tests that start a real Engine or
-  call Found (for example `bound_start_real_engine_start_close` and
-  `founder_joiner_mutual_tls_real_identities`; the 14b design check lists about a dozen such groups
-  under `cluster::consensus`). The 14b builder identified this conflict; these are standing CI
-  inventory, and no campaign grant was spent. Later local briefs require zero Engine invocations.
+  zero-Engine local brief. The 14a and 15a builders also ran the requested complete native
+  Windows lib suite, which passed standing tests that start a real Engine or call Found,
+  including `bound_start_real_engine_start_close` and `founder_joiner_mutual_tls_real_identities`.
+  These local runs spent no hosted grant. The 14b builder identified the conflict with the
+  no-Engine/no-Found instruction and skipped the unfiltered Windows run. The 14b design check
+  lists exclusions under `cluster::consensus` for live Engine and Found tests, startup-refusal
+  tests and opt-in diagnostic controls. Later local briefs require zero Engine invocations.
 - **14b and 15b (in progress):** the plan's proposed grants are adopted verbatim under the
   pre-approval. The Sol 6.2/high builders were assigned in parallel with three counted failures
   allowed each. Before any dispatch, 15b must resolve R6 and obtain coordinator approval for the
