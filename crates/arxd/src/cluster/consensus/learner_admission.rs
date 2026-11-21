@@ -75,6 +75,30 @@ pub(super) fn covers(progress: LogPos, target: LogPos) -> bool {
 
 type RetainedNode = tokio::sync::Mutex<ConsensusNode>;
 
+pub(super) struct PromotionStart(oneshot::Receiver<()>);
+
+impl PromotionStart {
+    pub(super) async fn run(self, work: impl std::future::Future<Output = ()>) {
+        if self.0.await.is_ok() {
+            work.await;
+        }
+    }
+}
+
+pub(super) fn register_with_node<N, R>(
+    node: &tokio::sync::Mutex<N>,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+) -> Result<R, Reply> {
+    let node = node.try_lock().map_err(|_| Reply::Refused)?;
+    let (ready, start) = oneshot::channel();
+    let registered = register(&node, PromotionStart(start));
+    // Owners may poll the worker before registration returns. Release this
+    // borrow before its single fresh observation can touch the node.
+    drop(node);
+    let _ = ready.send(());
+    Ok(registered)
+}
+
 pub(super) struct Controller {
     node: Weak<RetainedNode>,
     closed: Mutex<bool>,
@@ -118,8 +142,9 @@ impl Controller {
         }
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
-        let node = node.try_lock().map_err(|_| Reply::Refused)?;
-        node.register_admission(intent, work)
+        register_with_node(&node, |node, start| {
+            node.register_admission(intent, start.run(work))
+        })?
     }
 
     pub(super) fn progress(&self, learner: u64) -> Option<(LogPos, Option<LogPos>)> {

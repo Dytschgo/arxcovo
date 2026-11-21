@@ -174,3 +174,60 @@ async fn shared_intent_denies_overlap_and_retains_its_release_wake() {
     assert!(slot.notified().now_or_never().is_none());
     assert!(Intent::waking(&slot).is_ok());
 }
+
+#[tokio::test]
+async fn release_wake_observes_joint_once_after_registration_drops_the_node_borrow() {
+    use crate::cluster::consensus::learner_admission::{Intent, IntentSlot, register_with_node};
+    use futures_util::FutureExt;
+    use std::{
+        cell::Cell,
+        task::{Context, Waker},
+    };
+
+    let slot = IntentSlot::default();
+    let first = Intent::waking(&slot).unwrap();
+    assert!(matches!(Intent::waking(&slot), Err(Reply::Pending)));
+    drop(first);
+    assert!(slot.notified().now_or_never().is_some());
+
+    let joint = view(&[&[1], &[1, 5, 9]], &[1, 5, 9], &[1, 5, 9]);
+    let node = tokio::sync::Mutex::new(joint);
+    let observations = Cell::new(0);
+    let reconciliations = Cell::new(0);
+    let intent = Intent::waking(&slot).unwrap();
+    let work = async {
+        let _intent = intent;
+        let Ok(view) = node.try_lock() else { return };
+        observations.set(observations.get() + 1);
+        if matches!(decide(&view), Some(Transition::Flatten(_))) {
+            reconciliations.set(reconciliations.get() + 1);
+        }
+    };
+
+    // Poll at the owner spawn boundary while the real registration helper
+    // still holds the node mutex. No Engine or metric notification is needed.
+    let (first_poll, task) = register_with_node(&node, |_, start| {
+        assert!(node.try_lock().is_err());
+        let mut task = Box::pin(start.run(work));
+        let first_poll = task.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        (first_poll, task)
+    })
+    .unwrap();
+    if first_poll.is_pending() {
+        task.await;
+    }
+
+    assert_eq!(
+        observations.get(),
+        1,
+        "release wake must perform one fresh observation"
+    );
+    assert_eq!(
+        reconciliations.get(),
+        1,
+        "the exact J must reconcile without more progress"
+    );
+    assert!(first_poll.is_pending());
+    assert!(slot.notified().now_or_never().is_some());
+    assert!(slot.notified().now_or_never().is_none());
+}
