@@ -43,17 +43,34 @@ The Linux CLI uses the explicit `service cluster-control` command with the
 socket path and expected daemon UID. It opens and checks the foreground
 controlling terminal independently of redirected program streams. Mint writes
 only to that terminal. Join reads one canonical envelope terminated by Enter
-with echo and canonical mode disabled. The terminal guard restores settings on
-success, errors, timeout and handled signals. Input discard uses TCIFLUSH
-and mode changes use TCSANOW so neither waits on terminal output. The CLI
-reads back effective termios before accepting input and after restoration.
-A refused, timed-out or interrupted paste gets an initial input flush
-and a 200 ms discard window with echo disabled, then a final input flush
-and verified restoration. Bytes sent after the bounded window are new
-terminal input. A restore failure emits a fixed terminal-specific error. The owner protocol and terminal
-buffers use bounded allocation and volatile wiping on drop. ADR0040's durable
-Join consumer owns the checksum, CA pin and local route checks. Temporary
-values internal to the frozen codec retain their existing memory behavior.
+with echo, canonical mode and EXTPROC disabled. ICRNL maps an Enter sent as CR
+to LF. The owner protocol and terminal buffers use bounded allocation and
+volatile wiping on drop. ADR 0040's durable Join consumer owns the checksum,
+CA pin and local route checks. Temporary values internal to the frozen codec
+retain their existing memory behavior.
+
+## Residual: terminal handoff
+
+Linux provides no atomic input flush and termios restore for this controlling
+terminal. In the `TCSAFLUSH` path the N_TTY flush callback releases
+`termios_rwsem` before the separate termios update acquires it again. Incoming
+bytes can enter between those operations, and restoring canonical mode can
+make queued bytes readable. That path also waits for terminal output to drain.
+[Linux terminal ioctl](https://github.com/torvalds/linux/blob/v6.17/drivers/tty/tty_ioctl.c#L449) ·
+[Linux N_TTY flush](https://github.com/torvalds/linux/blob/v6.17/drivers/tty/n_tty.c#L328) ·
+[Linux canonical transition](https://github.com/torvalds/linux/blob/v6.17/drivers/tty/n_tty.c#L1681)
+
+The CLI verifies echo is off through `tcgetattr` before reading paste bytes.
+On refusal, timeout or interruption it flushes input and discards arriving
+bytes for 200 ms with echo off. It then flushes input with `TCIFLUSH` and
+restores the original settings with `TCSANOW`, which avoids an output-drain
+wait. It reads back the effective settings and reports any restore failure.
+
+Suffix bytes from an aborted paste that arrive during or after this final
+handoff can reach the next terminal reader or be echoed to the terminal.
+The coordinator accepted this residual on 2026-11-21 under the owner's
+pre-approval.
+
 
 Step 13c stages this source and exercises non-Engine controls. Step 13d wires
 the protected endpoint and trusted installation context into daemon startup.

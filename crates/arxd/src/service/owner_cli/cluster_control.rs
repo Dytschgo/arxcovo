@@ -315,6 +315,7 @@ impl NoEcho {
         let mut input = original;
         // SAFETY: input is valid initialized storage.
         unsafe { libc::cfmakeraw(&mut input) };
+        input.c_lflag &= !libc::EXTPROC;
         input.c_iflag |= libc::ICRNL;
         input.c_cc[libc::VMIN] = 1;
         input.c_cc[libc::VTIME] = 0;
@@ -388,7 +389,11 @@ fn set_mode(fd: libc::c_int, mode: &libc::termios, restoring: bool) -> io::Resul
         // unsuccessful change, since a driver can apply only part of a request.
         // SAFETY: fd belongs to the still-live terminal and mode is initialized.
         let changed = tty_result(unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) });
-        let verified = terminal_mode(fd).and_then(|actual| verify_mode(&actual, mode));
+        let verified = terminal_mode(fd).and_then(|actual| {
+            #[cfg(test)]
+            let actual = tests::transition_readback(actual, restoring);
+            verify_mode(&actual, mode)
+        });
         changed.and(verified).and(discarded)
     })
 }

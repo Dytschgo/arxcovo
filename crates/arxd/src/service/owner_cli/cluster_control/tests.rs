@@ -165,6 +165,16 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
     );
     // SAFETY: successful openpty transferred these distinct descriptors to us.
     let (mut master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    if case == "valid-cr" {
+        let mut inherited = mode(&slave);
+        inherited.c_lflag |= libc::EXTPROC;
+        // SAFETY: the owned slave descriptor and initialized termios are live.
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &inherited) },
+            0
+        );
+        assert_ne!(mode(&slave).c_lflag & libc::EXTPROC, 0);
+    }
     let original = mode(&slave);
     let mfd = master.as_raw_fd();
     let sfd = slave.as_raw_fd();
@@ -180,7 +190,7 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
         CASE
     };
     command
-        .args(["--exact", selector])
+        .args(["--exact", selector, "--nocapture"])
         .env(CHILD, case)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -203,7 +213,10 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
     let deadline = Instant::now() + Duration::from_secs(6);
     let paste = valid_paste();
     assert!(paste.bytes().len() > 4096);
-    if !matches!(case, "display" | "no-tty" | "wrong-daemon") {
+    if !matches!(
+        case,
+        "display" | "no-tty" | "wrong-daemon" | "partial-entry"
+    ) {
         while !noecho(&slave) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -211,12 +224,13 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
             expire(&mut child);
         }
         match case {
-            "valid" => {
+            "valid" | "valid-cr" | "partial-restore" => {
                 for bytes in paste.bytes().chunks(1024) {
                     send_input(&master, bytes, deadline, &mut child);
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                send_input(&master, b"\n", deadline, &mut child);
+                let enter = if case == "valid-cr" { b"\r" } else { b"\n" };
+                send_input(&master, enter, deadline, &mut child);
             }
             "overflow" => {
                 for _ in 0..9 {
@@ -298,6 +312,20 @@ fn run_pty(case: &str, target: Option<(&Path, u32)>) {
     } else {
         assert!(observed.bytes().is_empty(), "terminal leaked bytes");
     }
+    if matches!(case, "partial-entry" | "partial-restore") {
+        let diagnostic = if case == "partial-entry" {
+            b"arxd: cluster-control-refused\n".as_slice()
+        } else {
+            b"arxd: cluster-control-terminal-restore-failed\n"
+        };
+        assert!(
+            output
+                .stderr
+                .windows(diagnostic.len())
+                .any(|bytes| bytes == diagnostic),
+            "missing fixed diagnostic for {case}"
+        );
+    }
     if case == "late-suffix" {
         let suffix = &paste.bytes()[paste.bytes().len() - 64..];
         assert!(
@@ -334,6 +362,16 @@ pub(super) fn observe_suffix_drain() {
     if std::env::var(CHILD).as_deref() == Ok("late-suffix") {
         std::io::stderr().write_all(b"D").unwrap();
     }
+}
+
+pub(super) fn transition_readback(mut effective: libc::termios, restoring: bool) -> libc::termios {
+    let case = std::env::var(CHILD);
+    if (!restoring && case.as_deref() == Ok("partial-entry"))
+        || (restoring && case.as_deref() == Ok("partial-restore"))
+    {
+        effective.c_lflag ^= libc::ECHO;
+    }
+    effective
 }
 
 fn await_suffix_drain(child: &mut std::process::Child, deadline: Instant) {
@@ -463,7 +501,7 @@ fn cli_child(case: &str) {
         uid,
     ];
     let actual = super::super::main(&args);
-    assert_eq!(actual, if case == "valid" { 0 } else { 6 });
+    assert_eq!(actual, if case == "valid-cr" { 0 } else { 6 });
 }
 
 async fn provision(program: &str, args: &[&str], paths: &[&Path]) {
@@ -632,13 +670,15 @@ async fn production_pty() {
     .unwrap();
     assert_eq!(ready, *b"R");
     for case in [
-        "valid",
+        "valid-cr",
         "overflow",
         "extra",
         "truncated",
         "signal",
         "backpressure",
         "late-suffix",
+        "partial-entry",
+        "partial-restore",
         "no-tty",
     ] {
         run_pty(case, Some((&path, DAEMON)));
