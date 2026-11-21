@@ -12,7 +12,10 @@ use issue::found::FOUNDER;
 use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use peer_transport::Credentials;
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    os::fd::{AsRawFd, RawFd},
+};
 use tokio::{net::TcpListener, sync::MutexGuard};
 
 pub(super) struct ReadyIssuer {
@@ -60,8 +63,16 @@ impl ReadyIssuer {
         }
     }
 
-    fn member(&self) -> crate::cluster::enrollment::NodeId {
+    pub(super) fn member(&self) -> crate::cluster::enrollment::NodeId {
         self.promoted.map_or(FOUNDER, |(voter, _)| voter.node)
+    }
+
+    pub(super) fn mint_root(&self) -> &[u8] {
+        self.ca.cert_der()
+    }
+
+    pub(super) fn mint_clock(&self) -> Arc<HostClock> {
+        self.clock.clone()
     }
 
     pub(super) fn transfer_identity(&self) -> (ClusterId, [u8; 32], KeyDigest) {
@@ -188,6 +199,53 @@ impl Backend for Issuer {
     }
 }
 
+/// Non-owning observation of the exact bound listener. Holding another socket
+/// descriptor here would keep enrollment listening after its supervisor closed.
+#[derive(Clone, Copy)]
+pub(super) struct ServingListener {
+    fd: RawFd,
+    pub(super) cookie: u64,
+    pub(super) endpoint: SocketAddr,
+}
+
+impl ServingListener {
+    pub(super) fn capture(listener: &TcpListener, endpoint: SocketAddr) -> Option<Self> {
+        if listener.local_addr().ok()? != endpoint || endpoint.port() == 0 {
+            return None;
+        }
+        let fd = listener.as_raw_fd();
+        let cookie = socket_option::<u64>(fd, libc::SO_COOKIE)?;
+        Some(Self {
+            fd,
+            cookie,
+            endpoint,
+        })
+    }
+
+    pub(super) fn active(self) -> bool {
+        socket_option::<u64>(self.fd, libc::SO_COOKIE) == Some(self.cookie)
+            && socket_option::<libc::c_int>(self.fd, libc::SO_ACCEPTCONN) == Some(1)
+            && socket_option::<u64>(self.fd, libc::SO_COOKIE) == Some(self.cookie)
+    }
+}
+
+fn socket_option<T: Default>(fd: RawFd, option: libc::c_int) -> Option<T> {
+    let mut value = T::default();
+    let mut size = std::mem::size_of::<T>() as libc::socklen_t;
+    // SAFETY: Linux writes at most size initialized bytes to value. The only
+    // callers supply scalar types matching their respective kernel ABI.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_mut(&mut value).cast(),
+            &mut size,
+        )
+    };
+    (status == 0 && size as usize == std::mem::size_of::<T>()).then_some(value)
+}
+
 impl Job {
     // An explicit private activation on the enrollment endpoint from the
     // retained startup intent. The job registers it under the close gate.
@@ -211,6 +269,7 @@ impl Job {
         let listener = std::net::TcpListener::bind(ready.endpoint).map_err(|_| Refused)?;
         listener.set_nonblocking(true).map_err(|_| Refused)?;
         let listener = TcpListener::from_std(listener).map_err(|_| Refused)?;
+        let serving = ServingListener::capture(&listener, ready.endpoint);
         let ingress = ListenerOwner::start(
             listener,
             ready.tls.leaf.clone(),
@@ -224,12 +283,17 @@ impl Job {
             },
         )?;
         state.ingress = Some(ingress);
+        state.serving_enrollment = serving;
         Ok(())
     }
 }
 
 pub(super) async fn close(job: &Job) -> bool {
-    let ingress = job.state().ingress.take();
+    let ingress = {
+        let mut state = job.state();
+        state.serving_enrollment = None;
+        state.ingress.take()
+    };
     let Some(mut ingress) = ingress else {
         return true;
     };

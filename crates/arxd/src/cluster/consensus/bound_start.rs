@@ -55,6 +55,8 @@ struct State {
     #[cfg(target_os = "linux")]
     ingress: Option<crate::cluster::enrollment::session::ListenerOwner>,
     #[cfg(target_os = "linux")]
+    serving_enrollment: Option<enrollment_ingress::ServingListener>,
+    #[cfg(target_os = "linux")]
     admission: Option<Arc<learner_admission::Controller>>,
     #[cfg(target_os = "linux")]
     learner: Option<learner::Operation>,
@@ -68,6 +70,8 @@ pub(super) struct Job {
     state: Mutex<State>,
     changed: watch::Sender<Status>,
     close: Notify,
+    #[cfg(target_os = "linux")]
+    mint_lease: tokio::sync::Mutex<()>,
     #[cfg(test)]
     gate: Mutex<Option<PreparationPause>>,
     #[cfg(test)]
@@ -113,12 +117,16 @@ impl Job {
                 #[cfg(target_os = "linux")]
                 ingress: None,
                 #[cfg(target_os = "linux")]
+                serving_enrollment: None,
+                #[cfg(target_os = "linux")]
                 admission: None,
                 #[cfg(target_os = "linux")]
                 learner: None,
             }),
             changed,
             close: Notify::new(),
+            #[cfg(target_os = "linux")]
+            mint_lease: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             gate: Mutex::new(None),
             #[cfg(test)]
@@ -587,6 +595,8 @@ where
             return;
         }
         #[cfg(target_os = "linux")]
+        drop(job.mint_lease.lock().await);
+        #[cfg(target_os = "linux")]
         if !enrollment_ingress::close(job).await
             || !founder::close_transport(job).await
             || !learner::close_transport(job).await
@@ -683,3 +693,6 @@ mod learner_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, target_os = "linux"))]
+mod mint;
