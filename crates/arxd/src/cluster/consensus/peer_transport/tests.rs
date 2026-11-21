@@ -113,6 +113,34 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        let fixture = Self::unseeded();
+        let applied = fixture
+            .sm
+            .0
+            .lock()
+            .unwrap()
+            .apply(
+                LogPos {
+                    term: 1,
+                    leader: 1,
+                    index: 0,
+                },
+                &StoredEntry::Enrollment(Command::Found {
+                    cluster: CLUSTER,
+                    members: FoundMembers::new([
+                        (node(1), fixture.client.digest()),
+                        (node(2), fixture.server.digest()),
+                    ])
+                    .unwrap(),
+                    proposed_at_ms: 100,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(applied, Some(Outcome::Founded { replay: false })));
+        fixture
+    }
+
+    fn unseeded() -> Self {
         let mut p = CertificateParams::default();
         p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -124,7 +152,7 @@ impl Fixture {
         let client = Self::issue(&issuer, CLUSTER, 1, 940, 10000);
         let server = Self::issue(&issuer, CLUSTER, 2, 940, 10000);
         let dir = private_temp();
-        let mut store = StateStore::open(
+        let store = StateStore::open(
             dir.path(),
             Init {
                 cluster: CLUSTER,
@@ -132,25 +160,6 @@ impl Fixture {
             },
         )
         .unwrap();
-        let applied = store
-            .apply(
-                LogPos {
-                    term: 1,
-                    leader: 1,
-                    index: 0,
-                },
-                &StoredEntry::Enrollment(Command::Found {
-                    cluster: CLUSTER,
-                    members: FoundMembers::new([
-                        (node(1), client.digest()),
-                        (node(2), server.digest()),
-                    ])
-                    .unwrap(),
-                    proposed_at_ms: 100,
-                }),
-            )
-            .unwrap();
-        assert!(matches!(applied, Some(Outcome::Founded { replay: false })));
         Self {
             _dir: dir,
             sm: SmAdapter(Arc::new(Mutex::new(store))),
@@ -4675,22 +4684,185 @@ async fn admission_wire_requires_exact_route_method_source_and_end() {
     }
 }
 
+// The new admission cases authenticate the exact test identities without
+// applying a synthetic Found entry or starting an Engine.
+fn admission_verifier(f: &Fixture) -> PeerVerifier {
+    let bindings = [(node(1), f.client.digest()), (node(2), f.server.digest())];
+    let registry = Arc::new(move |cluster, peer, key| {
+        if cluster == CLUSTER && bindings.contains(&(peer, key)) {
+            Ok(())
+        } else {
+            Err(verify::VerifyRefusal::NotMember)
+        }
+    });
+    PeerVerifier::new(f.root.clone(), CLUSTER, registry).unwrap()
+}
+
+async fn accept_admission_peer(
+    f: &Fixture,
+    listener: &TcpListener,
+) -> tokio_rustls::server::TlsStream<TcpStream> {
+    let config = verify::server_config(
+        admission_verifier(f).server(),
+        f.client.cert.clone(),
+        f.client.private_key(),
+        Arc::new(pki::FixedTime(1001)),
+    )
+    .unwrap();
+    timeout(OBSERVE, async {
+        let (socket, _) = listener.accept().await.unwrap();
+        TlsAcceptor::from(Arc::new(config))
+            .accept(socket)
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+pub(in crate::cluster::consensus) async fn admission_test_peer()
+-> (AuthenticatedPeer, SmAdapter, tempfile::TempDir) {
+    let f = Fixture::unseeded();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = verify::client_config(
+        admission_verifier(&f).client(node(1)),
+        f.server.cert.clone(),
+        f.server.private_key(),
+        Arc::new(pki::FixedTime(1001)),
+    )
+    .unwrap();
+    let (client, server) = tokio::join!(
+        connect(Arc::new(config), listener.local_addr().unwrap()),
+        accept_admission_peer(&f, &listener)
+    );
+    assert!(client.is_ok());
+    let peer = AuthenticatedPeer::from_server(server.get_ref().1).unwrap();
+    assert_eq!(
+        peer.authenticated_identity(),
+        Ok((CLUSTER, node(2), f.server.digest()))
+    );
+    (peer, f.sm, f._dir)
+}
+
+async fn admission_tls_exchange() -> (Fixture, TransportOwner, AdmissionClient, TcpListener) {
+    let f = Fixture::unseeded();
+    let gate = learner_image(&f, 1, true, &f.sm);
+    let (owner, _) = listen_learner_for_test(&f, &f.sm, gate, rpc_spy(false)).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Dial loopback so the tests need no host-specific LAN address. Exercise
+    // request() and the real owned exchange after the endpoint constructor.
+    let client = AdmissionClient {
+        shared: Arc::downgrade(&owner.shared),
+        issuer: listener.local_addr().unwrap(),
+        advertised: "192.168.6.2:7001".parse().unwrap(),
+    };
+    (f, owner, client, listener)
+}
+
+async fn read_admission_request(stream: &mut (impl AsyncRead + Unpin), advertised: SocketAddr) {
+    timeout(OBSERVE, async {
+        let mut magic = [0; 4];
+        stream.read_exact(&mut magic).await.unwrap();
+        assert_eq!(magic, control::MAGIC);
+        // This test issuer stands in for the advertised peer on a LAN.
+        assert_eq!(
+            control::read_request(stream, reverse(), advertised).await,
+            Ok(advertised)
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn admission_close_before_first_write_is_definite_refusal() {
+    let (f, mut owner, client, listener) = admission_tls_exchange().await;
+    let mut rx = events(&owner);
+    let hold = gate(&owner, Stage::BeforeAdmissionWrite);
+    let response = client.request().unwrap();
+    let mut stream = accept_admission_peer(&f, &listener).await;
+    assert!(observe(&mut rx, Event::Stage(Stage::BeforeAdmissionWrite)).await);
+
+    let mut close = std::pin::pin!(owner.close());
+    assert!(futures_util::poll!(&mut close).is_pending());
+    hold.add_permits(1);
+    assert_eq!(response.reply().await, AdmissionReply::Refused);
+    let mut byte = [0; 1];
+    assert_eq!(
+        timeout(OBSERVE, stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(timeout(OBSERVE, close).await.unwrap(), Ok(()));
+}
+
+#[tokio::test]
+async fn admission_close_after_partial_write_is_unknown() {
+    let (f, mut owner, client, listener) = admission_tls_exchange().await;
+    let mut rx = events(&owner);
+    let hold = gate(&owner, Stage::AdmissionPartialWrite);
+    let response = client.request().unwrap();
+    let mut stream = accept_admission_peer(&f, &listener).await;
+    assert!(observe(&mut rx, Event::Stage(Stage::AdmissionPartialWrite)).await);
+    let mut byte = [0; 1];
+    timeout(OBSERVE, stream.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(byte, control::MAGIC[..1]);
+
+    let mut close = std::pin::pin!(owner.close());
+    assert!(futures_util::poll!(&mut close).is_pending());
+    hold.add_permits(1);
+    assert_eq!(response.reply().await, AdmissionReply::Unknown);
+    assert_eq!(
+        timeout(OBSERVE, stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(timeout(OBSERVE, close).await.unwrap(), Ok(()));
+}
+
 #[tokio::test]
 async fn admission_disconnect_after_request_has_unknown_disposition() {
-    use std::sync::atomic::AtomicBool;
-    for (attempted, expected) in [
-        (false, AdmissionReply::Refused),
-        (true, AdmissionReply::Unknown),
-    ] {
-        let (tx, reply) = oneshot::channel();
-        let response = AdmissionResponse {
-            reply,
-            deadline: Instant::now() + learner_admission::BUDGET,
-            sent: Arc::new(AtomicBool::new(attempted)),
-        };
-        drop(tx);
-        assert_eq!(response.reply().await, expected);
-    }
+    let (f, mut owner, client, listener) = admission_tls_exchange().await;
+    let response = client.request().unwrap();
+    let mut stream = accept_admission_peer(&f, &listener).await;
+    read_admission_request(&mut stream, client.advertised).await;
+    timeout(OBSERVE, stream.shutdown()).await.unwrap().unwrap();
+    assert_eq!(response.reply().await, AdmissionReply::Unknown);
+    assert_eq!(bounded_close(&mut owner).await, Ok(()));
+}
+
+#[tokio::test]
+async fn admission_complete_tls_reply_returns_applied() {
+    let (f, mut owner, client, listener) = admission_tls_exchange().await;
+    let response = client.request().unwrap();
+    let mut stream = accept_admission_peer(&f, &listener).await;
+    read_admission_request(&mut stream, client.advertised).await;
+    let answer = AdmissionReply::Applied(
+        LogPos {
+            term: 2,
+            leader: 1,
+            index: 9,
+        },
+        client.advertised,
+    );
+    timeout(
+        OBSERVE,
+        send_frame(&mut stream, &control::reply(route(), answer), false),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.reply().await, answer);
+    assert_eq!(bounded_close(&mut owner).await, Ok(()));
 }
 
 #[tokio::test]
