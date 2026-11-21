@@ -5,6 +5,7 @@ use super::{
     peer_control_wire as control, peer_registry, peer_rpc_wire as peer_wire,
 };
 use crate::cluster::{
+    c13_diagnostics::record,
     enrollment::{ClusterId, NodeId},
     pki::verify::{self, AuthenticatedPeer, PeerVerifier, Registry},
 };
@@ -75,6 +76,22 @@ pub(super) enum Refusal {
     Deadline,
     Dispatch,
     Unclean,
+}
+
+impl Refusal {
+    fn diagnostic_category(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Closed => "closed",
+            Self::NotReady => "unavailable",
+            Self::Address => "address",
+            Self::Tls => "tls",
+            Self::Identity => "identity",
+            Self::Deadline => "deadline",
+            Self::Dispatch => "dispatch",
+            Self::Frame | Self::Unclean => "transport",
+        }
+    }
 }
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -860,10 +877,15 @@ async fn inbound(
     // reading any application data, regardless of the peer's lane.
     let authorized = match &resources.learner {
         Some(learner) => learner
-            .authorize(peer.0, peer.1, peer.2, true)
+            .authorize(peer.0, peer.1, peer.2, true, deadline)
             .await
             .map(|_| ()),
-        None => resources.registry.authorize(peer.0, peer.1, peer.2).await,
+        None => {
+            resources
+                .registry
+                .authorize(peer.0, peer.1, peer.2, deadline, "peer-pre-frame")
+                .await
+        }
     };
     #[cfg(all(test, target_os = "linux"))]
     if let Some((trace, peer)) = trace {
@@ -917,7 +939,7 @@ async fn inbound(
         }
         resources
             .registry
-            .authorize(peer.0, peer.1, peer.2)
+            .authorize(peer.0, peer.1, peer.2, deadline, "admission-dispatch")
             .await
             .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
@@ -970,7 +992,7 @@ async fn inbound(
         }
         let bootstrap_allowed = matches!(request, Request::Append(_) | Request::Snapshot(..));
         let authorized = learner
-            .authorize(peer.0, peer.1, peer.2, bootstrap_allowed)
+            .authorize(peer.0, peer.1, peer.2, bootstrap_allowed, deadline)
             .await;
         #[cfg(all(test, target_os = "linux"))]
         if let Some((trace, peer)) = trace {
@@ -992,7 +1014,7 @@ async fn inbound(
     } else {
         resources
             .registry
-            .authorize(peer.0, peer.1, peer.2)
+            .authorize(peer.0, peer.1, peer.2, deadline, "peer-dispatch")
             .await
             .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
@@ -1231,7 +1253,10 @@ async fn outbound(
     if caller.is_closed() {
         return Err(Refusal::Closed);
     }
-    let authorized = resources.registry.authorize(peer.0, peer.1, peer.2).await;
+    let authorized = resources
+        .registry
+        .authorize(peer.0, peer.1, peer.2, deadline, "peer-client")
+        .await;
     #[cfg(all(test, target_os = "linux"))]
     if let Some(trace) = trace {
         trace.caller(
@@ -1294,7 +1319,7 @@ async fn outbound(
     }
     resources
         .registry
-        .authorize(peer.0, peer.1, peer.2)
+        .authorize(peer.0, peer.1, peer.2, deadline, "peer-client")
         .await
         .map_err(|_| Refusal::Identity)?;
     before_dispatch(shared, deadline)?;
@@ -2395,8 +2420,22 @@ pub(super) struct AdmissionResponse {
 impl AdmissionResponse {
     pub(super) async fn reply(self) -> AdmissionReply {
         match timeout_at(self.deadline, self.reply).await {
-            Ok(Ok(Ok(Ok(reply)))) if Instant::now() < self.deadline => reply,
-            _ => self.write.unconfirmed(),
+            Ok(Ok(Ok(Ok(reply)))) if Instant::now() < self.deadline => {
+                if let Some(category) = reply.refusal_category() {
+                    record("admission-reply", category);
+                }
+                reply
+            }
+            failure => {
+                let reply = self.write.unconfirmed();
+                let category = match failure {
+                    Ok(Ok(Ok(Err(error)))) => error.diagnostic_category(),
+                    Ok(Err(_)) => "transport",
+                    _ => "deadline",
+                };
+                record("admission-exchange", category);
+                reply
+            }
         }
     }
 }
@@ -2577,12 +2616,18 @@ mod issuer_channel {
         std::pin::Pin<Box<dyn Future<Output = Result<T, Refusal>> + Send + 'a>>;
 
     pub(super) trait Receiver: Send + Sync {
-        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> ReceiveFuture<'_, Offer>;
+        fn check(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            deadline: Instant,
+        ) -> ReceiveFuture<'_, Offer>;
         fn install<'a>(
             &'a self,
             claim: Claim,
             sender: AuthenticatedPeer,
             channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+            deadline: Instant,
         ) -> ReceiveFuture<'a, ()>;
     }
 
@@ -2594,13 +2639,19 @@ mod issuer_channel {
             offer: Offer,
             key: &'a [u8; 32],
             transcript: &'a [u8],
+            deadline: Instant,
         ) -> impl Future<Output = Result<Vec<u8>, Refusal>> + Send + 'a;
     }
 
     #[cfg(target_os = "linux")]
     impl Receiver for &'static super::super::bound_start::Job {
-        fn check(&self, claim: Claim, sender: AuthenticatedPeer) -> ReceiveFuture<'_, Offer> {
-            Box::pin(self.check_issuer_transfer(claim, sender))
+        fn check(
+            &self,
+            claim: Claim,
+            sender: AuthenticatedPeer,
+            deadline: Instant,
+        ) -> ReceiveFuture<'_, Offer> {
+            Box::pin(self.check_issuer_transfer(claim, sender, deadline))
         }
 
         fn install<'a>(
@@ -2608,8 +2659,9 @@ mod issuer_channel {
             claim: Claim,
             sender: AuthenticatedPeer,
             channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+            deadline: Instant,
         ) -> ReceiveFuture<'a, ()> {
-            Box::pin(self.install_voter_custody(claim, sender, channel))
+            Box::pin(self.install_voter_custody(claim, sender, channel, deadline))
         }
     }
 
@@ -2620,8 +2672,10 @@ mod issuer_channel {
             offer: Offer,
             key: &'a [u8; 32],
             transcript: &'a [u8],
+            deadline: Instant,
         ) -> Result<Vec<u8>, Refusal> {
-            self.seal_voter_transfer(offer, key, transcript).await
+            self.seal_voter_transfer(offer, key, transcript, deadline)
+                .await
         }
     }
 
@@ -2672,7 +2726,7 @@ mod issuer_channel {
         let sealed = wire::read_sealed(&mut stream).await?;
         check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source).await?;
         receiver
-            .install(claim, sender, (&key.0, &transcript, sealed))
+            .install(claim, sender, (&key.0, &transcript, sealed), deadline)
             .await?;
         drop(key);
         check_receiver(shared, deadline, receiver.as_ref(), claim, sender, source).await?;
@@ -2692,7 +2746,7 @@ mod issuer_channel {
         source: SocketAddr,
     ) -> Result<(), Refusal> {
         before_dispatch(shared, deadline)?;
-        let offer = receiver.check(claim, sender).await?;
+        let offer = receiver.check(claim, sender, deadline).await?;
         before_dispatch(shared, deadline)?;
         if source.ip() != offer.sender_address.ip() {
             return Err(Refusal::Address);
@@ -2768,7 +2822,16 @@ mod issuer_channel {
         pub(in crate::cluster::consensus) async fn outcome(self) -> Outcome {
             match timeout_at(self.deadline, self.reply).await {
                 Ok(Ok(Ok(()))) if Instant::now() < self.deadline => Outcome::Installed,
-                _ => self.attempt.refuse_or_unknown(),
+                failure => {
+                    let outcome = self.attempt.refuse_or_unknown();
+                    let category = match failure {
+                        Ok(Ok(Err(error))) => error.diagnostic_category(),
+                        Ok(Err(_)) => "transport",
+                        _ => "deadline",
+                    };
+                    record("transfer-exchange", category);
+                    outcome
+                }
             }
         }
     }
@@ -2965,7 +3028,7 @@ mod issuer_channel {
         }
         resources
             .registry
-            .authorize(peer.0, peer.1, peer.2)
+            .authorize(peer.0, peer.1, peer.2, deadline, "transfer-client")
             .await
             .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)?;
@@ -2980,7 +3043,7 @@ mod issuer_channel {
             .map_err(|_| Refusal::Tls)?;
         before_dispatch(shared, deadline)?;
         let sealed = check
-            .build_once(async { sender.seal(offer, &key.0, &transcript).await })
+            .build_once(async { sender.seal(offer, &key.0, &transcript, deadline).await })
             .await?;
         drop(key);
         before_dispatch(shared, deadline)?;
@@ -2988,7 +3051,7 @@ mod issuer_channel {
         wire::read_acknowledgement(&mut stream, &challenge).await?;
         resources
             .registry
-            .authorize(peer.0, peer.1, peer.2)
+            .authorize(peer.0, peer.1, peer.2, deadline, "transfer-client")
             .await
             .map_err(|_| Refusal::Identity)?;
         before_dispatch(shared, deadline)

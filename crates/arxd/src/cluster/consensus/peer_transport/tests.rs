@@ -4142,7 +4142,7 @@ async fn poll_while_store_is_held<F: Future>(
         "contended authorization must yield before returning"
     );
     let result = if expire {
-        tokio::time::advance(Duration::from_millis(4)).await;
+        tokio::time::advance(Duration::from_millis(20)).await;
         match exchange.poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(result) => Some(result),
             Poll::Pending => panic!("authorization did not refuse at its deadline"),
@@ -4621,7 +4621,13 @@ async fn learner_terminal_crossing_refuses_strict_remote_after_local_binding_rem
     assert_eq!(learner.phase(), Ok(peer_registry::Phase::Refused));
     assert_eq!(
         learner
-            .authorize(CLUSTER, node(1), f.client.digest(), true)
+            .authorize(
+                CLUSTER,
+                node(1),
+                f.client.digest(),
+                true,
+                Instant::now() + INBOUND_BUDGET,
+            )
             .await,
         Err(verify::VerifyRefusal::Unavailable)
     );
@@ -5300,6 +5306,7 @@ mod issuer_refusals {
             _: Offer,
             key: &'a [u8; 32],
             transcript: &'a [u8],
+            _: Instant,
         ) -> Result<Vec<u8>, Refusal> {
             self.packages.fetch_add(1, Ordering::SeqCst);
             custody::fixture_seal(
@@ -5326,6 +5333,7 @@ mod issuer_refusals {
             &self,
             claim: Claim,
             sender: AuthenticatedPeer,
+            _: Instant,
         ) -> issuer_channel::ReceiveFuture<'_, Offer> {
             Box::pin(async move { self.check(claim, sender) })
         }
@@ -5335,6 +5343,7 @@ mod issuer_refusals {
             claim: Claim,
             sender: AuthenticatedPeer,
             channel: (&'a [u8; 32], &'a [u8], Vec<u8>),
+            _: Instant,
         ) -> issuer_channel::ReceiveFuture<'a, ()> {
             Box::pin(async move { self.install(claim, sender, channel) })
         }
@@ -5964,6 +5973,7 @@ mod issuer_refusals {
                 _: Offer,
                 key: &'a [u8; 32],
                 transcript: &'a [u8],
+                _: Instant,
             ) -> Result<Vec<u8>, Refusal> {
                 self.sealed.fetch_add(1, Ordering::SeqCst);
                 let private = Wipe(self.ca.private_marker());
@@ -6136,7 +6146,7 @@ mod issuer_refusals {
                 sample,
                 clock,
             );
-            job.set_receiver_fixture_history(slot, live);
+            job.set_receiver_fixture_history(slot, live, &sm).await;
             assert!(base.join("history/strict").is_file());
             let fault = match case {
                 "temp-sync" => Some(TestFault::FileSync),

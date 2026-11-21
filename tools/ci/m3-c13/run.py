@@ -34,9 +34,34 @@ CLEANUP = re.compile(
     r"C13 cleanup spawned=([0-6]) signaled=([0-6]) reaped=([0-6]) clean=([0-6]) "
     r"helpers=(\d{1,4}) helpers_reaped=(\d{1,4}) helper_unknown=([01])"
 )
-FIRST = re.compile(
-    r"C13 first phase=(preflight|founder|join|promotion-transfer|recovery|survivor|publication|close) "
-    r"category=(assertion|spawn|helper-reap|listener|daemon-refused|terminal-io|pipe-io)"
+FIRST_PREFIX = (
+    r"C13 first phase=(?:preflight|founder|join|promotion-transfer|recovery|survivor|publication|close) "
+    r"category="
+)
+FIRST = re.compile(FIRST_PREFIX
+                   + r"(?:assertion|spawn|helper-reap|listener|daemon-refused|terminal-io|pipe-io)")
+ASSERTION = re.compile(
+    FIRST_PREFIX + r"assertion at=(?:m3_activation_linux\.rs|publish_only_probe\.rs):[1-9][0-9]{0,9} "
+    r"message=(?:assertion-failed|assertion-equality|value-unavailable|process-exited|"
+    r"readiness-elapsed|mint-refused|join-refused|terminal-unprotected|publication-refused|"
+    r"publication-possession-refused|publication-helper-failed)"
+)
+FIRST_LIMIT = 160
+OWNER_EXIT = re.compile(
+    r"C13 owner node=[abcd] action=(?:join|mint) exit=(?:[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5]|signal)"
+)
+DIAGNOSTIC = re.compile(
+    r"C13 diagnostic node=[abcd] (?:stage=(?:owner-join|join-start|join-attach|"
+    r"join-publication|join-admission|admission-route|admission-register|admission-worker|"
+    r"admission-membership|admission-confirm|admission-reply|admission-exchange|"
+    r"learner-authorization|peer-pre-frame|peer-dispatch|admission-dispatch|peer-client|"
+    r"transfer-client|transfer-receiver|transfer-exchange|lifecycle-observe) "
+    r"category=(?:unavailable-store-wait|unavailable-store|unavailable|phase-unavailable|"
+    r"clock|identity|busy|node-busy|closed|address|tls|deadline|dispatch|transport|"
+    r"revoked|stale-tail|refused|unconfirmed|incomplete|not-leader|view-changed|"
+    r"transfer|history|issuer|listener)|"
+    r"stage=transfer-seal category=(?:offer-node-busy|offer-fresh-read-busy|offer-read|offer-changed|issuer-busy|"
+    r"issuer-refused|seal|recheck-busy|recheck-refused))"
 )
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
 
@@ -176,17 +201,17 @@ class Capture:
         if self.first is not None:
             return
         # Track one candidate independently of the retained bulk prefix.
-        # Every allowed record fits in 96 bytes, including a Windows CR.
+        # Allow one trailing CR within the record limit.
         *lines, tail = data.split(b"\n")
         for line in lines:
-            if self._line is not None and len(self._line) + len(line) <= 96:
+            if self._line is not None and len(self._line) + len(line) <= FIRST_LIMIT:
                 record = (self._line + line).decode("ascii", errors="replace").removesuffix("\r")
-                if FIRST.fullmatch(record):
+                if FIRST.fullmatch(record) or ASSERTION.fullmatch(record):
                     self.first = record
                     return
             self._line = b""
         if self._line is not None:
-            self._line = self._line + tail if len(self._line) + len(tail) <= 96 else None
+            self._line = self._line + tail if len(self._line) + len(tail) <= FIRST_LIMIT else None
 
     def text(self):
         return self.bulk.decode("utf-8", errors="replace")
@@ -197,13 +222,13 @@ def pipe_capacity(fd):
     return fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
 
 
-def bounded_run(args, *, env, timeout):
+def bounded_run(args, *, env, timeout, stderr=subprocess.DEVNULL):
     capture = Capture()
     deadline = time.monotonic() + timeout
     work_deadline = deadline - REAP_GRACE
     remaining(work_deadline, timeout)
     process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
+                               stderr=stderr)
     # Popen's context exit waits implicitly. Own the pipe separately so an
     # unobserved child cannot extend either exit path.
     with process.stdout, selectors.DefaultSelector() as sel:
@@ -239,13 +264,35 @@ def bounded_run(args, *, env, timeout):
     return code, capture
 
 
-def cleanup_observed(lines):
+def run_campaign(args, *, env, timeout):
+    # Optional diagnostics never enter Capture or influence cleanup evidence.
+    try:
+        reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        code, capture = bounded_run(args, env=env, timeout=timeout)
+        return code, capture, b""
+    try:
+        code, capture = bounded_run(args, env=env, timeout=timeout, stderr=writer)
+        # Nonblocking and bounded even if a descendant still owns the writer.
+        try:
+            diagnostic = os.read(reader, OUTPUT_LIMIT)
+        except OSError:
+            diagnostic = b""
+        return code, capture, diagnostic
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+def cleanup_disposition(lines):
     records = [m.groups() for line in lines if (m := CLEANUP.fullmatch(line))]
     if len(records) != 1:
-        return False
+        return False, False
     spawned, signaled, reaped, clean, helpers, helpers_reaped, helper_unknown = records[0]
-    return (spawned == signaled == reaped == clean and helpers == helpers_reaped
-            and helper_unknown == "0")
+    reaped_all = (spawned == reaped and clean <= signaled <= spawned
+                  and helpers == helpers_reaped and helper_unknown == "0")
+    clean_close = reaped_all and spawned == signaled == clean
+    return reaped_all, clean_close
 
 
 def ip_json(arguments, deadline):
@@ -287,10 +334,38 @@ def launch_privileged(stage, root_deadline, deadline):
     # sudo provides SUDO_UID for the ownership check. Pass only the fixed,
     # already-qualified runner facts as env arguments to the command.
     facts = [f"{name}={value}" for name, value in HOSTED_ENV.items()]
-    subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", *facts,
-                    "/usr/bin/python3", "-I", "-B", Path(__file__).resolve(),
-                    "--staged", stage, str(int(root_deadline * 1_000_000))],
-                   env=ENV, stdin=subprocess.DEVNULL, check=True, timeout=remaining(deadline - 2, TOTAL))
+    result = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", *facts,
+                             "/usr/bin/python3", "-I", "-B", Path(__file__).resolve(),
+                             "--staged", stage, str(int(root_deadline * 1_000_000))],
+                            env=ENV, stdin=subprocess.DEVNULL, check=False,
+                            timeout=remaining(deadline - 2, TOTAL))
+    return int(result.returncode != 0)
+
+
+def relay_diagnostics(diagnostic):
+    if not diagnostic:
+        return
+    try:
+        stderr = sys.stderr.fileno()
+        original = os.fstat(stderr)
+        if not stat.S_ISFIFO(original.st_mode):
+            return
+        # Reopen the pipe with independent status flags. A dup would share
+        # O_NONBLOCK with any mandatory output using the same description.
+        writer = os.open(f"/proc/self/fd/{stderr}", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            reopened = os.fstat(writer)
+            if (not stat.S_ISFIFO(reopened.st_mode)
+                    or (reopened.st_dev, reopened.st_ino) != (original.st_dev, original.st_ino)):
+                return
+            for raw in diagnostic[:OUTPUT_LIMIT].split(b"\n")[:-1]:
+                if len(raw) < 128 and DIAGNOSTIC.fullmatch(raw.decode("ascii", errors="replace")):
+                    os.write(writer, raw + b"\n")
+        finally:
+            os.close(writer)
+    except (OSError, ValueError, AttributeError):
+        # An unavailable, full or closed diagnostic endpoint is disposable.
+        pass
 
 
 def privileged(stage, deadline):
@@ -311,6 +386,7 @@ def privileged(stage, deadline):
     may_remove = True
     successful = False
     first = None
+    diagnostic = b""
     start = time.monotonic()
     phase = "staging"
     try:
@@ -334,25 +410,30 @@ def privileged(stage, deadline):
         if timeout < CAMPAIGN_TIMEOUT - 1:
             raise TimeoutError("campaign cleanup reserve unavailable")
         may_remove = False
-        code, capture = bounded_run([root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
-                                    env=environment, timeout=timeout)
+        code, capture, diagnostic = run_campaign(
+            [root / "campaign", "--exact", SELECTOR, "--ignored", "--nocapture"],
+            env=environment, timeout=timeout,
+        )
         lines = capture.text().splitlines()
         first = capture.first
-        may_remove = code is not None and not capture.truncated and cleanup_observed(lines)
+        reaped_all, clean_close = cleanup_disposition(lines)
+        # A reaped daemon can fail to close gracefully. Reclaim its disposable
+        # role, but still require graceful close evidence for campaign success.
+        may_remove = code is not None and not capture.truncated and reaped_all
         print(f"C13 seconds={time.monotonic()-test_start:.3f} result={'timeout' if code is None else code}",
               flush=True)
         for line in lines:
-            if (line == PIN or CLEANUP.fullmatch(line) or re.fullmatch(
-                    r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
+            if (line == PIN or CLEANUP.fullmatch(line) or OWNER_EXIT.fullmatch(line)
+                    or re.fullmatch(
+                        r"C13 publication node=4 term=\d+ leader=\d+ index=\d+", line)):
                 print(line, flush=True)
-        successful = code == 0 and lines.count(PIN) == 1 and may_remove and first is None
+        successful = (code == 0 and lines.count(PIN) == 1 and may_remove
+                      and clean_close and first is None)
         if not successful and first is None:
             first = f"C13 first phase=campaign category={'timeout' if code is None else 'unconfirmed'}"
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         first = first or f"C13 first phase={phase} category={type(error).__name__}"
     finally:
-        if first is not None:
-            print(first, flush=True)
         removed, retained, unknown = 0, 0, 0
         if may_remove:
             for kind, name, id_ in reversed(roles):
@@ -371,11 +452,13 @@ def privileged(stage, deadline):
                 fixture = "removed"
             except (OSError, subprocess.SubprocessError):
                 fixture = "unknown"
+        if first is not None:
+            print(first, flush=True)
         print(f"C13 teardown fixture={fixture} roles_removed={removed} "
               f"roles_retained={retained} roles_unknown={unknown} "
               f"seconds={time.monotonic()-start:.3f}", flush=True)
-    if not successful or retained or unknown or fixture not in ("removed", "absent"):
-        raise ValueError("C13 execution or teardown unconfirmed")
+    relay_diagnostics(diagnostic)
+    return int(not successful or retained != 0 or unknown != 0 or fixture != "removed")
 
 
 def role_identity(kind, name):
@@ -428,13 +511,14 @@ def main():
         for name, actual in artifacts:
             digest = stage_binary(actual, stage / name, setup)
             print(f"C13 artifact {name} sha256={digest}", flush=True)
-        launch_privileged(stage, root_deadline, deadline)
+        status = launch_privileged(stage, root_deadline, deadline)
     print(f"C13 launcher seconds={time.monotonic()-start:.3f}", flush=True)
+    return status
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except (KeyError, ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"C13 launcher refused ({type(error).__name__})", file=sys.stderr)
         sys.exit(1)

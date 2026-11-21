@@ -7,20 +7,31 @@ use crate::cluster::{
     },
     pki::{ca::ClusterCa, preproof::Refused},
 };
-use checked_clock::{CheckedClock, HostClock};
+use crate::service::cluster_owner::TIME_EVIDENCE_LEN;
+use anchor_query::AnchorQueryError;
+use checked_clock::{CheckedClock, ClockError, HostClock};
 use issue::found::FOUNDER;
 use issuer_transfer::Voter;
 use openraft::type_config::async_runtime::watch::WatchReceiver;
 use peer_transport::Credentials;
+use sha2::{Digest, Sha256};
 use std::{
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
+    sync::{Mutex, OnceLock},
 };
 use tokio::{net::TcpListener, sync::MutexGuard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ActivationError {
     Deferred,
+    Refused,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AvailabilityError {
+    Busy,
+    NotReady,
     Refused,
 }
 
@@ -131,11 +142,27 @@ impl ReadyIssuer {
     // This is a local refusal check. Only the existing enroll guards establish
     // proposal and issuance authority.
     pub(super) fn available(&self, node: &ConsensusNode) -> Result<(), Refused> {
-        self.activation_available(node).map_err(|_| Refused)
+        self.availability(node).map_err(|_| Refused)
     }
 
     fn activation_available(&self, node: &ConsensusNode) -> Result<(), ActivationError> {
-        use ActivationError::{Deferred, Refused};
+        self.availability(node).map_err(|error| match error {
+            AvailabilityError::Busy | AvailabilityError::NotReady => ActivationError::Deferred,
+            AvailabilityError::Refused => ActivationError::Refused,
+        })
+    }
+
+    pub(super) fn availability(&self, node: &ConsensusNode) -> Result<(), AvailabilityError> {
+        self.availability_before(node, None)
+    }
+
+    pub(super) fn availability_before(
+        &self,
+        node: &ConsensusNode,
+        acquisition_deadline: Option<Instant>,
+    ) -> Result<(), AvailabilityError> {
+        use AvailabilityError::{Busy, NotReady, Refused};
+        use membership_observation::MembershipReadError;
         let raft = node.raft.as_ref().ok_or(Refused)?;
         let metrics = raft.metrics();
         let leader = {
@@ -152,19 +179,25 @@ impl ReadyIssuer {
             return Err(Refused);
         }
         if !leader {
-            return Err(Deferred);
+            return Err(NotReady);
         }
         if let Some((voter, installed_at)) = self.promoted {
             return node
                 .issuer_voter(self.cluster, voter, installed_at, true)
-                .map_err(Into::into);
+                .map_err(|error| match error {
+                    MembershipReadError::Busy => Busy,
+                    MembershipReadError::NotLeader | MembershipReadError::RetryLater => NotReady,
+                    MembershipReadError::Unavailable | MembershipReadError::PeerRefused => Refused,
+                });
         }
         let sm = node.sm.as_ref().ok_or(Refused)?;
         let store = sm.0.try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => Deferred,
+            std::sync::TryLockError::WouldBlock => Busy,
             std::sync::TryLockError::Poisoned(_) => Refused,
         })?;
-        if store.is_poisoned() {
+        if acquisition_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || store.is_poisoned()
+        {
             return Err(Refused);
         }
         store
@@ -178,6 +211,7 @@ impl ReadyIssuer {
 pub(super) struct ExchangeCounts {
     anchors: std::sync::atomic::AtomicU8,
     redeems: std::sync::atomic::AtomicU8,
+    last_query: Mutex<Option<LastQuery>>,
 }
 
 impl ExchangeCounts {
@@ -186,10 +220,96 @@ impl ExchangeCounts {
         [self.anchors.load(Relaxed), self.redeems.load(Relaxed)]
     }
 
-    fn count(counter: &std::sync::atomic::AtomicU8) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let _ = counter.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)));
+    fn count(counter: &std::sync::atomic::AtomicU8) -> u8 {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let previous = counter.fetch_update(Release, Relaxed, |n| Some(n.saturating_add(1)));
+        previous.unwrap_or_else(|n| n).saturating_add(1)
     }
+
+    pub(super) fn absent_time_evidence() -> [u8; TIME_EVIDENCE_LEN] {
+        let mut body = [0; TIME_EVIDENCE_LEN];
+        body[0] = 1;
+        body
+    }
+
+    fn time_evidence(
+        &self,
+        checkpoint: Option<Result<u64, ClockError>>,
+    ) -> [u8; TIME_EVIDENCE_LEN] {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut body = Self::absent_time_evidence();
+        if let Ok(last) = self.last_query.try_lock()
+            && let Some(last) = last
+                .as_ref()
+                .filter(|last| last.ordinal == self.anchors.load(Acquire))
+        {
+            body[1] = last.ordinal;
+            body[2] = match last.outcome {
+                Ok(()) => 1,
+                Err(AnchorQueryError::Refused) => 2,
+                Err(AnchorQueryError::Busy) => 3,
+                Err(AnchorQueryError::Unavailable) => 4,
+            };
+            body[3] = put_sample(last.sample, &mut body[5..13]);
+            body[21..].copy_from_slice(&last.handle);
+        }
+        body[4] = put_sample(checkpoint, &mut body[13..21]);
+        body
+    }
+}
+
+fn put_sample(sample: Option<Result<u64, ClockError>>, bytes: &mut [u8]) -> u8 {
+    match sample {
+        None => 0,
+        Some(Ok(ms)) => {
+            bytes.copy_from_slice(&ms.to_be_bytes());
+            1
+        }
+        Some(Err(_)) => 2,
+    }
+}
+
+struct LastQuery {
+    ordinal: u8,
+    handle: [u8; 32],
+    sample: Option<Result<u64, ClockError>>,
+    outcome: Result<(), AnchorQueryError>,
+}
+
+struct QueryClock<'a> {
+    source: &'a dyn CheckedClock,
+    sample: OnceLock<Result<u64, ClockError>>,
+}
+
+impl CheckedClock for QueryClock<'_> {
+    fn sample_ms(&self) -> Result<u64, ClockError> {
+        let result = self.source.sample_ms();
+        let _ = self.sample.set(result);
+        result
+    }
+}
+
+impl Job {
+    pub(super) fn time_evidence(&self) -> [u8; TIME_EVIDENCE_LEN] {
+        let Ok(state) = self.state.try_lock() else {
+            return ExchangeCounts::absent_time_evidence();
+        };
+        let exchange = state.exchange.clone();
+        let issuer = state.issuer.clone();
+        drop(state);
+        // A checkpoint uses the retained clock without taking the node's
+        // admission lock. The campaign serializes it with client exchanges.
+        let sample = issuer.map(|issuer| issuer.clock.sample_checkpoint());
+        exchange.time_evidence(sample)
+    }
+}
+
+fn query_handle(query: &[u8; 32]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"arxcovo-d5-query-v1\0")
+        .chain_update(query)
+        .finalize()
+        .into()
 }
 
 struct Issuer {
@@ -201,32 +321,72 @@ struct Issuer {
 }
 
 impl Issuer {
-    fn admit(&self, deadline: Instant) -> Result<MutexGuard<'_, ConsensusNode>, Refused> {
-        // No queue behind another dispatch or the retained node's owner.
-        let node = self.node.try_lock().map_err(|_| Refused)?;
-        self.ready.available(&node)?;
-        if Instant::now() >= deadline {
-            return Err(Refused);
-        }
-        Ok(node)
+    async fn admit(&self, deadline: Instant) -> Result<MutexGuard<'_, ConsensusNode>, Refused> {
+        wait_for_available(&self.node, None, deadline, |node| {
+            self.ready.availability(node)
+        })
+        .await
     }
+}
+
+async fn wait_for_available<'a, N>(
+    node: &'a tokio::sync::Mutex<N>,
+    mut held: Option<MutexGuard<'a, N>>,
+    deadline: Instant,
+    check: impl Fn(&N) -> Result<(), AvailabilityError>,
+) -> Result<MutexGuard<'a, N>, Refused> {
+    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
+    while Instant::now() < retry_until {
+        // There is no queue behind a retained node owner. Drop the node
+        // before yielding when either it or the applied store is busy.
+        if let Some(node) = held.take().or_else(|| node.try_lock().ok()) {
+            match check(&node) {
+                Ok(()) if Instant::now() < retry_until => return Ok(node),
+                Err(AvailabilityError::Busy) => {}
+                _ => return Err(Refused),
+            }
+        }
+        if !peer_registry::poll_store_until(retry_until).await {
+            break;
+        }
+    }
+    Err(Refused)
 }
 
 impl Backend for Issuer {
     async fn anchor(&self, query: Query, deadline: Instant) -> Result<BoundVoters, Refused> {
-        let node = self.admit(deadline)?;
-        if let Some(exchange) = &self.exchange {
-            ExchangeCounts::count(&exchange.anchors);
-        }
+        let node = self.admit(deadline).await?;
+        let ordinal = self
+            .exchange
+            .as_ref()
+            .map(|exchange| ExchangeCounts::count(&exchange.anchors));
         #[cfg(test)]
         if let Some(observation) = &self.observation {
             observation
                 .anchor_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let result = node
-            .anchor_query(&query.body(), self.ready.clock.as_ref())
-            .await;
+        let body = query.body();
+        let result = if let Some((exchange, ordinal)) = self.exchange.as_ref().zip(ordinal) {
+            let clock = QueryClock {
+                source: self.ready.clock.as_ref(),
+                sample: OnceLock::new(),
+            };
+            let result = node.anchor_query(&body, &clock).await;
+            if ordinal < u8::MAX
+                && let Ok(mut slot) = exchange.last_query.try_lock()
+            {
+                *slot = Some(LastQuery {
+                    ordinal,
+                    handle: query_handle(&body),
+                    sample: clock.sample.into_inner(),
+                    outcome: result.as_ref().map(|_| ()).map_err(|error| *error),
+                });
+            }
+            result
+        } else {
+            node.anchor_query(&body, self.ready.clock.as_ref()).await
+        };
         #[cfg(test)]
         if let Err(error) = &result
             && self.observation.is_some()
@@ -242,13 +402,18 @@ impl Backend for Issuer {
         if !voters.contains(self.ready.member(), self.ready.key) {
             return Err(Refused);
         }
-        self.ready.available(&node)?;
+        drop(
+            wait_for_available(&self.node, Some(node), deadline, |node| {
+                self.ready.availability(node)
+            })
+            .await?,
+        );
         Ok(voters)
     }
 
     async fn redeem(&self, request: Redeem, deadline: Instant) -> Result<Reply, Refused> {
         let (input, csr) = request.into_issuer();
-        let node = self.admit(deadline)?;
+        let node = self.admit(deadline).await?;
         if let Some(exchange) = &self.exchange {
             ExchangeCounts::count(&exchange.redeems);
         }
@@ -273,6 +438,67 @@ impl Backend for Issuer {
                 .await;
         }
         result.map(Reply::issued).map_err(|_| Refused)
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use std::sync::{Mutex, TryLockError};
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_retries_a_busy_store_and_releases_the_node_between_attempts() {
+        let node = tokio::sync::Mutex::new(());
+        let store = Mutex::new(());
+        let deadline = Instant::now() + peer_registry::STORE_WAIT;
+        let check = |_: &()| {
+            store.try_lock().map(drop).map_err(|error| match error {
+                TryLockError::WouldBlock => AvailabilityError::Busy,
+                TryLockError::Poisoned(_) => AvailabilityError::Refused,
+            })
+        };
+        let mut query_recheck = std::pin::pin!(wait_for_available(
+            &node,
+            Some(node.try_lock().unwrap()),
+            deadline,
+            check,
+        ));
+        {
+            let _store_guard = store.lock().unwrap();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(query_recheck.as_mut(), &mut cx).is_pending());
+            assert!(node.try_lock().is_ok());
+        }
+        assert!(query_recheck.await.is_ok());
+
+        let deadline = Instant::now() + peer_registry::STORE_WAIT;
+        let mut admission = std::pin::pin!(wait_for_available(&node, None, deadline, check));
+        {
+            let _node_guard = node.try_lock().unwrap();
+            assert!(futures_util::poll!(&mut admission).is_pending());
+        }
+        assert!(admission.await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_refuses_on_leadership_loss_or_the_outer_deadline() {
+        let node = tokio::sync::Mutex::new(());
+        let deadline = Instant::now() + std::time::Duration::from_millis(2);
+        let mut not_leader = std::pin::pin!(wait_for_available(&node, None, deadline, |_| {
+            Err(AvailabilityError::NotReady)
+        }));
+        assert!(matches!(
+            futures_util::poll!(&mut not_leader),
+            std::task::Poll::Ready(Err(_))
+        ));
+        let held = node.try_lock().unwrap();
+        let mut expired = std::pin::pin!(wait_for_available(&node, None, deadline, |_| {
+            panic!("availability queried at expiry")
+        }));
+        assert!(futures_util::poll!(&mut expired).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        drop(held);
+        assert!(expired.await.is_err());
     }
 }
 
@@ -1065,5 +1291,76 @@ mod hosted {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod time_evidence_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    struct Source(AtomicUsize);
+
+    impl CheckedClock for Source {
+        fn sample_ms(&self) -> Result<u64, ClockError> {
+            match self.0.fetch_add(1, Relaxed) {
+                0 => Ok(123),
+                _ => Err(ClockError::Unavailable),
+            }
+        }
+    }
+
+    #[test]
+    fn forwarding_preserves_each_result_and_captures_the_first() {
+        let source = Source(AtomicUsize::new(0));
+        let clock = QueryClock {
+            source: &source,
+            sample: OnceLock::new(),
+        };
+        assert_eq!(clock.sample_ms(), Ok(123));
+        assert_eq!(clock.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(clock.sample.into_inner(), Some(Ok(123)));
+        let clock = QueryClock {
+            source: &source,
+            sample: OnceLock::new(),
+        };
+        assert_eq!(clock.sample_ms(), Err(ClockError::Unavailable));
+        assert_eq!(
+            clock.sample.into_inner(),
+            Some(Err(ClockError::Unavailable))
+        );
+        assert_eq!(source.0.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn time_evidence_rejects_busy_and_stale_slots() {
+        let exchange = ExchangeCounts::default();
+        let ordinal = ExchangeCounts::count(&exchange.anchors);
+        let handle = query_handle(&[8; 32]);
+        assert_ne!(handle, query_handle(&[9; 32]));
+        {
+            let mut slot = exchange.last_query.lock().unwrap();
+            *slot = Some(LastQuery {
+                ordinal,
+                handle,
+                sample: Some(Ok(900_001)),
+                outcome: Err(AnchorQueryError::Refused),
+            });
+            assert_eq!(
+                exchange.time_evidence(None),
+                ExchangeCounts::absent_time_evidence()
+            );
+        }
+
+        let body = exchange.time_evidence(Some(Ok(900_002)));
+        assert_eq!(&body[..5], &[1, 1, 2, 1, 1]);
+        assert_eq!(&body[5..13], &900_001_u64.to_be_bytes());
+        assert_eq!(&body[13..21], &900_002_u64.to_be_bytes());
+        assert_eq!(&body[21..], &handle);
+        assert_eq!(ExchangeCounts::count(&exchange.anchors), 2);
+        assert_eq!(
+            exchange.time_evidence(None),
+            ExchangeCounts::absent_time_evidence()
+        );
     }
 }

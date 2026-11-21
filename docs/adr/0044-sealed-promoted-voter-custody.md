@@ -47,11 +47,14 @@ before its challenge, installation and acknowledgement. Each store
 acquisition uses the existing 4 ms budget. The receiver serializes
 installation across the unguarded disk and wait phases. Poison, an
 unavailable store, a failed clock and an exhausted acquisition budget
-refuse the observation. Signer load, readiness and promoted ingress
-admission are synchronous, so their final proof makes one non-blocking
-store acquisition. A held store refuses as busy. Mutex poison, internal
-store poison or an absent store refuses as unavailable before any applied
-field is read.
+refuse the observation. Signer load and readiness still use one
+non-blocking acquisition. Amendment A21 also uses the existing 4 ms
+contention window for founder offer and sealing checks, the receiver's
+strict-history check, and enrollment dispatch and post-query checks.
+Enrollment checks are capped by the existing exchange deadline. Retry
+waits release the node, job and applied-store guards. A changed offer
+refuses that exchange. Mutex poison, internal store poison or an absent
+store refuses as unavailable before any applied field is read.
 
 The transfer validates the root, leaf-validity window and matching P-256
 key on borrowed DER, with an optimizer-resistant wipe for temporary

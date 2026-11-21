@@ -26,6 +26,9 @@ const HEADER: usize = 7;
 const HANDSHAKE: Duration = Duration::from_secs(2);
 pub(super) const REPLY_WAIT: Duration = Duration::from_secs(16);
 const MAX_CONNECTIONS: usize = 4;
+const TIME_EVIDENCE: u8 = 5;
+const TIME_REPLY: u8 = 16;
+pub(crate) const TIME_EVIDENCE_LEN: usize = 53;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -323,31 +326,32 @@ impl Server {
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
     {
-        self.start_with_status(dispatch, || [0; 29])
+        self.start_with_stop(
+            dispatch,
+            || [0; 29],
+            || [0; TIME_EVIDENCE_LEN],
+            Shutdown::default(),
+        )
     }
 
-    pub(crate) fn start_with_status<F, Work, S>(self, dispatch: F, status: S) -> Control
-    where
-        F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
-        Work: Future<Output = Reply> + Send,
-        S: Fn() -> [u8; 29] + Clone + Send + 'static,
-    {
-        self.start_with_stop(dispatch, status, Shutdown::default())
-    }
-
-    pub(crate) fn start_with_stop<F, Work, S>(
+    pub(crate) fn start_with_stop<F, Work, S, T>(
         self,
         dispatch: F,
         status: S,
+        time_evidence: T,
         stop: Shutdown,
     ) -> Control
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
         S: Fn() -> [u8; 29] + Clone + Send + 'static,
+        T: Fn() -> [u8; TIME_EVIDENCE_LEN] + Clone + Send + 'static,
     {
         let requested = stop.clone();
-        let supervisor = tokio::spawn(async move { self.serve(requested, dispatch, status).await });
+        let supervisor =
+            tokio::spawn(
+                async move { self.serve(requested, dispatch, status, time_evidence).await },
+            );
         Control {
             stop,
             supervisor,
@@ -355,11 +359,18 @@ impl Server {
         }
     }
 
-    async fn serve<F, Work, S>(&self, stop: Shutdown, dispatch: F, status: S) -> Result<(), Failure>
+    async fn serve<F, Work, S, T>(
+        &self,
+        stop: Shutdown,
+        dispatch: F,
+        status: S,
+        time_evidence: T,
+    ) -> Result<(), Failure>
     where
         F: Fn(Operator, Request) -> Work + Clone + Send + 'static,
         Work: Future<Output = Reply> + Send,
         S: Fn() -> [u8; 29] + Clone + Send + 'static,
+        T: Fn() -> [u8; TIME_EVIDENCE_LEN] + Clone + Send + 'static,
     {
         let mut work = JoinSet::new();
         let mut outcome = Ok(());
@@ -392,8 +403,9 @@ impl Server {
                     let stop = stop.clone();
                     let owner = self.roles.owner;
                     let status = status.clone();
+                    let time_evidence = time_evidence.clone();
                     work.spawn(async move {
-                        connection_with_status(stream, owner, stop, dispatch, status).await;
+                        connection_with_status(stream, owner, stop, dispatch, status, time_evidence).await;
                     });
                 }
             }
@@ -464,19 +476,29 @@ where
     F: FnOnce(Operator, Request) -> Work,
     Work: Future<Output = Reply>,
 {
-    connection_with_status(stream, uid, stop, dispatch, || [0; 29]).await;
+    connection_with_status(
+        stream,
+        uid,
+        stop,
+        dispatch,
+        || [0; 29],
+        || [0; TIME_EVIDENCE_LEN],
+    )
+    .await;
 }
 
-async fn connection_with_status<F, Work, S>(
+async fn connection_with_status<F, Work, S, T>(
     mut stream: UnixStream,
     uid: u32,
     stop: Shutdown,
     dispatch: F,
     status: S,
+    time_evidence: T,
 ) where
     F: FnOnce(Operator, Request) -> Work,
     Work: Future<Output = Reply>,
     S: FnOnce() -> [u8; 29],
+    T: FnOnce() -> [u8; TIME_EVIDENCE_LEN],
 {
     let request = tokio::select! {
         biased;
@@ -486,6 +508,12 @@ async fn connection_with_status<F, Work, S>(
     let reply = match request {
         Ok(Ok((4, body))) if body.bytes().is_empty() && !stop.is_cancelled() => {
             let _ = timeout(HANDSHAKE, send(&mut stream, 15, &status())).await;
+            return;
+        }
+        Ok(Ok((TIME_EVIDENCE, body)))
+            if body.bytes().is_empty() && !stop.is_cancelled() && peer(&stream, uid).is_ok() =>
+        {
+            let _ = timeout(HANDSHAKE, send(&mut stream, TIME_REPLY, &time_evidence())).await;
             return;
         }
         Ok(Ok((tag, body))) if !stop.is_cancelled() => match decode_request(tag, body) {
@@ -639,3 +667,40 @@ impl Drop for InputHeader {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[tokio::test]
+async fn time_evidence_is_fixed_and_owner_only() {
+    // SAFETY: getuid takes no arguments.
+    let owner = unsafe { libc::geteuid() };
+    for (tag, payload, uid, reply_tag, expected) in [
+        (
+            TIME_EVIDENCE,
+            [].as_slice(),
+            owner,
+            TIME_REPLY,
+            [9; 53].as_slice(),
+        ),
+        (TIME_EVIDENCE, [].as_slice(), owner ^ 1, 13, [].as_slice()),
+        (TIME_EVIDENCE, [1].as_slice(), owner, 13, [].as_slice()),
+        (4, [].as_slice(), owner, 15, [7; 29].as_slice()),
+    ] {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        send(&mut client, tag, payload).await.unwrap();
+        connection_with_status(
+            server,
+            uid,
+            Shutdown::default(),
+            |_, _| async { panic!("observation reached enrollment dispatch") },
+            || [7; 29],
+            || {
+                assert_eq!((tag, uid, payload), (TIME_EVIDENCE, owner, [].as_slice()));
+                [9; TIME_EVIDENCE_LEN]
+            },
+        )
+        .await;
+        let (received, body) = receive(&mut client).await.unwrap();
+        assert_eq!(received, reply_tag);
+        assert_eq!(body.bytes(), expected);
+    }
+}
