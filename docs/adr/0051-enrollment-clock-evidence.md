@@ -46,7 +46,7 @@ The audit found no caller that uses a stale floor or a second unchecked
 time source. `runtime.rs` and `mint.rs` are unchanged. Remove stays
 internal and has no owner-facing path.
 
-## C15 design and status
+## C15 design
 
 C15 is one retained founder issuer on hosted Linux with real TLS ingress.
 The expected counts are one Engine start and owned close, one Found, three
@@ -87,14 +87,27 @@ Logs quote stage and relative millisecond offsets only, never a paste,
 code, verifier or proof. The campaign keeps the first failure, records
 bounded pre-close evidence and observes one owned close.
 
-**Status:** The campaign source is ready but not merged. Owner-local Mint
-needs a `service::cluster_owner::Operator`. Only an authenticated
-owner-socket connection can construct one, and that module is outside the
-15a fence. An in-process campaign therefore needs a recorded fence
-amendment that adds one Linux-test-only constructor. Without that
-amendment, C15 is not run and no C15 evidence exists. This is
-controlled-clock real transport only. It is not elapsed-time, UTC or
-suspend evidence, which remains with 15b and ADR 0030.
+**Owner Mint path (amendment A13).** Owner-local Mint needs a
+`service::cluster_owner::Operator`. Outside tests, only an authenticated
+owner-socket connection constructs one. Amendment A13 adds a single Linux
+test constructor, `Operator::for_campaign(uid)`, and makes no other change
+to that file. A crate-wide source inventory test checks that the
+constructor has exactly that one cfg-gated definition and exactly one
+caller, the C15 owner Mint. Each of the three Mints still goes through the
+real retained 13c caller, `Job::mint_owner`, including its leader-epoch and
+listener checks, the actual proposal and the checked-clock reveal policy.
+Only owner-socket authentication is bypassed. C15 therefore does not
+exercise owner-socket authentication. C13's hosted run covers that path
+with real distinct owner, daemon, agent and build UIDs. The C15 counts stay
+"three owner-local Mints" through the real Mint caller.
+
+**Replay window.** Destination A is prepared before the held continuation
+opens. The campaign prints the held continuation's anchored, verified and
+replay-send offsets and the remaining admission margin, all as relative
+milliseconds.
+
+This is controlled-clock real transport only. It is not elapsed-time, UTC
+or suspend evidence, which remains with 15b and ADR 0030.
 
 ## Consequences
 
