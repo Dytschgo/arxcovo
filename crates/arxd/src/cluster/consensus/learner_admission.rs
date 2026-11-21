@@ -78,10 +78,16 @@ type RetainedNode = tokio::sync::Mutex<ConsensusNode>;
 pub(super) struct PromotionStart(oneshot::Receiver<()>);
 
 impl PromotionStart {
-    pub(super) async fn run(self, work: impl std::future::Future<Output = ()>) {
+    async fn after_release<T>(self, work: impl std::future::Future<Output = T>, refused: T) -> T {
         if self.0.await.is_ok() {
-            work.await;
+            work.await
+        } else {
+            refused
         }
+    }
+
+    pub(super) async fn run(self, work: impl std::future::Future<Output = ()>) {
+        self.after_release(work, ()).await;
     }
 }
 
@@ -198,11 +204,16 @@ impl Controller {
         }
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
-        let node = node.try_lock().map_err(|_| Reply::Refused)?;
         let controller = self.clone();
-        node.register_admission(intent, async move {
-            controller.run(peer, address, deadline, &submitted).await
-        })
+        register_with_node(&node, |node, start| {
+            node.register_admission(
+                intent,
+                start.after_release(
+                    async move { controller.run(peer, address, deadline, &submitted).await },
+                    Reply::Refused,
+                ),
+            )
+        })?
     }
 
     async fn run(

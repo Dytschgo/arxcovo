@@ -490,6 +490,21 @@ impl ConsensusNode {
         &self,
         f: impl FnOnce(&StateStore) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<(LeaderId, T), ReadError> {
+        self.start_fresh_read(f)?.await
+    }
+
+    // Admit under the retained node and return the owned reply wait.
+    fn start_fresh_read<T, F>(
+        &self,
+        f: F,
+    ) -> Result<
+        impl std::future::Future<Output = Result<(LeaderId, T), ReadError>> + use<T, F>,
+        ReadError,
+    >
+    where
+        T: Send + 'static,
+        F: FnOnce(&StateStore) -> Result<T, StoreError> + Send + 'static,
+    {
         #[cfg(test)]
         use issue::found::observation;
         #[cfg(test)]
@@ -729,46 +744,48 @@ impl ConsensusNode {
                 }
             });
         }
-        match timeout_at(deadline, rx).await {
-            Ok(Ok(result)) if Instant::now() < deadline => {
+        Ok(async move {
+            match timeout_at(deadline, rx).await {
+                Ok(Ok(result)) if Instant::now() < deadline => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerReply,
+                        observation::Reason::Ok,
+                    );
+                    result
+                }
                 #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::CallerReply,
-                    observation::Reason::Ok,
-                );
-                result
-            }
-            #[cfg(test)]
-            Ok(Ok(_)) => {
+                Ok(Ok(_)) => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerReply,
+                        observation::Reason::Expired,
+                    );
+                    Err(ReadError::Unavailable)
+                }
                 #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::CallerReply,
-                    observation::Reason::Expired,
-                );
-                Err(ReadError::Unavailable)
+                Ok(Err(_)) => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerExpiry,
+                        observation::Reason::ReceiverClosed,
+                    );
+                    Err(ReadError::Unavailable)
+                }
+                _ => {
+                    #[cfg(test)]
+                    observation::mark(
+                        &obs,
+                        observation::Edge::CallerExpiry,
+                        observation::Reason::Expired,
+                    );
+                    Err(ReadError::Unavailable)
+                }
             }
-            #[cfg(test)]
-            Ok(Err(_)) => {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::CallerExpiry,
-                    observation::Reason::ReceiverClosed,
-                );
-                Err(ReadError::Unavailable)
-            }
-            _ => {
-                #[cfg(test)]
-                observation::mark(
-                    &obs,
-                    observation::Edge::CallerExpiry,
-                    observation::Reason::Expired,
-                );
-                Err(ReadError::Unavailable)
-            }
-        }
+        })
     }
     pub async fn linearizable_state(&self) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
         self.fresh_read(|s| Ok((s.applied(), s.snapshot())))
