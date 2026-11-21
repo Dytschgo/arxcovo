@@ -1046,11 +1046,31 @@ mod issuer_proof {
             .ok_or(MembershipReadError::PeerRefused)
     }
 
+    // Mirrors peer_registry::observe_store without waiting: a held store is
+    // Busy, while an absent store or a poisoned mutex is Unavailable.
+    fn acquire(
+        node: &ConsensusNode,
+    ) -> Result<std::sync::MutexGuard<'_, StateStore>, MembershipReadError> {
+        let sm = node.sm.as_ref().ok_or(MembershipReadError::Unavailable)?;
+        match sm.0.try_lock() {
+            Ok(store) => Ok(store),
+            Err(std::sync::TryLockError::WouldBlock) if !sm.0.is_poisoned() => {
+                Err(MembershipReadError::Busy)
+            }
+            Err(_) => Err(MembershipReadError::Unavailable),
+        }
+    }
+
+    // A failed persist keeps the last good image readable. Refuse it before
+    // any applied field authorizes an issuer operation.
     fn locked(
         store: &StateStore,
         sample: &Sample,
         leader: u64,
     ) -> Result<ObservedMembership, MembershipReadError> {
+        if store.is_poisoned() {
+            return Err(MembershipReadError::Unavailable);
+        }
         uniform(
             leader,
             sample,
@@ -1144,6 +1164,8 @@ mod issuer_proof {
                 node: self,
                 #[cfg(test)]
                 sample: None,
+                #[cfg(test)]
+                before_proof: None,
             }
         }
 
@@ -1172,8 +1194,7 @@ mod issuer_proof {
             let unavailable = MembershipReadError::Unavailable;
             let raft = self.raft.as_ref().ok_or(unavailable)?;
             let before = Sample::capture(raft)?;
-            let sm = self.sm.as_ref().ok_or(unavailable)?;
-            let store = sm.0.try_lock().map_err(|_| MembershipReadError::Busy)?;
+            let store = acquire(self)?;
             let view = locked(&store, &before, leader)?;
             let result = inspect(&store, &view)?;
             if Sample::capture(raft)? != before {
@@ -1182,10 +1203,15 @@ mod issuer_proof {
             Ok(result)
         }
     }
+    #[cfg(test)]
+    pub(in crate::cluster::consensus) type BeforeProof = Arc<dyn Fn() + Send + Sync>;
+
     pub(in crate::cluster::consensus) struct IssuerMembership<'a> {
         node: &'a ConsensusNode,
         #[cfg(test)]
         sample: Option<Sample>,
+        #[cfg(test)]
+        before_proof: Option<BeforeProof>,
     }
 
     // Retain the exact applied image until the guarded use has finished.
@@ -1218,6 +1244,16 @@ mod issuer_proof {
             self
         }
 
+        // Runs after the preliminary checks and before the final store observation.
+        #[cfg(test)]
+        pub(in crate::cluster::consensus) fn with_before_proof(
+            mut self,
+            hook: Option<BeforeProof>,
+        ) -> Self {
+            self.before_proof = hook;
+            self
+        }
+
         fn sample(&self) -> Result<Sample, MembershipReadError> {
             #[cfg(test)]
             if let Some(sample) = &self.sample {
@@ -1236,12 +1272,7 @@ mod issuer_proof {
             before: &Sample,
             leader: u64,
         ) -> Result<(IssuerProof<'a>, ObservedMembership), MembershipReadError> {
-            let sm = self
-                .node
-                .sm
-                .as_ref()
-                .ok_or(MembershipReadError::Unavailable)?;
-            let store = sm.0.try_lock().map_err(|_| MembershipReadError::Busy)?;
+            let store = acquire(self.node)?;
             let view = locked(&store, before, leader)?;
             Ok((IssuerProof(store), view))
         }
@@ -1295,6 +1326,10 @@ mod issuer_proof {
             if local.node.get() != self.node.id || (require_leader && leader != self.node.id) {
                 return Err(MembershipReadError::NotLeader);
             }
+            #[cfg(test)]
+            if let Some(hook) = &self.before_proof {
+                hook();
+            }
             let (proof, view) = self.lock_view(&before, leader)?;
             if pos(view.membership_id()) != installed_at
                 || epoch.is_some_and(|epoch| epoch != view.leader())
@@ -1329,5 +1364,7 @@ mod issuer_proof {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use issuer_proof::BeforeProof;
 #[cfg(target_os = "linux")]
 pub(super) use issuer_proof::{IssuerMembership, IssuerProof};

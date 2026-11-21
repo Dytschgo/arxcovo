@@ -29,6 +29,8 @@ pub(super) struct Operation {
     issuer_install: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     issuer_sample: Option<membership_observation::Sample>,
+    #[cfg(test)]
+    issuer_before_proof: Option<membership_observation::BeforeProof>,
     recovered: bool,
     #[cfg(test)]
     fixture: Option<HostedCatchUp>,
@@ -168,6 +170,8 @@ fn start(input: Input, params: Params, #[cfg(test)] fixture: Option<HostedCatchU
         issuer_install: Arc::default(),
         #[cfg(test)]
         issuer_sample: None,
+        #[cfg(test)]
+        issuer_before_proof: None,
         recovered,
         #[cfg(test)]
         fixture,
@@ -726,7 +730,9 @@ impl Operation {
     fn issuer_membership_view<'a>(&self, node: &'a ConsensusNode) -> IssuerMembership<'a> {
         let membership = node.issuer_membership();
         #[cfg(test)]
-        let membership = membership.with_sample(self.issuer_sample.clone());
+        let membership = membership
+            .with_sample(self.issuer_sample.clone())
+            .with_before_proof(self.issuer_before_proof.clone());
         membership
     }
 }
@@ -899,6 +905,7 @@ impl Job {
             issuer_membership: None,
             issuer_install: Arc::default(),
             issuer_sample: Some(sample),
+            issuer_before_proof: None,
             recovered: false,
             fixture: None,
         });
@@ -948,6 +955,81 @@ impl Job {
         );
         assert_eq!(self.state().issuer.is_some(), confirmed_at.is_some());
 
+        self.release_fixture();
+    }
+
+    /// `fail_write` runs between the preliminary gate and the final applied
+    /// proof of a readiness attempt. It must leave the store internally poisoned.
+    pub(in crate::cluster::consensus) fn assert_poisoned_final_proof_refuses(
+        &self,
+        root: &[u8],
+        survivor: (membership_observation::Sample, LeaderId),
+        fail_write: membership_observation::BeforeProof,
+    ) {
+        use membership_observation::MembershipReadError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (node, cluster, local) = {
+            let mut state = self.state();
+            let op = state.learner.as_mut().unwrap();
+            op.issuer_sample = Some(survivor.0.clone());
+            let member = op.member.as_ref().unwrap();
+            let local = super::issuer_transfer::Voter {
+                node: member.expected.node,
+                key: member.expected.key,
+                address: op.advertised.unwrap(),
+            };
+            let cluster = member.expected.cluster;
+            (state.node.clone().unwrap(), cluster, local)
+        };
+        let live = node.try_lock().unwrap();
+        let sm = live.sm.clone().unwrap();
+        let installed_at = self.state().learner.as_ref().unwrap().issuer_membership;
+        let installed_at = installed_at.expect("confirmed voter custody");
+        let final_proof = || {
+            live.issuer_membership()
+                .with_sample(Some(survivor.0.clone()))
+                .voter_proof(cluster, local, installed_at, true, Some(survivor.1))
+                .map(drop)
+        };
+
+        // Healthy control: this image loads the signer and passes the final proof.
+        assert!(voter_context(&self.state()).is_some());
+        let (ca, _, _, proof) = load_promoted(&self.state(), &live, None).unwrap();
+        assert_eq!(ca.cert_der(), root);
+        drop(proof);
+        assert_eq!(final_proof(), Ok(()));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        self.state().learner.as_mut().unwrap().issuer_before_proof = Some({
+            let calls = calls.clone();
+            Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    fail_write();
+                }
+            })
+        });
+        assert!(self.publish_promoted_issuer(&live, survivor.1).is_err());
+        // The failure reached the final proof and refused before signer load.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(self.state().issuer.is_none());
+        assert!(sm.0.try_lock().unwrap().is_poisoned());
+        assert_eq!(final_proof(), Err(MembershipReadError::Unavailable));
+
+        // A poisoned mutex is unavailable, never a retryable busy store.
+        let store = sm.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = store.0.lock().unwrap();
+            panic!("deliberate issuer store mutex poison");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        assert!(sm.0.is_poisoned());
+        assert_eq!(final_proof(), Err(MembershipReadError::Unavailable));
+        drop(live);
+        self.release_fixture();
+    }
+
+    fn release_fixture(&self) {
         let mut state = self.state();
         state.issuer.take();
         state.learner.take();

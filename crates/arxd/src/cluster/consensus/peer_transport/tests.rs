@@ -5304,15 +5304,13 @@ mod issuer_refusals {
             folder: &std::path::Path,
             bindings: [(NodeId, KeyDigest); 3],
             address: SocketAddr,
+            fail_writes: bool,
         ) -> (SmAdapter, Members) {
-            let mut store = StateStore::open(
-                folder,
-                Init {
-                    cluster: CLUSTER,
-                    first_free: node(5),
-                },
-            )
-            .unwrap();
+            let init = Init {
+                cluster: CLUSTER,
+                first_free: node(5),
+            };
+            let mut store = StateStore::open(folder, init).unwrap();
             let seed = StoredEntry::Enrollment(Command::Found {
                 cluster: CLUSTER,
                 members: FoundMembers::new(bindings).unwrap(),
@@ -5344,10 +5342,26 @@ mod issuer_refusals {
                     &StoredEntry::Membership(encode(&members).unwrap()),
                 )
                 .unwrap();
+            if fail_writes {
+                // Reopen the same image with a real SQL write failure armed.
+                drop(store);
+                let db = rusqlite::Connection::open(folder.join("cluster-state.sqlite3")).unwrap();
+                db.execute_batch("CREATE TRIGGER fail_issuer_write BEFORE UPDATE ON sm BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+                drop(db);
+                store = StateStore::open(folder, init).unwrap();
+            }
             (SmAdapter(Arc::new(Mutex::new(store))), members)
         }
 
         async fn run(stop: Option<ReceiveStage>, expected_stages: &[ReceiveStage]) {
+            run_with(stop, expected_stages, false).await;
+        }
+
+        async fn run_with(
+            stop: Option<ReceiveStage>,
+            expected_stages: &[ReceiveStage],
+            fail_before_final_proof: bool,
+        ) {
             let route = UdpSocket::bind("0.0.0.0:0").unwrap();
             route.connect("192.0.2.1:9").unwrap(); // Select a local interface without sending data.
             let ip = route.local_addr().unwrap().ip();
@@ -5414,6 +5428,7 @@ mod issuer_refusals {
                     (target, csr.digest()),
                 ],
                 address,
+                fail_before_final_proof,
             );
             let epoch = log_id(2, 1, PROMOTED.index + 1).leader_id;
             let sample = Sample::issuer_fixture(epoch, id(PROMOTED), members.clone());
@@ -5539,13 +5554,37 @@ mod issuer_refusals {
                 stop != Some(BeforeUnwrap)
             );
             let survivor = log_id(3, target.get(), PROMOTED.index + 2).leader_id;
-            job.assert_fixture_custody(
+            let survivor = (
+                Sample::issuer_fixture(survivor, id(PROMOTED), members),
+                survivor,
+            );
+            if !fail_before_final_proof {
+                job.assert_fixture_custody(root, stop.is_none().then_some(PROMOTED), survivor);
+                return;
+            }
+            let store = sm.clone();
+            job.assert_poisoned_final_proof_refuses(
                 root,
-                stop.is_none().then_some(PROMOTED),
-                (
-                    Sample::issuer_fixture(survivor, id(PROMOTED), members),
-                    survivor,
-                ),
+                survivor,
+                Arc::new(move || {
+                    let mut store = store
+                        .0
+                        .try_lock()
+                        .expect("the final proof has not acquired the store");
+                    let old = store.snapshot();
+                    assert_eq!(
+                        store.apply(
+                            LogPos {
+                                index: PROMOTED.index + 1,
+                                ..PROMOTED
+                            },
+                            &StoredEntry::Blank
+                        ),
+                        Err(crate::cluster::state_store::StoreError::Sql)
+                    );
+                    assert!(store.is_poisoned());
+                    assert_eq!(old, store.snapshot());
+                }),
             );
         }
 
@@ -5559,6 +5598,22 @@ mod issuer_refusals {
             run(
                 Some(BeforeReadback),
                 &[BeforeUnwrap, ChannelOpen, BeforeReadback],
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn persistence_failure_before_final_proof_refuses_promoted_readiness() {
+            run_with(
+                None,
+                &[
+                    BeforeUnwrap,
+                    ChannelOpen,
+                    BeforeReadback,
+                    ReadbackOpen,
+                    Confirmed,
+                ],
+                true,
             )
             .await;
         }

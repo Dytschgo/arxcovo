@@ -250,18 +250,29 @@ mod linux {
             Ok(file)
         }
         pub(super) fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, Error> {
+            self.read_wiped(name, max)
+                .map(|mut bytes| std::mem::take(&mut bytes.0))
+        }
+        /// Error paths wipe partial bytes. One bounded allocation avoids
+        /// leaving unwiped copies behind when the buffer grows.
+        pub(super) fn read_wiped(
+            &self,
+            name: &str,
+            max: usize,
+        ) -> Result<voter_transfer::Wipe<Vec<u8>>, Error> {
             let mut f = self.file(name, false)?;
             let before = f.metadata().map_err(|_| Error::Layout)?;
             if before.len() > max as u64 {
                 return Err(Error::Corrupt);
             }
-            let mut bytes = Vec::new();
+            let mut bytes = voter_transfer::Wipe(Vec::with_capacity(max + 1));
             (&mut f)
                 .take(max as u64 + 1)
-                .read_to_end(&mut bytes)
+                .read_to_end(&mut bytes.0)
                 .map_err(|_| Error::Unavailable)?;
             let current = self.file(name, false)?;
-            if bytes.len() > max || !same(&before, &current.metadata().map_err(|_| Error::Layout)?)
+            if bytes.0.len() > max
+                || !same(&before, &current.metadata().map_err(|_| Error::Layout)?)
             {
                 return Err(Error::Ownership);
             }
@@ -824,7 +835,7 @@ mod linux {
             if id != expected {
                 return Err(Error::Context);
             }
-            let secret = codec::Secret(wrap.read("seal-key", 32)?);
+            let secret = wrap.read_wiped("seal-key", 32)?;
             let key = codec::wrapping(&secret.0)?;
             let owner = Self::owner(wrap, store, lock, id, key);
             owner.inventory()?;
@@ -839,7 +850,7 @@ mod linux {
             if codec::installation(&self.wrap.read("install-context", 25)?)? != self.installation {
                 return Err(Error::Context);
             }
-            let wrapping = voter_transfer::Wipe(self.wrap.read("seal-key", 32)?);
+            let wrapping = self.wrap.read_wiped("seal-key", 32)?;
             if wrapping.0.len() != 32 {
                 return Err(Error::Corrupt);
             }
