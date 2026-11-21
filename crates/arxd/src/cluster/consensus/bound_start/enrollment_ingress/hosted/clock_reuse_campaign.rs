@@ -11,11 +11,12 @@ use crate::{
             session::SOCKET_BUDGET,
             transfer::{self, LocalRoute},
         },
-        pki::preproof::{ExchangeError, anchor},
+        pki::preproof::anchor,
         state_store::StateStore,
     },
     service::cluster_owner::{Operator, Paste, Reply as OwnerReply},
 };
+use rcgen::PublicKeyData as _;
 use std::{
     path::{Path, PathBuf},
     sync::Weak,
@@ -321,6 +322,121 @@ fn expect_anchor(
     }
 }
 
+// Header "ARXE", version 1, kind Anchor (2), length 1, refusal body 1.
+const REFUSAL_FRAME: [u8; 9] = [b'A', b'R', b'X', b'E', 1, 2, 0, 1, 1];
+
+/// Test-scoped observation of one refused Query on the production wire. It
+/// uses the production client verifier configuration (fresh, so the handshake
+/// is full), the production Query frame and the unchanged socket budget. It
+/// sends only the Query, never an attempt ID, key or proof. Success requires
+/// the authenticated retained issuer, the exact uniform Anchor refusal frame
+/// and a clean TLS close, so a deadline, EOF or broken transport cannot pass.
+async fn refused_query(
+    endpoint: SocketAddr,
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn rustls::time_provider::TimeProvider>,
+    issuer: (NodeId, KeyDigest),
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + SOCKET_BUDGET;
+    let config = crate::cluster::pki::preproof::test_config(code, root, time);
+    let stage = std::cell::Cell::new("connect");
+    let observed = tokio::time::timeout_at(deadline, async {
+        let tcp = tokio::net::TcpStream::connect(endpoint)
+            .await
+            .map_err(|e| format!("TCP {:?}", e.kind()))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| format!("TCP {:?}", e.kind()))?;
+        stage.set("TLS handshake");
+        let mut socket = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from(crate::cluster::pki::verify::SERVER_NAME)
+                    .map_err(|_| "server name")?,
+                crate::cluster::enrollment::session::QuotaSocket::new(
+                    tcp,
+                    SocketLimits::default(),
+                    deadline,
+                ),
+            )
+            .await
+            .map_err(|e| io_failure("TLS", &e))?;
+        let session = socket.get_ref().1;
+        if session.handshake_kind() != Some(rustls::HandshakeKind::Full) {
+            return Err("TLS session was not a full handshake".to_string());
+        }
+        let Some([peer]) = session.peer_certificates() else {
+            return Err("TLS peer certificate missing".to_string());
+        };
+        verify_leaf(peer, root, code.cluster(), issuer.0, issuer.1)
+            .map_err(|reason| format!("TLS peer is not the retained issuer: {reason}"))?;
+        stage.set("Query write");
+        socket
+            .write_all(&crate::cluster::enrollment::session::query_frame(
+                code.cluster(),
+                code.code_id(),
+            ))
+            .await
+            .map_err(|e| io_failure("Query write", &e))?;
+        socket
+            .flush()
+            .await
+            .map_err(|e| io_failure("Query flush", &e))?;
+        stage.set("refusal frame");
+        let mut frame = [0; REFUSAL_FRAME.len()];
+        socket
+            .read_exact(&mut frame)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => "EOF before the refusal frame".to_string(),
+                _ => io_failure("transport before the refusal frame", &e),
+            })?;
+        if frame != REFUSAL_FRAME {
+            return Err("received frame is not the uniform Anchor refusal".to_string());
+        }
+        stage.set("clean close");
+        let mut extra = [0; 1];
+        match socket.read(&mut extra).await {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("bytes followed the refusal frame".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(DEADLINE.to_string()),
+            Err(e) => Err(format!(
+                "refusal not followed by a clean close: {:?}",
+                e.kind()
+            )),
+        }
+    })
+    .await;
+    match observed {
+        Ok(Ok(())) => Ok(format!(
+            "uniform Anchor refusal received over a full TLS session with the retained issuer, clean close, no Redeem frame sent, +{} ms",
+            started.elapsed().as_millis()
+        )),
+        Ok(Err(reason)) if reason != DEADLINE => Err(format!(
+            "{CASE} refusal witness failed at {}: {reason}",
+            stage.get()
+        )),
+        // The outer budget or the socket's own copy of the same deadline.
+        Ok(Err(_)) | Err(_) => Err(format!(
+            "{CASE} refusal witness deadline at {}",
+            stage.get()
+        )),
+    }
+}
+
+const DEADLINE: &str = "deadline";
+
+/// The quota socket enforces the same deadline by returning TimedOut when
+/// polled; report that as the deadline, not as a transport failure.
+fn io_failure(what: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        DEADLINE.to_string()
+    } else {
+        format!("{what} {:?}", error.kind())
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn retained_issuer_replays_exact_request_and_refuses_controlled_expiry() {
     let layout = Layout::new();
@@ -354,7 +470,7 @@ async fn retained_issuer_replays_exact_request_and_refuses_controlled_expiry() {
         HostedFixture(()),
     )
     .expect("C15 retained founder dispatch");
-    let observed = Arc::new(Observation::default());
+    let observed = Arc::new(Observation::recording_intents());
     let mut evidence = Evidence {
         cluster,
         ..Evidence::default()
@@ -415,7 +531,7 @@ async fn drive(
     evidence.phase = "founder";
     observe_retained_status(observer, Status::FounderReady, job).await?;
     eprintln!("{CASE} founder ready; issuer Engine started");
-    let (node, root, clock, time, installation) = {
+    let (node, root, clock, time, installation, founder_key) = {
         let state = job.state();
         let ready = state.issuer.as_ref().ok_or("issuer missing")?;
         (
@@ -435,8 +551,10 @@ async fn drive(
                 .as_ref()
                 .and_then(|founder| founder.installation_id())
                 .ok_or("installation unavailable")?,
+            ready.key,
         )
     };
+    let issuer = (FOUNDER, founder_key);
     let (voters, first_free, initial) = {
         let node = node.lock().await;
         evidence.stores = Some((node.log_weak.clone(), node.sm_weak.clone()));
@@ -492,7 +610,7 @@ async fn drive(
     expect_anchor(observed, 0, &Ok(voters.encode()), "held continuation")?;
 
     evidence.phase = "A destination";
-    let (_join_a, mut result_a) =
+    let (join_a, mut result_a) =
         durable_join::start_retained(destination, paste_text, &routes, time.clone())
             .map_err(|status| format!("{CASE} destination A dispatch: {status:?}"))?;
     drop(paste_a);
@@ -507,7 +625,7 @@ async fn drive(
     }
     expect_counts(observed, 2, 1, "original Redeem")?;
     expect_anchor(observed, 1, &Ok(voters.encode()), "destination A Query")?;
-    let (request, csr) = observed.redeem_intents.lock().unwrap()[0].clone();
+    let (request, csr) = observed.intent(0).ok_or("original intent missing")?;
     let key = crate::cluster::pki::csr::ProvenCsr::parse(&csr)
         .map_err(|_| "dispatched CSR")?
         .digest();
@@ -534,21 +652,63 @@ async fn drive(
     let original_ms = held_at.elapsed().as_millis();
     observed.release.notify_one();
 
-    // R8: once the original Redeem is committed, applied and its E verified and
-    // released, the already-authorized second continuation sends the same intent
-    // once. The server admits Redeem work only while its full work budget still
-    // fits the socket budget; the client-side age below overstates server age.
+    // R8: complete and verify the first normal Redeem at its client before the
+    // held continuation is consumed. Destination A's own returned E, node and
+    // key come from its retained publication. Everything stays inside the
+    // unchanged admission window; a miss is a failed observation.
+    evidence.phase = "A first-client witness";
+    let window = SOCKET_BUDGET - SERVER_WORK_RESERVE;
+    let remaining = window
+        .checked_sub(held_at.elapsed())
+        .ok_or_else(|| format!("{CASE} replay window elapsed before the first-client witness"))?;
+    let status = timeout(remaining, result_a.terminal())
+        .await
+        .map_err(|_| format!("{CASE} replay window elapsed before destination A completed"))?;
+    if status != durable_join::Status::Published {
+        return Err(format!("{CASE} destination A terminal: {status:?}"));
+    }
+    let published_a = join_a
+        .consume()
+        .map_err(|status| format!("{CASE} destination A publication: {status:?}"))?;
+    let returned = &published_a.expected;
+    if returned.cluster != cluster
+        || returned.node != first_free
+        || returned.key != key
+        || returned.origin.position() != original
+    {
+        return Err(format!(
+            "{CASE} destination A returned node {} at {:?}, applied node {} at {original:?}",
+            returned.node.get(),
+            returned.origin.position(),
+            first_free.get()
+        ));
+    }
+    verify_leaf(
+        &published_a.leaf,
+        &root,
+        cluster,
+        returned.node,
+        returned.key,
+    )?;
+    let witnessed_ms = held_at.elapsed().as_millis();
+    eprintln!(
+        "{CASE} first client completed: destination A returned E {original:?}, node {}, key matches the applied original",
+        first_free.get()
+    );
+
+    // The already-authorized second continuation sends the same intent once.
+    // Redeem work is admitted only while its full work budget fits the socket
+    // budget; the client-side age below overstates the server-side age.
     evidence.phase = "A exact replay";
     let age = held_at.elapsed();
-    let window = SOCKET_BUDGET - SERVER_WORK_RESERVE;
     eprintln!(
-        "{CASE} R8 window (ms since held Query start): anchored +{anchored_ms}, original verified +{original_ms}, replay send +{}; admission window {}, margin {}",
+        "{CASE} R8 window (ms since held Query start): anchored +{anchored_ms}, original verified +{original_ms}, first client witnessed +{witnessed_ms}, replay send +{}; admission window {}, margin {}",
         age.as_millis(),
         window.as_millis(),
         i128::try_from(window.as_millis()).unwrap_or(i128::MAX)
             - i128::try_from(age.as_millis()).unwrap_or(i128::MAX),
     );
-    if age + SERVER_WORK_RESERVE >= SOCKET_BUDGET {
+    if age >= window {
         return Err(format!(
             "{CASE} replay window elapsed before the second Redeem"
         ));
@@ -562,7 +722,7 @@ async fn drive(
         }
     }
     expect_counts(observed, 2, 2, "replay Redeem")?;
-    if observed.redeem_intents.lock().unwrap().get(1) != Some(&(request, csr.clone())) {
+    if observed.intent(1) != Some((request, csr.clone())) {
         return Err(format!(
             "{CASE} replay did not dispatch the original intent"
         ));
@@ -597,40 +757,16 @@ async fn drive(
         ));
     }
     verify_leaf(leaf, &root, cluster, node_id, key)?;
-    let status = timeout(Duration::from_secs(10), result_a.terminal())
-        .await
-        .map_err(|_| "destination A terminal observation elapsed")?;
-    if status != durable_join::Status::Published {
-        return Err(format!("{CASE} destination A terminal: {status:?}"));
-    }
+    drop(published_a);
     eprintln!(
         "{CASE} exact replay: original E {original:?}, replay log ID {replay_at:?}, node {}, same key, one allocation; destination A published once",
         first_free.get()
     );
 
-    // A fresh attempt on the consumed code is refused at Query; no proof leaves.
+    // A new connection on the consumed code is refused at its Query. The
+    // observation client never sends an attempt ID, key or proof.
     evidence.phase = "A consumed reconnect";
-    let other = rcgen::KeyPair::generate().map_err(|_| "reconnect key")?;
-    let other_csr = rcgen::CertificateParams::default()
-        .serialize_request(&other)
-        .map_err(|_| "reconnect CSR")?;
-    let mut other_request = [7; 16];
-    if other_request == request {
-        other_request[0] ^= 1;
-    }
-    let reconnect = exchange(
-        endpoint,
-        &code_a,
-        &root,
-        time.clone(),
-        other_request,
-        other_csr.der(),
-        limits(),
-    )
-    .await;
-    if !matches!(reconnect, Err(ExchangeError::Refused)) {
-        return Err(format!("{CASE} consumed code reached the continuation"));
-    }
+    let reconnect = refused_query(endpoint, &code_a, &root, time.clone(), issuer).await?;
     expect_counts(observed, 3, 2, "consumed reconnect")?;
     expect_anchor(
         observed,
@@ -638,6 +774,7 @@ async fn drive(
         &Err(AnchorQueryError::Refused),
         "consumed reconnect",
     )?;
+    eprintln!("{CASE} consumed reconnect: {reconnect}");
 
     // Code B: mint, then advance only this issuer instance across its edge.
     evidence.phase = "owner Mint B";
@@ -700,14 +837,14 @@ async fn drive(
     );
 
     evidence.phase = "B expired Query";
-    let expired = anchor(endpoint, &code_b, &root, time.clone(), limits()).await;
-    if !matches!(expired, Err(ExchangeError::Refused)) {
-        return Err(format!("{CASE} expired B reached a continuation"));
-    }
-    // Dispatch proves healthy TLS and framing. Refused (not Unavailable or Busy)
-    // is the checked policy; the independent readback above attributes it.
+    let expired = refused_query(endpoint, &code_b, &root, time.clone(), issuer).await?;
+    // The witness proves the uniform refusal frame arrived over a full TLS
+    // session with the retained issuer and a clean close. Refused (not
+    // Unavailable or Busy) is the checked policy; the independent readback
+    // above attributes it.
     expect_counts(observed, 4, 2, "expired B")?;
     expect_anchor(observed, 3, &Err(AnchorQueryError::Refused), "expired B")?;
+    eprintln!("{CASE} expired B: {expired}");
     let healthy = clock
         .sample_ms()
         .map_err(|e| format!("{CASE} clock after B refusal: {e}"))?;
@@ -756,7 +893,7 @@ async fn drive(
     }
     expect_counts(observed, 5, 3, "positive C")?;
     expect_anchor(observed, 4, &Ok(voters.encode()), "positive C")?;
-    let (request_c, csr_c) = observed.redeem_intents.lock().unwrap()[2].clone();
+    let (request_c, csr_c) = observed.intent(2).ok_or("intent C missing")?;
     let key_c = crate::cluster::pki::csr::ProvenCsr::parse(&csr_c)
         .map_err(|_| "dispatched CSR C")?
         .digest();
@@ -818,6 +955,148 @@ async fn drive(
         inventory.kinds()
     );
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Stub {
+    Refuse,
+    EofBeforeFrame,
+    AbortAfterFrame,
+    WrongFrame,
+}
+
+/// One-connection stub issuer on loopback with the preproof fixture identity.
+/// It returns the number of bytes the client sent after its Query, or
+/// usize::MAX when no Query arrived.
+async fn stub_issuer(
+    fixture: &crate::cluster::pki::preproof_tests::Fixture,
+    stub: Stub,
+) -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let config = rustls::ServerConfig::builder_with_details(
+        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::new(crate::cluster::pki::preproof_tests::ProbeTime),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![fixture.good.clone().into()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(fixture.good_key.serialize_der()).into(),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return usize::MAX;
+        };
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            return usize::MAX;
+        };
+        let mut query = [0; 40];
+        if tls.read_exact(&mut query).await.is_err() {
+            return usize::MAX;
+        }
+        let wrote = match stub {
+            Stub::Refuse => {
+                tls.write_all(&REFUSAL_FRAME).await.is_ok() && tls.shutdown().await.is_ok()
+            }
+            Stub::EofBeforeFrame => tls.shutdown().await.is_ok(),
+            Stub::AbortAfterFrame => {
+                // Drop the TCP stream after the frame without TLS close-notify.
+                let sent = tls.write_all(&REFUSAL_FRAME).await.is_ok() && tls.flush().await.is_ok();
+                assert!(sent);
+                return 0;
+            }
+            Stub::WrongFrame => {
+                tls.write_all(&[b'A', b'R', b'X', b'E', 1, 4, 0, 1, 1])
+                    .await
+                    .is_ok()
+                    && tls.shutdown().await.is_ok()
+            }
+        };
+        assert!(wrote);
+        let mut rest = Vec::new();
+        let _ = tls.read_to_end(&mut rest).await;
+        rest.len()
+    });
+    (addr, task)
+}
+
+fn probe_time() -> Arc<dyn rustls::time_provider::TimeProvider> {
+    Arc::new(crate::cluster::pki::preproof_tests::ProbeTime)
+}
+
+#[tokio::test]
+async fn refusal_witness_requires_the_uniform_frame_over_tls_and_a_clean_close() {
+    let fixture = crate::cluster::pki::preproof_tests::fixture();
+    let issuer = (
+        NodeId::new(1).unwrap(),
+        KeyDigest::of_spki(&fixture.good_key.subject_public_key_info()).unwrap(),
+    );
+    for (stub, expected) in [
+        (Stub::Refuse, None),
+        (Stub::EofBeforeFrame, Some("EOF before the refusal frame")),
+        (
+            Stub::AbortAfterFrame,
+            Some("refusal not followed by a clean close"),
+        ),
+        (Stub::WrongFrame, Some("not the uniform Anchor refusal")),
+    ] {
+        let (addr, server) = stub_issuer(&fixture, stub).await;
+        let result = refused_query(addr, &fixture.code, &fixture.root, probe_time(), issuer).await;
+        match expected {
+            None => assert!(result.is_ok(), "{stub:?}: {result:?}"),
+            Some(reason) => assert!(
+                result.as_ref().is_err_and(|e| e.contains(reason)),
+                "{stub:?}: {result:?}"
+            ),
+        }
+        assert_eq!(server.await.unwrap(), 0, "{stub:?}: bytes after the Query");
+    }
+
+    let (addr, server) = stub_issuer(&fixture, Stub::Refuse).await;
+    let impostor = (
+        issuer.0,
+        KeyDigest::of_spki(&fixture.bad_key.subject_public_key_info()).unwrap(),
+    );
+    let result = refused_query(addr, &fixture.code, &fixture.root, probe_time(), impostor).await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.contains("not the retained issuer")),
+        "{result:?}"
+    );
+    assert_eq!(
+        server.await.unwrap(),
+        usize::MAX,
+        "Query sent to an impostor"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn refusal_witness_reports_a_silent_issuer_as_a_deadline() {
+    let fixture = crate::cluster::pki::preproof_tests::fixture();
+    let issuer = (
+        NodeId::new(1).unwrap(),
+        KeyDigest::of_spki(&fixture.good_key.subject_public_key_info()).unwrap(),
+    );
+    // Bound but never accepted: the kernel completes TCP and nothing answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = refused_query(
+        listener.local_addr().unwrap(),
+        &fixture.code,
+        &fixture.root,
+        probe_time(),
+        issuer,
+    )
+    .await;
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("deadline")),
+        "{result:?}"
+    );
 }
 
 // A13: the test-only Operator constructor has one cfg-gated definition and one
