@@ -1,8 +1,8 @@
 # Windows development host: one-time owner checklist
 
-Status: preparation only. No administrator changes or real VM tests have been performed by agents. Complete the account steps before dedicated-account host acceptance, and the remaining steps before milestone 4 VM acceptance. Keep the existing Lab Manager installation, state and `agent-windows-test` VM untouched.
+Status: see the owner update below, which supersedes the dedicated-account steps for this PC for both M2 and M4. No administrator changes or real VM tests have been performed by agents. Complete the account steps before dedicated-account host acceptance, and the remaining steps before milestone 4 VM acceptance. Keep the existing Lab Manager installation, state and `agent-windows-test` VM untouched.
 
-## Owner update 2026-11-23 (supersedes the dedicated-account steps below for this PC)
+## Owner update 2026-11-23 (supersedes the dedicated-account steps below for this PC, for M2 and M4)
 
 Relayed by the babysitter on the owner's behalf.
 
@@ -17,7 +17,7 @@ Relayed by the babysitter on the owner's behalf.
   | --- | --- |
   | Login | `azuread\<owner>`. UAC-filtered: medium integrity, `BUILTIN\Administrators` deny-only, not elevated. Compatible with `current_user` execution. |
   | Hypervisor | `HypervisorPresent=True`. `WinHvPlatform.dll` and `WinHvEmulation.dll` are present. `WHvGetCapability(HypervisorPresent)` returns 1, and the feature mask is `0x2FF`. **WHPX is usable from this login.** The optional-feature state query needs elevation and was not run. |
-  | QEMU | **Not installed.** The only `qemu-img.exe` on PATH belongs to the Android SDK emulator and is unrelated. The pinned QEMU 11.1.3 Windows x64 build with a binary receipt (ADR 0054) is still to be installed, by an agent under the scoped permission above. |
+  | QEMU | **Not found** on PATH or in the common install directories checked. The only `qemu-img.exe` on PATH belongs to the Android SDK emulator and is unrelated. A QEMU/WHPX boot is **unverified on real hardware**. The pinned QEMU 11.1.3 Windows x64 build with a binary receipt (ADR 0054) is still to be installed, by an agent under the scoped permission above. |
   | Data folder | `D:\ArxcovoData` exists. Free space: C: 600.9 GB, D: 1569.3 GB. |
   | CPU and RAM | 16 logical CPUs, 61.6 GB RAM. |
 

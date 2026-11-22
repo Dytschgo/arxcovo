@@ -16,4 +16,4 @@ Milestones 1–6 remain the v1 scope in KICKOFF.md. Owner amendment 2026-11-23 (
 
 Non-blocking issues triaged under the owner's 2026-11-23 rule (ADR 0056). Each keeps its evidence.
 
-- **Intermittent hosted C13 owner mint refusal.** PR #259 CI `45062459949` failed once in the hosted C13 activation campaign (`phase=join category=assertion message=mint-refused`, owner mint exit 8, clean teardown). It has passed in every later run (19 through `830b9de7`). Cause undetermined; no v1 feature or acceptance check is blocked. If it reddens `main` again, quarantine that single case.
+- **Intermittent hosted C13 owner mint refusal.** PR #259 CI `45062459949` failed once in the hosted C13 activation campaign (`phase=join category=assertion message=mint-refused`, owner mint exit 8, clean teardown). It passed in all 19 later runs that executed it through `830b9de7` (one later run skipped C13). Cause undetermined; no v1 feature or acceptance check is blocked. If it reddens `main` again, quarantine that single case.

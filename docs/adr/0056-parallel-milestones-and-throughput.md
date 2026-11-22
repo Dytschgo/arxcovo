@@ -31,8 +31,8 @@ The owner asked to "do everything possible to speed up this project", without fa
 - CI stays under 15 minutes, and `ci-time-budget` and `agent-review` are never bypassed.
 - Scratch stays on D:.
 - No access to the old Lab Manager or the `agent-windows-test` VM.
-- No owner admin steps; the M4 host setup remains the owner's.
+- No owner admin steps, except the scoped M4 host-prerequisite exception recorded later the same day in AGENTS.md and docs/dev-host-setup.md (WHPX, QEMU, the D: cap and reserve; additive only; UAC asked of the owner once).
 - No secrets.
 - Honest **unverified on real hardware** labels.
-- On a usage limit: commit WIP and schedule a resume.
+- When usage limits block all authorized work: commit WIP, record a resume note and schedule the resume.
 - The stop rule after three counted failures.

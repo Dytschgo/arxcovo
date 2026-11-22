@@ -11,7 +11,7 @@ Two roadmap items move into v1. They keep the settled design and are built on th
 - Long-lived VMs with stable, owner-meaningful names. They are distinct from expiring TEST clones and are not reaped by lifetime expiry.
 - **Agents cannot delete static VMs or backups.** That is a technical fence, not an approval flow. Agents may start, stop and run scripts in a static VM within its policy. Deletion and backup removal stay outside agent authority.
 - **The first static VM is a Linux web server.** It is an Ubuntu guest built through the M4 cloud-init Linux template path. Windows guests on this Windows host remain TEST-only.
-- Disk accounting, the cap and reserve, custody and the native admission gates are the same as M4 (ADR 0054). Native paths stay closed until those gates pass and are **unverified on real hardware** until exercised.
+- Disk accounting, the cap and reserve, custody and the native admission gates are the same as M4 (ADR 0054). Exception (owner, 2026-11-23): on this PC the execution identity is the owner's current login (ADR 0029 `current_user`, elevated tokens refused) rather than a dedicated account. ADR 0054's dedicated-account and distinct owner/supervisor identity gates, including the WTS owner-activity signal that assumes distinct SIDs, must be amended in the native activation change before native admission opens. Native paths stay closed until those gates pass and are **unverified on real hardware** until exercised.
 - Backups and maintenance updates stay on the roadmap, except for the protections above.
 
 ### Cloudflare Tunnel publishing (from roadmap item 8)
