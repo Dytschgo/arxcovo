@@ -1,5 +1,5 @@
 use super::diagnostics::{Diag, Fail, Helper};
-use super::mem_net::{Factory, MemRouter};
+use super::mem_net::{ElectionPhase, Factory, MemRouter};
 use super::*;
 use crate::cluster::enrollment::{CODE_TTL_MS, JoinCode, KeyDigest, Reject};
 use crate::service::application::tests::private_temp;
@@ -199,6 +199,12 @@ impl Cluster {
         a.report = Some(r);
         self.attribute(a);
     }
+    pub(super) fn trace_phase(&self, phase: ElectionPhase, i: usize) {
+        if self.router.election_trace.active() {
+            let sample = self.diag.sample(self.node(i).raft.as_ref().unwrap());
+            self.router.election_trace.phase(phase, i + 1, sample, None);
+        }
+    }
     /// The converge read with S3 before/after snapshots; same result as the bare read.
     pub(super) async fn attributed_read(
         &self,
@@ -206,19 +212,38 @@ impl Cluster {
     ) -> Result<(Option<LogPos>, Vec<u8>), ReadError> {
         let raft = self.node(l).raft.as_ref().unwrap();
         let before = self.diag.sample(raft);
+        let trace = &self.router.election_trace;
+        let tracing = trace.active();
+        if tracing {
+            trace.phase(ElectionPhase::FreshReadEntered, l + 1, before, None);
+        }
         let result = self.node(l).linearizable_state().await;
         if let Err(e) = &result {
             let after = self.diag.sample(raft);
             let fail = read_fail(e);
+            if tracing {
+                trace.phase(ElectionPhase::FreshReadReturned, l + 1, after, Some(fail));
+            }
             let mut a = self.diag.attribution(Helper::Converge, fail, l);
             a.read = Some((before, after, self.diag.read_class(l, before, after)));
             self.attribute(a);
+        } else if tracing {
+            trace.phase(
+                ElectionPhase::FreshReadReturned,
+                l + 1,
+                self.diag.sample(raft),
+                None,
+            );
+        }
+        if tracing {
+            trace.stop_capture();
         }
         result
     }
     pub(super) async fn converge(&self) {
         diagnostics_count(&self.diag.helpers.converge_calls);
         let l = self.leader().await;
+        self.trace_phase(ElectionPhase::ConvergeSelected, l);
         let (p, b) = self.attributed_read(l).await.unwrap();
         assert!(
             self.acknowledged
@@ -368,6 +393,7 @@ async fn t3_snapshot_catchup_then_consecutive_append() {
 impl Drop for Cluster {
     fn drop(&mut self) {
         // Bounded failure dump first: nonblocking, no await, no panic.
+        self.router.election_trace.dump_if_incomplete();
         self.diag.on_drop();
         self.router.nodes.lock().unwrap().clear();
     }

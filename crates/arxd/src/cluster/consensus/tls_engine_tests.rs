@@ -1,3 +1,5 @@
+use super::super::diagnostics::Sample;
+use super::super::mem_net::ElectionPhase;
 use super::super::three_node::{Cluster, code, mint};
 use super::found::{FOUNDER, founder_init};
 use super::*;
@@ -189,26 +191,28 @@ async fn authenticated_sender_mismatch_and_assumed_founder_control() {
             .await
             .unwrap();
         let before = c.router.mismatch.load(std::sync::atomic::Ordering::Relaxed);
+        let trace = &c.router.election_trace;
+        trace.begin(c.diag.t_ms());
         // source == claimed on every real leader RPC; authenticated node 4 differs.
         c.router
             .authenticated
             .lock()
             .unwrap()
             .insert(l as u64 + 1, real);
+        c.trace_phase(ElectionPhase::MismatchInstalled, l);
         timeout(Duration::from_secs(5), async {
             loop {
-                let new = (0..3).any(|i| {
-                    i != l
-                        && c.node(i)
-                            .raft
-                            .as_ref()
-                            .unwrap()
-                            .metrics()
-                            .borrow_watched()
-                            .state
-                            == openraft::ServerState::Leader
+                let new = (0..3).filter(|&i| i != l).find_map(|i| {
+                    let metrics = c.node(i).raft.as_ref().unwrap().metrics();
+                    let watched = metrics.borrow_watched();
+                    (watched.state == openraft::ServerState::Leader)
+                        .then(|| (i, Sample::of(&watched, c.diag.t_ms())))
                 });
-                if new && c.router.mismatch.load(std::sync::atomic::Ordering::Relaxed) > before {
+                if let Some((i, sample)) = new
+                    && c.router.mismatch.load(std::sync::atomic::Ordering::Relaxed) > before
+                {
+                    trace.phase(ElectionPhase::ReplacementObserved, i + 1, sample, None);
+                    c.trace_phase(ElectionPhase::MismatchDetected, l);
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -235,10 +239,12 @@ async fn authenticated_sender_mismatch_and_assumed_founder_control() {
         })
         .await
         .expect("old TLS sender observes new term");
+        c.trace_phase(ElectionPhase::OldTermBarrierExited, l);
         c.router.authenticated.lock().unwrap().insert(
             l as u64 + 1,
             AuthenticatedPeer::assume(pki::node(l as u64 + 1)),
         );
+        c.trace_phase(ElectionPhase::IdentityRestored, l);
         c.converge().await;
         assert!(
             c.router
@@ -247,6 +253,7 @@ async fn authenticated_sender_mismatch_and_assumed_founder_control() {
                 > before
         );
         c.finish().await;
+        c.router.election_trace.complete();
     })
     .await
     .unwrap();
