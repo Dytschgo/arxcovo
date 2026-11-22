@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, PipeReader, PipeWriter, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
@@ -24,9 +24,11 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    let runner = CgroupRoot::qualify()
-        .ok()
-        .map(|root| ScriptRunner::new(root, Some(port.as_fd())));
+    let runner = ReapOwner::establish().ok().and_then(|owner| {
+        CgroupRoot::qualify()
+            .ok()
+            .map(|root| ScriptRunner::new(root, Some(port.as_fd()), owner))
+    });
     serve_connection(&port, &port, runner)
 }
 
@@ -225,19 +227,21 @@ impl CommandCgroups for CgroupRoot {
 struct ScriptRunner<'port> {
     cgroups: Box<dyn CommandCgroups>,
     port: Option<BorrowedFd<'port>>,
+    reap_owner: ReapOwner,
     max_budget: Duration,
     cleanup_budget: Duration,
     drop_privileges: bool,
     #[cfg(test)]
-    stall: Option<StallBeforeExec>,
+    stall: Option<&'port StallWatchdog>,
 }
 
 impl<'port> ScriptRunner<'port> {
-    fn new(root: CgroupRoot, port: Option<BorrowedFd<'port>>) -> Self {
+    fn new(root: CgroupRoot, port: Option<BorrowedFd<'port>>, reap_owner: ReapOwner) -> Self {
         Self {
             drop_privileges: root.owner == 0,
             cgroups: Box::new(root),
             port,
+            reap_owner,
             max_budget: Duration::from_secs(arx_guest::MAX_TIMEOUT_S.into()),
             cleanup_budget: CLEANUP_BUDGET,
             #[cfg(test)]
@@ -247,6 +251,12 @@ impl<'port> ScriptRunner<'port> {
 
     fn run(&self, script: &str, budget: Duration) -> io::Result<ScriptOutcome> {
         let deadline = Instant::now() + budget.min(self.max_budget);
+        #[cfg(test)]
+        let deadline = if self.stall.is_some() {
+            Instant::now() + TEST_HANG_GUARD
+        } else {
+            deadline
+        };
         let mut group = self.cgroups.new_command()?;
         let prepared = PreparedScript::new(script);
         let launch_expired = Instant::now() >= deadline;
@@ -255,21 +265,24 @@ impl<'port> ScriptRunner<'port> {
         } else {
             prepared
                 .and_then(|script| {
-                    script.fork(ChildSetup {
-                        port: self.port.map(|port| port.as_raw_fd()),
-                        procs: Some(group.procs.as_raw_fd()),
-                        drop_privileges: self.drop_privileges,
-                        #[cfg(test)]
-                        stdout: None,
-                        #[cfg(test)]
-                        stall: self.stall,
-                    })
+                    script.fork(
+                        &self.reap_owner,
+                        ChildSetup {
+                            port: self.port.map(|port| port.as_raw_fd()),
+                            procs: Some(group.procs.as_raw_fd()),
+                            drop_privileges: self.drop_privileges,
+                            #[cfg(test)]
+                            stdout: None,
+                            #[cfg(test)]
+                            stall: self.stall.map(|stall| stall.child),
+                        },
+                    )
                 })
                 .ok()
         };
         let mut launch_uncertain = false;
         let result = match &mut child {
-            Some(child) => match child.wait_exec(deadline) {
+            Some(child) => match self.wait_exec(child, deadline) {
                 Ok(true) => observe(child, deadline),
                 Ok(false) => Ok(Observation::LaunchFailed),
                 Err(error) => {
@@ -281,17 +294,11 @@ impl<'port> ScriptRunner<'port> {
             None => Ok(Observation::LaunchFailed),
         };
         let cleanup_deadline = Instant::now() + self.cleanup_budget;
-        // An uncertain launch has an unreaped PID even before setpgid. Kill
-        // that PID directly as well as its group, then kill the cgroup.
+        // An uncertain launch may precede setpgid or the cgroup join. Stop
+        // the owned child as well as its group before killing the cgroup.
         let group_kill = match &child {
             Some(child) if launch_uncertain || matches!(result, Ok(Observation::Deadline)) => {
-                let group = signal_kill(-child.pid);
-                if launch_uncertain {
-                    let direct = signal_kill(child.pid);
-                    group.and(direct)
-                } else {
-                    group
-                }
+                child.kill()
             }
             _ => Ok(()),
         };
@@ -307,6 +314,54 @@ impl<'port> ScriptRunner<'port> {
         empty?;
         self.cgroups.remove_command(&group)?;
         Ok(result?.outcome())
+    }
+
+    fn wait_exec(&self, child: &mut ScriptChild, deadline: Instant) -> io::Result<bool> {
+        #[cfg(test)]
+        if let Some(stall) = self.stall {
+            return stall.expire_after_ready(deadline);
+        }
+        child.wait_exec(deadline)
+    }
+}
+
+// The dedicated service has one waiter and installs no other SIGCHLD handler.
+// With default SIGCHLD and no SA_NOCLDWAIT, even an exited child retains its
+// PID until that waiter reaps it.
+struct ReapOwner;
+
+impl ReapOwner {
+    fn establish() -> io::Result<Self> {
+        // SAFETY: sigaction accepts a live, initialized action and copies it.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            if libc::sigemptyset(&mut action.sa_mask) != 0
+                || libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Self::verify()
+    }
+
+    fn verify() -> io::Result<Self> {
+        let action = sigchld_action()?;
+        if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err(invalid());
+        }
+        Ok(Self)
+    }
+}
+
+fn sigchld_action() -> io::Result<libc::sigaction> {
+    // SAFETY: sigaction initializes the output on a successful read-back.
+    unsafe {
+        let mut action = std::mem::MaybeUninit::uninit();
+        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(action.assume_init())
     }
 }
 
@@ -443,6 +498,30 @@ struct StallBeforeExec {
     gate: RawFd,
 }
 
+#[cfg(test)]
+const TEST_HANG_GUARD: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+struct StallWatchdog {
+    child: StallBeforeExec,
+    ready: PipeReader,
+    receipt: Cell<Option<(libc::pid_t, u8)>>,
+}
+
+#[cfg(test)]
+impl StallWatchdog {
+    fn expire_after_ready(&self, deadline: Instant) -> io::Result<bool> {
+        wait_readable(self.ready.as_raw_fd(), deadline)?;
+        let mut receipt = [0; 5];
+        (&self.ready).read_exact(&mut receipt)?;
+        let [a, b, c, d, inherited] = receipt;
+        self.receipt
+            .set(Some((libc::pid_t::from_ne_bytes([a, b, c, d]), inherited)));
+        // Inject the watchdog event only after the whole pre-exec record.
+        Err(io::ErrorKind::TimedOut.into())
+    }
+}
+
 impl PreparedScript {
     fn new(script: &str) -> io::Result<Self> {
         if script.len() > MAX_SCRIPT {
@@ -466,7 +545,7 @@ impl PreparedScript {
         })
     }
 
-    fn fork(self, setup: ChildSetup) -> io::Result<ScriptChild> {
+    fn fork(self, _owner: &ReapOwner, setup: ChildSetup) -> io::Result<ScriptChild> {
         let input = self.input.as_raw_fd();
         let null = self.null.as_raw_fd();
         let report = self.exec_writer.as_raw_fd();
@@ -500,11 +579,7 @@ impl PreparedScript {
             return Err(io::Error::last_os_error());
         }
         drop(self.exec_writer);
-        Ok(ScriptChild {
-            pid: pid as libc::pid_t,
-            exec_reader: self.exec_reader,
-            status: None,
-        })
+        Ok(ScriptChild::new(pid as libc::pid_t, self.exec_reader))
     }
 }
 
@@ -514,20 +589,21 @@ unsafe fn exec_child(setup: ChildSetup, input: RawFd, null: RawFd, report: RawFd
     unsafe {
         #[cfg(test)]
         if let Some(stall) = setup.stall {
-            let pid = libc::getpid().to_ne_bytes();
-            let port_open =
-                [u8::from(setup.port.is_some_and(|port| {
-                    libc::fcntl(port, libc::F_GETFD) != -1
-                }))];
-            libc::write(stall.ready, pid.as_ptr().cast(), pid.len());
-            libc::write(stall.ready, port_open.as_ptr().cast(), 1);
+            let [a, b, c, d] = libc::getpid().to_ne_bytes();
+            let inherited = u8::from(
+                setup
+                    .port
+                    .is_some_and(|port| libc::fcntl(port, libc::F_GETFD) != -1),
+            );
+            let ready = [a, b, c, d, inherited];
+            libc::write(stall.ready, ready.as_ptr().cast(), ready.len());
             // Bound even a test whose supervisor regresses and never kills it.
             let mut gate = libc::pollfd {
                 fd: stall.gate,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if libc::poll(&mut gate, 1, 2000) <= 0 {
+            if libc::poll(&mut gate, 1, 10_000) <= 0 {
                 libc::_exit(124);
             }
             libc::read(stall.gate, [0u8].as_mut_ptr().cast(), 1);
@@ -582,12 +658,31 @@ unsafe fn launch_failed(report: RawFd) -> ! {
 
 struct ScriptChild {
     pid: libc::pid_t,
+    pidfd: Option<OwnedFd>,
+    pidfd_error: Option<io::Error>,
     exec_reader: PipeReader,
     status: Option<ExitStatus>,
 }
 
 impl ScriptChild {
+    fn new(pid: libc::pid_t, exec_reader: PipeReader) -> Self {
+        let (pidfd, pidfd_error) = match open_pidfd(pid) {
+            Ok(fd) => (fd, None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            pid,
+            pidfd,
+            pidfd_error,
+            exec_reader,
+            status: None,
+        }
+    }
+
     fn wait_exec(&mut self, deadline: Instant) -> io::Result<bool> {
+        if let Some(error) = self.pidfd_error.take() {
+            return Err(error);
+        }
         wait_readable(self.exec_reader.as_raw_fd(), deadline)?;
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -597,22 +692,104 @@ impl ScriptChild {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        while self.status.is_none() {
-            let mut status = 0;
-            // SAFETY: pid is this unreaped child and status is writable.
-            let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-            match waited {
-                0 => break,
-                -1 => {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-                _ => self.status = Some(ExitStatus::from_raw(status)),
-            }
+        if self.status.is_none() {
+            self.status = self.wait_status(0)?;
         }
         Ok(self.status)
+    }
+
+    fn wait_status(&self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
+        if let Some(pidfd) = &self.pidfd {
+            match wait_child(libc::P_PIDFD, pidfd.as_raw_fd() as libc::id_t, flags) {
+                // Linux 5.3 introduced pidfd_open before P_PIDFD wait.
+                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+                result => return result,
+            }
+        }
+        // The sole waiter owns the numeric PID until it reaps the child.
+        wait_child(libc::P_PID, self.pid as libc::id_t, flags)
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        // WNOWAIT proves child ownership before the numeric group signal,
+        // without giving up the PID. This service has no competing waiter.
+        if self.status.is_some() || self.wait_status(libc::WNOWAIT)?.is_some() {
+            return Ok(());
+        }
+        let group = numeric_kill(-self.pid);
+        let direct = match &self.pidfd {
+            Some(pidfd) => {
+                // SAFETY: this live descriptor identifies our forked child.
+                let sent = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        libc::c_long::from(pidfd.as_raw_fd()),
+                        libc::c_long::from(libc::SIGKILL),
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0 as libc::c_ulong,
+                    )
+                };
+                kill_result(sent)
+            }
+            None => numeric_kill(self.pid),
+        };
+        group.and(direct)
+    }
+}
+
+fn open_pidfd(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
+    // SAFETY: the caller has just forked this waitable child. The returned
+    // descriptor belongs to the caller and Linux opens it close-on-exec.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            libc::c_long::from(pid),
+            0 as libc::c_ulong,
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: a successful pidfd_open returns a fresh descriptor.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOSYS) {
+        return Ok(None);
+    }
+    Err(error)
+}
+
+fn wait_child(
+    kind: libc::idtype_t,
+    id: libc::id_t,
+    flags: libc::c_int,
+) -> io::Result<Option<ExitStatus>> {
+    loop {
+        // SAFETY: siginfo is valid writable storage. waitid with WNOHANG
+        // leaves si_pid zero when the child has no reportable exit.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited =
+            unsafe { libc::waitid(kind, id, &mut info, libc::WEXITED | libc::WNOHANG | flags) };
+        if waited == 0 {
+            // SAFETY: WEXITED reports SIGCHLD status information.
+            return unsafe {
+                if info.si_pid() == 0 {
+                    Ok(None)
+                } else {
+                    let status = info.si_status();
+                    let raw = match info.si_code {
+                        libc::CLD_EXITED => status << 8,
+                        libc::CLD_KILLED => status,
+                        libc::CLD_DUMPED => status | 0x80,
+                        _ => return Err(invalid()),
+                    };
+                    Ok(Some(ExitStatus::from_raw(raw)))
+                }
+            };
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -694,9 +871,15 @@ fn reap(child: &mut ScriptChild, deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn signal_kill(pid: libc::pid_t) -> io::Result<()> {
-    // SAFETY: the unreaped child pins its PID and any process group it leads.
-    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+fn numeric_kill(pid: libc::pid_t) -> io::Result<()> {
+    // SAFETY: the caller verified ownership and holds the unreaped child.
+    kill_result(libc::c_long::from(unsafe {
+        libc::kill(pid, libc::SIGKILL)
+    }))
+}
+
+fn kill_result(result: libc::c_long) -> io::Result<()> {
+    if result == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
@@ -736,6 +919,8 @@ fn invalid() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{DirBuilderExt, FileExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -745,6 +930,95 @@ mod tests {
 
     const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
     const FIXTURE_BUDGET: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn inherited_sigchld_ignore_is_reset_and_child_stays_waitable() {
+        const PROBE: &str = "ARX_TEST_INHERITED_SIGCHLD";
+        if std::env::var_os(PROBE).is_some() {
+            assert_eq!(sigchld_action().unwrap().sa_sigaction, libc::SIG_IGN);
+            ignore_sigchld().unwrap();
+            assert_ne!(sigchld_action().unwrap().sa_flags & libc::SA_NOCLDWAIT, 0);
+            assert!(ReapOwner::verify().is_err());
+
+            let owner = ReapOwner::establish().unwrap();
+            let action = sigchld_action().unwrap();
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+            assert_eq!(action.sa_flags & libc::SA_NOCLDWAIT, 0);
+            let deadline = Instant::now() + TEST_HANG_GUARD;
+            let mut child = PreparedScript::new("exit 7")
+                .unwrap()
+                .fork(&owner, ChildSetup::default())
+                .unwrap();
+            assert!(child.wait_exec(deadline).unwrap());
+            let observed = observe_until(
+                || child.wait_status(libc::WNOWAIT),
+                || pause_until(deadline),
+            )
+            .unwrap();
+            assert_eq!(observed.outcome(), ScriptOutcome::Exited { exit_code: 7 });
+            if let Some(pidfd) = &child.pidfd {
+                match wait_child(
+                    libc::P_PIDFD,
+                    pidfd.as_raw_fd() as libc::id_t,
+                    libc::WNOWAIT,
+                ) {
+                    Ok(status) => {
+                        assert_eq!(status.and_then(|status| status.code()), Some(7));
+                        eprintln!("pidfd wait fixture exercised");
+                    }
+                    Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EINVAL)),
+                }
+            }
+            // Exercise the numeric fallback against the same waitable child.
+            child.pidfd = None;
+            assert_eq!(
+                child.try_wait().unwrap().and_then(|status| status.code()),
+                Some(7)
+            );
+            assert_eq!(
+                child.wait_status(libc::WNOWAIT).unwrap_err().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            return;
+        }
+
+        let mut probe = Command::new(std::env::current_exe().unwrap());
+        probe.env(PROBE, "1").args([
+            "--exact",
+            "platform::linux::tests::inherited_sigchld_ignore_is_reset_and_child_stays_waitable",
+            "--nocapture",
+        ]);
+        // SAFETY: the callback only installs a fixed sigaction with libc.
+        unsafe { probe.pre_exec(ignore_sigchld) };
+        let deadline = Instant::now() + TEST_HANG_GUARD;
+        let mut probe = probe.spawn().unwrap();
+        loop {
+            if let Some(status) = probe.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if pause_until(deadline).is_err() {
+                let _ = probe.kill();
+                probe.wait().unwrap();
+                panic!("SIGCHLD probe did not exit");
+            }
+        }
+    }
+
+    fn ignore_sigchld() -> io::Result<()> {
+        // SAFETY: glibc sigaction reads the initialized action from this stack.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_IGN;
+            action.sa_flags = libc::SA_NOCLDWAIT;
+            if libc::sigemptyset(&mut action.sa_mask) != 0
+                || libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn shell_status_and_output_redaction() {
@@ -760,7 +1034,7 @@ mod tests {
             let mut child = launched(script, ChildSetup::default());
             let observed = observe(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
             if matches!(observed, Observation::Deadline) {
-                signal_kill(-child.pid).unwrap();
+                child.kill().unwrap();
                 reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
             }
             assert_eq!(observed.outcome(), expected);
@@ -768,10 +1042,13 @@ mod tests {
         let read_only = File::open("/dev/null").unwrap();
         let mut child = PreparedScript::new("exit 0")
             .unwrap()
-            .fork(ChildSetup {
-                procs: Some(read_only.as_raw_fd()),
-                ..ChildSetup::default()
-            })
+            .fork(
+                &ReapOwner::verify().unwrap(),
+                ChildSetup {
+                    procs: Some(read_only.as_raw_fd()),
+                    ..ChildSetup::default()
+                },
+            )
             .unwrap();
         assert!(!child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
         reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
@@ -796,7 +1073,7 @@ mod tests {
             Observation::Deadline
         ));
         let pid = child.pid;
-        signal_kill(-pid).unwrap();
+        child.kill().unwrap();
         reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
         assert_eq!(
             child.try_wait().unwrap().unwrap().signal(),
@@ -852,7 +1129,7 @@ mod tests {
             serve_connection(
                 &requests[..],
                 &mut responses,
-                Some(ScriptRunner::new(root, None))
+                Some(ScriptRunner::new(root, None, ReapOwner::verify().unwrap()))
             ),
             Err("script containment failed")
         );
@@ -870,31 +1147,32 @@ mod tests {
         // The child stalls before joining. The command cgroup stays empty.
         fs::write(fixture.0.join("cgroup.events"), b"populated 0\n").unwrap();
         let (mut peer, port) = io::pipe().unwrap();
-        let (mut started, ready) = io::pipe().unwrap();
+        let (started, ready) = io::pipe().unwrap();
         let (gate, _held_gate) = io::pipe().unwrap();
+        let stall = StallWatchdog {
+            child: StallBeforeExec {
+                ready: ready.as_raw_fd(),
+                gate: gate.as_raw_fd(),
+            },
+            ready: started,
+            receipt: Cell::new(None),
+        };
         let mut runner = fixture.runner();
-        runner.max_budget = Duration::from_millis(150);
+        runner.cleanup_budget = TEST_HANG_GUARD;
         runner.port = Some(port.as_fd());
-        runner.stall = Some(StallBeforeExec {
-            ready: ready.as_raw_fd(),
-            gate: gate.as_raw_fd(),
-        });
-        let start = Instant::now();
+        runner.stall = Some(&stall);
         let result = serve_connection(script_request("exit 7").as_slice(), &port, Some(runner));
-        let session_time = start.elapsed();
         drop(port);
         drop(ready);
 
-        wait_readable(started.as_raw_fd(), Instant::now() + FIXTURE_BUDGET).unwrap();
-        let mut identity = 0i32.to_ne_bytes();
-        started.read_exact(&mut identity).unwrap();
-        let mut inherited = [0];
-        started.read_exact(&mut inherited).unwrap();
-        let pid = libc::pid_t::from_ne_bytes(identity);
+        let (pid, inherited) = stall
+            .receipt
+            .get()
+            .expect("child did not acknowledge the stall");
         assert!(pid > 0);
-        wait_readable(peer.as_raw_fd(), Instant::now() + FIXTURE_BUDGET).unwrap();
+        wait_readable(peer.as_raw_fd(), Instant::now() + TEST_HANG_GUARD).unwrap();
         expect_hello(&mut peer, ScriptExecution::Available);
-        let release = wait_readable(peer.as_raw_fd(), Instant::now() + Duration::from_millis(50))
+        let release = wait_readable(peer.as_raw_fd(), Instant::now() + TEST_HANG_GUARD)
             .and_then(|()| peer.read(&mut [0]));
 
         // SAFETY: pid came directly from the forked fixture child. WNOHANG
@@ -904,26 +1182,14 @@ mod tests {
             waited == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
         if waited == 0 {
             // Keep the mutation witness from leaving its blocked child behind.
-            signal_kill(pid).unwrap();
-            let mut child = ScriptChild {
-                pid,
-                exec_reader: started,
-                status: None,
-            };
+            let mut child = ScriptChild::new(pid, stall.ready);
+            child.kill().unwrap();
             reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
         }
         assert_eq!(release.expect("stalled child kept the port open"), 0);
-        assert_eq!(
-            inherited,
-            [0],
-            "the first child step did not close the port"
-        );
+        assert_eq!(inherited, 0, "the first child step did not close the port");
         assert!(reaped, "the watchdog did not reap the stalled child");
         assert_eq!(result, Err("script containment failed"));
-        assert!(
-            session_time < Duration::from_millis(500),
-            "session did not retire promptly"
-        );
     }
 
     #[test]
@@ -1031,7 +1297,7 @@ mod tests {
         ready(&pipe);
         assert_eq!(pipe.read(&mut [0]).unwrap(), 0);
         assert!(!group.path.exists());
-        let runner = ScriptRunner::new(root, None);
+        let runner = ScriptRunner::new(root, None, ReapOwner::verify().unwrap());
         if owner == 0 {
             assert_eq!(
                 runner
@@ -1093,6 +1359,7 @@ mod tests {
             ScriptRunner {
                 cgroups: Box::new(Arc::clone(self)),
                 port: None,
+                reap_owner: ReapOwner::verify().unwrap(),
                 max_budget: FIXTURE_BUDGET,
                 cleanup_budget: FIXTURE_BUDGET,
                 drop_privileges: false,
@@ -1184,7 +1451,10 @@ mod tests {
     }
 
     fn launched(script: &str, setup: ChildSetup) -> ScriptChild {
-        let mut child = PreparedScript::new(script).unwrap().fork(setup).unwrap();
+        let mut child = PreparedScript::new(script)
+            .unwrap()
+            .fork(&ReapOwner::verify().unwrap(), setup)
+            .unwrap();
         assert!(child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
         child
     }
