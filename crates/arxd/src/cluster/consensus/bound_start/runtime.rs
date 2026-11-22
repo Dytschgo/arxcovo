@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use checked_clock::{CheckedClock, HostClock};
-use openraft::type_config::async_runtime::watch::WatchReceiver;
+use openraft::type_config::{alias::WatchReceiverOf, async_runtime::watch::WatchReceiver};
 use rustls::{pki_types::UnixTime, time_provider::TimeProvider};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -428,7 +428,12 @@ impl Running {
         }
     }
 
-    pub(crate) async fn mint_receipt(&self, operator: Operator) -> DispatchReply {
+    pub(crate) async fn mint_receipt(
+        &self,
+        operator: Operator,
+        stop: &crate::service::Shutdown,
+        deadline: tokio::time::Instant,
+    ) -> DispatchReply {
         let Some(installation) = self
             .job
             .state
@@ -438,7 +443,9 @@ impl Running {
         else {
             return Reply::Refused.into();
         };
-        self.job.mint_owner_receipt(operator, installation).await
+        self.job
+            .mint_owner_receipt(operator, installation, stop, deadline)
+            .await
     }
 
     fn installation_id(&self) -> Option<[u8; 16]> {
@@ -458,16 +465,24 @@ impl Running {
     }
 
     pub(crate) fn observe_ledger(&self, slots: &LedgerSlots, status: u8) -> DispatchReply {
-        match self.ledger_checkpoint(slots, status) {
+        match self.ledger_checkpoint(slots, status, Self::retained_ledger_peer, |node| {
+            Some(node.raft.as_ref()?.metrics())
+        }) {
             Some(bytes) => DispatchReply::Ledger(bytes),
             None => Reply::Refused.into(),
         }
     }
 
-    fn ledger_checkpoint(&self, slots: &LedgerSlots, status: u8) -> Option<[u8; LEDGER_REPLY_LEN]> {
+    fn ledger_checkpoint(
+        &self,
+        slots: &LedgerSlots,
+        status: u8,
+        retained_peer: impl Fn(&State) -> Option<peer_transport::BuildPeer>,
+        metrics: impl FnOnce(&ConsensusNode) -> Option<WatchReceiverOf<Arx, openraft::RaftMetrics<Arx>>>,
+    ) -> Option<[u8; LEDGER_REPLY_LEN]> {
         let origin = {
             let state = self.job.state.try_lock().ok()?;
-            self.ledger_origin(&state)?
+            self.ledger_origin(&state, &retained_peer)?
         };
 
         // Drop the Job guard first. Acquire retained node -> log -> state once,
@@ -477,8 +492,7 @@ impl Running {
             if node.id != origin.member.get() {
                 return None;
             }
-            let raft = node.raft.as_ref()?;
-            let metrics = raft.metrics();
+            let metrics = metrics(&node)?;
             let qualified_epoch = || qualified_ledger_epoch(&metrics.borrow_watched(), node.id);
             let (epoch, role, membership) = qualified_epoch()?;
             let log = node.log_weak.upgrade()?;
@@ -501,7 +515,7 @@ impl Running {
         };
 
         let state = self.job.state.try_lock().ok()?;
-        let current = self.ledger_origin(&state)?;
+        let current = self.ledger_origin(&state, &retained_peer)?;
         let issuer = state.issuer.as_ref().map(|issuer| {
             let (cluster, _, key) = issuer.transfer_identity();
             (cluster, issuer.member(), key)
@@ -509,7 +523,11 @@ impl Running {
         origin.checkpoint(&current, issuer, stored, epoch, role, status)
     }
 
-    fn ledger_origin(&self, state: &State) -> Option<LedgerOrigin> {
+    fn ledger_origin(
+        &self,
+        state: &State,
+        retained_peer: impl FnOnce(&State) -> Option<peer_transport::BuildPeer>,
+    ) -> Option<LedgerOrigin> {
         let installation = Self::retained_installation_id(state)?;
         let custody = qualified_ledger_custody(state, self.strict_written, || {
             state
@@ -517,12 +535,7 @@ impl Running {
                 .as_ref()
                 .is_some_and(learner::Operation::voter_custody)
         })?;
-        let peer = match state.status {
-            Status::FounderReady => state.founder.as_ref()?.delegated_build()?,
-            Status::LearnerReady => state.learner.as_ref()?.delegated_build()?,
-            _ => return None,
-        };
-        let (cluster, member) = peer.identity()?;
+        let (cluster, member) = retained_peer(state)?.identity()?;
         Some(LedgerOrigin {
             binding: state.node.clone()?,
             installation,
@@ -530,6 +543,14 @@ impl Running {
             cluster,
             member,
         })
+    }
+
+    fn retained_ledger_peer(state: &State) -> Option<peer_transport::BuildPeer> {
+        match state.status {
+            Status::FounderReady => state.founder.as_ref()?.delegated_build(),
+            Status::LearnerReady => state.learner.as_ref()?.delegated_build(),
+            _ => None,
+        }
     }
 
     pub(crate) async fn observe(&mut self) -> Result<Readiness, Error> {

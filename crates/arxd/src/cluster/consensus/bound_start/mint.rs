@@ -63,20 +63,80 @@ mod linux {
                 ActorId, BoundVoters, CODE_TTL_MS, CodeId, JoinCode, MintReceiptInput, transfer,
             },
         },
-        service::cluster_owner::{DispatchReply, MintReceipt, Operator, Paste, Reply},
+        service::{
+            Shutdown,
+            cluster_owner::{DispatchReply, MintReceipt, Operator, Paste, Reply},
+        },
     };
     use checked_clock::CheckedClock;
     use openraft::type_config::async_runtime::watch::WatchReceiver;
     use sha2::{Digest, Sha256};
     use std::{net::SocketAddr, time::Duration};
-    use tokio::time::timeout;
+    use tokio::time::{Instant, sleep_until, timeout};
 
     const MINT_WAIT: Duration = Duration::from_secs(10);
 
     #[derive(Clone, Copy)]
-    enum ResultMode {
+    pub(super) enum ResultMode<'a> {
         Paste,
-        Receipt,
+        Receipt(PrivateMintFence<'a>),
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct PrivateMintFence<'a> {
+        stop: &'a Shutdown,
+        deadline: Instant,
+    }
+
+    impl PrivateMintFence<'_> {
+        fn open(self) -> bool {
+            !self.stop.is_cancelled() && Instant::now() < self.deadline
+        }
+    }
+
+    impl<'a> ResultMode<'a> {
+        pub(super) fn receipt(stop: &'a Shutdown, deadline: Instant) -> Self {
+            Self::Receipt(PrivateMintFence { stop, deadline })
+        }
+
+        pub(super) async fn at_proposal<T, F: Future<Output = DispatchReply>>(
+            self,
+            prepare: impl Future<Output = Option<T>>,
+            submit: impl FnOnce(T) -> F,
+        ) -> DispatchReply {
+            let mut started = false;
+            let operation = async {
+                let Some(prepared) = prepare.await else {
+                    return Reply::Refused.into();
+                };
+                // Preparation may complete in the same poll that closes the fence.
+                if let Self::Receipt(fence) = self
+                    && !fence.open()
+                {
+                    return Reply::Refused.into();
+                }
+                started = true;
+                submit(prepared).await
+            };
+            let Self::Receipt(fence) = self else {
+                return operation.await;
+            };
+            if !fence.open() {
+                return Reply::Refused.into();
+            }
+            let reply = tokio::select! {
+                biased;
+                _ = fence.stop.cancelled() => None,
+                _ = sleep_until(fence.deadline) => None,
+                reply = operation => Some(reply),
+            };
+            match reply {
+                Some(reply) if fence.open() => reply,
+                // Dropping the waiter leaves any owned proposal running.
+                _ if started => Reply::Unknown.into(),
+                _ => Reply::Refused.into(),
+            }
+        }
     }
 
     fn actor(owner: &Operator, installation: [u8; 16], cluster: [u8; 16]) -> ActorId {
@@ -157,8 +217,10 @@ mod linux {
             &self,
             owner: Operator,
             installation: [u8; 16],
+            stop: &Shutdown,
+            deadline: Instant,
         ) -> DispatchReply {
-            self.mint_owner_mode(owner, installation, ResultMode::Receipt)
+            self.mint_owner_mode(owner, installation, ResultMode::receipt(stop, deadline))
                 .await
         }
 
@@ -166,7 +228,7 @@ mod linux {
             &self,
             owner: Operator,
             installation: [u8; 16],
-            mode: ResultMode,
+            mode: ResultMode<'_>,
         ) -> DispatchReply {
             let Ok(_lease) = self.mint_lease.try_lock() else {
                 return Reply::Refused.into();
@@ -291,31 +353,21 @@ mod linux {
         serving: &Serving,
         owner: &Operator,
         installation: [u8; 16],
-        mode: ResultMode,
+        mode: ResultMode<'_>,
     ) -> DispatchReply {
-        let Some((before, floor, proposed_at_ms)) = serving.view(node, None).await else {
-            return Reply::Refused.into();
-        };
-        let (command, code_id, paste) = {
+        let prepare = async {
+            let (before, floor, proposed_at_ms) = serving.view(node, None).await?;
             let (cluster, root, _) = serving.issuer.transfer_identity();
-            let Ok(code) = JoinCode::generate(cluster, root, before.anchor, getrandom::fill) else {
-                return Reply::Refused.into();
-            };
+            let code = JoinCode::generate(cluster, root, before.anchor, getrandom::fill).ok()?;
             let mut request = [0; 16];
-            if getrandom::fill(&mut request).is_err() {
-                return Reply::Refused.into();
-            }
+            getrandom::fill(&mut request).ok()?;
             // Prepare the protected value before the irreversible boundary, including
             // ADR0040's fixed endpoint and root checks.
-            let Ok(value) = transfer::encode(before.endpoint, serving.issuer.mint_root(), &code)
-            else {
-                return Reply::Refused.into();
-            };
+            let value =
+                transfer::encode(before.endpoint, serving.issuer.mint_root(), &code).ok()?;
             let paste = Paste::copy(value.expose_for_owner_transfer().as_bytes());
             drop(value);
-            let Some(paste) = paste else {
-                return Reply::Refused.into();
-            };
+            let paste = paste?;
             let code_id = code.code_id();
             let command = Command::Mint {
                 cluster,
@@ -325,39 +377,56 @@ mod linux {
                 verifier: code.verifier(),
                 proposed_at_ms,
             };
-            (command, code_id, paste)
-        };
-        if !job.still_serving(serving)
-            || !is_current(node, before)
-            || serving.issuer.available(node).is_err()
-        {
-            return Reply::Refused.into();
-        }
-        let receipt = matches!(mode, ResultMode::Receipt).then(|| MintReceiptInput::new(&command));
-        let (position, outcome) = match timeout(MINT_WAIT, node.propose(command)).await {
-            Ok(Ok((_, Some(Outcome::Rejected(_))))) => return Reply::Refused.into(),
-            Ok(Ok(result)) => result,
-            Ok(Err(ProposeError::Busy | ProposeError::Stopped | ProposeError::NotLeader(_))) => {
-                return Reply::Refused.into();
+            if !job.still_serving(serving)
+                || !is_current(node, before)
+                || serving.issuer.available(node).is_err()
+            {
+                return None;
             }
-            _ => return Reply::Unknown.into(),
+            let receipt =
+                matches!(mode, ResultMode::Receipt(_)).then(|| MintReceiptInput::new(&command));
+            Some((
+                command,
+                code_id,
+                paste,
+                before,
+                floor,
+                proposed_at_ms,
+                receipt,
+            ))
         };
-        let Some(expiry) = first_expiry(before, floor, position, outcome) else {
-            return Reply::Unknown.into();
-        };
-        let Some((after, applied, now)) = serving.view(node, Some(code_id)).await else {
-            return Reply::Unknown.into();
-        };
-        if proposed_at_ms
-            .checked_add(CODE_TTL_MS)
-            .is_none_or(|minimum| expiry < minimum)
-            || !may_reveal(before, after, applied, position, now, expiry)
-            || !job.still_serving(serving)
-            || !is_current(node, after)
-        {
-            return Reply::Unknown.into();
-        }
-        mint_result(paste, receipt.as_ref(), position, expiry)
+        mode.at_proposal(
+            prepare,
+            async |(command, code_id, paste, before, floor, proposed_at_ms, receipt)| {
+                let (position, outcome) = match timeout(MINT_WAIT, node.propose(command)).await {
+                    Ok(Ok((_, Some(Outcome::Rejected(_))))) => return Reply::Refused.into(),
+                    Ok(Ok(result)) => result,
+                    Ok(Err(
+                        ProposeError::Busy | ProposeError::Stopped | ProposeError::NotLeader(_),
+                    )) => {
+                        return Reply::Refused.into();
+                    }
+                    _ => return Reply::Unknown.into(),
+                };
+                let Some(expiry) = first_expiry(before, floor, position, outcome) else {
+                    return Reply::Unknown.into();
+                };
+                let Some((after, applied, now)) = serving.view(node, Some(code_id)).await else {
+                    return Reply::Unknown.into();
+                };
+                if proposed_at_ms
+                    .checked_add(CODE_TTL_MS)
+                    .is_none_or(|minimum| expiry < minimum)
+                    || !may_reveal(before, after, applied, position, now, expiry)
+                    || !job.still_serving(serving)
+                    || !is_current(node, after)
+                {
+                    return Reply::Unknown.into();
+                }
+                mint_result(paste, receipt.as_ref(), position, expiry)
+            },
+        )
+        .await
     }
 
     pub(super) fn mint_result(

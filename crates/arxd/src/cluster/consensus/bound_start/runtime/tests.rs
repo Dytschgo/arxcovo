@@ -100,12 +100,13 @@ mod ledger {
         cluster::{
             bound_open::{BoundIntent, BoundStores},
             enrollment::{CODE_TTL_MS, FoundMembers, JoinCode, MintReceiptInput, Outcome, Reject},
+            restart_history::tests as history_fixture,
             startup_plan::tests::Layout,
         },
         service::cluster_owner::MintReceipt,
     };
 
-    const CLUSTER: ClusterId = [23; 16];
+    const CLUSTER: ClusterId = history_fixture::CLUSTER;
     const EXPIRY: u64 = 100 + CODE_TTL_MS;
 
     fn position(index: u64) -> LogPos {
@@ -147,8 +148,8 @@ mod ledger {
     }
 
     struct Fixture {
-        state: Mutex<StateStore>,
-        log: Mutex<VoteLogStore>,
+        state: Arc<Mutex<StateStore>>,
+        log: Arc<Mutex<VoteLogStore>>,
         _bound: OwnedStores,
         _owner: Owner,
         _layout: Layout,
@@ -168,8 +169,8 @@ mod ledger {
             .into_owned();
             let (state, log) = bound.take_pair().unwrap();
             let fixture = Self {
-                state: Mutex::new(state),
-                log: Mutex::new(log),
+                state: Arc::new(Mutex::new(state)),
+                log: Arc::new(Mutex::new(log)),
                 _bound: bound,
                 _owner: owner,
                 _layout: layout,
@@ -257,14 +258,132 @@ mod ledger {
                 issue_permits: Arc::new(Semaphore::new(0)),
                 read_blocking: Arc::default(),
                 raft: None,
-                sm: None,
+                sm: Some(SmAdapter(self.state.clone())),
                 log_released: self.log.lock().unwrap().released(),
                 sm_released: self.state.lock().unwrap().released(),
-                log_weak: std::sync::Weak::new(),
-                sm_weak: std::sync::Weak::new(),
+                log_weak: Arc::downgrade(&self.log),
+                sm_weak: Arc::downgrade(&self.state),
                 permits: Arc::new(Semaphore::new(0)),
                 owners: Mutex::default(),
             }))
+        }
+    }
+
+    #[test]
+    fn ledger_checkpoint_qualifies_retained_origin_and_live_epoch_against_stores() {
+        use openraft::type_config::{alias::WatchOf, async_runtime::watch::Watch};
+
+        fn recovered_founder() -> (Layout, RecoveredHistory) {
+            let mut fixture = history_fixture::Fixture::new(true, true, None);
+            let address = fixture.owner.plan.peer.clone();
+            fixture.seed(history_fixture::E, history_fixture::E, Some(&address));
+            let layout = fixture.release();
+            let base = layout.root.path();
+            let ready = startup_recovery::recover_process(
+                Owner::acquire(history_fixture::plan(base, Mode::RecoverFounder)).unwrap(),
+                history_fixture::slot(base),
+                &base.join("wrap"),
+                &base.join("custody"),
+                false,
+            )
+            .into_ready()
+            .unwrap_or_else(|_| panic!("fixture recovery refused"));
+            (layout, ready.history)
+        }
+
+        fn metrics(
+            leader: u64,
+            role: openraft::ServerState,
+            membership: LogPos,
+        ) -> openraft::RaftMetrics<Arx> {
+            let mut m = openraft::RaftMetrics::<Arx>::new_initial(1);
+            m.vote = openraft::Vote::new(1, leader);
+            m.vote.committed = true;
+            m.current_leader = Some(leader);
+            m.state = role;
+            m.membership_config = Arc::new(openraft::StoredMembership::new(
+                Some(id(membership)),
+                m.membership_config.membership().clone(),
+            ));
+            m.committed_membership_config = m.membership_config.clone();
+            m
+        }
+
+        let (_layout, history) = recovered_founder();
+        let installation = history.founder().unwrap().installation();
+        let stores = Fixture::new(vec![[1, 2, 3].into()]);
+        let slots = LedgerSlots::for_test(&[stores.pending(2, 1), stores.pending(3, 2)]);
+        let member = NodeId::new(1).unwrap();
+        let (peer, _) = peer_transport::TransportOwner::pending_founder(CLUSTER, member);
+        let job = Job::anchor();
+        {
+            let mut state = job.state();
+            state.process_owned = true;
+            state.status = Status::FounderReady;
+            state.founder_recovered = Some(history);
+            state.node = Some(stores.binding(member));
+        }
+        let running = Running::founder(job, None, false);
+        let leader = openraft::ServerState::Leader;
+        let follower = openraft::ServerState::Follower;
+        let checkpoint = |m, between: &mut dyn FnMut()| {
+            running.ledger_checkpoint(
+                &slots,
+                4,
+                |_| Some(peer.build_peer()),
+                |_| {
+                    // The first origin was captured before the live metrics lookup.
+                    between();
+                    Some(<WatchOf<Arx> as Watch>::channel(m).1)
+                },
+            )
+        };
+
+        let expected = checkpoint(metrics(1, leader, position(1)), &mut || {}).unwrap();
+        assert_eq!(&expected[..4], &[LEDGER_VERSION, 4, 1, 0]);
+        assert_eq!(&expected[4..28], &[1_u64; 3].map(u64::to_be_bytes).concat());
+        assert_eq!(&expected[28..44], &installation);
+        assert_eq!(&expected[44..60], &CLUSTER);
+        assert_eq!(
+            &expected[60..92],
+            KeyDigest::of_spki(&[1]).unwrap().as_bytes()
+        );
+        assert_eq!(&expected[92..116], &position_bytes(position(1)));
+        assert_eq!(&expected[116..140], &position_bytes(position(3)));
+        assert_eq!(
+            &expected[140..],
+            &[1_u64, 2, 3].map(u64::to_be_bytes).concat()
+        );
+
+        assert!(checkpoint(metrics(1, leader, position(2)), &mut || {}).is_none());
+        // A qualified follower epoch with the wrong same-term leader.
+        assert!(checkpoint(metrics(2, follower, position(1)), &mut || {}).is_none());
+        assert!(checkpoint(metrics(1, follower, position(1)), &mut || {}).is_none());
+
+        let (_other_layout, other) = recovered_founder();
+        assert_ne!(other.founder().unwrap().installation(), installation);
+        let mut other = Some(other);
+        assert!(
+            checkpoint(metrics(1, leader, position(1)), &mut || {
+                std::mem::swap(&mut job.state().founder_recovered, &mut other);
+            })
+            .is_none()
+        );
+        job.state().founder_recovered = other;
+        assert!(
+            checkpoint(metrics(1, leader, position(1)), &mut || {
+                job.state().node = Some(stores.binding(member));
+            })
+            .is_none()
+        );
+        assert_eq!(
+            checkpoint(metrics(1, leader, position(1)), &mut || {}),
+            Some(expected)
+        );
+        {
+            let mut state = job.state();
+            state.node = None;
+            state.founder_recovered = None;
         }
     }
 

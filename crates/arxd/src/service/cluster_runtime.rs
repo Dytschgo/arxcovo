@@ -582,21 +582,6 @@ impl PrivateWorkBudget<'_> {
         }
     }
 
-    async fn mint(
-        &self,
-        operation: impl Future<Output = cluster_owner::DispatchReply>,
-    ) -> cluster_owner::DispatchReply {
-        use cluster_owner::Reply;
-        if !self.open() {
-            return Reply::Refused.into();
-        }
-        match tokio::time::timeout_at(self.deadline, operation).await {
-            Ok(reply) if self.open() => reply,
-            // An admitted Mint may have proposed before its receipt was lost.
-            _ => Reply::Unknown.into(),
-        }
-    }
-
     fn observe(
         &self,
         operation: impl FnOnce() -> cluster_owner::DispatchReply,
@@ -642,53 +627,6 @@ mod private_work_tests {
         drop(held);
         assert!(queued.await.is_none());
         assert!(work.try_lock().is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn interrupted_mint_after_admission_drops_its_receipt() {
-        fn receipt() -> DispatchReply {
-            DispatchReply::MintReceipt(cluster_owner::MintReceipt {
-                position: crate::cluster::state_store::LogPos {
-                    term: 1,
-                    leader: 1,
-                    index: 2,
-                },
-                digest: [3; 32],
-            })
-        }
-
-        let stop = Shutdown::default();
-        let budget = PrivateWorkBudget {
-            stop: &stop,
-            deadline: Instant::now() + OBSERVE,
-        };
-        assert!(matches!(
-            budget.mint(async { receipt() }).await,
-            DispatchReply::MintReceipt(_)
-        ));
-        let late = budget
-            .mint(async {
-                tokio::time::advance(OBSERVE).await;
-                receipt()
-            })
-            .await;
-        assert!(matches!(late, DispatchReply::Control(Reply::Unknown)));
-
-        let budget = PrivateWorkBudget {
-            stop: &stop,
-            deadline: Instant::now() + OBSERVE,
-        };
-        let stopped = budget
-            .mint(async {
-                stop.cancel();
-                receipt()
-            })
-            .await;
-        assert!(matches!(stopped, DispatchReply::Control(Reply::Unknown)));
-        let refused = budget
-            .mint(std::future::poll_fn(|_| panic!("closed Mint was polled")))
-            .await;
-        assert!(matches!(refused, DispatchReply::Control(Reply::Refused)));
     }
 
     #[test]
@@ -895,7 +833,9 @@ impl Lifecycle {
                             let Some(running) = &work.running else {
                                 return Reply::Refused.into();
                             };
-                            budget.mint(running.mint_receipt(operator)).await
+                            running
+                                .mint_receipt(operator, budget.stop, budget.deadline)
+                                .await
                         }
                         Request::ObserveLedger(slots) => {
                             let Some(running) = &work.running else {
