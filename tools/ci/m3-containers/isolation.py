@@ -757,7 +757,7 @@ def policy(bridge, links):
     def pair(source, target):
         source_ip, source_mac = nodes[source]
         target_ip, target_mac = nodes[target]
-        return (f"{port(source, 'i')} {port(target, 'o')} ether saddr {source_mac} ether daddr {target_mac}"
+        return (f"{port(source, 'i')} {port(target, 'o')} ether daddr {target_mac} ether saddr {source_mac}"
                 f" ip saddr {source_ip} ip daddr {target_ip}")
     forward = []
     flows = (("peer", "b", "a"), ("enrollment", "b", "c"), ("build", "a", "b"))
@@ -767,7 +767,7 @@ def policy(bridge, links):
                         (name + "-return", f"{pair(target, source)} tcp sport {service} ct state established", "accept")))
     b_ip, b_mac = nodes["b"]
     c_ip, c_mac = nodes["c"]
-    identity = f"{port('b', 'i')} {port('c', 'o')} ether saddr {b_mac} ether daddr {c_mac}"
+    identity = f"{port('b', 'i')} {port('c', 'o')} ether daddr {c_mac} ether saddr {b_mac}"
     exceptional = [
         ("forbidden", f"{identity} ip saddr {b_ip} ip daddr {c_ip} tcp dport 22174"),
         ("stray-outside", f'{identity} ip saddr {b_ip} ip daddr {NETWORK["outside"]} tcp dport 22174'),
@@ -784,7 +784,7 @@ def policy(bridge, links):
                                 f"{port(source, 'i')} {port(target, 'o')} ether saddr {source_mac} "
                                 f"arp saddr ether {source_mac} arp saddr ip {source_ip} arp daddr ip {target_ip}", "accept"))
     local, local_mac = NETWORK["local"]
-    local_probe = (f"{port('b', 'i')} ether saddr {b_mac} ether daddr {local_mac}"
+    local_probe = (f"{port('b', 'i')} ether daddr {local_mac} ether saddr {b_mac}"
                    f" ip saddr {b_ip} ip daddr {local} tcp dport 22174")
     outside_probe = local_probe.replace(f"ip daddr {local}", f'ip daddr {NETWORK["outside"]}')
     input_rules = [("synthetic-local", local_probe, "accept"), ("outside-to-host", outside_probe, "accept")]
@@ -892,9 +892,15 @@ def allowed_nft_dependencies(source, family):
     deps = set()
     if family == "bridge":
         if has_ip:
-            deps.add(("payload", "ether", "type", "ip"))
+            deps.update((
+                ("payload", "ether", "type", "ip"),
+                ("meta", "protocol", "ip"),
+            ))
         if has_ip6:
-            deps.add(("payload", "ether", "type", "ip6"))
+            deps.update((
+                ("payload", "ether", "type", "ip6"),
+                ("meta", "protocol", "ip6"),
+            ))
         if has_arp:
             deps.update((
                 ("payload", "ether", "type", "arp"),

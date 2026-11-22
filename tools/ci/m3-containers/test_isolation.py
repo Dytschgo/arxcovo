@@ -253,7 +253,7 @@ class Network(unittest.TestCase):
                        "type": "filter", "hook": "forward", "prio": -310, "policy": "accept"}},
             rule_row("bridge", "r2_forward", 11, "peer", [
                 m_meta("iifname", PORTS["b"]), m_meta("oifname", PORTS["a"]),
-                m_pay("ether", "saddr", b_mac), m_pay("ether", "daddr", a_mac),
+                m_pay("ether", "daddr", a_mac), m_pay("ether", "saddr", b_mac),
                 m_pay("ether", "type", "ip"),
                 m_pay("ip", "saddr", b_ip), m_pay("ip", "daddr", a_ip),
                 m_pay("ip", "protocol", "tcp"),
@@ -261,7 +261,7 @@ class Network(unittest.TestCase):
             ], "accept"),
             rule_row("bridge", "r2_forward", 12, "peer-return", [
                 m_meta("iifname", PORTS["a"]), m_meta("oifname", PORTS["b"]),
-                m_pay("ether", "saddr", a_mac), m_pay("ether", "daddr", b_mac),
+                m_pay("ether", "daddr", b_mac), m_pay("ether", "saddr", a_mac),
                 m_pay("ether", "type", "ip"),
                 m_pay("ip", "saddr", a_ip), m_pay("ip", "daddr", b_ip),
                 m_meta("l4proto", "tcp"),
@@ -270,7 +270,7 @@ class Network(unittest.TestCase):
             ], "accept"),
             rule_row("bridge", "r2_forward", 13, "ipv6", [
                 m_meta("iifname", PORTS["b"]), m_meta("oifname", PORTS["c"]),
-                m_pay("ether", "saddr", b_mac), m_pay("ether", "daddr", c_mac),
+                m_pay("ether", "daddr", c_mac), m_pay("ether", "saddr", b_mac),
                 m_pay("ether", "type", "ip6"),
                 m_pay("ip6", "saddr", "fd42:72::12"), m_pay("ip6", "daddr", NETWORK["ipv6"]),
                 m_pay("ip6", "nexthdr", "tcp"),
@@ -278,7 +278,7 @@ class Network(unittest.TestCase):
             ], "drop"),
             rule_row("bridge", "r2_forward", 14, "dns-udp", [
                 m_meta("iifname", PORTS["b"]), m_meta("oifname", PORTS["c"]),
-                m_pay("ether", "saddr", b_mac), m_pay("ether", "daddr", c_mac),
+                m_pay("ether", "daddr", c_mac), m_pay("ether", "saddr", b_mac),
                 m_pay("ether", "type", "ip"),
                 m_pay("ip", "saddr", b_ip), m_pay("ip", "daddr", c_ip),
                 m_pay("ip", "protocol", "udp"),
@@ -345,6 +345,120 @@ class Network(unittest.TestCase):
                 tampered[idx]["rule"]["expr"].insert(0, bad_expr)
                 with self.assertRaisesRegex(Refusal, "nft-"):
                     isolation.read_counters(tampered, subset, family, TABLE)
+
+    def test_policy_dual_mac_bridge_rules_emit_daddr_before_saddr_and_reject_reversed_readback(self):
+        graph = isolation.policy(BRIDGE, PORTS)
+        dual_mac_labels = set()
+        arp_labels = set()
+        for _chain, (_hook, rules) in graph["bridge"].items():
+            for label, predicate, _verdict in rules:
+                has_daddr = "ether daddr " in predicate
+                has_saddr = "ether saddr " in predicate
+                if has_daddr and has_saddr:
+                    dual_mac_labels.add(label)
+                    self.assertLess(
+                        predicate.index("ether daddr "),
+                        predicate.index("ether saddr "),
+                        f"{label} must emit ether daddr before ether saddr",
+                    )
+                elif label.startswith("arp-"):
+                    arp_labels.add(label)
+                    self.assertTrue(has_saddr and not has_daddr, f"{label} must retain single ether saddr")
+        self.assertEqual(
+            dual_mac_labels,
+            {
+                "peer", "peer-return", "enrollment", "enrollment-return", "build", "build-return",
+                "forbidden", "stray-outside", "link-local", "ipv6", "dns-tcp", "dns-udp",
+                "synthetic-local", "outside-to-host",
+            },
+        )
+        self.assertEqual(len(arp_labels), 6)
+
+        # Reversed ether saddr before ether daddr in nft JSON readback must fail with nft-match-drift.
+        b_ip, b_mac = NETWORK["nodes"]["b"]
+        a_ip, a_mac = NETWORK["nodes"]["a"]
+        peer_source = next(src for label, src, _ in graph["bridge"]["r2_forward"][1] if label == "peer")
+        reversed_exprs = [
+            {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": PORTS["b"]}},
+            {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": PORTS["a"]}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "saddr"}}, "right": b_mac}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "daddr"}}, "right": a_mac}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "type"}}, "right": "ip"}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": b_ip}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": a_ip}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "protocol"}}, "right": "tcp"}},
+            {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 22171}},
+        ]
+        with self.assertRaisesRegex(Refusal, "^nft-match-drift$"):
+            isolation.rules_readback(reversed_exprs, peer_source, "bridge")
+
+    def test_bridge_meta_protocol_dependencies_accepted_for_matching_ip_and_rejected_otherwise(self):
+        graph = isolation.policy(BRIDGE, PORTS)
+        b_ip, b_mac = NETWORK["nodes"]["b"]
+        a_ip, a_mac = NETWORK["nodes"]["a"]
+        c_ip, c_mac = NETWORK["nodes"]["c"]
+        local_ip, _ = NETWORK["local"]
+
+        def m_meta(key, value):
+            return {"match": {"op": "==", "left": {"meta": {"key": key}}, "right": value}}
+
+        def m_pay(proto, field, value):
+            return {"match": {"op": "==", "left": {"payload": {"protocol": proto, "field": field}}, "right": value}}
+
+        forward_map = {label: src for label, src, _ in graph["bridge"]["r2_forward"][1]}
+        inet_local_source = next(src for label, src, _ in graph["inet"]["r2_input"][1] if label == "local")
+
+        peer_with_meta_proto = [
+            m_meta("iifname", PORTS["b"]), m_meta("oifname", PORTS["a"]),
+            m_pay("ether", "daddr", a_mac), m_pay("ether", "saddr", b_mac),
+            m_meta("protocol", "ip"),
+            m_pay("ip", "saddr", b_ip), m_pay("ip", "daddr", a_ip),
+            m_pay("ip", "protocol", "tcp"),
+            m_pay("tcp", "dport", 22171),
+        ]
+        ipv6_with_meta_proto = [
+            m_meta("iifname", PORTS["b"]), m_meta("oifname", PORTS["c"]),
+            m_pay("ether", "daddr", c_mac), m_pay("ether", "saddr", b_mac),
+            m_meta("protocol", "ip6"),
+            m_pay("ip6", "saddr", "fd42:72::12"), m_pay("ip6", "daddr", NETWORK["ipv6"]),
+            m_pay("ip6", "nexthdr", "tcp"),
+            m_pay("tcp", "dport", 22174),
+        ]
+        arp_base = [
+            m_meta("iifname", PORTS["a"]), m_meta("oifname", PORTS["b"]),
+            m_pay("ether", "saddr", a_mac),
+            m_pay("ether", "type", "arp"),
+            m_pay("arp", "saddr ether", a_mac), m_pay("arp", "saddr ip", a_ip), m_pay("arp", "daddr ip", b_ip),
+        ]
+        catchall_base = [m_meta("iifname", PORTS["b"])]
+        inet_local_base = [
+            m_meta("iifname", BRIDGE),
+            m_meta("nfproto", "ipv4"),
+            m_pay("ip", "saddr", b_ip), m_pay("ip", "daddr", local_ip),
+            m_meta("l4proto", "tcp"),
+            m_pay("tcp", "dport", 22174),
+        ]
+
+        # Accepted for matching bridge IP and IPv6 rules.
+        isolation.rules_readback(peer_with_meta_proto, forward_map["peer"], "bridge")
+        isolation.rules_readback(ipv6_with_meta_proto, forward_map["ipv6"], "bridge")
+
+        # Rejected on wrong-protocol, wrong-family, duplicate, or catch-all rules.
+        for label, exprs, source, family in (
+            ("ip6-meta-on-ip", [m_meta("protocol", "ip6"), *peer_with_meta_proto], forward_map["peer"], "bridge"),
+            ("ip-meta-on-ip6", [m_meta("protocol", "ip"), *ipv6_with_meta_proto], forward_map["ipv6"], "bridge"),
+            ("ip-meta-on-arp", [m_meta("protocol", "ip"), *arp_base], forward_map["arp-a-b"], "bridge"),
+            ("ip6-meta-on-arp", [m_meta("protocol", "ip6"), *arp_base], forward_map["arp-a-b"], "bridge"),
+            ("ip-meta-on-inet", [m_meta("protocol", "ip"), *inet_local_base], inet_local_source, "inet"),
+            ("ip6-meta-on-inet", [m_meta("protocol", "ip6"), *inet_local_base], inet_local_source, "inet"),
+            ("duplicate-ip-meta", [m_meta("protocol", "ip"), *peer_with_meta_proto], forward_map["peer"], "bridge"),
+            ("duplicate-ip6-meta", [m_meta("protocol", "ip6"), *ipv6_with_meta_proto], forward_map["ipv6"], "bridge"),
+            ("ip-meta-on-catchall", [m_meta("protocol", "ip"), *catchall_base], forward_map["forward-in-b"], "bridge"),
+            ("ip6-meta-on-catchall", [m_meta("protocol", "ip6"), *catchall_base], forward_map["forward-in-b"], "bridge"),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(Refusal, "nft-"):
+                    isolation.rules_readback(exprs, source, family)
 
     def test_counter_requires_allow_and_deny_hits_with_same_handles(self):
         graph = isolation.policy(BRIDGE, PORTS)
