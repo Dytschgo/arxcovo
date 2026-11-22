@@ -777,11 +777,12 @@ class LiveCampaign(unittest.TestCase):
         return struct.pack(">QQQ", term, leader, index) + bytes([tag])*32
 
     @staticmethod
-    def ledger_reply(node, *, status=None, membership=(5, 1, 10), applied=(5, 1, 16)):
+    def ledger_reply(node, *, status=None, epoch=(5, 1), membership=(5, 1, 10), applied=(5, 1, 16)):
+        leader = node == epoch[1]
         if status is None:
-            status = 5 if node == 1 else 3
-        raw = bytes((1, status, 1 if node == 1 else 2, int(node != 1)))
-        raw += struct.pack(">QQQ", node, 5, 1) + b"install-secret!" + bytes([node])
+            status = 5 if leader else 3
+        raw = bytes((1, status, 1 if leader else 2, int(node != 1)))
+        raw += struct.pack(">QQQ", node, *epoch) + b"install-secret!" + bytes([node])
         raw += bytes([16])*16 + b"key-digest-secret!".ljust(32, b"k")
         return raw + struct.pack(">QQQQQQQQQ", *membership, *applied, 1, 2, 3)
 
@@ -909,32 +910,46 @@ class LiveCampaign(unittest.TestCase):
         campaign = self.ledger_campaign()
         status, receipts = campaign.status.copy(), campaign.receipts.copy()
         end = 2 * run.LEDGER_BACKOFF
-        replies = [self.ledger_reply(1), self.ledger_reply(2, status=2), self.ledger_reply(2), self.ledger_reply(3)]
+        replies = [self.ledger_reply(1), self.ledger_reply(2, status=2), self.ledger_reply(3),
+                   self.ledger_reply(2, applied=(5, 1, 17))]
         with self.ledger_observation(campaign, replies) as (owner, pause, clock):
             self.assertEqual(campaign.observe("before_loss", "abc", end), (5, 1))
         self.assertLess(clock.now, end)
         pause.assert_called_once_with(run.LEDGER_BACKOFF)
         payload = run.ledger_slots(receipts)
-        self.assertEqual(owner.call_args_list, [call(node, "owner-ledger", 18, 164, end, payload) for node in "abbc"])
+        self.assertEqual(owner.call_args_list, [call(node, "owner-ledger", 18, 164, end, payload) for node in "abcb"])
         self.assertEqual(campaign.receipts, receipts)
         self.assertEqual(campaign.status, status)
         diagnostic = campaign.ledger_diagnostic["before_loss"]["b"]
         self.assertEqual(diagnostic["retries"], 1)
         self.assertEqual(diagnostic["first"]["predicate"], "peer-status")
-        self.assertEqual(campaign.checkpoints["before_loss"]["applied"]["b"], (5, 1, 16))
+        self.assertEqual(campaign.checkpoints["before_loss"]["applied"]["b"], (5, 1, 17))
+
+    def test_ledger_retries_every_peer_and_skips_a_node_once_it_recovers(self):
+        campaign = self.ledger_campaign()
+        peer_c = self.ledger_reply(3, status=2)
+        replies = [self.ledger_reply(1), self.ledger_reply(2, status=2), peer_c,
+                   self.ledger_reply(2), peer_c, self.ledger_reply(3)]
+        with self.ledger_observation(campaign, replies) as (owner, pause, _):
+            self.assertEqual(campaign.observe("before_loss", "abc", 1), (5, 1))
+        self.assertEqual([entry.args[0] for entry in owner.call_args_list], list("abcbcc"))
+        self.assertEqual(pause.call_args_list, [call(run.LEDGER_BACKOFF)] * 2)
+        diagnostic = campaign.ledger_diagnostic["before_loss"]
+        self.assertEqual({node: row["retries"] for node, row in diagnostic.items()}, {"b": 1, "c": 2})
 
     def test_persistent_ledger_peer_stops_at_deadline_or_retry_limit(self):
         for end, retries in ((1.5 * run.LEDGER_BACKOFF, 1), (60, run.LEDGER_RETRIES)):
             with self.subTest(end=end):
                 campaign = self.ledger_campaign()
                 peer = self.ledger_reply(2, status=2)
-                with self.ledger_observation(campaign, [self.ledger_reply(1)] + [peer] * (retries + 1)) as (
+                replies = [self.ledger_reply(1), peer, self.ledger_reply(3)] + [peer] * retries
+                with self.ledger_observation(campaign, replies) as (
                     owner, pause, clock
                 ), self.assertRaisesRegex(fixture.Refusal, "^ledger-checkpoint$"):
                     campaign.observe("before_loss", "abc", end)
                 self.assertLess(clock.now, end)
                 self.assertEqual(pause.call_count, retries)
-                self.assertEqual(owner.call_count, retries + 2)
+                self.assertEqual(owner.call_count, retries + 3)
                 diagnostic = campaign.ledger_diagnostic["before_loss"]["b"]
                 self.assertEqual(diagnostic["retries"], retries)
                 self.assertEqual(diagnostic["first"]["predicate"], "peer-status")
@@ -942,7 +957,7 @@ class LiveCampaign(unittest.TestCase):
         campaign = self.ledger_campaign()
         end = 2 * run.LEDGER_BACKOFF
         peer = self.ledger_reply(2, status=2)
-        with self.ledger_observation(campaign, [self.ledger_reply(1), peer]) as (owner, pause, clock):
+        with self.ledger_observation(campaign, [self.ledger_reply(1), peer, self.ledger_reply(3)]) as (owner, pause, clock):
             def oversleep(delay):
                 clock.now = end + delay
 
@@ -950,7 +965,7 @@ class LiveCampaign(unittest.TestCase):
             with self.assertRaisesRegex(fixture.Refusal, "^ledger-checkpoint$"):
                 campaign.observe("before_loss", "abc", end)
         self.assertGreater(clock.now, end)
-        self.assertEqual(owner.call_count, 2)
+        self.assertEqual(owner.call_count, 3)
         self.assertEqual(campaign.ledger_diagnostic["before_loss"]["b"]["first"]["predicate"], "peer-status")
 
     def test_ledger_other_predicates_fail_before_any_peer_retry(self):
@@ -994,14 +1009,62 @@ class LiveCampaign(unittest.TestCase):
                 self.assertEqual(diagnostic["retries"], 0)
                 self.assertEqual(diagnostic["first"]["predicate"], predicate)
 
+    def test_ledger_peer_duplicate_with_later_node_fails_before_replacing_reply(self):
+        campaign = self.ledger_campaign()
+        peer, voter = self.ledger_reply(2, status=2), self.ledger_reply(3)
+        duplicate = peer[:28] + voter[28:44] + peer[44:]
+        replies = {"a": iter([self.ledger_reply(1)]), "b": iter([duplicate, self.ledger_reply(2)]),
+                   "c": iter([voter])}
+        with self.ledger_observation(campaign, lambda node, *_: next(replies[node])) as (owner, pause, _), \
+             self.assertRaisesRegex(fixture.Refusal, "^ledger-consistency$"):
+            campaign.observe("before_loss", "abc", 1)
+        self.assertEqual([entry.args[0] for entry in owner.call_args_list], list("abc"))
+        pause.assert_not_called()
+        diagnostic = campaign.ledger_diagnostic["before_loss"]["c"]
+        self.assertEqual(diagnostic["retries"], 0)
+        self.assertEqual(diagnostic["first"]["predicate"], "unique-installation")
+
+    def test_ledger_peer_epoch_mismatch_fails_before_replacing_first_reply(self):
+        campaign = self.ledger_campaign()
+        campaign.receipts.extend([self.receipt(6, 3, 17, 15), self.receipt(6, 3, 18, 16)])
+        peer = self.ledger_reply(2, status=2, epoch=(6, 3), applied=(6, 3, 18))
+        later_b = self.ledger_reply(2, epoch=(7, 3), applied=(7, 3, 19))
+        later_c = self.ledger_reply(3, epoch=(7, 3), applied=(7, 3, 19))
+        campaign.identities = {"b": peer[28:92], "c": later_c[28:92]}
+        replies = {"b": iter([peer, later_b]), "c": iter([later_c])}
+        with self.ledger_observation(campaign, lambda node, *_: next(replies[node])) as (owner, pause, _), \
+             self.assertRaisesRegex(fixture.Refusal, "^ledger-consistency$"):
+            campaign.observe("during_loss", "bc", 1, after_term=5)
+        self.assertEqual([entry.args[0] for entry in owner.call_args_list], list("bc"))
+        pause.assert_not_called()
+        diagnostic = campaign.ledger_diagnostic["during_loss"]["c"]
+        self.assertEqual(diagnostic["retries"], 0)
+        self.assertEqual(diagnostic["first"]["predicate"], "shared-epoch")
+
+    def test_ledger_peer_reread_revalidates_against_complete_original_set(self):
+        campaign = self.ledger_campaign()
+        peer, voter = self.ledger_reply(2, status=2), self.ledger_reply(3)
+        recovered = self.ledger_reply(2)
+        duplicate = recovered[:28] + voter[28:44] + recovered[44:]
+        replies = [self.ledger_reply(1), peer, voter, duplicate]
+        with self.ledger_observation(campaign, replies) as (owner, pause, _), \
+             self.assertRaisesRegex(fixture.Refusal, "^ledger-consistency$"):
+            campaign.observe("before_loss", "abc", 1)
+        self.assertEqual([entry.args[0] for entry in owner.call_args_list], list("abcb"))
+        pause.assert_called_once_with(run.LEDGER_BACKOFF)
+        diagnostic = campaign.ledger_diagnostic["before_loss"]["b"]
+        self.assertEqual(diagnostic["retries"], 1)
+        self.assertEqual(diagnostic["first"]["predicate"], "peer-status")
+        self.assertEqual(diagnostic["last"]["predicate"], "unique-installation")
+
     def test_ledger_owner_refusal_after_peer_stops_without_another_retry(self):
         campaign = self.ledger_campaign()
         # The owner helper rejects a non-tag-18 reply before its body can be decoded.
-        replies = [self.ledger_reply(1), self.ledger_reply(2, status=2), fixture.Refusal("owner-reply")]
+        replies = [self.ledger_reply(1), self.ledger_reply(2, status=2), self.ledger_reply(3), fixture.Refusal("owner-reply")]
         with self.ledger_observation(campaign, replies) as (owner, pause, _), \
              self.assertRaisesRegex(fixture.Refusal, "^owner-reply$"):
             campaign.observe("before_loss", "abc", 1)
-        self.assertEqual(owner.call_count, 3)
+        self.assertEqual(owner.call_count, 4)
         pause.assert_called_once_with(run.LEDGER_BACKOFF)
         self.assertEqual(campaign.ledger_diagnostic["before_loss"]["b"]["retries"], 1)
 
@@ -1010,7 +1073,8 @@ class LiveCampaign(unittest.TestCase):
         campaign.resources.cleanup.return_value = ["unit-a2"]
         peer = self.ledger_reply(2, status=2)
         invalid = self.ledger_reply(2, applied=(2**64 - 1,) * 3)[:-1] + b"\x04"
-        with self.ledger_observation(campaign, [self.ledger_reply(1), peer, invalid]) as (owner, pause, _), \
+        replies = [self.ledger_reply(1), peer, self.ledger_reply(3), invalid]
+        with self.ledger_observation(campaign, replies) as (owner, pause, _), \
              patch.object(run, "checked_metadata", return_value=({"modules": {}}, None, None, None, None)), \
              patch.object(run, "Resources", return_value=campaign.resources), \
              patch.object(run, "stage", return_value={}), patch.object(run, "Campaign", return_value=campaign), \
@@ -1019,7 +1083,7 @@ class LiveCampaign(unittest.TestCase):
              ):
             result = run.live_run({}, 1001)
         pause.assert_called_once_with(run.LEDGER_BACKOFF)
-        self.assertEqual(owner.call_count, 3)
+        self.assertEqual(owner.call_count, 4)
         self.assertEqual(result["first"], {"phase": "build", "category": "ledger-checkpoint"})
         self.assertEqual(result["cleanup_errors"], ["unit-a2"])
         diagnostic = result["ledger_diagnostic"]["before_loss"]["b"]

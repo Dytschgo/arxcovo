@@ -853,40 +853,68 @@ class Campaign:
             self.receipts.append(raw[1:])
         ledger_slots(self.receipts)
 
-    def read_ledger(self, label, node, end, payload, validate):
-        diagnostic = None
-        for attempt in range(LEDGER_RETRIES + 1):
-            if diagnostic is not None:
-                diagnostic["retries"] = attempt
+    def read_ledger_set(self, label, nodes, end, validate, prepare=None):
+        payload = ledger_slots(self.receipts)
+        observations = {}
+        evidence_by_node = {}
+
+        def reject(node, predicate):
+            evidence = {**evidence_by_node[node], "predicate": predicate}
+            diagnostic = self.ledger_diagnostic.setdefault(label, {}).setdefault(
+                node, {"retries": 0, "first": evidence})
+            if evidence != diagnostic["first"]:
+                diagnostic["last"] = evidence
+            else:
+                diagnostic.pop("last", None)
+
+        def sample(node, sampled_nodes, original=None):
+            remaining(end)
+            if original is not None:
+                self.ledger_diagnostic[label][node]["retries"] += 1
             evidence = {}
+            evidence_by_node[node] = evidence
             try:
                 raw = self.owner(node, "owner-ledger", 18, 164, end, payload)
                 record = decode_ledger_checkpoint(raw, evidence)
-                validate(record)
-                # R7 has already proved the Mint slots. Retry only the lifecycle sample.
-                ledger_require(record["status"] != LEDGER_PEER, "peer-status")
-                remaining(end)
-                return record
+                validate({**observations, node: record}, sampled_nodes)
+                if original is not None:
+                    ledger_require(record["epoch"] == original["epoch"], "retry-epoch", "ledger-consistency")
+                    ledger_require(record["identity"] == original["identity"], "retry-installation",
+                                   "ledger-installation-drift")
             except LedgerRefusal as error:
-                evidence["predicate"] = error.predicate
-                # Keep only the first rejection and any different terminal rejection.
-                if diagnostic is None:
-                    diagnostic = {"retries": 0, "first": evidence}
-                    self.ledger_diagnostic.setdefault(label, {})[node] = diagnostic
-                if error.predicate == "peer-status" and attempt < LEDGER_RETRIES:
-                    if time.monotonic() + LEDGER_BACKOFF < end:
-                        time.sleep(LEDGER_BACKOFF)
-                        if time.monotonic() < end:
-                            continue
-                if evidence != diagnostic["first"]:
-                    diagnostic["last"] = evidence
+                reject(node, error.predicate)
                 raise
+            observations[node] = record
+
+        for index, node in enumerate(nodes):
+            if prepare is not None:
+                prepare(node)
+            sample(node, nodes[:index + 1])
+
+        # Every original reply has now passed the full checkpoint except for status.
+        original = observations.copy()
+        peers = [node for node in nodes if original[node]["status"] == LEDGER_PEER]
+        for node in peers:
+            reject(node, "peer-status")
+        for _ in range(LEDGER_RETRIES):
+            if not peers or time.monotonic() + LEDGER_BACKOFF >= end:
+                break
+            time.sleep(LEDGER_BACKOFF)
+            if time.monotonic() >= end:
+                break
+            for node in peers:
+                sample(node, nodes, original[node])
+                if observations[node]["status"] == LEDGER_PEER:
+                    reject(node, "peer-status")
+            peers = [node for node in peers if observations[node]["status"] == LEDGER_PEER]
+        ledger_require(not peers, "peer-status")
+        remaining(end)
+        return observations
 
     def observe(self, label, nodes, end, *, after_term=None, expected_epoch=None):
-        payload = ledger_slots(self.receipts)
-        observations = {}
         goal = position(self.receipts[-1][:24])
-        for index, node in enumerate(nodes):
+
+        def prepare(node):
             while True:
                 remaining(end)
                 try:
@@ -898,23 +926,21 @@ class Campaign:
                 else:
                     require(len(prefix) == 35 and prefix[:11] == b"ARXSM1\0\0\0\x03\x01", "applied-prefix")
                     if covers(position(prefix[11:35]), goal):
-                        break
+                        return
                 time.sleep(0.04)
-            def validate(record):
-                # Check consistency with every qualified observation before a retry is possible.
-                epoch, member_pos = check_checkpoint_set({**observations, node: record}, nodes[:index + 1],
-                                                         self.receipts, self.identities)
-                ledger_require(member_pos == self.membership[-1][0], "expected-membership",
-                               "ledger-membership-position")
-                if expected_epoch is not None:
-                    ledger_require(epoch == expected_epoch, "recovery-epoch", "recovery-epoch")
-                elif after_term is not None:
-                    ledger_require(epoch[0] > after_term, "survivor-term", "survivor-epoch")
-                    ledger_require(epoch[1] == goal[1], "survivor-leader", "survivor-epoch")
-                else:
-                    ledger_require(epoch[1] == 1, "founder-leader", "founder-leader-precondition")
 
-            observations[node] = self.read_ledger(label, node, end, payload, validate)
+        def validate(observations, sampled_nodes):
+            epoch, member_pos = check_checkpoint_set(observations, sampled_nodes, self.receipts, self.identities)
+            ledger_require(member_pos == self.membership[-1][0], "expected-membership", "ledger-membership-position")
+            if expected_epoch is not None:
+                ledger_require(epoch == expected_epoch, "recovery-epoch", "recovery-epoch")
+            elif after_term is not None:
+                ledger_require(epoch[0] > after_term, "survivor-term", "survivor-epoch")
+                ledger_require(epoch[1] == goal[1], "survivor-leader", "survivor-epoch")
+            else:
+                ledger_require(epoch[1] == 1, "founder-leader", "founder-leader-precondition")
+
+        observations = self.read_ledger_set(label, nodes, end, validate, prepare)
         epoch, member_pos = observations[nodes[0]]["epoch"], observations[nodes[0]]["member_pos"]
         if self.identities is None:
             self.identities = {node: row["identity"] for node, row in observations.items()}
@@ -932,14 +958,15 @@ class Campaign:
         self.pre_epoch = self.observe("before_loss", "abc", end)
 
     def recover(self, end):
-        def validate_held(held):
+        def validate_held(observations, nodes):
+            held = observations["a"]
             ledger_require(held["node"] == 1, "expected-member", "kill-epoch-drift")
             ledger_require(held["epoch"] == self.pre_epoch, "kill-epoch", "kill-epoch-drift")
             ledger_require(held["identity"] == self.identities["a"], "expected-installation", "kill-epoch-drift")
             ledger_require(held["member_pos"] == self.membership[-1][0], "expected-membership", "kill-epoch-drift")
-            check_checkpoint_set({"a": held}, "a", self.receipts, self.identities)
+            check_checkpoint_set(observations, nodes, self.receipts, self.identities)
 
-        self.read_ledger("pre_kill", "a", end, ledger_slots(self.receipts), validate_held)
+        self.read_ledger_set("pre_kill", "a", end, validate_held)
         images = [self.resources.root / name for name in ("root.ext4", "a.ext4")]
         original = [image_id(path) for path in images]
         quiescent_data(self.data("a"))
