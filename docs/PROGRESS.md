@@ -335,7 +335,9 @@
   4a guest, 4b1 recipe/seed, 4b2 stages, 4c durable build/reaper, 4d MCP, 4e optional
   hosted proof.
 - **PR #260 merged** as `3e00dbc5` (M4 PR 4a: contained Linux virtio script runner). Sol
-  6.2 high builder 0/3 (report SHA256 `ff27b655…7517`). Reviews HOLD `359f35f0…ea48`
+  6.2 high builder **1/3** (report SHA256 `ff27b655…7517`). The builder self-reported 0/3, but its
+  first Linux Clippy run failed on a missing `Debug` bound in test assertions. That is a build
+  failure outside the AGENTS.md exemptions, so the coordinator records it as counted. Reviews HOLD `359f35f0…ea48`
   (spawn stall, required CI blind to `cgroup.kill`), HOLD `970838fd…5741` (pre-exec stall
   kept the port open), HOLD `61697bf2…7b49` (`SIGCHLD=SIG_IGN` PID reuse), PASS
   `79cb3290…e911`, status `59607427748`. Scripts run as 65534 under `no_new_privs` in a
@@ -347,16 +349,19 @@
   first-boot account; installer residue), PASS `3f3d094c…ba30`, status `59609122872`.
   Unverified ISO and derived-asset pins make the recipe `recipe_unqualified`. Target
   cloud-init is disabled, so the template has no login account; installer logs copied
-  after late-commands are documented non-secret residue. A real offline install is
-  **unverified on real hardware**.
+  after late-commands are documented non-secret residue by construction (no credential
+  material in the inputs); inspecting those logs on a real offline install remains an open
+  acceptance item. A real offline install is **unverified on real hardware**.
 - **PR #262 merged** as `b1e3f19c` (guest: a fresh Hello resets the session). Sol 6.2 high
   builder 1/3 (report SHA256 `997fbbb0…0637`); review PASS `2a34f9bc…a175`, status
-  `59610038207`.
+  `59610038207`. Linux virtio reset and port reopen, the OVMF-to-Linux handoff, script
+  containment across a reset and end-to-end readiness are **unverified on real hardware**.
 - **M4 PR 4b2 in progress** (Ubuntu stage transitions and private runtime interface,
   fixture-backed) with a Sol 6.2 high builder.
 - **Intermittent C13.** PR #259 CI `45062459949` failed once in the hosted C13 activation
   campaign (`phase=join category=assertion message=mint-refused`, owner mint exit 8,
-  clean teardown), outside the diff; it has not recurred in nine later runs.
+  clean teardown), outside the diff; C13 then passed in 19 later runs through `830b9de7`
+  (one of them a workflow cancelled after C13 passed).
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
   relying on a summary. Reviewers are asked to classify activation-gate residuals and
   theoretical hardening as non-blocking P3. Long shell here-strings caused unanswerable delegate approval
