@@ -1,7 +1,15 @@
-//! Portable VM metadata and admission policy. Native runtime integration is a later slice.
+//! VM admission and confined runtime components. Native issuance is closed.
 mod controller;
+pub mod guest;
 mod model;
+pub mod paths;
 mod policy;
+pub mod qemu_args;
+pub mod qemu_img;
+pub mod qmp;
+pub mod runtime;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
 
 pub use controller::VmController;
 pub use model::*;

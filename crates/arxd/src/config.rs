@@ -9,6 +9,79 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+/// Candidate-only VM profile. The installed and foreground schemas stay closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmRuntimeProfile {
+    enabled: bool,
+    owner_sid: String,
+    supervisor_sid: String,
+    bundle: String,
+    volume: String,
+    state: String,
+    disk_ceiling_bytes: u64,
+    manifest: VmManifest,
+}
+
+#[derive(Deserialize)]
+enum VmManifest {
+    #[serde(rename = "qemu-11.1.3-windows-x64")]
+    Qemu1113WindowsX64,
+}
+
+impl VmRuntimeProfile {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        use crate::vm::paths::LocalPath;
+
+        if bytes.len() > 16_384 {
+            bail!("VM profile too large");
+        }
+        let profile: Self =
+            serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid VM profile"))?;
+        let invalid_path = |_| anyhow::anyhow!("invalid VM profile path");
+        let bundle = LocalPath::parse(&profile.bundle).map_err(invalid_path)?;
+        let volume = LocalPath::parse(&profile.volume).map_err(invalid_path)?;
+        let state = LocalPath::parse(&profile.state).map_err(invalid_path)?;
+        if !local_account_sid(&profile.owner_sid)
+            || !local_account_sid(&profile.supervisor_sid)
+            || profile.owner_sid == profile.supervisor_sid
+            || !volume.is_drive_root()
+            || state.is_drive_root()
+            || bundle.is_drive_root()
+            || !volume.contains(&state)
+            || volume.overlaps(&bundle)
+            || !(1..=crate::vm::VmPolicy::default().disk_cap).contains(&profile.disk_ceiling_bytes)
+        {
+            bail!("invalid VM profile");
+        }
+        Ok(profile)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn manifest_id(&self) -> &'static str {
+        match self.manifest {
+            VmManifest::Qemu1113WindowsX64 => "qemu-11.1.3-windows-x64",
+        }
+    }
+}
+
+fn local_account_sid(sid: &str) -> bool {
+    let Some(parts) = sid.strip_prefix("S-1-5-21-") else {
+        return false;
+    };
+    let mut parts = parts.split('-');
+    (0..4).all(|_| {
+        parts.next().is_some_and(|part| {
+            !part.starts_with('0')
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && part.parse::<u32>().is_ok_and(|n| n > 0)
+        })
+    }) && parts.next().is_none()
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
