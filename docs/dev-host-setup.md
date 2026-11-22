@@ -2,6 +2,27 @@
 
 Status: preparation only. No administrator changes or real VM tests have been performed by agents. Complete the account steps before dedicated-account host acceptance, and the remaining steps before milestone 4 VM acceptance. Keep the existing Lab Manager installation, state and `agent-windows-test` VM untouched.
 
+## Owner update 2026-11-23 (supersedes the dedicated-account steps below for this PC)
+
+Relayed by the babysitter on the owner's behalf.
+
+- **Execution account.** The owner's current login is the Windows host execution account, using ADR 0029 `current_user` execution. Elevated, admin and SYSTEM tokens are still refused. No separate Windows host account is created. Agents may create their own guest OS users inside VMs.
+- **Scoped install permission.** Agents verify the M4 host prerequisites read-only first. If something is missing, they may install or enable only: Windows Hypervisor Platform/WHPX, QEMU, and the `D:\ArxcovoData` disk cap and reserve settings.
+  - An interactive UAC step is recorded here with its exact command and asked of the owner once.
+  - Existing VMs, including Hyper-V `agent-windows-test`, and their hypervisor settings are never touched, stopped or reconfigured; changes are additive only.
+  - `D:\Code\LabManager` and its installed app and state stay untouched.
+- **Read-only verification, 2026-11-23, by the coordinator:**
+
+  | Check | Result |
+  | --- | --- |
+  | Login | `azuread\<owner>`. UAC-filtered: medium integrity, `BUILTIN\Administrators` deny-only, not elevated. Compatible with `current_user` execution. |
+  | Hypervisor | `HypervisorPresent=True`. `WinHvPlatform.dll` and `WinHvEmulation.dll` are present. `WHvGetCapability(HypervisorPresent)` returns 1, and the feature mask is `0x2FF`. **WHPX is usable from this login.** The optional-feature state query needs elevation and was not run. |
+  | QEMU | **Not installed.** The only `qemu-img.exe` on PATH belongs to the Android SDK emulator and is unrelated. The pinned QEMU 11.1.3 Windows x64 build with a binary receipt (ADR 0054) is still to be installed, by an agent under the scoped permission above. |
+  | Data folder | `D:\ArxcovoData` exists. Free space: C: 600.9 GB, D: 1569.3 GB. |
+  | CPU and RAM | 16 logical CPUs, 61.6 GB RAM. |
+
+  The disk cap and owner reserve are not yet configured.
+
 ## Owner actions
 
 - [ ] Create a dedicated local Windows account named `Arxcovo`, with account type **Standard user**. Keep its password out of chat, repository files and logs. ADR 0009 specifies S4U without collecting the account password; that mechanism remains unverified. A different mechanism requires a reviewed ADR, never an automatic password fallback. Do not add this account to Administrators or give it access to personal folders.

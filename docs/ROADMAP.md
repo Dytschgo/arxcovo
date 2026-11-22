@@ -1,15 +1,15 @@
 # Post-v1 roadmap
 
-Milestones 1–6 remain the v1 scope in KICKOFF.md. Later work, in order:
+Milestones 1–6 remain the v1 scope in KICKOFF.md. Owner amendment 2026-11-23 ([ADR 0058](adr/0058-v1-scope-static-vms-and-cloudflare.md)): static VMs (first target an Ubuntu web server) and Cloudflare Tunnel publishing (off by default, owner credential) moved into v1. Later work, in order:
 
 1. Linux hosts.
 2. WireGuard overlay.
-3. Static VMs, backups and maintenance updates.
+3. Backups and maintenance updates. Static VMs moved into v1 (ADR 0058); the agent no-delete fence for static VMs and backups applies now.
 4. Host board and warm migration.
 5. Mac hosts and macOS guests.
 6. Ephemeral GitHub runners.
 7. Agent spawning and encrypted secrets vault.
-8. Cloudflare exposure with public publishing off by default.
+8. Cloudflare exposure beyond the v1 tunnel publishing of ADR 0058.
 9. Signing and public release.
 
 ## Known issues / later release
