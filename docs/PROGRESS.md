@@ -2,11 +2,14 @@
 
 ## Current state (2026-11-22)
 
-- **Main and last merge.** PR #238 (M3 14b/C14) merged at `bb5ed691`.
-  Push CI `44956759543` passed all nine jobs in 514 s wall, 508 s charged.
+- **Main and last merge.** PR #244 merged at `a6979102`. Its first push CI
+  `44972860364` was in progress at this checkpoint. The preceding push CI
+  `44972022543` on `e40c8be9` passed in 523 s wall. PR #238 (M3 14b/C14)
+  merged at `bb5ed691`, and push CI `44956759543` passed all nine jobs in
+  514 s wall, 508 s charged.
   The Ubuntu Rust worker passed in 240 s, including C13, A10 and C14.
-  [Main CI](https://github.com/Dytschgo/arxcovo/actions/runs/44956759543)
-- **S2b re-pin.** PR #243 remains open at `fec67c4`. The Sol 6.2/high
+  [Latest main CI](https://github.com/Dytschgo/arxcovo/actions/runs/44972860364)
+- **S2b re-pin.** PR #243 merged at `e40c8be9` from `fec67c4`. The Sol 6.2/high
   independent review passed both axes and 27 targeted tests. All 12 hosted
   checks passed, including `native-evidence`, `ci-time-budget` and
   `agent-review` (status `59568005282`).
@@ -17,16 +20,20 @@
   The independent Sol 6.2/high review passed both axes, repeated all 37 local
   tests and verified the conservative 900/901 s wall-time boundary.
   All 11 hosted checks passed, including `agent-review` (status `59569158821`).
-  The completed Rust job reported Ubuntu 24.04.5, image `20261116.133.1`.
-  The owner kept both #243 and #244 merges with the Opus 5.5/high coordinator.
+  After #243 landed, GitHub required an updated base. Refreshed head `364964fb`
+  preserved both changed blobs, passed 27 independent workflow and policy
+  tests, received a fresh Sol 6.2/high `agent-review` pass (status
+  `59573312189`) and passed all 11 hosted checks. Both Linux Rust runs
+  reported Ubuntu 24.04.5, image `20261116.133.1`. The owner authorized Sol
+  6.2/high to finish these merges.
   [PR #244](https://github.com/Dytschgo/arxcovo/pull/244) ·
-  [Worker receipt](https://github.com/Dytschgo/arxcovo/actions/runs/44960089931/job/137016757854)
+  [Refreshed worker receipt](https://github.com/Dytschgo/arxcovo/actions/runs/44972183382/job/137054159821)
 - **M3 16a / R2 dry run.** The Sol 6.2/high builder retained the zero-daemon
   checkpoint locally at `b774204c` with 68 local tests passed and 1/3 counted
   attempts (Zig rejected the initial target spelling). The checkpoint expects
-  a 24.04 userland and refuses the prior worker's 26.04 inputs. It awaits an
-  integrated 24.04 worker and matching host pins. Dry-run containment and
-  timings are **unverified on hosted runner**.
+  a 24.04 userland and refuses the prior worker's 26.04 inputs. The 24.04 worker
+  has merged. R2 awaits green integrated CI and matching host pins. Dry-run
+  containment and timings are **unverified on hosted runner**.
 - **M3 16a / R7 ledger observer.** The Sol 6.2/high builder retained
   `bd250f04` at 1/3. The builder reported 880 filtered Windows tests and
   106 focused non-root Linux QEMU tests passed. Independent Sol 6.2/high review
@@ -43,8 +50,15 @@
   refusal from failed delivery and uses the R2 fixture endpoint. Formatting
   and diff checks passed. The single approved validation stopped at `E0034`
   on an ambiguous `chain` call in the new test before linking or running tests.
-  Follow-up allowance 1/1 used. R7 remains unpublished and held. The original
-  attempt count remains 3/3.
+  First follow-up allowance 1/1 used. Following the owner's instruction to
+  continue, Sol 6.2/high selected the async `chain` explicitly at `494c6f28`. The glibc 2.36
+  link, 12 focused non-root Linux QEMU tests and Linux all-targets Clippy
+  passed. The first emulator executable exited before guest boot. The packaged
+  test executable was unchanged for the successful run. Independent Sol
+  6.2/high review closed the reconnect objection and held both axes because
+  shutdown or expiry can still race the first private Mint proposal and tests
+  leave checkpoint composition and the proposal boundary uncovered. R7
+  remains unpublished. The original attempt count remains 3/3.
 - **Milestones.** M2 remains open for its owner-dependent acceptance and M3
   remains in progress. C16, installed service and native multi-host paths are
   **unverified on real hardware**.
