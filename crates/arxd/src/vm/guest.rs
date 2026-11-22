@@ -10,6 +10,15 @@ use tokio::{
     time::Instant,
 };
 
+/// Absolute budget, from the accepted startup `cont`, for the guest service
+/// to start and answer the boot's one fresh challenge. Fixed: no recipe,
+/// profile or caller can extend it.
+pub const GUEST_READY_BUDGET: Duration = Duration::from_secs(180);
+
+/// Once the first byte of a response arrives, the rest of that frame must
+/// arrive within this bound, inside any outer deadline.
+pub const FRAME_BOUND: Duration = Duration::from_secs(10);
+
 /// Protocol state for a single authenticated transport. The Windows adapter
 /// must verify the held server and this exact pipe handle before constructing it.
 pub struct GuestChannel<T> {
@@ -18,7 +27,15 @@ pub struct GuestChannel<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
+    /// Boot readiness. The v1 protocol is host-initiated: the guest service
+    /// reads exactly one `Hello` first and treats a second one as a protocol
+    /// error. So the host sends one fresh challenge and tolerates silence
+    /// until `GUEST_READY_BUDGET`. Until the guest opens its virtio-serial
+    /// port, QEMU leaves the frame unread in the host pipe, so a guest service
+    /// that starts late still receives this exact challenge. Only an ack that
+    /// echoes it is accepted; there is no retry and no reconnect.
     pub async fn handshake(mut transport: T, cancel: &Shutdown) -> Result<Self, ChannelError> {
+        let ready_by = Instant::now() + GUEST_READY_BUDGET;
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| ChannelError::Io)?;
         let challenge = hex::encode(random);
@@ -26,12 +43,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
             version: PROTOCOL_VERSION,
             challenge: challenge.clone(),
         };
-        let response = bounded(
-            cancel,
-            Instant::now() + Duration::from_secs(10),
-            exchange(&mut transport, &request),
-        )
-        .await?;
+        let response = bounded(cancel, ready_by, exchange(&mut transport, &request)).await?;
         if !matches!(response, Response::HelloAck {
             version: PROTOCOL_VERSION,
             challenge: echo,
@@ -116,17 +128,28 @@ async fn exchange(
         .await
         .map_err(|_| ChannelError::Io)?;
     transport.flush().await.map_err(|_| ChannelError::Io)?;
+    // Silence before the first byte is bounded only by the caller's deadline.
     let mut prefix = [0; 4];
     transport
-        .read_exact(&mut prefix)
+        .read_exact(&mut prefix[..1])
         .await
         .map_err(read_error)?;
-    let size = u32::from_be_bytes(prefix) as usize;
-    if !(1..=MAX_FRAME).contains(&size) {
-        return Err(ChannelError::Oversize);
-    }
-    frame.resize(size, 0);
-    transport.read_exact(&mut frame).await.map_err(read_error)?;
+    let frame_by = Instant::now() + FRAME_BOUND;
+    let rest = async {
+        transport
+            .read_exact(&mut prefix[1..])
+            .await
+            .map_err(read_error)?;
+        let size = u32::from_be_bytes(prefix) as usize;
+        if !(1..=MAX_FRAME).contains(&size) {
+            return Err(ChannelError::Oversize);
+        }
+        frame.resize(size, 0);
+        transport.read_exact(&mut frame).await.map_err(read_error)
+    };
+    tokio::time::timeout_at(frame_by, rest)
+        .await
+        .map_err(|_| ChannelError::Timeout)??;
     read_frame(&mut std::io::Read::chain(
         prefix.as_slice(),
         frame.as_slice(),

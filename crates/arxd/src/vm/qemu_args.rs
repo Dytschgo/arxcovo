@@ -1,7 +1,7 @@
 use super::{
     paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
     qemu_img::{CLUSTER, InvalidImage, inspect_header},
-    runtime::OfflineLease,
+    runtime::{NativeRefusal, OfflineLease},
 };
 use serde_json::{Value, json};
 
@@ -49,8 +49,10 @@ pub struct BootRecipe<'a> {
 /// What a sealed plan does. Only the validated builders in this module choose it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanKind {
-    /// The fixed QEMU recipe.
+    /// The fixed QEMU recipe for an installed disk.
     Boot,
+    /// The fixed QEMU recipe with installer media. Natively refused.
+    InstallerBoot,
     /// Read-only qemu-img inspection of the immutable golden image.
     Inspect,
     /// qemu-img inspection of a writable image, bound to an offline lease.
@@ -60,7 +62,9 @@ pub enum PlanKind {
 }
 
 enum Binding<'a> {
-    Boot,
+    Boot {
+        installer: bool,
+    },
     Inspect,
     Offline {
         lease: &'a OfflineLease,
@@ -90,7 +94,8 @@ impl<'a> CommandPlan<'a> {
 
     pub fn kind(&self) -> PlanKind {
         match self.binding {
-            Binding::Boot => PlanKind::Boot,
+            Binding::Boot { installer: false } => PlanKind::Boot,
+            Binding::Boot { installer: true } => PlanKind::InstallerBoot,
             Binding::Inspect => PlanKind::Inspect,
             Binding::Offline { mutate: false, .. } => PlanKind::InspectWritable,
             Binding::Offline { mutate: true, .. } => PlanKind::Mutate,
@@ -102,7 +107,19 @@ impl<'a> CommandPlan<'a> {
     pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
         match self.binding {
             Binding::Offline { lease, .. } => Some(lease),
-            Binding::Boot | Binding::Inspect => None,
+            Binding::Boot { .. } | Binding::Inspect => None,
+        }
+    }
+
+    /// The native launcher's first check, before any handle, Job or process
+    /// exists. An installer boot needs a phase the runtime does not provide
+    /// yet: no guest service runs during installation. Writable-image plans
+    /// return their lease, which the launcher keeps borrowed.
+    pub fn native_admission(&self) -> Result<Option<&'a OfflineLease>, NativeRefusal> {
+        match self.binding {
+            Binding::Boot { installer: true } => Err(NativeRefusal::InstallerPhaseUnavailable),
+            Binding::Boot { installer: false } | Binding::Inspect => Ok(None),
+            Binding::Offline { lease, .. } => Ok(Some(lease)),
         }
     }
 }
@@ -353,7 +370,9 @@ impl BootRecipe<'_> {
         Ok(CommandPlan {
             image,
             args,
-            binding: Binding::Boot,
+            binding: Binding::Boot {
+                installer: matches!(self.boot, BootPurpose::Installer(_)),
+            },
         })
     }
 }

@@ -7,7 +7,7 @@
 use super::{
     guest::GuestChannel,
     paths::{FileIdentity, LocalPath},
-    qemu_args::{CommandPlan, PlanKind, SerialName},
+    qemu_args::{CommandPlan, SerialName},
     qmp::Qmp,
     runtime::{
         FRESHNESS, LaunchAuthority, NativeRefusal, OfflineLease, StopDisposition, StopEvidence,
@@ -1763,16 +1763,9 @@ impl<'a> NativeLaunch<'a> {
         token: &VmToken,
         inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
-        // Writable-image plans carry their lease by construction; refuse otherwise.
-        let offline = match inputs.plan.kind() {
-            PlanKind::Mutate | PlanKind::InspectWritable => Some(
-                inputs
-                    .plan
-                    .offline_lease()
-                    .ok_or(NativeRefusal::QualificationMissing)?,
-            ),
-            PlanKind::Boot | PlanKind::Inspect => None,
-        };
+        // First, before any handle, Job or process: installer boots refuse,
+        // and writable-image plans yield the lease kept borrowed below.
+        let offline = inputs.plan.native_admission()?;
         let gate = std::sync::Arc::new(DispatchGate::default());
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
         let job = Job::new(inputs.memory, Some(inputs.cpu_rate))
@@ -2963,14 +2956,11 @@ mod tests {
         .expect("the input worker kept the child's stdin open");
     }
 
-    async fn still_pending(task: &tokio::task::JoinHandle<Result<(), NativeRefusal>>) {
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !task.is_finished(),
-            "boot decided before the worker finished its write"
-        );
+    /// Polls boot's settle future exactly once. `Pending` comes from the
+    /// future itself after it registered as a waiter on the gate state.
+    fn parks<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        future.poll(&mut context).is_pending()
     }
 
     #[test]
@@ -3023,11 +3013,14 @@ mod tests {
         assert!(matches!(io.gate.current(), Dispatch::Writing(_)));
         // Boot observes the acknowledgement now.
         let gate = io.gate.clone();
-        let boot = tokio::spawn(async move { gate.settle(BOUND).await });
-        still_pending(&boot).await;
+        let mut boot = Box::pin(async move { gate.settle(BOUND).await });
+        assert!(
+            parks(boot.as_mut()),
+            "boot decided before the worker finished its write"
+        );
         set_clock(&io.gate, base + FRESHNESS);
         release.send(()).unwrap();
-        assert_eq!(boot.await.unwrap(), Err(NativeRefusal::ReservesUnverified));
+        assert_eq!(boot.await, Err(NativeRefusal::ReservesUnverified));
         assert_eq!(io.gate.current(), Dispatch::Ambiguous);
         input_worker_exits(&io.workers).await;
         io.workers
@@ -3045,12 +3038,15 @@ mod tests {
         io.write.write_all(CONT).await.unwrap();
         parked.recv_timeout(BOUND).unwrap();
         let gate = io.gate.clone();
-        let boot = tokio::spawn(async move { gate.settle(BOUND).await });
-        still_pending(&boot).await;
+        let mut boot = Box::pin(async move { gate.settle(BOUND).await });
+        assert!(
+            parks(boot.as_mut()),
+            "boot decided before the worker finished its write"
+        );
         // Completed one tick before the deadline.
         set_clock(&io.gate, base + FRESHNESS - Duration::from_nanos(1));
         release.send(()).unwrap();
-        assert_eq!(boot.await.unwrap(), Ok(()));
+        assert_eq!(boot.await, Ok(()));
         assert_eq!(io.gate.current(), Dispatch::Idle);
         // After startup, later commands pass through untracked.
         *io.gate.test.checkpoint.lock().unwrap() = None;

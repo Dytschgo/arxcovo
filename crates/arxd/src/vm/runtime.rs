@@ -17,6 +17,9 @@ pub enum NativeRefusal {
     OwnerActivityUnverified,
     ReservesUnverified,
     NetworkFenceUnverified,
+    /// Installer boots need a QMP-only power-off observation and a
+    /// two-medium recipe from the follow-up runtime fence.
+    InstallerPhaseUnavailable,
 }
 
 pub enum NativeCapability {

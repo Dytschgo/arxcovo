@@ -3,7 +3,7 @@ use arxd::{
     config::{Config, VmRuntimeProfile},
     service::Shutdown,
     vm::{
-        guest::GuestChannel,
+        guest::{FRAME_BOUND, GUEST_READY_BUDGET, GuestChannel},
         paths::{Artifact, ArtifactRole, LocalPath},
         qemu_args::{BootPurpose, BootRecipe, NETWORK, PlanKind, SerialName},
         qemu_img,
@@ -432,7 +432,7 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
         vcpus: 2,
     };
     let plan = recipe.plan().unwrap();
-    assert_eq!(plan.kind(), PlanKind::Boot);
+    assert_eq!(plan.kind(), PlanKind::InstallerBoot);
     assert!(plan.offline_lease().is_none());
     let args = plan.args();
     let values = |key: &str| {
@@ -803,4 +803,172 @@ async fn guest_requires_current_echo_support_and_matching_request_id() {
         }
         fixture.await.unwrap();
     }
+}
+
+/// Answers the boot's single Hello after `delay`, echoing `challenge(echo)`.
+fn late_guest(
+    mut peer: DuplexStream,
+    delay: Duration,
+    echo: fn(String) -> String,
+) -> tokio::task::JoinHandle<DuplexStream> {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let Request::Hello { version, challenge } = guest_request(&mut peer).await else {
+            panic!("expected hello")
+        };
+        guest_reply(
+            &mut peer,
+            Response::HelloAck {
+                version,
+                challenge: echo(challenge),
+                script_execution: ScriptExecution::Available,
+            },
+        )
+        .await;
+        peer
+    })
+}
+
+/// The paused tokio clock is the injected clock: it only moves when every
+/// task is idle, so the budget is measured exactly and never by wall time.
+#[tokio::test(start_paused = true)]
+async fn guest_readiness_tolerates_a_late_service_within_the_fixed_budget() {
+    let cancel = Shutdown::default();
+    // Starts late but inside the budget: the buffered Hello is still the
+    // boot's one fresh challenge, and its echo is accepted.
+    let (host, peer) = duplex(4096);
+    let start = tokio::time::Instant::now();
+    let guest = late_guest(peer, GUEST_READY_BUDGET - Duration::from_secs(1), |c| c);
+    assert!(GuestChannel::handshake(host, &cancel).await.is_ok());
+    assert!(start.elapsed() >= GUEST_READY_BUDGET - Duration::from_secs(1));
+    guest.await.unwrap();
+
+    // Never starts: refused exactly at the budget, not before.
+    let (host, _silent) = duplex(4096);
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Timeout)
+    );
+    assert_eq!(start.elapsed(), GUEST_READY_BUDGET);
+
+    // Starts just after the budget: still refused at the budget.
+    let (host, peer) = duplex(4096);
+    let start = tokio::time::Instant::now();
+    let _late = late_guest(peer, GUEST_READY_BUDGET + Duration::from_secs(1), |c| c);
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Timeout)
+    );
+    assert_eq!(start.elapsed(), GUEST_READY_BUDGET);
+}
+
+#[tokio::test(start_paused = true)]
+async fn guest_readiness_refuses_stale_garbage_and_stalled_acks() {
+    let cancel = Shutdown::default();
+    // A stale ack carrying some other challenge, sent late in the window.
+    let (host, peer) = duplex(4096);
+    let _stale = late_guest(peer, Duration::from_secs(60), |_| "0".repeat(32));
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Unexpected)
+    );
+    // A replayed ack written before the Hello was ever read.
+    let (host, mut peer) = duplex(4096);
+    guest_reply(
+        &mut peer,
+        Response::HelloAck {
+            version: 1,
+            challenge: "f".repeat(32),
+            script_execution: ScriptExecution::Available,
+        },
+    )
+    .await;
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Unexpected)
+    );
+    // An oversized frame prefix.
+    let (host, mut peer) = duplex(4096);
+    peer.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Oversize)
+    );
+    // A well-sized frame that is not a valid response.
+    let (host, mut peer) = duplex(4096);
+    peer.write_all(&5u32.to_be_bytes()).await.unwrap();
+    peer.write_all(b"junk!").await.unwrap();
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Invalid)
+    );
+    // A frame that starts and then stalls is bounded by FRAME_BOUND, not
+    // by the remaining readiness budget.
+    let (host, mut peer) = duplex(4096);
+    let stall = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        peer.write_all(&[0]).await.unwrap();
+        peer
+    });
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        GuestChannel::handshake(host, &cancel).await.err(),
+        Some(ChannelError::Timeout)
+    );
+    assert_eq!(start.elapsed(), Duration::from_secs(30) + FRAME_BOUND);
+    drop(stall.await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn guest_readiness_stops_promptly_on_cancellation() {
+    let (host, _silent) = duplex(4096);
+    let cancel = Shutdown::default();
+    let waiting = cancel.clone();
+    let boot = tokio::spawn(async move { GuestChannel::handshake(host, &waiting).await.err() });
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let cancelled_at = tokio::time::Instant::now();
+    cancel.cancel();
+    assert_eq!(boot.await.unwrap(), Some(ChannelError::Cancelled));
+    // No virtual time passed between cancellation and the refusal.
+    assert_eq!(cancelled_at.elapsed(), Duration::ZERO);
+}
+
+#[test]
+fn installer_boots_are_refused_before_any_native_launch() {
+    use ArtifactRole::*;
+    let image = artifact(Qemu, "E:/bundle/qemu-system-x86_64.exe");
+    let data = artifact(Data, "E:/bundle/pc-bios");
+    let code = artifact(FirmwareCode, "E:/bundle/edk2-x86_64-code.fd");
+    let vars = artifact(Vars, "D:/vms/vars.fd");
+    let disk = artifact(GuestDisk, "D:/vms/current.qcow2");
+    let iso = artifact(InstallMedia, "E:/iso/installer.iso");
+    let serial = SerialName::generate().unwrap();
+    let header = qcow2_11_1_3(None);
+    let recipe = |boot| BootRecipe {
+        image: &image,
+        data: &data,
+        firmware: &code,
+        vars: &vars,
+        disk: &disk,
+        disk_header: &header,
+        backing: None,
+        backing_header: None,
+        serial: &serial,
+        boot,
+        ram_mib: 2048,
+        vcpus: 2,
+    };
+    let installer = recipe(BootPurpose::Installer(&iso));
+    let plan = installer.plan().unwrap();
+    assert_eq!(plan.kind(), PlanKind::InstallerBoot);
+    // The launcher's first check refuses before any handle, Job or process.
+    assert_eq!(
+        plan.native_admission().err(),
+        Some(NativeRefusal::InstallerPhaseUnavailable)
+    );
+    let installed = recipe(BootPurpose::Installed);
+    let plan = installed.plan().unwrap();
+    assert_eq!(plan.kind(), PlanKind::Boot);
+    assert!(plan.native_admission().is_ok_and(|lease| lease.is_none()));
 }
