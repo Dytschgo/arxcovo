@@ -23,6 +23,8 @@ pub enum ChannelError {
     Unexpected,
     Remote,
     Closed,
+    /// The caller's live resource revalidation refused the transition.
+    Refused,
 }
 
 pub(super) async fn bounded<T>(
@@ -298,8 +300,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
         Ok(status)
     }
 
-    /// The caller rechecks native resources before this one-time release.
-    pub async fn release_startup_hold(&mut self, cancel: &Shutdown) -> Result<(), ChannelError> {
+    /// One-time release of the `-S` hold. `revalidate` runs after the
+    /// prelaunch status receipt and before `cont`; `false` sends no `cont`
+    /// and closes the channel.
+    pub async fn release_startup_hold(
+        &mut self,
+        cancel: &Shutdown,
+        revalidate: impl FnOnce() -> bool,
+    ) -> Result<(), ChannelError> {
         let mut stream = self.stream.take().ok_or(ChannelError::Closed)?;
         if self.started {
             return Err(ChannelError::Unexpected);
@@ -311,6 +319,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
                 serde_json::from_value(result).map_err(|_| ChannelError::Invalid)?;
             if status.running || status.status != RunStatus::Prelaunch || events.guest_shutdown {
                 return Err(ChannelError::Unexpected);
+            }
+            if !revalidate() {
+                return Err(ChannelError::Refused);
             }
             empty(stream.command(Command::Continue, &mut events).await?)?;
             if events.guest_shutdown {

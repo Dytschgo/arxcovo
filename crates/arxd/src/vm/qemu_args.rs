@@ -1,4 +1,7 @@
-use super::paths::{Artifact, ArtifactRole, InvalidPath, LocalPath};
+use super::{
+    paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
+    runtime::OfflineLease,
+};
 use serde_json::{Value, json};
 
 pub const QEMU_VERSION: &str = "11.1.3";
@@ -38,9 +41,101 @@ pub struct BootRecipe<'a> {
     pub vcpus: u32,
 }
 
+/// What a sealed plan does. Only the typed builders in this module choose it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanKind {
+    /// The fixed QEMU recipe.
+    Boot,
+    /// Read-only qemu-img inspection of a trusted artifact.
+    Inspect,
+    /// Mutating qemu-img operation, bound to a borrowed offline lease.
+    Mutate,
+}
+
+enum Binding<'a> {
+    Boot,
+    Inspect,
+    Mutate(&'a OfflineLease),
+}
+
+/// A sealed program image and argv. The fields are private and the only
+/// constructors are this module's operation-specific builders, so no caller
+/// can construct, extend or edit the argv the native launcher consumes.
 pub struct CommandPlan<'a> {
-    pub image: &'a LocalPath,
-    pub args: Vec<String>,
+    image: &'a LocalPath,
+    args: Vec<String>,
+    binding: Binding<'a>,
+}
+
+impl<'a> CommandPlan<'a> {
+    pub fn image(&self) -> &'a LocalPath {
+        self.image
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn kind(&self) -> PlanKind {
+        match self.binding {
+            Binding::Boot => PlanKind::Boot,
+            Binding::Inspect => PlanKind::Inspect,
+            Binding::Mutate(_) => PlanKind::Mutate,
+        }
+    }
+
+    /// Present exactly for mutating plans; the launcher keeps it borrowed.
+    pub fn offline_lease(&self) -> Option<&'a OfflineLease> {
+        match self.binding {
+            Binding::Mutate(lease) => Some(lease),
+            Binding::Boot | Binding::Inspect => None,
+        }
+    }
+}
+
+/// Fixed read-only `qemu-img info` of an already role-checked image.
+pub(super) fn qemu_img_info<'a>(image: &'a LocalPath, disk: &LocalPath) -> CommandPlan<'a> {
+    CommandPlan {
+        image,
+        args: ["info", "--output=json", "-f", "qcow2", disk.as_str()]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        binding: Binding::Inspect,
+    }
+}
+
+/// Fixed `qemu-img create` on a staging role. Requires the offline lease.
+pub(super) fn qemu_img_create<'a>(
+    lease: &'a OfflineLease,
+    image: &'a LocalPath,
+    staging: &LocalPath,
+    backing: Option<&LocalPath>,
+    size: u64,
+) -> CommandPlan<'a> {
+    let mut args = [
+        "create",
+        "-f",
+        "qcow2",
+        "-o",
+        "compat=1.1,cluster_size=65536,lazy_refcounts=off",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if let Some(backing) = backing {
+        args.extend([
+            "-F".into(),
+            "qcow2".into(),
+            "-b".into(),
+            backing.as_str().into(),
+        ]);
+    }
+    args.extend([staging.as_str().into(), size.to_string()]);
+    CommandPlan {
+        image,
+        args,
+        binding: Binding::Mutate(lease),
+    }
 }
 
 impl BootRecipe<'_> {
@@ -140,7 +235,11 @@ impl BootRecipe<'_> {
                 "ide-cd,drive=installer,bus=ide.0,bootindex=1".into(),
             ]);
         }
-        Ok(CommandPlan { image, args })
+        Ok(CommandPlan {
+            image,
+            args,
+            binding: Binding::Boot,
+        })
     }
 }
 

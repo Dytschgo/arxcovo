@@ -1,6 +1,6 @@
 use super::{
     paths::{Artifact, ArtifactRole, InvalidPath, LocalPath},
-    qemu_args::CommandPlan,
+    qemu_args::{self, CommandPlan},
     runtime::OfflineLease,
 };
 use serde::Deserialize;
@@ -98,23 +98,14 @@ fn info<'a>(
     disk: &Artifact,
     disk_role: ArtifactRole,
 ) -> Result<CommandPlan<'a>, InvalidImage> {
-    Ok(CommandPlan {
-        image: role(image, ArtifactRole::QemuImg)?,
-        args: [
-            "info",
-            "--output=json",
-            "-f",
-            "qcow2",
-            role(disk, disk_role)?.as_str(),
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-    })
+    Ok(qemu_args::qemu_img_info(
+        role(image, ArtifactRole::QemuImg)?,
+        role(disk, disk_role)?,
+    ))
 }
 
 pub fn create<'a>(
-    _lease: &OfflineLease,
+    lease: &'a OfflineLease,
     image: &'a Artifact,
     staging: &Artifact,
     backing: Option<&Artifact>,
@@ -128,31 +119,16 @@ pub fn create<'a>(
     if size == 0 || peak.is_none_or(|peak| peak > ceiling) {
         return Err(InvalidImage);
     }
-    let mut args = [
-        "create",
-        "-f",
-        "qcow2",
-        "-o",
-        "compat=1.1,cluster_size=65536,lazy_refcounts=off",
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    if let Some(backing) = backing {
-        args.extend([
-            "-F".into(),
-            "qcow2".into(),
-            "-b".into(),
-            role(backing, ArtifactRole::Golden)?.as_str().into(),
-        ]);
-    }
-    args.extend([
-        role(staging, ArtifactRole::Staging)?.as_str().into(),
-        size.to_string(),
-    ]);
-    Ok(CommandPlan {
-        image: role(image, ArtifactRole::QemuImg)?,
-        args,
-    })
+    let backing = backing
+        .map(|artifact| role(artifact, ArtifactRole::Golden))
+        .transpose()?;
+    Ok(qemu_args::qemu_img_create(
+        lease,
+        role(image, ArtifactRole::QemuImg)?,
+        role(staging, ArtifactRole::Staging)?,
+        backing,
+        size,
+    ))
 }
 
 fn role(artifact: &Artifact, role: ArtifactRole) -> Result<&LocalPath, InvalidImage> {

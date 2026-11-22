@@ -5,7 +5,7 @@ use arxd::{
     vm::{
         guest::GuestChannel,
         paths::{Artifact, ArtifactRole, LocalPath},
-        qemu_args::{BootPurpose, BootRecipe, NETWORK, SerialName},
+        qemu_args::{BootPurpose, BootRecipe, NETWORK, PlanKind, SerialName},
         qemu_img,
         qmp::{ChannelError, Qmp, RunStatus},
         runtime::{
@@ -243,7 +243,10 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
         ram_mib: 4096,
         vcpus: 2,
     };
-    let args = recipe.plan().unwrap().args;
+    let plan = recipe.plan().unwrap();
+    assert_eq!(plan.kind(), PlanKind::Boot);
+    assert!(plan.offline_lease().is_none());
+    let args = plan.args();
     let values = |key: &str| {
         args.windows(2)
             .filter(|pair| pair[0] == key)
@@ -280,6 +283,36 @@ fn qemu_has_one_restricted_network_and_explicit_block_and_monitor_roles() {
     }
     recipe.backing = Some(&disk);
     assert!(recipe.plan().is_err());
+}
+
+/// `CommandPlan` has private fields and no public constructor, so argv can
+/// come only from these builders; the accessors are read-only views.
+#[test]
+fn sealed_plans_expose_read_only_argv_and_a_fixed_kind() {
+    let tool = artifact(ArtifactRole::QemuImg, "E:/bundle/qemu-img.exe");
+    let golden = artifact(ArtifactRole::Golden, "D:/test_vms/golden.qcow2");
+    let mut header = vec![0; 65_536];
+    header[..4].copy_from_slice(b"QFI\xfb");
+    for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 104)] {
+        header[at..at + 4].copy_from_slice(&val.to_be_bytes());
+    }
+    header[24..32].copy_from_slice(&1_048_576u64.to_be_bytes());
+    let plan = qemu_img::golden_info(&tool, &golden, &header).unwrap();
+    assert_eq!(plan.kind(), PlanKind::Inspect);
+    assert!(plan.offline_lease().is_none());
+    assert_eq!(plan.image().as_str(), r"E:\bundle\qemu-img.exe");
+    assert_eq!(
+        plan.args(),
+        [
+            "info",
+            "--output=json",
+            "-f",
+            "qcow2",
+            r"D:\test_vms\golden.qcow2"
+        ]
+    );
+    // A role mismatch yields no plan at all.
+    assert!(qemu_img::golden_info(&golden, &golden, &header).is_err());
 }
 
 #[test]
@@ -390,7 +423,7 @@ async fn qmp_correlates_fragmented_greeting_interleaved_events_and_shutdown() {
     });
     let cancel = Shutdown::default();
     let mut qmp = Qmp::handshake(read, write, &cancel).await.unwrap();
-    qmp.release_startup_hold(&cancel).await.unwrap();
+    qmp.release_startup_hold(&cancel, || true).await.unwrap();
     assert_eq!(qmp.status(&cancel).await, Ok(RunStatus::Running));
     qmp.powerdown(&cancel).await.unwrap();
     fixture.await.unwrap();
@@ -415,10 +448,53 @@ async fn qmp_shutdown_is_bounded_and_host_reset_is_not_guest_shutdown() {
     });
     let cancel = Shutdown::default();
     let mut qmp = Qmp::handshake(read, write, &cancel).await.unwrap();
-    qmp.release_startup_hold(&cancel).await.unwrap();
+    qmp.release_startup_hold(&cancel, || true).await.unwrap();
     assert_eq!(qmp.powerdown(&cancel).await, Err(ChannelError::Timeout));
     fixture.abort();
     assert!(fixture.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn qmp_revalidates_after_prelaunch_status_and_refusal_sends_no_cont() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (host, peer) = duplex(4096);
+    let (read, write) = split(host);
+    let status_sent = Arc::new(AtomicBool::new(false));
+    let sent = status_sent.clone();
+    let fixture = tokio::spawn(async move {
+        let mut peer = BufReader::new(peer);
+        hello(&mut peer).await;
+        command(&mut peer, "query-status", 2).await;
+        sent.store(true, Ordering::SeqCst);
+        record(
+            &mut peer,
+            json!({"return": {"status": "prelaunch", "running": false}, "id": 2}),
+        )
+        .await;
+        // A refusal closes the channel instead of sending `cont`.
+        let mut rest = String::new();
+        peer.read_line(&mut rest).await.unwrap();
+        rest
+    });
+    let cancel = Shutdown::default();
+    let mut qmp = Qmp::handshake(read, write, &cancel).await.unwrap();
+    let calls = Cell::new(0);
+    let released = qmp
+        .release_startup_hold(&cancel, || {
+            calls.set(calls.get() + 1);
+            // The sample is taken only after the prelaunch status receipt.
+            assert!(status_sent.load(Ordering::SeqCst));
+            false
+        })
+        .await;
+    assert_eq!(released, Err(ChannelError::Refused));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(qmp.status(&cancel).await, Err(ChannelError::Closed));
+    drop(qmp);
+    assert_eq!(fixture.await.unwrap(), "", "`cont` reached the peer");
 }
 
 #[tokio::test]

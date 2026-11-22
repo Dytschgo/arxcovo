@@ -7,9 +7,9 @@
 use super::{
     guest::GuestChannel,
     paths::{FileIdentity, LocalPath},
-    qemu_args::{CommandPlan, SerialName},
+    qemu_args::{CommandPlan, PlanKind, SerialName},
     qmp::Qmp,
-    runtime::{LaunchAuthority, NativeRefusal, StopDisposition, StopEvidence},
+    runtime::{LaunchAuthority, NativeRefusal, OfflineLease, StopDisposition, StopEvidence},
 };
 use crate::{security::vm_acl, service::Shutdown};
 use std::{
@@ -479,52 +479,125 @@ fn wait(handle: &impl AsRawHandle, millis: u32) -> io::Result<bool> {
     }
 }
 
-enum LaunchToken<'a> {
-    Restricted(&'a OwnedHandle),
+/// The only argv sources. Production launches take a sealed `CommandPlan`
+/// under the restricted token; tests may re-execute their own binary.
+enum Launch<'a> {
+    Restricted {
+        token: &'a OwnedHandle,
+        plan: &'a CommandPlan<'a>,
+    },
     #[cfg(test)]
-    Fixture,
+    Fixture { image: &'a Path, args: &'a [String] },
+}
+
+/// Creation-time Job assignment. Every production launch names one Job.
+enum Assignment<'a> {
+    Job(&'a Job),
+    /// Test-only control that isolates the Job-list attribute when an outer
+    /// runner Job may refuse nesting. It never resumes the created process.
+    #[cfg(test)]
+    ControlWithoutJob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpawnStage {
+    Recipe,
+    Attributes,
+    Create,
+    Verify,
+}
+
+#[derive(Debug)]
+struct SpawnError {
+    stage: SpawnStage,
+    error: io::Error,
+}
+
+fn at(stage: SpawnStage) -> impl FnOnce(io::Error) -> SpawnError {
+    move |error| SpawnError { stage, error }
 }
 
 fn spawn(
-    image: &Path,
-    args: &[String],
+    launch: Launch<'_>,
     cwd: &Path,
     environment: &[u16],
-    token: LaunchToken<'_>,
     job: Job,
     stdio: Stdio,
-) -> io::Result<Child> {
+) -> Result<Child, SpawnError> {
+    let (process, thread) =
+        create_suspended(&launch, cwd, environment, Assignment::Job(&job), &stdio)?;
+    let child = Child {
+        job,
+        process,
+        suspended: Some(thread),
+    };
+    child.verify_live().map_err(at(SpawnStage::Verify))?;
+    Ok(child)
+}
+
+fn create_suspended(
+    launch: &Launch<'_>,
+    cwd: &Path,
+    environment: &[u16],
+    assignment: Assignment<'_>,
+    stdio: &Stdio,
+) -> Result<(OwnedHandle, OwnedHandle), SpawnError> {
+    let (image, args): (&Path, &[String]) = match launch {
+        Launch::Restricted { plan, .. } => (Path::new(plan.image().as_str()), plan.args()),
+        #[cfg(test)]
+        Launch::Fixture { image, args } => (image, args),
+    };
+    let recipe = |message| SpawnError {
+        stage: SpawnStage::Recipe,
+        error: io::Error::other(message),
+    };
     if !image.is_absolute() || !cwd.is_absolute() || !environment.ends_with(&[0, 0]) {
-        return Err(io::Error::other("invalid launch recipe"));
+        return Err(recipe("invalid launch recipe"));
     }
     let image = wide(image);
     let cwd = wide(cwd);
     if image[..image.len() - 1].contains(&0) || cwd[..cwd.len() - 1].contains(&0) {
-        return Err(io::Error::other("invalid launch path"));
+        return Err(recipe("invalid launch path"));
     }
     let mut command = Vec::new();
-    quote_arg(&mut command, &image[..image.len() - 1])?;
+    quote_arg(&mut command, &image[..image.len() - 1]).map_err(at(SpawnStage::Recipe))?;
     for arg in args {
         command.push(b' ' as u16);
-        quote_arg(&mut command, &arg.encode_utf16().collect::<Vec<_>>())?;
+        quote_arg(&mut command, &arg.encode_utf16().collect::<Vec<_>>())
+            .map_err(at(SpawnStage::Recipe))?;
     }
     command.push(0);
     if command.len() > 32_767 {
-        return Err(io::Error::other("command line too long"));
+        return Err(recipe("command line too long"));
     }
     let handles = stdio.handles();
-    let jobs = [job.0.as_raw_handle()];
-    let mut attributes = Attributes::new()?;
+    let mut attributes = Attributes::new().map_err(at(SpawnStage::Attributes))?;
     for (index, handle) in handles.iter().copied().enumerate() {
         let mut flags = 0;
         // Verify the exact distinct child ends and their inheritance flags.
-        succeeded(unsafe { GetHandleInformation(handle, &mut flags) })?;
+        succeeded(unsafe { GetHandleInformation(handle, &mut flags) })
+            .map_err(at(SpawnStage::Attributes))?;
         if handles[..index].contains(&handle) || flags & HANDLE_FLAG_INHERIT == 0 {
-            return Err(io::Error::other("invalid inherited handle list"));
+            return Err(SpawnError {
+                stage: SpawnStage::Attributes,
+                error: io::Error::other("invalid inherited handle list"),
+            });
         }
     }
-    attributes.insert(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, &jobs)?;
-    attributes.insert(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &handles)?;
+    // The Job array outlives the attribute list, which is destroyed below.
+    let jobs = match assignment {
+        Assignment::Job(job) => Some([job.0.as_raw_handle()]),
+        #[cfg(test)]
+        Assignment::ControlWithoutJob => None,
+    };
+    if let Some(jobs) = &jobs {
+        attributes
+            .insert(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, jobs)
+            .map_err(at(SpawnStage::Attributes))?;
+    }
+    attributes
+        .insert(PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, &handles)
+        .map_err(at(SpawnStage::Attributes))?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -541,8 +614,8 @@ fn spawn(
         | CREATE_NO_WINDOW;
     // All arrays, command buffer, and attribute storage remain live for this call.
     succeeded(unsafe {
-        match token {
-            LaunchToken::Restricted(token) => CreateProcessAsUserW(
+        match launch {
+            Launch::Restricted { token, .. } => CreateProcessAsUserW(
                 token.as_raw_handle(),
                 image.as_ptr(),
                 command.as_mut_ptr(),
@@ -556,7 +629,7 @@ fn spawn(
                 &mut process,
             ),
             #[cfg(test)]
-            LaunchToken::Fixture => CreateProcessW(
+            Launch::Fixture { .. } => CreateProcessW(
                 image.as_ptr(),
                 command.as_mut_ptr(),
                 null(),
@@ -569,17 +642,15 @@ fn spawn(
                 &mut process,
             ),
         }
-    })?;
+    })
+    .map_err(at(SpawnStage::Create))?;
+    drop(attributes);
     // The kernel has created both handles and assigned the Job before any child instruction.
-    let child = unsafe {
-        Child {
-            job,
-            process: owned(process.hProcess)?,
-            suspended: Some(owned(process.hThread)?),
-        }
-    };
-    child.verify_live()?;
-    Ok(child)
+    let (process, thread) = unsafe { (owned(process.hProcess), owned(process.hThread)) };
+    Ok((
+        process.map_err(at(SpawnStage::Verify))?,
+        thread.map_err(at(SpawnStage::Verify))?,
+    ))
 }
 
 fn quote_arg(out: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
@@ -1350,34 +1421,47 @@ struct LaunchInputs<'a> {
     pins: Vec<PathPin>,
 }
 
-struct NativeLaunch {
+struct NativeLaunch<'a> {
     child: Child,
     workers: Option<WorkerSet>,
     _pins: Vec<PathPin>,
+    // A mutating qemu-img launch stays borrowed against its offline lease.
+    _offline: Option<&'a OfflineLease>,
 }
 
 type PipeQmp = Qmp<tokio::io::DuplexStream, tokio::io::DuplexStream>;
 type SerialGuest = GuestChannel<tokio::net::windows::named_pipe::NamedPipeClient>;
 
-impl NativeLaunch {
-    /// Shared entry for prepared QEMU and qemu-img recipes. There is no issuer
+impl<'a> NativeLaunch<'a> {
+    /// Shared entry for sealed QEMU and qemu-img plans. There is no issuer
     /// for LaunchAuthority in this slice.
     fn hold(
         _authority: &LaunchAuthority,
         token: &VmToken,
-        inputs: LaunchInputs<'_>,
+        inputs: LaunchInputs<'a>,
     ) -> Result<(Self, tokio::io::DuplexStream, tokio::io::DuplexStream), NativeRefusal> {
+        // A mutating plan carries its lease by construction; refuse otherwise.
+        let offline = match inputs.plan.kind() {
+            PlanKind::Mutate => Some(
+                inputs
+                    .plan
+                    .offline_lease()
+                    .ok_or(NativeRefusal::QualificationMissing)?,
+            ),
+            PlanKind::Boot | PlanKind::Inspect => None,
+        };
         let (stdio, parent) = token.stdio().map_err(|_| NativeRefusal::QmpUnverified)?;
         let job = Job::new(inputs.memory, Some(inputs.cpu_rate))
             .map_err(|_| NativeRefusal::JobUnverified)?;
         let environment = launch_environment(inputs.loader_root, inputs.scratch)
             .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
         let child = spawn(
-            Path::new(inputs.plan.image.as_str()),
-            &inputs.plan.args,
+            Launch::Restricted {
+                token: &token.token,
+                plan: &inputs.plan,
+            },
             Path::new(inputs.cwd.as_str()),
             &environment,
-            LaunchToken::Restricted(&token.token),
             job,
             stdio,
         )
@@ -1394,6 +1478,7 @@ impl NativeLaunch {
                 child,
                 workers: Some(workers),
                 _pins: inputs.pins,
+                _offline: offline,
             },
             read,
             write,
@@ -1407,12 +1492,9 @@ impl NativeLaunch {
         read: tokio::io::DuplexStream,
         write: tokio::io::DuplexStream,
         cancel: &Shutdown,
-        revalidate: impl FnOnce() -> Result<(), NativeRefusal>,
+        mut revalidate: impl FnMut() -> Result<(), NativeRefusal>,
     ) -> Result<(PipeQmp, SerialGuest), NativeRefusal> {
-        revalidate_before_resume(cancel, &self.child)?;
-        self.child
-            .resume()
-            .map_err(|_| NativeRefusal::JobUnverified)?;
+        self.child.resume_checked(cancel, &mut revalidate)?;
         // Workers are already draining. Do not await the QMP greeting while
         // QEMU may be waiting for a client at CreateNamedPipe/ConnectNamedPipe.
         let pipe = connect_serial(
@@ -1427,10 +1509,19 @@ impl NativeLaunch {
         let mut qmp = Qmp::handshake(read, write, cancel)
             .await
             .map_err(|_| NativeRefusal::QmpUnverified)?;
-        revalidate()?;
-        qmp.release_startup_hold(cancel)
-            .await
-            .map_err(|_| NativeRefusal::QmpUnverified)?;
+        // Resample between the prelaunch status receipt and `cont`, so guest
+        // execution never starts on a sample older than the freshness window.
+        let mut refused = None;
+        let released = qmp
+            .release_startup_hold(cancel, || match revalidate() {
+                Ok(()) => true,
+                Err(reason) => {
+                    refused = Some(reason);
+                    false
+                }
+            })
+            .await;
+        released.map_err(|_| refused.unwrap_or(NativeRefusal::QmpUnverified))?;
         let guest = GuestChannel::handshake(pipe, cancel)
             .await
             .map_err(|_| NativeRefusal::GuestEndpointUnverified)?;
@@ -1481,14 +1572,23 @@ impl Child {
     }
 }
 
-fn revalidate_before_resume(cancel: &Shutdown, child: &Child) -> Result<(), NativeRefusal> {
-    if cancel.is_cancelled() {
-        return Err(NativeRefusal::JobUnverified);
+impl Child {
+    /// Checks cancellation, the live held child and a fresh resource sample,
+    /// then releases the suspended thread. Nothing runs between the resource
+    /// check and `ResumeThread` except the held-child liveness recheck.
+    fn resume_checked(
+        &mut self,
+        cancel: &Shutdown,
+        revalidate: &mut dyn FnMut() -> Result<(), NativeRefusal>,
+    ) -> Result<(), NativeRefusal> {
+        if cancel.is_cancelled() {
+            return Err(NativeRefusal::JobUnverified);
+        }
+        self.verify_live()
+            .map_err(|_| NativeRefusal::JobUnverified)?;
+        revalidate()?;
+        self.resume().map_err(|_| NativeRefusal::JobUnverified)
     }
-    child
-        .verify_live()
-        .map(|_| ())
-        .map_err(|_| NativeRefusal::JobUnverified)
 }
 
 fn launch_environment(loader: &LocalPath, scratch: &LocalPath) -> io::Result<Vec<u16>> {
@@ -1622,28 +1722,52 @@ mod tests {
         let job = Job::new(256 * 1024 * 1024, None).unwrap();
         let image = std::env::current_exe().unwrap();
         let args = ["--exact", fixture, "--ignored", "--nocapture"].map(str::to_owned);
-        let result = spawn(
-            &image,
-            &args,
-            image.parent().unwrap(),
-            &fixture_environment(probe),
-            LaunchToken::Fixture,
-            job,
-            child_io,
-        );
-        match result {
+        let launch = Launch::Fixture {
+            image: &image,
+            args: &args,
+        };
+        let cwd = image.parent().unwrap();
+        let environment = fixture_environment(probe);
+        match spawn(launch, cwd, &environment, job, child_io) {
             Ok(child) => Some((child, parent_io)),
-            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-                let mut outer = 0;
-                // An existing runner Job can forbid nested Job creation.
-                succeeded(unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut outer) })
-                    .unwrap();
-                assert_ne!(outer, 0, "access denied without a runner Job");
-                eprintln!("{UNSUPPORTED}");
+            Err(SpawnError {
+                stage: SpawnStage::Create,
+                error,
+            }) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                classify_job_refusal(&image, &args, cwd, &environment);
                 None
             }
-            Err(error) => panic!("fixture launch failed: {error}"),
+            Err(SpawnError { stage, error }) => {
+                panic!("fixture launch failed at {stage:?}: {error}")
+            }
         }
+    }
+
+    /// Only an outer runner Job that refuses the creation-time Job-list
+    /// attribute is an unsupported case. The control repeats the identical
+    /// creation without that one attribute; any other denial is a failure.
+    fn classify_job_refusal(image: &Path, args: &[String], cwd: &Path, environment: &[u16]) {
+        let mut outer = 0;
+        // Query only the current process's own Job membership.
+        succeeded(unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut outer) }).unwrap();
+        assert_ne!(outer, 0, "access denied without an outer runner Job");
+        let (child_io, _parent_io) = fixture_stdio();
+        let control = Launch::Fixture { image, args };
+        let (process, _thread) = create_suspended(
+            &control,
+            cwd,
+            environment,
+            Assignment::ControlWithoutJob,
+            &child_io,
+        )
+        .unwrap_or_else(|failure| {
+            panic!("access denied is not specific to the Job list: {failure:?}")
+        });
+        // The suspended control never runs an instruction; discard it.
+        succeeded(unsafe { TerminateProcess(process.as_raw_handle(), 1) }).unwrap();
+        assert!(wait(&process, 2000).unwrap());
+        println!("SKIP vm-job-fixture: {UNSUPPORTED}");
+        eprintln!("SKIP vm-job-fixture: {UNSUPPORTED}");
     }
 
     #[test]
@@ -2093,7 +2217,8 @@ mod tests {
         let fields: Vec<&str> = report.split(' ').collect();
         let pid: u32 = match fields.as_slice() {
             ["ARX_SUPERVISOR_UNSUPPORTED", seen] if *seen == nonce => {
-                eprintln!("{UNSUPPORTED}");
+                println!("SKIP vm-supervisor-loss: {UNSUPPORTED}");
+                eprintln!("SKIP vm-supervisor-loss: {UNSUPPORTED}");
                 return;
             }
             ["ARX_SUPERVISOR", pid, seen] if *seen == nonce => pid.parse().unwrap(),
@@ -2120,10 +2245,40 @@ mod tests {
         let Some((child, _stdio)) = fixture_launch(0) else {
             return;
         };
+        let (user_data, user) = current_user();
+        // `user_data` backs this SID for the rest of the test.
+        let me = unsafe { (*user_data.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let network = LocalSid::parse("S-1-5-2").unwrap();
+        let system = LocalSid::parse("S-1-5-18").unwrap();
+        let expected = [
+            vm_acl::Entry {
+                deny: true,
+                sid: network.0,
+                mask: FILE_ALL_ACCESS,
+            },
+            vm_acl::Entry {
+                deny: false,
+                sid: me,
+                mask: FILE_ALL_ACCESS,
+            },
+            vm_acl::Entry {
+                deny: false,
+                sid: system.0,
+                mask: FILE_ALL_ACCESS,
+            },
+        ];
+        let descriptor = Descriptor::parse(&format!(
+            "O:{user}D:P(D;;FA;;;NU)(A;;FA;;;{user})(A;;FA;;;SY)"
+        ));
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
         let serial = SerialName::generate().unwrap();
         let name = wide(format!(r"\\.\pipe\{}", serial.basename()));
-        // The current supervisor, not the held child, owns this server.
-        let _server = unsafe {
+        // This test process, not the held child, serves the pipe.
+        let server = unsafe {
             owned(CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
@@ -2132,25 +2287,79 @@ mod tests {
                 4096,
                 4096,
                 0,
-                null(),
+                &attributes,
             ))
         }
         .unwrap();
-        let owner = LocalSid::parse("S-1-5-18").unwrap();
+        // The endpoint carries exactly the owner and DACL connect_serial is
+        // told to expect, so the server PID is the only property that differs.
+        assert!(
+            unsafe { vm_acl::exact(&server, me, &expected) },
+            "fixture pipe descriptor differs from the expected one"
+        );
+        assert_ne!(
+            unsafe { GetCurrentProcessId() },
+            child.verify_live().unwrap()
+        );
         let cancel = Shutdown::default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let error = connect_serial(&serial, &child, owner.0, &[], &cancel, deadline)
+        let error = connect_serial(&serial, &child, me, &expected, &cancel, deadline)
             .await
             .unwrap_err();
         assert_eq!(error, NativeRefusal::GuestEndpointUnverified);
         cancel.cancel();
         let unknown = SerialName::generate().unwrap();
         assert!(
-            connect_serial(&unknown, &child, owner.0, &[], &cancel, deadline)
+            connect_serial(&unknown, &child, me, &expected, &cancel, deadline)
                 .await
                 .is_err()
         );
         child.job.terminate().unwrap();
         child.reap(deadline).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_rechecks_resources_immediately_before_releasing_the_thread() {
+        let Some((mut child, stdio)) = fixture_launch(0) else {
+            return;
+        };
+        let (mut read, mut write, workers) = start_stdio(stdio).unwrap();
+        let mut calls = 0;
+        let fresh = Shutdown::default();
+        let refused = child.resume_checked(&fresh, &mut || {
+            calls += 1;
+            Err(NativeRefusal::ReservesUnverified)
+        });
+        assert_eq!(refused, Err(NativeRefusal::ReservesUnverified));
+        assert_eq!(calls, 1);
+        assert!(child.suspended.is_some(), "thread released after a refusal");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read.read_u8())
+                .await
+                .is_err(),
+            "the refused child ran"
+        );
+        // Cancellation refuses before any resource sample is taken.
+        let cancelled = Shutdown::default();
+        cancelled.cancel();
+        let refused = child.resume_checked(&cancelled, &mut || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(refused, Err(NativeRefusal::JobUnverified));
+        assert_eq!(calls, 1);
+        assert!(child.suspended.is_some());
+        child
+            .resume_checked(&fresh, &mut || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 2);
+        ready(&mut read).await;
+        write.write_all(&[42]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        child.reap(deadline).await.unwrap();
+        workers.join(deadline).await.unwrap();
     }
 }
