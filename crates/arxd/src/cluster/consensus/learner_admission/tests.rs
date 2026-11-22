@@ -134,6 +134,7 @@ fn watermarks_compare_exact_identity_at_equality() {
     assert!(covers(LogPos { index: 13, ..p }, p));
 }
 
+// Finish the timed loopback TLS handshake before pausing Tokio time.
 async fn no_engine_fixture() -> (
     AuthenticatedPeer,
     Arc<RetainedNode>,
@@ -164,8 +165,11 @@ fn take_diagnostics(controller: &Controller) -> Vec<(&'static str, &'static str)
     std::mem::take(&mut *controller.hooks.diagnostics.lock().unwrap())
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_register_waits_for_node_release_within_store_wait() {
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
+
     let node = Arc::new(tokio::sync::Mutex::new(0usize));
     let gate = StopGate::new();
     let held = node.clone().try_lock_owned().unwrap();
@@ -210,7 +214,6 @@ async fn admission_register_waits_for_node_release_within_store_wait() {
     assert_eq!(worker.as_mut().await, Reply::Pending);
     assert_eq!(*node.try_lock().unwrap(), 1);
 
-    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let held = retained.clone().try_lock_owned().unwrap();
     let start = Instant::now();
@@ -229,8 +232,11 @@ async fn admission_register_waits_for_node_release_within_store_wait() {
     assert!(!controller.intent.load(Ordering::Relaxed));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_worker_and_confirm_wait_for_node_release_within_store_wait() {
+    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
+
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
@@ -272,8 +278,6 @@ async fn admission_worker_and_confirm_wait_for_node_release_within_store_wait() 
 
     // Exercise the actual Controller `admission-worker` and `admission-confirm` stages
     // against a non-Engine RetainedNode held for 12 ms.
-    let (genuine, retained, controller, _dir) = no_engine_fixture().await;
-
     let held = retained.clone().try_lock_owned().unwrap();
     let submitted = AtomicBool::new(false);
     let start = Instant::now();
@@ -303,9 +307,10 @@ async fn admission_worker_and_confirm_wait_for_node_release_within_store_wait() 
     assert!(take_diagnostics(&controller).is_empty());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_paths_fail_closed_and_record_node_busy_at_cap_and_tighter_deadline() {
     let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
@@ -378,8 +383,15 @@ async fn admission_paths_fail_closed_and_record_node_busy_at_cap_and_tighter_dea
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_paths_wake_immediately_on_stop_without_node_busy_or_post_stop_work() {
+    let [register, worker, confirm] = [
+        no_engine_fixture().await,
+        no_engine_fixture().await,
+        no_engine_fixture().await,
+    ];
+    tokio::time::pause();
+
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
@@ -389,7 +401,7 @@ async fn admission_paths_wake_immediately_on_stop_without_node_busy_or_post_stop
 
     // 1. admission-register wakes immediately on stop (0 ms elapsed) with no node-busy.
     {
-        let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+        let (genuine, retained, controller, _dir) = register;
         let held = retained.clone().try_lock_owned().unwrap();
         let start = Instant::now();
         let deadline = start + BUDGET;
@@ -408,7 +420,7 @@ async fn admission_paths_wake_immediately_on_stop_without_node_busy_or_post_stop
 
     // 2. admission-worker wakes immediately on stop with Reply::Refused and no node-busy.
     {
-        let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+        let (genuine, retained, controller, _dir) = worker;
         let held = retained.clone().try_lock_owned().unwrap();
         let submitted = AtomicBool::new(false);
         let start = Instant::now();
@@ -428,7 +440,7 @@ async fn admission_paths_wake_immediately_on_stop_without_node_busy_or_post_stop
 
     // 3. admission-confirm wakes immediately on stop with Reply::Unknown and no node-busy.
     {
-        let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+        let (genuine, retained, controller, _dir) = confirm;
         let held = retained.clone().try_lock_owned().unwrap();
         let start = Instant::now();
         let deadline = start + BUDGET;
@@ -475,9 +487,10 @@ async fn admission_paths_wake_immediately_on_stop_without_node_busy_or_post_stop
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_paths_refuse_already_expired_deadline_without_locking_node() {
     let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
@@ -568,8 +581,22 @@ async fn admission_paths_refuse_already_expired_deadline_without_locking_node() 
     assert_eq!(controller.hooks.calls.load(Ordering::Relaxed), 0);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
+    let budgets = [
+        (BUDGET, peer_registry::STORE_WAIT),
+        (Duration::from_millis(5), Duration::from_millis(5)),
+    ];
+    let mut fixtures = Vec::with_capacity(budgets.len());
+    for _ in budgets {
+        fixtures.push([
+            no_engine_fixture().await,
+            no_engine_fixture().await,
+            no_engine_fixture().await,
+        ]);
+    }
+    tokio::time::pause();
+
     let address: SocketAddr = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
@@ -590,13 +617,12 @@ async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
     gate.report_if_open(|| count += 1);
     assert_eq!(count, 1);
 
-    for (outer_budget, expected_wait) in [
-        (BUDGET, peer_registry::STORE_WAIT),
-        (Duration::from_millis(5), Duration::from_millis(5)),
-    ] {
+    for ((outer_budget, expected_wait), [register, worker, confirm]) in
+        budgets.into_iter().zip(fixtures)
+    {
         // 1. admission-register stopped at exact exhaustion boundary.
         {
-            let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+            let (genuine, retained, controller, _dir) = register;
             let held = retained.clone().try_lock_owned().unwrap();
             let start = Instant::now();
             let deadline = start + outer_budget;
@@ -616,7 +642,7 @@ async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
 
         // 2. admission-worker stopped at exact exhaustion boundary.
         {
-            let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+            let (genuine, retained, controller, _dir) = worker;
             let held = retained.clone().try_lock_owned().unwrap();
             let submitted = AtomicBool::new(false);
             let start = Instant::now();
@@ -637,7 +663,7 @@ async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
 
         // 3. admission-confirm stopped at exact exhaustion boundary.
         {
-            let (genuine, retained, controller, _dir) = no_engine_fixture().await;
+            let (genuine, retained, controller, _dir) = confirm;
             let held = retained.clone().try_lock_owned().unwrap();
             let start = Instant::now();
             let deadline = start + outer_budget;
@@ -658,13 +684,17 @@ async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_stop_after_acquisition_does_not_poll_observation() {
-    for (stage, reply) in [
-        ("admission-worker", Reply::Refused),
-        ("admission-confirm", Reply::Unknown),
+    let worker = no_engine_fixture().await;
+    let confirm = no_engine_fixture().await;
+    tokio::time::pause();
+
+    for (stage, reply, fixture) in [
+        ("admission-worker", Reply::Refused, worker),
+        ("admission-confirm", Reply::Unknown, confirm),
     ] {
-        let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+        let (_peer, retained, controller, _dir) = fixture;
         let node = controller
             .lock_node_for_stage(&retained, Instant::now() + BUDGET, stage)
             .await
@@ -680,19 +710,23 @@ async fn admission_stop_after_acquisition_does_not_poll_observation() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_stop_cancels_in_flight_observations_even_when_input_is_ready() {
+    let worker = no_engine_fixture().await;
+    let confirm = no_engine_fixture().await;
+    tokio::time::pause();
+
     let address = "192.168.1.2:1234".parse().unwrap();
     let position = LogPos {
         term: 1,
         leader: 1,
         index: 14,
     };
-    for (stage, reply) in [
-        ("admission-worker", Reply::Refused),
-        ("admission-confirm", Reply::Unknown),
+    for (stage, reply, fixture) in [
+        ("admission-worker", Reply::Refused, worker),
+        ("admission-confirm", Reply::Unknown, confirm),
     ] {
-        let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+        let (_peer, retained, controller, _dir) = fixture;
         let start = Instant::now();
         let node = controller
             .lock_node_for_stage(&retained, start + BUDGET, stage)
@@ -718,9 +752,10 @@ async fn admission_stop_cancels_in_flight_observations_even_when_input_is_ready(
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_stop_after_add_observation_refuses_without_dispatch() {
     let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
     let deadline = Instant::now() + BUDGET;
     let node = controller
         .lock_node_for_stage(&retained, deadline, "admission-worker")
@@ -761,9 +796,10 @@ async fn admission_stop_after_add_observation_refuses_without_dispatch() {
     assert!(take_diagnostics(&controller).is_empty());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn admission_stop_preserves_started_proposal_ownership() {
     let (_peer, _retained, controller, _dir) = no_engine_fixture().await;
+    tokio::time::pause();
     let deadline = Instant::now() + BUDGET;
     let submitted = AtomicBool::new(false);
     let (complete, ready) = oneshot::channel();
