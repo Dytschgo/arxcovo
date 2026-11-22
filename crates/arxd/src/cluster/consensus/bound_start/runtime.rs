@@ -4,17 +4,20 @@ use crate::{
     cluster::{
         c13_diagnostics::record,
         enrollment::{
-            ClusterId, NodeId,
+            BoundVoters, ClusterId, KeyDigest, NodeId,
             durable_join::{self, Destination},
             transfer::LocalRoute,
         },
         restart_history::{RecoveredHistory, Slot},
         startup_plan::{Mode, Plan},
     },
-    service::cluster_owner::{Operator, Paste, Reply},
+    service::cluster_owner::{
+        DispatchReply, LEDGER_REPLY_LEN, LEDGER_VERSION, LedgerSlots, Operator, Paste, Reply,
+        position_bytes,
+    },
 };
 use checked_clock::{CheckedClock, HostClock};
-use openraft::type_config::async_runtime::watch::WatchReceiver;
+use openraft::type_config::{alias::WatchReceiverOf, async_runtime::watch::WatchReceiver};
 use rustls::{pki_types::UnixTime, time_provider::TimeProvider};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -425,8 +428,32 @@ impl Running {
         }
     }
 
+    pub(crate) async fn mint_receipt(
+        &self,
+        operator: Operator,
+        stop: &crate::service::Shutdown,
+        deadline: tokio::time::Instant,
+    ) -> DispatchReply {
+        let Some(installation) = self
+            .job
+            .state
+            .try_lock()
+            .ok()
+            .and_then(|state| Self::retained_installation_id(&state))
+        else {
+            return Reply::Refused.into();
+        };
+        self.job
+            .mint_owner_receipt(operator, installation, stop, deadline)
+            .await
+    }
+
     fn installation_id(&self) -> Option<[u8; 16]> {
         let state = self.job.state();
+        Self::retained_installation_id(&state)
+    }
+
+    fn retained_installation_id(state: &State) -> Option<[u8; 16]> {
         if let Some(learner) = &state.learner {
             return learner.installation_id();
         }
@@ -435,6 +462,95 @@ impl Running {
             .as_ref()
             .and_then(|history| Some(history.founder()?.installation()))
             .or_else(|| state.founder.as_ref()?.installation_id())
+    }
+
+    pub(crate) fn observe_ledger(&self, slots: &LedgerSlots, status: u8) -> DispatchReply {
+        match self.ledger_checkpoint(slots, status, Self::retained_ledger_peer, |node| {
+            Some(node.raft.as_ref()?.metrics())
+        }) {
+            Some(bytes) => DispatchReply::Ledger(bytes),
+            None => Reply::Refused.into(),
+        }
+    }
+
+    fn ledger_checkpoint(
+        &self,
+        slots: &LedgerSlots,
+        status: u8,
+        retained_peer: impl Fn(&State) -> Option<peer_transport::BuildPeer>,
+        metrics: impl FnOnce(&ConsensusNode) -> Option<WatchReceiverOf<Arx, openraft::RaftMetrics<Arx>>>,
+    ) -> Option<[u8; LEDGER_REPLY_LEN]> {
+        let origin = {
+            let state = self.job.state.try_lock().ok()?;
+            self.ledger_origin(&state, &retained_peer)?
+        };
+
+        // Drop the Job guard first. Acquire retained node -> log -> state once,
+        // without waiting or holding a synchronous guard across an await.
+        let (epoch, role, stored) = {
+            let node = origin.binding.try_lock().ok()?;
+            if node.id != origin.member.get() {
+                return None;
+            }
+            let metrics = metrics(&node)?;
+            let qualified_epoch = || qualified_ledger_epoch(&metrics.borrow_watched(), node.id);
+            let (epoch, role, membership) = qualified_epoch()?;
+            let log = node.log_weak.upgrade()?;
+            let stored = observe_local_ledger(
+                &log,
+                &node.sm.as_ref()?.0,
+                slots,
+                origin.cluster,
+                origin.member,
+            )?;
+            if qualified_epoch()? != (epoch, role, membership)
+                || id(stored.membership) != membership
+                || !stored.voters.contains(&epoch.node_id)
+                || (epoch.term, epoch.node_id) != (stored.applied.term, stored.applied.leader)
+                    && epoch.term <= stored.applied.term
+            {
+                return None;
+            }
+            (epoch, role, stored)
+        };
+
+        let state = self.job.state.try_lock().ok()?;
+        let current = self.ledger_origin(&state, &retained_peer)?;
+        let issuer = state.issuer.as_ref().map(|issuer| {
+            let (cluster, _, key) = issuer.transfer_identity();
+            (cluster, issuer.member(), key)
+        });
+        origin.checkpoint(&current, issuer, stored, epoch, role, status)
+    }
+
+    fn ledger_origin(
+        &self,
+        state: &State,
+        retained_peer: impl FnOnce(&State) -> Option<peer_transport::BuildPeer>,
+    ) -> Option<LedgerOrigin> {
+        let installation = Self::retained_installation_id(state)?;
+        let custody = qualified_ledger_custody(state, self.strict_written, || {
+            state
+                .learner
+                .as_ref()
+                .is_some_and(learner::Operation::voter_custody)
+        })?;
+        let (cluster, member) = retained_peer(state)?.identity()?;
+        Some(LedgerOrigin {
+            binding: state.node.clone()?,
+            installation,
+            custody,
+            cluster,
+            member,
+        })
+    }
+
+    fn retained_ledger_peer(state: &State) -> Option<peer_transport::BuildPeer> {
+        match state.status {
+            Status::FounderReady => state.founder.as_ref()?.delegated_build(),
+            Status::LearnerReady => state.learner.as_ref()?.delegated_build(),
+            _ => None,
+        }
     }
 
     pub(crate) async fn observe(&mut self) -> Result<Readiness, Error> {
@@ -583,6 +699,158 @@ impl Running {
     }
 }
 
+fn qualified_ledger_epoch(
+    m: &openraft::RaftMetrics<Arx>,
+    member: u64,
+) -> Option<(LeaderId, u8, Id)> {
+    let epoch = m.vote.leader_id;
+    let role = match m.state {
+        openraft::ServerState::Leader if epoch.node_id == member => 1,
+        openraft::ServerState::Follower if epoch.node_id != member => 2,
+        _ => return None,
+    };
+    if m.id != member
+        || m.running_state.is_err()
+        || !m.vote.committed
+        || m.current_leader != Some(epoch.node_id)
+        || m.committed_membership_config != m.membership_config
+    {
+        return None;
+    }
+    Some((epoch, role, (*m.committed_membership_config.log_id())?))
+}
+
+fn qualified_ledger_custody(
+    state: &State,
+    strict_written: bool,
+    voter_custody: impl FnOnce() -> bool,
+) -> Option<bool> {
+    if state.close_requested || !state.process_owned {
+        return None;
+    }
+    match state.status {
+        Status::FounderReady if state.learner.is_none() => Some(false),
+        Status::LearnerReady if strict_written && voter_custody() => Some(true),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct LedgerOrigin {
+    binding: Arc<tokio::sync::Mutex<ConsensusNode>>,
+    installation: [u8; 16],
+    custody: bool,
+    cluster: ClusterId,
+    member: NodeId,
+}
+
+impl LedgerOrigin {
+    fn checkpoint(
+        &self,
+        current: &Self,
+        issuer: Option<(ClusterId, NodeId, KeyDigest)>,
+        stored: LocalLedger,
+        epoch: LeaderId,
+        role: u8,
+        status: u8,
+    ) -> Option<[u8; LEDGER_REPLY_LEN]> {
+        if !Arc::ptr_eq(&current.binding, &self.binding)
+            || (
+                current.installation,
+                current.custody,
+                current.cluster,
+                current.member,
+            ) != (self.installation, self.custody, self.cluster, self.member)
+            || issuer.is_some_and(|identity| identity != (self.cluster, self.member, stored.key))
+        {
+            return None;
+        }
+        let mut bytes = [0; LEDGER_REPLY_LEN];
+        bytes[..4].copy_from_slice(&[LEDGER_VERSION, status, role, u8::from(self.custody)]);
+        bytes[4..12].copy_from_slice(&self.member.get().to_be_bytes());
+        bytes[12..20].copy_from_slice(&epoch.term.to_be_bytes());
+        bytes[20..28].copy_from_slice(&epoch.node_id.to_be_bytes());
+        bytes[28..44].copy_from_slice(&self.installation);
+        bytes[44..60].copy_from_slice(&self.cluster);
+        bytes[60..92].copy_from_slice(stored.key.as_bytes());
+        bytes[92..116].copy_from_slice(&position_bytes(stored.membership));
+        bytes[116..140].copy_from_slice(&position_bytes(stored.applied));
+        for (dest, voter) in bytes[140..].chunks_exact_mut(8).zip(stored.voters) {
+            dest.copy_from_slice(&voter.to_be_bytes());
+        }
+        Some(bytes)
+    }
+}
+
+struct LocalLedger {
+    applied: LogPos,
+    membership: LogPos,
+    voters: [u64; 3],
+    key: KeyDigest,
+}
+
+fn ledger_covers(applied: LogPos, target: LogPos) -> bool {
+    applied == target
+        || (applied.index > target.index
+            && (applied.term > target.term
+                || (applied.term, applied.leader) == (target.term, target.leader)))
+}
+
+fn observe_local_ledger(
+    log: &Mutex<VoteLogStore>,
+    state: &Mutex<StateStore>,
+    slots: &LedgerSlots,
+    cluster: ClusterId,
+    member: NodeId,
+) -> Option<LocalLedger> {
+    let log = log.try_lock().ok()?;
+    let state = state.try_lock().ok()?;
+    if state.is_poisoned() {
+        return None;
+    }
+    let applied = state.applied()?;
+    let (membership, blob) = state.membership()?;
+    if !ledger_covers(applied, *membership) {
+        return None;
+    }
+    let wire = WireMembership::decode(blob.bytes()).ok()?;
+    let [voters] = wire.configs() else {
+        return None;
+    };
+    let voters: [u64; 3] = voters.iter().copied().collect::<Vec<_>>().try_into().ok()?;
+    if wire.nodes().len() != voters.len() || !voters.contains(&member.get()) {
+        return None;
+    }
+    let key = state.state().bound_key(cluster, member).ok()?;
+    let bound = BoundVoters::observe(state.state(), &wire).ok()?;
+    if !bound.contains(member, key) {
+        return None;
+    }
+    let mut previous = None;
+    for slot in slots.receipts() {
+        let (position, StoredEntry::Enrollment(command)) =
+            log.observe_entry(slot.position.index).ok()??
+        else {
+            return None;
+        };
+        if position != slot.position
+            || previous.is_some_and(|prev| !ledger_covers(position, prev))
+            || !(ledger_covers(*membership, position) || ledger_covers(position, *membership))
+            || !ledger_covers(applied, position)
+            || state.state().pending_mint_receipt(&command, position)? != slot.digest
+        {
+            return None;
+        }
+        previous = Some(position);
+    }
+    Some(LocalLedger {
+        applied,
+        membership: *membership,
+        voters,
+        key,
+    })
+}
+
 struct BuildAuthority {
     job: &'static Job,
     peer: peer_transport::BuildPeer,
@@ -697,6 +965,9 @@ async fn publish(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod c16_probe;
 
 #[cfg(test)]
 pub(crate) fn refused_founder_for_test(

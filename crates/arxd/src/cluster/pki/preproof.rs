@@ -285,6 +285,26 @@ pub(in crate::cluster) async fn anchor(
     time: Arc<dyn TimeProvider>,
     limits: SocketLimits,
 ) -> Result<AnchoredClient, ExchangeError> {
+    anchor_inner(
+        address,
+        code,
+        root,
+        time,
+        limits,
+        #[cfg(all(test, target_os = "linux"))]
+        None,
+    )
+    .await
+}
+
+async fn anchor_inner(
+    address: SocketAddr,
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+    limits: SocketLimits,
+    #[cfg(all(test, target_os = "linux"))] terminal: Option<&mut bool>,
+) -> Result<AnchoredClient, ExchangeError> {
     let deadline = Instant::now() + SOCKET_BUDGET;
     let config = client_config(code, root, time).map_err(|_| ExchangeError::Refused)?;
     timeout_at(deadline, async {
@@ -305,7 +325,14 @@ pub(in crate::cluster) async fn anchor(
             .await
             .map_err(|_| Refused)?;
         socket.flush().await.map_err(|_| Refused)?;
-        let (challenge, voters) = session::receive_anchor(&mut socket).await?;
+        #[cfg(all(test, target_os = "linux"))]
+        let response = match terminal {
+            Some(refusal) => receive_anchor_probe(&mut socket, deadline, refusal).await,
+            None => session::receive_anchor(&mut socket).await,
+        };
+        #[cfg(not(all(test, target_os = "linux")))]
+        let response = session::receive_anchor(&mut socket).await;
+        let (challenge, voters) = response?;
         let _peer = check_voters(socket.get_ref().1, code.cluster(), code.anchor(), &voters)?;
         session::nothing_pending(&mut socket).await?;
         if Instant::now() >= deadline {
@@ -324,6 +351,136 @@ pub(in crate::cluster) async fn anchor(
     .await
     .map_err(|_| ExchangeError::Refused)?
     .map_err(|_: Refused| ExchangeError::Refused)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) enum AnchorProbe {
+    Received,
+    TerminalRefusal,
+    Unconfirmed,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::cluster) async fn probe_anchor(
+    address: SocketAddr,
+    code: &JoinCode,
+    root: &[u8],
+    time: Arc<dyn TimeProvider>,
+    limits: SocketLimits,
+) -> AnchorProbe {
+    let mut terminal = false;
+    match anchor_inner(address, code, root, time, limits, Some(&mut terminal)).await {
+        Ok(_) => AnchorProbe::Received,
+        Err(_) if terminal => AnchorProbe::TerminalRefusal,
+        Err(_) => AnchorProbe::Unconfirmed,
+    }
+}
+
+// Capture only the canonical terminal frame's width as the production decoder
+// reads it. The probe invokes this after the full, authenticated TLS handshake.
+#[cfg(all(test, target_os = "linux"))]
+const TERMINAL_ANCHOR: [u8; 9] = *b"ARXE\x01\x02\x00\x01\x01";
+
+#[cfg(all(test, target_os = "linux"))]
+struct AnchorPrefix<'a, R> {
+    source: &'a mut R,
+    bytes: [u8; TERMINAL_ANCHOR.len()],
+    len: usize,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AnchorPrefix<'_, R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut *self.source).poll_read(cx, buffer);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            let start = self.len;
+            let captured = (buffer.filled().len() - before).min(self.bytes.len() - start);
+            self.bytes[start..start + captured]
+                .copy_from_slice(&buffer.filled()[before..before + captured]);
+            self.len += captured;
+        }
+        result
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn receive_anchor_probe(
+    socket: &mut (impl tokio::io::AsyncRead + Unpin),
+    deadline: Instant,
+    refusal: &mut bool,
+) -> Result<([u8; 16], BoundVoters), Refused> {
+    use tokio::io::AsyncReadExt;
+
+    let mut prefix = AnchorPrefix {
+        source: socket,
+        bytes: [0; TERMINAL_ANCHOR.len()],
+        len: 0,
+    };
+    let reply = session::receive_anchor(&mut prefix).await;
+    // On TLS, a bare transport EOF is an error, even after a complete frame.
+    if reply.is_err()
+        && prefix.len == TERMINAL_ANCHOR.len()
+        && prefix.bytes == TERMINAL_ANCHOR
+        && matches!(socket.read(&mut [0]).await, Ok(0))
+        && Instant::now() < deadline
+    {
+        *refusal = true;
+    }
+    reply
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[tokio::test]
+async fn anchor_probe_distinguishes_a_complete_terminal_refusal_from_failed_delivery() {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct Reset;
+    impl AsyncRead for Reset {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+    }
+
+    let deadline = Instant::now() + SOCKET_BUDGET;
+    let extra = [TERMINAL_ANCHOR.as_slice(), &[0]].concat();
+    for (mut input, expected) in [
+        (TERMINAL_ANCHOR.as_slice(), true),
+        (&TERMINAL_ANCHOR[..8], false),
+        (&[b'A', b'R', b'X', b'E', 1, 2, 0, 1, 0], false),
+        (extra.as_slice(), false),
+        (&[], false),
+    ] {
+        let mut refusal = false;
+        assert!(
+            receive_anchor_probe(&mut input, deadline, &mut refusal)
+                .await
+                .is_err()
+        );
+        assert_eq!(refusal, expected);
+    }
+
+    let mut reset = tokio::io::AsyncReadExt::chain(TERMINAL_ANCHOR.as_slice(), Reset);
+    let mut refusal = false;
+    assert!(
+        receive_anchor_probe(&mut reset, deadline, &mut refusal)
+            .await
+            .is_err()
+    );
+    assert!(!refusal);
 }
 
 /// Compatibility entry for the existing closed-exchange callers.

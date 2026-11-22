@@ -32,6 +32,168 @@ const FLOOR: LogPos = LogPos {
 const MINT: LogPos = LogPos { index: 11, ..FLOOR };
 const EXPIRES: u64 = 900_100;
 
+#[cfg(target_os = "linux")]
+mod proposal_boundary {
+    use super::*;
+    use crate::service::{
+        Shutdown,
+        cluster_owner::{DispatchReply, MintReceipt, Paste, Reply},
+    };
+    use linux::ResultMode;
+    use std::{cell::Cell, future::pending, task::Poll, time::Duration};
+    use tokio::time::{Instant, advance};
+
+    const WAIT: Duration = Duration::from_secs(1);
+
+    fn receipt() -> DispatchReply {
+        DispatchReply::MintReceipt(MintReceipt {
+            position: MINT,
+            digest: [3; 32],
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_or_expired_view_never_submits() {
+        for expire in [false, true] {
+            let stop = Shutdown::default();
+            let proposals = Cell::new(0);
+            let start = Instant::now();
+            let mode = ResultMode::receipt(&stop, start + WAIT);
+            let mut mint = std::pin::pin!(mode.at_proposal(pending::<Option<()>>(), |()| async {
+                proposals.set(proposals.get() + 1);
+                receipt()
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(mint.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            if expire {
+                advance(WAIT).await;
+            } else {
+                stop.cancel();
+            }
+            assert!(matches!(mint.await, DispatchReply::Control(Reply::Refused)));
+            assert_eq!(proposals.get(), 0);
+            if !expire {
+                assert_eq!(Instant::now(), start);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_or_expiry_as_view_finishes_never_submits() {
+        for expire in [false, true] {
+            let stop = Shutdown::default();
+            let deadline = Instant::now() + WAIT;
+            let proposals = Cell::new(0);
+            let reply = ResultMode::receipt(&stop, deadline)
+                .at_proposal(
+                    std::future::poll_fn(|cx| {
+                        if expire {
+                            // advance changes the clock before yielding to the timer driver.
+                            assert!(std::pin::pin!(advance(WAIT)).poll(cx).is_pending());
+                            assert_eq!(Instant::now(), deadline);
+                        } else {
+                            stop.cancel();
+                        }
+                        Poll::Ready(Some(()))
+                    }),
+                    |()| async {
+                        proposals.set(proposals.get() + 1);
+                        receipt()
+                    },
+                )
+                .await;
+            assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
+            assert_eq!(proposals.get(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_or_expiry_after_submission_returns_unknown() {
+        for expire in [false, true] {
+            let stop = Shutdown::default();
+            let proposals = Cell::new(0);
+            let start = Instant::now();
+            let mode = ResultMode::receipt(&stop, start + WAIT);
+            let mut mint = std::pin::pin!(mode.at_proposal(async { Some(()) }, |()| async {
+                proposals.set(proposals.get() + 1);
+                // Make a receipt available in the deadline poll or leave
+                // a pending receipt waiter for lifecycle stop to cancel.
+                if expire {
+                    tokio::time::sleep(WAIT).await;
+                } else {
+                    pending::<()>().await;
+                }
+                receipt()
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(mint.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(proposals.get(), 1);
+            if expire {
+                advance(WAIT).await;
+            } else {
+                stop.cancel();
+            }
+            assert!(matches!(mint.await, DispatchReply::Control(Reply::Unknown)));
+            assert_eq!(proposals.get(), 1);
+            if !expire {
+                assert_eq!(Instant::now(), start);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_completion_cannot_release_a_ready_receipt() {
+        let stop = Shutdown::default();
+        let proposals = Cell::new(0);
+        let mode = ResultMode::receipt(&stop, Instant::now() + WAIT);
+        let reply = mode
+            .at_proposal(async { Some(()) }, |()| async {
+                proposals.set(proposals.get() + 1);
+                stop.cancel();
+                receipt()
+            })
+            .await;
+        assert_eq!(proposals.get(), 1);
+        assert!(matches!(reply, DispatchReply::Control(Reply::Unknown)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timely_private_receipt_and_ordinary_paste_are_delivered() {
+        let stop = Shutdown::default();
+        let deadline = Instant::now() + WAIT;
+        let mode = ResultMode::receipt(&stop, deadline);
+        let reply = mode
+            .at_proposal(async { Some(()) }, |()| async { receipt() })
+            .await;
+        assert!(matches!(reply, DispatchReply::MintReceipt(receipt) if receipt.position == MINT));
+
+        let proposals = Cell::new(0);
+        let reply = ResultMode::Paste
+            .at_proposal(
+                async {
+                    stop.cancel();
+                    advance(WAIT).await;
+                    Some(())
+                },
+                |()| async {
+                    assert!(stop.is_cancelled() && Instant::now() >= deadline);
+                    proposals.set(proposals.get() + 1);
+                    linux::mint_result(Paste::copy(b"ordinary paste").unwrap(), None, MINT, EXPIRES)
+                },
+            )
+            .await;
+        assert_eq!(proposals.get(), 1);
+        assert!(matches!(reply, DispatchReply::Control(Reply::Minted(paste))
+            if paste.bytes() == b"ordinary paste"));
+    }
+}
+
 #[test]
 fn owner_mint_accepts_only_first_result_from_exact_epoch_above_floor() {
     let outcome = || {
@@ -54,12 +216,59 @@ fn owner_mint_accepts_only_first_result_from_exact_epoch_above_floor() {
             view(),
             FLOOR,
             MINT,
+            Some(Outcome::Rejected(
+                crate::cluster::enrollment::Reject::CodeIdCollision
+            )),
+        ),
+        None,
+    );
+    assert_eq!(
+        first_expiry(
+            view(),
+            FLOOR,
+            MINT,
             Some(Outcome::Minted {
                 replay: true,
                 expires_ms: EXPIRES
             })
         ),
         None
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mint_result_modes_only_release_the_requested_representation() {
+    use crate::{
+        cluster::enrollment::{Command, JoinCode, MintReceiptInput},
+        service::cluster_owner::{DispatchReply, Paste, Reply},
+    };
+    let code = JoinCode::generate([1; 16], [2; 32], anchor(9), |buffer| {
+        buffer.fill(7);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let mint = Command::Mint {
+        cluster: [1; 16],
+        actor: [3; 16],
+        request: [4; 16],
+        code: code.code_id(),
+        verifier: code.verifier(),
+        proposed_at_ms: 100,
+    };
+    let input = MintReceiptInput::new(&mint);
+    let protected = || Paste::copy(b"test-only protected bytes").unwrap();
+    let result = linux::mint_result(protected(), Some(&input), MINT, EXPIRES);
+    let DispatchReply::MintReceipt(receipt) = result else {
+        panic!("receipt mode returned a different representation");
+    };
+    assert_eq!(receipt.position, MINT);
+    assert_eq!(Some(receipt.digest), input.digest(MINT, EXPIRES));
+    assert_ne!(Some(receipt.digest), input.digest(FLOOR, EXPIRES));
+    let result = linux::mint_result(protected(), None, MINT, EXPIRES);
+    assert!(
+        matches!(result, DispatchReply::Control(Reply::Minted(paste))
+        if paste.bytes() == b"test-only protected bytes")
     );
 }
 

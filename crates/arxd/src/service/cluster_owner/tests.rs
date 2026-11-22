@@ -9,6 +9,197 @@ use std::{
 };
 use tokio::sync::Notify;
 
+fn ledger_frame(count: u8) -> [u8; LEDGER_REQUEST_LEN] {
+    let mut bytes = [0; LEDGER_REQUEST_LEN];
+    bytes[..2].copy_from_slice(&[1, count]);
+    for i in 0..usize::from(count).min(SLOT_COUNT) {
+        let offset = 2 + i * SLOT_LEN;
+        bytes[offset + 7] = 2;
+        bytes[offset + 15] = 1;
+        bytes[offset + 23] = (i + 5) as u8;
+        bytes[offset + 24..offset + SLOT_LEN].fill((i + 10) as u8);
+    }
+    bytes
+}
+
+#[test]
+fn ledger_request_requires_exact_canonical_slots() {
+    for count in [2, 4] {
+        let bytes = ledger_frame(count);
+        let slots = LedgerSlots::decode(&bytes).unwrap();
+        assert_eq!(slots.receipts().len(), usize::from(count));
+        assert_eq!(
+            slots.receipts()[0].position,
+            LogPos {
+                term: 2,
+                leader: 1,
+                index: 5
+            }
+        );
+        assert_eq!(slots.receipts()[0].digest, [10; 32]);
+        assert!(LedgerSlots::decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(LedgerSlots::decode(&[bytes.as_slice(), &[0]].concat()).is_none());
+    }
+    for count in [0, 1, 3, 5, u8::MAX] {
+        assert!(LedgerSlots::decode(&ledger_frame(count)).is_none());
+    }
+    for (offset, value) in [
+        (0, 2),
+        (2 + 23, 0),
+        (2 + SLOT_LEN + 23, 5),
+        (2 + SLOT_LEN + 23, 4),
+        (2 + 2 * SLOT_LEN, 1),
+    ] {
+        let mut bytes = ledger_frame(2);
+        bytes[offset] = value;
+        assert!(LedgerSlots::decode(&bytes).is_none());
+    }
+    let mut duplicate = ledger_frame(2);
+    duplicate[2 + SLOT_LEN + 24..2 + 2 * SLOT_LEN].fill(10);
+    assert!(LedgerSlots::decode(&duplicate).is_none());
+    for index in [i64::MAX as u64 + 1, u64::MAX] {
+        let mut bytes = ledger_frame(2);
+        bytes[2 + SLOT_LEN + 16..2 + SLOT_LEN + 24].copy_from_slice(&index.to_be_bytes());
+        assert!(LedgerSlots::decode(&bytes).is_none());
+    }
+}
+
+#[test]
+fn protected_paste_scrub_covers_the_full_allocation() {
+    let mut paste = Paste::copy(&[0x71; MAX_PASTE]).unwrap();
+    // Exercise the same scrub on even the part outside the occupied range.
+    paste.1 = 1;
+    paste.clear();
+    assert!(paste.bytes().is_empty());
+    assert!(paste.0.iter().all(|&byte| byte == 0));
+}
+
+#[tokio::test]
+async fn legacy_mint_and_join_wire_bytes_are_unchanged() {
+    let paste = format!("arxje1-040000000000000001{}", "ab".repeat(275));
+    assert!(paste_shape(paste.as_bytes()));
+    for (request_tag, request_body, reply_tag, reply_body) in [
+        (1, &[][..], 11, paste.as_bytes()),
+        (2, paste.as_bytes(), 12, &[][..]),
+    ] {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        send(&mut client, request_tag, request_body).await.unwrap();
+        connection(server, 1, Shutdown::default(), |_, request| async {
+            match request {
+                Request::Mint if request_tag == 1 => {
+                    Reply::Minted(Paste::copy(reply_body).unwrap())
+                }
+                Request::Join(value) if request_tag == 2 => {
+                    assert_eq!(value.bytes(), request_body);
+                    Reply::Joined
+                }
+                _ => panic!("unexpected legacy dispatch"),
+            }
+        })
+        .await;
+        let (tag, body) = receive(&mut client).await.unwrap();
+        assert_eq!(tag, reply_tag);
+        assert_eq!(body.bytes(), reply_body);
+    }
+}
+
+#[tokio::test]
+async fn private_frames_require_kernel_owner_and_have_fixed_replies() {
+    // SAFETY: geteuid takes no pointers.
+    let uid = unsafe { libc::geteuid() };
+    assert!(peer_matches(uid, Some(1), uid));
+    for pid in [Some(-1), Some(0), None] {
+        assert!(!peer_matches(uid, pid, uid));
+    }
+    for (tag, body, expected_uid, reply_tag) in [
+        (6, Vec::new(), uid, 17),
+        (7, ledger_frame(2).to_vec(), uid, 18),
+        (6, Vec::new(), uid ^ 1, 13),
+        (7, ledger_frame(2).to_vec(), uid ^ 1, 13),
+        (6, vec![1], uid, 13),
+        (
+            7,
+            ledger_frame(4)[..LEDGER_REQUEST_LEN - 1].to_vec(),
+            uid,
+            13,
+        ),
+        (8, Vec::new(), uid, 13),
+    ] {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        send(&mut client, tag, &body).await.unwrap();
+        connection_with_status(
+            server,
+            expected_uid,
+            Shutdown::default(),
+            |operator, request| async move {
+                assert_eq!(operator.uid(), uid);
+                match request {
+                    Request::MintReceipt if reply_tag == 17 => {
+                        DispatchReply::MintReceipt(MintReceipt {
+                            position: LogPos {
+                                term: 2,
+                                leader: 1,
+                                index: 5,
+                            },
+                            digest: [10; 32],
+                        })
+                    }
+                    Request::ObserveLedger(slots) if reply_tag == 18 => {
+                        assert_eq!(slots.receipts().len(), 2);
+                        DispatchReply::Ledger([16; 164])
+                    }
+                    _ => panic!("wrong owner dispatch"),
+                }
+            },
+            || [0; 29],
+            || [0; TIME_EVIDENCE_LEN],
+        )
+        .await;
+        let (received, body) = receive(&mut client).await.unwrap();
+        assert_eq!(received, reply_tag);
+        match received {
+            17 => {
+                let mut expected = vec![1];
+                for word in [2u64, 1, 5] {
+                    expected.extend(word.to_be_bytes());
+                }
+                expected.extend([10; 32]);
+                assert_eq!(body.bytes(), expected);
+            }
+            18 => assert_eq!(body.bytes(), [16; 164]),
+            _ => assert!(body.bytes().is_empty()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn private_frames_refuse_trailing_bytes_and_stop_before_dispatch() {
+    // SAFETY: geteuid takes no pointers.
+    let uid = unsafe { libc::geteuid() };
+    for stopped in [false, true] {
+        let stop = Shutdown::default();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(b"ARXO\x06\x00\x00").await.unwrap();
+        if stopped {
+            stop.cancel();
+        } else {
+            client.write_all(&[42]).await.unwrap();
+        }
+        client.shutdown().await.unwrap();
+        connection(server, uid, stop, |_, _| async {
+            panic!("refused frame dispatched")
+        })
+        .await;
+        if stopped {
+            assert!(receive(&mut client).await.is_err());
+        } else {
+            let (tag, body) = receive(&mut client).await.unwrap();
+            assert_eq!(tag, 13);
+            assert!(body.bytes().is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn owner_protocol_refuses_oversize_extra_and_non_owner_operations_before_dispatch() {
     for (case, request) in [
