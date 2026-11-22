@@ -223,11 +223,41 @@ test('Rust retains every native, Python and package validation with exact comman
         timeout-minutes: 2
         shell: bash
         run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
-    `name: Hosted R2 zero-daemon containment qualification
+    `name: Bind ignored C16 AnchorQuery helper to the Linux build
         if: runner.os == 'Linux'
-        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $proofRoot = Join-Path $env:RUNNER_TEMP 'arx-bound-sqlite'
+          $anchorMessages = Join-Path $proofRoot 'c16-anchor-build.jsonl'
+          $targetDir = $env:CARGO_TARGET_DIR.TrimEnd('/')
+          $manifest = Join-Path $env:GITHUB_WORKSPACE 'crates/arxd/Cargo.toml'
+          cargo test --locked -p arxd --lib --no-run --message-format=json-render-diagnostics > $anchorMessages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $linked = @(Get-Content -LiteralPath $anchorMessages | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'arxd' -and ($_.target.kind -contains 'lib') -and $_.profile.test -eq $true -and $_.manifest_path -eq $manifest -and $_.executable })
+          if ($linked.Count -ne 1) { throw 'Invalid C16 anchor compiler-artifact' }
+          $anchor = $linked[0].executable
+          if ((Split-Path -Parent $anchor) -ne "$targetDir/debug/deps" -or (Split-Path -Leaf $anchor) -cnotmatch '^arxd-[a-f0-9]{16}$') { throw 'Invalid C16 anchor artifact path' }
+          $item = Get-Item -LiteralPath $anchor
+          if (($item.LinkType -and $item.LinkType -ne 'HardLink') -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) { throw 'Invalid anchor artifact' }
+          $receipt = [ordered]@{
+            schema = 'arxcovo/c16-anchor/1'
+            head = $env:GITHUB_SHA
+            run = $env:GITHUB_RUN_ID
+            attempt = $env:GITHUB_RUN_ATTEMPT
+            target_dir = $targetDir
+            executable = $anchor
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $anchor).Hash.ToLowerInvariant()
+            bytes = [int64]$item.Length
+            messages_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $anchorMessages).Hash.ToLowerInvariant()
+            selector = 'cluster::consensus::bound_start::runtime::c16_probe::c16_distinct_reconnect_anchor_only'
+          }
+          $receipt | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $proofRoot 'c16-anchor-receipt.json') -Encoding ascii -NoNewline`,
+    `name: Hosted C16 live three-container acceptance
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
         shell: bash
-        run: python3 -I -B tools/ci/m3-containers/run.py --mode dry`,
+        run: python3 -I -B tools/ci/m3-containers/run.py --mode live`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
@@ -289,7 +319,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
     '        timeout-minutes: 3',
     '        timeout-minutes: 2',
     '        timeout-minutes: 2',
-    '        timeout-minutes: 2',
+    '        timeout-minutes: 5',
     '    timeout-minutes: 12',
     '    timeout-minutes: 12',
   ]);
@@ -298,7 +328,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {
   assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
   assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 2);
-  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR']);
+  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR']);
   for (const path of ['../Cargo.toml', '../.cargo/config', '../.cargo/config.toml']) {
     const url = new URL(path, import.meta.url);
     if (existsSync(url)) {

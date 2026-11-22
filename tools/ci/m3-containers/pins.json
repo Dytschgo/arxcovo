@@ -28,16 +28,17 @@
   "roles": {"owner": 21070, "daemon": 21071, "build": 21072, "agent": 21073},
   "network": {
     "nodes": {
-      "a": ["198.18.72.11", "02:72:00:00:00:11"],
-      "b": ["198.18.72.12", "02:72:00:00:00:12"],
-      "c": ["198.18.72.13", "02:72:00:00:00:13"]
+      "a": ["192.168.72.11", "02:72:00:00:00:11"],
+      "b": ["192.168.72.12", "02:72:00:00:00:12"],
+      "c": ["192.168.72.13", "02:72:00:00:00:13"]
     },
     "prefix": 24,
     "ports": {"peer": 22171, "enrollment": 22172, "build": 22173, "forbidden": 22174},
-    "local": ["198.18.72.14", "02:72:00:00:00:14"],
+    "local": ["192.168.72.14", "02:72:00:00:00:14"],
     "outside": "192.0.2.72", "link_local": "169.254.254.72", "ipv6": "fd42:72::13"
   },
   "outer": {"cpu_percent": 100, "memory": 536870912, "swap": 0, "pids": 128, "nofile": 128, "core": 0},
   "inner": {"caps": 193, "nnp": 1, "memory": 134217728, "swap": 0, "pids": 32},
-  "seconds": {"preflight": 8, "stage": 24, "contain": 16, "network": 12, "cleanup": 25}
+  "seconds": {"preflight": 8, "stage": 24, "contain": 16, "network": 12, "cleanup": 25},
+  "live_seconds": {"setup": 60, "activation": 60, "build": 30, "recovery": 55, "evidence": 10, "cleanup": 25}
 }

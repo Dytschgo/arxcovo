@@ -3,9 +3,12 @@
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import selectors
+import secrets
+import shutil
 import signal
 import stat
 import struct
@@ -14,9 +17,14 @@ import time
 from contextlib import contextmanager
 
 MIB = 1024**2
+MANIFEST_LIMIT = 64 * 1024
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 TIME = {"preflight": 8, "stage": 24, "contain": 16, "network": 12, "cleanup": 25}
+LIVE_TIME = {"setup": 60, "activation": 60, "build": 30, "recovery": 55, "evidence": 10, "cleanup": 25}
+ANCHOR_TEST = ("cluster::consensus::bound_start::runtime::c16_probe::"
+               "c16_distinct_reconnect_anchor_only")
+CARGO_ARGS = ["build", "--offline", "--locked", "--target-dir", "out/target"]
 ROLES = {"owner": 21070, "daemon": 21071, "build": 21072, "agent": 21073}
 OUTER = {"cpu_percent": 100, "memory": 512*MIB, "swap": 0, "pids": 128, "nofile": 128, "core": 0}
 INNER = {"caps": 193, "nnp": 1, "memory": 128*MIB, "swap": 0, "pids": 32}
@@ -35,9 +43,9 @@ HOST_PROFILES = [
      "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
 ]
 NETWORK = {
-    "nodes": {node: [f"198.18.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
+    "nodes": {node: [f"192.168.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
     "prefix": 24, "ports": {"peer": 22171, "enrollment": 22172, "build": 22173, "forbidden": 22174},
-    "local": ["198.18.72.14", "02:72:00:00:00:14"],
+    "local": ["192.168.72.14", "02:72:00:00:00:14"],
     "outside": "192.0.2.72", "link_local": "169.254.254.72", "ipv6": "fd42:72::13",
 }
 ENV = {"PATH": "/usr/sbin:/usr/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
@@ -86,7 +94,7 @@ def check_pins(pins):
             "bytes": 1024*MIB, "data_bytes": 256*MIB, "run_bytes": 4*MIB,
             "tmp_bytes": 8*MIB, "dev_bytes": MIB, "block_size": 4096, "data_inodes": 16384,
         },
-        "roles": ROLES, "network": NETWORK, "outer": OUTER, "inner": INNER, "seconds": TIME,
+        "roles": ROLES, "network": NETWORK, "outer": OUTER, "inner": INNER, "seconds": TIME, "live_seconds": LIVE_TIME,
     }
     require(json.dumps(expected, sort_keys=True) == json.dumps(pins, sort_keys=True), "pins-schema")
     return pins
@@ -246,7 +254,7 @@ def open_artifact(path, owners, size, *, executable=False):
                 == identity(path.lstat()), "artifact-changed")
 
 
-def inspect_elf(stream, size):
+def elf_segments(stream, size):
     header = stream.read(64)
     require(len(header) == 64 and header[:7] == b"\x7fELF\x02\x01\x01", "elf-header")
     kind, arch, version = struct.unpack_from("<HHI", header, 16)
@@ -258,12 +266,33 @@ def inspect_elf(stream, size):
     segments = [struct.unpack("<IIQQQQQQ", stream.read(56)) for _ in range(count)]
     require(any(item[0] == 1 and item[1] & 1 for item in segments), "elf-load")
     require(all(item[2] <= size and item[5] <= size - item[2] for item in segments), "elf-segments")
+    return segments
+
+
+def elf_interpreter(stream, segments, *, required):
     loaders = [item for item in segments if item[0] == 3]
+    if not loaders and not required:
+        return
     require(len(loaders) == 1 and 1 < loaders[0][5] <= 128, "elf-interpreter")
     stream.seek(loaders[0][2])
     loader = stream.read(loaders[0][5])
     require(loader == b"/lib64/ld-linux-x86-64.so.2\0", "elf-interpreter")
+
+
+def inspect_elf(stream, size):
+    elf_interpreter(stream, elf_segments(stream, size), required=True)
     stream.seek(0)
+
+
+def dynamic_elf(path, owners):
+    with open_artifact(path, owners, 512*MIB) as (stream, metadata):
+        header = stream.read(18)
+        if not header.startswith(b"\x7fELF") or header[16:18] == b"\x01\x00":
+            return False
+        stream.seek(0)
+        segments = elf_segments(stream, metadata.st_size)
+        elf_interpreter(stream, segments, required=False)
+        return any(segment[0] == 2 for segment in segments)
 
 
 def stream_hash(stream, size, end, output=None):
@@ -423,6 +452,48 @@ def select_daemon(target_raw, workspace, owner, proof_root, identity, end):
     return path, digest
 
 
+def select_anchor_probe(target_raw, workspace, owner, proof_root, identity, end):
+    target = Path(target_raw) if target_raw else workspace / "target"
+    owners = (0, owner)
+    proof = {}
+    timestamps = {}
+    for name, limit in (("c16-anchor-build.jsonl", 64*MIB), ("c16-anchor-receipt.json", 8192)):
+        with open_artifact(proof_root / name, owners, limit) as (stream, metadata):
+            proof[name] = stream.read(metadata.st_size + 1)
+            require(len(proof[name]) == metadata.st_size, "anchor-proof-size")
+            timestamps[name] = metadata.st_mtime_ns
+    raw = proof["c16-anchor-build.jsonl"]
+    receipt = json.loads(proof["c16-anchor-receipt.json"], object_pairs_hook=unique_pairs)
+    require(set(receipt) == {"schema", "head", "run", "attempt", "target_dir", "executable",
+                             "sha256", "bytes", "messages_sha256", "selector"}
+            and receipt["schema"] == "arxcovo/c16-anchor/1" and receipt["selector"] == ANCHOR_TEST
+            and all(receipt[key] == identity[key] for key in ("head", "run", "attempt"))
+            and receipt["target_dir"] == target.as_posix()
+            and receipt["messages_sha256"] == hashlib.sha256(raw).hexdigest(), "anchor-receipt")
+    path = Path(receipt["executable"])
+    require(path.parent == target / "debug/deps" and re.fullmatch(r"arxd-[a-f0-9]{16}", path.name),
+            "anchor-path")
+    manifest = (workspace / "crates/arxd/Cargo.toml").as_posix()
+    lines = raw.splitlines()
+    require(1 <= len(lines) <= 50000, "anchor-build-lines")
+    rows = [json.loads(line, object_pairs_hook=unique_pairs) for line in lines if line.strip()]
+    linked = [row.get("executable") for row in rows if row.get("reason") == "compiler-artifact"
+              and row.get("manifest_path") == manifest and row["target"]["name"] == "arxd"
+              and row["target"]["kind"] == ["lib"] and row["profile"]["test"] is True]
+    require(linked == [path.as_posix()]
+            and [row.get("success") for row in rows if row.get("reason") == "build-finished"] == [True]
+            and timestamps["c16-anchor-receipt.json"] >= timestamps["c16-anchor-build.jsonl"],
+            "anchor-build-messages")
+    require(type(receipt["bytes"]) is int and re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"]),
+            "anchor-digest")
+    with open_artifact(path, owners, 256*MIB, executable=True) as (stream, metadata):
+        require(metadata.st_size == receipt["bytes"], "anchor-size")
+        inspect_elf(stream, metadata.st_size)
+        digest = stream_hash(stream, metadata.st_size, end)
+        require(digest == receipt["sha256"], "anchor-digest")
+    return path, digest
+
+
 def allocate(path, size):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -483,6 +554,83 @@ def data_layout(root, node):
         path.chmod(0o644)
 
 
+
+def record_json(path, value, uid, mode):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    with os.fdopen(fd, "w", encoding="ascii") as output:
+        os.fchown(output.fileno(), uid, uid)
+        os.fchmod(output.fileno(), mode)
+        json.dump(value, output, separators=(",", ":"), ensure_ascii=True)
+
+
+def broker_settings():
+    daemon, build = ROLES["daemon"], ROLES["build"]
+    return {
+        "daemon_uid": daemon, "daemon_gid": daemon,
+        "daemon_roots": ["/data/" + name for name in
+                         ("cluster-work", "state", "credentials", "wrap", "history", "private", "activity")],
+        "service": {
+            "schema": "arxd-service/1", "client": {"identity": str(daemon)},
+            "build_account": {"name": "arx-build", "identity": str(build), "gid": build},
+            "rights": "standard", "workspace": "/data/workspace",
+            "environment": {"PATH": "/fixture/tools:/usr/bin", "HOME": "/data/home",
+                            "CARGO_HOME": "/data/home"},
+            "limits": {"max_concurrent_runs": 1, "memory_bytes": INNER["memory"], "pids": INNER["pids"]},
+            "agents": [{"principal": "qualification", "token_sha256": "0" * 64}],
+            "granted_batch_right": False,
+        },
+    }
+
+
+def node_endpoint(node, service):
+    return f'{NETWORK["nodes"][node][0]}:{NETWORK["ports"][service]}'
+
+
+def build_descriptor(slot="ordinary"):
+    return {"workspace": slot, "tool": "cargo", "args": CARGO_ARGS, "timeout_s": 12, "output_bytes": 1024}
+
+
+def install_live(root, node, *, founder_key=None):
+    owner, daemon, build, agent = (ROLES[role] for role in ("owner", "daemon", "build", "agent"))
+    require(node in ("a", "b", "c") and (node == "b") == (founder_key is not None), "installation-node")
+    private = ("cluster-work", "state", "credentials", "wrap", "history", "private/custody")
+    for name in private:
+        private_directory(root / name, 0o700, daemon, daemon)
+    settings = dict(zip(("workspace", "state", "credentials", "wrap", "history", "custody"),
+                        ("/data/" + name for name in private)))
+    settings.update(owner_socket="/run/c16/owner/socket", owner_uid=owner, owner_gid=owner,
+                    daemon_uid=daemon, daemon_gid=daemon, build_uid=build, agent_uid=agent,
+                    peer=node_endpoint(node, "peer"), enrollment=node_endpoint(node, "enrollment"),
+                    founder_cluster=[16] * 16 if node == "a" else None,
+                    issuer_peer=None if node == "a" else node_endpoint("a", "peer"),
+                    executor_socket="/fixture/control/executor.sock" if node == "b" else None)
+    if node != "c":
+        private_directory(root / "activity", 0o700, daemon, daemon)
+        private_directory(root / "clients", 0o700, agent, agent)
+        agents = []
+        for name in ("fixture", "foreign"):
+            token = secrets.token_hex(32)
+            agents.append({"uid": agent, "principal": name, "agent": name,
+                           "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest()})
+            record_json(root / "clients" / f"{name}.json", {
+                "address": "/run/c16/mcp/socket", "expected_server_identity": str(daemon),
+                "token": token, "delegated": {"owner_uid": owner, "daemon_uid": daemon, "agent_group": agent},
+            }, agent, 0o400)
+        grants = []
+        if node == "b":
+            require(len(founder_key) == 32 and all(type(b) is int and 0 <= b <= 255 for b in founder_key)
+                    and any(founder_key), "founder-public-key")
+            grants.append({"source": 1, "key": founder_key, "agent": "fixture",
+                           "commands": [build_descriptor(slot) for slot in ("ordinary", "link", "writable")]})
+            (root / "workspace/link").symlink_to("ordinary")
+            private_directory(root / "workspace/writable", 0o775)
+        settings["delegated_build"] = {
+            "socket": "/run/c16/mcp/socket", "activity": "/data/activity", "peer": node_endpoint(node, "build"),
+            "agent_group": agent, "agents": agents, "grants": grants,
+            "routes": [{"node": 2 if node == "a" else 1, "address": node_endpoint("b" if node == "a" else "a", "build")}],
+        }
+    record_json(root / "install.json", settings, daemon, 0o400)
+
 def host_file(path, roots, owners=(0,)):
     canonical = path.resolve(strict=True)
     require(any(canonical.is_relative_to(root) for root in roots), "host-file-closure")
@@ -522,7 +670,71 @@ def stage_compiler_path(raw_value, *, resolve=None, links=("bin", "lib", "lib64"
     return relative, traversed_dirs
 
 
-def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
+def gnu_linker_inputs(path, owners):
+    with open_artifact(path, owners, 512*MIB) as (stream, metadata):
+        if stream.read(4) == b"\x7fELF":
+            return []
+        require(metadata.st_size <= 8192, "linker-script-size")
+        stream.seek(0)
+        script = re.sub(rb"/\*.*?\*/", b" ", stream.read(8193), flags=re.S)
+    # The pinned libc and GCC entry points use OUTPUT_FORMAT and GROUP/INPUT.
+    match = re.fullmatch(
+        rb"\s*(?:OUTPUT_FORMAT\s*\([a-zA-Z0-9_-]+\)\s*)?"
+        rb"(?:GROUP|INPUT)\s*\(([a-zA-Z0-9_./()\s+-]+)\)\s*;?\s*", script,
+    )
+    require(match is not None, "linker-script-format")
+    body = re.sub(rb"AS_NEEDED\s*\(([^()]*)\)", rb"\1", match[1])
+    tokens = body.split()
+    require(1 <= len(tokens) <= 16 and all(re.fullmatch(
+        rb"(?:-l[a-zA-Z0-9_]+|(?:/(?:usr/)?lib(?:64)?/(?:[a-zA-Z0-9_.+-]+/)*)?"
+        rb"[a-zA-Z0-9_+-][a-zA-Z0-9_.+-]*\.(?:a|so(?:\.[0-9]+)*))", token
+    ) for token in tokens), "linker-script-input")
+    require(all(not {b".", b".."} & set(token.split(b"/")) for token in tokens), "linker-script-input")
+    return [token.decode("ascii") for token in tokens]
+
+
+def rust_image_input(path, toolchain, owners, binaries, rust_links):
+    canonical = host_file(path, (toolchain,), owners)
+    requested = "opt/rust/" + path.relative_to(toolchain).as_posix()
+    target = "opt/rust/" + canonical.relative_to(toolchain).as_posix()
+    binaries[target] = canonical
+    if requested != target:
+        rust_links[requested] = posixpath.relpath(target, posixpath.dirname(requested))
+
+
+def add_loader_closure(binaries, candidates, toolchain, owners, end, vetted, rust_links=None):
+    usr = Path("/usr")
+    for executable in dict.fromkeys(candidates):
+        if rust_links is not None and not dynamic_elf(executable, owners):
+            continue
+        # Only the named system/toolchain objects and the bootstrap enter ldd.
+        env = {**ENV, "LD_LIBRARY_PATH": str(toolchain / "lib")} if executable.is_relative_to(toolchain) else ENV
+        closure = host_command("ldd", end, executable, env=env, tools=vetted, limit=8192)
+        if closure.strip() == "statically linked":
+            continue
+        for record in closure.splitlines():
+            if re.fullmatch(r"\s*linux-vdso\.so\.1 \(0x[0-9a-f]+\)", record):
+                continue
+            match = re.fullmatch(r"\s*(?:[\w.+-]+ => )?(/[^ ]+) \(0x[0-9a-f]+\)", record)
+            require(match is not None, "loader-closure")
+            source = Path(match[1])
+            if source.is_relative_to(toolchain):
+                if rust_links is not None:
+                    rust_image_input(source, toolchain, owners, binaries, rust_links)
+                else:
+                    relative = Path("opt/rust") / source.relative_to(toolchain)
+                    binaries[relative.as_posix()] = host_file(source, (toolchain, usr), owners)
+            else:
+                require(any(source.is_relative_to(directory) for directory in (
+                    "/lib", "/lib64", "/usr/lib", "/usr/lib64",
+                )), "loader-path")
+                relative = source.relative_to("/")
+                if relative.parts[0] in ("lib", "lib64"):
+                    relative = Path("usr") / relative
+                binaries[relative.as_posix()] = host_file(source, (usr,), owners)
+
+
+def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted, *, anchor=None):
     """Populate a merged-/usr tree from named inputs and their loader closure."""
     rootfs = host["rootfs"]
     require(rootfs["userland"] == host["host"]["os"], "offline-userland-input")
@@ -541,85 +753,128 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
         "usr/bin/cc": compiler, "usr/bin/as": host_file(Path("/usr/bin/as"), usr),
         "usr/bin/ld": host_file(Path("/usr/bin/ld"), usr),
     }
-    compiler_inputs = ("cc1", "collect2", "libgcc.a", "libgcc_s.so", "crtbegin.o", "crtbeginS.o",
-                       "crtend.o", "crtendS.o", "crti.o", "crtn.o", "crt1.o", "Scrt1.o", "libc.so",
-                       "libc_nonshared.a")
-    compiler_exec = []
-    for name in compiler_inputs:
-        argument = "-print-prog-name" if name in ("cc1", "collect2") else "-print-file-name"
-        value = capture([compiler, f"{argument}={name}"], end, limit=2048).decode("ascii").strip()
+    compiler_programs = ("cc1", "collect2")
+    compiler_inputs = ("libgcc.a", "libgcc_s.so", "crtbegin.o", "crtbeginS.o", "crtend.o", "crtendS.o",
+                       "crti.o", "crtn.o", "crt1.o", "Scrt1.o", "libc.so", "libc_nonshared.a")
+    if anchor:
+        compiler_programs += ("lto-wrapper",)
+        compiler_inputs += ("liblto_plugin.so", "libgcc_eh.a", "libgcc_s.so.1", "libm.so", "libmvec.so.1",
+                            "libpthread.a", "libdl.a", "librt.a", "libutil.a", "libresolv.so")
+        for name in ("as", "ld"):
+            target = f"x86_64-linux-gnu-{name}"
+            binaries[f"usr/bin/{target}"] = host_file(Path("/usr/bin") / target, usr)
+        binaries[f"usr/bin/{compiler.name}"] = compiler
+        binaries["usr/bin/gcc"] = compiler
+
+    def add_compiler_path(value):
         relative, traversed_dirs = stage_compiler_path(value, resolve=lambda item: host_file(Path(item), usr))
-        source = host_file(Path("/") / relative, usr)
+        binaries[relative] = host_file(Path("/") / relative, usr)
         for directory in traversed_dirs:
             (tree / directory).mkdir(mode=0o755, parents=True, exist_ok=True)
-        binaries[relative] = source
-        if name in ("cc1", "collect2"):
-            compiler_exec.append(source)
-    for name in ("cargo", "rustc"):
-        binaries[f"opt/rust/bin/{name}"] = host_file(toolchain / "bin" / name, (toolchain,), (0, host_uid))
-    compiler_files = set(binaries)
+        return relative
+
+    lookup = {}
+    for name in (*compiler_programs, *compiler_inputs):
+        argument = "-print-prog-name" if name in compiler_programs else "-print-file-name"
+        value = capture([compiler, f"{argument}={name}"], end, limit=2048).decode("ascii").strip()
+        lookup[name] = add_compiler_path(value)
+
+    owners = (0, host_uid)
+    if anchor:
+        # Noble ships the plugin in libexec with a lib/gcc alias. Retain both
+        # locations used by the relocated GCC driver and collect2.
+        plugin = binaries[lookup["liblto_plugin.so"]]
+        exec_root = Path("/usr/libexec/gcc")
+        require(plugin.is_relative_to(exec_root), "gcc-plugin-layout")
+        alias = Path("/usr/lib/gcc") / plugin.relative_to(exec_root)
+        require(host_file(alias, usr) == plugin, "gcc-plugin-alias")
+        add_compiler_path(plugin.as_posix())
+        add_compiler_path(alias.as_posix())
+
+        for name in ("libc.so", "libm.so", "libgcc_s.so"):
+            for dependency in gnu_linker_inputs(binaries[lookup[name]], owners):
+                if dependency.startswith("/"):
+                    add_compiler_path(dependency)
+                else:
+                    pinned = f"lib{dependency[2:]}.a" if dependency.startswith("-l") else dependency
+                    require(pinned in lookup, "linker-script-search-input")
     rust_libs = toolchain / "lib"
     allowed_rust = [*sorted(rust_libs.glob("*.so*"))]
     name = "x86_64-unknown-linux-gnu"
     for group in ("lib", "bin"):
         arch = rust_libs / "rustlib" / name / group
         require(arch.is_dir(), "rust-target")
-        allowed_rust.extend(item for item in arch.rglob("*") if not item.is_dir())
+        allowed_rust.extend(sorted(item for item in arch.rglob("*") if not item.is_dir()))
     require(5 <= len(allowed_rust) <= 128, "rust-closure-count")
-    for path in allowed_rust:
-        binaries[str(Path("opt/rust") / path.relative_to(toolchain))] = host_file(path, (toolchain,), (0, host_uid))
+    rust_links = {}
+    for path in [toolchain / "bin" / "cargo", toolchain / "bin" / "rustc", *allowed_rust]:
+        if anchor:
+            rust_image_input(path, toolchain, owners, binaries, rust_links)
+        else:
+            relative = Path("opt/rust") / path.relative_to(toolchain)
+            binaries[relative.as_posix()] = host_file(path, (toolchain,), owners)
+    if anchor:
+        linker_dir = f"opt/rust/lib/rustlib/{name}/bin/"
+        require(all(linker_dir + name in binaries or linker_dir + name in rust_links
+                    for name in ("rust-lld", "gcc-ld/ld.lld")), "rust-linker-path")
     helper = stage / "bootstrap"
     host_command("cc", end, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
                  "-o", helper, stage / "bootstrap.c", tools=vetted, limit=8192)
     binaries["fixture/probe"] = helper
-    for executable in [helper, compiler, *compiler_exec, binaries["usr/bin/sh"], binaries["usr/bin/as"],
-                       binaries["usr/bin/ld"], binaries["opt/rust/bin/cargo"], binaries["opt/rust/bin/rustc"]]:
-        # ldd runs only on the fixed compiler/toolchain and our inert helper. The
-        # selected daemon never enters this execution path.
-        env = {**ENV, "LD_LIBRARY_PATH": str(rust_libs)} if executable.is_relative_to(toolchain) else ENV
-        closure = host_command("ldd", end, executable, env=env, tools=vetted, limit=8192)
-        for record in closure.splitlines():
-            if re.fullmatch(r"\s*linux-vdso\.so\.1 \(0x[0-9a-f]+\)", record):
-                continue
-            match = re.fullmatch(r"\s*(?:[\w.+-]+ => )?(/[^ ]+) \(0x[0-9a-f]+\)", record)
-            require(match is not None, "loader-closure")
-            source = Path(match[1])
-            if source.is_relative_to(toolchain):
-                relative = Path("opt/rust") / source.relative_to(toolchain)
-            else:
-                require(source.is_relative_to("/lib") or source.is_relative_to("/lib64")
-                        or source.is_relative_to("/usr/lib") or source.is_relative_to("/usr/lib64"),
-                        "loader-path")
-                relative = source.relative_to("/")
-                if relative.parts[0] in links:
-                    relative = Path("usr") / relative
-            binaries[str(relative)] = host_file(source, (toolchain, *usr), (0, host_uid))
-    require(len(binaries) <= 256, "image-inventory")
+    if anchor:
+        add_loader_closure(binaries, tuple(binaries.values()), toolchain, owners, end, vetted, rust_links)
+    else:
+        candidates = [helper, compiler, *(binaries[lookup[name]] for name in compiler_programs),
+                      *(binaries[name] for name in ("usr/bin/sh", "usr/bin/as", "usr/bin/ld",
+                                                    "opt/rust/bin/cargo", "opt/rust/bin/rustc"))]
+        add_loader_closure(binaries, candidates, toolchain, owners, end, vetted)
+    require(len(binaries) + len(rust_links) <= 256, "image-inventory")
+    require(not (binaries.keys() & rust_links.keys()), "rust-image-alias")
     for relative, source in sorted(binaries.items()):
         path = tree / relative
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         mode = 0o755 if source.stat().st_mode & 0o100 else 0o644
         hashes[relative] = stage_copy(source, path, end, (0, host_uid), mode=mode)
+    for name, target in rust_links.items():
+        link = tree / name
+        link.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        link.symlink_to(target)
+    links.update(rust_links)
     hashes["fixture/arxd"] = stage_copy(daemon, tree / "fixture/arxd", end, (0, host_uid),
-                                       elf=True, mode=0o400, limit=256*MIB)
-    require(compiler_files <= hashes.keys() and "usr/lib64/ld-linux-x86-64.so.2" in hashes,
-            "image-loader")
+                                       elf=True, mode=0o755 if anchor else 0o400, limit=256*MIB)
+    if anchor:
+        hashes["fixture/c16-anchor"] = stage_copy(anchor[0], tree / "fixture/c16-anchor", end, (0, host_uid),
+                                                 elf=True, mode=0o755, limit=256*MIB)
+        require(hashes["fixture/c16-anchor"] == anchor[1], "anchor-digest-drift")
+        (tree / "fixture/tools").mkdir(mode=0o755)
+        wrapper = tree / "fixture/tools/cargo"
+        shutil.copyfile(tree / "fixture/probe", wrapper)
+        wrapper.chmod(0o755)
+        hashes["fixture/tools/cargo"] = file_digest(wrapper, end, MIB)
+        private_directory(tree / "fixture/broker", 0o700)
+        private_directory(tree / "fixture/control", 0o755)
+        record_json(tree / "fixture/broker/settings.json", broker_settings(), 0, 0o400)
+        hashes["fixture/broker/settings.json"] = file_digest(tree / "fixture/broker/settings.json", end, 8192)
+    require("usr/lib64/ld-linux-x86-64.so.2" in hashes, "image-loader")
     for path in sorted((tree / "etc").iterdir()):
         hashes[str(path.relative_to(tree))] = file_digest(path, end, 8192)
     manifest = {"files": hashes, "links": links}
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("ascii")
+    require(len(manifest_bytes) <= MANIFEST_LIMIT, "image-manifest-bound")
     (tree / "fixture/manifest").write_bytes(manifest_bytes)
     return manifest, hashlib.sha256(manifest_bytes).hexdigest()
 
 
 def verify_manifest(root, manifest, digest, end):
-    raw = bounded_read(root / "fixture/manifest", 32768)
+    raw = bounded_read(root / "fixture/manifest", MANIFEST_LIMIT)
     require(hashlib.sha256(raw).hexdigest() == digest
             and json.loads(raw, object_pairs_hook=unique_pairs) == manifest, "manifest-digest")
     for name, destination in manifest["links"].items():
         path = root / name
+        relative = PurePosixPath(posixpath.normpath(posixpath.join(posixpath.dirname(name), destination)))
+        require(not relative.is_absolute() and ".." not in relative.parts, "image-link")
         require(path.is_symlink() and os.readlink(path) == destination
-                and path.resolve(strict=True) == root / destination, "merged-usr")
+                and path.resolve(strict=True) == root / relative.as_posix(), "image-link")
     for name, expected in manifest["files"].items():
         require(file_digest(root / name, end, 512*MIB) == expected, "loaded-image-digest")
 

@@ -1,12 +1,14 @@
-"""Attributed hosted-only resources for the zero-daemon R2 exercise."""
+"""Attributed hosted-only resources for R2 containment and live C16."""
 
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -23,6 +25,10 @@ LIVENESS_GATES = {
     ("c", "boot0"): ("c0", "boot0"),
     ("b", "boot1"): ("b1", "boot1"),
     ("b", "daemon/listeners1"): ("b1", "listeners1"),
+    ("a", "live2"): ("a2", "live-boot"),
+    ("b", "live2"): ("b2", "live-boot"),
+    ("c", "live2"): ("c2", "live-boot"),
+    ("a", "live3"): ("a3", "live-restart"),
 }
 BOOTSTRAP_MESSAGE = re.compile(r"R2 bootstrap ([a-z0-9-]{1,40}) errno=([0-9]{1,4})")
 # Keep this vocabulary aligned with bootstrap.c. Text with the right shape
@@ -51,6 +57,16 @@ BOOTSTRAP_CATEGORIES = frozenset("""
     socket-denial sole-pid status-key status-value stdin stdin-device systemd-cgroup-owner
     systemd-placement tcp-control udp-control unexpected-acl-xattr unexpected-probe-exit
     version-cargo version-cc version-exec version-output version-rustc workspace-root workspace-slot-mount
+    live-broker-exit live-broker-socket live-build-ack live-build-arguments
+    live-build-cgroup live-build-cwd live-build-leaf live-build-pid
+    live-build-private live-build-replacement live-build-role live-build-socket
+    live-cargo-exec live-chroot live-command-exec live-command-wait
+    live-fds live-frame live-keepcaps live-mcp-socket
+    live-membership live-namespaces live-owner-action live-owner-connect
+    live-owner-eof live-owner-input live-owner-peer live-owner-reply
+    live-owner-shutdown live-owner-socket live-pid live-pidfd
+    live-root live-target live-tty live-unit
+    live-wait
 """.split())
 
 
@@ -92,8 +108,20 @@ def token(receipt):
     return hashlib.sha256(raw.encode("ascii")).hexdigest()[:16]
 
 
+def check_host_routes(rows):
+    network = ipaddress.ip_network(NETWORK["nodes"]["a"][0] + "/24", strict=False)
+    for row in rows:
+        require(isinstance(row, dict), "host-route-shape")
+        destination = row.get("dst")
+        if destination in ("default", "0.0.0.0/0"):
+            continue  # A routing fallback claims no specific address range.
+        require(isinstance(destination, str), "host-route-shape")
+        route = ipaddress.IPv4Network(destination, strict=False)
+        require(not network.overlaps(route), "host-route-collision")
+
+
 class Resources:
-    def __init__(self, receipt, pins, tools=None):
+    def __init__(self, receipt, pins, tools=None, *, live=False):
         self.id = token(receipt)
         self.root = Path("/var/lib") / f"arx-r2-{self.id}"
         self.bridge = "r2" + self.id[:11]
@@ -102,6 +130,11 @@ class Resources:
         self.links = {node: f"{self.bridge}{node}" for node in "abc"}
         self.budget = pins["rootfs"]
         self.tools = tools
+        self.live = live
+        self.nodes = {}
+        self.daemons = {}
+        self.probe_units = []
+        self.node_links = {}
         self.cleanup_stack = []
         self.facts = {}
         self.failure_diagnostic = None
@@ -302,6 +335,7 @@ class Resources:
         require(len(rows) == 1 and rows[0]["ifindex"] == state["index"]
                 and rows[0].get("ifalias") == self.table, "link-attribution")
         state["tagged"] = True
+        return state["index"]
 
     def remove_link(self, name, index, end, *, tagged=True, expected_kind=None, expected_mac=None,
                     peer_node=None, peer_ns_identity=None):
@@ -389,24 +423,43 @@ class Resources:
         self.add_link(self.bridge, end, "address", NETWORK["local"][1], "type", "bridge",
                       "stp_state", "0", "mcast_snooping", "0", kind="bridge", mac=NETWORK["local"][1])
         self.ip(end, "link", "set", "dev", self.bridge, "addrgenmode", "none")
-        for node, (address, mac) in NETWORK["nodes"].items():
-            namespace = self.namespaces[node]
-            ns_identity = self.add_namespace(node, end)
-            link = self.links[node]
-            self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns", namespace,
-                          kind="veth", peer_node=node, peer_ns_identity=ns_identity)
-            self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
-            self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
-            self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
-            for other, (peer, peer_mac) in NETWORK["nodes"].items():
-                if other != node:
-                    self.ns(end, node, "neigh", "add", peer, "lladdr", peer_mac, "nud", "permanent", "dev", "eth0")
+        for node in NETWORK["nodes"]:
+            self.make_endpoint(node, end)
+
+    def make_endpoint(self, node, end):
+        address, mac = NETWORK["nodes"][node]
+        ns_identity = self.add_namespace(node, end)
+        link = self.links[node]
+        index = self.add_link(link, end, "type", "veth", "peer", "name", "eth0", "netns",
+                              self.namespaces[node], kind="veth", peer_node=node, peer_ns_identity=ns_identity)
+        self.node_links[node] = (ns_identity, index)
+        self.ip(end, "link", "set", "dev", link, "master", self.bridge, "addrgenmode", "none")
+        self.ns(end, node, "link", "set", "dev", "eth0", "address", mac, "addrgenmode", "none")
+        self.ns(end, node, "address", "add", f"{address}/24", "dev", "eth0")
+        for other, (peer, peer_mac) in NETWORK["nodes"].items():
+            if other != node:
+                self.ns(end, node, "neigh", "add", peer, "lladdr", peer_mac, "nud", "permanent", "dev", "eth0")
+
+    def drop_founder_endpoint(self, end):
+        identity, index = self.node_links["a"]
+        require("a" not in self.nodes and type(index) is int, "founder-net-attribution")
+        self.remove_link(self.links["a"], index, end)
+        self.remove_namespace("a", identity, end)
+        del self.node_links["a"]
+        self.old_founder_link = index
+
+    def restore_founder_endpoint(self, end):
+        require("a" not in self.node_links and "a" not in self.nodes, "founder-net-residue")
+        self.make_endpoint("a", end)
+        require(self.node_links["a"][1] != self.old_founder_link, "founder-link-reused")
+        self.activate_endpoint("a", end)
+        self.endpoint_inventory(end, temporary=False)
 
     def nft(self, end, *args):
         return self.cmd("nft", end, *args)
 
     def apply_policy(self, end):
-        rules = policy(self.bridge, self.links)
+        rules = policy(self.bridge, self.links, live=self.live)
         lines = []
         for family, entries in rules.items():
             lines.append(f"table {family} {self.table} {{")
@@ -463,10 +516,13 @@ class Resources:
 
     def activate(self, end):
         self.ip(end, "link", "set", "dev", self.bridge, "up")
-        for node, link in self.links.items():
-            self.ip(end, "link", "set", "dev", link, "up")
-            self.ns(end, node, "link", "set", "dev", "lo", "up")
-            self.ns(end, node, "link", "set", "dev", "eth0", "up")
+        for node in self.links:
+            self.activate_endpoint(node, end)
+
+    def activate_endpoint(self, node, end):
+        self.ip(end, "link", "set", "dev", self.links[node], "up")
+        self.ns(end, node, "link", "set", "dev", "lo", "up")
+        self.ns(end, node, "link", "set", "dev", "eth0", "up")
 
     def synthetic(self, end):
         """Endpoints exist only on C or on the fixture bridge during the probes."""
@@ -584,19 +640,20 @@ class Resources:
         require(not cgroup.exists(), "unit-cgroup-residue")
 
     def start(self, instance, end):
-        require(instance in ("a0", "b0", "b1", "c0"), "boot-instance")
+        live = instance in ("a2", "b2", "c2", "a3")
+        require(instance in ("a0", "b0", "b1", "c0") or (live and self.live), "boot-instance")
         unit = f"arx-r2-{self.id}-{instance}.service"
         require(self.unit_info(unit, end).get("LoadState") == "not-found", "unit-preexisting")
         properties = {
             "Type": "exec", "Delegate": "memory pids", "CPUQuota": "100%", "MemoryMax": "512M",
             "MemorySwapMax": "0", "TasksMax": "128", "LimitNOFILE": "128", "LimitCORE": "0",
-            "RuntimeMaxSec": "34s", "TimeoutStopSec": "1s", "KillMode": "control-group", "Restart": "no",
+            "RuntimeMaxSec": "240s" if live else "34s", "TimeoutStopSec": "1s", "KillMode": "control-group", "Restart": "no",
             "StandardInput": "null", "StandardOutput": "journal", "StandardError": "journal",
         }
         args = [f"--property={name}={value}" for name, value in properties.items()]
         try:
             self.cmd("unit", end, "--quiet", "--unit", unit, *args,
-                     self.root / "bootstrap", "boot", self.id, instance)
+                     self.root / "bootstrap", "live-boot" if live else "boot", self.id, instance)
         finally:
             # An incomplete launch still owns any attributable invocation under the
             # freshly reserved name, which must go through the same stop checks.
@@ -608,7 +665,10 @@ class Resources:
         validate_unit(unit, facts)
         group = Path("/sys/fs/cgroup") / facts["ControlGroup"].lstrip("/")
         observe_limits(group)
-        return unit, invocation, int(facts["MainPID"])
+        process = unit, invocation, int(facts["MainPID"])
+        if not live:
+            self.probe_units.append(process)
+        return process
 
     def diagnose_exit(self, node, path, unit, invocation, end):
         instance, gate = LIVENESS_GATES[node, path]
@@ -689,9 +749,9 @@ class Resources:
         require(restarted[2] != b[2], "restart-process-identity")
         self.facts["restart"] = "same-data-fresh-run"
 
-    def check_namespace(self, node, unit, pid, end):
+    def check_namespace(self, node, unit, pid, end, *, live=False):
         remaining(end)
-        require(re.fullmatch(rf"arx-r2-{self.id}-{node}[01]\.service", unit), "unit-attribution")
+        require(re.fullmatch(rf"arx-r2-{self.id}-{node}[0123]\.service", unit), "unit-attribution")
         outer = Path(f"/proc/{pid}")
         children = bounded_read(outer / f"task/{pid}/children", 1024).decode("ascii").split()
         require(len(children) == 1 and re.fullmatch(r"[1-9][0-9]{0,9}", children[0]), "namespace-init")
@@ -701,7 +761,7 @@ class Resources:
                 "namespace-init-pid")
         check_security_status(status, 0, 0)
         check_mount_inventory(bounded_read(init / "mountinfo", 8192).decode("ascii"), node == "b",
-                              cgroup_root=f"/system.slice/{unit}")
+                              cgroup_root=f"/system.slice/{unit}", live=live)
         for namespace in ("mnt", "uts", "ipc", "pid", "net", "cgroup"):
             actual = (init / "ns" / namespace).stat().st_ino
             require(actual != (Path("/proc/self/ns") / namespace).stat().st_ino, "namespace-host-alias")
@@ -716,7 +776,10 @@ class Resources:
             cgroup = bounded_read(outer / "cgroup", 256).decode("ascii").strip()
             require(cgroup == f"0::/system.slice/{unit}/init", "broker-host-membership")
             delegate = Path("/sys/fs/cgroup") / cgroup[4:].removesuffix("/init") / "system.slice/arxd.service"
+            if live:
+                return init, delegate
             self.facts[node]["broker"] = self.check_delegate(delegate, init)
+        return init, None
 
     @staticmethod
     def check_delegate(unit, init):
@@ -778,6 +841,150 @@ class Resources:
         stable_rules(counters, self.counters(end))
 
 
+    def retire_probes(self, end):
+        for unit, invocation, pid in reversed(self.probe_units):
+            self.stop_unit(unit, invocation, end)
+            require(not Path(f"/proc/{pid}").exists(), "probe-retire")
+        for namespace in self.namespaces.values():
+            require(not self.ip(end, "netns", "pids", namespace).strip(), "probe-netns-residue")
+        self.endpoint_inventory(end, temporary=False)
+
+    def start_live(self, instance, end):
+        node = instance[0]
+        require(self.live and node not in self.nodes, "duplicate-live-node")
+        process = self.start(instance, end)
+        self.event(node, f"live{instance[1]}", b"c16-init-v1\n", end, process=process)
+        init, delegate = self.check_namespace(node, process[0], process[2], end, live=True)
+        root = init / "root"
+        require(os.path.samestat((root / "fixture/arxd").stat(), (self.root / "root/fixture/arxd").stat()),
+                "live-root-identity")
+        data = self.root / node
+        require(os.path.samestat((root / "data").stat(), data.stat()), "live-data-identity")
+        self.nodes[node] = instance, process, init, delegate
+        if delegate:
+            self.broker(node, end)
+        launcher = self.spawn_live(node, "daemon", end)
+        self.daemons[node] = launcher
+        self.remember(f"daemon-{instance}", lambda deadline: self.reap_live(launcher, deadline))
+        self.wait_socket(node, "/run/c16/owner/socket", (21071, 21070), end, launcher)
+
+    def spawn_live(self, node, action, end, **stdio):
+        instance, (unit, invocation, pid), init, _ = self.nodes[node]
+        facts = self.attributed_unit(unit, invocation, end)
+        require(facts["MainPID"] == str(pid) and init.is_dir(), "live-unit-attribution")
+        return subprocess.Popen([self.root / "bootstrap", "enter", self.id, instance, init.name, action],
+                                env={"PATH": "/usr/bin", "LC_ALL": "C"}, close_fds=True,
+                                stdin=stdio.get("stdin", subprocess.DEVNULL),
+                                stdout=stdio.get("stdout", subprocess.DEVNULL),
+                                stderr=subprocess.DEVNULL)
+
+    @staticmethod
+    def reap_live(process, end):
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=remaining(end))
+
+    def wait_path(self, node, path, end, process=None):
+        result = self.nodes[node][2] / "root" / path.removeprefix("/")
+        while True:
+            remaining(end)
+            if process is not None:
+                require(process.poll() is None, "live-process-exit")
+            if result.exists():
+                return result
+            time.sleep(0.015)
+
+    def wait_socket(self, node, name, account, end, process=None):
+        endpoint = self.wait_path(node, name, end, process)
+        while True:
+            mode = endpoint.lstat()
+            require(stat.S_ISSOCK(mode.st_mode) and mode.st_uid == account[0], "live-socket-type")
+            if (mode.st_gid, stat.S_IMODE(mode.st_mode)) == (account[1], 0o660):
+                return endpoint
+            if process is not None:
+                require(process.poll() is None, "live-process-exit")
+            time.sleep(min(0.01, remaining(end)))
+
+    def daemon_identity(self, node, end):
+        _, (unit, invocation, main), init, _ = self.nodes[node]
+        launcher = self.daemons[node]
+        require(launcher.poll() is None and self.attributed_unit(unit, invocation, end)["MainPID"] == str(main),
+                "daemon-unit-attribution")
+        launcher_path = Path(f"/proc/{launcher.pid}")
+        found = bounded_read(launcher_path / f"task/{launcher.pid}/children", 64).split()
+        require(len(found) == 1 and re.fullmatch(rb"[1-9][0-9]{0,9}", found[0]), "daemon-child")
+        pid = int(found[0])
+        path = Path(f"/proc/{pid}")
+        require(os.path.samestat((path / "exe").stat(), (self.root / "root/fixture/arxd").stat())
+                and (path / "ns/pid").stat().st_ino == (init / "ns/pid").stat().st_ino
+                and bounded_read(path / "cgroup", 256) == f"0::/system.slice/{unit}/init\n".encode("ascii"),
+                "daemon-process-attribution")
+        status = bounded_read(path / "status", 8192).decode("ascii")
+        check_security_status(status, 0, 21071)
+        match = re.search(r"^NSpid:\s+" + str(pid) + r"\s+([1-9][0-9]{0,9})$", status, re.M)
+        require(match is not None, "daemon-namespace-pid")
+        return pid, int(match[1])
+
+    def broker(self, node, end):
+        _, (_, _, _), init, delegate = self.nodes[node]
+        require(node == "b" and delegate is not None, "live-broker-node")
+        self.wait_socket(node, "/fixture/control/executor.sock", (0, 21071), end)
+        raw = bounded_read(delegate / "supervisor/cgroup.procs", 64)
+        require(re.fullmatch(rb"[1-9][0-9]{0,9}\n", raw), "live-broker-sole-pid")
+        pid = int(raw)
+        process = Path(f"/proc/{pid}")
+        status = bounded_read(process / "status", 8192).decode("ascii")
+        check_security_status(status, 193, 0)
+        match = re.search(r"^NSpid:\s+" + str(pid) + r"\s+([1-9][0-9]{0,9})$", status, re.M)
+        require(match and os.path.samestat((process / "exe").stat(), (self.root / "root/fixture/arxd").stat())
+                and (process / "ns/pid").stat().st_ino == (init / "ns/pid").stat().st_ino,
+                "live-broker-attribution")
+        runs = delegate / "runs"
+        metadata = runs.lstat()
+        require(stat.S_ISDIR(metadata.st_mode) and (metadata.st_uid, metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode)) == (0, 0, 0o700), "live-runs-identity")
+        for parent in (delegate, runs):
+            require({b"memory", b"pids"} <= set(bounded_read(parent / "cgroup.subtree_control", 256).split()),
+                    "live-broker-controllers")
+        require(os.getxattr(delegate, "user.delegate", follow_symlinks=False) == b"1"
+                and bounded_read(delegate / "cgroup.procs", 128) == b""
+                and bounded_read(delegate / "cgroup.type", 32) == b"domain\n", "live-broker-delegate")
+        return pid, int(match[1]), runs
+
+    @staticmethod
+    def signal_pid(pid, signum, end, verify):
+        pinned = os.pidfd_open(pid)
+        try:
+            require(verify() == pid, "signal-pid-attribution")
+            signal.pidfd_send_signal(pinned, signum)
+            poll = select.poll()
+            poll.register(pinned, select.POLLIN)
+            events = poll.poll(int(remaining(end)*1000))
+            require(len(events) == 1 and bool(events[0][1] & select.POLLIN), "signal-pid-exit")
+        finally:
+            os.close(pinned)
+
+    def stop_live(self, node, end, *, crash=False):
+        _, (unit, invocation, _), init, _ = self.nodes[node]
+        require(not crash or node == "a", "founder-loss-only")
+        stop = signal.SIGKILL if crash else signal.SIGTERM
+        self.signal_pid(self.daemon_identity(node, end)[0], stop, end,
+                        lambda: self.daemon_identity(node, end)[0])
+        require(self.daemons[node].wait(timeout=remaining(end)) == (137 if crash else 0), "daemon-exit-status")
+        if node == "b":
+            pid, _, runs = self.broker(node, end)
+            require(not any(path.is_dir() for path in runs.iterdir()), "broker-run-residue")
+            self.signal_pid(pid, signal.SIGTERM, end, lambda: self.broker(node, end)[0])
+            endpoint = init / "root/fixture/control/executor.sock"
+            require(not endpoint.exists() and not any(path.is_dir() for path in runs.iterdir()),
+                    "broker-drain")
+        self.stop_unit(unit, invocation, end)
+        require(not init.exists() and not self.ip(end, "netns", "pids", self.namespaces[node]).strip(),
+                "live-namespace-residue")
+        del self.nodes[node]
+        del self.daemons[node]
+
+
 def endpoint_inventory(node, address, mac, links, ipv4, ipv6, temporary):
     require(len(links) == 2 and {row["ifname"] for row in links} == {"eth0", "lo"}, "node-endpoints")
     eth = next(row for row in links if row["ifname"] == "eth0")
@@ -792,7 +999,7 @@ def endpoint_inventory(node, address, mac, links, ipv4, ipv6, temporary):
     for interface, expected in ((eth, expected_eth), (loopback, expected_lo)):
         observed = [(row["local"], row["prefixlen"]) for row in interface["addr_info"]]
         require(len(observed) == len(expected) and set(observed) == expected, "node-addresses")
-    routes = [("198.18.72.0/24", "eth0", None)]
+    routes = [("192.168.72.0/24", "eth0", None)]
     if temporary and node == "b":
         routes.extend(((NETWORK["outside"], "eth0", NETWORK["local"][0]),
                        (NETWORK["link_local"], "eth0", NETWORK["nodes"]["c"][0])))
@@ -858,7 +1065,7 @@ def observe_limits(group, root=Path("/sys/fs/cgroup")):
                     "cgroup-ancestor-cpu")
 
 
-def policy(bridge, links):
+def policy(bridge, links, *, live=False):
     nodes = NETWORK["nodes"]
     for node, link in links.items():
         require(node in nodes and re.fullmatch(r"r2[0-9a-f]{11}[abc]", link), "policy-interface")
@@ -872,8 +1079,12 @@ def policy(bridge, links):
                 f" ip saddr {source_ip} ip daddr {target_ip}")
     forward = []
     flows = (("peer", "b", "a"), ("enrollment", "b", "c"), ("build", "a", "b"))
+    if live:
+        flows += tuple((f"peer-{source}-{target}", source, target) for source in "abc" for target in "abc"
+                       if source != target and (source, target) != ("b", "a"))
+        flows += (("enrollment-b-a", "b", "a"), ("enrollment-c-a", "c", "a"))
     for name, source, target in flows:
-        service = NETWORK["ports"][name]
+        service = NETWORK["ports"][name.split("-")[0]]
         forward.extend(((name, f"{pair(source, target)} tcp dport {service}", "accept"),
                         (name + "-return", f"{pair(target, source)} tcp sport {service} ct state established", "accept")))
     b_ip, b_mac = nodes["b"]
@@ -1112,7 +1323,7 @@ def check_security_status(status, caps, uid):
             and "Groups" in fields and not fields["Groups"].strip(), "process-locks")
 
 
-def check_mount_inventory(contents, broker, cgroup_root="/"):
+def check_mount_inventory(contents, broker, cgroup_root="/", *, live=False):
     require(
         isinstance(cgroup_root, str)
         and (cgroup_root == "/"
@@ -1129,6 +1340,10 @@ def check_mount_inventory(contents, broker, cgroup_root="/"):
     if broker:
         delegate_root = "/system.slice/arxd.service" if cgroup_root == "/" else f"{cgroup_root}/system.slice/arxd.service"
         expected[cgroup + "/system.slice/arxd.service"] = ("cgroup2", delegate_root, "rw")
+    if live:
+        expected["/data/install.json"] = ("ext4", "/install.json", "ro")
+        if broker:
+            expected["/fixture/control"] = ("tmpfs", "/c16/control", "rw")
     observed = {}
     ids = set()
     for line in contents.splitlines():
