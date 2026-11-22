@@ -13,14 +13,18 @@ const ZERO: [u8; SECTOR] = [0; SECTOR];
 
 // Each identifier includes the extension separator and version, even when
 // its extension is empty. Directory order compares base name, then extension.
-const PRIMARY_NAMES: [&str; 5] = [
+const PRIMARY_NAMES: [&str; 7] = [
+    "ARXAUDIT.;1",
+    "ARXAUDIT.SVC;1",
     "ARXGUEST.;1",
     "ARXGUEST.SVC;1",
     "FINALIZE.;1",
     "METADATA.;1",
     "USERDATA.;1",
 ];
-const JOLIET_NAMES: [&str; 5] = [
+const JOLIET_NAMES: [&str; 7] = [
+    "arx-account-audit.;1",
+    "arx-account-audit.service;1",
     "arx-guest.;1",
     "arx-guest.service;1",
     "arx-finalize.;1",
@@ -35,13 +39,13 @@ struct Extent {
 }
 
 pub(super) struct Image<'a> {
-    files: [&'a [u8]; 5],
-    extents: [Extent; 5],
+    files: [&'a [u8]; 7],
+    extents: [Extent; 7],
     sectors: u32,
 }
 
 impl<'a> Image<'a> {
-    pub(super) fn new(files: [&'a [u8]; 5]) -> Option<Self> {
+    pub(super) fn new(files: [&'a [u8]; 7]) -> Option<Self> {
         let (extents, sectors) = layout(files.map(<[u8]>::len))?;
         Some(Self {
             files,
@@ -80,9 +84,9 @@ impl<'a> Image<'a> {
         let mut offset = record(&mut data, root, b"\0", true);
         offset += record(&mut data[offset..], root, b"\x01", true);
         let order = if joliet {
-            [2, 0, 1, 3, 4]
+            [0, 1, 4, 2, 3, 5, 6]
         } else {
-            [0, 1, 2, 3, 4]
+            [0, 1, 2, 3, 4, 5, 6]
         };
         for index in order {
             let name = if joliet {
@@ -99,8 +103,8 @@ impl<'a> Image<'a> {
     }
 }
 
-fn layout(lengths: [usize; 5]) -> Option<([Extent; 5], u32)> {
-    let [guest, _, _, meta, user] = lengths;
+fn layout(lengths: [usize; 7]) -> Option<([Extent; 7], u32)> {
+    let [_, _, guest, _, _, meta, user] = lengths;
     if guest > MAX_GUEST || meta > 1024 || user > 16 * 1024 {
         return None;
     }
@@ -108,7 +112,7 @@ fn layout(lengths: [usize; 5]) -> Option<([Extent; 5], u32)> {
     let mut extents = [Extent {
         sector: 0,
         length: 0,
-    }; 5];
+    }; 7];
     for (extent, length) in extents.iter_mut().zip(lengths) {
         let length = u32::try_from(length).ok()?;
         if length == 0 {
@@ -195,8 +199,11 @@ fn descriptor(joliet: bool, sectors: u32) -> [u8; SECTOR] {
     block[140..144].copy_from_slice(&path.to_le_bytes());
     block[148..152].copy_from_slice(&(path + 1).to_be_bytes());
     record(&mut block[156..190], root_extent(root), b"\0", true);
-    // ECMA-119 uses filler for absent identifiers. Joliet uses UCS-2
-    // spaces, with a zero byte in the odd position of each field.
+    // The Joliet fields follow libisofs: UCS-2 spaces and a trailing zero.
+    // https://sources.debian.org/src/libisofs/1.5.2-1/libisofs/joliet.c/#L2223
+    // ECMA-119 Annex B.2(f), its informative Joliet summary, lists zero
+    // filler. Linux isofs selects Joliet by its escape sequence and does
+    // not inspect these identifiers.
     if joliet {
         for field in block[702..813].chunks_exact_mut(37) {
             for character in field.chunks_exact_mut(2) {
@@ -220,12 +227,12 @@ mod tests {
 
     #[test]
     fn seed_layout_enforces_each_limit_including_padding() {
-        assert!(layout([MAX_GUEST, 1, 1, 1024, 16 * 1024]).is_some());
-        assert!(layout([MAX_GUEST + 1, 1, 1, 1, 1]).is_none());
-        assert!(layout([1, 1, 1, 1025, 1]).is_none());
-        assert!(layout([1, 1, 1, 1, 16 * 1024 + 1]).is_none());
-        let exact = (MAX_SECTORS - JOLIET_ROOT - 5) as usize * SECTOR;
-        assert_eq!(layout([1, exact, 1, 1, 1]).unwrap().1, MAX_SECTORS);
-        assert!(layout([1, exact + 1, 1, 1, 1]).is_none());
+        assert!(layout([1, 1, MAX_GUEST, 1, 1, 1024, 16 * 1024]).is_some());
+        assert!(layout([1, 1, MAX_GUEST + 1, 1, 1, 1, 1]).is_none());
+        assert!(layout([1, 1, 1, 1, 1, 1025, 1]).is_none());
+        assert!(layout([1, 1, 1, 1, 1, 1, 16 * 1024 + 1]).is_none());
+        let exact = (MAX_SECTORS - JOLIET_ROOT - 7) as usize * SECTOR;
+        assert_eq!(layout([1, 1, 1, exact, 1, 1, 1]).unwrap().1, MAX_SECTORS);
+        assert!(layout([1, 1, 1, exact + 1, 1, 1, 1]).is_none());
     }
 }

@@ -3,6 +3,10 @@
 //! commands neither inspect nor change accounts. Removing and disabling the
 //! target datasource also disables that deferred creation path. Detached
 //! health asserts there is no login-capable account before qualification.
+//! A fixed root oneshot checks protected files and publishes a boot-bound
+//! verdict readable by the unprivileged health script. A guest with
+//! compromised root can forge the verdict. Readiness proves liveness,
+//! not guest integrity.
 //!
 //! Subiquity can copy installer logs after late commands. The seed supplies
 //! no reusable credentials. Acceptance on a real install must confirm that
@@ -81,7 +85,7 @@ pub struct UbuntuRecipe {
     pub guest: Option<AssetPin>,
     pub service: Option<AssetPin>,
     pub finalize: Option<AssetPin>,
-    /// Pin the versioned NoCloud profile, including all three fixed literals.
+    /// Pin the versioned NoCloud profile and every fixed seed literal.
     pub nocloud_schema: Option<AssetPin>,
     pub firmware_code: Option<AssetPin>,
     pub firmware_vars: Option<AssetPin>,
@@ -109,22 +113,23 @@ impl UbuntuRecipe {
         0x27, 0x4b,
     ];
     // Arxcovo's NoCloud seed schema identifier, including the newline.
-    const NOCLOUD_SCHEMA: &[u8] = b"arxcovo-nocloud-v1\n";
+    const NOCLOUD_SCHEMA: &[u8] = b"arxcovo-nocloud-v2\n";
 
-    /// SHA256 and length of the schema identifier, user-data template, unit
-    /// and finalizer, in that order, separated by NUL bytes.
+    /// SHA256 and length of the schema identifier, user-data template, guest
+    /// unit, finalizer, audit unit and audit script, separated by NUL bytes.
     pub const NOCLOUD_PROFILE_PIN: AssetPin = AssetPin {
-        length: 2807,
+        length: 4757,
         sha256: [
-            0xe2, 0xf3, 0xe3, 0x2a, 0xbf, 0x8b, 0xe9, 0xd6, 0xf8, 0xa8, 0x56, 0xab, 0x9d, 0xf9,
-            0x75, 0x17, 0x4f, 0x5e, 0x89, 0x62, 0x6a, 0xf9, 0x29, 0x53, 0x4a, 0x10, 0xa3, 0x88,
-            0x9f, 0x36, 0x89, 0x8a,
+            0x37, 0xaa, 0xba, 0x54, 0x48, 0x07, 0x89, 0x14, 0xff, 0x93, 0xf6, 0x46, 0xcc, 0xe7,
+            0x8d, 0x26, 0x55, 0x88, 0xf1, 0xa1, 0x4d, 0x5d, 0x34, 0xe6, 0x62, 0x55, 0x22, 0x95,
+            0xae, 0xe0, 0x57, 0x2c,
         ],
     };
 
     pub const SERVICE: &[u8] = br"[Unit]
 Description=Arxcovo guest supervisor
-After=systemd-udevd.service
+Wants=arx-account-audit.service
+After=systemd-udevd.service arx-account-audit.service
 
 [Service]
 Type=simple
@@ -137,6 +142,63 @@ DelegateSubgroup=arx-supervisor
 [Install]
 WantedBy=multi-user.target
 ";
+
+    const ACCOUNT_AUDIT_SERVICE: &[u8] = br"[Unit]
+Description=Arxcovo boot account audit
+Before=arx-guest.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+RemainAfterExit=yes
+RuntimeDirectory=arx-account-audit
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/sbin/arx-account-audit
+
+[Install]
+WantedBy=multi-user.target
+";
+
+    const ACCOUNT_AUDIT_SCRIPT: &[u8] = br#"#!/bin/sh
+set -eu
+export LC_ALL=C
+result=/run/arx-account-audit/result
+rm -f -- "$result"
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+
+audit_accounts() {
+    test ! -e /root/.ssh && test ! -L /root/.ssh || return 1
+    for key in /etc/ssh/ssh_host_*; do
+        test ! -e "$key" && test ! -L "$key" || return 1
+    done
+    awk -F: '
+        FILENAME == ARGV[1] {
+            if (NF != 9 || $1 == "" || locked[$1]++ || $2 !~ /^[!*]/) bad = 1
+            next
+        }
+        {
+            if (NF != 7 || !($1 in locked) || seen[$1]++ || ($2 != "x" && $2 != "*")) bad = 1
+            if ($1 == "root") {
+                if ($3 != "0") bad = 1
+                root = 1
+            } else if ($3 !~ /^[0-9]+$/ || $3 + 0 == 0 ||
+                       $7 !~ /^\/(usr\/)?(sbin\/nologin|bin\/false|bin\/sync|sbin\/halt|sbin\/shutdown)$/) {
+                bad = 1
+            }
+        }
+        END { if (bad || !root) exit 1 }
+    ' /etc/shadow /etc/passwd
+}
+
+verdict=account-check-failed
+if audit_accounts; then verdict=ok; fi
+entry=$(mktemp "$result.XXXXXX")
+trap 'rm -f -- "$entry"' EXIT
+printf '%s %s\n' "$verdict" "$boot_id" > "$entry"
+chmod 0644 "$entry"
+mv -T -- "$entry" "$result"
+"#;
 
     pub const FINALIZE: &[u8] = br#"#!/bin/sh
 set -eu
@@ -156,6 +218,7 @@ install -m 0444 /dev/null /etc/machine-id
 install -d -m 0755 /var/lib/dbus
 ln -s /etc/machine-id /var/lib/dbus/machine-id
 
+systemctl --root=/ enable arx-account-audit.service
 rm -f /usr/local/sbin/arx-finalize
 install -d -m 0755 /etc/arxcovo
 printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
@@ -234,7 +297,11 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
                 .chain(separator)
                 .chain(Self::SERVICE)
                 .chain(separator)
-                .chain(Self::FINALIZE),
+                .chain(Self::FINALIZE)
+                .chain(separator)
+                .chain(Self::ACCOUNT_AUDIT_SERVICE)
+                .chain(separator)
+                .chain(Self::ACCOUNT_AUDIT_SCRIPT),
         )?;
         let meta = format!(
             "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
@@ -247,6 +314,15 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
 /// Run once over the script-capable channel of the detached verification boot.
 pub(super) const DETACHED_HEALTH: &str = r#"set -eu
 export LC_ALL=C
+verify_account_result() {
+    boot_id=$(cat "$1")
+    result=$2
+    test ! -L "$result"
+    test -f "$result"
+    test "$(stat -c '%u:%g:%a:%s' -- "$result")" = 0:0:644:40
+    printf 'ok %s\n' "$boot_id" | cmp -s - "$result"
+}
+verify_account_result /proc/sys/kernel/random/boot_id /run/arx-account-audit/result
 printf '%s\n' ubuntu-noble-amd64-v1 | cmp -s - /etc/arxcovo/template-finalized
 test -x /usr/local/bin/arx-guest
 test -f /etc/systemd/system/arx-guest.service
@@ -255,32 +331,81 @@ test -f /etc/cloud/cloud-init.disabled
 test ! -e /var/lib/cloud/seed
 test ! -e /etc/cloud/cloud.cfg.d/99-installer.cfg
 test ! -e /usr/sbin/sshd
-test ! -e /root/.ssh
-for key in /etc/ssh/ssh_host_*; do
-    test ! -e "$key"
-done
 test "$(wc -c </etc/machine-id)" -eq 33
 grep -Eq '^[0-9a-f]{32}$' /etc/machine-id
 test "$(cat /etc/machine-id)" != 00000000000000000000000000000000
 test "$(readlink /var/lib/dbus/machine-id)" = /etc/machine-id
-awk -F: '
-    FILENAME == ARGV[1] {
-        if (NF != 9 || $1 == "" || locked[$1]++ || $2 !~ /^[!*]/) bad = 1
-        next
-    }
-    {
-        if (NF != 7 || !($1 in locked) || seen[$1]++) bad = 1
-        if ($1 == "root") {
-            if ($3 != "0") bad = 1
-            root = 1
-        } else if ($3 !~ /^[0-9]+$/ || $3 + 0 == 0 ||
-                   $7 !~ /^\/(usr\/)?(sbin\/nologin|bin\/false|bin\/sync|sbin\/halt|sbin\/shutdown)$/) {
-            bad = 1
-        }
-    }
-    END { if (bad || !root) exit 1 }
-' /etc/shadow /etc/passwd
 "#;
+
+#[cfg(test)]
+pub(super) fn health_uses_public_paths(script: &str) -> bool {
+    script
+        .split(|c: char| c.is_ascii_whitespace() || r#"<>\"'();="#.contains(c))
+        .filter(|word| word.starts_with('/'))
+        .all(|path| {
+            matches!(
+                path,
+                "/proc/sys/kernel/random/boot_id"
+                    | "/run/arx-account-audit/result"
+                    | "/etc/arxcovo/template-finalized"
+                    | "/usr/local/bin/arx-guest"
+                    | "/etc/systemd/system/arx-guest.service"
+                    | "/etc/cloud/cloud-init.disabled"
+                    | "/var/lib/cloud/seed"
+                    | "/etc/cloud/cloud.cfg.d/99-installer.cfg"
+                    | "/usr/sbin/sshd"
+                    | "/etc/machine-id"
+                    | "/var/lib/dbus/machine-id"
+            )
+        })
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn unprivileged_receipt_check_requires_current_root_owned_success() {
+    use std::{fs, process::Command};
+
+    let (predicate, _) = DETACHED_HEALTH
+        .split_once("\nverify_account_result /proc/")
+        .unwrap();
+    // Account metadata is synthetic, while sh executes the actual decision
+    // and compares the verdict and boot ID in a fixture's public files.
+    let script = format!(
+        "{predicate}\n{}",
+        r#"
+stat() {
+    test "$1:$2:$3:$4" = "-c:%u:%g:%a:%s:--:$RESULT_PATH" || return 1
+    printf '%s\n' "$RESULT_METADATA"
+}
+verify_account_result "$1" "$2"
+"#
+    );
+    let root = tempfile::tempdir().unwrap();
+    let receipt = root.path().join("result");
+    let boot = root.path().join("boot_id");
+    let current = "00000000-0000-0000-0000-000000000001";
+    let previous = "00000000-0000-0000-0000-000000000002";
+    fs::write(&boot, format!("{current}\n")).unwrap();
+    for (category, id, meta, expected) in [
+        ("ok", current, "0:0:644:40", true),
+        ("ok", previous, "0:0:644:40", false),
+        ("account-check-failed", current, "0:0:644:58", false),
+        ("ok", current, "65534:65534:644:40", false),
+        ("ok", current, "0:0:666:40", false),
+        ("no", current, "0:0:644:40", false),
+    ] {
+        fs::write(&receipt, format!("{category} {id}\n")).unwrap();
+        let status = Command::new("sh")
+            .args(["-c", &script, "account-result-fixture"])
+            .arg(&boot)
+            .arg(&receipt)
+            .env("RESULT_PATH", &receipt)
+            .env("RESULT_METADATA", meta)
+            .status()
+            .unwrap();
+        assert_eq!(status.success(), expected, "{category} {id} {meta}");
+    }
+}
 
 fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
     pin.filter(|pin| pin.length != 0)
@@ -289,6 +414,8 @@ fn required(pin: Option<AssetPin>) -> Result<AssetPin, RecipeError> {
 
 fn image<'a>(guest: &'a [u8], meta: &'a str, user: &'a str) -> Result<Image<'a>, RecipeError> {
     Image::new([
+        UbuntuRecipe::ACCOUNT_AUDIT_SCRIPT,
+        UbuntuRecipe::ACCOUNT_AUDIT_SERVICE,
         guest,
         UbuntuRecipe::SERVICE,
         UbuntuRecipe::FINALIZE,
@@ -303,6 +430,14 @@ fn user_data(guest: AssetPin, service: AssetPin, finalize: AssetPin) -> String {
         .replace("{guest_hash}", &hex::encode(guest.sha256))
         .replace("{service_hash}", &hex::encode(service.sha256))
         .replace("{finalize_hash}", &hex::encode(finalize.sha256))
+        .replace(
+            "{audit_unit_hash}",
+            &hex::encode(Sha256::digest(UbuntuRecipe::ACCOUNT_AUDIT_SERVICE)),
+        )
+        .replace(
+            "{audit_script_hash}",
+            &hex::encode(Sha256::digest(UbuntuRecipe::ACCOUNT_AUDIT_SCRIPT)),
+        )
 }
 
 const USER_DATA_TEMPLATE: &str = r#"#cloud-config
@@ -362,10 +497,14 @@ autoinstall:
         cd "$seed"
         printf '%s  %s\n' '{guest_hash}' arx-guest '{service_hash}' arx-guest.service '{finalize_hash}' arx-finalize |
           sha256sum --check --strict
+        printf '%s  %s\n' '{audit_unit_hash}' arx-account-audit.service '{audit_script_hash}' arx-account-audit |
+          sha256sum --check --strict
       )
       install -m 0755 "$seed/arx-guest" /target/usr/local/bin/arx-guest
       install -m 0644 "$seed/arx-guest.service" /target/etc/systemd/system/arx-guest.service
       install -m 0700 "$seed/arx-finalize" /target/usr/local/sbin/arx-finalize
+      install -o 0 -g 0 -m 0644 "$seed/arx-account-audit.service" /target/etc/systemd/system/arx-account-audit.service
+      install -o 0 -g 0 -m 0700 "$seed/arx-account-audit" /target/usr/local/sbin/arx-account-audit
       systemctl --root=/target enable arx-guest.service
       curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize
 "#;

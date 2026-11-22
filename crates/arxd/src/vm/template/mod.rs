@@ -703,8 +703,8 @@ mod lifecycle {
                 assert_eq!(boot, DETACHED);
                 assert_eq!(self.live, Some(boot));
                 assert_eq!(script, DETACHED_HEALTH);
-                assert!(script.contains("/etc/shadow /etc/passwd"));
-                assert!(script.contains("$2 !~ /^[!*]/"));
+                assert!(super::super::ubuntu::health_uses_public_paths(script));
+                assert!(script.contains("verify_account_result /proc/sys/kernel/random/boot_id /run/arx-account-audit/result"));
                 assert_eq!(seconds, 30);
                 Ok(match self.fault {
                     Some(Fault::Health(status, exit_code)) => (status, exit_code),
