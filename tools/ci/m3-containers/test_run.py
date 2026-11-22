@@ -58,6 +58,24 @@ class FixtureTests(unittest.TestCase):
                 with self.assertRaisesRegex(fixture.Refusal, "elf-"):
                     fixture.inspect_elf(io.BytesIO(changed), len(changed))
 
+    def test_live_client_credentials_have_agent_private_parent(self):
+        for node, options in (("a", {}), ("b", {"founder_key": [1] * 32})):
+            with self.subTest(node=node):
+                root = Path("/data")
+                with patch.object(fixture, "private_directory") as directory, patch.object(
+                    fixture, "record_json"
+                ) as record, patch.object(type(root), "symlink_to"):
+                    fixture.install_live(root, node, **options)
+
+                clients = root / "clients"
+                self.assertEqual([entry for entry in directory.call_args_list if entry.args[0] == clients],
+                                 [call(clients, 0o700, 21073, 21073)])
+                self.assertEqual(
+                    [(entry.args[0], entry.args[2], entry.args[3]) for entry in record.call_args_list
+                     if entry.args[0].parent == clients],
+                    [(clients / name, 21073, 0o400) for name in ("fixture.json", "foreign.json")],
+                )
+
     def test_anchor_artifact_is_bound_to_the_exact_rust_library_test_and_receipt(self):
         target = PurePosixPath("/work/target")
         work = target.parent

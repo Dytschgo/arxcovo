@@ -583,7 +583,7 @@ def install_live(root, node, *, founder_key=None):
                     executor_socket="/fixture/control/executor.sock" if node == "b" else None)
     if node != "c":
         private_directory(root / "activity", 0o700, daemon, daemon)
-        private_directory(root / "clients", 0o755)
+        private_directory(root / "clients", 0o700, agent, agent)
         agents = []
         for name in ("fixture", "foreign"):
             token = secrets.token_hex(32)
