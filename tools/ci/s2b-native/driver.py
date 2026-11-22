@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-PINS = {'crates/arxd/src/exec/cgroup.rs': '64d4cb8c48e516d5fdcd92f85fe2c9c9abb028ee55251929e95824c16211d121', 'crates/arxd/src/exec/mod.rs': '1f23fe1a7d03c2a8a455426cafcfbd289ab6bf334bff290620dbd024e44896ad', 'crates/arxd/src/service/executor.rs': '45da7396dc926ad40b18a5fab1ff2fd898c3d0577b8cd13d91eba1a7205cf5ed', 'crates/arxd/src/service/unix_bridge/tests.rs': 'e500e65fcfd42f30d0492bced7ac6911de9e0dc6619e50e87e82cc94aced7eae', 'crates/arxd/src/service/unix_bridge/tests/e6.rs': '05e30be5a57921492bd6289f23cd3618fb56270d89a78947cab18779516c05bb', 'crates/arxd/src/service/unix_bridge/tests/s2b.rs': 'a5dfde4904bf5d45b66f5ae3719883d2d61a66e17e74bc7c4f1055f90bbd1f7b', 'crates/arxd/src/service/unix_bridge.rs': '323fa965a041c4ad53c99d149f810e031d886cc09e83089d26c82d27b49026d1'}
+PINS = {'crates/arxd/src/exec/cgroup.rs': '64d4cb8c48e516d5fdcd92f85fe2c9c9abb028ee55251929e95824c16211d121', 'crates/arxd/src/exec/mod.rs': '1f23fe1a7d03c2a8a455426cafcfbd289ab6bf334bff290620dbd024e44896ad', 'crates/arxd/src/service/executor.rs': 'f863eae7da45bc49cb9b259123b8eb68909b86e4453bd2f0f755711973093c84', 'crates/arxd/src/service/unix_bridge/tests.rs': 'e500e65fcfd42f30d0492bced7ac6911de9e0dc6619e50e87e82cc94aced7eae', 'crates/arxd/src/service/unix_bridge/tests/e6.rs': '05e30be5a57921492bd6289f23cd3618fb56270d89a78947cab18779516c05bb', 'crates/arxd/src/service/unix_bridge/tests/s2b.rs': 'a5dfde4904bf5d45b66f5ae3719883d2d61a66e17e74bc7c4f1055f90bbd1f7b', 'crates/arxd/src/service/unix_bridge.rs': '0f726200d87b0aaec3e03f6bcf34df73626b1996212ae8539e22534d1838b7e7'}
 TARGETS = tuple(PINS)
 MANIFEST = "tools/ci/s2b-native/mutations.jsonl"
 MANIFEST_SHA = '28f05948ca4aace6944fbe8c77676e8f702575042cf77d9c9c176096ac5b0f94'
