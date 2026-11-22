@@ -2,13 +2,76 @@
 
 ## Current state (2026-11-22)
 
-- **Main and last merge.** PR #244 merged at `a6979102`. Its first push CI
-  `44972860364` was in progress at this checkpoint. The preceding push CI
-  `44972022543` on `e40c8be9` passed in 523 s wall. PR #238 (M3 14b/C14)
-  merged at `bb5ed691`, and push CI `44956759543` passed all nine jobs in
-  514 s wall, 508 s charged.
-  The Ubuntu Rust worker passed in 240 s, including C13, A10 and C14.
-  [Latest main CI](https://github.com/Dytschgo/arxcovo/actions/runs/44972860364)
+- **Main and last merges.** `main` is **green** at `428de5ec` (PR #248, M3 step
+  16a Part 2 — R2 zero-daemon Proposal A three-container containment dry-run &
+  ADR 0052). Push CI `45036710149` passed all 9 jobs in `522 s` wall (`rust
+  (ubuntu-latest)` `277 s` including C13 `3.434 s`, A10, C14, and R2 dry-run
+  `8.151 s`, `first: null`, `cleanup: confirmed`, archived log
+  `D:/Temp/arx-coordinator/main-45036710149-ubuntu.log`, SHA256 `60c84152…5a8d`;
+  `rust (macos-latest)` `328 s`; `rust (windows-latest)` `506 s`).
+  Earlier merges today:
+  - PR #250 (`3e5a8307`, C13 pre-proposal re-observation & ADR 0053): push CI
+    `45034752691` passed all 9 jobs in `373 s` wall (`rust (ubuntu-latest)`
+    `236 s`), **restoring green `main`** after `73fbf607`.
+  - PR #249 (`73fbf607`, bounded `RetainedNode` lock wait & stop cancellation):
+    push CI `45030029009` failed (**red**) on Ubuntu 24.04 (`job/137231361287`,
+    archived log `D:/Temp/arx-coordinator/main-45030029009-ubuntu.log`, SHA256
+    `58f1eadf…442e`): 1135/1135 unit tests passed, then C13 failed node `c` join
+    with `stage=peer-client category=unavailable-store-wait` +
+    `stage=admission-membership category=view-changed`. Per babysitter steering
+    (2026-11-22 14:07 UTC), red `main` was treated as a merge blocker and PR
+    #248 was held until PR #250 restored green `main` (`45034752691`).
+  - PR #247 (`61a97ced`, M3 step 16a Part 1 — R7 owner-local ledger observer &
+    C16 client helper): push CI `44982149245` passed all 9 jobs (**green**).
+  - PR #246 (`f85762f1`, Ubuntu 24.04 host-fact receipt): push CI `44980455251`
+    passed all 9 jobs (`419 s` wall, **restored green `main`** after `2bdcb657`).
+  - PR #245 (`2bdcb657`, docs): push CI `44973602943` failed (**red**) on Ubuntu
+    24.04 in
+    `cluster::consensus::issue::tls_engine_tests::authenticated_sender_mismatch_and_assumed_founder_control`
+    (`three_node.rs:222:52 NotLeader` during second convergence; archived log
+    `D:/Temp/arx-main-2bdcb657/ubuntu-failed.log`, SHA256 `a9081f43…ffdc`).
+  - Preceding green `main` runs: PR #244 (`a6979102`, `44972860364`), PR #243
+    (`e40c8be9`, `44972022543`, `523 s` wall), PR #238 (`bb5ed691`, M3 14b/C14,
+    `44956759543`, `514 s` wall / `508 s` charged, Ubuntu Rust `240 s`).
+  [Latest green main CI (PR #248)](https://github.com/Dytschgo/arxcovo/actions/runs/45036710149) ·
+  [PR #250 green main CI](https://github.com/Dytschgo/arxcovo/actions/runs/45034752691) ·
+  [PR #249 red main CI](https://github.com/Dytschgo/arxcovo/actions/runs/45030029009) ·
+  [PR #247 green main CI](https://github.com/Dytschgo/arxcovo/actions/runs/44982149245) ·
+  [PR #246 green main CI](https://github.com/Dytschgo/arxcovo/actions/runs/44980455251)
+- **Owner routing & babysitter steering (2026-11-22).** Governing `AGENTS.md`
+  routing remains explicit (`AGENTS.md` specifies Claude Opus 5.5/high for
+  coordination, Sol 6.2/high for engineering, architecture, security and
+  reviews, Claude only for UI work otherwise, and the owner fallback chain Sol →
+  Opus → Fable → Astra 6.2 → Grok → Muse → Gemini Neon without resetting
+  counters). On 2026-11-22 the owner authorized **Gemini 4 Neon**
+  (`gemini-4-neon`, `thought_level: high`) and **Gemini 4 Argon**
+  (`gemini-4-argon`, `thought_level: high`) alongside Sol 6.2/high for
+  engineering, architecture, security, and cross-provider independent reviews,
+  preserving the independent-reviewer requirement, at most two builders and one
+  reviewer active, and coordinator-only merges. Babysitter steering applied:
+  (1) when a usage limit hits with a stated reset window, schedule a one-shot
+  resume just past the reset before stopping and keep WIP committed; (2) treat
+  red `main` (`73fbf607` / `45030029009`) as a merge blocker and do not merge
+  PR #248 until a green `main` CI run lands after `73fbf607`. Babysitter left
+  intact.
+- **Red `main` `2bdcb657` diagnosis and owner-authorized single diagnostic run.**
+  Independent Sol 6.2/high diagnosis (`D:/Temp/arx-main-2bdcb657-diagnosis/review.md`,
+  SHA256 `dd390202…06cd`) placed the `NotLeader` failure under the existing
+  Engine fix hold (Engine Sol `3/3` exhausted, historical Opus `0/2` unchanged).
+  The owner authorized ONE focused Ubuntu 24.04 diagnostic run with bounded
+  `cfg(test)` election tracing while keeping the Engine fix hold and preserving
+  run `44973602943` and counters. Sol 6.2/high built the 3-file `cfg(test)` ring
+  trace (`befdbce7` on `diag/main-2bdcb657-notleader-trace`, `1/3`, report
+  `D:/Temp/arx-main-2bdcb657-diag-b1/report.md`, SHA256 `2033e286…68dc`), and
+  cross-provider Gemini 4 Argon pre-push review passed
+  (`D:/Temp/arx-main-diag-review/review.md`, SHA256 `a2fd9723…f83e`). In the
+  single `workflow_dispatch` run `44979915612` (`rust (ubuntu-latest)` job
+  `137077950426`, archived log `D:/Temp/arx-coordinator/job-44979915612.log`,
+  SHA256 `4f052e06…a871`),
+  `authenticated_sender_mismatch_and_assumed_founder_control` passed in
+  `1.795 s` (alongside C13 `3.569 s`, A10, C14). Per the diagnostic criteria,
+  observation ended without pass credit for original failed run `44973602943`,
+  and the Engine fix hold remains intact.
 - **S2b re-pin.** PR #243 merged at `e40c8be9` from `fec67c4`. The Sol 6.2/high
   independent review passed both axes and 27 targeted tests. All 12 hosted
   checks passed, including `native-evidence`, `ci-time-budget` and
@@ -28,40 +91,137 @@
   6.2/high to finish these merges.
   [PR #244](https://github.com/Dytschgo/arxcovo/pull/244) ·
   [Refreshed worker receipt](https://github.com/Dytschgo/arxcovo/actions/runs/44972183382/job/137054159821)
-- **M3 16a / R2 dry run.** The Sol 6.2/high builder retained the zero-daemon
-  checkpoint locally at `b774204c` with 68 local tests passed and 1/3 counted
-  attempts (Zig rejected the initial target spelling). The checkpoint expects
-  a 24.04 userland and refuses the prior worker's 26.04 inputs. The 24.04 worker
-  has merged. R2 awaits green integrated CI and matching host pins. Dry-run
-  containment and timings are **unverified on hosted runner**.
-- **M3 16a / R7 ledger observer.** The Sol 6.2/high builder retained
-  `bd250f04` at 1/3. The builder reported 880 filtered Windows tests and
-  106 focused non-root Linux QEMU tests passed. Independent Sol 6.2/high review
-  held the branch on private request boundaries, production behavior coverage
-  and client-side refusal evidence. Sol 6.2/high retained the deadline and stop
-  correction at `4bb0bf54`. Its two build failures exhausted 3/3. The fresh
-  independent Sol 6.2/high review traced those failures to the missing archive
-  tool and the default Zig glibc target, which lacks the existing `execveat`
-  dependency.
-- **R7 recovery.** The owner approved a private test-only AnchorQuery result
-  in `pki/preproof.rs` and one separate correction and focused validation with
-  the existing glibc 2.36 linker, preserving the original 3/3. Sol 6.2/high
-  committed `737e9f2e` locally. The helper distinguishes a complete terminal
-  refusal from failed delivery and uses the R2 fixture endpoint. Formatting
-  and diff checks passed. The single approved validation stopped at `E0034`
-  on an ambiguous `chain` call in the new test before linking or running tests.
-  First follow-up allowance 1/1 used. Following the owner's instruction to
-  continue, Sol 6.2/high selected the async `chain` explicitly at `494c6f28`. The glibc 2.36
-  link, 12 focused non-root Linux QEMU tests and Linux all-targets Clippy
-  passed. The first emulator executable exited before guest boot. The packaged
-  test executable was unchanged for the successful run. Independent Sol
-  6.2/high review closed the reconnect objection and held both axes because
-  shutdown or expiry can still race the first private Mint proposal and tests
-  leave checkpoint composition and the proposal boundary uncovered. R7
-  remains unpublished. The original attempt count remains 3/3.
-- **Milestones.** M2 remains open for its owner-dependent acceptance and M3
-  remains in progress. C16, installed service and native multi-host paths are
-  **unverified on real hardware**.
+- **PR #246 (Ubuntu 24.04 host-fact receipt).** With the original `3/3` counted
+  logic holds preserved (`D:/Temp/arx-pr246-stuck-review/review.md`, SHA256
+  `69e6f9aa…31ae`), the owner authorized one narrow raw-symlink correction and
+  one validation (`565b6652`). Hosted Ubuntu 24.04 run `44978108723` (job
+  `137072425820`, archived log `D:/Temp/arx-coordinator/job-44978108723.log`,
+  SHA256 `bff7d085…d1a1`) passed 20 observer tests and reported
+  `ubuntu24 / 20261116.376.1 / 7.0.0-1017-azure / 255.4-1ubuntu8.18` with **all
+  13 required tool checks `true`** (including `/usr/sbin/ip: true`). Independent
+  Sol 6.2/high round 4 exact-head review passed
+  (`D:/Temp/arx-pr246-review4/review.md`, SHA256 `3f5cf619…27c2`) with
+  `agent-review: success` status ID `59575505893`, and PR #246 merged as
+  `f85762f1`.
+  [PR #246](https://github.com/Dytschgo/arxcovo/pull/246)
+- **PR #247 (M3 step 16a Part 1 — R7 owner-local ledger observer & C16 client helper).**
+  The Sol 6.2/high builder initially retained `bd250f04` at `1/3` (880 filtered
+  Windows tests and 106 focused non-root Linux QEMU tests passed). Independent
+  Sol 6.2/high review held the branch on private request boundaries, production
+  behavior coverage and client-side refusal evidence. Sol 6.2/high retained the
+  deadline and stop correction at `4bb0bf54`; its two build failures exhausted
+  `3/3`, traced by fresh independent Sol 6.2/high review to the missing archive
+  tool and the default Zig glibc target lacking the existing `execveat`
+  dependency. The owner approved a private test-only `AnchorQuery` result in
+  `pki/preproof.rs` and one separate correction and focused validation with the
+  existing glibc 2.36 linker, preserving the original `3/3`. Sol 6.2/high
+  committed `737e9f2e` locally (distinguishing a complete terminal refusal from
+  failed delivery and using the R2 fixture endpoint; formatting and diff checks
+  passed; the single approved validation stopped at `E0034` on an ambiguous
+  `chain` call before linking or running tests, using first follow-up allowance
+  `1/1`). Following the owner's instruction to continue, Sol 6.2/high selected
+  the async `chain` explicitly at `494c6f28` (glibc 2.36 link, 12 focused
+  non-root Linux QEMU tests and Linux all-targets Clippy passed; the first
+  emulator executable exited before guest boot, and the packaged test executable
+  was unchanged for the successful run). Independent Sol 6.2/high review closed
+  the reconnect objection and held both axes on the pre-effect private Mint
+  shutdown/expiry race and uncovered checkpoint composition and proposal
+  boundary. Scoped Sol 6.2/high recovery then closed those final 2 review
+  findings (pre-effect private Mint shutdown/deadline fence + production
+  checkpoint composition & proposal-boundary no-Engine tests) at `a545c11f`
+  (`2/3` on scoped recovery; original `3/3` and `1/1` preserved; report
+  `D:/Temp/arx-r7-final/report.md`, SHA256 `b51a5bb6…09a9`; Windows §(d)
+  880/880, non-root Linux QEMU 34/34). After syncing cleanly onto `f85762f1`
+  (`2f258fb1`), cross-provider Gemini 4 Argon pre-push review passed
+  (`D:/Temp/arx-r7-prepush-review3/review.md`, SHA256 `003f72b9…8b6d`). Hosted
+  CI run `44981182729` passed all 10 checks (`1125/1125` Ubuntu 24.04 tests +
+  C13, A10, C14; archived log `D:/Temp/arx-pr247-exact-review/ubuntu-rust.log`,
+  SHA256 `78147399…cdc2`). Cross-provider Gemini 4 Argon exact-head confirmation
+  passed (`D:/Temp/arx-pr247-exact-review/review.md`, SHA256 `24c5b5a8…8707`)
+  with `agent-review: success` status ID `59576562555`, and PR #247 merged as
+  `61a97ced`.
+  [PR #247](https://github.com/Dytschgo/arxcovo/pull/247)
+- **PR #249 (Learner admission bounded `RetainedNode` lock wait & stop cancellation).**
+  Replaced zero-wait `node.try_lock()` at `admission-register`,
+  `admission-worker`, and `admission-confirm` with bounded `STORE_WAIT` (20 ms
+  capped at outer deadline) plus `StopGate` immediate stop cancellation and
+  pre-submit serialization (`learner_admission.rs`, `learner_admission/tests.rs`
+  only; zero D6 files). Preserved attempt counters: Builder #1 (Gemini 4 Neon)
+  `3/3 exhausted` (Sol 6.2/high pre-push holds `c206f727…46ecd` and
+  `982c2ef7…8412` plus local `E0503`); Builder #2 (Sol 6.2/high) `1/3` (`58d0b70d`
+  Argon PASS `7b8a89b0…7f93b`; macOS paused-time loopback TLS handshake fix
+  `f269144b` after CI `45017344587`, Argon PASS `ad747f15…199c5`). Hosted CI
+  `45028954404` passed 10/10 (`1135/1135` Ubuntu + C13 `3.561 s`, A10, C14,
+  archived `job-45028954404-ubuntu.log` SHA256 `1589324c…2813`; `914/914` macOS,
+  archived `job-45028954404-macos.log` SHA256 `a49f2ed3…12a9`). Exact-head
+  Gemini 4 Argon review passed (`D:/Temp/arx-pr249-exact-review/review.md`,
+  SHA256 `4e2a6df8…8390`), `agent-review: success` status `59592685156`, merged
+  as `73fbf607`.
+  [PR #249](https://github.com/Dytschgo/arxcovo/pull/249)
+- **PR #250 (Red-`main` `73fbf607` repair: pre-proposal admission re-observation & ADR 0053).**
+  Independent Sol 6.2/high diagnosis (`D:/Temp/arx-main-73fbf607-diagnosis/review.md`,
+  SHA256 `71ebe0ca…f40f`) traced `main` run `45030029009`'s C13 `view-changed`
+  refusal to pre-proposal observation while `b` caught up to `c`'s committed
+  `Redeem` (pre-existing race predating PR #249). Sol 6.2/high implemented the
+  bounded single stop-aware pre-proposal re-observation (capped at
+  `min(250 ms, original_deadline)`, preserving strict one-proposal semantics,
+  all 3 Raft guards, C10 zero-append `StaleTail` refusal, and ADR 0037 D6
+  freeze) in 4 files (`membership_observation.rs`, `learner_admission.rs`,
+  `learner_admission/tests.rs`, `docs/adr/0053-admission-pre-proposal-reobservation.md`)
+  at `aaf3231b` (`2/3` counted, report `D:/Temp/arx-admission-reobserve/report.md`,
+  SHA256 `e1e3f95d…c42e`). Cross-provider Gemini 4 Argon pre-push review passed
+  (`D:/Temp/arx-admission-reobserve-review/review.md`, SHA256 `fa1ff336…48d0d`).
+  Hosted CI `45033677474` passed 10/10 (`1141/1141` Ubuntu + C13 `4.396 s`, A10,
+  C14, archived `job-45033677474-ubuntu.log` SHA256 `35c0b49c…2add`; `920/920`
+  macOS, archived `job-45033677474-macos.log` SHA256 `85cc23b6…c1e7`). Exact-head
+  Gemini 4 Argon confirmation passed (`D:/Temp/arx-pr250-exact-review/review.md`,
+  SHA256 `7411098f…b4b9`), `agent-review: success` status `59594388643`, merged
+  as `3e5a8307`; push CI `45034752691` restored green `main` (9/9, `373 s` wall).
+  [PR #250](https://github.com/Dytschgo/arxcovo/pull/250)
+- **PR #248 (M3 step 16a Part 2 — R2 zero-daemon three-container containment dry-run & ADR 0052).**
+  Merged onto green `main` at `428de5ec` (11 approved R2 files, zero D6 files).
+  Preserved attempt counters: Builder #1 (Sol + Gemini 4 Neon) `3/3 exhausted`
+  (`b774204c`, `b4fec06a`, `fa580be3`, `1bdf45e4`, `497f679d`, `54be9e3b`,
+  `8a218733`); Builder #2 (Gemini 4 Neon) `3/3 exhausted` (hosted Ubuntu 24.04
+  `nft-match-drift` fix `604d3b3c`, host-perspective `cgroup_show_path`
+  `mountinfo` fix `3bc946a0`, and `probe-process-exited` + `cleanup_errors` on
+  run `45016499536`; fresh Sol 6.2/high stuck-rule diagnosis
+  `D:/Temp/arx-pr248-stuck-review-b2/review.md`, SHA256 `6135ea53…a344`);
+  Builder #3 (Sol 6.2/high) `1/3` (AWS Linux 7.0 `cgroup.events` post-reap
+  `wait_leaf_empty()` + systemd 255.4 empty `ControlGroup` cleanup + closed-vocabulary
+  diagnostics `2ae583ac`, Argon PASS `b0171553…1669`; TCP `SO_REUSEADDR` restart
+  fix `269aa9b1` after run `45029790859`, Argon PASS `dea04ed3…f95`).
+  Hosted CI `45030808854` on `269aa9b1` passed 10/10 (R2 dry-run `9.755 s`,
+  archived `job-45030808854-r2-pass.log` SHA256 `f366bda8…b7c9`; Argon exact-head
+  PASS `2ae2d7f2…64a2`; `agent-review: success` `59593452209` — held until green
+  `main`). Refreshed onto green `main` `3e5a8307` as `9994c0d7` (byte-for-byte
+  identical 11-file diff SHA256 `4b5e07d5…399f`), passed hosted CI `45035598340`
+  10/10 (R2 dry-run **`8.089 s`**, archived `job-45035598340-r2-refresh-pass.log`
+  SHA256 `f24b1660…b172`), passed Gemini 4 Argon exact-head confirmation
+  (`D:/Temp/arx-pr248-refresh-review/review.md`, SHA256 `08c4987c…af5f`,
+  `agent-review: success` status `59595112179`), and merged as `428de5ec`. Push CI
+  `45036710149` verified R2 zero-daemon dry-run on `main` in **`8.151 s`** (`ubuntu24 / 20261116.133.1 / 7.0.0-1014-aws / 255.4-1ubuntu8.18`, `first: null`, `cleanup: confirmed`).
+  [PR #248](https://github.com/Dytschgo/arxcovo/pull/248)
+- **M3 step 16a Part 3 (Live C16 three-container acceptance — in progress).**
+  Existing 9-job CI topology qualified (`236 s`–`277 s` Ubuntu Rust baseline +
+  `240 s` C16 ceiling + `60 s` planning margin ≤ `720 s`). Sol 6.2/high builder
+  (`isolation: worktree` off `428de5ec`) stopped cleanly at the Rust write fence
+  with zero edits and zero failed fixes (`D:/Temp/arx-m3-c16-live/report.md`,
+  SHA256 `6aca65e9…3e06`) after proving `peer_control_wire::qualified` rejects
+  RFC 2544 `198.18.72.0/24` before founder `Found`. Coordinator decision adopted
+  under owner 2026-11-21 delegated authority: keep production
+  `peer_control_wire::qualified` untouched, repin the isolated R2/C16 bridge
+  subnet to RFC1918 `192.168.72.0/24` (with host-route collision refusal in
+  `isolation.py` preflight), and grant a narrow 1-file `#[cfg(test)]` Rust fence
+  amendment for `crates/arxd/src/cluster/consensus/bound_start/runtime/c16_probe.rs`
+  only. Sol 6.2/high builder resumed on local branch `feat/m3-c16-live-acceptance`.
+- **Milestones & verification boundary.** M2 remains open for its
+  owner-dependent acceptance; M3 remains in progress (16a Part 1 R7 merged;
+  Part 2 R2 zero-daemon dry-run merged and verified on hosted Ubuntu 24.04; Part
+  3 live C16 in progress). Live C16 is **unverified on hosted runner**;
+  installed service, physical suspend, and native multi-host paths remain
+  **unverified on real hardware**. Preserved holds: Engine Sol `3/3 exhausted`,
+  historical Opus `0/2`, D6 freeze.
 
 ## Checkpoint (2026-11-21, coordinator Gemini 4 Neon / high)
 
