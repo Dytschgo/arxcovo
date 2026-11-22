@@ -135,14 +135,19 @@ def summarize(label, target, result, platform):
 
 def runner_tool_present(path):
     try:
-        target = Path(path).resolve(strict=True)
+        candidate = Path(path)
+        target = candidate.resolve(strict=True)
         if target.parent not in (Path("/usr/bin"), Path("/usr/sbin")):
             return False
-        info = target.stat()
+        for parent in dict.fromkeys((*candidate.parents, *target.parents)):
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+        info = target.lstat()
     except (OSError, RuntimeError):
         return False
     return (info.st_uid == 0 and stat.S_ISREG(info.st_mode)
-            and bool(info.st_mode & 0o111) and not (info.st_mode & 0o022))
+            and bool(info.st_mode & 0o100) and not (info.st_mode & 0o022))
 
 
 def r2_runner_receipt(env, run):
@@ -155,7 +160,9 @@ def r2_runner_receipt(env, run):
     if not re.fullmatch(r"[0-9]{8}\.[0-9]{1,5}\.[0-9]{1,5}", image):
         return None
     kernel = os.uname().release
-    package = run(list(R2_SYSTEMD_ARGS), timeout=1)
+    tools = {path: runner_tool_present(path) for path in R2_TOOLS}
+    package = (run(list(R2_SYSTEMD_ARGS), timeout=1)
+               if tools[R2_SYSTEMD_ARGS[0]] else Capture("unavailable"))
     return {
         "image_os": "ubuntu24",
         "image_version": image,
@@ -164,7 +171,7 @@ def r2_runner_receipt(env, run):
                             if package.status == "completed" and package.code == 0
                             and re.fullmatch(rb"[0-9][0-9A-Za-z.+:~_-]{0,63}", package.stdout)
                             else None),
-        "tools": {path: runner_tool_present(path) for path in R2_TOOLS},
+        "tools": tools,
     }
 
 

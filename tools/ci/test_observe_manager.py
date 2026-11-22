@@ -79,7 +79,7 @@ class ManagerObservationTests(unittest.TestCase):
                 self.assertNotIn("r2_runner", json.loads(encoded))
         with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
             release="7.private\nvalue"), create=True), patch.object(
-            diagnostic, "runner_tool_present", return_value=False
+            diagnostic, "runner_tool_present", return_value=True
         ):
             for result in (diagnostic.Capture("completed", 0, b"255\nprivate"),
                            diagnostic.Capture("completed", 1, b"255.4-1ubuntu8.18"),
@@ -88,18 +88,39 @@ class ManagerObservationTests(unittest.TestCase):
                 self.assertIsNone(receipt["kernel"])
                 self.assertIsNone(receipt["systemd_package"])
 
+    def test_r2_package_query_refuses_an_unvetted_executable(self):
+        with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
+            release="7.0.0-1014-aws"), create=True), patch.object(
+            diagnostic, "runner_tool_present", side_effect=lambda path: path != "/usr/bin/dpkg-query"
+        ):
+            def unexpected_query(*args, **kwargs):
+                self.fail("unvetted package executable was invoked")
+
+            receipt = diagnostic.r2_runner_receipt(self.R2_ENV, unexpected_query)
+        self.assertFalse(receipt["tools"]["/usr/bin/dpkg-query"])
+        self.assertIsNone(receipt["systemd_package"])
+
     def test_r2_tool_metadata_refuses_unsafe_locations_and_permissions(self):
         system = diagnostic.Path("/usr/sbin/nft")
         with patch.object(diagnostic.Path, "resolve", return_value=diagnostic.Path("/tmp/nft")), \
-             patch.object(diagnostic.Path, "stat") as metadata:
+             patch.object(diagnostic.Path, "lstat") as metadata:
             self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
             metadata.assert_not_called()
         with patch.object(diagnostic.Path, "resolve", return_value=system):
             for uid, mode, expected in [(0, 0o100755, True), (1001, 0o100755, False),
                                         (0, 0o100775, False), (0, 0o100644, False),
-                                        (0, 0o040755, False)]:
-                with patch.object(diagnostic.Path, "stat", return_value=SimpleNamespace(st_uid=uid, st_mode=mode)):
+                                        (0, 0o100001, False), (0, 0o040755, False)]:
+                ancestry = [SimpleNamespace(st_uid=0, st_mode=0o040755)] * len(system.parents)
+                with patch.object(diagnostic.Path, "lstat", side_effect=[
+                    *ancestry, SimpleNamespace(st_uid=uid, st_mode=mode)
+                ]):
                     self.assertEqual(diagnostic.runner_tool_present("/usr/sbin/nft"), expected)
+            for uid, mode in [(0, 0o040777), (1001, 0o040755), (0, 0o120755)]:
+                with patch.object(diagnostic.Path, "lstat", return_value=SimpleNamespace(
+                    st_uid=uid, st_mode=mode
+                )) as metadata:
+                    self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
+                    metadata.assert_called_once()
         with patch.object(diagnostic.Path, "resolve", side_effect=FileNotFoundError):
             self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
 
