@@ -109,12 +109,7 @@ class HarnessTests(unittest.TestCase):
         root = Path(__file__).absolute().parents[3]
         rows = d.load_mutations(root)
         self.assertEqual(len(rows), 2)
-        # 14a/A11: verify the new bridge and executor source while preserving the historical driver pins.
-        # 14b/A20: pin the reviewed delegated admission and cwd source.
-        pins = {**d.PINS,
-                'crates/arxd/src/service/executor.rs': 'f863eae7da45bc49cb9b259123b8eb68909b86e4453bd2f0f755711973093c84',
-                'crates/arxd/src/service/unix_bridge.rs': '0f726200d87b0aaec3e03f6bcf34df73626b1996212ae8539e22534d1838b7e7'}
-        for path, pin in pins.items():
+        for path, pin in d.PINS.items():
             self.assertEqual(d.sha(d.bounded_read(d.regular(root,path),262144)),pin)
         for row in rows:
             original = d.bounded_read(d.regular(root,row['target']),262144)
