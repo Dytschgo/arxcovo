@@ -137,17 +137,43 @@ claimed.
 Guest readiness for an installed boot has an absolute, fixed budget of
 180 s from the accepted `cont`. No recipe, profile or caller can extend it.
 The merged v1 guest protocol is host-initiated: the guest service reads
-exactly one `Hello` first and treats a second one as a protocol error. So
-the host sends one fresh 128-bit challenge and tolerates silence until the
-budget expires. Until the guest opens its virtio-serial port, QEMU leaves
-that frame unread in the host pipe. A service that starts late therefore
-still receives this boot's challenge, and only an ack that echoes it, with
-script support advertised, is accepted. Stale, replayed, malformed or
-oversized replies refuse. Once a reply's first byte arrives, the rest of
-that frame must arrive within 10 s. Cancellation stops the wait at once.
-There is no retry, no second `Hello` and no reconnect. These properties come
-from the protocol and QEMU's multiport virtio-serial behavior; they are
-**unverified on real hardware** against the pinned binary.
+exactly one `Hello` first and treats a second one as a protocol error.
+Firmware can open the port first. OVMF's VirtioSerialDxe opens a named port
+before Linux, QEMU then moves a pending frame into the firmware queue, and
+`ExitBootServices` resets that queue.
+
+Readiness is therefore driven by QEMU's port-state events. The fixed port
+device id `arxguestport` is part of the recipe. The bounded QMP event set
+includes `VSERPORT_CHANGE {id, open}`. The id must match exactly; other
+ports' events are skipped and counted, and a malformed port event refuses.
+- The host writes no `Hello` until it has observed `open = true` for that
+  port.
+- Each open sends one fresh 128-bit challenge.
+- `open = false` voids the outstanding challenge.
+- A reply echoing a voided challenge is discarded, never accepted. Only an
+  echo of the latest challenge, with script support advertised, completes
+  readiness.
+- A challenge the host never issued, or a malformed or oversized reply,
+  refuses.
+- If a close and a reply are both pending, the close is handled first.
+- At most 8 opens are accepted; the next one refuses.
+- Once a reply's first byte arrives, the frame must complete within 10 s.
+- A result that completes at or after any deadline still refuses, because
+  Tokio polls ready I/O before an expired timer.
+- Cancellation stops the wait at once.
+- There is no serial reconnect: the one verified pipe handle is kept
+  throughout.
+
+Residual: QEMU does not read the pipe while the guest port is closed. A
+`Hello` written just as firmware closes the port can therefore stay
+buffered and reach the Linux service ahead of the fresh one. The service
+then answers the stale challenge, receives a second `Hello`, takes a
+protocol error and exits. Readiness then converges only through the
+service manager (systemd) restarting the service. That restart produces a
+close and an open, and a new fresh challenge. The host discards the echo of
+the stale challenge throughout. This convergence path, the firmware
+behavior, the event timing and the 180 s budget against real cold boots are
+**unverified on real hardware** against the pinned QEMU and EDK2 binaries.
 
 Installer boots are refused. A plan with installer media is
 `PlanKind::InstallerBoot`, and the native launcher's first check, before any
@@ -258,10 +284,22 @@ server PID differs. Other tests cover:
   records a late write is refused; and an in-time write is accepted. The
   boot-side settle future is polled directly to `Pending` before the worker
   is released;
-- guest readiness on the paused tokio clock: a late service inside the
-  budget passes; a silent or too-late service refuses exactly at 180 s;
-  stale, replayed, oversized and malformed acks refuse; a stalled frame
-  refuses after 10 s; and cancellation stops the wait without delay;
+- event-driven guest readiness on the paused tokio clock, with in-memory
+  QMP and serial streams:
+  - firmware consumes the first challenge, and Linux receives and answers a
+    fresh one;
+  - an echo of a voided challenge is never accepted;
+  - nothing is written before the first open;
+  - the open-cycle cap refuses;
+  - the budget spans every cycle;
+  - other ports are ignored, and malformed port events refuse;
+  - a stale buffered `Hello` converges through a service restart;
+  - a late service inside the budget passes, and a silent one refuses at
+    exactly 180 s;
+  - unissued, oversized and malformed acks refuse;
+  - a stalled frame refuses after 10 s;
+  - cancellation stops the wait;
+  - a reply that is ready together with the expired deadline refuses;
 - an installer recipe refused with `InstallerPhaseUnavailable` at the
   launcher's first check;
 - the 112-byte v11.1.3 create headers, with each refused feature,
