@@ -553,6 +553,19 @@ async fn admission_paths_refuse_already_expired_deadline_without_locking_node() 
         drop(held);
         assert!(take_diagnostics(&controller).is_empty());
     }
+
+    // A deadline can also expire between acquiring the node and submission.
+    let submitted = AtomicBool::new(false);
+    assert_eq!(
+        controller
+            .submit_membership(Instant::now(), &submitted, || -> std::future::Ready<()> {
+                panic!("membership dispatch invoked after the deadline");
+            })
+            .await,
+        Err(Reply::Refused)
+    );
+    assert!(!submitted.load(Ordering::SeqCst));
+    assert_eq!(controller.hooks.calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -643,4 +656,130 @@ async fn admission_stop_at_exhaustion_boundary_records_zero_node_busy() {
             assert!(take_diagnostics(&controller).is_empty());
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_stop_after_acquisition_does_not_poll_observation() {
+    for (stage, reply) in [
+        ("admission-worker", Reply::Refused),
+        ("admission-confirm", Reply::Unknown),
+    ] {
+        let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+        let node = controller
+            .lock_node_for_stage(&retained, Instant::now() + BUDGET, stage)
+            .await
+            .expect("node acquired before stop");
+        controller.stop();
+        let read = async {
+            drop(node);
+            panic!("observation polled after stop");
+        };
+        assert_eq!(controller.gate.observe::<()>(read, reply).await, Err(reply));
+        assert!(retained.try_lock().is_ok());
+        assert!(take_diagnostics(&controller).is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_stop_cancels_in_flight_observations_even_when_input_is_ready() {
+    let address = "192.168.1.2:1234".parse().unwrap();
+    let position = LogPos {
+        term: 1,
+        leader: 1,
+        index: 14,
+    };
+    for (stage, reply) in [
+        ("admission-worker", Reply::Refused),
+        ("admission-confirm", Reply::Unknown),
+    ] {
+        let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+        let start = Instant::now();
+        let node = controller
+            .lock_node_for_stage(&retained, start + BUDGET, stage)
+            .await
+            .expect("node acquired before stop");
+        let (complete, ready) = oneshot::channel();
+        let mut observed = std::pin::pin!(controller.gate.observe(
+            async {
+                ready.await.unwrap();
+                drop(node);
+                Reply::Applied(position, address)
+            },
+            reply,
+        ));
+        assert!(futures_util::poll!(&mut observed).is_pending());
+        assert!(retained.try_lock().is_err());
+        controller.stop();
+        complete.send(()).unwrap();
+        assert_eq!(futures_util::poll!(&mut observed), Poll::Ready(Err(reply)));
+        assert_eq!(Instant::now(), start);
+        assert!(retained.try_lock().is_ok(), "observation dropped on stop");
+        assert!(take_diagnostics(&controller).is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_stop_after_add_observation_refuses_without_dispatch() {
+    let (_peer, retained, controller, _dir) = no_engine_fixture().await;
+    let deadline = Instant::now() + BUDGET;
+    let node = controller
+        .lock_node_for_stage(&retained, deadline, "admission-worker")
+        .await
+        .expect("node acquired before stop");
+    let tail = id(LogPos {
+        term: 1,
+        leader: 1,
+        index: 15,
+    });
+    let observed = controller
+        .gate
+        .observe(
+            async {
+                drop(node);
+                AdmissionObservation::Add {
+                    leader: tail.leader_id,
+                    membership: tail,
+                    tail,
+                }
+            },
+            Reply::Refused,
+        )
+        .await;
+    assert!(matches!(observed, Ok(AdmissionObservation::Add { .. })));
+    let submitted = AtomicBool::new(false);
+    controller.stop();
+    assert_eq!(
+        controller
+            .submit_membership(deadline, &submitted, || -> std::future::Ready<()> {
+                panic!("membership dispatch invoked after stop");
+            })
+            .await,
+        Err(Reply::Refused)
+    );
+    assert!(!submitted.load(Ordering::SeqCst));
+    assert_eq!(controller.hooks.calls.load(Ordering::Relaxed), 0);
+    assert!(take_diagnostics(&controller).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_stop_preserves_started_proposal_ownership() {
+    let (_peer, _retained, controller, _dir) = no_engine_fixture().await;
+    let deadline = Instant::now() + BUDGET;
+    let submitted = AtomicBool::new(false);
+    let (complete, ready) = oneshot::channel();
+    let mut proposal = std::pin::pin!(controller.submit_membership(deadline, &submitted, || {
+        async {
+            assert!(controller.gate.closed.try_lock().is_err());
+            assert!(submitted.load(Ordering::SeqCst));
+            ready.await
+        }
+    }));
+    assert!(futures_util::poll!(&mut proposal).is_pending());
+    controller.stop();
+    assert!(futures_util::poll!(&mut proposal).is_pending());
+    complete.send(()).unwrap();
+    assert_eq!(futures_util::poll!(&mut proposal), Poll::Ready(Ok(Ok(()))));
+    assert!(submitted.load(Ordering::SeqCst));
+    assert_eq!(controller.hooks.calls.load(Ordering::Relaxed), 1);
+    assert!(take_diagnostics(&controller).is_empty());
 }

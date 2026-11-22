@@ -6,8 +6,11 @@ use openraft::{
     type_config::async_runtime::watch::WatchReceiver,
 };
 use std::{
+    future::{Future, poll_fn},
     net::SocketAddr,
+    pin::pin,
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
 };
 #[derive(Default)]
 pub(super) struct IntentSlot {
@@ -155,6 +158,25 @@ impl StopGate {
     fn lock_open(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
         let closed = self.closed.lock().ok()?;
         (!*closed).then_some(closed)
+    }
+
+    async fn observe<T>(&self, read: impl Future<Output = T>, on_stop: Reply) -> Result<T, Reply> {
+        let mut read = pin!(read);
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        tokio::select! {
+            biased;
+            () = stopped.as_mut() => Err(on_stop),
+            result = poll_fn(|cx| {
+                // The first poll can register an owned read. Order it
+                // against stop, and recheck the gate on each later poll.
+                let Some(_open) = self.lock_open() else {
+                    return Poll::Ready(Err(on_stop));
+                };
+                read.as_mut().poll(cx).map(Ok)
+            }) => result,
+        }
     }
 
     fn report_if_open(&self, report: impl FnOnce()) {
@@ -401,7 +423,18 @@ impl Controller {
             let Some(raft) = node.raft.clone() else {
                 return Reply::Refused;
             };
-            (raft, node.admission_observation(peer, address, None).await)
+            let observed = self
+                .gate
+                .observe(
+                    node.admission_observation(peer, address, None),
+                    Reply::Refused,
+                )
+                .await;
+            (raft, observed)
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(reply) => return reply,
         };
         let (leader, membership, tail) = match observed {
             Ok(AdmissionObservation::Answer(reply)) => return reply,
@@ -435,10 +468,6 @@ impl Controller {
             return Reply::Refused;
         }
 
-        submitted.store(true, Ordering::SeqCst);
-        if Instant::now() >= deadline {
-            return Reply::Refused;
-        }
         let add = ChangeMembers::AddNodes(BTreeMap::from([(
             peer.node().get(),
             BasicNode::new(address.to_string()),
@@ -454,9 +483,15 @@ impl Controller {
                 last_log_id: Some(tail),
             },
         ];
-        #[cfg(test)]
-        self.hooks.calls.fetch_add(1, Ordering::Relaxed);
-        let result = raft.change_membership_if(add, true, guards).await;
+        let result = self
+            .submit_membership(deadline, submitted, || {
+                raft.change_membership_if(add, true, guards)
+            })
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(reply) => return reply,
+        };
         let response = match result {
             Ok(response) => response,
             Err(RaftError::APIError(ClientWriteError::PreconditionFailed(
@@ -490,6 +525,38 @@ impl Controller {
             .await
     }
 
+    async fn submit_membership<F: Future>(
+        &self,
+        deadline: Instant,
+        submitted: &AtomicBool,
+        dispatch: impl FnOnce() -> F,
+    ) -> Result<F::Output, Reply> {
+        let mut proposal = pin!(async { dispatch().await });
+        let mut started = false;
+        poll_fn(|cx| {
+            if started {
+                return proposal.as_mut().poll(cx).map(Ok);
+            }
+            let Some(_open) = self.gate.lock_open() else {
+                return Poll::Ready(Err(Reply::Refused));
+            };
+            // Publish before the final deadline check so the caller cannot
+            // time out with Refused and then have a proposal start.
+            submitted.store(true, Ordering::SeqCst);
+            if Instant::now() >= deadline {
+                submitted.store(false, Ordering::SeqCst);
+                return Poll::Ready(Err(Reply::Refused));
+            }
+            // The Raft API starts on poll. Serialize that handoff with stop
+            // and let the owner await any pending result outside the gate.
+            started = true;
+            #[cfg(test)]
+            self.hooks.calls.fetch_add(1, Ordering::Relaxed);
+            proposal.as_mut().poll(cx).map(Ok)
+        })
+        .await
+    }
+
     async fn confirm_admission(
         &self,
         node: &RetainedNode,
@@ -504,11 +571,15 @@ impl Controller {
         else {
             return Reply::Unknown;
         };
-        match node
-            .admission_observation(peer, address, Some(position))
+        match self
+            .gate
+            .observe(
+                node.admission_observation(peer, address, Some(position)),
+                Reply::Unknown,
+            )
             .await
         {
-            Ok(AdmissionObservation::Answer(reply)) => reply,
+            Ok(Ok(AdmissionObservation::Answer(reply))) | Err(reply) => reply,
             _ => {
                 #[cfg(test)]
                 if self.hooks.active.load(Ordering::Relaxed) {
