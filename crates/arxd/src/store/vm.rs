@@ -3,8 +3,9 @@
 //! A v5 VM opener rejects v6. Upgraded state must be opened with v6-capable code.
 use super::{check_size, validate_principal};
 use crate::vm::{
-    Action, Completion, ExpiredVm, ExpiryClaim, Id, RETRY_WINDOW_MS, Receipt, RecoveryClaim,
-    Refusal, RequestId, Status,
+    Action, ArtifactEvidence, ArtifactSlot, BuildRequest, BuildSlots, Completion, ExpiredVm,
+    ExpiryClaim, Guest, Id, OperationRef, OperationStatus, PairSlots, RETRY_WINDOW_MS, Receipt,
+    RecoveryClaim, Refusal, RequestId, ScriptResult, Status, Subject, VmStatus,
 };
 use anyhow::{Result, ensure};
 use rusqlite::{
@@ -666,13 +667,24 @@ pub(crate) fn refusal(
     now: i64,
     reason: Refusal,
 ) -> Result<()> {
+    refusal_for(db, principal, Some(vm), action as i64, now, reason)
+}
+
+pub(crate) fn refusal_for(
+    db: &Connection,
+    principal: &str,
+    vm: Option<Id>,
+    action: i64,
+    now: i64,
+    reason: Refusal,
+) -> Result<()> {
     if headroom(db)? {
         validate_principal(principal)?;
         db.execute(
             "INSERT INTO activity(principal,vm,action,started_ms,status,reason,finished_ms,actor,terminal_order)
              VALUES(?1,?2,?3,?4,4,?5,?4,'agent',
                (SELECT coalesce(max(terminal_order),0)+1 FROM activity))",
-            params![principal, vm, action as i64, now, reason as i64],
+            params![principal, vm, action, now, reason as i64],
         )?;
         prune(db)?;
         require_headroom(db)?;
@@ -687,6 +699,17 @@ pub(crate) fn finish(
     now: i64,
     cleanup: Option<bool>,
 ) -> Result<()> {
+    finish_with_script(db, id, status, now, cleanup, None)
+}
+
+fn finish_with_script(
+    db: &Connection,
+    id: i64,
+    status: Status,
+    now: i64,
+    cleanup: Option<bool>,
+    script: Option<ScriptResult>,
+) -> Result<()> {
     ensure!(
         db.execute(
             "UPDATE activity SET status=?2,finished_ms=?3,cleanup_confirmed=?4,
@@ -696,9 +719,18 @@ pub(crate) fn finish(
         )? == 1,
         "VM activity already terminal"
     );
+    let (result, code) = match script {
+        Some(ScriptResult::Exited(code)) => (Some("exited"), Some(code)),
+        Some(ScriptResult::Unavailable) => (Some("unavailable"), None),
+        Some(ScriptResult::TimedOut) => (Some("timed_out"), None),
+        Some(ScriptResult::LaunchFailed) => (Some("launch_failed"), None),
+        Some(ScriptResult::Terminated) => (Some("terminated"), None),
+        None => (None, None),
+    };
     db.execute(
-        "UPDATE vm_operations SET status=?2 WHERE activity_id=?1",
-        params![id, status.code()],
+        "UPDATE vm_operations SET status=?2,script_result=coalesce(?3,script_result),script_exit_code=?4
+         WHERE activity_id=?1",
+        params![id, status.code(), result, code],
     )?;
     prune(db)
 }
@@ -726,12 +758,12 @@ fn retry_time(db: &Connection, now: i64) -> Result<i64> {
 pub(crate) struct Binding<'a> {
     pub principal: &'a str,
     pub key: RequestId,
-    pub vm: Id,
-    pub action: Action,
+    pub subject: Subject<'a>,
+    pub action: i64,
 }
 
 pub(crate) struct Replay {
-    pub receipt: Receipt,
+    pub operation: OperationRef,
     pub lease_end: Option<i64>,
 }
 
@@ -748,25 +780,45 @@ impl Binding<'_> {
         }
         let previous = db
             .query_row(
-                "SELECT action,vm,activity_id,status,lease_end_ms FROM vm_operations
+                "SELECT action,vm,activity_id,status,lease_end_ms,operation_id,binding_kind,
+                    subject_id,request_digest,recipe_id,recipe_digest FROM vm_operations
              WHERE principal=?1 AND request_key=?2",
                 params![self.principal, self.key.key],
                 |row| {
+                    let matches = row.get::<_, i64>(0)? == self.action
+                        && match (self.subject, row.get::<_, String>(6)?.as_str()) {
+                            (Subject::Vm(id), "legacy_vm" | "vm") => {
+                                row.get::<_, Option<Id>>(1)? == Some(id)
+                            }
+                            (Subject::Template(id, digest), "template") => {
+                                row.get::<_, Option<Id>>(7)? == Some(id)
+                                    && row.get::<_, Option<[u8; 32]>>(8)? == Some(digest)
+                            }
+                            (Subject::Recipe(id, digest), "recipe") => {
+                                row.get::<_, Option<String>>(9)?.as_deref() == Some(id)
+                                    && row.get::<_, Option<[u8; 32]>>(10)? == Some(digest)
+                            }
+                            _ => false,
+                        };
                     Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Id>(1)?,
-                        Receipt {
-                            activity_id: row.get(2)?,
-                            status: Status::from_code(row.get(3)?)?,
+                        matches,
+                        Replay {
+                            operation: OperationRef {
+                                id: row.get(5)?,
+                                receipt: Receipt {
+                                    activity_id: row.get(2)?,
+                                    status: Status::from_code(row.get(3)?)?,
+                                },
+                            },
+                            lease_end: row.get(4)?,
                         },
-                        row.get(4)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((action, vm, receipt, lease_end)) = previous {
-            return Ok(if action == self.action as i64 && vm == self.vm {
-                Ok(Some(Replay { receipt, lease_end }))
+        if let Some((matches, prior)) = previous {
+            return Ok(if matches {
+                Ok(Some(prior))
             } else {
                 Err(Refusal::KeyCollision)
             });
@@ -794,23 +846,176 @@ impl Binding<'_> {
         self.key.issued_at_ms + RETRY_WINDOW_MS
     }
 
-    pub(crate) fn record(&self, db: &Connection, now: i64, lease_end: Option<i64>) -> Result<i64> {
-        let id = activity(db, self.principal, self.vm, self.action, now)?;
+    pub(crate) fn record(
+        &self,
+        db: &Connection,
+        now: i64,
+        vm: Option<Id>,
+        lease_end: Option<i64>,
+    ) -> Result<OperationRef> {
         db.execute(
-            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
-                lease_end_ms,script_result)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?4=2 THEN 'legacy' END)",
-            params![self.principal, self.key.key, self.vm, self.action as i64, id, self.valid_through(), lease_end],
+            "INSERT INTO activity(principal,vm,action,started_ms,actor) VALUES(?1,?2,?3,?4,'agent')",
+            params![self.principal, vm, self.action, now],
         )?;
-        Ok(id)
+        let activity_id = db.last_insert_rowid();
+        let (kind, subject, request, recipe, digest) = match self.subject {
+            Subject::Vm(id) => {
+                // The existing public clone API still binds its supplied VM ID.
+                let kind = if self.action == Action::Clone as i64 {
+                    "legacy_vm"
+                } else {
+                    "vm"
+                };
+                (kind, (kind == "vm").then_some(id), None, None, None)
+            }
+            Subject::Template(id, digest) => ("template", Some(id), Some(digest), None, None),
+            Subject::Recipe(id, digest) => ("recipe", None, None, Some(id), Some(digest)),
+        };
+        let id = db.query_row(
+            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
+                lease_end_ms,binding_kind,subject_id,request_digest,recipe_id,recipe_digest,script_result)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,CASE WHEN ?4=2 THEN 'legacy' END)
+             RETURNING operation_id",
+            params![self.principal, self.key.key, vm, self.action, activity_id, self.valid_through(),
+                lease_end, kind, subject, request, recipe, digest],
+            |row| row.get(0),
+        )?;
+        Ok(OperationRef {
+            id,
+            receipt: Receipt {
+                activity_id,
+                status: Status::Pending,
+            },
+        })
     }
+}
+
+#[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
+pub(crate) fn operation_status(
+    db: &Connection,
+    principal: &str,
+    operation: Id,
+    now: i64,
+) -> Result<Option<OperationStatus>> {
+    let now = retry_time(db, now)?;
+    Ok(db
+        .query_row(
+            "SELECT o.action,o.status,o.vm,o.recipe_id,
+                coalesce(o.subject_id, v.template, (SELECT b.template_id FROM vm_build_intents b
+                    WHERE o.action=11 AND o.status=1 AND b.state='sealed'
+                       AND b.recipe_id=o.recipe_id AND b.recipe_digest=o.recipe_digest)),
+                o.lease_end_ms,o.script_result,o.script_exit_code,a.cleanup_confirmed
+         FROM vm_operations o LEFT JOIN activity a ON a.id=o.activity_id
+         LEFT JOIN vm_instances v ON v.id=o.vm AND v.principal=o.principal
+         WHERE o.principal=?1 AND o.operation_id=?2 AND (o.status=0 OR o.valid_through_ms>=?3)",
+            params![principal, operation, now],
+            |row| {
+                let action: i64 = row.get(0)?;
+                let state = Status::from_code(row.get(1)?)?;
+                let (action, stage) = match action {
+                    1 => ("create", Some("cloning")),
+                    2 => ("run_script", Some("executing")),
+                    3 => ("start", Some("booting")),
+                    4 => ("stop", Some("stopping")),
+                    5 => ("snapshot", Some("queued")),
+                    6 => ("restore", Some("queued")),
+                    8 => ("extend", None),
+                    11 => ("template_build", Some("staging")),
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                let script = match row.get::<_, Option<String>>(6)?.as_deref() {
+                    Some("exited") => Some(ScriptResult::Exited(row.get(7)?)),
+                    Some("unavailable") => Some(ScriptResult::Unavailable),
+                    Some("timed_out") => Some(ScriptResult::TimedOut),
+                    Some("launch_failed") => Some(ScriptResult::LaunchFailed),
+                    Some("terminated") => Some(ScriptResult::Terminated),
+                    _ => None,
+                };
+                let cleanup = match (row.get::<_, Option<bool>>(8)?, state) {
+                    (Some(true), _) => Some("confirmed"),
+                    (Some(false), _) | (_, Status::Interrupted) => Some("unconfirmed"),
+                    (None, Status::Succeeded | Status::Failed) if action != "extend" => {
+                        Some("confirmed")
+                    }
+                    _ => None,
+                };
+                Ok(OperationStatus {
+                    id: operation,
+                    action,
+                    state,
+                    stage: stage.filter(|_| state == Status::Pending),
+                    cleanup,
+                    vm: row.get(2)?,
+                    recipe: row.get(3)?,
+                    template: if matches!(action, "create" | "template_build") {
+                        row.get(4)?
+                    } else {
+                        None
+                    },
+                    expires_at_ms: row.get(5)?,
+                    script,
+                })
+            },
+        )
+        .optional()?)
+}
+
+#[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
+pub(crate) fn vm_status_rows(
+    db: &Connection,
+    principal: &str,
+    exact: Option<Id>,
+    after: Option<Id>,
+    limit: u32,
+    now: i64,
+) -> Result<Vec<VmStatus>> {
+    let mut stmt = db.prepare(
+        "SELECT v.id,v.template,t.guest,v.state,v.expires_ms,a.cleanup_confirmed
+         FROM vm_instances v JOIN vm_templates t ON t.id=v.template
+         LEFT JOIN activity a ON a.id=v.cleanup_id
+         WHERE v.principal=?1 AND (?2 IS NULL OR v.id=?2) AND (?3 IS NULL OR v.id>?3)
+         ORDER BY v.id LIMIT ?4",
+    )?;
+    let items = stmt.query_map(params![principal, exact, after, limit], |row| {
+        let expires: i64 = row.get(4)?;
+        let state = match (row.get::<_, i64>(3)?, expires <= now) {
+            (0..=4, true) | (4, _) => "teardown",
+            (0, _) => "creating",
+            (1, _) => "stopped",
+            (2, _) => "running",
+            (3, _) => "recovering",
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+        let cleanup = match (row.get::<_, Option<bool>>(5)?, state) {
+            (Some(false), _) => Some("unconfirmed"),
+            (_, "teardown" | "recovering") => Some("pending"),
+            _ => None,
+        };
+        Ok(VmStatus {
+            id: row.get(0)?,
+            template: Some(row.get(1)?),
+            guest: Some(match row.get::<_, i64>(2)? {
+                1 => Guest::UbuntuX86_64,
+                2 => Guest::WindowsX86_64,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }),
+            state,
+            ready: false,
+            expires_at_ms: Some(expires),
+            expired_at_ms: None,
+            cleanup,
+            snapshots: [],
+        })
+    })?;
+    Ok(items.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
     let mut stmt = db.prepare(
         "SELECT bytes FROM vm_templates
         UNION ALL SELECT persistent FROM vm_disk_claims
-        UNION ALL SELECT staging FROM vm_disk_claims",
+        UNION ALL SELECT staging FROM vm_disk_claims
+        UNION ALL SELECT staging_bytes FROM vm_build_intents",
     )?;
     let mut rows = stmt.query([])?;
     let mut total = 0u64;
@@ -823,9 +1028,349 @@ pub(crate) fn disk_bytes(db: &Connection) -> Result<Option<u64>> {
     Ok(Some(total))
 }
 
+pub(crate) fn new_id() -> Result<Id> {
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).map_err(|_| anyhow::anyhow!("VM identity unavailable"))?;
+    Ok(id)
+}
+
+fn new_generation(db: &Connection, build: Option<Id>, vm: Option<Id>, ordinal: i64) -> Result<Id> {
+    let id = new_id()?;
+    db.execute(
+        "INSERT INTO vm_generations(id,build_id,vm_id,generation) VALUES(?1,?2,?3,?4)",
+        params![id, build, vm, ordinal],
+    )?;
+    Ok(id)
+}
+
+fn plan(db: &Connection, generation: Id, role: &'static str) -> Result<ArtifactSlot> {
+    let key = new_id()?;
+    db.execute(
+        "INSERT INTO vm_artifacts(generation_id,role,object_key,state) VALUES(?1,?2,?3,'planned')",
+        params![generation, role, key],
+    )?;
+    Ok(ArtifactSlot {
+        generation,
+        role,
+        key,
+    })
+}
+
+fn plan_pair(db: &Connection, generation: Id, disk_role: &'static str) -> Result<PairSlots> {
+    Ok(PairSlots {
+        disk: plan(db, generation, disk_role)?,
+        vars: plan(db, generation, "vars")?,
+    })
+}
+
+pub(crate) fn reserve_build(
+    db: &Connection,
+    request: BuildRequest<'_>,
+    operation: OperationRef,
+    peak: u64,
+) -> Result<BuildSlots> {
+    let id = new_id()?;
+    ensure!(
+        db.execute(
+            "INSERT INTO vm_build_intents(id,operation_id,recipe_id,recipe_digest,staging_bytes,state)
+             SELECT ?1,operation_id,recipe_id,recipe_digest,?3,'pending' FROM vm_operations
+             WHERE operation_id=?2 AND principal=?4 AND request_key=?5 AND action=11 AND status=0
+               AND activity_id=?6 AND recipe_id=?7 AND recipe_digest=?8",
+            params![id, operation.id, peak, request.principal, request.key.key,
+                operation.receipt.activity_id, request.recipe, request.digest],
+        )? == 1,
+        "invalid build reservation binding"
+    );
+    let golden = new_generation(db, Some(id), None, 1)?;
+    let verification = new_generation(db, Some(id), None, 2)?;
+    Ok(BuildSlots {
+        id,
+        pair: plan_pair(db, golden, "disk")?,
+        seed: plan(db, golden, "seed")?,
+        verification: plan_pair(db, verification, "verification_overlay")?,
+    })
+}
+
+pub(crate) fn plan_clone(db: &Connection, vm: Id) -> Result<PairSlots> {
+    plan_pair(db, new_generation(db, None, Some(vm), 1)?, "disk")
+}
+
+pub(crate) fn created(db: &Connection, slot: ArtifactSlot) -> Result<()> {
+    ensure!(
+        db.execute(
+            "UPDATE vm_artifacts SET state='created'
+             WHERE generation_id=?1 AND role=?2 AND object_key=?3 AND state IN ('planned','created')",
+            params![slot.generation, slot.role, slot.key],
+        )? == 1,
+        "invalid created artifact"
+    );
+    Ok(())
+}
+
+pub(crate) fn identify(
+    db: &Connection,
+    slot: ArtifactSlot,
+    evidence: ArtifactEvidence,
+) -> Result<()> {
+    let volume = evidence.identity.volume.to_be_bytes();
+    ensure!(
+        db.execute(
+            "UPDATE vm_artifacts SET state='identified',volume_id=?4,directory_id=?5,file_id=?6,
+                content_digest=?7,bytes=?8
+             WHERE generation_id=?1 AND role=?2 AND object_key=?3
+               AND (state='created' OR (state='identified' AND volume_id=?4 AND directory_id=?5
+                    AND file_id=?6 AND content_digest=?7 AND bytes=?8))",
+            params![
+                slot.generation,
+                slot.role,
+                slot.key,
+                volume,
+                evidence.directory,
+                evidence.identity.file,
+                evidence.pin.sha256,
+                evidence.pin.size
+            ],
+        )? == 1,
+        "invalid artifact identity"
+    );
+    Ok(())
+}
+
+pub(crate) fn sealed_pair(
+    db: &Connection,
+    recipe: &str,
+    digest: [u8; 32],
+) -> Result<Option<(Id, PairSlots)>> {
+    Ok(db.query_row(
+        "SELECT t.id,g.id,d.object_key,v.object_key FROM vm_templates t
+         JOIN vm_build_intents b ON b.template_id=t.id
+         JOIN vm_generations g ON g.build_id=b.id AND g.active=1
+         JOIN vm_artifacts d ON d.generation_id=g.id AND d.role='disk' AND d.state='sealed'
+         JOIN vm_artifacts v ON v.generation_id=g.id AND v.role='vars' AND v.state='sealed'
+         WHERE b.state='sealed' AND b.recipe_id=?1 AND b.recipe_digest=?2
+           AND t.recipe_digest=?2 AND t.disk_digest=d.content_digest AND t.vars_digest=v.content_digest",
+        params![recipe, digest],
+        |row| {
+            let generation = row.get(1)?;
+            Ok((row.get(0)?, PairSlots {
+                disk: ArtifactSlot { generation, role: "disk", key: row.get(2)? },
+                vars: ArtifactSlot { generation, role: "vars", key: row.get(3)? },
+            }))
+        },
+    ).optional()?)
+}
+
+pub(crate) fn evidence_matches(
+    db: &Connection,
+    slot: ArtifactSlot,
+    proof: ArtifactEvidence,
+    state: &str,
+) -> Result<bool> {
+    Ok(count(db,
+        "SELECT EXISTS(SELECT 1 FROM vm_artifacts WHERE generation_id=?1 AND role=?2 AND object_key=?3
+         AND volume_id=?4 AND directory_id=?5 AND file_id=?6 AND content_digest=?7 AND bytes=?8 AND state=?9)",
+        params![slot.generation, slot.role, slot.key, proof.identity.volume.to_be_bytes(),
+            proof.directory, proof.identity.file, proof.pin.sha256, proof.pin.size, state],
+    )? != 0)
+}
+
+pub(crate) fn publish_build(
+    db: &Connection,
+    activity_id: i64,
+    slots: BuildSlots,
+    request: BuildRequest<'_>,
+    proof: [ArtifactEvidence; 2],
+    now: i64,
+) -> Result<()> {
+    let [disk, vars] = proof;
+    let retained = request
+        .retained
+        .persistent()
+        .ok_or_else(|| anyhow::anyhow!("invalid retained charge"))?;
+    let peak = retained
+        .checked_add(
+            request
+                .transient
+                .total()
+                .ok_or_else(|| anyhow::anyhow!("invalid transient charge"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid build peak"))?;
+    ensure!(
+        slots.pair.disk.role == "disk"
+            && slots.pair.vars.role == "vars"
+            && slots.pair.disk.generation == slots.pair.vars.generation
+            && disk.identity != vars.identity
+            && disk
+                .pin
+                .size
+                .checked_add(vars.pin.size)
+                .is_some_and(|bytes| bytes <= request.retained.images)
+            && evidence_matches(db, slots.pair.disk, disk, "identified")?
+            && evidence_matches(db, slots.pair.vars, vars, "identified")?,
+        "invalid sealed artifact evidence"
+    );
+    let template = slots.id;
+    ensure!(db.execute(
+        "INSERT INTO vm_templates
+         SELECT ?1,?2,b.recipe_digest,?3,?4,?5 FROM vm_build_intents b
+         JOIN vm_operations o USING(operation_id)
+         JOIN vm_generations g ON g.build_id=b.id AND g.generation=1
+         WHERE b.id=?6 AND g.id=?7 AND b.state='pending' AND b.staging_bytes=?13
+           AND o.activity_id=?8 AND o.action=11 AND o.status=0 AND b.recipe_id=?9 AND b.recipe_digest=?10
+           AND o.recipe_id=b.recipe_id AND o.recipe_digest=b.recipe_digest
+           AND o.principal=?11 AND o.request_key=?12",
+        params![template, Guest::UbuntuX86_64 as i64, disk.pin.sha256, vars.pin.sha256,
+            retained, slots.id, slots.pair.disk.generation, activity_id, request.recipe,
+            request.digest, request.principal, request.key.key, peak],
+    )? == 1, "invalid build publication binding");
+    // The caller has proved release and removed the transient files.
+    ensure!(db.execute(
+        "DELETE FROM vm_artifacts WHERE generation_id=?1 AND role='seed' AND object_key=?2 AND state='identified'",
+        params![slots.pair.disk.generation, slots.seed.key],
+    )? == 1, "invalid released seed");
+    ensure!(
+        count(
+            db,
+            "SELECT count(*) FROM vm_generations g JOIN vm_artifacts a ON a.generation_id=g.id
+         WHERE g.id=?1 AND g.build_id=?2 AND g.generation=2 AND g.active=0
+           AND a.object_key IN (?3,?4) AND a.state='identified'",
+            params![
+                slots.verification.disk.generation,
+                slots.id,
+                slots.verification.disk.key,
+                slots.verification.vars.key
+            ],
+        )? == 2,
+        "invalid released verification pair"
+    );
+    forget_generation(db, slots.verification.disk.generation)?;
+    activate(db, slots.pair, "sealed")?;
+    db.execute(
+        "UPDATE vm_build_intents SET state='sealed',template_id=?2,staging_bytes=0,health_verified=1 WHERE id=?1",
+        params![slots.id, template],
+    )?;
+    finish(db, activity_id, Status::Succeeded, now, Some(true))?;
+    require_headroom(db)
+}
+
+fn activate(db: &Connection, pair: PairSlots, state: &str) -> Result<()> {
+    ensure!(
+        pair.disk.generation == pair.vars.generation
+            && db.execute(
+                "UPDATE vm_artifacts SET state=?4 WHERE generation_id=?1 AND state='identified'
+                 AND object_key IN (?2,?3)",
+                params![pair.disk.generation, pair.disk.key, pair.vars.key, state],
+            )? == 2,
+        "invalid generation pair"
+    );
+    ensure!(
+        db.execute(
+            "UPDATE vm_generations SET active=1 WHERE id=?1 AND active=0",
+            [pair.disk.generation],
+        )? == 1,
+        "invalid generation activation"
+    );
+    Ok(())
+}
+
+fn forget_generation(db: &Connection, generation: Id) -> Result<()> {
+    db.execute(
+        "DELETE FROM vm_artifacts WHERE generation_id=?1",
+        [generation],
+    )?;
+    db.execute("DELETE FROM vm_generations WHERE id=?1", [generation])?;
+    Ok(())
+}
+
+pub(crate) fn cancel_untouched_build(
+    db: &Connection,
+    slots: BuildSlots,
+    activity_id: i64,
+    now: i64,
+) -> Result<()> {
+    ensure!(
+        count(
+            db,
+            "SELECT count(*) FROM vm_build_intents b JOIN vm_operations o USING(operation_id)
+         WHERE b.id=?1 AND b.state='pending' AND o.activity_id=?2
+           AND NOT EXISTS(SELECT 1 FROM vm_artifacts a JOIN vm_generations g ON g.id=a.generation_id
+               WHERE g.build_id=b.id AND a.state<>'planned')",
+            params![slots.id, activity_id],
+        )? == 1,
+        "invalid untouched build"
+    );
+    let mut stmt = db.prepare("SELECT id FROM vm_generations WHERE build_id=?1")?;
+    for generation in stmt
+        .query_map([slots.id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        forget_generation(db, generation)?;
+    }
+    db.execute("DELETE FROM vm_build_intents WHERE id=?1", [slots.id])?;
+    finish(db, activity_id, Status::Failed, now, Some(true))
+}
+
+pub(crate) fn abandon_build(db: &Connection, id: Id, activity_id: i64, now: i64) -> Result<()> {
+    ensure!(count(db,
+        "SELECT count(*) FROM vm_build_intents WHERE id=?1 AND state='pending'
+         AND operation_id=(SELECT operation_id FROM vm_operations WHERE activity_id=?2 AND status=0)",
+        params![id, activity_id],
+    )? == 1, "invalid interrupted build");
+    let mut stmt = db.prepare("SELECT id FROM vm_generations WHERE build_id=?1")?;
+    for generation in stmt.query_map([id], |row| row.get(0))? {
+        abandon_inactive(db, Some(generation?))?;
+    }
+    classify_abandoned_builds(db, Some(id))?;
+    finish(db, activity_id, Status::Interrupted, now, Some(false))
+}
+
+pub(crate) fn settle_clone(
+    db: &Connection,
+    activity_id: i64,
+    pair: PairSlots,
+    proof: Option<[ArtifactEvidence; 2]>,
+    now: i64,
+) -> Result<Status> {
+    ensure!(count(db,
+        "SELECT count(*) FROM vm_operations o JOIN vm_instances v ON v.id=o.vm
+         JOIN vm_generations g ON g.vm_id=v.id
+         WHERE o.activity_id=?1 AND o.action=1 AND o.status=0 AND o.binding_kind='template'
+           AND o.subject_id=v.template AND o.principal=v.principal AND g.id=?2 AND g.active=0 AND v.state=0",
+        params![activity_id, pair.disk.generation],
+    )? == 1, "invalid clone settlement binding");
+    let status = if let Some([disk, vars]) = proof {
+        ensure!(disk.identity != vars.identity, "shared clone artifact");
+        for (slot, evidence) in [(pair.disk, disk), (pair.vars, vars)] {
+            created(db, slot)?;
+            identify(db, slot, evidence)?;
+        }
+        activate(db, pair, "active")?;
+        settle_operation(db, activity_id, now, Completion::Succeeded)?
+    } else {
+        abandon_inactive(db, Some(pair.disk.generation))?;
+        settle_operation(db, activity_id, now, Completion::CleanupUnconfirmed)?
+    };
+    require_headroom(db)?;
+    Ok(status)
+}
+
+fn abandon_inactive(db: &Connection, generation: Option<Id>) -> Result<()> {
+    // Identity is custody evidence, never evidence that a process exited.
+    // Keep every charge and never publish an incomplete generation.
+    db.execute(
+        "UPDATE vm_artifacts SET state=CASE WHEN state='identified' THEN 'pending_disposal' ELSE 'quarantined' END
+         WHERE state IN ('planned','created','identified') AND generation_id IN
+            (SELECT id FROM vm_generations WHERE active=0 AND (?1 IS NULL OR id=?1))",
+        [generation],
+    )?;
+    Ok(())
+}
+
 /// Preserve all charges on uncertainty, including on restart.
 pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
     purge_tombstones(db, now)?;
+    abandon_inactive(db, None)?;
+    classify_abandoned_builds(db, None)?;
     db.execute("UPDATE vm_instances SET state=4 WHERE state=0", [])?;
     let mut stmt = db.prepare(
         "SELECT id FROM vm_instances WHERE state IN (1,2)
@@ -837,14 +1382,27 @@ pub(crate) fn recover(db: &Connection, now: i64) -> Result<()> {
     for vm in interrupted {
         begin_recovery(db, vm, now)?;
     }
-    let mut stmt =
-        db.prepare("SELECT id FROM activity WHERE status=0 AND action<=6 ORDER BY id LIMIT ?1")?;
+    let mut stmt = db.prepare(
+        "SELECT id FROM activity WHERE status=0 AND (action<=6 OR action=11) ORDER BY id LIMIT ?1",
+    )?;
     let pending = stmt
         .query_map([MAX_CALLER_PENDING], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in pending {
         finish(db, id, Status::Interrupted, now, Some(false))?;
     }
+    Ok(())
+}
+
+fn classify_abandoned_builds(db: &Connection, id: Option<Id>) -> Result<()> {
+    db.execute(
+        "UPDATE vm_build_intents SET state=CASE WHEN EXISTS(
+            SELECT 1 FROM vm_artifacts a JOIN vm_generations g ON g.id=a.generation_id
+            WHERE g.build_id=vm_build_intents.id AND a.state='quarantined')
+         THEN 'quarantined' ELSE 'pending_disposal' END
+         WHERE state='pending' AND (?1 IS NULL OR id=?1)",
+        [id],
+    )?;
     Ok(())
 }
 
@@ -863,12 +1421,26 @@ pub(crate) fn settle_operation(
     now: i64,
     completion: Completion,
 ) -> Result<Status> {
+    settle_with_script(db, id, now, completion, None)
+}
+
+pub(crate) fn settle_with_script(
+    db: &Connection,
+    id: i64,
+    now: i64,
+    completion: Completion,
+    script: Option<ScriptResult>,
+) -> Result<Status> {
     let (vm, action, state): (Id, i64, i64) = db.query_row(
         "SELECT a.vm,a.action,v.state FROM activity a JOIN vm_instances v ON a.vm=v.id
          WHERE a.id=?1 AND a.status=0 AND a.action<=6",
         [id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    ensure!(
+        script.is_none() || action == Action::Script as i64,
+        "invalid script worker"
+    );
     if completion == Completion::CleanupUnconfirmed || state == 4 {
         if state == 0 {
             db.execute("UPDATE vm_instances SET state=4 WHERE id=?1", [vm])?;
@@ -907,7 +1479,7 @@ pub(crate) fn settle_operation(
         params![id, success],
     )?;
     release_staging(db, id)?;
-    finish(db, id, status, now, Some(true))?;
+    finish_with_script(db, id, status, now, Some(true), script)?;
     Ok(status)
 }
 
@@ -926,8 +1498,11 @@ fn release_staging(db: &Connection, id: i64) -> Result<()> {
 pub(crate) fn expiry_claims(db: &Connection, now: i64) -> Result<Vec<ExpiryClaim>> {
     purge_tombstones(db, now)?;
     let mut stmt = db.prepare(
-        "SELECT id,cleanup_id FROM vm_instances WHERE (state<>4 OR cleanup_id IS NULL)
-        AND (state=4 OR expires_ms<=?1) ORDER BY expires_ms,id LIMIT 8",
+        "SELECT id,cleanup_id FROM vm_instances v WHERE (state<>4 OR cleanup_id IS NULL)
+        AND (state=4 OR expires_ms<=?1)
+        AND NOT ((state=0 OR cleanup_route IS 'staging')
+            AND EXISTS(SELECT 1 FROM vm_generations WHERE vm_id=v.id))
+        ORDER BY expires_ms,id LIMIT 8",
     )?;
     let due = stmt
         .query_map([now], |row| {
@@ -974,6 +1549,13 @@ pub(crate) fn record_expired(db: &Connection, claim: ExpiryClaim, now: i64) -> R
          LIMIT -1 OFFSET ?1)",
         params![MAX_TOMBSTONES, claim.vm],
     )?;
+    let mut stmt = db.prepare("SELECT id FROM vm_generations WHERE vm_id=?1")?;
+    for generation in stmt
+        .query_map([claim.vm], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        forget_generation(db, generation)?;
+    }
     db.execute("DELETE FROM vm_instances WHERE id=?1", [claim.vm])?;
     finish(db, claim.activity_id, Status::Succeeded, now, Some(true))
 }
@@ -1027,6 +1609,39 @@ pub(crate) fn recovery_intents(db: &Connection) -> Result<Vec<RecoveryClaim>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservation_refuses_an_operation_bound_to_another_recipe() {
+        let dir = crate::service::application::tests::private_temp();
+        let db = VmStore::open(dir.path(), 0).unwrap();
+        db.transact(|db| {
+            let request = BuildRequest {
+                principal: "fixture",
+                key: RequestId::parse("00000000000000000000000000000001").unwrap(),
+                recipe: "fece98c2030f405fb6402fc92a79935d",
+                digest: [9; 32],
+                retained: crate::vm::DiskClaim::default(),
+                transient: crate::vm::DiskClaim::default(),
+            };
+            for subject in [
+                Subject::Recipe("e03a3012c18d20b8691490b580ab41e9", request.digest),
+                Subject::Recipe(request.recipe, [8; 32]),
+            ] {
+                let binding = Binding {
+                    principal: request.principal,
+                    key: request.key,
+                    subject,
+                    action: 11,
+                };
+                let operation = binding.record(db, 0, None, None)?;
+                assert!(reserve_build(db, request, operation, 8).is_err());
+                assert_eq!(count(db, "SELECT count(*) FROM vm_build_intents", [])?, 0);
+                db.execute("DELETE FROM vm_operations", [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
     use crate::service::application::tests::private_temp;
 
     const NOW: i64 = 100;
@@ -1129,17 +1744,17 @@ mod tests {
             for (principal, vm, id) in [("alice", 1, 11), ("bob", 3, 9)] {
                 let mut subject = [0; 16];
                 subject[15] = vm;
-                let replay = Binding { principal, key, vm: subject, action: Action::Script }
+                let replay = Binding { principal, key, subject: Subject::Vm(subject), action: Action::Script as i64 }
                     .replay(db, NOW, false)?.unwrap().unwrap();
-                assert_eq!(replay.receipt, Receipt { activity_id: id, status: Status::Interrupted });
+                assert_eq!(replay.operation.receipt, Receipt { activity_id: id, status: Status::Interrupted });
             }
             let mut vm = [0; 16];
             vm[15] = 1;
             let extend = Binding {
-                principal: "alice", vm, action: Action::Extend,
+                principal: "alice", subject: Subject::Vm(vm), action: Action::Extend as i64,
                 key: RequestId::parse("0000000000000000000000000000000f").unwrap(),
             }.replay(db, NOW, false)?.unwrap().unwrap();
-            assert_eq!(extend.receipt, Receipt { activity_id: 15, status: Status::Succeeded });
+            assert_eq!(extend.operation.receipt, Receipt { activity_id: 15, status: Status::Succeeded });
             assert_eq!(extend.lease_end, Some(400));
 
             assert_eq!(count(db, "SELECT count(DISTINCT operation_id) FROM vm_operations", [])?, 7);
