@@ -6,8 +6,11 @@ use openraft::{
     type_config::async_runtime::watch::WatchReceiver,
 };
 use std::{
+    future::{Future, poll_fn},
     net::SocketAddr,
+    pin::pin,
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
 };
 #[derive(Default)]
 pub(super) struct IntentSlot {
@@ -105,23 +108,160 @@ impl PromotionStart {
     }
 }
 
+fn finish_registration<N, R, G>(
+    node: tokio::sync::MutexGuard<'_, N>,
+    extra_guard: G,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+) -> R {
+    let (ready, start) = oneshot::channel();
+    let registered = register(&node, PromotionStart(start));
+    // Owners may poll the worker before registration returns. Release all
+    // registration locks before its single fresh observation can touch the node.
+    drop(node);
+    drop(extra_guard);
+    let _ = ready.send(());
+    registered
+}
+
 pub(super) fn register_with_node<N, R>(
     node: &tokio::sync::Mutex<N>,
     register: impl FnOnce(&N, PromotionStart) -> R,
 ) -> Result<R, Reply> {
     let node = node.try_lock().map_err(|_| Reply::Refused)?;
-    let (ready, start) = oneshot::channel();
-    let registered = register(&node, PromotionStart(start));
-    // Owners may poll the worker before registration returns. Release this
-    // borrow before its single fresh observation can touch the node.
-    drop(node);
-    let _ = ready.send(());
-    Ok(registered)
+    Ok(finish_registration(node, (), register))
+}
+
+struct StopGate {
+    closed: Mutex<bool>,
+    stopped: tokio::sync::Notify,
+}
+
+impl StopGate {
+    fn new() -> Self {
+        Self {
+            closed: Mutex::new(false),
+            stopped: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn stop(&self) {
+        if let Ok(mut closed) = self.closed.lock() {
+            *closed = true;
+        }
+        self.stopped.notify_waiters();
+    }
+
+    fn is_open(&self) -> bool {
+        self.closed.lock().is_ok_and(|closed| !*closed)
+    }
+
+    fn lock_open(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
+        let closed = self.closed.lock().ok()?;
+        (!*closed).then_some(closed)
+    }
+
+    async fn observe<T>(&self, read: impl Future<Output = T>, on_stop: Reply) -> Result<T, Reply> {
+        let mut read = pin!(read);
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        tokio::select! {
+            biased;
+            () = stopped.as_mut() => Err(on_stop),
+            result = poll_fn(|cx| {
+                // The first poll can register an owned read. Order it
+                // against stop, and recheck the gate on each later poll.
+                let Some(_open) = self.lock_open() else {
+                    return Poll::Ready(Err(on_stop));
+                };
+                read.as_mut().poll(cx).map(Ok)
+            }) => result,
+        }
+    }
+
+    fn report_if_open(&self, report: impl FnOnce()) {
+        if let Some(_open) = self.lock_open() {
+            report();
+        }
+    }
+}
+
+async fn wait_for_node_bounded<'a, N, R>(
+    node: &'a tokio::sync::Mutex<N>,
+    gate: &StopGate,
+    deadline: Instant,
+    on_locked: impl FnOnce(tokio::sync::MutexGuard<'a, N>, std::sync::MutexGuard<'_, bool>) -> R,
+    on_busy: impl FnOnce(),
+) -> Option<R> {
+    let retry_until = peer_registry::store_wait_deadline(Some(deadline));
+    let mut on_locked = Some(on_locked);
+    loop {
+        let stopped = gate.stopped.notified();
+        tokio::pin!(stopped);
+        // Register the stop waiter before checking `closed` so a concurrent
+        // `stop()` cannot miss the wakeup between the check and `select!`.
+        stopped.as_mut().enable();
+        enum Attempt<R> {
+            Done(R),
+            Busy,
+            StopOrExpired,
+        }
+        let attempt = {
+            let open = gate.lock_open()?;
+            if Instant::now() >= retry_until {
+                Attempt::StopOrExpired
+            } else if let Ok(guard) = node.try_lock() {
+                if Instant::now() >= retry_until {
+                    drop(guard);
+                    Attempt::StopOrExpired
+                } else {
+                    Attempt::Done(on_locked.take().expect("single lock acquisition")(
+                        guard, open,
+                    ))
+                }
+            } else {
+                Attempt::Busy
+            }
+        };
+        match attempt {
+            Attempt::Done(value) => return Some(value),
+            Attempt::StopOrExpired => return None,
+            Attempt::Busy => {
+                let keep_waiting = tokio::select! {
+                    biased;
+                    () = stopped.as_mut() => return None,
+                    keep = peer_registry::poll_store_until(retry_until) => keep,
+                };
+                if !keep_waiting {
+                    gate.report_if_open(on_busy);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn register_with_node_bounded<N, R>(
+    node: &tokio::sync::Mutex<N>,
+    gate: &StopGate,
+    deadline: Instant,
+    register: impl FnOnce(&N, PromotionStart) -> R,
+    on_busy: impl FnOnce(),
+) -> Result<R, Reply> {
+    wait_for_node_bounded(
+        node,
+        gate,
+        deadline,
+        |node, open| finish_registration(node, open, register),
+        on_busy,
+    )
+    .await
+    .ok_or(Reply::Refused)
 }
 
 pub(super) struct Controller {
     node: Weak<RetainedNode>,
-    closed: Mutex<bool>,
+    gate: StopGate,
     intent: Arc<IntentSlot>,
     #[cfg(test)]
     pub(super) hooks: Hooks,
@@ -131,7 +271,7 @@ impl Controller {
     pub(super) fn new(node: &Arc<RetainedNode>) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::downgrade(node),
-            closed: Mutex::new(false),
+            gate: StopGate::new(),
             intent: Arc::default(),
             #[cfg(test)]
             hooks: Hooks::default(),
@@ -139,13 +279,11 @@ impl Controller {
     }
 
     pub(super) fn stop(&self) {
-        if let Ok(mut closed) = self.closed.lock() {
-            *closed = true;
-        }
+        self.gate.stop();
     }
 
     pub(super) fn open(&self) -> bool {
-        self.closed.lock().is_ok_and(|closed| !*closed)
+        self.gate.is_open()
     }
 
     pub(super) async fn intent_released(&self) {
@@ -156,10 +294,7 @@ impl Controller {
         &self,
         work: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<oneshot::Receiver<()>, Reply> {
-        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
-        if *closed {
-            return Err(Reply::Refused);
-        }
+        let _open = self.gate.lock_open().ok_or(Reply::Refused)?;
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
         register_with_node(&node, |node, start| {
@@ -183,6 +318,33 @@ impl Controller {
         Some((pos(metrics.cluster_committed?), matched))
     }
 
+    fn record_diagnostic(&self, stage: &'static str, category: &'static str) {
+        #[cfg(test)]
+        if let Ok(mut recorded) = self.hooks.diagnostics.lock() {
+            recorded.push((stage, category));
+        }
+        record(stage, category);
+    }
+
+    async fn lock_node_for_stage<'a>(
+        &self,
+        node: &'a RetainedNode,
+        deadline: Instant,
+        stage: &'static str,
+    ) -> Option<tokio::sync::MutexGuard<'a, ConsensusNode>> {
+        wait_for_node_bounded(
+            node,
+            &self.gate,
+            deadline,
+            |guard, open| {
+                drop(open);
+                guard
+            },
+            || self.record_diagnostic(stage, "node-busy"),
+        )
+        .await
+    }
+
     pub(super) async fn admit(
         self: &Arc<Self>,
         peer: AuthenticatedPeer,
@@ -192,7 +354,9 @@ impl Controller {
         #[cfg(test)]
         self.hooks.requests.fetch_add(1, Ordering::Relaxed);
         let submitted = Arc::new(AtomicBool::new(false));
-        let result = self.register(peer, address, deadline, submitted.clone());
+        let result = self
+            .register(peer, address, deadline, submitted.clone())
+            .await;
         let rx = match result {
             Ok(rx) => rx,
             Err(answer) => return answer,
@@ -204,7 +368,7 @@ impl Controller {
         }
     }
 
-    fn register(
+    async fn register(
         self: &Arc<Self>,
         peer: AuthenticatedPeer,
         address: SocketAddr,
@@ -212,23 +376,31 @@ impl Controller {
         submitted: Arc<AtomicBool>,
     ) -> Result<oneshot::Receiver<Reply>, Reply> {
         peer.authenticated_identity().map_err(|_| Reply::Refused)?;
-        let closed = self.closed.lock().map_err(|_| Reply::Refused)?;
-        if *closed || Instant::now() >= deadline {
-            return Err(Reply::Refused);
+        {
+            let _open = self.gate.lock_open().ok_or(Reply::Refused)?;
+            if Instant::now() >= deadline {
+                return Err(Reply::Refused);
+            }
         }
         let intent = Intent::waking(&self.intent)?;
         let node = self.node.upgrade().ok_or(Reply::Refused)?;
         let controller = self.clone();
-        register_with_node(&node, |node, start| {
-            node.register_admission(
-                intent,
-                start.after_release(
-                    async move { controller.run(peer, address, deadline, &submitted).await },
-                    Reply::Refused,
-                ),
-            )
-        })
-        .inspect_err(|_| record("admission-register", "node-busy"))?
+        register_with_node_bounded(
+            &node,
+            &self.gate,
+            deadline,
+            |node, start| {
+                node.register_admission(
+                    intent,
+                    start.after_release(
+                        async move { controller.run(peer, address, deadline, &submitted).await },
+                        Reply::Refused,
+                    ),
+                )
+            },
+            || self.record_diagnostic("admission-register", "node-busy"),
+        )
+        .await?
     }
 
     async fn run(
@@ -242,14 +414,27 @@ impl Controller {
             return Reply::Refused;
         };
         let (raft, observed) = {
-            let Ok(node) = node.try_lock() else {
-                record("admission-worker", "node-busy");
+            let Some(node) = self
+                .lock_node_for_stage(&node, deadline, "admission-worker")
+                .await
+            else {
                 return Reply::Refused;
             };
             let Some(raft) = node.raft.clone() else {
                 return Reply::Refused;
             };
-            (raft, node.admission_observation(peer, address, None).await)
+            let observed = self
+                .gate
+                .observe(
+                    node.admission_observation(peer, address, None),
+                    Reply::Refused,
+                )
+                .await;
+            (raft, observed)
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(reply) => return reply,
         };
         let (leader, membership, tail) = match observed {
             Ok(AdmissionObservation::Answer(reply)) => return reply,
@@ -283,10 +468,6 @@ impl Controller {
             return Reply::Refused;
         }
 
-        submitted.store(true, Ordering::SeqCst);
-        if Instant::now() >= deadline {
-            return Reply::Refused;
-        }
         let add = ChangeMembers::AddNodes(BTreeMap::from([(
             peer.node().get(),
             BasicNode::new(address.to_string()),
@@ -302,9 +483,15 @@ impl Controller {
                 last_log_id: Some(tail),
             },
         ];
-        #[cfg(test)]
-        self.hooks.calls.fetch_add(1, Ordering::Relaxed);
-        let result = raft.change_membership_if(add, true, guards).await;
+        let result = self
+            .submit_membership(deadline, submitted, || {
+                raft.change_membership_if(add, true, guards)
+            })
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(reply) => return reply,
+        };
         let response = match result {
             Ok(response) => response,
             Err(RaftError::APIError(ClientWriteError::PreconditionFailed(
@@ -334,15 +521,65 @@ impl Controller {
             }
         };
         let position = pos(response.log_id);
-        let Ok(node) = node.try_lock() else {
-            record("admission-confirm", "node-busy");
+        self.confirm_admission(&node, peer, address, position, deadline)
+            .await
+    }
+
+    async fn submit_membership<F: Future>(
+        &self,
+        deadline: Instant,
+        submitted: &AtomicBool,
+        dispatch: impl FnOnce() -> F,
+    ) -> Result<F::Output, Reply> {
+        let mut proposal = pin!(async { dispatch().await });
+        let mut started = false;
+        poll_fn(|cx| {
+            if started {
+                return proposal.as_mut().poll(cx).map(Ok);
+            }
+            let Some(_open) = self.gate.lock_open() else {
+                return Poll::Ready(Err(Reply::Refused));
+            };
+            // Publish before the final deadline check so the caller cannot
+            // time out with Refused and then have a proposal start.
+            submitted.store(true, Ordering::SeqCst);
+            if Instant::now() >= deadline {
+                submitted.store(false, Ordering::SeqCst);
+                return Poll::Ready(Err(Reply::Refused));
+            }
+            // The Raft API starts on poll. Serialize that handoff with stop
+            // and let the owner await any pending result outside the gate.
+            started = true;
+            #[cfg(test)]
+            self.hooks.calls.fetch_add(1, Ordering::Relaxed);
+            proposal.as_mut().poll(cx).map(Ok)
+        })
+        .await
+    }
+
+    async fn confirm_admission(
+        &self,
+        node: &RetainedNode,
+        peer: AuthenticatedPeer,
+        address: SocketAddr,
+        position: LogPos,
+        deadline: Instant,
+    ) -> Reply {
+        let Some(node) = self
+            .lock_node_for_stage(node, deadline, "admission-confirm")
+            .await
+        else {
             return Reply::Unknown;
         };
-        match node
-            .admission_observation(peer, address, Some(position))
+        match self
+            .gate
+            .observe(
+                node.admission_observation(peer, address, Some(position)),
+                Reply::Unknown,
+            )
             .await
         {
-            Ok(AdmissionObservation::Answer(reply)) => reply,
+            Ok(Ok(AdmissionObservation::Answer(reply))) | Err(reply) => reply,
             _ => {
                 #[cfg(test)]
                 if self.hooks.active.load(Ordering::Relaxed) {
@@ -394,6 +631,7 @@ pub(super) struct Hooks {
     pub(super) suppress_success: AtomicBool,
     pub(super) lost_reply: Mutex<Option<Reply>>,
     pub(super) barrier: Mutex<Option<Barrier>>,
+    pub(super) diagnostics: Mutex<Vec<(&'static str, &'static str)>>,
     pub(super) promotion: super::initial_promotion::Hooks,
 }
 
