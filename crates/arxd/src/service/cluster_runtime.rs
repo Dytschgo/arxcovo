@@ -21,7 +21,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::{
+    sync::{Mutex, MutexGuard, watch},
+    time::Instant,
+};
 
 const OBSERVE: Duration = Duration::from_millis(40);
 const CLOSE: Duration = Duration::from_secs(10);
@@ -556,6 +559,98 @@ struct Work {
     first: Option<activation::Error>,
 }
 
+struct PrivateWorkBudget<'a> {
+    stop: &'a Shutdown,
+    deadline: Instant,
+}
+
+impl PrivateWorkBudget<'_> {
+    fn open(&self) -> bool {
+        !self.stop.is_cancelled() && Instant::now() < self.deadline
+    }
+
+    async fn lock<'a>(&self, work: &'a Mutex<Work>) -> Option<MutexGuard<'a, Work>> {
+        if !self.open() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => None,
+            guard = tokio::time::timeout_at(self.deadline, work.lock()) => {
+                guard.ok().filter(|_| self.open())
+            }
+        }
+    }
+
+    fn observe(
+        &self,
+        operation: impl FnOnce() -> cluster_owner::DispatchReply,
+    ) -> cluster_owner::DispatchReply {
+        use cluster_owner::Reply;
+        if !self.open() {
+            return Reply::Refused.into();
+        }
+        let reply = operation();
+        if self.open() {
+            reply
+        } else {
+            Reply::Refused.into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod private_work_tests {
+    use super::*;
+    use cluster_owner::{DispatchReply, Reply};
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_private_request_cannot_take_a_lock_released_at_its_deadline() {
+        let work = Mutex::new(Work {
+            waiting: None,
+            running: None,
+            first: None,
+        });
+        let held = work.lock().await;
+        let stop = Shutdown::default();
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + OBSERVE,
+        };
+        let mut queued = std::pin::pin!(budget.lock(&work));
+        std::future::poll_fn(|cx| {
+            assert!(queued.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(OBSERVE).await;
+        drop(held);
+        assert!(queued.await.is_none());
+        assert!(work.try_lock().is_ok());
+    }
+
+    #[test]
+    fn stopped_observer_drops_its_checkpoint() {
+        let stop = Shutdown::default();
+        let budget = PrivateWorkBudget {
+            stop: &stop,
+            deadline: Instant::now() + cluster_owner::PRIVATE_WORK_WAIT,
+        };
+        let reply = budget.observe(|| DispatchReply::Ledger([1; cluster_owner::LEDGER_REPLY_LEN]));
+        assert!(
+            matches!(reply, DispatchReply::Ledger(bytes) if bytes == [1; cluster_owner::LEDGER_REPLY_LEN])
+        );
+        let reply = budget.observe(|| {
+            stop.cancel();
+            DispatchReply::Ledger([1; cluster_owner::LEDGER_REPLY_LEN])
+        });
+        assert!(stop.is_cancelled());
+        assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
+        let reply = budget.observe(|| panic!("closed observation was invoked"));
+        assert!(matches!(reply, DispatchReply::Control(Reply::Refused)));
+    }
+}
+
 struct BuildRuntime {
     service: Arc<cluster_build::BuildService>,
     tasks: tokio::task::JoinSet<Result<(), ()>>,
@@ -698,33 +793,64 @@ impl Lifecycle {
         }));
         let routes = Arc::new(checked.routes);
         let issuer = checked.issuer;
+        let owner = checked.roles.owner;
         let dispatch = {
             let work = work.clone();
             let stop = stop.clone();
             let fence = fence.clone();
             let status = status.clone();
-            move |operator, request| {
+            move |operator: cluster_owner::Operator, request| {
                 let work = work.clone();
                 let stop = stop.clone();
                 let fence = fence.clone();
                 let status = status.clone();
                 let routes = routes.clone();
                 async move {
-                    let mut work = work.lock().await;
-                    if stop.is_cancelled() || work.first.is_some() {
-                        return cluster_owner::Reply::Refused;
-                    }
                     use cluster_owner::{Reply, Request};
+                    let budget = PrivateWorkBudget {
+                        stop: &stop,
+                        deadline: Instant::now() + cluster_owner::PRIVATE_WORK_WAIT,
+                    };
+                    let private =
+                        matches!(request, Request::MintReceipt | Request::ObserveLedger(_));
+                    let mut work = if private {
+                        let Some(work) = budget.lock(&work).await else {
+                            return Reply::Refused.into();
+                        };
+                        work
+                    } else {
+                        work.lock().await
+                    };
+                    if operator.uid() != owner || stop.is_cancelled() || work.first.is_some() {
+                        return Reply::Refused.into();
+                    }
                     match request {
                         Request::Mint => match &work.running {
-                            Some(running) => running.mint(operator).await,
-                            None => Reply::Refused,
+                            Some(running) => running.mint(operator).await.into(),
+                            None => Reply::Refused.into(),
                         },
+                        Request::MintReceipt => {
+                            let Some(running) = &work.running else {
+                                return Reply::Refused.into();
+                            };
+                            running
+                                .mint_receipt(operator, budget.stop, budget.deadline)
+                                .await
+                        }
+                        Request::ObserveLedger(slots) => {
+                            let Some(running) = &work.running else {
+                                return Reply::Refused.into();
+                            };
+                            budget.observe(|| {
+                                let code = status.borrow().code();
+                                running.observe_ledger(&slots, code)
+                            })
+                        }
                         Request::Join(paste) => {
                             let (Some(installation), Some(issuer)) = (work.waiting.take(), issuer)
                             else {
                                 record("owner-join", "refused");
-                                return Reply::Refused;
+                                return Reply::Refused.into();
                             };
                             status.send_replace(Status::Starting);
                             match Running::join(installation, paste, &routes, &fence).await {
@@ -733,7 +859,7 @@ impl Lifecycle {
                                     record("join-start", "refused");
                                     work.first = Some(reason);
                                     status.send_replace(Status::Refused);
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 }
                             }
                             let running = work.running.as_ref().unwrap();
@@ -741,7 +867,7 @@ impl Lifecycle {
                                 biased;
                                 _ = stop.cancelled() => {
                                     record("join-attach", "closed");
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 },
                                 result = running.attached() => result,
                             };
@@ -749,7 +875,7 @@ impl Lifecycle {
                                 Ok(()) if !stop.is_cancelled() => running.admit(issuer).await,
                                 Ok(()) => {
                                     record("join-attach", "closed");
-                                    return Reply::Unknown;
+                                    return Reply::Unknown.into();
                                 }
                                 Err(reason) => {
                                     record("join-attach", "refused");
@@ -757,11 +883,11 @@ impl Lifecycle {
                                 }
                             };
                             match result {
-                                Ok(()) => Reply::Joined,
+                                Ok(()) => Reply::Joined.into(),
                                 Err(reason) => {
                                     work.first = Some(reason);
                                     status.send_replace(Status::Refused);
-                                    Reply::Unknown
+                                    Reply::Unknown.into()
                                 }
                             }
                         }

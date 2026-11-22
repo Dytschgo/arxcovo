@@ -112,6 +112,65 @@ impl Command {
         }
     }
 }
+
+// Keep a receipt-only copy of the actual proposal until its original expiry
+// is known. No encoded command or verifier buffer is needed for the hash.
+#[cfg(target_os = "linux")]
+pub(in crate::cluster) struct MintReceiptInput(Command);
+
+#[cfg(target_os = "linux")]
+impl MintReceiptInput {
+    pub(in crate::cluster) fn new(mint: &Command) -> Self {
+        Self(mint.clone())
+    }
+
+    pub(in crate::cluster) fn digest(&self, pos: LogPos, expires_ms: u64) -> Option<[u8; 32]> {
+        mint_digest(&self.0, pos, expires_ms)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MintReceiptInput {
+    fn drop(&mut self) {
+        if let Command::Mint { verifier, .. } = &mut self.0 {
+            // SAFETY: verifier is exclusively borrowed and valid for the write.
+            unsafe { std::ptr::write_volatile(verifier, CodeVerifier::from_bytes([0; 32])) };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mint_digest(mint: &Command, pos: LogPos, expires_ms: u64) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let Command::Mint {
+        cluster,
+        actor,
+        request,
+        code,
+        verifier,
+        proposed_at_ms,
+    } = mint
+    else {
+        return None;
+    };
+    Some(
+        Sha256::new()
+            .chain_update(b"arxcovo/c16/mint-receipt/v1")
+            .chain_update(pos.term.to_be_bytes())
+            .chain_update(pos.leader.to_be_bytes())
+            .chain_update(pos.index.to_be_bytes())
+            .chain_update(cluster)
+            .chain_update(actor)
+            .chain_update(request)
+            .chain_update(code)
+            .chain_update(verifier.bytes())
+            .chain_update(proposed_at_ms.to_be_bytes())
+            .chain_update(expires_ms.to_be_bytes())
+            .finalize()
+            .into(),
+    )
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
     AnchorChanged,
@@ -300,6 +359,39 @@ impl EnrollmentState {
             committed_ms: 0,
             records: BTreeMap::new(),
         }
+    }
+
+    /// Match an exact logged Mint to the applied pending record. This is a
+    /// statement about applied state at its clock floor.
+    #[cfg(target_os = "linux")]
+    pub(in crate::cluster) fn pending_mint_receipt(
+        &self,
+        mint: &Command,
+        pos: LogPos,
+    ) -> Option<[u8; 32]> {
+        let Command::Mint {
+            cluster,
+            actor,
+            request,
+            code,
+            verifier,
+            ..
+        } = mint
+        else {
+            return None;
+        };
+        let record = self.records.get(code)?;
+        if !self.founded
+            || *cluster != self.cluster
+            || record.actor != *actor
+            || record.request != *request
+            || !bool::from(record.verifier.bytes().ct_eq(verifier.bytes()))
+            || record.consumed.is_some()
+            || self.committed_ms.checked_add(2 * SKEW_MS)? >= record.expires_ms
+        {
+            return None;
+        }
+        mint_digest(mint, pos, record.expires_ms)
     }
     /// Check the retained consumption, independently of local membership.
     pub fn check_grant(&self, grant: &EnrollmentGrant, code: &CodeId) -> Result<(), Reject> {
@@ -540,6 +632,164 @@ impl EnrollmentState {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn receipt_digest_uses_fixed_field_order_and_stored_expiry() {
+    use sha2::{Digest, Sha256};
+
+    let cluster = [1; 16];
+    let pos = LogPos {
+        term: 2,
+        leader: 3,
+        index: 4,
+    };
+    let mut state = EnrollmentState::new(cluster, NodeId::new(2).unwrap());
+    let found = Command::Found {
+        cluster,
+        members: FoundMembers::new([(NodeId::new(1).unwrap(), KeyDigest([9; 32]))]).unwrap(),
+        proposed_at_ms: 105,
+    };
+    state.apply(&found, LogPos { index: 0, ..pos }, None);
+    let command = Command::Mint {
+        cluster,
+        actor: [5; 16],
+        request: [6; 16],
+        code: [7; 16],
+        verifier: CodeVerifier::from_bytes([8; 32]),
+        proposed_at_ms: 100,
+    };
+    let expiry = 105 + CODE_TTL_MS;
+    assert_eq!(state.pending_mint_receipt(&command, pos), None);
+    assert_eq!(
+        state.apply(&command, pos, None),
+        Outcome::Minted {
+            expires_ms: expiry,
+            replay: false
+        }
+    );
+    let canonical = [
+        b"arxcovo/c16/mint-receipt/v1".as_slice(),
+        &2u64.to_be_bytes(),
+        &3u64.to_be_bytes(),
+        &4u64.to_be_bytes(),
+        &[1; 16],
+        &[5; 16],
+        &[6; 16],
+        &[7; 16],
+        &[8; 32],
+        &100u64.to_be_bytes(),
+        &expiry.to_be_bytes(),
+    ]
+    .concat();
+    let expected: [u8; 32] = Sha256::digest(&canonical).into();
+    let before = state.clone();
+    assert_eq!(state.pending_mint_receipt(&command, pos), Some(expected));
+    assert_eq!(
+        MintReceiptInput::new(&command).digest(pos, expiry),
+        Some(expected)
+    );
+    assert_eq!(state.pending_mint_receipt(&found, pos), None);
+    for field in 0..5 {
+        let mut altered = command.clone();
+        if let Command::Mint {
+            cluster,
+            actor,
+            request,
+            code,
+            verifier,
+            ..
+        } = &mut altered
+        {
+            match field {
+                0 => cluster[0] ^= 1,
+                1 => actor[0] ^= 1,
+                2 => request[0] ^= 1,
+                3 => code[0] ^= 1,
+                _ => *verifier = CodeVerifier::from_bytes([42; 32]),
+            }
+        }
+        assert_eq!(state.pending_mint_receipt(&altered, pos), None);
+    }
+    assert_eq!(state, before);
+    state.committed_ms = expiry - 2 * SKEW_MS;
+    assert_eq!(state.pending_mint_receipt(&command, pos), None);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn six_record_campaign_fits_with_two_consumed_and_four_pending() {
+    let cluster = [1; 16];
+    let membership = Membership::new(vec![[1].into()], [(1, "voter".into())].into()).unwrap();
+    let mut state = EnrollmentState::new(cluster, NodeId::new(2).unwrap());
+    let pos = |index| LogPos {
+        term: 1,
+        leader: 1,
+        index,
+    };
+    let founding = Command::Found {
+        cluster,
+        members: FoundMembers::new([(NodeId::new(1).unwrap(), KeyDigest([9; 32]))]).unwrap(),
+        proposed_at_ms: 100,
+    };
+    assert!(matches!(
+        state.apply(&founding, pos(0), Some(&membership)),
+        Outcome::Founded { replay: false }
+    ));
+    let anchor = state.voter_anchor(&membership).unwrap();
+    for n in 1..=6_u8 {
+        let code = JoinCode::generate(cluster, [2; 32], anchor, |bytes| {
+            bytes.fill(n);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        let command = Command::Mint {
+            cluster,
+            actor: [4; 16],
+            request: [n; 16],
+            code: code.code_id(),
+            verifier: code.verifier(),
+            proposed_at_ms: 100,
+        };
+        let position = pos(u64::from(n) * 2 - 1);
+        assert_eq!(
+            state.apply(&command, position, Some(&membership)),
+            Outcome::Minted {
+                expires_ms: 100 + CODE_TTL_MS,
+                replay: false,
+            }
+        );
+        if n <= 2 {
+            let command = Command::redeem(
+                cluster,
+                [n; 16],
+                code.code_id(),
+                &code.proof(),
+                KeyDigest([n; 32]),
+                anchor,
+                100,
+            );
+            assert!(matches!(
+                state.apply(&command, pos(position.index + 1), Some(&membership)),
+                Outcome::Enrolled(_)
+            ));
+        } else {
+            assert!(state.pending_mint_receipt(&command, position).is_some());
+        }
+    }
+    let pending = state
+        .records
+        .values()
+        .filter(|record| record.consumed.is_none())
+        .count();
+    assert_eq!((pending, state.records.len() - pending), (4, 2));
+    assert!(pending <= MAX_PENDING);
+    assert!(state.records.len() <= MAX_RECORDS);
+    let estimate = 4866 + state.records.len() * 209;
+    let mut encoded = Vec::new();
+    codec::encode(&state, &mut encoded);
+    assert!(encoded.len() <= estimate && estimate <= 16 * 1024);
+}
 
 impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
