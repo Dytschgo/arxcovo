@@ -409,6 +409,44 @@ def check_checkpoint_set(observations, nodes, receipts, identities=None):
     return epoch, membership
 
 
+def build_output_excerpt(output):
+    if not isinstance(output, dict):
+        return ""
+    lines = []
+    for name in ("stderr", "stdout"):
+        stream = output.get(name)
+        if not isinstance(stream, dict):
+            continue
+        for section in ("head", "tail"):
+            value = stream.get(section)
+            if isinstance(value, str):
+                lines.extend(value[:1024].splitlines())
+    failures = [line for line in lines if any(token in line for token in (
+        "fatal error", "error while loading shared libraries", "cannot find",
+        "No such file or directory", "Too many open files", "signal: 9",
+    ))]
+    excerpt = " ".join(failures or lines)
+    excerpt = re.sub(r"(?i)[0-9a-f]{32,}", "redacted", excerpt)
+    return re.sub(r"[^A-Za-z0-9 _.:/()=-]+", " ", excerpt).strip()[:256]
+
+
+def build_result_diagnostic(result, target):
+    outcome = result.get("outcome")
+    allowed = ("started", "succeeded", "failed", "rejected", "refused", "interrupted", "unknown")
+    fields = {"activity_id", "cleanup_confirmed", "exit_code", "gid", "outcome", "uid"}
+    diagnostic = {"outcome": outcome if outcome in allowed else "unknown",
+                  "cleanup_confirmed": None, "keys": sorted(target.keys() & fields),
+                  "output": build_output_excerpt(result.get("output"))}
+    for name, minimum, maximum in (("exit_code", -(2**31), 2**31 - 1), ("activity_id", 0, 2**63 - 1),
+                                    ("uid", 0, 2**32 - 1), ("gid", 0, 2**32 - 1)):
+        value = target.get(name)
+        diagnostic[name] = value if type(value) is int and minimum <= value <= maximum else None
+    cleanup = target.get("cleanup_confirmed")
+    if type(cleanup) is bool:
+        diagnostic["cleanup_confirmed"] = cleanup
+    return diagnostic
+
+
 def activity(path, forwarded):
     query = ("SELECT hex(d.operation),a.id,a.outcome FROM delegated_build d "
              "JOIN activity a ON a.id=d.activity_id "
@@ -599,6 +637,7 @@ class Campaign:
                        "engine_starts": 0, "leader_kill": 0, "normal_closes": 0}
         self.checkpoints = {}
         self.anchor_diagnostic = None
+        self.build_diagnostic = None
         self.identities = None
 
     def owner(self, node, action, tag, width, end, data=b""):
@@ -713,12 +752,18 @@ class Campaign:
             client.send("run_command", args)
             runs, leaf = self.build_witness(client, end)
             result = client.tool_result()
-        target = result["target_activity"]
-        operation = result["operation_id"]
-        require(result["outcome"] == "succeeded" and re.fullmatch(r"[0-9a-f]{64}", operation)
-                and target["uid"] == target["gid"] == 21072 and target["cleanup_confirmed"] is True
-                and type(target["exit_code"]) is int and target["exit_code"] == 0
-                and type(target["activity_id"]) is int and target["activity_id"] > 0, "target-build-result")
+        result = result if isinstance(result, dict) else {}
+        target = result.get("target_activity")
+        target = target if isinstance(target, dict) else {}
+        operation = result.get("operation_id")
+        if not (result.get("outcome") == "succeeded" and isinstance(operation, str)
+                and re.fullmatch(r"[0-9a-f]{64}", operation)
+                and all(type(target.get(name)) is int and target[name] == 21072 for name in ("uid", "gid"))
+                and target.get("cleanup_confirmed") is True
+                and type(target.get("exit_code")) is int and target["exit_code"] == 0
+                and type(target.get("activity_id")) is int and target["activity_id"] > 0):
+            self.build_diagnostic = build_result_diagnostic(result, target)
+            raise Refusal("target-build-result")
         artifact = self.data("b") / "workspace/ordinary/out/target/debug/c14-fixture"
         with open_artifact(artifact, (0, 21072), 16*MIB, executable=True) as (_, info):
             require(info.st_uid == info.st_gid == 21072 and not (runs / leaf).exists(), "build-artifact")
@@ -888,6 +933,8 @@ def live_run(env, uid):
         driver.latch(error)
         if campaign is not None and driver.receipt["first"]["category"] == "anchor-client-refusal":
             driver.receipt["anchor_diagnostic"] = campaign.anchor_diagnostic
+        if campaign is not None and driver.receipt["first"]["category"] == "target-build-result":
+            driver.receipt["diagnostic"] = campaign.build_diagnostic
 
     def cleanup(end):
         if sealed:
@@ -913,7 +960,7 @@ def live_run(env, uid):
         driver.receipt["cleanup"] = "incomplete"
         driver.latch(error)
     if driver.resources and driver.resources.failure_diagnostic is not None:
-        driver.receipt["diagnostic"] = driver.resources.failure_diagnostic
+        driver.receipt.setdefault("diagnostic", driver.resources.failure_diagnostic)
     return driver.receipt
 
 

@@ -320,6 +320,90 @@ class FixtureTests(unittest.TestCase):
                 with self.assertRaisesRegex(fixture.Refusal, pattern):
                     run_select("", {**base_files, **override_files}, candidates=candidates)
 
+    def test_loader_scan_checks_dynamic_elf_and_skips_relocatable_inputs(self):
+        @contextmanager
+        def opened(raw):
+            yield io.BytesIO(raw), SimpleNamespace(st_size=len(raw))
+
+        shared = bytearray(elf())
+        struct.pack_into("<I", shared, 120, 2)  # PT_DYNAMIC without PT_INTERP
+        relocatable = bytearray(shared)
+        struct.pack_into("<H", relocatable, 16, 1)  # ET_REL
+        wrong_loader = elf().replace(b"/lib64/", b"/lib32/")
+        for raw, expected in ((shared, True), (relocatable, False), (b"!<arch>\n", False), (elf(), False)):
+            with self.subTest(expected=expected), patch.object(
+                fixture, "open_artifact", return_value=opened(raw),
+            ):
+                self.assertEqual(fixture.dynamic_elf(Path("input"), (0,)), expected)
+        with patch.object(fixture, "open_artifact", return_value=opened(wrong_loader)), self.assertRaisesRegex(fixture.Refusal, "elf-interpreter"):
+            fixture.dynamic_elf(Path("input"), (0,))
+
+    def test_live_loader_closure_includes_the_rust_and_gcc_linker_inputs(self):
+        root = PurePosixPath("/toolchain")
+        rust_bin = root / "lib/rustlib/x86_64-unknown-linux-gnu/bin"
+        rust_tools = [rust_bin / "rust-lld", rust_bin / "gcc-ld/ld.lld"]
+        system_tools = [PurePosixPath(name) for name in (
+            "/usr/bin/x86_64-linux-gnu-as", "/usr/bin/x86_64-linux-gnu-ld",
+            "/usr/lib/gcc/x86_64-linux-gnu/13/liblto_plugin.so",
+        )]
+        archive = root / "lib/stdlib.rlib"
+        dependencies = ("libz.so.1", "libstdc++.so.6", "libbfd.so", "libctf.so.0", "libsframe.so.1")
+
+        def ldd(_tool, _end, path, **_options):
+            name = dict(zip(rust_tools + system_tools, dependencies))[path]
+            return f"\t{name} => /lib/x86_64-linux-gnu/{name} (0x1234)\n"
+
+        files, links = {}, {}
+        with patch.object(fixture, "Path", PurePosixPath), patch.object(
+            fixture, "dynamic_elf", side_effect=lambda path, _owners: path != archive
+        ), patch.object(fixture, "host_file", side_effect=lambda path, *_: path), patch.object(
+            fixture, "host_command", side_effect=ldd
+        ) as cmds:
+            fixture.add_loader_closure(files, [*rust_tools, *system_tools, archive, rust_tools[0]],
+                                       root, (0, 1001), 10, {}, links)
+            self.assertEqual([item.args[2] for item in cmds.call_args_list], rust_tools + system_tools)
+            self.assertEqual(cmds.call_args_list[0].kwargs["env"]["LD_LIBRARY_PATH"], "/toolchain/lib")
+            self.assertNotIn("LD_LIBRARY_PATH", cmds.call_args_list[-1].kwargs["env"])
+            self.assertEqual(set(files), {f"usr/lib/x86_64-linux-gnu/{name}" for name in dependencies})
+            cmds.side_effect = None
+            cmds.return_value = "libmissing.so => not found\n"
+            with self.assertRaisesRegex(fixture.Refusal, "loader-closure"):
+                fixture.add_loader_closure({}, [rust_tools[0]], root, (0, 1001), 10, {}, {})
+
+    def test_rust_linker_alias_keeps_its_canonical_origin(self):
+        root = PurePosixPath("/toolchain")
+        alias = root / "lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld"
+        target = alias.parent.parent / "rust-lld"
+        files, links = {}, {}
+        with patch.object(fixture, "host_file", return_value=target):
+            fixture.rust_image_input(alias, root, (0, 1001), files, links)
+        self.assertEqual(files, {"opt/rust/" + target.relative_to(root).as_posix(): target})
+        self.assertEqual(links, {"opt/rust/" + alias.relative_to(root).as_posix(): "../rust-lld"})
+
+    def test_pinned_gnu_scripts_enumerate_absolute_and_gcc_search_inputs(self):
+        inputs = [
+            (b"/* glibc */ OUTPUT_FORMAT(elf64-x86-64)\n"
+             b"GROUP ( /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libc_nonshared.a "
+             b"AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )\n",
+             ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+              "/lib64/ld-linux-x86-64.so.2"]),
+            (b"GROUP ( libgcc_s.so.1 -lgcc )\n", ["libgcc_s.so.1", "-lgcc"]),
+            (elf(), []),
+        ]
+
+        @contextmanager
+        def opened(raw):
+            yield io.BytesIO(raw), SimpleNamespace(st_size=len(raw))
+
+        for script, expected in inputs:
+            with patch.object(fixture, "open_artifact", return_value=opened(script)):
+                self.assertEqual(fixture.gnu_linker_inputs(Path("ld-script"), (0,)), expected)
+        for script in (b"INCLUDE /etc/private", b"GROUP ( /etc/private.so )", b"GROUP ( ../libc.so )"):
+            with patch.object(fixture, "open_artifact", return_value=opened(script)), self.assertRaisesRegex(
+                fixture.Refusal, "linker-script-"
+            ):
+                fixture.gnu_linker_inputs(Path("ld-script"), (0,))
+
     def test_gcc_multiarch_search_paths_canonicalize_for_manifest(self):
         ubuntu_lookups = {
             "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1": "usr/libexec/gcc/x86_64-linux-gnu/13/cc1",
@@ -838,6 +922,55 @@ class LiveCampaign(unittest.TestCase):
             call.dispatch("run_command", args), call.terminal(),
         ])
         self.assertEqual(driver.status["builds"], 1)
+
+    def test_target_build_failure_diagnostic_uses_only_bounded_wire_fields(self):
+        failure = {
+            "outcome": "failed",
+            "operation_id": "operation-sentinel",
+            "target_activity": {"activity_id": 42, "exit_code": 101, "outcome": "failed",
+                                "uid": 21072, "gid": 21072, "cleanup_confirmed": True},
+            "output": {"stderr": {"head": "Compiling c14-fixture",
+                                  "tail": "cc: fatal error: missing liblto_plugin.so\n"
+                                          "error while loading shared libraries: \x1b[1m" + "a"*64 + ": caf\xe9"},
+                       "stdout": {"tail": "x"*300}},
+        }
+        diagnostic = run.build_result_diagnostic(failure, failure["target_activity"])
+        self.assertEqual({name: diagnostic[name] for name in ("outcome", "activity_id", "exit_code", "uid", "gid",
+                                                              "cleanup_confirmed")},
+                         {"outcome": "failed", "activity_id": 42, "exit_code": 101,
+                          "uid": 21072, "gid": 21072, "cleanup_confirmed": True})
+        self.assertEqual(diagnostic["keys"], sorted(failure["target_activity"]))
+        self.assertIn("liblto_plugin.so", diagnostic["output"])
+        self.assertRegex(diagnostic["output"], r"^[A-Za-z0-9 _.:/()=-]{1,256}$")
+        self.assertNotIn("operation-sentinel", run.encode_receipt(diagnostic))
+        self.assertNotIn("a"*32, diagnostic["output"])
+        self.assertEqual(len(run.build_output_excerpt({"stdout": {"tail": "x"*300}})), 256)
+
+        bad = {"uid": "21072", "gid": True, "exit_code": 2**33, "activity_id": -1,
+               "cleanup_confirmed": 1, "unexpected-key": "private"}
+        diagnostic = run.build_result_diagnostic({"outcome": "other", "output": ["private"]}, bad)
+        self.assertEqual(diagnostic, {
+            "outcome": "unknown", "activity_id": None, "exit_code": None, "uid": None, "gid": None,
+            "cleanup_confirmed": None, "keys": ["activity_id", "cleanup_confirmed", "exit_code", "gid", "uid"],
+            "output": "",
+        })
+
+    def test_live_receipt_keeps_build_failure_diagnostic_through_cleanup(self):
+        resources = Mock()
+        resources.facts = {}
+        resources.cleanup.return_value = ["unit-a2"]
+        resources.failure_diagnostic = {"setup": "discarded"}
+        campaign = Mock()
+        campaign.build_and_mint.side_effect = fixture.Refusal("target-build-result")
+        campaign.build_diagnostic = run.build_result_diagnostic({"outcome": "failed"}, {"exit_code": 101})
+        with patch.object(run, "checked_metadata", return_value=({"modules": {}}, None, None, None, None)), \
+             patch.object(run, "Resources", return_value=resources), patch.object(run, "stage", return_value={}), \
+             patch.object(run, "Campaign", return_value=campaign):
+            result = json.loads(run.encode_receipt(run.live_run({}, 1001)))
+        self.assertEqual(result["diagnostic"], campaign.build_diagnostic)
+        self.assertEqual(result["first"], {"phase": "build", "category": "target-build-result"})
+        self.assertEqual(result["cleanup"], "incomplete")
+        campaign.recover.assert_not_called()
 
     def test_fault_removes_founder_before_mints_and_recreates_endpoint_once(self):
         res = Mock()
