@@ -36,12 +36,18 @@ The dedicated account and filesystem ACLs govern access to files and
 credentials.
 
 Launch plans are sealed. `CommandPlan` has private fields, no public
-constructor and read-only accessors. Only the typed boot recipe and the
-fixed qemu-img info and create builders produce one. A mutating qemu-img plan
-holds a borrowed `OfflineLease`. The native launcher requires the lease for
-`PlanKind::Mutate` and keeps it borrowed for the life of the launch. The
-private process-creation path takes argv only from a sealed plan in
-production builds. Test fixtures may re-execute only the test binary.
+constructor and read-only accessors. Exactly four constructors exist:
+`BootRecipe::plan`, golden `info`, writable-disk `info` and `create`. Each one
+checks the artifact roles, the immediate qcow2 header, and the size and
+peak-allocation ceiling before it returns a plan. Their private helpers
+return argv only, never a plan, so no crate-internal caller can produce an
+unvalidated plan. Inspecting a writable disk and creating a staging image
+both hold a borrowed `OfflineLease` (`PlanKind::InspectWritable` and
+`PlanKind::Mutate`). The native launcher requires that lease and keeps it
+borrowed for the life of the helper launch. The private process-creation
+path takes argv only from a sealed plan in production builds. The attribute
+list guard owns copies of the Job-list and handle-list values and destroys
+the list before releasing them, on every success and error path. Test fixtures may re-execute only the test binary.
 Visibility alone makes caller-supplied argv unrepresentable, so no
 compile-fail harness is used. `OfflineLease` and `LaunchAuthority` stay
 uninhabited, so no mutating plan or native launch can be constructed in this
@@ -87,11 +93,20 @@ QMP uses the startup hold `-S`. The single internal `cont` is available
 after valid capabilities, a prelaunch status, qualified endpoint custody and
 a fresh resource check. The resource revalidator runs at two points. The
 first is immediately before `ResumeThread`, after the cancellation and
-held-child checks. The second is between receipt of the prelaunch
-`query-status` reply and `cont`. Guest execution therefore never starts on a
-sample older than the five-second freshness window. A refusal at the first
-point leaves the thread suspended. A refusal at the second sends no `cont`
-and closes the channel. The guest protocol subsequently requires a fresh
+held-child checks, and the sample must be within the five-second window
+there. The second is between receipt of the prelaunch `query-status` reply
+and `cont`. That sample arms a dispatch gate with its own monotonic deadline.
+The stdin worker that writes to QEMU starts a write only before that deadline
+and requires the write to complete before it. A refusal at the first point
+leaves the thread suspended. A refusal at the second sends no `cont` and
+closes the channel. A worker that reaches the pipe after the deadline writes
+nothing. A write that completes after the deadline counts as ambiguous
+delivery. In either case the gate trips permanently, the worker closes
+QEMU's stdin, and the boot refuses even if QEMU acknowledges `cont`. The
+caller then reconciles the launch through the bounded stop path, which
+terminates the Job. This bounds when the host *dispatches* `cont`. When QEMU
+reads it and when the guest begins executing are outside the host's control.
+They are not claimed. The guest protocol subsequently requires a fresh
 challenge echo and advertised script support. Graceful stop requires a
 matching guest shutdown event, a clean child exit, Job-empty, worker joins
 and artifact release. Containment termination yields a dirty release when
@@ -123,13 +138,34 @@ Path custody walks relative to held handles. The volume root is the only
 object opened by absolute name. Each later component is opened with
 `NtCreateFile` relative to the already-checked parent handle, using
 `FILE_OPEN_REPARSE_POINT` and `OBJ_DONT_REPARSE`, and then its reparse,
-sparse, compressed, type, link-count and volume attributes are checked. The
-pin keeps every ancestor open without write or delete sharing. A later
-rename of a checked ancestor fails. A junction cannot be set on a held
-ancestor, because a mount point needs an empty directory and the share mode
-denies write access. Even if a reparse point appeared on a held ancestor,
-the next open is relative to the held object and does not parse that
-ancestor's name again. The leaf reopen goes through the same parent handle.
+sparse, compressed, type, link-count and volume attributes are checked. Every
+pinned object is opened with data access and without delete sharing, so it
+takes part in sharing checks. A writable leaf also shares write for its
+consumer. The leaf reopen goes through the same parent handle. The tests
+establish the following, on the developer host's NTFS:
+
+- Renaming a pinned ancestor fails. Renaming or deleting a pinned leaf fails,
+  for a newly created leaf and for an existing writable one. Adding a hard
+  link to a pinned leaf fails. The link count is checked once at pin time,
+  and the held pin then refuses a new alias.
+- A pinned ancestor that still contains the next pinned component cannot be
+  made a junction. This was tried through a write handle (refused by the
+  share mode) and through an attribute-only handle (refused by NTFS's
+  empty-directory rule for mount points). Share modes alone do not bar
+  attribute-only opens.
+- A pinned ancestor that is still empty can be made a junction through an
+  attribute-only handle. This was observed for the parent of an exclusive
+  create. The relative, no-follow walk then refused the next open, and
+  nothing was created in the junction target.
+- A relative open follows the held parent object after its name is moved
+  and replaced by a junction.
+
+What remains: the defense for an empty pinned ancestor is the relative
+no-follow lookup, not an inability to convert it. Same-account code can
+therefore make a walk refuse, which denies the operation but does not
+redirect it. Behavior was observed on one host and NTFS version. Other
+reparse tags (for example symbolic links, which need a privilege) were not
+exercised. Owner qualification must confirm these on the dedicated volume.
 
 QEMU and qemu-img still open their image, firmware, disk and data paths by
 name. That residual sits inside the same-account trust boundary above:
@@ -160,19 +196,24 @@ handle and the observer holds only a wait handle on the grandchild. The
 same tests cover hard-link and rename refusal, junctions as an intermediate
 component and as a leaf, the volume-root binding, and exact-owner and
 ordered explicit-DACL matching with positive and negative cases. They also
-race the custody walk: a component swapped for a junction after its parent
-is pinned is refused, held ancestors resist rename and junction attempts,
-and a relative open follows the held parent after its name moves. The
-wrong-PID fixture serves exactly the expected owner and DACL, so only the
-server PID differs. Other tests cover the resource revalidator refusing at
-resume and at `cont`.
+race the custody walk, covering each case listed under storage above.
+The wrong-PID fixture serves exactly the expected owner and DACL, so only the
+server PID differs. Other tests cover:
+
+- the resource revalidator refusing at resume and at `cont`;
+- the stdin worker writing nothing once the sample deadline passes, and
+  failing closed when a write completes late;
+- an existing writable leaf refusing rename, delete and new hard links;
+- process creation failing after both attributes are set;
+- each constructor refusing a wrong role, header or size.
 
 An access denial counts as a restrictive outer runner Job only when it
 comes from process creation and an identical creation without the Job-list
-attribute succeeds. In that case the fixture prints a `SKIP vm-job-fixture`
-or `SKIP vm-supervisor-loss` line and returns. Nextest shows that line for a
-passing test only with `--no-capture` or `--success-output`. Any other
-denial fails the test.
+attribute succeeds. In that case a local run prints a `SKIP vm-job-fixture`
+or `SKIP vm-supervisor-loss` line and returns. When `CI=true`, which GitHub
+hosted runners set, the same classification fails the test instead. Hosted
+evidence therefore shows a pass only if the supported Job path ran, with no
+CI profile change. Any other denial fails the test everywhere.
 
 These tests ran under the developer's interactive account. Native WHPX, the
 dedicated standard account, effective pipe ACLs against distinct SIDs,
