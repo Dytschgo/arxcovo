@@ -173,7 +173,35 @@ test('Rust retains every native, Python and package validation with exact comman
           python -I -B scripts/check-bound-sqlite.py --check-loader-env
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo nextest run --workspace --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`,
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsLinux) {
+            $proofRoot = Join-Path $env:RUNNER_TEMP 'arx-bound-sqlite'
+            $messages = Join-Path $proofRoot 'build-messages.jsonl'
+            $linkMessages = Join-Path $proofRoot 'arxd-build-messages.jsonl'
+            $targetDir = $env:CARGO_TARGET_DIR.TrimEnd('/')
+            $arxd = Join-Path $targetDir 'debug/arxd'
+            $manifest = Join-Path $env:GITHUB_WORKSPACE 'crates/arxd/Cargo.toml'
+            cargo build --locked -p arxd --bin arxd --message-format=json-render-diagnostics > $linkMessages
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $ErrorActionPreference = 'Stop'
+            $linked = @(Get-Content -LiteralPath $linkMessages | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'arxd' -and ($_.target.kind -contains 'bin') -and $_.manifest_path -eq $manifest -and $_.executable })
+            if ($linked.Count -ne 1 -or $linked[0].executable -ne $arxd) { throw 'Invalid arxd compiler-artifact' }
+            $item = Get-Item -LiteralPath $arxd
+            if (($item.LinkType -and $item.LinkType -ne 'HardLink') -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.PSIsContainer) { throw 'Invalid arxd artifact' }
+            $receipt = [ordered]@{
+              schema = 'arxcovo/r2-artifact/1'
+              head = $env:GITHUB_SHA
+              run = $env:GITHUB_RUN_ID
+              attempt = $env:GITHUB_RUN_ATTEMPT
+              target_dir = $targetDir
+              executable = $arxd
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $arxd).Hash.ToLowerInvariant()
+              bytes = [int64]$item.Length
+              build_messages_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $messages).Hash.ToLowerInvariant()
+              link_messages_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $linkMessages).Hash.ToLowerInvariant()
+            }
+            $receipt | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $proofRoot 'arxd-receipt.json') -Encoding ascii -NoNewline
+          }`,
     `name: Hosted distinct-UID custody qualification
         if: runner.os == 'Linux'
         shell: bash
@@ -195,6 +223,11 @@ test('Rust retains every native, Python and package validation with exact comman
         timeout-minutes: 2
         shell: bash
         run: python3 -I -B tools/ci/m3-containers/delegated-build-probe.py`,
+    `name: Hosted R2 zero-daemon containment qualification
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -I -B tools/ci/m3-containers/run.py --mode dry`,
     `name: Read-only service artifact checks
         run: python -I scripts/test-service-artifacts.py`,
     `name: Pure Windows probe guards (no provisioning)
@@ -256,6 +289,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
     '        timeout-minutes: 3',
     '        timeout-minutes: 2',
     '        timeout-minutes: 2',
+    '        timeout-minutes: 2',
     '    timeout-minutes: 12',
     '    timeout-minutes: 12',
   ]);
@@ -264,7 +298,7 @@ test('CI replaces superseded PR runs without cancelling main measurements and re
 test('CI disables dev debuginfo for Rust without overriding runtime profile defaults', () => {
   assert.match(jobs.rust, /^ {4}timeout-minutes: 12\n {4}env:\n {6}CARGO_PROFILE_DEV_DEBUG: '0'\n {4}steps:$/m);
   assert.equal((workflow.match(/^\s*env:/gm) ?? []).length, 2);
-  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR']);
+  assert.deepEqual(workflow.match(/\bCARGO_\w+/g), ['CARGO_PROFILE_DEV_DEBUG', 'CARGO_HOME', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_TARGET_DIR']);
   for (const path of ['../Cargo.toml', '../.cargo/config', '../.cargo/config.toml']) {
     const url = new URL(path, import.meta.url);
     if (existsSync(url)) {
