@@ -329,7 +329,7 @@ fn shared_and_vm_openers_keep_distinct_versions_and_locks() {
     );
 
     let f = Fixture::sealed();
-    assert_eq!(scalar(f.dir.path(), "PRAGMA user_version"), 5);
+    assert_eq!(scalar(f.dir.path(), "PRAGMA user_version"), 6);
     assert!(VmController::open(f.dir.path(), VmPolicy::default(), f.clock.clone()).is_err());
     let Fixture {
         controller,
@@ -338,12 +338,12 @@ fn shared_and_vm_openers_keep_distinct_versions_and_locks() {
     } = f;
     drop(controller);
     assert!(Activity::open(dir.path()).is_err());
-    assert_eq!(scalar(dir.path(), "PRAGMA user_version"), 5);
+    assert_eq!(scalar(dir.path(), "PRAGMA user_version"), 6);
     drop(VmController::open(dir.path(), VmPolicy::default(), clock).unwrap());
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM vm_templates"), 1);
 
     db(dir.path())
-        .pragma_update(None, "user_version", 6)
+        .pragma_update(None, "user_version", 7)
         .unwrap();
     assert!(Activity::open(dir.path()).is_err());
     assert!(VmController::open(dir.path(), VmPolicy::default(), TestClock::new()).is_err());
@@ -571,7 +571,8 @@ fn full_ledger_retains_replay_after_receipt_pruning_then_recovers() {
         .unwrap();
         let key = [NOW.to_be_bytes(), nonce.to_be_bytes()].concat();
         tx.execute(
-            "INSERT INTO vm_operations VALUES('alice',?1,?2,2,?3,?4,1,NULL)",
+            "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
+                status,script_result) VALUES('alice',?1,?2,2,?3,?4,1,'legacy')",
             params![key, VM, tx.last_insert_rowid(), NOW + RETRY_WINDOW_MS],
         )
         .unwrap();
