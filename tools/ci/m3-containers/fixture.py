@@ -6,6 +6,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import selectors
+import secrets
+import shutil
 import signal
 import stat
 import struct
@@ -17,6 +19,10 @@ MIB = 1024**2
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 TIME = {"preflight": 8, "stage": 24, "contain": 16, "network": 12, "cleanup": 25}
+LIVE_TIME = {"setup": 60, "activation": 60, "build": 30, "recovery": 55, "evidence": 10, "cleanup": 25}
+ANCHOR_TEST = ("cluster::consensus::bound_start::runtime::c16_probe::"
+               "c16_distinct_reconnect_anchor_only")
+CARGO_ARGS = ["build", "--offline", "--locked", "--target-dir", "out/target"]
 ROLES = {"owner": 21070, "daemon": 21071, "build": 21072, "agent": 21073}
 OUTER = {"cpu_percent": 100, "memory": 512*MIB, "swap": 0, "pids": 128, "nofile": 128, "core": 0}
 INNER = {"caps": 193, "nnp": 1, "memory": 128*MIB, "swap": 0, "pids": 32}
@@ -35,9 +41,9 @@ HOST_PROFILES = [
      "kernel": "7.0.0-1017-azure", "systemd_package": "255.4-1ubuntu8.18"},
 ]
 NETWORK = {
-    "nodes": {node: [f"198.18.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
+    "nodes": {node: [f"192.168.72.{i}", f"02:72:00:00:00:{i}"] for i, node in enumerate("abc", 11)},
     "prefix": 24, "ports": {"peer": 22171, "enrollment": 22172, "build": 22173, "forbidden": 22174},
-    "local": ["198.18.72.14", "02:72:00:00:00:14"],
+    "local": ["192.168.72.14", "02:72:00:00:00:14"],
     "outside": "192.0.2.72", "link_local": "169.254.254.72", "ipv6": "fd42:72::13",
 }
 ENV = {"PATH": "/usr/sbin:/usr/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
@@ -86,7 +92,7 @@ def check_pins(pins):
             "bytes": 1024*MIB, "data_bytes": 256*MIB, "run_bytes": 4*MIB,
             "tmp_bytes": 8*MIB, "dev_bytes": MIB, "block_size": 4096, "data_inodes": 16384,
         },
-        "roles": ROLES, "network": NETWORK, "outer": OUTER, "inner": INNER, "seconds": TIME,
+        "roles": ROLES, "network": NETWORK, "outer": OUTER, "inner": INNER, "seconds": TIME, "live_seconds": LIVE_TIME,
     }
     require(json.dumps(expected, sort_keys=True) == json.dumps(pins, sort_keys=True), "pins-schema")
     return pins
@@ -423,6 +429,48 @@ def select_daemon(target_raw, workspace, owner, proof_root, identity, end):
     return path, digest
 
 
+def select_anchor_probe(target_raw, workspace, owner, proof_root, identity, end):
+    target = Path(target_raw) if target_raw else workspace / "target"
+    owners = (0, owner)
+    proof = {}
+    timestamps = {}
+    for name, limit in (("c16-anchor-build.jsonl", 64*MIB), ("c16-anchor-receipt.json", 8192)):
+        with open_artifact(proof_root / name, owners, limit) as (stream, metadata):
+            proof[name] = stream.read(metadata.st_size + 1)
+            require(len(proof[name]) == metadata.st_size, "anchor-proof-size")
+            timestamps[name] = metadata.st_mtime_ns
+    raw = proof["c16-anchor-build.jsonl"]
+    receipt = json.loads(proof["c16-anchor-receipt.json"], object_pairs_hook=unique_pairs)
+    require(set(receipt) == {"schema", "head", "run", "attempt", "target_dir", "executable",
+                             "sha256", "bytes", "messages_sha256", "selector"}
+            and receipt["schema"] == "arxcovo/c16-anchor/1" and receipt["selector"] == ANCHOR_TEST
+            and all(receipt[key] == identity[key] for key in ("head", "run", "attempt"))
+            and receipt["target_dir"] == target.as_posix()
+            and receipt["messages_sha256"] == hashlib.sha256(raw).hexdigest(), "anchor-receipt")
+    path = Path(receipt["executable"])
+    require(path.parent == target / "debug/deps" and re.fullmatch(r"arxd-[a-f0-9]{16}", path.name),
+            "anchor-path")
+    manifest = (workspace / "crates/arxd/Cargo.toml").as_posix()
+    lines = raw.splitlines()
+    require(1 <= len(lines) <= 50000, "anchor-build-lines")
+    rows = [json.loads(line, object_pairs_hook=unique_pairs) for line in lines if line.strip()]
+    linked = [row.get("executable") for row in rows if row.get("reason") == "compiler-artifact"
+              and row.get("manifest_path") == manifest and row["target"]["name"] == "arxd"
+              and row["target"]["kind"] == ["lib"] and row["profile"]["test"] is True]
+    require(linked == [path.as_posix()]
+            and [row.get("success") for row in rows if row.get("reason") == "build-finished"] == [True]
+            and timestamps["c16-anchor-receipt.json"] >= timestamps["c16-anchor-build.jsonl"],
+            "anchor-build-messages")
+    require(type(receipt["bytes"]) is int and re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"]),
+            "anchor-digest")
+    with open_artifact(path, owners, 256*MIB, executable=True) as (stream, metadata):
+        require(metadata.st_size == receipt["bytes"], "anchor-size")
+        inspect_elf(stream, metadata.st_size)
+        digest = stream_hash(stream, metadata.st_size, end)
+        require(digest == receipt["sha256"], "anchor-digest")
+    return path, digest
+
+
 def allocate(path, size):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -483,6 +531,83 @@ def data_layout(root, node):
         path.chmod(0o644)
 
 
+
+def record_json(path, value, uid, mode):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    with os.fdopen(fd, "w", encoding="ascii") as output:
+        os.fchown(output.fileno(), uid, uid)
+        os.fchmod(output.fileno(), mode)
+        json.dump(value, output, separators=(",", ":"), ensure_ascii=True)
+
+
+def broker_settings():
+    daemon, build = ROLES["daemon"], ROLES["build"]
+    return {
+        "daemon_uid": daemon, "daemon_gid": daemon,
+        "daemon_roots": ["/data/" + name for name in
+                         ("cluster-work", "state", "credentials", "wrap", "history", "private", "activity")],
+        "service": {
+            "schema": "arxd-service/1", "client": {"identity": str(daemon)},
+            "build_account": {"name": "arx-build", "identity": str(build), "gid": build},
+            "rights": "standard", "workspace": "/data/workspace",
+            "environment": {"PATH": "/fixture/tools:/usr/bin", "HOME": "/data/home",
+                            "CARGO_HOME": "/data/home"},
+            "limits": {"max_concurrent_runs": 1, "memory_bytes": INNER["memory"], "pids": INNER["pids"]},
+            "agents": [{"principal": "qualification", "token_sha256": "0" * 64}],
+            "granted_batch_right": False,
+        },
+    }
+
+
+def node_endpoint(node, service):
+    return f'{NETWORK["nodes"][node][0]}:{NETWORK["ports"][service]}'
+
+
+def build_descriptor(slot="ordinary"):
+    return {"workspace": slot, "tool": "cargo", "args": CARGO_ARGS, "timeout_s": 12, "output_bytes": 1024}
+
+
+def install_live(root, node, *, founder_key=None):
+    owner, daemon, build, agent = (ROLES[role] for role in ("owner", "daemon", "build", "agent"))
+    require(node in ("a", "b", "c") and (node == "b") == (founder_key is not None), "installation-node")
+    private = ("cluster-work", "state", "credentials", "wrap", "history", "private/custody")
+    for name in private:
+        private_directory(root / name, 0o700, daemon, daemon)
+    settings = dict(zip(("workspace", "state", "credentials", "wrap", "history", "custody"),
+                        ("/data/" + name for name in private)))
+    settings.update(owner_socket="/run/c16/owner/socket", owner_uid=owner, owner_gid=owner,
+                    daemon_uid=daemon, daemon_gid=daemon, build_uid=build, agent_uid=agent,
+                    peer=node_endpoint(node, "peer"), enrollment=node_endpoint(node, "enrollment"),
+                    founder_cluster=[16] * 16 if node == "a" else None,
+                    issuer_peer=None if node == "a" else node_endpoint("a", "peer"),
+                    executor_socket="/fixture/control/executor.sock" if node == "b" else None)
+    if node != "c":
+        private_directory(root / "activity", 0o700, daemon, daemon)
+        private_directory(root / "clients", 0o755)
+        agents = []
+        for name in ("fixture", "foreign"):
+            token = secrets.token_hex(32)
+            agents.append({"uid": agent, "principal": name, "agent": name,
+                           "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest()})
+            record_json(root / "clients" / f"{name}.json", {
+                "address": "/run/c16/mcp/socket", "expected_server_identity": str(daemon),
+                "token": token, "delegated": {"owner_uid": owner, "daemon_uid": daemon, "agent_group": agent},
+            }, agent, 0o400)
+        grants = []
+        if node == "b":
+            require(len(founder_key) == 32 and all(type(b) is int and 0 <= b <= 255 for b in founder_key)
+                    and any(founder_key), "founder-public-key")
+            grants.append({"source": 1, "key": founder_key, "agent": "fixture",
+                           "commands": [build_descriptor(slot) for slot in ("ordinary", "link", "writable")]})
+            (root / "workspace/link").symlink_to("ordinary")
+            private_directory(root / "workspace/writable", 0o775)
+        settings["delegated_build"] = {
+            "socket": "/run/c16/mcp/socket", "activity": "/data/activity", "peer": node_endpoint(node, "build"),
+            "agent_group": agent, "agents": agents, "grants": grants,
+            "routes": [{"node": 2 if node == "a" else 1, "address": node_endpoint("b" if node == "a" else "a", "build")}],
+        }
+    record_json(root / "install.json", settings, daemon, 0o400)
+
 def host_file(path, roots, owners=(0,)):
     canonical = path.resolve(strict=True)
     require(any(canonical.is_relative_to(root) for root in roots), "host-file-closure")
@@ -522,7 +647,7 @@ def stage_compiler_path(raw_value, *, resolve=None, links=("bin", "lib", "lib64"
     return relative, traversed_dirs
 
 
-def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
+def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted, *, anchor=None):
     """Populate a merged-/usr tree from named inputs and their loader closure."""
     rootfs = host["rootfs"]
     require(rootfs["userland"] == host["host"]["os"], "offline-userland-input")
@@ -544,6 +669,14 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
     compiler_inputs = ("cc1", "collect2", "libgcc.a", "libgcc_s.so", "crtbegin.o", "crtbeginS.o",
                        "crtend.o", "crtendS.o", "crti.o", "crtn.o", "crt1.o", "Scrt1.o", "libc.so",
                        "libc_nonshared.a")
+    if anchor:
+        # The compiler version probes never reach GNU's linker scripts. The
+        # actual Rust stdlib link uses these libc development entry points.
+        compiler_inputs += ("libm.so", "libmvec.so.1", "libpthread.a", "libdl.a", "librt.a",
+                            "libutil.a", "libresolv.so")
+        for name in ("as", "ld"):
+            target = f"x86_64-linux-gnu-{name}"
+            binaries[f"usr/bin/{target}"] = host_file(Path("/usr/bin") / target, usr)
     compiler_exec = []
     for name in compiler_inputs:
         argument = "-print-prog-name" if name in ("cc1", "collect2") else "-print-file-name"
@@ -601,7 +734,20 @@ def stage_rootfs(host, tree, stage, daemon, toolchain, host_uid, end, vetted):
         mode = 0o755 if source.stat().st_mode & 0o100 else 0o644
         hashes[relative] = stage_copy(source, path, end, (0, host_uid), mode=mode)
     hashes["fixture/arxd"] = stage_copy(daemon, tree / "fixture/arxd", end, (0, host_uid),
-                                       elf=True, mode=0o400, limit=256*MIB)
+                                       elf=True, mode=0o755 if anchor else 0o400, limit=256*MIB)
+    if anchor:
+        hashes["fixture/c16-anchor"] = stage_copy(anchor[0], tree / "fixture/c16-anchor", end, (0, host_uid),
+                                                 elf=True, mode=0o755, limit=256*MIB)
+        require(hashes["fixture/c16-anchor"] == anchor[1], "anchor-digest-drift")
+        (tree / "fixture/tools").mkdir(mode=0o755)
+        wrapper = tree / "fixture/tools/cargo"
+        shutil.copyfile(tree / "fixture/probe", wrapper)
+        wrapper.chmod(0o755)
+        hashes["fixture/tools/cargo"] = file_digest(wrapper, end, MIB)
+        private_directory(tree / "fixture/broker", 0o700)
+        private_directory(tree / "fixture/control", 0o755)
+        record_json(tree / "fixture/broker/settings.json", broker_settings(), 0, 0o400)
+        hashes["fixture/broker/settings.json"] = file_digest(tree / "fixture/broker/settings.json", end, 8192)
     require(compiler_files <= hashes.keys() and "usr/lib64/ld-linux-x86-64.so.2" in hashes,
             "image-loader")
     for path in sorted((tree / "etc").iterdir()):

@@ -278,7 +278,7 @@ class Network(unittest.TestCase):
             {"ifname": "eth0", "address": mac, "addr_info": [{"local": address, "prefixlen": 24}]},
             {"ifname": "lo", "addr_info": [{"local": "127.0.0.1", "prefixlen": 8}, {"local": "::1", "prefixlen": 128}]},
         ]
-        ipv4 = [{"dst": "198.18.72.0/24", "dev": "eth0"}]
+        ipv4 = [{"dst": "192.168.72.0/24", "dev": "eth0"}]
         isolation.endpoint_inventory("b", address, mac, links, ipv4, [], False)
         with self.assertRaisesRegex(Refusal, "node-endpoints"):
             isolation.endpoint_inventory("b", address, mac, [*links, links[0]], ipv4, [], False)
@@ -576,6 +576,40 @@ class Network(unittest.TestCase):
             isolation.counter_delta(initial, {**later, "ipv6": (*initial["ipv6"][:2], 9, 660)})
 
 
+class LiveIsolation(unittest.TestCase):
+    def test_explicit_host_routes_must_not_overlap_the_fixture(self):
+        isolation.check_host_routes([
+            {"dst": "default"}, {"dst": "0.0.0.0/0"}, {"dst": "192.168.73.0/24"},
+            {"dst": "192.168.71.255"}, {"dst": "10.0.0.0/8"},
+        ])
+        for route in ("192.168.72.11", "192.168.72.128/25", "192.168.0.0/16", "192.168.72.0/24"):
+            with self.subTest(route=route), self.assertRaisesRegex(Refusal, "host-route-collision"):
+                isolation.check_host_routes([{"dst": route, "table": "local"}])
+        with self.assertRaisesRegex(Refusal, "host-route-shape"):
+            isolation.check_host_routes([{}])
+
+    def test_live_mounts_require_the_sealed_install_and_volatile_broker_socket(self):
+        content = mounts() + ("\n20 1 0:1 /install.json /data/install.json ro,nosuid - ext4 none rw"
+                              "\n21 1 0:2 /c16/control /fixture/control rw,nosuid - tmpfs none rw")
+        isolation.check_mount_inventory(content, True, live=True)
+        for changed in (content.replace("/install.json /data/install.json ro", "/install.json /data/install.json rw"),
+                        content.replace("/c16/control", "/host-control"), mounts()):
+            with self.assertRaisesRegex(Refusal, "mount-inventory"):
+                isolation.check_mount_inventory(changed, True, live=True)
+
+    def test_live_nft_flows_are_exact_and_closed(self):
+        dry = isolation.policy(BRIDGE, PORTS)["bridge"]["r2_forward"][1]
+        live = isolation.policy(BRIDGE, PORTS, live=True)["bridge"]["r2_forward"][1]
+        expected = {"peer-a-b", "peer-a-c", "peer-b-c", "peer-c-a", "peer-c-b",
+                    "enrollment-b-a", "enrollment-c-a"}
+        self.assertEqual({name for name, _, _ in live} - {name for name, _, _ in dry},
+                         expected | {name + "-return" for name in expected})
+        for name, rule, action in live:
+            if name in expected:
+                self.assertEqual(action, "accept")
+                self.assertIn(" tcp dport ", rule)
+                self.assertEqual(rule.count("192.168.72."), 2)
+
 class Bootstrap(unittest.TestCase):
     def test_marker_timeouts_and_post_reap_cgroup_settle(self):
         source = (Path(__file__).parent / "bootstrap.c").read_text(encoding="ascii")
@@ -585,6 +619,7 @@ class Bootstrap(unittest.TestCase):
             '"/run/r2/kill-leaf", "await-kill-leaf"',
             '"/run/r2/broker", "await-broker"',
             'ready, "await-build-ready"',
+            '"/data/probe/build-ack", "live-build-ack"',
             'trigger, "await-network-go"',
         ])
         self.assertIn("refuse(timeout_category);", source)

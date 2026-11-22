@@ -10,7 +10,7 @@ import struct
 import subprocess
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import fixture
 import isolation
@@ -57,6 +57,55 @@ class FixtureTests(unittest.TestCase):
                 changed[offset] = byte
                 with self.assertRaisesRegex(fixture.Refusal, "elf-"):
                     fixture.inspect_elf(io.BytesIO(changed), len(changed))
+
+    def test_anchor_artifact_is_bound_to_the_exact_rust_library_test_and_receipt(self):
+        target = PurePosixPath("/work/target")
+        work = target.parent
+        proofs = PurePosixPath("/proof")
+        executable = target / "debug/deps/arxd-0123456789abcdef"
+        raw_elf = elf()
+        identity = {"head": "a"*40, "run": "1", "attempt": "2"}
+        link = {
+            "reason": "compiler-artifact", "manifest_path": str(work / "crates/arxd/Cargo.toml"),
+            "target": {"name": "arxd", "kind": ["lib"]}, "profile": {"test": True},
+            "executable": str(executable),
+        }
+        finish = {"reason": "build-finished", "success": True}
+
+        def select(messages, **changes):
+            raw = "\n".join(map(json.dumps, messages)).encode("ascii")
+            receipt = {
+                **identity, "schema": "arxcovo/c16-anchor/1", "target_dir": str(target),
+                "executable": str(executable), "sha256": hashlib.sha256(raw_elf).hexdigest(),
+                "bytes": len(raw_elf), "messages_sha256": hashlib.sha256(raw).hexdigest(),
+                "selector": fixture.ANCHOR_TEST, **changes,
+            }
+            files = {
+                "c16-anchor-build.jsonl": (raw, 100),
+                "c16-anchor-receipt.json": (json.dumps(receipt).encode("ascii"), 200),
+                executable.name: (raw_elf, 60),
+            }
+
+            @contextmanager
+            def opened(path, *_args, **_kwargs):
+                data, stamp = files[path.name]
+                yield io.BytesIO(data), SimpleNamespace(st_size=len(data), st_mtime_ns=stamp)
+
+            with patch.object(fixture, "Path", PurePosixPath), patch.object(fixture, "open_artifact", opened), \
+                 patch.object(fixture, "remaining", return_value=10):
+                return fixture.select_anchor_probe(str(target), work, 1001, proofs, identity, 100)
+
+        self.assertEqual(select([link, finish]), (executable, hashlib.sha256(raw_elf).hexdigest()))
+        for rows, changes, category in (
+            ([link, link, finish], {}, "anchor-build-messages"),
+            ([{**link, "target": {"name": "arxd", "kind": ["bin"]}}, finish], {}, "anchor-build-messages"),
+            ([link, finish], {"attempt": "1"}, "anchor-receipt"),
+            ([link, finish], {"selector": "another-item"}, "anchor-receipt"),
+            ([link, finish], {"executable": "/wrong/arxd-0123456789abcdef"}, "anchor-path"),
+            ([link, finish], {"sha256": "b"*64}, "anchor-digest"),
+        ):
+            with self.subTest(category=category), self.assertRaisesRegex(fixture.Refusal, category):
+                select(rows, **changes)
 
     def test_stream_copy_and_short_or_surplus_input(self):
         end = fixture.time.monotonic() + 1
@@ -541,27 +590,36 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(order[1], ("git", "/usr/bin/git"))
         self.assertEqual(order[2], ("dpkg", "/usr/bin/dpkg-query"))
 
-    def test_only_dry_dispatches_and_uses_no_legacy_driver(self):
-        expected = {"first": None, "cleanup": "confirmed"}
+    def test_closed_dispatch_keeps_dry_inert_and_live_separate(self):
+        env = {"SUDO_UID": "1001"}
         with patch.object(run.sys, "platform", "linux"), patch.object(run.os, "geteuid", return_value=0, create=True):
-            with patch.object(run, "dry_run", return_value=expected) as dry, patch("builtins.print"):
+            result = {"first": None, "cleanup": "confirmed"}
+            with patch.object(run, "dry_run", return_value=result) as dry, \
+                 patch.object(run, "live_run", return_value=result) as live, patch("builtins.print") as output:
                 with patch("sys.stderr", new_callable=io.StringIO):
-                    for args in ([], ["--mode", "live"], ["--mode", "daemon"], ["--mode", "dry", "arxd"],
+                    for args in ([], ["--mode", "daemon"], ["--mode", "dry", "arxd"],
                                  ["--mod", "dry"], ["--mode", "dry", "--mode", "live"]):
                         with self.subTest(args=args):
                             with self.assertRaises(SystemExit):
-                                run.entry(args, {"SUDO_UID": "1001"})
-                dry.assert_not_called()
-                self.assertEqual(run.entry(["--mode", "dry"], {"SUDO_UID": "1001"}), 0)
-                dry.assert_called_once_with({"SUDO_UID": "1001"}, 1001)
-        directory = fixture.HERE
-        helper = (directory / "bootstrap.c").read_text(encoding="ascii")
-        self.assertEqual(helper.count("execve("), 2)
-        self.assertNotIn('"/fixture/arxd"', helper)
-        self.assertNotIn('"build", "--offline"', helper)
+                                run.entry(args, env)
+                live.assert_not_called()
+                self.assertEqual(run.entry(["--mode", "dry"], env), 0)
+                dry.assert_called_once_with(env, 1001)
+                self.assertTrue(output.call_args.args[0].startswith("R2 receipt "))
+                live.assert_not_called()
+                self.assertEqual(run.entry(["--mode", "live"], env), 0)
+                live.assert_called_once_with(env, 1001)
+                dry.assert_called_once_with(env, 1001)
+                self.assertTrue(output.call_args.args[0].startswith("C16 receipt "))
+        helper = (fixture.HERE / "bootstrap.c").read_text(encoding="ascii")
+        inert = helper.split('    dir("/run/r2", 0700);')[1].split('static bool run_id')[0]
+        self.assertIn("launch_broker(false);", inert)
+        self.assertNotIn("ARXD", inert)
+        self.assertIn("live ? ARXD : PROBE", helper)
+        self.assertIn('execve(live ? ARXD : PROBE, live ? live_args : dry_args', helper)
         for path in ("run.py", "fixture.py", "isolation.py"):
-            text = (directory / path).read_text(encoding="ascii")
-            for command in ("executor-probe.py", "delegated-build-probe.py", "m3-c13", "cargo build",
+            text = (fixture.HERE / path).read_text(encoding="ascii")
+            for command in ("executor-probe.py", "delegated-build-probe.py", "m3-c13",
                             "cluster join", "cluster mint"):
                 self.assertNotIn(command, text)
 
@@ -609,3 +667,176 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["cleanup"], "confirmed")
         self.assertIsNone(result["first"])
         self.assertNotIn("diagnostic", result)
+
+
+class LiveCampaign(unittest.TestCase):
+    @staticmethod
+    def receipt(term, leader, index, tag):
+        return struct.pack(">QQQ", term, leader, index) + bytes([tag])*32
+
+    def test_reconnect_requires_same_query_valid_sample_epoch_and_counts(self):
+        good = bytes((1, 1, 1, 1, 1)) + struct.pack(">QQ", 120, 121) + b"d"*32
+        rejected = bytes((1, 2, 2, 1, 1)) + struct.pack(">QQ", 130, 131) + b"d"*32
+        before, after = run.time_evidence(good), run.time_evidence(rejected)
+        base = (before, after, 100, (1, 1), (1, 1), (2, 1))
+        run.check_reconnect(*base)
+        for offset, wrong in ((1, (2, 3, 130, 131, b"d"*32)),
+                              (1, (2, 2, 130, 131, b"x"*32)),
+                              (1, (2, 2, 130, 780_100, b"d"*32)),
+                              (2, 125), (4, (2, 1)), (5, (2, 2))):
+            args = list(base)
+            args[offset] = wrong
+            with self.subTest(offset=offset, wrong=wrong), self.assertRaisesRegex(fixture.Refusal, "consumed-anchor"):
+                run.check_reconnect(*args)
+        for invalid in (rejected[:3] + b"\0" + rejected[4:], rejected[:4] + b"\0" + rejected[5:], rejected[:-1]):
+            with self.assertRaisesRegex(fixture.Refusal, "owner-"):
+                run.time_evidence(invalid)
+
+    def test_ledger_slots_and_distinct_observers_are_closed(self):
+        receipts = [self.receipt(5, 1, 15, 13), self.receipt(5, 1, 16, 14)]
+        encoded = run.ledger_slots(receipts)
+        self.assertEqual(encoded[:2], b"\x01\x02")
+        self.assertEqual(encoded[2:114], b"".join(receipts))
+        self.assertEqual(encoded[114:], bytes(112))
+        for invalid in ([receipts[0]], list(reversed(receipts)), [receipts[0]]*2,
+                        [receipts[0], self.receipt(5, 1, 17, 13)]):
+            with self.assertRaisesRegex(fixture.Refusal, "ledger-"):
+                run.ledger_slots(invalid)
+
+        def checkpoint(node):
+            raw = bytes((1, 5 if node == 1 else 3, 1 if node == 1 else 2, int(node != 1)))
+            raw += struct.pack(">QQQ", node, 5, 1) + bytes([node])*16 + bytes([16])*16 + b"k"*32
+            raw += struct.pack(">QQQQQQQQQ", 5, 1, 10, 5, 1, 16, 1, 2, 3)
+            return run.ledger_checkpoint(raw)
+
+        nodes = {name: checkpoint(i) for i, name in enumerate("abc", 1)}
+        identities = {name: value["identity"] for name, value in nodes.items()}
+        self.assertEqual(run.check_checkpoint_set(nodes, "abc", receipts, identities), ((5, 1), (5, 1, 10)))
+        for invalid in ({key: nodes[key] for key in "bc"}, {**nodes, "b": nodes["c"]},
+                        {**nodes, "b": {**nodes["b"], "applied": (5, 1, 15)}},
+                        {**nodes, "b": {**nodes["b"], "member_pos": (5, 1, 11)}},
+                        {**nodes, "c": {**nodes["c"], "identity": b"	"*16 + nodes["c"]["identity"][16:]}}):
+            with self.assertRaisesRegex(fixture.Refusal, "ledger-"):
+                run.check_checkpoint_set(invalid, "abc", receipts, identities)
+
+    def test_build_dispatches_once_only_after_the_three_denials(self):
+        resources = Mock()
+        resources.root = Path("/fixture")
+        driver = run.Campaign(resources)
+        foreign = Mock()
+        foreign.call.return_value = {"outcome": "refused"}
+        agent = Mock()
+        agent.call.side_effect = [{"targets": [2]}, {"outcome": "refused"}, {"outcome": "refused"}]
+        operation = "a" * 64
+        agent.tool_result.return_value = {
+            "outcome": "succeeded", "operation_id": operation, "target_activity": {
+                "uid": 21072, "gid": 21072, "exit_code": 0, "cleanup_confirmed": True, "activity_id": 1,
+            },
+        }
+        events = Mock()
+        events.attach_mock(foreign.call, "foreign")
+        events.attach_mock(agent.call, "probe")
+        events.attach_mock(agent.send, "dispatch")
+        events.attach_mock(agent.tool_result, "terminal")
+
+        @contextmanager
+        def connect(role, _end):
+            yield {"foreign": foreign, "agent": agent}[role]
+
+        @contextmanager
+        def artifact(*_args, **_kwargs):
+            yield None, SimpleNamespace(st_uid=21072, st_gid=21072)
+
+        expected = (operation.upper(), 1, "succeeded")
+        with patch.object(driver, "mcp", side_effect=connect), patch.object(
+            run, "activity", side_effect=[[], [], [], [expected], [expected], []]
+        ), patch.object(driver, "build_witness", return_value=(Path("/fixture/runs"), "arx-2-0")), \
+             patch.object(run, "open_artifact", side_effect=artifact):
+            driver.delegated_build(100)
+        args = {"target": 2, **fixture.build_descriptor()}
+        self.assertEqual(events.mock_calls, [
+            call.foreign("run_command", args), call.probe("discover_build_targets", {}),
+            call.probe("run_command", {**args, "workspace": "link"}),
+            call.probe("run_command", {**args, "workspace": "writable"}),
+            call.dispatch("run_command", args), call.terminal(),
+        ])
+        self.assertEqual(driver.status["builds"], 1)
+
+    def test_fault_removes_founder_before_mints_and_recreates_endpoint_once(self):
+        res = Mock()
+        res.root = Path("/fixture")
+        res.nodes = dict.fromkeys("abc")
+        res.stop_live.side_effect = lambda node, *args, **kwargs: res.nodes.pop(node)
+        driver = run.Campaign(res)
+        driver.pre_epoch = (5, 1)
+        driver.receipts = [self.receipt(5, 1, 15, 13), self.receipt(5, 1, 16, 14)]
+        driver.identities = {"a": b"original"}
+        member_pos = (5, 1, 13)
+        driver.membership = [(member_pos, b"members")]
+        events = Mock()
+        events.attach_mock(res.stop_live, "stop")
+        events.attach_mock(res.drop_founder_endpoint, "drop")
+        events.attach_mock(res.restore_founder_endpoint, "restore")
+        events.attach_mock(Mock(side_effect=lambda node, _: b"\x05" if node == "c" else b"\x03"), "evidence")
+        events.attach_mock(Mock(), "mint")
+        events.attach_mock(Mock(return_value=(6, 3)), "observe")
+        events.attach_mock(Mock(), "start")
+        with patch.object(driver, "owner"), patch.object(
+            run, "ledger_checkpoint", return_value={"node": 1, "epoch": (5, 1), "member_pos": member_pos,
+                                                      "identity": b"original"}
+        ), patch.object(run, "image_id", return_value=(3, 7)), patch.multiple(
+            driver, evidence=events.evidence, mint_ledger=events.mint, observe=events.observe, start=events.start
+        ):
+            driver.recover(100)
+        self.assertEqual(events.mock_calls, [
+            call.stop("a", 100, crash=True), call.drop(100), call.evidence("b", 100), call.evidence("c", 100),
+            call.mint("c", 100), call.observe("during_loss", "bc", 100), call.restore(100),
+            call.start("a3", (3, 4, 5), 100), call.observe("after_recovery", "abc", 100),
+        ])
+        self.assertEqual(driver.status["leader_kill"], 1)
+
+    def test_live_setup_and_campaign_order_including_cleanup_failure(self):
+        events = Mock()
+        res = Mock()
+        res.facts = {"probe": "qualified"}
+        res.failure_diagnostic = None
+        for name in ("contain", "network", "retire_probes", "cleanup", "stop_live"):
+            events.attach_mock(getattr(res, name), name)
+        res.cleanup.return_value = ["mount-b"]
+        operations = Mock()
+        operations.checkpoints = {"activation": {"consumed_refusals": 1}}
+        operations.status = {**run.ACCOUNT, "normal_closes": 0}
+        for name in ("activate", "build_and_mint", "recover", "seal"):
+            events.attach_mock(getattr(operations, name), name)
+        with patch.object(run, "checked_metadata", return_value=({"modules": {}}, None, None, None, None)), \
+             patch.object(run, "Resources", return_value=res), patch.object(run, "stage", return_value={}), \
+             patch.object(run, "Campaign", return_value=operations):
+            result = run.live_run({}, 1001)
+        self.assertEqual([entry[0] for entry in events.mock_calls],
+                         ["contain", "network", "retire_probes", "activate", "build_and_mint", "recover",
+                          "seal", "stop_live", "stop_live", "stop_live", "cleanup"])
+        self.assertEqual(result["accounting"], run.ACCOUNT)
+        self.assertEqual(result["first"], {"phase": "cleanup", "category": "partial-cleanup"})
+        self.assertEqual(result["cleanup"], "incomplete")
+        self.assertEqual(sum(fixture.LIVE_TIME.values()), 240)
+        self.assertEqual(set(result["durations_seconds"]), set(fixture.LIVE_TIME))
+        self.assertTrue(run.encode_receipt(result).isascii())
+
+    def test_live_activation_refusal_prevents_build_loss_and_restart(self):
+        res = Mock()
+        res.facts = {}
+        res.cleanup.return_value = ["unit-a2"]
+        res.failure_diagnostic = None
+        operations = Mock()
+        operations.activate.side_effect = fixture.Refusal("consumed-anchor-evidence")
+        with patch.object(run, "checked_metadata", return_value=({"modules": {}}, None, None, None, None)), \
+             patch.object(run, "Resources", return_value=res), patch.object(run, "stage", return_value={}), \
+             patch.object(run, "Campaign", return_value=operations):
+            result = run.live_run({}, 1001)
+        self.assertEqual(result["first"], {"phase": "activation", "category": "consumed-anchor-evidence"})
+        self.assertEqual(result["cleanup_errors"], ["unit-a2"])
+        self.assertNotIn("accounting", result)
+        operations.build_and_mint.assert_not_called()
+        operations.recover.assert_not_called()
+        res.stop_live.assert_not_called()
+        res.cleanup.assert_called_once()

@@ -41,8 +41,11 @@
 #define SUP UNIT "/supervisor"
 #define RUNS UNIT "/runs"
 #define LEAF RUNS "/fixture"
+#define OWNER 21070
 #define DAEMON 21071
 #define BUILD 21072
+#define AGENT 21073
+#define ARXD "/fixture/arxd"
 #define BROKER_CAPS 0xc1u
 #define SLOT "/data/workspace/ordinary"
 #define PROBE "/fixture/probe"
@@ -293,7 +296,7 @@ static void host_cgroup(const char *id, const char *instance, char *relative, si
     dir(path, 0755);
 }
 
-static void mount_root(const char *id, char node)
+static void mount_root(const char *id, char node, bool live)
 {
     const unsigned long fence = MS_NOSUID | MS_NODEV | MS_NOEXEC;
     char base[96], root[128], source[128], target[160];
@@ -306,6 +309,12 @@ static void mount_root(const char *id, char node)
     join_path(target, sizeof(target), root, "/data");
     set_mount(source, target, NULL, MS_BIND, NULL);
     expect_fs(target, EXT4_SUPER_MAGIC, false);
+    if (live) {
+        join_path(target, sizeof(target), root, "/data/install.json");
+        identity(target, DAEMON, DAEMON, 0400, false);
+        set_mount(target, target, NULL, MS_BIND, NULL);
+        set_mount(NULL, target, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | fence, NULL);
+    }
     join_path(target, sizeof(target), root, "/proc");
     set_mount("proc", target, "proc", fence, "hidepid=2");
     join_path(target, sizeof(target), root, "/run");
@@ -638,41 +647,97 @@ static void supervise(void)
 
 static void network(char node, uid_t uid, char generation);
 
-static void init(const char *id, char node, int outside_peer, char generation)
+static pid_t launch_broker(bool live)
+{
+    int barrier[2];
+    CHECK(channel_pair(barrier) == 0, "broker-barrier");
+    pid_t child = fork_child();
+    if (child == 0) {
+        char ready;
+        peer(barrier[1], 1);
+        CHECK(close(barrier[0]) == 0 && read(barrier[1], &ready, 1) == 1 && ready == '1'
+              && close(barrier[1]) == 0 && setgroups(0, NULL) == 0, "broker-release");
+        capabilities(BROKER_CAPS, true);
+        char *const dry_args[] = {PROBE, "broker", NULL};
+        char *const live_args[] = {ARXD, "cluster-build-broker", "/fixture/broker/settings.json", NULL};
+        execve(live ? ARXD : PROBE, live ? live_args : dry_args, tool_env);
+        refuse("broker-exec");
+    }
+    CHECK(close(barrier[1]) == 0, "barrier-direction");
+    pid_write(SUP "/cgroup.procs", child);
+    pid_exact(SUP "/cgroup.procs", child);
+    CHECK(write(barrier[0], "1", 1) == 1 && close(barrier[0]) == 0, "broker-barrier-send");
+    return child;
+}
+
+static void live_supervise(pid_t broker_pid)
+{
+    struct sigaction action = {.sa_handler = stop};
+    CHECK(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGTERM, &action, NULL) == 0
+          && sigaction(SIGINT, &action, NULL) == 0, "signals");
+    while (!stopping) {
+        int status;
+        pid_t child = waitpid(-1, &status, 0);
+        if (child > 0) {
+            CHECK(child != broker_pid || (WIFEXITED(status) && WEXITSTATUS(status) == 0),
+                  "live-broker-exit");
+            continue;
+        }
+        CHECK(errno == EINTR || errno == ECHILD, "live-wait");
+        if (errno == ECHILD && !stopping)
+            usleep(20000);
+    }
+    _exit(0);
+}
+
+static void layout_live(char node)
+{
+    dir("/run/c16", 0755);
+    dir("/run/c16/owner", 0700);
+    CHECK(chown("/run/c16/owner", DAEMON, OWNER) == 0
+          && chmod("/run/c16/owner", 02710) == 0, "live-owner-socket");
+    if (node != 'c') {
+        dir("/run/c16/mcp", 0700);
+        CHECK(chown("/run/c16/mcp", DAEMON, AGENT) == 0
+              && chmod("/run/c16/mcp", 02710) == 0, "live-mcp-socket");
+    }
+    if (node == 'b') {
+        dir("/run/c16/control", 0710);
+        CHECK(chown("/run/c16/control", 0, DAEMON) == 0, "live-broker-socket");
+        set_mount("/run/c16/control", "/fixture/control", NULL, MS_BIND, NULL);
+    }
+}
+
+static void init(const char *id, char node, int outside_peer, char generation, bool live)
 {
     CHECK(getpid() == 1 && prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0, "pid-one");
     CHECK(setgroups(0, NULL) == 0, "init-groups");
     peer(outside_peer, 0);
     CHECK(close(outside_peer) == 0, "parent-peer-close");
-    mount_root(id, node);
-    mount_inventory(node == 'b');
+    mount_root(id, node, live);
+    if (!live)
+        mount_inventory(node == 'b');
     reset_fds();
     device_inventory();
     identity("/", 0, 0, 0755, true);
     role_inventory();
     exact("/data/probe/persistent", "r2-persistent-v1\n", "persistent-image");
+    if (live) {
+        layout_live(node);
+        if (node == 'b')
+            workspace();
+        pid_t broker_pid = node == 'b' ? launch_broker(true) : -1;
+        capabilities(0, false);
+        security(0, false);
+        report(generation == '2' ? "/data/probe/live2" : "/data/probe/live3", "c16-init-v1\n");
+        live_supervise(broker_pid);
+    }
     dir("/run/r2", 0700);
     socket_probes();
     pty_probe();
     if (node == 'b') {
         workspace();
-        int barrier[2];
-        CHECK(channel_pair(barrier) == 0, "broker-barrier");
-        pid_t child = fork_child();
-        if (child == 0) {
-            char ready;
-            peer(barrier[1], 1);
-            CHECK(close(barrier[0]) == 0 && read(barrier[1], &ready, 1) == 1 && ready == '1'
-                  && close(barrier[1]) == 0 && setgroups(0, NULL) == 0, "broker-release");
-            capabilities(BROKER_CAPS, true);
-            char *const args[] = {PROBE, "broker", NULL};
-            execve(PROBE, args, tool_env);
-            refuse("broker-exec");
-        }
-        CHECK(close(barrier[1]) == 0, "barrier-direction");
-        pid_write(SUP "/cgroup.procs", child);
-        pid_exact(SUP "/cgroup.procs", child);
-        CHECK(write(barrier[0], "1", 1) == 1 && close(barrier[0]) == 0, "broker-barrier-send");
+        launch_broker(false);
         wait_path("/run/r2/kill-leaf", "await-kill-leaf");
         pid_t disposable = fork_child();
         if (disposable == 0) {
@@ -719,18 +784,220 @@ static void init(const char *id, char node, int outside_peer, char generation)
     supervise();
 }
 
+static bool run_id(const char *id)
+{
+    return strlen(id) == 16 && strspn(id, "0123456789abcdef") == 16;
+}
+
+static bool live_instance(const char *instance)
+{
+    return !strcmp(instance, "a2") || !strcmp(instance, "b2") || !strcmp(instance, "c2")
+           || !strcmp(instance, "a3");
+}
+
+static void bytes_io(int fd, void *buffer, size_t size, bool output)
+{
+    char *bytes = buffer;
+    while (size > 0) {
+        ssize_t n = output ? write(fd, bytes, size) : read(fd, bytes, size);
+        if (n < 0 && errno == EINTR)
+            continue;
+        CHECK(n > 0, "live-frame");
+        size -= (size_t)n;
+        bytes += n;
+    }
+}
+
+static void owner_frame(const char *action)
+{
+    unsigned char tag = !strcmp(action, "owner-status") ? 4 : !strcmp(action, "owner-time") ? 5 :
+                        !strcmp(action, "owner-mint-receipt") ? 6 : !strcmp(action, "owner-ledger") ? 7 : 0;
+    CHECK(tag > 0, "live-owner-action");
+    unsigned char frame[233] = {'A', 'R', 'X', 'O', tag, 0, 0};
+    unsigned char extra;
+    size_t length = tag == 7 ? 226 : 0;
+    frame[6] = (unsigned char)length;
+    bytes_io(STDIN_FILENO, frame + 7, length, false);
+    CHECK(read(STDIN_FILENO, &extra, 1) == 0, "live-owner-input");
+    const struct sockaddr_un address = {.sun_family = AF_UNIX, .sun_path = "/run/c16/owner/socket"};
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(fd >= 0 && connect(fd, (const struct sockaddr *)&address, sizeof(address)) == 0,
+          "live-owner-connect");
+    struct ucred credentials;
+    socklen_t size = sizeof(credentials);
+    CHECK(getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) == 0 && size == sizeof(credentials)
+          && credentials.pid > 0 && credentials.uid == DAEMON && credentials.gid == DAEMON,
+          "live-owner-peer");
+    bytes_io(fd, frame, 7 + length, true);
+    CHECK(shutdown(fd, SHUT_WR) == 0, "live-owner-shutdown");
+    bytes_io(fd, frame, 7, false);
+    length = (size_t)frame[5] * 256 + frame[6];
+    CHECK(memcmp(frame, "ARXO", 4) == 0 && length <= 164, "live-owner-reply");
+    bytes_io(fd, frame + 7, length, false);
+    CHECK(read(fd, &extra, 1) == 0 && close(fd) == 0, "live-owner-eof");
+    uint32_t pid = htonl((uint32_t)credentials.pid);
+    bytes_io(STDOUT_FILENO, &pid, sizeof(pid), true);
+    bytes_io(STDOUT_FILENO, frame, 7 + length, true);
+    _exit(0);
+}
+
+static void build_private_socket(const char *path)
+{
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    join_path(address.sun_path, sizeof(address.sun_path), path, "");
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(fd >= 0 && connect(fd, (const struct sockaddr *)&address, sizeof(address)) == -1
+          && (errno == EACCES || errno == EPERM) && close(fd) == 0, "live-build-socket");
+}
+
+static void cargo_wrapper(int argc, char **argv)
+{
+    static char *const cargo_args[] = {"/opt/rust/bin/cargo", "build", "--offline", "--locked",
+                                      "--target-dir", "out/target", NULL};
+    CHECK(argc == 6 && getuid() == BUILD && geteuid() == BUILD && getgid() == BUILD
+          && getegid() == BUILD && getgroups(0, NULL) == 0, "live-build-role");
+    for (int i = 1; i < argc; ++i)
+        CHECK(!strcmp(argv[i], cargo_args[i]), "live-build-arguments");
+    char cwd[128], status[8192], group[160], leaf_path[160], witness[160], expected[32];
+    CHECK(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, SLOT), "live-build-cwd");
+    read_text("/proc/self/status", status, sizeof(status));
+    status_value(status, "NoNewPrivs:", 1, 10);
+    status_value(status, "CapEff:", 0, 16);
+    status_value(status, "CapPrm:", 0, 16);
+    status_value(status, "CapInh:", 0, 16);
+    status_value(status, "CapAmb:", 0, 16);
+    status_value(status, "CapBnd:", BROKER_CAPS, 16);
+    check_fds();
+    read_text("/proc/self/cgroup", group, sizeof(group));
+    const char prefix[] = "0::/system.slice/arxd.service/runs/";
+    CHECK(!strncmp(group, prefix, strlen(prefix)), "live-build-cgroup");
+    char *leaf = group + strlen(prefix);
+    unsigned int broker_pid = 0, counter = 0;
+    int length = 0;
+    CHECK(sscanf(leaf, "arx-%u-%u%n", &broker_pid, &counter, &length) == 2
+          && broker_pid > 1 && !strcmp(leaf + length, "\n"), "live-build-leaf");
+    leaf[length] = '\0';
+    join_path(leaf_path, sizeof(leaf_path), RUNS "/", leaf);
+    deny_write(CG "/cgroup.procs");
+    const char *const controls[] = {"/cgroup.procs", "/cgroup.kill", "/memory.max", "/memory.swap.max", "/pids.max"};
+    for (size_t i = 0; i < sizeof(controls)/sizeof(controls[0]); ++i) {
+        char path[192];
+        join_path(path, sizeof(path), leaf_path, controls[i]);
+        deny_write(path);
+    }
+    const char *const private_paths[] = {"/fixture/broker/settings.json", "/data/private/custody",
+                                        "/data/wrap", "/data/history", "/data/activity"};
+    for (size_t i = 0; i < sizeof(private_paths)/sizeof(private_paths[0]); ++i) {
+        int fd = open(private_paths[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        CHECK(fd < 0 && (errno == EACCES || errno == EPERM), "live-build-private");
+    }
+    build_private_socket("/fixture/control/executor.sock");
+    build_private_socket("/run/c16/mcp/socket");
+    build_private_socket("/run/c16/owner/socket");
+    CHECK(rename(SLOT, "/data/workspace/replaced") == -1
+          && (errno == EACCES || errno == EPERM), "live-build-replacement");
+    CHECK(snprintf(witness, sizeof(witness), "%d %s\n", getpid(), leaf) > 0
+          && snprintf(expected, sizeof(expected), "%d\n", getpid()) > 0, "live-build-pid");
+    report(SLOT "/out/observed", witness);
+    wait_path("/data/probe/build-ack", "live-build-ack");
+    exact("/data/probe/build-ack", expected, "live-build-ack");
+    execve(cargo_args[0], cargo_args, tool_env);
+    refuse("live-cargo-exec");
+}
+
+static void command_in_node(const char *id, const char *instance, const char *target,
+                            const char *action)
+{
+    CHECK(run_id(id) && live_instance(instance) && strlen(target) <= 10 && target[0] >= '1'
+          && target[0] <= '9' && strspn(target, "0123456789") == strlen(target), "live-target");
+    long pid = strtol(target, NULL, 10);
+    CHECK(pid > 1 && pid <= INT_MAX, "live-pid");
+    char proc[64], path[256], unit[160], expected[168];
+    CHECK(snprintf(proc, sizeof(proc), "/proc/%ld", pid) > 0
+          && snprintf(unit, sizeof(unit), "/system.slice/arx-r2-%s-%s.service/init", id, instance) > 0
+          && snprintf(expected, sizeof(expected), "0::%s\n", unit) > 0, "live-unit");
+    int procfd = open(proc, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    CHECK(procfd >= 0 && pidfd >= 0, "live-pidfd");
+    join_path(path, sizeof(path), proc, "/cgroup");
+    exact(path, expected, "live-membership");
+    int root = openat(procfd, "root", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(root >= 0 && close(procfd) == 0, "live-root");
+    join_path(path, sizeof(path), CG, unit);
+    join_path(expected, sizeof(expected), path, "/cgroup.procs");
+    pid_write(expected, 0);
+    CHECK(setns(pidfd, CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET
+                       | CLONE_NEWPID | CLONE_NEWCGROUP) == 0 && close(pidfd) == 0,
+          "live-namespaces");
+    CHECK(fchdir(root) == 0 && chroot(".") == 0 && chdir("/") == 0 && close(root) == 0, "live-chroot");
+    struct rlimit files = {128, 128}, core = {0, 0};
+    CHECK(setrlimit(RLIMIT_NOFILE, &files) == 0 && setrlimit(RLIMIT_CORE, &core) == 0
+          && syscall(SYS_close_range, 3u, ~0u, 0u) == 0, "live-fds");
+    pid_t child = fork_child();
+    if (child > 0) {
+        capabilities(0, false);
+        int status;
+        CHECK(waitpid(child, &status, 0) == child, "live-command-wait");
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+    }
+
+    uid_t uid = DAEMON;
+    if (!strcmp(action, "mint") || !strcmp(action, "join")
+        || !strcmp(action, "owner-status") || !strcmp(action, "owner-time")
+        || !strcmp(action, "owner-mint-receipt") || !strcmp(action, "owner-ledger")
+        || !strcmp(action, "anchor"))
+        uid = OWNER;
+    else if (!strcmp(action, "agent") || !strcmp(action, "foreign"))
+        uid = AGENT;
+    CHECK(prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == 0, "live-keepcaps");
+    enter_role(uid);
+    capabilities(0, false);
+
+    if (!strcmp(action, "mint") || !strcmp(action, "join")) {
+        CHECK(setsid() == getpid() && ioctl(STDIN_FILENO, TIOCSCTTY, 0) == 0, "live-tty");
+        char *const args[] = {ARXD, "service", "cluster-control", (char *)action, "--socket",
+                              "/run/c16/owner/socket", "--daemon-uid", "21071", NULL};
+        execve(ARXD, args, tool_env);
+    } else if (!strcmp(action, "agent") || !strcmp(action, "foreign")) {
+        char *const args[] = {ARXD, "mcp-stdio", "--client-config",
+                              !strcmp(action, "agent") ? "/data/clients/fixture.json" :
+                                                         "/data/clients/foreign.json", NULL};
+        execve(ARXD, args, tool_env);
+    } else if (!strcmp(action, "anchor")) {
+        char *const args[] = {"/fixture/c16-anchor", "--ignored", "--exact", "--nocapture",
+            "cluster::consensus::bound_start::runtime::c16_probe::c16_distinct_reconnect_anchor_only", NULL};
+        execve(args[0], args, tool_env);
+    } else if (!strcmp(action, "daemon")) {
+        char *intent = !strcmp(instance, "a2") ? "create-founder" :
+                       !strcmp(instance, "a3") ? "recover-founder" : "join";
+        char *const args[] = {ARXD, "--cluster-config", "/data/install.json", "--cluster-intent", intent, NULL};
+        execve(ARXD, args, tool_env);
+    } else {
+        owner_frame(action);
+    }
+    refuse("live-command-exec");
+}
+
 int main(int argc, char **argv)
 {
+    if (getuid() == BUILD && !strcmp(argv[0], "/fixture/tools/cargo")) {
+        cargo_wrapper(argc, argv);
+        return 1;
+    }
     CHECK(getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0, "root-identity");
     umask(0077);
     if (argc == 2 && strcmp(argv[1], "broker") == 0) {
         broker();
         return 1;
     }
-    CHECK(argc == 4 && strcmp(argv[1], "boot") == 0 && strlen(argv[2]) == 16
-          && strspn(argv[2], "0123456789abcdef") == 16
-          && (!strcmp(argv[3], "a0") || !strcmp(argv[3], "b0") || !strcmp(argv[3], "c0")
-              || !strcmp(argv[3], "b1")), "arguments");
+    if (argc == 6 && !strcmp(argv[1], "enter")) {
+        command_in_node(argv[2], argv[3], argv[4], argv[5]);
+        return 1;
+    }
+    bool live = argc == 4 && !strcmp(argv[1], "live-boot");
+    CHECK(argc == 4 && (live || !strcmp(argv[1], "boot")) && run_id(argv[2])
+          && (live ? live_instance(argv[3]) : (!strcmp(argv[3], "a0") || !strcmp(argv[3], "b0")
+                  || !strcmp(argv[3], "c0") || !strcmp(argv[3], "b1"))), "arguments");
     char net[128], group[160];
     CHECK(snprintf(net, sizeof(net), "/run/netns/r2-%s-%c", argv[2], argv[3][0]) > 0, "netns-path");
     int ns = open(net, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -743,7 +1010,7 @@ int main(int argc, char **argv)
     pid_t child = fork_child();
     if (child == 0) {
         CHECK(close(pair[0]) == 0, "outside-peer-close");
-        init(argv[2], argv[3][0], pair[1], argv[3][1]);
+        init(argv[2], argv[3][0], pair[1], argv[3][1], live);
     }
     CHECK(close(pair[0]) == 0 && close(pair[1]) == 0, "outside-close");
     reset_fds();
@@ -907,18 +1174,18 @@ static void serve(const struct network_case *probes, size_t count, bool syntheti
 static void network(char node, uid_t uid, char generation)
 {
     static const struct network_case a[] = {
-        {"198.18.72.11", 22171, SOCK_STREAM, true},
+        {"192.168.72.11", 22171, SOCK_STREAM, true},
     };
     static const struct network_case c[] = {
-        {"198.18.72.13", 22172, SOCK_STREAM, true},
-        {"198.18.72.13", 22174, SOCK_STREAM, false},
-        {"198.18.72.13", 53, SOCK_STREAM, false},
-        {"198.18.72.13", 53, SOCK_DGRAM, false},
+        {"192.168.72.13", 22172, SOCK_STREAM, true},
+        {"192.168.72.13", 22174, SOCK_STREAM, false},
+        {"192.168.72.13", 53, SOCK_STREAM, false},
+        {"192.168.72.13", 53, SOCK_DGRAM, false},
         {"192.0.2.72", 22174, SOCK_STREAM, false},
         {"169.254.254.72", 22174, SOCK_STREAM, false},
         {"fd42:72::13", 22174, SOCK_STREAM, false},
     };
-    static const struct network_case build_route = {"198.18.72.12", 22173, SOCK_STREAM, true};
+    static const struct network_case build_route = {"192.168.72.12", 22173, SOCK_STREAM, true};
     if (node == 'a') {
         pid_t actor = fork_child();
         if (actor == 0) {
@@ -948,7 +1215,7 @@ static void network(char node, uid_t uid, char generation)
     attempt(a);
     for (size_t i = 0; i < sizeof(c)/sizeof(c[0]); ++i)
         attempt(&c[i]);
-    const struct network_case local = {"198.18.72.14", 22174, SOCK_STREAM, false};
+    const struct network_case local = {"192.168.72.14", 22174, SOCK_STREAM, false};
     attempt(&local);
     report(results, "r2-network-v1\n");
     while (true)
