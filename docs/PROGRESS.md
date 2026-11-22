@@ -2,8 +2,12 @@
 
 ## Current state (2026-11-22)
 
-- **Main and last merges.** `main` is **green** at `40b9964b` (PR #257); push CI
-  `45060763474` passed. Later merges: PR #253 `fe4aeb21` (docs; push CI `45052134556`
+- **Main and last merges.** `main` is **green** at `830b9de7` (PR #259, M4 PR 3); push CI
+  `45078865824` passed. Merges since `40b9964b`: PR #258 `8fb9c148` (docs; `45062860274`
+  green), PR #260 `3e00dbc5` (M4 PR 4a; `45070826878` green), PR #261 `94bd68a9` (M4 PR
+  4b1; `45075434704` green), PR #262 `b1e3f19c` (guest Hello reset; `45077937197` green),
+  PR #259 `830b9de7`. Earlier: `main` was green at `40b9964b` (PR #257); push CI
+  `45060763474` passed. Merges before that: PR #253 `fe4aeb21` (docs; push CI `45052134556`
   green), PR #254 `bbb8c543` (M4 PR 1; `45054473530` red on attempt 1 from a macOS
   CI-budget fixture timeout, green on attempt 2), PR #256 `5e30d1c9` (CI-budget fixture;
   `45056799498` red on attempt 1 from an intermittent live C16 ledger check, green on
@@ -299,16 +303,68 @@
   from pinned QEMU 11.1.3 source, with the exact binary receipt pending, QMP over private stdio, the serial pipe checked
   for DACL and server PID before I/O, a suspended child in a kill-on-close Job, a dedicated
   NTFS volume, a WTS owner-session signal, and native admission closed by default.
-- **M4 PR 3 in progress (confined Windows QEMU runtime).** The Sol 6.2 high builder
-  exhausted its 3/3 tally on Windows compilation (report SHA256 `252bfbd5…2aa6`). An Opus 5.5
-  high diagnosis (SHA256 `99b578d0…3d0c`) found four E0061 errors in one integration-test
-  target, three missing hosted-Windows fixture groups (junctions, effective DACL and
-  separate-process supervisor loss), and a volume-root identity gap to fix or record before
-  native activation. The Opus 5.5 high builder has its own three-failure budget, with
-  independent Sol 6.2 high review to follow. Native paths remain **unverified on real
+- **PR #259 merged** as `830b9de7` (M4 PR 3: confined Windows QEMU and QMP runtime,
+  native admission closed). The Sol 6.2 high builder exhausted 3/3 on Windows compilation
+  (report SHA256 `252bfbd5…2aa6`); an Opus 5.5 high diagnosis (SHA256 `99b578d0…3d0c`)
+  preceded a new Opus 5.5 high builder (its own budget, not a counter reset), which
+  finished at **2/3** after six fix rounds (report SHA256 `c0c5fc71…b17c`; counted: a
+  pre-existing `PathPin` create bug and a test-helper EOF bug; one stale-binary mutation
+  restore was ruled tooling and confirmed by review 3). Seven independent Sol 6.2 high
+  reviews: HOLD `3a25c724…328e` (editable plans, revalidation points, path custody,
+  wrong-PID isolation), HOLD `460efb00…4cc8` (attribute-list lifetime, unvalidated plan
+  minting, late `cont`, existing-leaf delete sharing), HOLD `45b614df…6df0` (QMP ack vs.
+  late write, qcow2 reference checks, 112-byte v3 header), HOLD `66689c6a…2635` (guest
+  reply required 10 s after `cont`), HOLD `87dd2d52…a9f9` (OVMF can consume the single
+  Hello), HOLD `95e00814…4c6c` (restart convergence and QEMU event coalescing), PASS
+  `58c561e4…cdc7`, status `59610386286`; PR CI `45078048954` green (7m35s). Coordinator
+  decisions under pre-approval: installer boots refuse with `InstallerPhaseUnavailable`
+  and the installer phase is deferred to a runtime-fence follow-up (activation gate);
+  installed readiness uses a fixed 180 s budget, fresh challenges on every virtio-serial
+  open event and a bounded retry schedule, and accepts an echo of any challenge issued in
+  the current boot (with the guest reset below). Handle-relative custody, sealed plans,
+  write-time `cont` freshness and qcow2 header validation are in ADR 0054. Native WHPX,
+  the QEMU binary receipt, dedicated account, pipe ACLs, custody on the owner volume,
+  readiness against real OVMF/QEMU and the disk ceilings remain **unverified on real
   hardware**.
+- **Slice 4 design adopted** (`D:/Temp/arx-m4-slice4/design.md`, SHA256 `0a5a8706…5c97`)
+  with all recommended defaults under pre-approval: fixture-qualified foreground MCP
+  profile with native admission closed; candidate Ubuntu 24.04.3 amd64 pin pending signed
+  provenance; detached verification boot on a disposable overlay and VARS copy; SID
+  endpoint DACL plus per-principal keys; cgroup v2 cleanup required for Linux script
+  capability; VM-only v6 migration; fresh extension refused while unqualified. Split:
+  4a guest, 4b1 recipe/seed, 4b2 stages, 4c durable build/reaper, 4d MCP, 4e optional
+  hosted proof.
+- **PR #260 merged** as `3e00dbc5` (M4 PR 4a: contained Linux virtio script runner). Sol
+  6.2 high builder **1/3** (report SHA256 `ff27b655…7517`). The builder self-reported 0/3, but its
+  first Linux Clippy run failed on a missing `Debug` bound in test assertions. That is a build
+  failure outside the AGENTS.md exemptions, so the coordinator records it as counted. Reviews HOLD `359f35f0…ea48`
+  (spawn stall, required CI blind to `cgroup.kill`), HOLD `970838fd…5741` (pre-exec stall
+  kept the port open), HOLD `61697bf2…7b49` (`SIGCHLD=SIG_IGN` PID reuse), PASS
+  `79cb3290…e911`, status `59607427748`. Scripts run as 65534 under `no_new_privs` in a
+  fresh per-command cgroup; results only after `populated=0`. Live virtio in a real
+  Ubuntu guest is **unverified on real hardware**.
+- **PR #261 merged** as `94bd68a9` (M4 PR 4b1: Ubuntu recipe manifest and CIDATA seed).
+  Sol 6.2 high builder 0/3 (a Zig temp-file rename failure was ruled environmental;
+  report SHA256 `df13c71b…c8f7`). Review HOLD `0182fded…0d2e` (late-commands needed the
+  first-boot account; installer residue), PASS `3f3d094c…ba30`, status `59609122872`.
+  Unverified ISO and derived-asset pins make the recipe `recipe_unqualified`. Target
+  cloud-init is disabled, so the template has no login account; installer logs copied
+  after late-commands are documented residue. The seed supplies no reusable credentials,
+  but whether those logs contain secrets is **unverified on real hardware** and requires
+  inspection during a real offline install. A real offline install is **unverified on real hardware**.
+- **PR #262 merged** as `b1e3f19c` (guest: a fresh Hello resets the session). Sol 6.2 high
+  builder 1/3 (report SHA256 `997fbbb0…0637`); review PASS `2a34f9bc…a175`, status
+  `59610038207`. Linux virtio reset and port reopen, the OVMF-to-Linux handoff, script
+  containment across a reset and end-to-end readiness are **unverified on real hardware**.
+- **M4 PR 4b2 in progress** (Ubuntu stage transitions and private runtime interface,
+  fixture-backed) with a Sol 6.2 high builder.
+- **Intermittent C13.** PR #259 CI `45062459949` failed once in the hosted C13 activation
+  campaign (`phase=join category=assertion message=mint-refused`, owner mint exit 8,
+  clean teardown), outside the diff; C13 then passed in 19 later runs through `830b9de7`
+  (one of them a workflow cancelled after C13 passed).
 - **Process notes.** The coordinator now reads every failed job of each PR CI run before
-  relying on a summary. Long shell here-strings caused unanswerable delegate approval
+  relying on a summary. Reviewers are asked to classify activation-gate residuals and
+  theoretical hardening as non-blocking P3. Long shell here-strings caused unanswerable delegate approval
   stalls, so briefs now require file-edit tools. An interim Gemini coordinator's C:
   worktree was replaced with a D: worktree.
 - **Milestones & verification boundary.** M1 accepted; M2 open for owner-dependent
