@@ -238,6 +238,18 @@ class Resources:
             return []
         return json_rows(output)
 
+    def host_nsid(self, end, name):
+        output = self.ip(end, "-j", "netns", "list-id")
+        require(bool(output.strip()), "link-attribution")
+        rows = json_rows(output)
+        matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name]
+        require(len(matches) == 1 and type(matches[0].get("nsid")) is int and matches[0]["nsid"] >= 0,
+                "link-attribution")
+        nsid = matches[0]["nsid"]
+        require(sum(1 for row in rows if isinstance(row, dict) and row.get("nsid") == nsid) == 1,
+                "link-attribution")
+        return nsid
+
     def add_link(self, name, end, *add_args, kind, mac=None, peer_node=None, peer_ns_identity=None):
         state = {"index": None, "tagged": False}
         self.remember("link", lambda deadline, n=name, s=state, k=kind, m=mac, pn=peer_node, pi=peer_ns_identity:
@@ -281,6 +293,8 @@ class Resources:
                     host_netnsid = row.get("link_netnsid")
                     require(type(host_link_index) is int and type(host_netnsid) is int and host_netnsid >= 0,
                             "link-attribution")
+                    expected_host_nsid = self.host_nsid(end, self.namespaces[peer_node])
+                    require(host_netnsid == expected_host_nsid, "link-attribution")
                     peer_rows = self.ns_links_at(end, peer_node, "eth0")
                     require(len(peer_rows) == 1, "link-attribution")
                     peer = peer_rows[0]

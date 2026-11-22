@@ -661,7 +661,7 @@ class Cleanup(unittest.TestCase):
                                               expected_kind="bridge", expected_mac=NETWORK["local"][1])
                     self.assertEqual(del_calls, [])
 
-        # 1b. Committed-but-unobserved veth: positive recovery requires verified bidirectional peer attribution in attributed netns.
+        # 1b. Committed-but-unobserved veth: positive recovery requires host nsid + reciprocal peer attribution in attributed netns.
         resources = self.make_resources()
         veth_name = resources.links["a"]
         ns_name = resources.namespaces["a"]
@@ -675,7 +675,7 @@ class Cleanup(unittest.TestCase):
         def fake_ip_veth(_end, *args, **kwargs):
             if args[:2] == ("link", "add"):
                 veth_live[veth_name] = {
-                    "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 0,
+                    "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 7,
                     "ifalias": "", "linkinfo": {"info_kind": "veth"},
                 }
                 peer_live["eth0"] = {
@@ -683,6 +683,8 @@ class Cleanup(unittest.TestCase):
                     "linkinfo": {"info_kind": "veth"},
                 }
                 return ""
+            if args == ("-j", "netns", "list-id"):
+                return json.dumps([{"nsid": 7, "name": ns_name}])
             if args[:3] == ("-j", "-d", "link"):
                 if fail_veth_readback[0]:
                     fail_veth_readback[0] = False
@@ -713,40 +715,59 @@ class Cleanup(unittest.TestCase):
             self.assertEqual(veth_deleted, [veth_name])
             self.assertEqual(veth_live, {})
 
-        # Unobserved unrelated same-name veth with missing or mismatched peer attribution must NOT be deleted.
+        # Unobserved unrelated same-name veth with wrong peer namespace, missing/ambiguous nsid, or mismatched peer
+        # attribution must NOT be deleted.
         base_host_veth = {
-            "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 0,
+            "ifname": veth_name, "ifindex": 301, "link_index": 2, "link_netnsid": 7,
             "ifalias": "", "linkinfo": {"info_kind": "veth"},
         }
-        for label, host_row, peer_rows, ns_stat_pair in (
-            ("missing-peer", base_host_veth, [], ns_id),
+        matching_peer = [{
+            "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
+            "linkinfo": {"info_kind": "veth"},
+        }]
+        good_nsid_rows = [{"nsid": 7, "name": ns_name}]
+        for label, host_row, peer_rows, ns_stat_pair, nsid_rows in (
+            # Exact counterexample: reciprocal indices match (301 <-> 2), but host veth points to nsid 9 (netns B)
+            # while attributed netns A has nsid 7.
+            ("wrong-peer-netnsid", {**base_host_veth, "link_netnsid": 9}, matching_peer, ns_id,
+             [{"nsid": 7, "name": ns_name}, {"nsid": 9, "name": "other-b"}]),
+            ("missing-nsid-empty", base_host_veth, matching_peer, ns_id, []),
+            ("missing-nsid-other", base_host_veth, matching_peer, ns_id, [{"nsid": 9, "name": "other-b"}]),
+            ("ambiguous-duplicate-nsid", base_host_veth, matching_peer, ns_id,
+             [{"nsid": 7, "name": ns_name}, {"nsid": 7, "name": "other-b"}]),
+            ("ambiguous-duplicate-name", base_host_veth, matching_peer, ns_id,
+             [{"nsid": 7, "name": ns_name}, {"nsid": 8, "name": ns_name}]),
+            ("missing-peer", base_host_veth, [], ns_id, good_nsid_rows),
             ("mismatched-peer-link-index", base_host_veth, [{
                 "ifname": "eth0", "ifindex": 2, "link_index": 999, "link_netnsid": 0,
                 "linkinfo": {"info_kind": "veth"},
-            }], ns_id),
+            }], ns_id, good_nsid_rows),
             ("mismatched-peer-ifindex", base_host_veth, [{
                 "ifname": "eth0", "ifindex": 5, "link_index": 301, "link_netnsid": 0,
                 "linkinfo": {"info_kind": "veth"},
-            }], ns_id),
+            }], ns_id, good_nsid_rows),
             ("same-netns-no-link-netnsid", {
                 "ifname": veth_name, "ifindex": 301, "link_index": 2, "ifalias": "",
                 "linkinfo": {"info_kind": "veth"},
-            }, [{
-                "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
-                "linkinfo": {"info_kind": "veth"},
-            }], ns_id),
-            ("substituted-peer-netns", base_host_veth, [{
-                "ifname": "eth0", "ifindex": 2, "link_index": 301, "link_netnsid": 0,
-                "linkinfo": {"info_kind": "veth"},
-            }], (7, 999)),
+            }, matching_peer, ns_id, good_nsid_rows),
+            ("substituted-peer-netns", base_host_veth, matching_peer, (7, 999), good_nsid_rows),
         ):
             with self.subTest(bad_veth=label):
                 del_calls = []
+
+                def fake_bad_ip(_end, *args, rows=nsid_rows, **kwargs):
+                    if args == ("-j", "netns", "list-id"):
+                        return json.dumps(rows)
+                    if args[:2] == ("link", "del"):
+                        del_calls.append(args)
+                        return ""
+                    raise AssertionError(f"unexpected ip call: {args}")
+
                 with patch.object(resources, "links_at", return_value=[host_row]), \
                      patch.object(resources, "ns_links_at", return_value=peer_rows), \
                      patch.object(Path, "exists", lambda p: p == ns_path), \
                      patch.object(Path, "stat", lambda p: SimpleNamespace(st_dev=ns_stat_pair[0], st_ino=ns_stat_pair[1])), \
-                     patch.object(resources, "ip", side_effect=lambda *a, **kw: del_calls.append(a)):
+                     patch.object(resources, "ip", side_effect=fake_bad_ip):
                     with self.assertRaisesRegex(Refusal, "link-attribution"):
                         resources.remove_link(veth_name, None, 10, tagged=False,
                                               expected_kind="veth", peer_node="a", peer_ns_identity=ns_id)
