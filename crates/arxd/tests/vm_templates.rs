@@ -29,7 +29,7 @@ fn fixture_recipe() -> UbuntuRecipe {
         guest: Some(pin(GUEST)),
         service: Some(pin(UbuntuRecipe::SERVICE)),
         finalize: Some(pin(UbuntuRecipe::FINALIZE)),
-        nocloud_schema: Some(pin(UbuntuRecipe::NOCLOUD_SCHEMA)),
+        nocloud_schema: Some(UbuntuRecipe::NOCLOUD_PROFILE_PIN),
         firmware_code: Some(pin(HOST_ASSET)),
         firmware_vars: Some(pin(HOST_ASSET)),
         qemu_receipt: Some(pin(HOST_ASSET)),
@@ -128,6 +128,30 @@ fn joliet_text(bytes: &[u8]) -> Parsed<String> {
     .map_err(|_| "Joliet encoding")
 }
 
+fn file_identifier(name: &str, joliet: bool) -> Parsed<(&str, &str)> {
+    let identifier = name.strip_suffix(";1").ok_or("file version")?;
+    let (stem, extension) = identifier.split_once('.').ok_or("extension separator")?;
+    let valid = |byte: u8| {
+        byte.is_ascii_digit()
+            || if joliet {
+                byte.is_ascii_lowercase() || byte == b'-'
+            } else {
+                byte.is_ascii_uppercase() || byte == b'_'
+            }
+    };
+    if stem.is_empty()
+        || !stem.bytes().chain(extension.bytes()).all(valid)
+        || if joliet {
+            name.len() > 64
+        } else {
+            stem.len() > 8 || extension.len() > 3
+        }
+    {
+        return Err("file identifier");
+    }
+    Ok((stem, extension))
+}
+
 fn directory(
     iso: &[u8],
     descriptor: &[u8],
@@ -198,6 +222,7 @@ fn directory(
         data = &data[length..];
     }
     let mut entries = BTreeMap::new();
+    let mut previous: Option<(String, String)> = None;
     while let Some(&first) = data.first() {
         if first == 0 {
             if data.iter().any(|&byte| byte != 0) {
@@ -216,14 +241,27 @@ fn directory(
                 .map_err(|_| "name encoding")?
                 .to_owned()
         };
-        let name = name.strip_suffix(";1").ok_or("file version")?;
-        let name = name.strip_suffix('.').unwrap_or(name);
+        let (stem, extension) = file_identifier(&name, joliet)?;
+        let visible = if extension.is_empty() {
+            stem
+        } else {
+            &name[..name.len() - 2]
+        };
         if entries
-            .insert(name.to_owned(), (entry.block, entry.size))
+            .insert(visible.to_owned(), (entry.block, entry.size))
             .is_some()
         {
             return Err("duplicate file");
         }
+        // ECMA-119 compares the name and extension separately, padding each
+        // shorter component with spaces. This profile uses characters above
+        // space and only version 1, so component-wise order is equivalent.
+        if let Some((last_stem, last_extension)) = &previous
+            && (last_stem.as_str(), last_extension.as_str()) >= (stem, extension)
+        {
+            return Err("directory order");
+        }
+        previous = Some((stem.to_owned(), extension.to_owned()));
         data = &data[length..];
     }
     Ok(entries)
@@ -344,7 +382,7 @@ fn golden_seed_is_deterministic() {
     assert_eq!(iso, fixture());
     assert_eq!(
         hex::encode(Sha256::digest(&iso)),
-        "8ed71fef5e89400d9c76df0a479d23a4fcd4373bed586d6b944c38501f3f9175",
+        "839ce0a9d6b0820013700b30e9ad4bbc23f77d730a0e1f99ff78feb3c3f1f82f",
     );
     assert!(read_iso(&iso).is_ok());
     assert_ne!(iso, fixture_recipe().render_seed([0; 16], GUEST).unwrap());
@@ -362,6 +400,44 @@ fn check_hashes(files: &BTreeMap<String, &[u8]>, recipe: &UbuntuRecipe) -> Parse
         }
     }
     Ok(())
+}
+
+#[test]
+fn profile_pin_binds_the_emitted_literals() {
+    let iso = fixture();
+    let files = read_iso(&iso).unwrap();
+    let mut template = std::str::from_utf8(files["user-data"]).unwrap().to_owned();
+    for (file, token) in [
+        ("arx-guest", "{guest_hash}"),
+        ("arx-guest.service", "{service_hash}"),
+        ("arx-finalize", "{finalize_hash}"),
+    ] {
+        let hash = hex::encode(Sha256::digest(files[file]));
+        assert_eq!(template.matches(&hash).count(), 1);
+        template = template.replace(&hash, token);
+    }
+    let profile = [
+        b"arxcovo-nocloud-v1\n".as_slice(),
+        template.as_bytes(),
+        files["arx-guest.service"],
+        files["arx-finalize"],
+    ]
+    .join(&0);
+    let observed = pin(&profile);
+    let expected = UbuntuRecipe::NOCLOUD_PROFILE_PIN;
+    assert_eq!(observed.length, expected.length);
+    assert_eq!(observed.sha256, expected.sha256);
+
+    let recipe = UbuntuRecipe {
+        nocloud_schema: Some(pin(b"arxcovo-nocloud-v1\n")),
+        ..fixture_recipe()
+    };
+    let mut out = Vec::new();
+    assert!(matches!(
+        write_fixture(&recipe, &mut NeverRead, &mut out),
+        RecipeError::Unqualified,
+    ));
+    assert!(out.is_empty());
 }
 
 #[test]
@@ -454,11 +530,21 @@ fn readback_contains_only_the_fixed_offline_profile() {
     }
     assert!(service.contains("udevadm wait --timeout=10 /dev/virtio-ports/org.arxcovo.agent.0"));
     let finalize = text("arx-finalize");
+    assert!(finalize.starts_with("#!/bin/sh\nset -eu\n\nrm -f /etc/arxcovo/template-finalized\n"));
+    for account_action in [
+        "/etc/shadow",
+        "/etc/passwd",
+        "/home/arx/",
+        "useradd ",
+        "usermod ",
+    ] {
+        assert!(!finalize.contains(account_action), "{account_action}");
+    }
     for action in [
-        "exit !(root && bootstrap)",
         "install -m 0644 /dev/null /etc/cloud/cloud-init.disabled",
+        "rm -f /etc/cloud/cloud.cfg.d/99-installer.cfg",
         "rm -rf /var/lib/cloud /var/log/installer /var/lib/subiquity /var/lib/arx-guest",
-        "rm -rf /root/.ssh /home/arx/.ssh",
+        "rm -rf /root/.ssh",
         "rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed",
         "rm -f /etc/machine-id /var/lib/dbus/machine-id",
         "install -m 0444 /dev/null /etc/machine-id",
@@ -509,6 +595,20 @@ fn independent_reader_rejects_malformed_images() {
         end += usize::from(clean[end]);
     }
     let first = &clean[joliet..joliet + usize::from(clean[joliet])];
+    let identifier_end = joliet + 33 + usize::from(clean[joliet + 32]);
+    bad = clean.clone();
+    bad[identifier_end - 5] = b'-';
+    assert_eq!(read_iso(&bad), Err("extension separator"));
+    bad = clean.clone();
+    bad[identifier_end - 1] = b'2';
+    assert_eq!(read_iso(&bad), Err("file version"));
+    let guest = joliet + first.len();
+    let unit = guest + usize::from(clean[guest]);
+    let after_unit = unit + usize::from(clean[unit]);
+    bad = clean.clone();
+    bad[guest..after_unit].rotate_left(unit - guest);
+    assert_eq!(read_iso(&bad), Err("directory order"));
+
     bad = clean.clone();
     bad[end..end + first.len()].copy_from_slice(first);
     assert_eq!(read_iso(&bad), Err("duplicate file"));
@@ -669,7 +769,7 @@ fn seed_refuses_oversize_and_bad_embedded_pins() {
         |recipe: &mut UbuntuRecipe| recipe.guest = None,
         |recipe: &mut UbuntuRecipe| recipe.service = Some(pin(b"wrong unit")),
         |recipe: &mut UbuntuRecipe| recipe.finalize = Some(pin(b"wrong finalize")),
-        |recipe: &mut UbuntuRecipe| recipe.nocloud_schema = Some(pin(b"wrong schema")),
+        |recipe: &mut UbuntuRecipe| recipe.nocloud_schema = Some(pin(b"arxcovo-nocloud-v1\n")),
     ] {
         recipe = fixture_recipe();
         change(&mut recipe);
@@ -681,14 +781,20 @@ fn seed_refuses_oversize_and_bad_embedded_pins() {
 }
 
 #[test]
-fn host_data_and_provisioning_secrets_cannot_enter_seed() {
+fn seed_and_user_data_contain_no_provisioning_credentials() {
     let mut recipe = fixture_recipe();
     let sentinel = b"https://remote.invalid/my-provisioning-secret/D:\\private\\owner";
     recipe.qemu_receipt = Some(pin(sentinel));
     let iso = recipe.render_seed(ID, GUEST).unwrap();
     assert_eq!(iso, fixture());
-    let text = String::from_utf8_lossy(&iso);
-    for sentinel in [
+    let files = read_iso(&iso).unwrap();
+    let user_data = std::str::from_utf8(files["user-data"]).unwrap();
+    let (profile, _) = cloud_config(user_data);
+    assert_eq!(profile["autoinstall.identity.password"], "'!'");
+    assert_eq!(profile["autoinstall.ssh.authorized-keys"], "[]");
+    assert_eq!(profile["autoinstall.ssh.install-server"], "false");
+    assert_eq!(profile["autoinstall.ssh.allow-pw"], "false");
+    let sentinels = [
         "remote.invalid",
         "my-provisioning-secret",
         "D:\\private\\owner",
@@ -696,7 +802,14 @@ fn host_data_and_provisioning_secrets_cannot_enter_seed() {
         "https://",
         "ssh-rsa ",
         "ssh-ed25519 ",
+        "ecdsa-sha2-",
         "BEGIN OPENSSH PRIVATE KEY",
+        "BEGIN PRIVATE KEY",
+        "ssh_authorized_keys:",
+        "ssh_import_id:",
+        "hashed_passwd:",
+        "chpasswd:",
+        "token:",
         "ds=nocloud;",
         "seedfrom:",
         "addresses:",
@@ -704,10 +817,16 @@ fn host_data_and_provisioning_secrets_cannot_enter_seed() {
         "gateway4:",
         "proxy:",
         "$6$",
+        "$5$",
+        "$2b$",
         "$y$",
-    ] {
-        assert!(!text.contains(sentinel), "{sentinel}");
+    ];
+    let seed = String::from_utf8_lossy(&iso);
+    for text in [user_data, &seed] {
+        for sentinel in sentinels {
+            assert!(!text.contains(sentinel), "{sentinel}");
+        }
+        assert_eq!(text.matches("password:").count(), 1);
+        assert!(text.contains("password: '!'\n"));
     }
-    assert_eq!(text.matches("password:").count(), 1);
-    assert!(text.contains("password: '!'\n"));
 }

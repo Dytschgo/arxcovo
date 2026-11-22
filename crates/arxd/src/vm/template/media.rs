@@ -11,7 +11,8 @@ const MAX_SECTORS: u32 = (64 * 1024 * 1024 / SECTOR) as u32;
 pub(super) const MAX_GUEST: usize = 32 * 1024 * 1024;
 const ZERO: [u8; SECTOR] = [0; SECTOR];
 
-// ISO9660 directory records are sorted by identifier within each namespace.
+// Each identifier includes the extension separator and version, even when
+// its extension is empty. Directory order compares base name, then extension.
 const PRIMARY_NAMES: [&str; 5] = [
     "ARXGUEST.;1",
     "ARXGUEST.SVC;1",
@@ -20,11 +21,11 @@ const PRIMARY_NAMES: [&str; 5] = [
     "USERDATA.;1",
 ];
 const JOLIET_NAMES: [&str; 5] = [
-    "arx-guest;1",
+    "arx-guest.;1",
     "arx-guest.service;1",
-    "arx-finalize;1",
-    "meta-data;1",
-    "user-data;1",
+    "arx-finalize.;1",
+    "meta-data.;1",
+    "user-data.;1",
 ];
 
 #[derive(Clone, Copy)]
@@ -79,7 +80,7 @@ impl<'a> Image<'a> {
         let mut offset = record(&mut data, root, b"\0", true);
         offset += record(&mut data[offset..], root, b"\x01", true);
         let order = if joliet {
-            [2, 1, 0, 3, 4]
+            [2, 0, 1, 3, 4]
         } else {
             [0, 1, 2, 3, 4]
         };

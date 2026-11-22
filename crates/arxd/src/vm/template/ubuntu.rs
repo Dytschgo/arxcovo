@@ -1,3 +1,14 @@
+//! The autoinstall identity uses Subiquity's locked password marker. On
+//! 24.04.3 account creation can be deferred to target cloud-init, so late
+//! commands neither inspect nor change accounts. Removing and disabling the
+//! target datasource also disables that deferred creation path. The 4b2
+//! detached health check must establish the expected account presence and
+//! lock state before qualification.
+//!
+//! Subiquity can copy installer logs after late commands. The seed supplies
+//! no reusable credentials. Acceptance on a real install must confirm that
+//! this remaining installer residue contains no secrets.
+
 use super::media::{Image, MAX_GUEST};
 use crate::vm::Id;
 use sha2::{Digest, Sha256};
@@ -71,6 +82,7 @@ pub struct UbuntuRecipe {
     pub guest: Option<AssetPin>,
     pub service: Option<AssetPin>,
     pub finalize: Option<AssetPin>,
+    /// Pin the versioned NoCloud profile, including all three fixed literals.
     pub nocloud_schema: Option<AssetPin>,
     pub firmware_code: Option<AssetPin>,
     pub firmware_vars: Option<AssetPin>,
@@ -98,7 +110,18 @@ impl UbuntuRecipe {
         0x27, 0x4b,
     ];
     // Arxcovo's NoCloud seed schema identifier, including the newline.
-    pub const NOCLOUD_SCHEMA: &[u8] = b"arxcovo-nocloud-v1\n";
+    const NOCLOUD_SCHEMA: &[u8] = b"arxcovo-nocloud-v1\n";
+
+    /// SHA256 and length of the schema identifier, user-data template, unit
+    /// and finalizer, in that order, separated by NUL bytes.
+    pub const NOCLOUD_PROFILE_PIN: AssetPin = AssetPin {
+        length: 2807,
+        sha256: [
+            0xe2, 0xf3, 0xe3, 0x2a, 0xbf, 0x8b, 0xe9, 0xd6, 0xf8, 0xa8, 0x56, 0xab, 0x9d, 0xf9,
+            0x75, 0x17, 0x4f, 0x5e, 0x89, 0x62, 0x6a, 0xf9, 0x29, 0x53, 0x4a, 0x10, 0xa3, 0x88,
+            0x9f, 0x36, 0x89, 0x8a,
+        ],
+    };
 
     pub const SERVICE: &[u8] = br"[Unit]
 Description=Arxcovo guest supervisor
@@ -119,17 +142,12 @@ WantedBy=multi-user.target
     pub const FINALIZE: &[u8] = br#"#!/bin/sh
 set -eu
 
-# Require both installed accounts to have locked password fields.
-awk -F: '
-    $1 == "root" && $2 ~ /^[!*]/ { root = 1 }
-    $1 == "arx" && $2 ~ /^[!*]/ { bootstrap = 1 }
-    END { exit !(root && bootstrap) }
-' /etc/shadow
-
+rm -f /etc/arxcovo/template-finalized
 install -m 0644 /dev/null /etc/cloud/cloud-init.disabled
+rm -f /etc/cloud/cloud.cfg.d/99-installer.cfg
 rm -rf /var/lib/cloud /var/log/installer /var/lib/subiquity /var/lib/arx-guest
 rm -f /var/log/cloud-init.log /var/log/cloud-init-output.log
-rm -rf /root/.ssh /home/arx/.ssh
+rm -rf /root/.ssh
 rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
 
 # An empty regular machine-id permits a transient ID on the first boot.
@@ -205,7 +223,20 @@ printf '%s\n' ubuntu-noble-amd64-v1 > /etc/arxcovo/template-finalized
         guest_pin.verify(guest)?;
         service.verify(Self::SERVICE)?;
         finalize.verify(Self::FINALIZE)?;
-        schema.verify(Self::NOCLOUD_SCHEMA)?;
+        let expected = Self::NOCLOUD_PROFILE_PIN;
+        if schema.length != expected.length || schema.sha256 != expected.sha256 {
+            return Err(RecipeError::Unqualified);
+        }
+        let separator: &[u8] = b"\0";
+        schema.verify(
+            Self::NOCLOUD_SCHEMA
+                .chain(separator)
+                .chain(USER_DATA_TEMPLATE.as_bytes())
+                .chain(separator)
+                .chain(Self::SERVICE)
+                .chain(separator)
+                .chain(Self::FINALIZE),
+        )?;
         let meta = format!(
             "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
             hex::encode(build_id),
@@ -230,14 +261,14 @@ fn image<'a>(guest: &'a [u8], meta: &'a str, user: &'a str) -> Result<Image<'a>,
     .ok_or(RecipeError::MediaLimit)
 }
 
-// Subiquity's identity mapping uses the locked shadow value "!". The
-// pinned installer still needs qualification for accepting this value.
 fn user_data(guest: AssetPin, service: AssetPin, finalize: AssetPin) -> String {
-    let guest_hash = hex::encode(guest.sha256);
-    let service_hash = hex::encode(service.sha256);
-    let finalize_hash = hex::encode(finalize.sha256);
-    format!(
-        r#"#cloud-config
+    USER_DATA_TEMPLATE
+        .replace("{guest_hash}", &hex::encode(guest.sha256))
+        .replace("{service_hash}", &hex::encode(service.sha256))
+        .replace("{finalize_hash}", &hex::encode(finalize.sha256))
+}
+
+const USER_DATA_TEMPLATE: &str = r#"#cloud-config
 autoinstall:
   version: 1
   interactive-sections: []
@@ -300,6 +331,4 @@ autoinstall:
       install -m 0700 "$seed/arx-finalize" /target/usr/local/sbin/arx-finalize
       systemctl --root=/target enable arx-guest.service
       curtin in-target --target=/target -- /bin/sh /usr/local/sbin/arx-finalize
-"#
-    )
-}
+"#;
