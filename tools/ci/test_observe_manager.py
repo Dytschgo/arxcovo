@@ -4,12 +4,16 @@ import json
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import observe_manager as diagnostic
 
 
 class ManagerObservationTests(unittest.TestCase):
+    R2_ENV = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+              "RUNNER_OS": "Linux", "ImageOS": "ubuntu24", "ImageVersion": "20261116.133.1"}
+
     def test_only_fixed_read_queries(self):
         calls = []
 
@@ -36,6 +40,68 @@ class ManagerObservationTests(unittest.TestCase):
             self.assertLessEqual(len(encoded), 2048)
             self.assertTrue(all(r["exit_code"] == 113
                                 for r in json.loads(encoded)["observations"]))
+
+    def test_r2_receipt_uses_fixed_read_only_queries_and_shapes(self):
+        calls = []
+
+        def run(argv, timeout=None):
+            calls.append((argv, timeout))
+            return diagnostic.Capture("completed", 0, b"255.4-1ubuntu8.18", b"private")
+
+        with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
+            release="7.0.0-1014-aws"), create=True), patch.object(
+            diagnostic, "runner_tool_present", side_effect=lambda path: path != "/usr/sbin/nft"
+        ) as tools:
+            encoded = diagnostic.observe("linux", run, self.R2_ENV)
+        self.assertEqual(calls, [
+            (["/usr/bin/systemctl", *diagnostic.SYSTEMD_ARGS], None),
+            (["/usr/bin/dpkg-query", "-W", "-f=${Version}", "systemd"], 1),
+        ])
+        self.assertEqual([call.args[0] for call in tools.call_args_list], list(diagnostic.R2_TOOLS))
+        self.assertLessEqual(len(encoded), 2048)
+        self.assertNotIn("private", encoded)
+        receipt = json.loads(encoded)["r2_runner"]
+        self.assertEqual(receipt, {
+            "image_os": "ubuntu24", "image_version": "20261116.133.1",
+            "kernel": "7.0.0-1014-aws", "systemd_package": "255.4-1ubuntu8.18",
+            "tools": {path: path != "/usr/sbin/nft" for path in diagnostic.R2_TOOLS},
+        })
+
+    def test_r2_receipt_rejects_uncorrelated_runner_or_malformed_versions(self):
+        for name, value in [("GITHUB_ACTIONS", "false"), ("RUNNER_ENVIRONMENT", "self-hosted"),
+                            ("RUNNER_OS", "Windows"), ("ImageOS", "ubuntu26"),
+                            ("ImageVersion", "private-image")]:
+            with self.subTest(field=name):
+                env = {**self.R2_ENV, name: value}
+                with patch.object(diagnostic, "runner_tool_present") as tools:
+                    encoded = diagnostic.observe("linux", lambda _: diagnostic.Capture("unavailable"), env)
+                tools.assert_not_called()
+                self.assertNotIn("r2_runner", json.loads(encoded))
+        with patch.object(diagnostic.os, "uname", return_value=SimpleNamespace(
+            release="7.private\nvalue"), create=True), patch.object(
+            diagnostic, "runner_tool_present", return_value=False
+        ):
+            for result in (diagnostic.Capture("completed", 0, b"255\nprivate"),
+                           diagnostic.Capture("completed", 1, b"255.4-1ubuntu8.18"),
+                           diagnostic.Capture("timeout")):
+                receipt = diagnostic.r2_runner_receipt(self.R2_ENV, lambda *a, **k: result)
+                self.assertIsNone(receipt["kernel"])
+                self.assertIsNone(receipt["systemd_package"])
+
+    def test_r2_tool_metadata_refuses_unsafe_locations_and_permissions(self):
+        system = diagnostic.Path("/usr/sbin/nft")
+        with patch.object(diagnostic.Path, "resolve", return_value=diagnostic.Path("/tmp/nft")), \
+             patch.object(diagnostic.Path, "stat") as metadata:
+            self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
+            metadata.assert_not_called()
+        with patch.object(diagnostic.Path, "resolve", return_value=system):
+            for uid, mode, expected in [(0, 0o100755, True), (1001, 0o100755, False),
+                                        (0, 0o100775, False), (0, 0o100644, False),
+                                        (0, 0o040755, False)]:
+                with patch.object(diagnostic.Path, "stat", return_value=SimpleNamespace(st_uid=uid, st_mode=mode)):
+                    self.assertEqual(diagnostic.runner_tool_present("/usr/sbin/nft"), expected)
+        with patch.object(diagnostic.Path, "resolve", side_effect=FileNotFoundError):
+            self.assertFalse(diagnostic.runner_tool_present("/usr/sbin/nft"))
 
     def test_absence_phrases_are_observations_not_guessed_success(self):
         result = diagnostic.Capture("completed", 113, b"",

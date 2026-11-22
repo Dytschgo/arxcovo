@@ -3,16 +3,25 @@ import json
 import os
 import re
 import selectors
+import stat
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 CAP = 16384
 TIMEOUT = 6
 SYSTEMD_ARGS = ("show", "--property=LoadState,ActiveState,FragmentPath,DropInPaths", "arxd.service")
 MAC_TARGETS = (("arxcovo", "system/com.arxcovo.arxd"),
                ("apple_syslog_control", "system/com.apple.syslogd"))
+R2_SYSTEMD_ARGS = ("/usr/bin/dpkg-query", "-W", "-f=${Version}", "systemd")
+R2_TOOLS = (
+    "/usr/bin/gcc", "/usr/sbin/nft", "/usr/sbin/ip", "/usr/sbin/mkfs.ext4",
+    "/usr/sbin/losetup", "/usr/bin/systemd-run", "/usr/bin/systemctl",
+    "/usr/bin/mount", "/usr/bin/umount", "/usr/bin/findmnt", "/usr/bin/ldd",
+    "/usr/bin/dpkg-query", "/usr/bin/git",
+)
 
 
 @dataclass
@@ -124,7 +133,42 @@ def summarize(label, target, result, platform):
     return row
 
 
-def observe(platform, run=capture):
+def runner_tool_present(path):
+    try:
+        target = Path(path).resolve(strict=True)
+        if target.parent not in (Path("/usr/bin"), Path("/usr/sbin")):
+            return False
+        info = target.stat()
+    except (OSError, RuntimeError):
+        return False
+    return (info.st_uid == 0 and stat.S_ISREG(info.st_mode)
+            and bool(info.st_mode & 0o111) and not (info.st_mode & 0o022))
+
+
+def r2_runner_receipt(env, run):
+    if (env.get("GITHUB_ACTIONS") != "true"
+            or env.get("RUNNER_ENVIRONMENT") != "github-hosted"
+            or env.get("RUNNER_OS") != "Linux"
+            or env.get("ImageOS") != "ubuntu24"):
+        return None
+    image = env.get("ImageVersion", "")
+    if not re.fullmatch(r"[0-9]{8}\.[0-9]{1,5}\.[0-9]{1,5}", image):
+        return None
+    kernel = os.uname().release
+    package = run(list(R2_SYSTEMD_ARGS), timeout=1)
+    return {
+        "image_os": "ubuntu24",
+        "image_version": image,
+        "kernel": kernel if re.fullmatch(r"[0-9][0-9A-Za-z.+_-]{0,63}", kernel) else None,
+        "systemd_package": (package.stdout.decode("ascii")
+                            if package.status == "completed" and package.code == 0
+                            and re.fullmatch(rb"[0-9][0-9A-Za-z.+:~_-]{0,63}", package.stdout)
+                            else None),
+        "tools": {path: runner_tool_present(path) for path in R2_TOOLS},
+    }
+
+
+def observe(platform, run=capture, runner_env=None):
     if platform == "darwin":
         rows = [summarize(label, target, run(["/bin/launchctl", "print", target]), platform)
                 for label, target in MAC_TARGETS]
@@ -133,7 +177,12 @@ def observe(platform, run=capture):
                           run(["/usr/bin/systemctl", *SYSTEMD_ARGS]), platform)]
     else:
         rows = [{"target": "platform", "status": "unsupported", "exit_code": None}]
-    encoded = json.dumps({"schemaVersion": 1, "observations": rows}, separators=(",", ":"))
+    evidence = {"schemaVersion": 1, "observations": rows}
+    if platform == "linux" and runner_env is not None:
+        receipt = r2_runner_receipt(runner_env, run)
+        if receipt is not None:
+            evidence["r2_runner"] = receipt
+    encoded = json.dumps(evidence, separators=(",", ":"))
     if len(encoded) > 2048:
         raise RuntimeError("manager-observation-bound")
     return encoded
@@ -143,7 +192,7 @@ def main():
     if len(sys.argv) != 1:
         print("manager-observation-arguments", file=sys.stderr)
         return 2
-    print(observe(sys.platform))
+    print(observe(sys.platform, runner_env=os.environ))
     return 0
 
 
