@@ -211,18 +211,19 @@
   acceptance; reviewed head `bcc727e9`). The isolated R2/C16 bridge subnet was repinned
   to RFC1918 `192.168.72.0/24` with a host-route collision refusal, production
   `peer_control_wire::qualified` stayed untouched, and a 1-file `#[cfg(test)]` fence
-  amendment covered `bound_start/runtime/c16_probe.rs`. Sol 6.2/high builder, tally 2/3
-  (report `D:/Temp/arx-m3-c16-live/report.md`, SHA256 `d4a593fd…4ade`); the second counted
-  failure was a libtest output-format mismatch on the one-CPU cgroup, fixed in the
-  launcher only. Pre-push reviews: HOLD (SHA256 `3f9d1dae…0df6`), PASS (SHA256 `89f718f3…9620`),
-  PASS (SHA256 `b3c5cdb4…75e3`), PASS (SHA256 `5d30a046…04dc`). PR CI `45048031980` passed all 10
-  checks with live C16 in `14.116 s` on an AWS runner (`7.0.0-1014-aws`; log SHA256
+  amendment covered `bound_start/runtime/c16_probe.rs`. Sol 6.2/high builder, tally **3/3 exhausted** (report
+  `D:/Temp/arx-m3-c16-live/report.md`, SHA256 `d4a593fd…4ade`). The counted fixes
+  covered the MCP client directory mode, serial libtest output handling in the C16
+  launcher with a regression test, and the sealed compiler/linker dependency closure. Pre-push reviews: HOLD (SHA256 `3f9d1dae…0df6`), PASS (SHA256 `89f718f3…9620`),
+  PASS (SHA256 `b3c5cdb4…75e3`), PASS (SHA256 `5d30a046…04dc`). PR CI run `45048031980` passed all nine
+  jobs and `ci-time-budget` was green, with live C16 in `14.116 s` on an AWS runner (`7.0.0-1014-aws`; log SHA256
   `3071b903…5b6d`). Exact-head review PASS (`D:/Temp/arx-pr252-exact-review/review.md`,
   SHA256 `91ea2a0a…89d6`), agent-review status `59599655996`. C16 accounting, identical on
   the PR run and on `main`: engine starts 4, normal closes 3, one deliberate leader kill,
   Found 1, owner Mints 6, AnchorQuery 3, Redeem 2, enrollment proposals 9, AddNodes 2,
-  joint 1, flatten 1, CA handoffs 2, builds 1; the surviving pair elected a new leader
-  (epoch `[2,3]`) and the ledger kept every acknowledged write.
+  joint 1, flatten 1, CA handoffs 2, builds 1; in both runs the surviving pair elected a new leader, with the recorded
+  `[epoch, leader]` pair `[2,2]` in PR CI and `[2,3]` on `main`. The ledger preserved all
+  four acknowledged Mint writes exercised by the campaign across failover and recovery.
 - **M3 acceptance passed for the conditional hosted Linux profile.** KICKOFF M3 asks
   that a 3-node cluster survive one node going offline without losing writes (C16, above)
   and that an expired or reused join code be rejected (C15, PR #234; D5 elapsed
@@ -230,13 +231,16 @@
   service, physical suspend and native multi-host paths remain **unverified on real
   hardware**. M2 remains open only for its owner-dependent acceptance.
 - **M4 started (Windows host + QEMU/WHPX test VMs).** A Sol 6.2/high design proposes seven
-  sequential PRs (`D:/Temp/arx-m4-plan/plan.md`, SHA256 `7332b865…f778`); it is under
-  independent review before adoption. The Gemini 4 Neon interim coordinator started the
+  sequential PRs (`D:/Temp/arx-m4-plan/plan.md`, SHA256 `7332b865…f778`). Independent review recommended **ADOPT WITH REQUIRED
+  CHANGES** (`D:/Temp/arx-m4-plan-review/review.md`, SHA256 `f56b94b8…b74a`). The
+  coordinator recorded adoption under pre-approval, sent the required slice 1 contract
+  changes to the builder, and flagged to the owner the decision to start M4 while M2
+  owner-dependent acceptance remains open. The Gemini 4 Neon interim coordinator started the
   PR 1 builder (bounded `arx-guest` protocol) in a C: worktree; the returning
   coordinator cancelled it under the D: worktree rule and relaunched it in
-  `D:/ArxcovoData/wt/m4pr1` (not a counted failure). Owner-host evidence for M4 (WHPX,
-  the dedicated standard account, disk cap and CPU/RAM reserve per
-  `docs/dev-host-setup.md`) is pending and is not an agent step.
+  `D:/ArxcovoData/wt/m4pr1` (not a counted failure). Owner setup for M4 (WHPX, the dedicated standard account, disk cap and CPU/RAM reserve
+  per `docs/dev-host-setup.md`) is pending. M4 native paths remain **unverified on real
+  hardware**.
 - **Milestones & verification boundary.** M1 accepted; M2 open for owner-dependent
   acceptance; M3 complete for the conditional hosted Linux profile; M4 in progress.
   Preserved holds: Engine Sol `3/3 exhausted`, historical Opus `0/2`, D6 freeze.
