@@ -1,12 +1,11 @@
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, PipeReader, PipeWriter, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, mpsc};
+use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +24,9 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(1);
 
 pub(crate) fn serve_virtio() -> Result<(), &'static str> {
     let port = open_port().map_err(|_| "virtio setup failed")?;
-    let runner = CgroupRoot::qualify().ok().map(ScriptRunner::new);
+    let runner = CgroupRoot::qualify()
+        .ok()
+        .map(|root| ScriptRunner::new(root, Some(port.as_fd())));
     serve_connection(&port, &port, runner)
 }
 
@@ -74,7 +75,7 @@ fn verify_port_name(device: libc::dev_t) -> io::Result<()> {
 fn serve_connection(
     reader: impl Read,
     writer: impl Write,
-    runner: Option<ScriptRunner>,
+    runner: Option<ScriptRunner<'_>>,
 ) -> Result<(), &'static str> {
     let retired = Cell::new(false);
     let mut executor = LinuxExecutor {
@@ -116,7 +117,7 @@ impl<W: Write> Write for SessionWriter<'_, W> {
 }
 
 struct LinuxExecutor<'a> {
-    runner: Option<ScriptRunner>,
+    runner: Option<ScriptRunner<'a>>,
     retired: &'a Cell<bool>,
 }
 
@@ -221,43 +222,77 @@ impl CommandCgroups for CgroupRoot {
     }
 }
 
-type Spawn = dyn Fn(&mut Command) -> io::Result<Child> + Send + Sync;
-
-struct ScriptRunner {
+struct ScriptRunner<'port> {
     cgroups: Box<dyn CommandCgroups>,
-    spawn: Arc<Spawn>,
+    port: Option<BorrowedFd<'port>>,
     max_budget: Duration,
     cleanup_budget: Duration,
     drop_privileges: bool,
+    #[cfg(test)]
+    stall: Option<StallBeforeExec>,
 }
 
-impl ScriptRunner {
-    fn new(root: CgroupRoot) -> Self {
+impl<'port> ScriptRunner<'port> {
+    fn new(root: CgroupRoot, port: Option<BorrowedFd<'port>>) -> Self {
         Self {
             drop_privileges: root.owner == 0,
             cgroups: Box::new(root),
-            spawn: Arc::new(Command::spawn),
+            port,
             max_budget: Duration::from_secs(arx_guest::MAX_TIMEOUT_S.into()),
             cleanup_budget: CLEANUP_BUDGET,
+            #[cfg(test)]
+            stall: None,
         }
     }
 
     fn run(&self, script: &str, budget: Duration) -> io::Result<ScriptOutcome> {
         let deadline = Instant::now() + budget.min(self.max_budget);
         let mut group = self.cgroups.new_command()?;
-        let mut child = match script_command(script, Some(&group.procs), self.drop_privileges) {
-            Ok(command) => spawn_until(command, Arc::clone(&self.spawn), deadline)?,
-            Err(_) => None,
+        let prepared = PreparedScript::new(script);
+        let launch_expired = Instant::now() >= deadline;
+        let mut child = if launch_expired {
+            None
+        } else {
+            prepared
+                .and_then(|script| {
+                    script.fork(ChildSetup {
+                        port: self.port.map(|port| port.as_raw_fd()),
+                        procs: Some(group.procs.as_raw_fd()),
+                        drop_privileges: self.drop_privileges,
+                        #[cfg(test)]
+                        stdout: None,
+                        #[cfg(test)]
+                        stall: self.stall,
+                    })
+                })
+                .ok()
         };
+        let mut launch_uncertain = false;
         let result = match &mut child {
-            Some(child) => observe(child, deadline),
+            Some(child) => match child.wait_exec(deadline) {
+                Ok(true) => observe(child, deadline),
+                Ok(false) => Ok(Observation::LaunchFailed),
+                Err(error) => {
+                    launch_uncertain = true;
+                    Err(error)
+                }
+            },
+            None if launch_expired => Err(io::ErrorKind::TimedOut.into()),
             None => Ok(Observation::LaunchFailed),
         };
         let cleanup_deadline = Instant::now() + self.cleanup_budget;
-        // A child whose wait reached the deadline is still unreaped. Its PID
-        // pins the process group identity for killpg.
-        let group_kill = match (&child, &result) {
-            (Some(child), Ok(Observation::Deadline)) => kill_process_group(child),
+        // An uncertain launch has an unreaped PID even before setpgid. Kill
+        // that PID directly as well as its group, then kill the cgroup.
+        let group_kill = match &child {
+            Some(child) if launch_uncertain || matches!(result, Ok(Observation::Deadline)) => {
+                let group = signal_kill(-child.pid);
+                if launch_uncertain {
+                    let direct = signal_kill(child.pid);
+                    group.and(direct)
+                } else {
+                    group
+                }
+            }
             _ => Ok(()),
         };
         let cgroup_kill = group.kill();
@@ -265,45 +300,14 @@ impl ScriptRunner {
             Some(child) => reap(child, cleanup_deadline),
             None => Ok(()),
         };
-        let cleanup = group
-            .wait_empty(cleanup_deadline)
-            .and_then(|()| self.cgroups.remove_command(&group));
+        let empty = group.wait_empty(cleanup_deadline);
         group_kill?;
         cgroup_kill?;
-        cleanup?;
         reap?;
+        empty?;
+        self.cgroups.remove_command(&group)?;
         Ok(result?.outcome())
     }
-}
-
-fn spawn_until(
-    mut command: Command,
-    spawn: Arc<Spawn>,
-    deadline: Instant,
-) -> io::Result<Option<Child>> {
-    if Instant::now() >= deadline {
-        return Err(io::ErrorKind::TimedOut.into());
-    }
-    let (sender, receiver) = mpsc::sync_channel(0);
-    // A stalled pre-exec handshake may still own a child with unknown cgroup
-    // membership. Detach the worker: the session retires and leaves its slot
-    // in place for fail-closed restart and outer VM teardown.
-    thread::Builder::new().spawn(move || {
-        let child = spawn(&mut command).ok();
-        let late = if Instant::now() >= deadline {
-            drop(sender);
-            child
-        } else {
-            sender.send(child).err().and_then(|error| error.0)
-        };
-        if let Some(mut child) = late {
-            let _ = kill_process_group(&child);
-            let _ = reap(&mut child, Instant::now() + CLEANUP_BUDGET);
-        }
-    })?;
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| io::ErrorKind::TimedOut.into())
 }
 
 fn supervisor_path(service: &str) -> io::Result<PathBuf> {
@@ -414,64 +418,229 @@ impl CommandGroup {
     }
 }
 
-fn script_command(
-    script: &str,
-    procs: Option<&File>,
+struct PreparedScript {
+    input: PipeReader,
+    null: File,
+    exec_reader: PipeReader,
+    exec_writer: PipeWriter,
+}
+
+#[derive(Default)]
+struct ChildSetup {
+    port: Option<RawFd>,
+    procs: Option<RawFd>,
     drop_privileges: bool,
-) -> io::Result<Command> {
-    if script.len() > MAX_SCRIPT {
-        return Err(invalid());
+    #[cfg(test)]
+    stdout: Option<RawFd>,
+    #[cfg(test)]
+    stall: Option<StallBeforeExec>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct StallBeforeExec {
+    ready: RawFd,
+    gate: RawFd,
+}
+
+impl PreparedScript {
+    fn new(script: &str) -> io::Result<Self> {
+        if script.len() > MAX_SCRIPT {
+            return Err(invalid());
+        }
+        let (input, mut writer) = io::pipe()?;
+        // SAFETY: writer owns the pipe descriptor. F_GETPIPE_SZ takes no argument.
+        let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        if !usize::try_from(capacity).is_ok_and(|capacity| capacity >= script.len()) {
+            return Err(invalid());
+        }
+        // The private pipe has room for the entire script before a reader runs.
+        writer.write_all(script.as_bytes())?;
+        drop(writer);
+        let (exec_reader, exec_writer) = io::pipe()?;
+        Ok(Self {
+            input,
+            null: File::options().write(true).open("/dev/null")?,
+            exec_reader,
+            exec_writer,
+        })
     }
-    let (reader, mut writer) = io::pipe()?;
-    // SAFETY: writer owns a live pipe descriptor. F_GETPIPE_SZ takes no argument.
-    let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
-    if !usize::try_from(capacity).is_ok_and(|capacity| capacity >= script.len()) {
-        return Err(invalid());
+
+    fn fork(self, setup: ChildSetup) -> io::Result<ScriptChild> {
+        let input = self.input.as_raw_fd();
+        let null = self.null.as_raw_fd();
+        let report = self.exec_writer.as_raw_fd();
+        let zero: libc::c_ulong = 0;
+        let flags = libc::SIGCHLD as libc::c_ulong;
+        // s390 passes the child stack before the flags. All other arguments
+        // are zero because this is a separate process with copied descriptors.
+        let (first, second) = if cfg!(target_arch = "s390x") {
+            (zero, flags)
+        } else {
+            (flags, zero)
+        };
+        // SAFETY: fork-style clone (no shared stack, memory, or FD table).
+        // The child uses only async-signal-safe operations and never returns
+        // through Rust or libc fork hooks. The first child syscall closes the
+        // port. Before that close there is only local control flow, and the
+        // supervisor's File keeps this close from being the final release.
+        let pid = unsafe {
+            let pid = libc::syscall(libc::SYS_clone, first, second, zero, zero, zero);
+            if pid == 0 {
+                if let Some(port) = setup.port
+                    && libc::syscall(libc::SYS_close, libc::c_long::from(port)) != 0
+                {
+                    launch_failed(report);
+                }
+                exec_child(setup, input, null, report);
+            }
+            pid
+        };
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(self.exec_writer);
+        Ok(ScriptChild {
+            pid: pid as libc::pid_t,
+            exec_reader: self.exec_reader,
+            status: None,
+        })
     }
-    // The private empty pipe has room for the entire bounded script. Prefill
-    // before spawn and close the writer, so handoff cannot wait on the shell.
-    writer.write_all(script.as_bytes())?;
-    drop(writer);
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-s"])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("LANG", "C")
-        .current_dir("/")
-        .stdin(Stdio::from(reader))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    let procs = procs.map(File::try_clone).transpose()?;
-    // SAFETY: the closure owns the duplicated descriptor and writes a fixed
-    // byte. Raw credential syscalls avoid libc's setxid locks and broadcasts
-    // after fork, when only the calling thread survives.
+}
+
+// SAFETY: fork child only. All descriptors are inherited and live, and all
+// strings and buffers have fixed size. No allocation, lock or Rust unwind.
+unsafe fn exec_child(setup: ChildSetup, input: RawFd, null: RawFd, report: RawFd) -> ! {
     unsafe {
-        command.pre_exec(move || {
-            if let Some(file) = &procs
-                && libc::write(file.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1
-            {
-                return Err(io::Error::last_os_error());
+        #[cfg(test)]
+        if let Some(stall) = setup.stall {
+            let pid = libc::getpid().to_ne_bytes();
+            let port_open =
+                [u8::from(setup.port.is_some_and(|port| {
+                    libc::fcntl(port, libc::F_GETFD) != -1
+                }))];
+            libc::write(stall.ready, pid.as_ptr().cast(), pid.len());
+            libc::write(stall.ready, port_open.as_ptr().cast(), 1);
+            // Bound even a test whose supervisor regresses and never kills it.
+            let mut gate = libc::pollfd {
+                fd: stall.gate,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if libc::poll(&mut gate, 1, 2000) <= 0 {
+                libc::_exit(124);
             }
-            let one: libc::c_ulong = 1;
-            let zero: libc::c_ulong = 0;
-            let gid = libc::c_ulong::from(SCRIPT_GID);
-            let uid = libc::c_ulong::from(SCRIPT_UID);
-            if drop_privileges
-                && (libc::syscall(libc::SYS_setgroups, zero, std::ptr::null::<libc::gid_t>()) != 0
+            libc::read(stall.gate, [0u8].as_mut_ptr().cast(), 1);
+        }
+
+        #[cfg(not(test))]
+        let stdout = null;
+        #[cfg(test)]
+        let stdout = setup.stdout.unwrap_or(null);
+        let one: libc::c_ulong = 1;
+        let zero: libc::c_ulong = 0;
+        let gid = libc::c_ulong::from(SCRIPT_GID);
+        let uid = libc::c_ulong::from(SCRIPT_UID);
+        // Raw credential syscalls avoid libc's setxid locks and broadcasts.
+        let failed = libc::setpgid(0, 0) != 0
+            || setup
+                .procs
+                .is_some_and(|fd| libc::write(fd, b"0".as_ptr().cast(), 1) != 1)
+            || libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR
+            || libc::dup2(input, libc::STDIN_FILENO) < 0
+            || libc::dup2(stdout, libc::STDOUT_FILENO) < 0
+            || libc::dup2(null, libc::STDERR_FILENO) < 0
+            || libc::chdir(c"/".as_ptr()) != 0
+            || (setup.drop_privileges
+                && (libc::syscall(libc::SYS_setgroups, zero, std::ptr::null::<libc::gid_t>())
+                    != 0
                     || libc::syscall(libc::SYS_setresgid, gid, gid, gid) != 0
-                    || libc::syscall(libc::SYS_setresuid, uid, uid, uid) != 0)
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+                    || libc::syscall(libc::SYS_setresuid, uid, uid, uid) != 0))
+            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero) != 0;
+        if !failed {
+            let shell = c"/bin/sh".as_ptr();
+            let args = [shell, c"-s".as_ptr(), std::ptr::null()];
+            let env = [
+                c"PATH=/usr/bin:/bin".as_ptr(),
+                c"LANG=C".as_ptr(),
+                std::ptr::null(),
+            ];
+            libc::execve(shell, args.as_ptr(), env.as_ptr());
+        }
+        launch_failed(report);
     }
-    Ok(command)
+}
+
+// SAFETY: the reporting pipe is private, empty and has a live reader during
+// launch (or returns EPIPE after retirement). The child must never unwind.
+unsafe fn launch_failed(report: RawFd) -> ! {
+    unsafe {
+        libc::write(report, b"1".as_ptr().cast(), 1);
+        libc::_exit(127);
+    }
+}
+
+struct ScriptChild {
+    pid: libc::pid_t,
+    exec_reader: PipeReader,
+    status: Option<ExitStatus>,
+}
+
+impl ScriptChild {
+    fn wait_exec(&mut self, deadline: Instant) -> io::Result<bool> {
+        wait_readable(self.exec_reader.as_raw_fd(), deadline)?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        // The child writes one byte on failure. Exec closes the writer.
+        Ok(self.exec_reader.read(&mut [0])? == 0)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        while self.status.is_none() {
+            let mut status = 0;
+            // SAFETY: pid is this unreaped child and status is writable.
+            let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            match waited {
+                0 => break,
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                _ => self.status = Some(ExitStatus::from_raw(status)),
+            }
+        }
+        Ok(self.status)
+    }
+}
+
+fn wait_readable(fd: RawFd, deadline: Instant) -> io::Result<()> {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let ms = (remaining.as_millis() + 1).min(i32::MAX as u128) as i32;
+        // SAFETY: poll is a single initialized descriptor record.
+        match unsafe { libc::poll(&mut poll, 1, ms) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            0 => {}
+            _ if poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 => return Ok(()),
+            _ => return Err(invalid()),
+        }
+    }
 }
 
 enum Observation {
@@ -496,7 +665,7 @@ impl Observation {
     }
 }
 
-fn observe(child: &mut Child, deadline: Instant) -> io::Result<Observation> {
+fn observe(child: &mut ScriptChild, deadline: Instant) -> io::Result<Observation> {
     observe_until(|| child.try_wait(), || pause_until(deadline))
 }
 
@@ -516,7 +685,7 @@ fn observe_until(
     }
 }
 
-fn reap(child: &mut Child, deadline: Instant) -> io::Result<()> {
+fn reap(child: &mut ScriptChild, deadline: Instant) -> io::Result<()> {
     loop {
         if child.try_wait()?.is_some() {
             return Ok(());
@@ -525,9 +694,9 @@ fn reap(child: &mut Child, deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn kill_process_group(child: &Child) -> io::Result<()> {
-    // SAFETY: PID belongs to an unreaped child spawned as its own group leader.
-    if unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) } == 0 {
+fn signal_kill(pid: libc::pid_t) -> io::Result<()> {
+    // SAFETY: the unreaped child pins its PID and any process group it leads.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
@@ -567,9 +736,7 @@ fn invalid() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{DirBuilderExt, FileExt};
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ChildStdout;
-    use std::sync::Mutex;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use arx_guest::{Request, Response, ScriptStatus, read_frame, write_frame};
@@ -590,42 +757,46 @@ mod tests {
             ("exit 7", ScriptOutcome::Exited { exit_code: 7 }),
             ("kill -TERM $$", ScriptOutcome::Terminated),
         ] {
-            let mut child = script_command(script, None, false)
-                .unwrap()
-                .spawn()
-                .unwrap();
+            let mut child = launched(script, ChildSetup::default());
             let observed = observe(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
             if matches!(observed, Observation::Deadline) {
-                kill_process_group(&child).unwrap();
+                signal_kill(-child.pid).unwrap();
                 reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
             }
             assert_eq!(observed.outcome(), expected);
         }
         let read_only = File::open("/dev/null").unwrap();
-        let error = script_command("exit 0", Some(&read_only), false)
+        let mut child = PreparedScript::new("exit 0")
             .unwrap()
-            .spawn()
-            .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+            .fork(ChildSetup {
+                procs: Some(read_only.as_raw_fd()),
+                ..ChildSetup::default()
+            })
+            .unwrap();
+        assert!(!child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
+        reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
     }
 
     #[test]
     fn short_deadline_kills_process_group_and_reaps_owned_child() {
-        let mut child = script_command("sleep 2 & printf '%s\\n' \"$!\"; wait", None, false)
-            .unwrap()
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut pipe = child.stdout.take().unwrap();
+        let (mut pipe, output) = io::pipe().unwrap();
+        let mut child = launched(
+            "sleep 2 & printf '%s\\n' \"$!\"; wait",
+            ChildSetup {
+                stdout: Some(output.as_raw_fd()),
+                ..ChildSetup::default()
+            },
+        );
+        drop(output);
         let descendant = read_pid(&mut pipe);
         // SAFETY: getpgid reads kernel state and has no pointer parameters.
-        assert_eq!(unsafe { libc::getpgid(descendant) }, child.id() as i32);
+        assert_eq!(unsafe { libc::getpgid(descendant) }, child.pid);
         assert!(matches!(
             observe(&mut child, Instant::now() + Duration::from_millis(10)).unwrap(),
             Observation::Deadline
         ));
-        let pid = child.id();
-        kill_process_group(&child).unwrap();
+        let pid = child.pid;
+        signal_kill(-pid).unwrap();
         reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
         assert_eq!(
             child.try_wait().unwrap().unwrap().signal(),
@@ -633,7 +804,7 @@ mod tests {
         );
         // SAFETY: a null status pointer discards the result. WNOHANG bounds the call.
         assert_eq!(
-            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
             -1
         );
         assert_eq!(
@@ -678,7 +849,11 @@ mod tests {
         };
         let mut responses = Vec::new();
         assert_eq!(
-            serve_connection(&requests[..], &mut responses, Some(ScriptRunner::new(root))),
+            serve_connection(
+                &requests[..],
+                &mut responses,
+                Some(ScriptRunner::new(root, None))
+            ),
             Err("script containment failed")
         );
         let mut responses = &responses[..];
@@ -690,27 +865,65 @@ mod tests {
     }
 
     #[test]
-    fn stalled_spawn_retires_the_session_without_joining() {
+    fn stalled_pre_exec_child_releases_port_and_is_reaped() {
         let fixture = Arc::new(FakeCgroups::new());
+        // The child stalls before joining. The command cgroup stays empty.
+        fs::write(fixture.0.join("cgroup.events"), b"populated 0\n").unwrap();
+        let (mut peer, port) = io::pipe().unwrap();
+        let (mut started, ready) = io::pipe().unwrap();
+        let (gate, _held_gate) = io::pipe().unwrap();
         let mut runner = fixture.runner();
         runner.max_budget = Duration::from_millis(150);
-        let (entered, worker) = mpsc::channel();
-        let (finished, completion) = mpsc::channel();
-        let (release, resume) = mpsc::channel();
-        let resume = Mutex::new(resume);
-        runner.spawn = Arc::new(move |_| {
-            entered.send(()).unwrap();
-            let _ = resume.lock().unwrap().recv_timeout(Duration::from_secs(2));
-            finished.send(()).unwrap();
-            Err(io::ErrorKind::WouldBlock.into())
+        runner.port = Some(port.as_fd());
+        runner.stall = Some(StallBeforeExec {
+            ready: ready.as_raw_fd(),
+            gate: gate.as_raw_fd(),
         });
-        let (result, bytes) = run_exit_seven(runner);
-        worker.recv_timeout(FIXTURE_BUDGET).unwrap();
-        let still_blocked = completion.try_recv() == Err(mpsc::TryRecvError::Empty);
-        let _ = release.send(());
-        assert!(still_blocked, "the service waited for the stalled spawn");
-        completion.recv_timeout(FIXTURE_BUDGET).unwrap();
-        assert_retired(result, &bytes);
+        let start = Instant::now();
+        let result = serve_connection(script_request("exit 7").as_slice(), &port, Some(runner));
+        let session_time = start.elapsed();
+        drop(port);
+        drop(ready);
+
+        wait_readable(started.as_raw_fd(), Instant::now() + FIXTURE_BUDGET).unwrap();
+        let mut identity = 0i32.to_ne_bytes();
+        started.read_exact(&mut identity).unwrap();
+        let mut inherited = [0];
+        started.read_exact(&mut inherited).unwrap();
+        let pid = libc::pid_t::from_ne_bytes(identity);
+        assert!(pid > 0);
+        wait_readable(peer.as_raw_fd(), Instant::now() + FIXTURE_BUDGET).unwrap();
+        expect_hello(&mut peer, ScriptExecution::Available);
+        let release = wait_readable(peer.as_raw_fd(), Instant::now() + Duration::from_millis(50))
+            .and_then(|()| peer.read(&mut [0]));
+
+        // SAFETY: pid came directly from the forked fixture child. WNOHANG
+        // checks whether the runner already reaped it without blocking.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let reaped =
+            waited == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        if waited == 0 {
+            // Keep the mutation witness from leaving its blocked child behind.
+            signal_kill(pid).unwrap();
+            let mut child = ScriptChild {
+                pid,
+                exec_reader: started,
+                status: None,
+            };
+            reap(&mut child, Instant::now() + FIXTURE_BUDGET).unwrap();
+        }
+        assert_eq!(release.expect("stalled child kept the port open"), 0);
+        assert_eq!(
+            inherited,
+            [0],
+            "the first child step did not close the port"
+        );
+        assert!(reaped, "the watchdog did not reap the stalled child");
+        assert_eq!(result, Err("script containment failed"));
+        assert!(
+            session_time < Duration::from_millis(500),
+            "session did not retire promptly"
+        );
     }
 
     #[test]
@@ -790,16 +1003,17 @@ mod tests {
             }
         };
         let mut group = root.new_command().unwrap();
-        let mut child = script_command(
+        let (mut pipe, output) = io::pipe().unwrap();
+        let mut child = launched(
             "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\"; exec sleep 2' & exit 0",
-            Some(&group.procs),
-            owner == 0,
-        )
-        .unwrap()
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-        let mut pipe = child.stdout.take().unwrap();
+            ChildSetup {
+                procs: Some(group.procs.as_raw_fd()),
+                drop_privileges: owner == 0,
+                stdout: Some(output.as_raw_fd()),
+                ..ChildSetup::default()
+            },
+        );
+        drop(output);
         let descendant = read_pid(&mut pipe);
         // SAFETY: getsid reads kernel state and has no pointer parameters.
         assert_eq!(unsafe { libc::getsid(descendant) }, descendant);
@@ -817,7 +1031,7 @@ mod tests {
         ready(&pipe);
         assert_eq!(pipe.read(&mut [0]).unwrap(), 0);
         assert!(!group.path.exists());
-        let runner = ScriptRunner::new(root);
+        let runner = ScriptRunner::new(root, None);
         if owner == 0 {
             assert_eq!(
                 runner
@@ -875,13 +1089,14 @@ mod tests {
             fixture
         }
 
-        fn runner(self: &Arc<Self>) -> ScriptRunner {
+        fn runner<'port>(self: &Arc<Self>) -> ScriptRunner<'port> {
             ScriptRunner {
                 cgroups: Box::new(Arc::clone(self)),
-                spawn: Arc::new(Command::spawn),
+                port: None,
                 max_budget: FIXTURE_BUDGET,
                 cleanup_budget: FIXTURE_BUDGET,
                 drop_privileges: false,
+                stall: None,
             }
         }
     }
@@ -907,7 +1122,7 @@ mod tests {
         }
     }
 
-    fn run_exit_seven(runner: ScriptRunner) -> (Result<(), &'static str>, Vec<u8>) {
+    fn run_exit_seven(runner: ScriptRunner<'_>) -> (Result<(), &'static str>, Vec<u8>) {
         let mut bytes = Vec::new();
         let result = serve_connection(
             script_request("exit 7").as_slice(),
@@ -957,7 +1172,7 @@ mod tests {
         requests
     }
 
-    fn expect_hello(responses: &mut &[u8], script_execution: ScriptExecution) {
+    fn expect_hello(responses: &mut impl Read, script_execution: ScriptExecution) {
         assert!(matches!(
             read_frame::<Response>(responses).unwrap(),
             Some(Response::HelloAck {
@@ -968,7 +1183,13 @@ mod tests {
         ));
     }
 
-    fn read_pid(pipe: &mut ChildStdout) -> libc::pid_t {
+    fn launched(script: &str, setup: ChildSetup) -> ScriptChild {
+        let mut child = PreparedScript::new(script).unwrap().fork(setup).unwrap();
+        assert!(child.wait_exec(Instant::now() + FIXTURE_BUDGET).unwrap());
+        child
+    }
+
+    fn read_pid(pipe: &mut PipeReader) -> libc::pid_t {
         ready(pipe);
         let mut line = [0; 32];
         let len = pipe.read(&mut line).unwrap();
